@@ -1,26 +1,31 @@
 # Deployment: running the bootstrap under the OS init system
 
 An update hierarchy must terminate somewhere. These templates run the tiny,
-installer-owned **bootstrap** under the host's init system. The bootstrap launches
-the committed **supervisor** and safely advances to a verified, content-addressed
-candidate; the supervisor selects releases while the bootstrap owns the application
-process and executes lifecycle commands on the supervisor's behalf.
+installer-owned **bootstrap guardian** under the host's init system. The guardian
+owns both the replaceable **supervisor** and the managed application. The supervisor
+selects releases and requests application lifecycle operations through the guardian,
+but it is never the application's process parent.
 
 ```
-  init system ─manages─► bootstrap ─activates─► supervisor ─journal-updates─► app
-                            │
-                    pointer-swaps the supervisor (readiness-gated); never itself
+  init system ──manages──► bootstrap guardian
+                                  ├──owns/readiness-gates──► supervisor
+                                  └──owns──────────────────► application
 
-  installer/package manager ─replaces─► bootstrap/supervisor  (out-of-band alt.)
+               supervisor ──authenticated control requests──► guardian
+               supervisor ──health probes───────────────────► application
+
+  The guardian readiness-gates and pointer-commits supervisor replacements.
+  The supervisor verifies and journal-updates the application through the guardian.
 ```
 
 The verbs on the arrows are intentional. The init system **manages** the
-bootstrap's process lifecycle. The bootstrap **activates** supervisor releases: it
+guardian's process lifecycle. The guardian **activates** supervisor releases: it
 launches a staged candidate, waits for it to prove it can run, and either commits
 its path or retains the previous pointer — but it never updates *itself*. The
-supervisor **updates** the application with an in-place, journaled swap, and stages
-its own next version for the bootstrap to activate. Supervisor releases use the
-reserved `supervisor` product on the application's configured channel.
+supervisor **updates** the application with an in-place, journaled swap, but asks the
+guardian to stop, start, or adopt that application. It also stages its own next
+version for the guardian to activate. Supervisor releases use the reserved
+`supervisor` product on the application's configured channel.
 
 Ending the hierarchy at the init system (systemd / launchd / SCM) is the whole
 point: it is present on every target, restarts a process that exits, and is updated
@@ -46,21 +51,24 @@ including on Windows, where replacing a running image is forbidden.
 
 ### A supervisor restart never disrupts the application
 
-The supervisor is not on the data path and does not own the application. The
-bootstrap keeps the application in memory across supervisor crashes and self-updates,
-so the replacement supervisor re-adopts the PID through the inherited control
-channel. If the bootstrap itself stops, it stops the application too; the application
-does not outlive its permanent guardian.
+The supervisor is not on the data path and is not the application's process parent.
+The guardian keeps the application alive across supervisor crashes and replacements,
+then lets the replacement supervisor adopt the existing PID through the authenticated
+control channel. If the guardian stops, it stops both children. Neither the supervisor
+nor the application outlives its permanent guardian.
 
 ### Terminology invariant
 
-In this documentation, **manages** means process lifecycle (start, stop, restart),
+In this documentation, **owns** means OS process parent and lifetime boundary,
+**manages** means init-system process lifecycle (start, stop, restart),
 **activates** means launch-a-candidate-and-commit-or-roll-back, and **updates**
 means release installation, verification, commit, and rollback. Do not describe an
 init system as updating anything: it manages the bootstrap. Do not describe the
-application as "self-updating": the supervisor owns that transaction. The one
-component whose replacement is gated by proof-of-execution is the supervisor, and
-the bootstrap — not the init system, and not the supervisor itself — performs that
+supervisor as owning the application: it requests lifecycle operations from the
+guardian. Do not describe the application as "self-updating": the supervisor owns
+that transaction. The one component whose replacement is gated by proof-of-execution
+is the supervisor, and
+the guardian — not the init system, and not the supervisor itself — performs that
 swap.
 
 ## Layout assumed by the templates
