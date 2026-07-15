@@ -235,12 +235,6 @@ unsafe extern "system" fn handle_ctrl(_ctrl_type: u32) -> windows_sys::Win32::Fo
 /// out the grace and then hard-kills the supervisor.
 pub fn terminate_gracefully(_pid: u32) {}
 
-/// A no-op on Windows: std has no directory fsync. A rename is atomic and process-crash
-/// safe; only an abrupt power loss may lose the newest directory entry.
-pub fn sync_dir(_dir: &std::path::Path) -> io::Result<()> {
-    Ok(())
-}
-
 // ------------------------------ the control channel ------------------------------
 
 /// The guardian's end of the inherited control channel: a duplex pair of anonymous pipes

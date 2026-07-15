@@ -127,10 +127,9 @@ mod dependency_isolation {
 
     const MANIFEST: &str = include_str!("../Cargo.toml");
 
-    /// The frozen wire-protocol crate plus platform binding crates. `control` is the one
-    /// project dependency the guardian may take: it is std-only and changes only when
-    /// the protocol does, which the guardian tracks regardless.
-    const ALLOWED: &[&str] = &["control", "libc", "windows-sys"];
+    /// Frozen protocol and mechanism crates plus platform bindings. Both project crates
+    /// are dependency-isolated and contain no tower policy or behavioral dependencies.
+    const ALLOWED: &[&str] = &["control", "foundation", "libc", "windows-sys"];
 
     #[test]
     fn only_platform_binding_crates_are_allowed() {

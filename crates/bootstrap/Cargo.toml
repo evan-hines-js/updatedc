@@ -9,8 +9,8 @@ license.workspace = true
 # policy holder, so it should almost never need updating.
 #
 # Dependency rule (enforced by `dependency_isolation` in main.rs):
-#   * the ONLY project crate allowed is `control` — the frozen, std-only wire protocol
-#     the guardian must track anyway; never `updated`, which changes constantly;
+#   * the only project crates allowed are the frozen `control` protocol and the
+#     dependency-isolated `foundation` mechanisms; never the policy tower;
 #   * no behavioral third-party crate — no serde, tokio, tracing, http, crypto,
 #     config, or update libraries;
 #   * platform BINDING crates are allowed (libc, windows-sys) — they are just
@@ -23,6 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 control = { path = "../control" }
+foundation = { path = "../foundation" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

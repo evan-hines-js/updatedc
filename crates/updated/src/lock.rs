@@ -1,22 +1,19 @@
 //! Single-instance advisory lock for an installation transaction.
 //!
-//! One portable path via the standard-library file lock (`File::try_lock`, stable
-//! since 1.89) — `flock` on Unix, `LockFileEx` on Windows — rather than hand-rolled
-//! `flock`/`CreateFileW` FFI. The OS releases the lock when the owning handle is
-//! dropped, or unconditionally when the process exits or crashes.
+//! `File::try_lock` maps to the platform lock primitive. The OS releases the lock
+//! when the handle is dropped or the owning process exits.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::path::Path;
 
-/// Holds the lock for as long as it is alive.
+/// Holds the installation lock for as long as it is alive.
 pub struct InstanceLock {
     _file: File,
 }
 
 impl InstanceLock {
-    /// Acquire an exclusive, non-blocking lock on `path`, creating it if needed.
-    /// Errors with [`io::ErrorKind::WouldBlock`] if another live process holds it.
+    /// Acquire an exclusive, non-blocking lock, creating its file if needed.
     pub fn acquire(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -30,7 +27,7 @@ impl InstanceLock {
                 io::ErrorKind::WouldBlock,
                 format!("another instance already owns {}", path.display()),
             )),
-            Err(TryLockError::Error(e)) => Err(e),
+            Err(TryLockError::Error(error)) => Err(error),
         }
     }
 }
@@ -44,18 +41,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lock-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("x.lock");
-
         let first = InstanceLock::acquire(&path).unwrap();
-        assert!(
-            InstanceLock::acquire(&path).is_err(),
-            "second acquire must fail"
-        );
+        assert!(InstanceLock::acquire(&path).is_err());
         drop(first);
-        assert!(
-            InstanceLock::acquire(&path).is_ok(),
-            "released lock is reacquirable"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(InstanceLock::acquire(&path).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

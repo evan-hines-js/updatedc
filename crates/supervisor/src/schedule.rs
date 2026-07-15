@@ -3,18 +3,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |duration| duration.as_secs())
 }
 
 pub(crate) fn jitter(duration: Duration, percent: u32) -> Duration {
-    let tick = SystemTime::now()
+    let entropy = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    jitter_with(
-        duration,
-        percent,
-        tick ^ (u64::from(std::process::id()) << 32),
-    )
+        .map_or(0, |duration| duration.as_nanos() as u64)
+        ^ (u64::from(std::process::id()) << 32);
+    jitter_with(duration, percent, entropy)
 }
 
 /// The pure jitter computation, taking its entropy explicitly so the arithmetic is
@@ -23,9 +20,8 @@ fn jitter_with(duration: Duration, percent: u32, entropy: u64) -> Duration {
     if duration.is_zero() || percent == 0 {
         return duration;
     }
-    let x = mix(entropy);
     let span = u64::from(percent) * 2 + 1;
-    let signed = (x % span) as i64 - i64::from(percent);
+    let signed = (mix(entropy) % span) as i64 - i64::from(percent);
     let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
     let delta = millis.saturating_mul(signed.unsigned_abs()) / 100;
     Duration::from_millis(if signed < 0 {
@@ -43,9 +39,7 @@ fn mix(mut seed: u64) -> u64 {
 }
 
 pub(crate) fn network_backoff(base: Duration, failures: u32) -> Duration {
-    let factor = 1u32.checked_shl(failures.min(6)).unwrap_or(64);
-    base.saturating_mul(factor)
-        .min(Duration::from_secs(15 * 60))
+    foundation::time::exponential_backoff(base, failures, 6, Duration::from_secs(15 * 60))
 }
 
 #[cfg(test)]

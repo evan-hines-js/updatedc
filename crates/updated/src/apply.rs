@@ -2,9 +2,8 @@
 //! renames atomic; `<target>.old` remains available until commit.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn old_path(target: &Path) -> PathBuf {
     crate::config::with_suffix(target, ".old")
@@ -30,23 +29,7 @@ pub fn rollback(target: &Path) -> io::Result<()> {
 }
 
 fn create_temp(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
-    let pid = std::process::id();
-    for attempt in 0..10_000u32 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(attempt);
-        let path = dir.join(format!("{prefix}{pid}-{nanos}-{attempt}"));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(f) => return Ok((f, path)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not create a unique temp file",
-    ))
+    foundation::durable::create_temp(dir, prefix)
 }
 
 /// Atomically replace a stopped target while retaining `<target>.old` for rollback.
@@ -161,72 +144,23 @@ fn backup(target: &Path) -> io::Result<()> {
 /// mapping (or an antivirus scan triggered by that teardown) still briefly makes
 /// replacement return `ERROR_ACCESS_DENIED`.
 fn replace_path(from: &Path, to: &Path) -> io::Result<()> {
-    let mut attempt = 0u32;
-    loop {
-        match replace_once(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt < 50 && is_transient_lock(&e) => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(
-                    (20 * attempt as u64).min(100),
-                ));
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    foundation::durable::replace(from, to)
 }
 
+#[cfg(test)]
 fn is_transient_lock(e: &io::Error) -> bool {
-    match e.raw_os_error() {
-        #[cfg(windows)]
-        Some(5) | Some(32) | Some(33) => true,
-        #[cfg(unix)]
-        Some(16) | Some(26) => true,
-        _ => false,
-    }
-}
-
-/// Atomically replace an existing file. `fs::rename` is a replace-existing rename
-/// on every target we support: `rename(2)` on Unix, and
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows (what Rust's `fs::rename`
-/// issues). We deliberately do NOT use `ReplaceFileW`: its internal rename-aside
-/// dance returns `ERROR_ACCESS_DENIED` in some environments even for an idle plain
-/// file, whereas the single MoveFileEx is robust. The target is never a running
-/// image here — the supervisor stops the child before a Windows swap.
-fn replace_once(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
+    foundation::durable::is_transient_lock(e)
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(dir)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    // Windows has no directly equivalent directory-fsync operation in Rust's
-    // standard library. File contents are flushed before replacement, and rename
-    // remains atomic, but a sudden power loss may lose the newest directory-entry
-    // change (creation, removal, or rename). Process-crash recovery is unaffected.
-    let _ = dir;
-    Ok(())
+    foundation::durable::sync_dir(dir)
 }
 
 /// Atomically write `data` to `path`, flushing its contents before replacement.
 /// Unix also fsyncs the containing directory; see [`sync_dir`] for the narrower
 /// Windows sudden-power-loss guarantee.
 pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let (mut tmp, tmp_path) = create_temp(dir, ".state-")?;
-    if let Err(e) = tmp.write_all(data).and_then(|_| tmp.sync_all()) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    drop(tmp);
-    if let Err(e) = replace_path(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    sync_dir(dir)
+    foundation::durable::atomic_write(path, ".state-", data)
 }
 
 /// Remove `path` and, on Unix, durably record its absence by fsyncing the containing
@@ -235,13 +169,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 /// success. On Windows removal is atomic and process-crash-safe, but an abrupt power
 /// loss may retain the old directory entry; callers still get ordinary I/O errors.
 pub fn remove_file_durable(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    sync_dir(dir)
+    foundation::durable::remove_file(path)
 }
 
 #[cfg(test)]

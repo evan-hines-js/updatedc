@@ -66,10 +66,8 @@ impl Backoff {
         if ran_for >= Self::SETTLED {
             self.consecutive = 0;
         }
-        let factor = 1u32
-            .checked_shl(self.consecutive.min(8))
-            .unwrap_or(u32::MAX);
-        let delay = Self::BASE.saturating_mul(factor).min(Self::CAP);
+        let delay =
+            foundation::time::exponential_backoff(Self::BASE, self.consecutive, 8, Self::CAP);
         self.consecutive = self.consecutive.saturating_add(1);
         delay
     }

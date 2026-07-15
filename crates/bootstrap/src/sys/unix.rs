@@ -200,11 +200,6 @@ pub fn terminate_gracefully(pid: u32) {
     }
 }
 
-/// Fsync a directory so a rename or creation within it is durable across power loss.
-pub fn sync_dir(dir: &std::path::Path) -> io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
-}
-
 /// Wait up to `timeout_ms` for `fd` to become readable, so the single-threaded guardian
 /// can watch the control channel while still periodically checking the app and supervisor.
 fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> Ready {

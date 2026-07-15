@@ -86,6 +86,7 @@ name = "bootstrap"
 version = "0.1.0"
 dependencies = [
  "control",
+ "foundation",
  "libc",
  "windows-sys 0.59.0",
 ]
@@ -269,6 +270,10 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "foundation"
+version = "0.1.0"
 
 [[package]]
 name = "fs_extra"
@@ -1312,6 +1317,7 @@ name = "supervisor"
 version = "0.1.0"
 dependencies = [
  "control",
+ "foundation",
  "reqwest",
  "rustls",
  "tokio",
@@ -1636,6 +1642,7 @@ name = "updated"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "foundation",
  "hex",
  "semver",
  "serde",

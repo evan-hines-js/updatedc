@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+foundation = { path = "../foundation" }
 # The shared operator-config loader for the supervisor and one-shot updater.
 serde = { workspace = true }
 # The committed installed-state record (updated::state) is JSON.

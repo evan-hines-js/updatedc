@@ -264,9 +264,9 @@ fn default_state_path(binary: &Path) -> PathBuf {
 /// Append `suffix` to a path's final component — `foo` + `.old` ⇒ `foo.old`. The
 /// tower's one way to name a sibling of a state or binary file.
 pub fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
-    let mut s = base.as_os_str().to_owned();
-    s.push(suffix);
-    PathBuf::from(s)
+    let mut value = base.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 /// Parse the sole CLI contract shared by every entrypoint that loads this config

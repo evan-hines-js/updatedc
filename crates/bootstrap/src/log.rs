@@ -1,15 +1,11 @@
-//! A three-line logger. The guardian cannot use the tower's `updated::log`, so it has
-//! its own: a component prefix and a level on stderr, which the service manager
-//! captures. Nothing more is warranted for a program this small.
+//! Guardian component label over the shared minimal logger.
 
 pub fn info(msg: &str) {
-    eprintln!("[guardian] {msg}");
+    foundation::log::info("guardian", msg);
 }
-
 pub fn warn(msg: &str) {
-    eprintln!("[guardian] WARN {msg}");
+    foundation::log::warn("guardian", msg);
 }
-
 pub fn error(msg: &str) {
-    eprintln!("[guardian] ERROR {msg}");
+    foundation::log::error("guardian", msg);
 }

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/foundation",
     "crates/updated",
     "crates/updated-tuf",
     "crates/control",
