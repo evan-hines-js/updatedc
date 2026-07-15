@@ -1,0 +1,12 @@
+[package]
+name = "windows-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "selfupdate-service"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

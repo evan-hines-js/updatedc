@@ -1,0 +1,24 @@
+[package]
+name = "supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "supervisor"
+path = "src/main.rs"
+
+[features]
+# Deterministic crash injection at update-transaction boundaries, for the e2e's
+# crash-recovery scenarios. OFF by default so production binaries contain no injection
+# points at all — a stray `UPDATED_CHAOS_POINT` can never crash a real supervisor.
+chaos = []
+
+[dependencies]
+updated = { path = "../updated" }
+updated-tuf = { path = "../updated-tuf" }
+# The disposable supervisor drives the guardian over the frozen control protocol.
+control = { path = "../control" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }

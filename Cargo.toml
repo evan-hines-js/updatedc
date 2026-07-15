@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/updated",
+    "crates/updated-tuf",
+    "crates/control",
+    "crates/server",
+    "crates/bootstrap",
+    "crates/supervisor",
+    "crates/oneshot",
+    "crates/sampleapp",
+    "crates/e2e",
+    "crates/windows-service",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+# Pinned once here so every crate agrees on versions. All hashing and signing go
+# through `aws-lc-rs` (already pulled in by the TUF client), so there is one
+# crypto library, not two.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# One operator config file shared by the supervisor and one-shot updater.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+semver = "1"
+hex = "0.4"
+# Test-only HTTP client for the e2e harness (localhost, so no TLS).
+ureq = { version = "2", default-features = false }
+libc = "0.2"
+# TUF is the update trust path: the mature `tough` client/editor plus a Tokio
+# runtime (tough is async-native) and `url` for repository base URLs.
+tough = { version = "0.24", features = ["http"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "time",
+    "fs",
+    "io-util",
+    "signal",
+    "sync",
+] }
+url = "2"
+# Pinned to match tough's own versions so the trees unify (no duplicates).
+aws-lc-rs = "1"      # the one crypto lib: SHA-256, ed25519 keygen, secure RNG
+jiff = "0.2"         # timestamps for TUF metadata expiry
+futures = "0.3"      # stream combinators for verified target downloads
+# Async HTTP for the supervisor's localhost health probe (no TLS needed).
+reqwest = { version = "0.13", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # CreateJobObjectW (e2e harness) takes a SECURITY_ATTRIBUTES pointer, so its
+    # signature — hence the whole function — lives behind Win32_Security.
+    "Win32_Security",
+    # SetConsoleCtrlHandler: the bootstrap's stop-signal handling.
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+strip = true

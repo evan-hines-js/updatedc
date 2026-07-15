@@ -1,0 +1,67 @@
+# systemd unit for the self-updating supervisor (Linux). Template — adjust paths,
+# URLs, user, and intervals for your deployment, then install as:
+# Ownership terminology is defined canonically in deploy/README.md.
+#
+#   install -m0644 selfupdate-supervisor.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now selfupdate-supervisor
+#
+# systemd is the root PROCESS supervisor. It manages the lifecycle of the tiny,
+# installer-owned BOOTSTRAP. The bootstrap launches the committed supervisor pointer and
+# advances it only after a content-addressed candidate proves it can run; the supervisor manages and
+# updates the application. The update hierarchy terminates at systemd — an
+# OS-maintained root we do not ship:
+#
+#   systemd --manages--> bootstrap --activates--> supervisor --journal-updates--> app
+#                            |
+#                      pointer-swaps the supervisor (readiness-gated); never itself
+#
+#     package manager --replaces--> bootstrap/supervisor   (out-of-band alternative)
+#
+# The bootstrap runs continuously: when the supervisor stages a self-update and
+# exits, the bootstrap (not systemd) activates the candidate under a readiness
+# gate, committing its path or retaining the previous pointer. systemd only relaunches
+# the bootstrap itself, on the rare event that it crashes.
+#
+# KillMode=process is REQUIRED: on stop/restart systemd signals only the bootstrap,
+# never the supervisor or the application's separate process group. The bootstrap
+# coordinates a clean tower shutdown; the application does not outlive the guardian.
+
+[Unit]
+Description=Self-updating supervisor and application (via bootstrap)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# The bootstrap is installer-owned and read-only; it never updates itself, so it
+# lives outside the writable state directory. The initial supervisor is installer-owned;
+# later verified candidates live content-addressed under the state directory.
+ExecStart=/usr/lib/selfupdate/bootstrap --state-dir /var/lib/selfupdate --supervisor-config /etc/selfupdate/config.toml --supervisor /usr/lib/selfupdate/supervisor --ready-timeout 60
+
+# Relaunch the bootstrap if it ever crashes. The start-limit defaults stop a
+# crash-looping build after a few tries; each guardian relaunch restores the tower.
+Restart=always
+RestartSec=2
+
+# Signal only the bootstrap; it coordinates shutdown of the supervisor and application.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# --- Sandboxing (tighten to taste). Supervisor candidates and the application
+#     binary self-update, so they live under the writable state directory (which
+#     also holds the commit journal and the TUF metadata cache). The bootstrap and
+#     the pinned TUF root — the two anchors of trust — stay read-only. ---
+User=selfupdate
+Group=selfupdate
+StateDirectory=selfupdate
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/selfupdate
+
+[Install]
+WantedBy=multi-user.target

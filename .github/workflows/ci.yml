@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  trivy:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan dependencies, secrets, and configuration
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15-intel is Intel; macos-14 is a native Apple Silicon runner. Keeping
+        # both makes the advertised x86-64/aarch64 support part of CI rather than
+        # relying only on cross-compilation.
+        include:
+          - os: ubuntu-latest
+            release: linux-x86_64
+          - os: macos-15-intel
+            release: macos-x86_64
+          - os: macos-14
+            release: macos-aarch64
+          - os: windows-latest
+            release: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # aws-lc-rs (via the `tough` TUF client) builds its C with CMake on every
+      # OS — preinstalled on the runners — plus NASM on Windows MSVC, which is not.
+      - if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # Compile and run the test artifacts first. Clippy then reuses Cargo's
+      # dependency artifacts and analyzes only this workspace's code.
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+      # Portable updater scenarios run identically on every OS.
+      - run: cargo run -p e2e
+      # Windows additionally exercises the real Service Control Manager boundary:
+      # native service registration, durable bootstrap state, clean application
+      # shutdown, and a fresh application launch after service restart. GitHub's
+      # Windows runners permit service creation from the runner administrator account.
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: .\deploy\windows\test-scm-e2e.ps1
+
+      # A main build produces the continuously-running update tower for each desktop
+      # target. The optional updated-oneshot companion remains independently buildable
+      # but is not part of this supervisor/application deployment bundle.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          cargo build --release -p bootstrap -p supervisor
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cargo build --release -p windows-service
+          fi
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/updated-${{ matrix.release }}.tar.gz" \
+            bootstrap supervisor
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $files = @(
+            "target/release/bootstrap.exe"
+            "target/release/supervisor.exe"
+            "target/release/selfupdate-service.exe"
+          )
+          Compress-Archive -Path $files -DestinationPath "dist/updated-${{ matrix.release }}.zip"
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: updated-${{ matrix.release }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish rolling release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, trivy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: updated-*
+          path: dist
+          merge-multiple: true
+      - name: Verify all platform packages were downloaded
+        shell: bash
+        run: |
+          packages=(
+            dist/updated-linux-x86_64.tar.gz
+            dist/updated-macos-x86_64.tar.gz
+            dist/updated-macos-aarch64.tar.gz
+            dist/updated-windows-x86_64.zip
+          )
+          for package in "${packages[@]}"; do
+            test -s "$package" || {
+              echo "Missing or empty release package: $package" >&2
+              exit 1
+            }
+          done
+      - name: Move the edge tag to this verified build
+        run: |
+          git tag --force edge "$GITHUB_SHA"
+          git push --force origin refs/tags/edge
+      - name: Publish four platform packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          packages=(
+            dist/updated-linux-x86_64.tar.gz
+            dist/updated-macos-x86_64.tar.gz
+            dist/updated-macos-aarch64.tar.gz
+            dist/updated-windows-x86_64.zip
+          )
+          if gh release view edge >/dev/null 2>&1; then
+            gh release upload edge "${packages[@]}" --clobber
+            gh release edit edge \
+              --title "Latest main build" \
+              --notes "Automated build of main at $GITHUB_SHA." \
+              --prerelease
+          else
+            gh release create edge "${packages[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "Latest main build" \
+              --notes "Automated build of main at $GITHUB_SHA." \
+              --prerelease
+          fi
+
+          release_assets="$(gh release view edge --json assets --jq '.assets[].name')"
+          for package in "${packages[@]}"; do
+            name="${package##*/}"
+            grep -Fxq "$name" <<<"$release_assets" || {
+              echo "Release is missing uploaded package: $name" >&2
+              exit 1
+            }
+          done

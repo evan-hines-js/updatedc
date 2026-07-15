@@ -1,0 +1,18 @@
+[package]
+name = "control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The frozen guardian⇄supervisor control protocol: the one wire contract shared by the
+# permanent guardian (`bootstrap`) and the disposable `supervisor`. It is deliberately
+# std-only and dependency-free — it must not drag any churn into the guardian, which is
+# why the guardian may depend on it even though the guardian depends on nothing else in
+# the workspace. It changes only when the protocol itself changes, which both sides must
+# track regardless. Runtime compatibility across versions is the negotiation handshake's
+# job, not this crate's build-time sharing.
+[lib]
+name = "control"
+path = "src/lib.rs"
+
+[dependencies]

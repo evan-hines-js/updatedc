@@ -1,0 +1,10 @@
+# Workspace cargo aliases.
+[alias]
+# Unit-test coverage over the shipped code. The e2e harness, sampleapp demo, mock
+# `server`, and Windows SCM wrapper are scaffolding, excluded so they don't dilute the
+# totals. This measures the library primitives (apply/state/recovery/reject/policy/
+# select/config/…); the supervisor and bootstrap orchestration is covered behaviorally
+# by the e2e suite (`cargo run -p e2e`), which llvm-cov does not fold into these numbers
+# (it runs the tower as release subprocesses it doesn't instrument). Extra args pass
+# through, e.g. `cargo cov --html`, `cargo cov --lcov --output-path lcov.info`.
+cov = "llvm-cov --workspace --exclude e2e --exclude sampleapp --exclude server --exclude windows-service"

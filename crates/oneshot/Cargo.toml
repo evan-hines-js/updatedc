@@ -1,0 +1,17 @@
+[package]
+name = "updated-oneshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "updated-oneshot"
+path = "src/main.rs"
+
+[dependencies]
+updated = { path = "../updated" }
+updated-tuf = { path = "../updated-tuf" }
+# The TUF client is async; the updater needs a runtime only to drive one refresh.
+tokio = { workspace = true }
+# Install the workspace's single aws-lc-rs crypto provider for the TUF HTTP client.
+rustls = { workspace = true }

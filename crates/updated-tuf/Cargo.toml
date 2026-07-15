@@ -1,0 +1,18 @@
+[package]
+name = "updated-tuf"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+updated = { path = "../updated" }
+tough = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+serde_json = { workspace = true }
+semver = { workspace = true }
+# Hex-encoding a verified target's content hash (updated_tuf::select::target_sha).
+hex = { workspace = true }
+aws-lc-rs = { workspace = true }
+jiff = { workspace = true }
+futures = { workspace = true }

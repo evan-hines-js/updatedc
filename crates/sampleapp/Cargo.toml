@@ -1,0 +1,19 @@
+[package]
+name = "sampleapp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sampleapp"
+path = "src/main.rs"
+
+[dependencies]
+updated = { path = "../updated" }
+# SO_REUSEADDR so a fresh instance can rebind the port immediately after the
+# supervisor stops the previous one.
+socket2 = "0.5"
+# Unix signal / fork / exec / fd plumbing for the zero-downtime reload modes
+# (reexec, handoff). The plain `restart` mode uses none of it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

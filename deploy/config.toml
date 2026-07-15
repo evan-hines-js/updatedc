@@ -1,0 +1,30 @@
+# /etc/selfupdate/config.toml — one operator config for the whole update tower.
+# The bootstrap receives its state directory, initial supervisor path, and this
+# supervisor config as command-line arguments. Install this file read-only beside
+# the pinned TUF root. The packager substitutes both application tokens.
+
+[repository]
+root         = "/etc/selfupdate/root.json" # installer-pinned trust anchor (read-only)
+metadata_url = "https://updates.example.com/metadata/"
+targets_url  = "https://updates.example.com/targets/"
+
+[application]
+product         = "app"
+channel         = "stable"
+current_version = "@APPLICATION_VERSION@"
+current_sha256  = "@APPLICATION_SHA256@"
+command         = ["/var/lib/selfupdate/app", "--addr", "127.0.0.1:9090"]
+health_url      = "http://127.0.0.1:9090/healthz"   # omit for liveness-only
+# Authenticated application target versions below the installed version are denied.
+
+# All optional; defaults shown. Durations accept "15s", "5m", "2h", or bare seconds.
+[timeouts]
+check_interval      = "60s"   # how often to check for an application update
+health_grace        = "10s"   # time to become healthy; raise for a slow-starting app
+                              #   (minutes is fine — a crash is still detected instantly)
+health_successes    = 1       # consecutive good health answers required to trust a version
+                              #   (a readiness successThreshold); raise to confirm sustained health
+health_interval     = "1s"    # spacing between those confirmation probes (ignored when successes = 1)
+retry_after         = "5m"    # how often a health-failed release is retried (not blocked forever)
+confirmation_window = "2m"   # a crash before this elapses reverts the committed update
+supervisor_check_interval = "1h" # how often to check for a supervisor release

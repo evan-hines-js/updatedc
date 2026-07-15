@@ -1,0 +1,21 @@
+[package]
+name = "e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# End-to-end test/demo harness. One cross-platform Rust binary replacing the old
+# bash + PowerShell scripts, so the two can never drift. Run: `cargo run -p e2e`.
+[[bin]]
+name = "e2e"
+path = "src/main.rs"
+
+[dependencies]
+updated = { path = "../updated" }
+ureq.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

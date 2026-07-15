@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for the self-updating supervisor (macOS). Template — adjust paths,
+  URLs, and intervals, then install as a system daemon:
+  Ownership terminology is defined canonically in deploy/README.md.
+
+      sudo cp com.example.selfupdate-supervisor.plist /Library/LaunchDaemons/
+      sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.selfupdate-supervisor.plist
+
+  launchd is the root PROCESS supervisor: it manages the lifecycle of the tiny,
+  installer-owned BOOTSTRAP. The bootstrap launches the committed supervisor pointer and
+  advances it only after a content-addressed candidate proves it can run; the supervisor manages and
+  updates the application. The update hierarchy terminates at launchd — an
+  OS-maintained root we do not ship:
+
+    launchd --manages--> bootstrap --activates--> supervisor --journal-updates--> app
+                            |
+                      pointer-swaps the supervisor (readiness-gated); never itself
+      package manager --replaces--> bootstrap/supervisor   (out-of-band alternative)
+
+  The bootstrap runs continuously: when the supervisor stages a self-update and
+  exits, the bootstrap activates the candidate under a readiness gate, committing
+  it or retaining the previous committed pointer. KeepAlive relaunches only the bootstrap,
+  on the rare event that it crashes. The guardian owns the application for its lifetime.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.selfupdate-supervisor</string>
+
+  <!-- Run as a dedicated unprivileged account, NEVER root. Without UserName a
+       system LaunchDaemon runs as root, so a misused or leaked release signing
+       key would become root code execution on the client. Create `_selfupdate`
+       and grant it write access to the state dir under /usr/local/var/selfupdate
+       (which holds content-addressed supervisor candidates, the application
+       binary, version state, and the TUF metadata cache); keep the installer-owned
+       bootstrap and the pinned TUF root in /etc/selfupdate root-owned and
+       read-only. -->
+  <key>UserName</key>
+  <string>_selfupdate</string>
+  <key>GroupName</key>
+  <string>_selfupdate</string>
+
+  <!-- The bootstrap is installer-owned and read-only. Its arguments name the state
+       directory, supervisor config, initial supervisor, and readiness timeout. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/etc/selfupdate/bootstrap</string>
+    <string>--state-dir</string>
+    <string>/usr/local/var/selfupdate</string>
+    <string>--supervisor-config</string>
+    <string>/etc/selfupdate/config.toml</string>
+    <string>--supervisor</string>
+    <string>/etc/selfupdate/supervisor</string>
+    <string>--ready-timeout</string>
+    <string>60</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>

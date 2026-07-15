@@ -1,0 +1,16 @@
+[package]
+name = "updated"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The shared operator-config loader for the supervisor and one-shot updater.
+serde = { workspace = true }
+# The committed installed-state record (updated::state) is JSON.
+serde_json = { workspace = true }
+toml = { workspace = true }
+semver = { workspace = true }
+# SHA-256 of a file for supervisor/one-shot drift and transaction verification.
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }

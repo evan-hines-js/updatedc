@@ -1,0 +1,12 @@
+/target
+/e2e/.demo
+*.old
+# Signing material must never be committed. Only the *public* key is embedded in
+# the app (at build time), and even that is passed via env, not stored here.
+keys/
+*.key
+
+# Coverage instrumentation artifacts.
+*.profraw
+*.profdata
+mutants.out*/

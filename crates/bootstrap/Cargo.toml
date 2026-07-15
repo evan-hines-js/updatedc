@@ -1,0 +1,34 @@
+[package]
+name = "bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The installer-owned root of the update tower and the permanent process guardian
+# that owns the managed application. It is deliberately frozen: a mechanism, not a
+# policy holder, so it should almost never need updating.
+#
+# Dependency rule (enforced by `dependency_isolation` in main.rs):
+#   * the ONLY project crate allowed is `control` — the frozen, std-only wire protocol
+#     the guardian must track anyway; never `updated`, which changes constantly;
+#   * no behavioral third-party crate — no serde, tokio, tracing, http, crypto,
+#     config, or update libraries;
+#   * platform BINDING crates are allowed (libc, windows-sys) — they are just
+#     ABI-correct types, constants, and function declarations, and hand-writing
+#     Windows structs/unions/flags would be more likely to make the guardian unsafe
+#     than to keep it stable.
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+control = { path = "../control" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Only the binding feature sets the guardian actually calls: process creation and
+# handles, Job Objects, anonymous pipes for the inherited control channel, and the
+# console-stop handler.
+windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }
