@@ -132,9 +132,14 @@ fn handle(mut stream: TcpStream) {
     let req = String::from_utf8_lossy(&buf[..n]);
     let path = req.split_whitespace().nth(1).unwrap_or("/");
 
+    // Optional diagnostics for deployment smoke tests (not an application contract):
+    // guardian ownership and adoption use the OS-derived child PID over `control` and
+    // never depend on this endpoint.
+    let pid = std::process::id().to_string();
     let (code, body) = match path {
         "/version" => (200, VERSION),
         "/healthz" => (200, "ok"),
+        "/pid" => (200, pid.as_str()),
         _ => (404, "not found"),
     };
     let reason = if code == 200 { "OK" } else { "Not Found" };
