@@ -7,4 +7,5 @@ license.workspace = true
 # Shared mechanisms only. Keep this crate usable by the permanent guardian: no
 # serialization, async runtime, crypto policy, configuration, or application crates.
 # It currently needs no dependencies; platform bindings are the only permitted future
-# exception.
+# exception. Routine tower changes must remain deployable against an older statically
+# linked guardian. A rare guardian/OS release may coordinate a new tower baseline.

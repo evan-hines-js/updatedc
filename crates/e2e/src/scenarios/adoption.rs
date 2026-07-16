@@ -22,8 +22,6 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
             .health(svc)
             .guardian()?,
     )?;
-    let pid_url = format!("http://{svc}/pid");
-
     if !wait_for_version(svc, "1.0.0", 60) {
         return fail("app never came up under the tower");
     }
@@ -32,9 +30,11 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
     if !boot.wait_for_log("started application pid", 15) {
         return fail("the supervisor never reported launching the application");
     }
-    let sup_pid = pid_after(&boot.captured_log(), "launched supervisor")
+    let initial_log = boot.captured_log();
+    let sup_pid = pid_after(&initial_log, "launched supervisor")
         .ok_or("could not find the supervisor PID in the guardian log")?;
-    let pid1 = http_text(&pid_url).ok_or("app did not answer /pid")?;
+    let pid1 = pid_number_after(&initial_log, "started application pid")
+        .ok_or("supervisor did not record the guardian-reported application PID")?;
 
     // Crash ONLY the supervisor (not the guardian, not the app). The guardian owns the
     // app, so it keeps running; the guardian relaunches a fresh supervisor.
@@ -58,7 +58,8 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
     if !wait_for_version(svc, "1.0.0", 30) {
         return fail("app not serving after the supervisor relaunch");
     }
-    let pid2 = http_text(&pid_url).ok_or("app did not answer /pid after re-adoption")?;
+    let pid2 = pid_after(&boot.captured_log(), "adopted the running application")
+        .ok_or("new supervisor did not record the guardian-owned application PID")?;
     if pid1 != pid2 {
         return fail(format!(
             "the supervisor crash restarted the app (pid {pid1} -> {pid2}) instead of leaving it"
@@ -103,9 +104,8 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
     if !boot.wait_for_log("started application pid", 15) {
         return fail("the supervisor never reported launching the application");
     }
-    let app_pid: u32 = http_text(&format!("http://{svc}/pid"))
-        .and_then(|s| s.trim().parse().ok())
-        .ok_or("app did not answer /pid")?;
+    let app_pid = pid_number_after(&boot.captured_log(), "started application pid")
+        .ok_or("supervisor did not record the guardian-reported application PID")?;
     let guardian_pid = boot.pid();
     let sup_pid = pid_after(&boot.captured_log(), "launched supervisor");
     if !pid_alive(app_pid) {

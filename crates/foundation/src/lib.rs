@@ -2,6 +2,16 @@
 //!
 //! This crate may use `std` and operating-system bindings only. It contains no
 //! application policy, wire protocol, configuration, serialization, or runtime.
+//!
+//! # Rollout rule
+//!
+//! Consumers statically link their own copy and commonly run different foundation
+//! versions. Compatibility is intentionally asymmetric: a routine tower upgrade must
+//! never require redeploying the guardian. A rare guardian/OS upgrade may establish a
+//! new baseline and require coordinated tower binaries, because that deployment can
+//! carry them together. Shared wire formats and cross-process compatibility contracts
+//! still belong in dedicated versioned crates such as `control`, where that transition
+//! can be negotiated explicitly.
 
 pub mod durable;
 pub mod log;

@@ -15,12 +15,15 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
         .health_grace("2s")
         .health(svc)
         .guardian()?;
-    let _first = Proc::spawn("supervisor-1", &mut first_cmd)?;
+    let first = Proc::spawn("supervisor-1", &mut first_cmd)?;
     if !wait_for_version(svc, "1.0.0", 25) {
         return fail("first supervisor never came up");
     }
-    let first_pid = http_text(&format!("http://{svc}/pid"))
-        .ok_or_else(|| "first application did not expose its pid".to_string())?;
+    if !first.wait_for_log("started application pid", 10) {
+        return fail("first supervisor did not record the application launch");
+    }
+    let first_pid = pid_number_after(&first.captured_log(), "started application pid")
+        .ok_or("could not read the guardian-reported application PID")?;
 
     let second_cmd = Sup::new(
         ctx,
@@ -38,8 +41,7 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     }
     let second_log = second.captured_log();
     let first_still_live = wait_for_version(svc, "1.0.0", 5);
-    let pid_unchanged =
-        http_text(&format!("http://{svc}/pid")).as_deref() == Some(first_pid.as_str());
+    let pid_unchanged = pid_alive(first_pid);
     if second_log.contains("started application pid") || !first_still_live || !pid_unchanged {
         return fail(format!(
             "lock rejection disturbed the owner (live={first_still_live}, \

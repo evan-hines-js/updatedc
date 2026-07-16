@@ -50,12 +50,15 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
 
     let boot = Proc::spawn("guardian", &mut tower(ctx, &dir, srv, svc, &app, &sup_v1)?)?;
-    let pid_url = format!("http://{svc}/pid");
     if !wait_for_version(svc, "1.0.0", 25) {
         kill_stray(&app);
         return fail("app never came up under the tower");
     }
-    let pid1 = http_text(&pid_url).ok_or("app did not answer /pid")?;
+    if !boot.wait_for_log("started application pid", 10) {
+        return fail("supervisor did not record the application launch");
+    }
+    let pid1 = pid_number_after(&boot.captured_log(), "started application pid")
+        .ok_or("could not read the guardian-reported application PID")?;
     ok("tower up on supervisor 1.0.0; app live");
 
     // Publish supervisor 2.0.0 (different bytes). The running supervisor stages it,
@@ -68,18 +71,8 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     let adopted =
         committed && wait_until(15, || boot.log_contains("adopted the running application"));
 
-    // The application must have kept the same PID throughout; sample across a window so
-    // a disruptive relaunch cannot slip between two checks.
-    let mut pid2 = http_text(&pid_url);
-    let mut undisturbed = adopted;
-    for _ in 0..10 {
-        pid2 = http_text(&pid_url);
-        if pid2.as_deref() != Some(pid1.as_str()) {
-            undisturbed = false;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let pid2 = pid_after(&boot.captured_log(), "adopted the running application");
+    let undisturbed = adopted && pid2 == Some(pid1) && pid_alive(pid1);
     let desired = desired_supervisor(&dir)?;
     kill_stray(&app);
 
@@ -125,12 +118,15 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
 
     let boot = Proc::spawn("guardian", &mut tower(ctx, &dir, srv, svc, &app, &sup_v1)?)?;
-    let pid_url = format!("http://{svc}/pid");
     if !wait_for_version(svc, "1.0.0", 25) {
         kill_stray(&app);
         return fail("app never came up under the tower");
     }
-    let pid1 = http_text(&pid_url).ok_or("app did not answer /pid")?;
+    if !boot.wait_for_log("started application pid", 10) {
+        return fail("supervisor did not record the application launch");
+    }
+    let pid1 = pid_number_after(&boot.captured_log(), "started application pid")
+        .ok_or("could not read the guardian-reported application PID")?;
     ok("tower up on supervisor 1.0.0; app live");
 
     // Publish a supervisor "2.0.0" whose bytes cannot execute. The running supervisor
@@ -146,14 +142,14 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     std::thread::sleep(Duration::from_secs(6));
     let recorded = boot.wait_for_log("recorded rejected supervisor candidate", 5);
     let served = wait_for_version(svc, "1.0.0", 5);
-    let pid2 = http_text(&pid_url);
+    let pid2 = pid_after(&boot.captured_log(), "adopted the running application");
     let desired = desired_supervisor(&dir)?;
     kill_stray(&app);
 
     if !rejected {
         return fail("guardian did not roll back the unlaunchable supervisor candidate");
     }
-    if !served || pid2.as_deref() != Some(pid1.as_str()) {
+    if !served || pid2 != Some(pid1) || !pid_alive(pid1) {
         return fail(format!(
             "the failed self-update disrupted the application (pid {pid1} -> {pid2:?})"
         ));

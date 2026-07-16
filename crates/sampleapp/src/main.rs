@@ -132,13 +132,9 @@ fn handle(mut stream: TcpStream) {
     let req = String::from_utf8_lossy(&buf[..n]);
     let path = req.split_whitespace().nth(1).unwrap_or("/");
 
-    // `/pid` lets the e2e prove a supervisor restart re-adopted the *same* process
-    // (and that a reexec reload kept its PID) rather than starting a new one.
-    let pid = std::process::id().to_string();
     let (code, body) = match path {
         "/version" => (200, VERSION),
         "/healthz" => (200, "ok"),
-        "/pid" => (200, pid.as_str()),
         _ => (404, "not found"),
     };
     let reason = if code == 200 { "OK" } else { "Not Found" };

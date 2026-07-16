@@ -662,6 +662,18 @@ pub fn pid_after(log: &str, needle: &str) -> Option<u32> {
     rest[open..open + close].trim().parse().ok()
 }
 
+/// Extract the decimal PID immediately following `needle`, as printed by the
+/// supervisor after the guardian returns the OS-derived child PID.
+pub fn pid_number_after(log: &str, needle: &str) -> Option<u32> {
+    let at = log.find(needle)? + needle.len();
+    let digits: String = log[at..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
 /// Kill one process by PID (not its group/tree) — to simulate a supervisor crash while
 /// the guardian and the application keep running.
 pub fn kill_pid(pid: u32) {
