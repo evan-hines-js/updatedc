@@ -4,6 +4,7 @@
 //! documented production extension).
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
@@ -109,26 +110,57 @@ pub async fn generate_keys(keys_dir: &Path) -> Result<Keys> {
     let keys = Keys::in_dir(keys_dir);
     let rng = SystemRandom::new();
     for (_role, path) in keys.all() {
-        if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        if path.exists() {
+            validate_key_file(path)?;
             continue;
         }
         let pkcs8 =
             Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| err("generating ed25519 key", e))?;
-        tokio::fs::write(path, pkcs8.as_ref())
-            .await
-            .map_err(|e| err("writing key", e))?;
-        restrict(path).await;
+        create_key_file(path, pkcs8.as_ref())?;
     }
     Ok(keys)
 }
 
-#[cfg(unix)]
-async fn restrict(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await;
+fn create_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| err("exclusively creating signing key", e))?;
+    if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(err("durably writing signing key", e));
+    }
+    validate_key_file(path)
 }
-#[cfg(not(unix))]
-async fn restrict(_path: &Path) {}
+
+fn validate_key_file(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| err("inspecting signing key", e))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RepoError(format!(
+            "signing key {} must be a regular, non-symlink file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(RepoError(format!(
+                "signing key {} must have mode 0600, found {mode:04o}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Initialize an empty TUF repository under `repo_dir`: mint and sign `root.json`,
 /// then sign empty targets/snapshot/timestamp. Creates `metadata/` and `targets/`.
@@ -142,7 +174,7 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
         .await
         .map_err(|e| err("creating targets dir", e))?;
 
-    let expires = expiry(expiry_days);
+    let expires = expiry(expiry_days)?;
 
     // Build root.json: one ed25519 key per role, threshold 1.
     let mut root_keys: HashMap<Decoded<Hex>, Key> = HashMap::new();
@@ -227,6 +259,11 @@ pub async fn add_release(
     let targets_dir = repo_dir.join("targets");
     let root_path = metadata_dir.join("root.json");
 
+    // Validate every filesystem-bound name before hashing, signing, or copying anything.
+    for pt in &targets {
+        validate_target_name(&pt.name)?;
+    }
+
     // Load the current repository to learn its metadata versions (bump = +1).
     let root = tokio::fs::read(&root_path)
         .await
@@ -241,7 +278,7 @@ pub async fn add_release(
     let next_snapshot = nz(repo.snapshot().signed.version.get() + 1);
     let next_timestamp = nz(repo.timestamp().signed.version.get() + 1);
 
-    let expires = expiry(expiry_days);
+    let expires = expiry(expiry_days)?;
     let mut editor = RepositoryEditor::from_repo(&root_path, repo)
         .await
         .map_err(|e| err("opening editor from repo", e))?;
@@ -310,10 +347,31 @@ fn nz(n: u64) -> NonZeroU64 {
     NonZeroU64::new(n).expect("version/threshold is non-zero")
 }
 
-fn expiry(days: i64) -> jiff::Timestamp {
+fn validate_target_name(name: &str) -> Result<()> {
+    let parts: Vec<_> = name.split('/').collect();
+    let safe = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains(['\\', ':'])
+            && !part.chars().any(char::is_control)
+    };
+    if parts.len() != 6 || parts[0] != "products" || !parts.iter().all(|p| safe(p)) {
+        return Err(RepoError(format!("unsafe target path {name:?}")));
+    }
+    Ok(())
+}
+
+fn expiry(days: i64) -> Result<jiff::Timestamp> {
+    if days <= 0 {
+        return Err(RepoError("expiry days must be greater than zero".into()));
+    }
+    let hours = days
+        .checked_mul(24)
+        .ok_or_else(|| RepoError("expiry days overflow".into()))?;
     jiff::Timestamp::now()
-        .checked_add(jiff::SignedDuration::from_hours(days * 24))
-        .unwrap_or(jiff::Timestamp::MAX)
+        .checked_add(jiff::SignedDuration::from_hours(hours))
+        .map_err(|e| err("expiry is outside the supported timestamp range", e))
 }
 
 fn dir_url(dir: &Path) -> Result<Url> {
@@ -343,7 +401,7 @@ mod tests {
     fn expiry_is_days_out_in_whole_days() {
         // `days` is converted to hours as days*24 — not days+24 (~16 days) or days/24.
         let now = jiff::Timestamp::now();
-        let e = expiry(365);
+        let e = expiry(365).unwrap();
         let low = now
             .checked_add(jiff::SignedDuration::from_hours(364 * 24))
             .unwrap();
@@ -351,5 +409,39 @@ mod tests {
             .checked_add(jiff::SignedDuration::from_hours(366 * 24))
             .unwrap();
         assert!(e > low && e < high, "expiry ~365 days out, got {e}");
+    }
+
+    #[test]
+    fn expiry_rejects_non_positive_and_overflowing_values() {
+        assert!(expiry(0).is_err());
+        assert!(expiry(-1).is_err());
+        assert!(expiry(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn target_names_are_confined_to_the_product_layout() {
+        assert!(validate_target_name("products/app/stable/1.0.0/linux-x86_64/app").is_ok());
+        assert!(validate_target_name("products/../../outside/stable/1.0/app").is_err());
+        assert!(validate_target_name("products/app/stable/1.0/linux/app/extra").is_err());
+        assert!(validate_target_name("products/app/stable/1.0/linux/app\\evil").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_keys_must_be_owner_only_regular_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("updated-key-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("root.pk8");
+        std::fs::write(&key, b"key").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_key_file(&key).is_err());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_key_file(&key).is_ok());
+        let link = dir.join("link.pk8");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        assert!(validate_key_file(&link).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

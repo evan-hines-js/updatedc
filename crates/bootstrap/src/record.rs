@@ -49,23 +49,27 @@ fn write_pointer(path: &Path, target: &Path) -> std::io::Result<()> {
 /// The supervisor reads and clears this on recovery to revert an unconfirmed update.
 /// A clean stop leaves it untouched, so it distinguishes a crash-restart from an
 /// ordinary service restart.
-pub fn mark_app_crashed(state_dir: &Path) {
+pub fn mark_app_crashed(state_dir: &Path) -> std::io::Result<()> {
     // Durable (atomic write + fsync), like the desired pointer: a crash marker lost to
     // power loss would let a crash-looping update come back up unreverted on reboot.
-    let _ = durable::atomic_write(&state_dir.join(control::CRASH_MARKER_FILE), b"");
+    durable::atomic_write(&state_dir.join(control::CRASH_MARKER_FILE), b"")
 }
 
 /// Note the path of a candidate supervisor that failed its readiness gate, for the
 /// supervisor to read and reject on recovery. The guardian records the fact and forgets
 /// it — what to do about it (skip that release forever) is the supervisor's policy.
-pub fn mark_rejected_supervisor(state_dir: &Path, candidate: &Path) {
+pub fn mark_rejected_supervisor(state_dir: &Path, candidate: &Path) -> std::io::Result<()> {
     if let Some(s) = candidate.to_str() {
         // Durable + atomic so a crash mid-write can't leave a truncated path and a power
         // loss can't drop the rejection (which would let the bad candidate be re-staged).
-        let _ = durable::atomic_write(
+        durable::atomic_write(
             &state_dir.join(control::REJECTED_SUPERVISOR_FILE),
             s.as_bytes(),
-        );
+        )
+    } else {
+        Err(std::io::Error::other(
+            "rejected supervisor path is not valid UTF-8",
+        ))
     }
 }
 
@@ -92,13 +96,22 @@ mod tests {
     #[test]
     fn markers_are_written_for_the_supervisor_to_interpret() {
         let d = dir("markers");
-        mark_app_crashed(&d);
+        mark_app_crashed(&d).unwrap();
         assert!(d.join(control::CRASH_MARKER_FILE).exists());
         let bad = d.join("supervisors/badc0de/supervisor");
-        mark_rejected_supervisor(&d, &bad);
+        mark_rejected_supervisor(&d, &bad).unwrap();
         assert_eq!(
             std::fs::read_to_string(d.join(control::REJECTED_SUPERVISOR_FILE)).unwrap(),
             bad.to_str().unwrap()
         );
+    }
+
+    #[test]
+    fn marker_write_failures_are_reported() {
+        let d = dir("marker-errors");
+        std::fs::create_dir(d.join(control::CRASH_MARKER_FILE)).unwrap();
+        assert!(mark_app_crashed(&d).is_err());
+        std::fs::create_dir(d.join(control::REJECTED_SUPERVISOR_FILE)).unwrap();
+        assert!(mark_rejected_supervisor(&d, Path::new("candidate")).is_err());
     }
 }

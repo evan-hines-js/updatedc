@@ -114,7 +114,8 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
             }
             Cycle::Activate(path) => next = Some(path),
             Cycle::AppCrashed(code) => {
-                record::mark_app_crashed(&cfg.state_dir);
+                record::mark_app_crashed(&cfg.state_dir)
+                    .map_err(|e| format!("recording application crash before restart: {e}"))?;
                 warn(&format!(
                     "application exited (code {code}); rolling it up and letting the init system restart"
                 ));
@@ -142,6 +143,7 @@ fn run_supervisor(
             "no committed supervisor recorded and none supplied (--supervisor)".to_string()
         })?,
     };
+    validate_supervisor_path(cfg, &binary, candidate.is_some())?;
 
     // An application crash that landed while the guardian was between supervisors (the
     // backoff sleep, or a handoff) is only visible here — `poll_crash` runs solely inside
@@ -171,7 +173,9 @@ fn run_supervisor(
                     "candidate supervisor {} could not be launched ({e}); rejecting",
                     path.display()
                 ));
-                record::mark_rejected_supervisor(&cfg.state_dir, path);
+                record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|marker| {
+                    format!("candidate {} failed to launch ({e}) and recording its rejection failed: {marker}", path.display())
+                })?;
                 return Ok(Cycle::Continue);
             }
             error(&format!(
@@ -222,7 +226,12 @@ fn serve<L: Link>(
                 path.display()
             ));
             sup.stop();
-            record::mark_rejected_supervisor(&cfg.state_dir, path);
+            record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
+                format!(
+                    "recording timed-out supervisor {} rejection: {e}",
+                    path.display()
+                )
+            })?;
             return Ok(Cycle::Continue);
         }
 
@@ -271,7 +280,12 @@ fn serve<L: Link>(
                     "candidate {} exited before signalling ready; rejecting it",
                     path.display()
                 ));
-                record::mark_rejected_supervisor(&cfg.state_dir, path);
+                record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
+                    format!(
+                        "recording exited supervisor {} rejection: {e}",
+                        path.display()
+                    )
+                })?;
                 return Ok(Cycle::Continue);
             }
             if let Some(path) = pending_replace.take() {
@@ -315,8 +329,14 @@ fn dispatch<L: Link>(
             // The guardian keeps no rejection set: the supervisor is responsible for not
             // re-staging a candidate it already knows failed (it read the marker). The
             // guardian just accepts the handoff and activates it when this supervisor exits.
-            *pending_replace = Some(PathBuf::from(path));
-            Response::Ok
+            let path = PathBuf::from(path);
+            match validate_supervisor_path(cfg, &path, true) {
+                Ok(()) => {
+                    *pending_replace = Some(path);
+                    Response::Ok
+                }
+                Err(e) => Response::Error(e),
+            }
         }
         Request::Ready(nonce) => {
             if !*committed && nonce == sup.nonce() {
@@ -343,20 +363,63 @@ fn dispatch<L: Link>(
 /// On first boot, record the supplied initial supervisor as the committed one.
 fn seed_desired_supervisor(cfg: &Config) -> Result<(), String> {
     if record::desired_supervisor(&cfg.state_dir).is_some() {
-        return Ok(());
+        let committed = record::desired_supervisor(&cfg.state_dir).expect("checked above");
+        return validate_supervisor_path(cfg, &committed, false);
     }
     let initial = cfg
         .initial_supervisor
         .as_ref()
         .ok_or("no committed supervisor and no --supervisor to seed one")?;
-    if !initial.exists() {
-        return Err(format!(
-            "initial supervisor {} does not exist",
-            initial.display()
-        ));
-    }
+    validate_supervisor_path(cfg, initial, false)?;
     record::set_desired_supervisor(&cfg.state_dir, initial)
         .map_err(|e| format!("recording the initial supervisor: {e}"))
+}
+
+fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("inspecting supervisor {}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "supervisor {} must be a regular, non-symlink file",
+            path.display()
+        ));
+    }
+    if !candidate {
+        if let Some(initial) = &cfg.initial_supervisor {
+            if std::fs::canonicalize(path).ok() == std::fs::canonicalize(initial).ok() {
+                return Ok(());
+            }
+        }
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("canonicalizing supervisor {}: {e}", path.display()))?;
+    let root = std::fs::canonicalize(cfg.state_dir.join("supervisors"))
+        .map_err(|e| format!("canonicalizing supervisor staging directory: {e}"))?;
+    let relative = canonical.strip_prefix(&root).map_err(|_| {
+        format!(
+            "supervisor {} is outside the managed staging directory",
+            path.display()
+        )
+    })?;
+    let parts: Vec<_> = relative.components().collect();
+    let expected_name = if cfg!(windows) {
+        "supervisor.exe"
+    } else {
+        "supervisor"
+    };
+    if parts.len() != 2
+        || parts[0]
+            .as_os_str()
+            .to_str()
+            .is_none_or(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
+        || parts[1].as_os_str() != expected_name
+    {
+        return Err(format!(
+            "supervisor {} must be supervisors/<64-hex-sha256>/{expected_name}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Sleep up to `dur`, returning `true` early if a stop signal arrives.
@@ -534,6 +597,19 @@ mod tests {
         std::fs::read_to_string(c.state_dir.join(control::REJECTED_SUPERVISOR_FILE)).ok()
     }
 
+    fn staged_candidate(c: &Config, byte: u8) -> PathBuf {
+        let digest = format!("{byte:02x}").repeat(32);
+        let dir = c.state_dir.join("supervisors").join(digest);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(if cfg!(windows) {
+            "supervisor.exe"
+        } else {
+            "supervisor"
+        });
+        std::fs::write(&path, b"candidate").unwrap();
+        path
+    }
+
     #[test]
     fn dispatch_launch_starts_the_app_and_replies_launched() {
         let c = cfg(temp_dir("launch"), None);
@@ -578,21 +654,41 @@ mod tests {
         let mut sup = FakeLink::new();
         let mut app = App::none();
         let (mut committed, mut pending) = (true, None);
+        let candidate = staged_candidate(&c, 0x11);
         dispatch(
             &c,
             &mut sup,
             &mut app,
-            Request::ReplaceSupervisor(OsString::from("/state/supervisors/new/supervisor")),
+            Request::ReplaceSupervisor(candidate.as_os_str().to_owned()),
             None,
             &mut committed,
             &mut pending,
         )
         .unwrap();
-        assert_eq!(
-            pending,
-            Some(PathBuf::from("/state/supervisors/new/supervisor"))
-        );
+        assert_eq!(pending, Some(candidate));
         assert_eq!(sup.responses, vec![Response::Ok]);
+    }
+
+    #[test]
+    fn dispatch_replace_rejects_paths_outside_content_addressed_staging() {
+        let c = cfg(temp_dir("replace-invalid"), None);
+        let outside = c.state_dir.join("arbitrary-supervisor");
+        std::fs::write(&outside, b"candidate").unwrap();
+        let mut sup = FakeLink::new();
+        let mut app = App::none();
+        let (mut committed, mut pending) = (true, None);
+        dispatch(
+            &c,
+            &mut sup,
+            &mut app,
+            Request::ReplaceSupervisor(outside.into_os_string()),
+            None,
+            &mut committed,
+            &mut pending,
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert!(matches!(sup.responses.as_slice(), [Response::Error(_)]));
     }
 
     #[test]
@@ -754,11 +850,11 @@ mod tests {
 
     #[test]
     fn seed_preserves_an_existing_desired_pointer() {
-        let c = cfg(
-            temp_dir("seed-existing"),
-            Some(PathBuf::from("/state/supervisors/new/supervisor")),
-        );
-        let existing = PathBuf::from("/state/supervisors/old/supervisor");
+        let state = temp_dir("seed-existing");
+        let initial = state.join("initial-supervisor");
+        std::fs::write(&initial, b"initial").unwrap();
+        let c = cfg(state, Some(initial));
+        let existing = staged_candidate(&c, 0x22);
         record::set_desired_supervisor(&c.state_dir, &existing).unwrap();
         seed_desired_supervisor(&c).unwrap();
         assert_eq!(

@@ -10,7 +10,14 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn create_temp(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
     create_temp_with(dir, prefix, |path| {
-        OpenOptions::new().write(true).create_new(true).open(path)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)
     })
 }
 
@@ -132,5 +139,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(attempts, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_files_are_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("private");
+        let (_file, path) = create_temp(&d, ".secret-").unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

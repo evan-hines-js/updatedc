@@ -44,7 +44,7 @@ async fn main() {
 async fn init(args: &[String]) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
-    let expiry_days = flag_i64(args, "--expiry-days", 365);
+    let expiry_days = flag_i64(args, "--expiry-days", 365)?;
 
     let keys = repo::generate_keys(&keys_dir).await?;
     repo::init(&repo_dir, &keys, expiry_days).await?;
@@ -70,7 +70,7 @@ async fn publish(args: &[String]) -> R {
     let version = flag(args, "--version").ok_or("--version <semver> is required")?;
     semver::Version::parse(&version).map_err(|e| format!("invalid --version: {e}"))?;
     let component = flag(args, "--component").unwrap_or_else(|| product.clone());
-    let expiry_days = flag_i64(args, "--expiry-days", 365);
+    let expiry_days = flag_i64(args, "--expiry-days", 365)?;
 
     // `--target <os>-<arch>=<path>`, repeatable.
     let raw = flags_all(args, "--target");
@@ -253,10 +253,13 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     None
 }
 
-fn flag_i64(args: &[String], name: &str, default: i64) -> i64 {
-    flag(args, name)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+fn flag_i64(args: &[String], name: &str, default: i64) -> Result<i64, String> {
+    match flag(args, name) {
+        Some(value) => value
+            .parse()
+            .map_err(|e| format!("invalid {name} value {value:?}: {e}")),
+        None => Ok(default),
+    }
 }
 
 fn flags_all(args: &[String], name: &str) -> Vec<String> {
@@ -307,6 +310,13 @@ mod tests {
                 "macos-aarch64=./b".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn invalid_integer_flag_is_rejected_instead_of_defaulted() {
+        let args = vec!["--expiry-days".into(), "forever".into()];
+        assert!(flag_i64(&args, "--expiry-days", 365).is_err());
+        assert_eq!(flag_i64(&[], "--expiry-days", 365).unwrap(), 365);
     }
 
     #[test]
