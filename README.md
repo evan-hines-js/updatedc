@@ -604,7 +604,7 @@ when asked to publish a version below the running version. Downgrades are not su
 
 After starting the smoke tower, `scripts/macos-publish-fuzz.sh` concurrently publishes
 bursts of three or four fresh random versions. It continues as soon as the application
-selects the greatest published version, completing as many bursts as possible in ten
+selects the greatest published version, completing as many bursts as possible in one
 minutes and allowing the last started burst to finish. Every burst has a 30-second
 convergence timeout, and every burst is generated above the preceding maximum so each
 successful check represents a real upgrade. Each burst also publishes a corrupt executable
