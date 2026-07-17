@@ -99,9 +99,13 @@ jobs:
           if-no-files-found: error
 
   macos-publish-fuzz:
-    name: macOS concurrent publish fuzz
+    name: macOS concurrent publish fuzz (${{ matrix.mode }})
     runs-on: macos-14
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [restart, reexec]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -113,14 +117,14 @@ jobs:
           UPDATED_SMOKE_CONFIRMATION_WINDOW: 2s
           UPDATED_SMOKE_STOP_GRACE_SECONDS: 1
           UPDATED_SMOKE_LAUNCHD_THROTTLE_SECONDS: 1
-        run: ./scripts/macos-smoke.sh start
+        run: ./scripts/macos-smoke.sh start "${{ matrix.mode }}"
       - name: Fuzz concurrent version publication and convergence
         run: ./scripts/macos-publish-fuzz.sh
       - name: Preserve failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-publish-fuzz-logs
+          name: macos-publish-fuzz-${{ matrix.mode }}-logs
           path: |
             target/macos-smoke/*.log
             target/macos-smoke/publish-fuzz-results/

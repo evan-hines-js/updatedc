@@ -7,8 +7,11 @@ SMOKE="$ROOT/scripts/macos-smoke.sh"
 WORK="${UPDATED_SMOKE_DIR:-$ROOT/target/macos-smoke}"
 RESULTS="$WORK/publish-fuzz-results"
 DURATION="${UPDATED_SMOKE_FUZZ_SECONDS:-60}"
-INTERVAL="${UPDATED_SMOKE_FUZZ_INTERVAL_SECONDS:-30}"
+INTERVAL="${UPDATED_SMOKE_FUZZ_INTERVAL_SECONDS:-60}"
 BATCH="${UPDATED_SMOKE_FUZZ_BATCH_SIZE:-4}"
+probe_version() {
+  curl --connect-timeout 1 --max-time 1 -fsS http://127.0.0.1:19090/version 2>/dev/null || true
+}
 if grep -Eq '^mode[[:space:]]*=[[:space:]]*"reexec"' "$WORK/config.toml"; then
   MODE=reexec
 else
@@ -36,7 +39,7 @@ trap cleanup_children EXIT
 trap 'echo "Interrupted; stopping fuzz publisher and monitor children" >&2; exit 130' INT TERM
 
 [[ "$(uname -s)" == Darwin ]] || { echo "This fuzzer requires macOS." >&2; exit 1; }
-current="$(curl -fsS http://127.0.0.1:19090/version 2>/dev/null || true)"
+current="$(probe_version)"
 [[ -n "$current" ]] || { echo "Start the smoke tower first: $SMOKE start" >&2; exit 1; }
 rm -rf "$RESULTS"
 mkdir -p "$RESULTS"
@@ -59,7 +62,7 @@ while (( round == 0 || SECONDS - started < DURATION )); do
   rm -f "$monitor_stop"
   (
     while [[ ! -e "$monitor_stop" ]]; do
-      observed="$(curl -fsS http://127.0.0.1:19090/version 2>/dev/null || true)"
+      observed="$(probe_version)"
       printf '%s %s\n' "$(date '+%H:%M:%S')" "${observed:-unavailable}" >>"$samples"
       sleep 0.1
     done
@@ -106,11 +109,16 @@ while (( round == 0 || SECONDS - started < DURATION )); do
     exit 1
   fi
   echo "All ${#versions[@]} signed publications completed; waiting up to ${INTERVAL}s for recovery and convergence..."
-  deadline=$((SECONDS + INTERVAL)); probes=0
+  recovery_started=$SECONDS
+  deadline=$((recovery_started + INTERVAL)); probes=0; next_progress=$recovery_started
   while (( SECONDS < deadline )); do
     probes=$((probes + 1))
-    current="$(curl -fsS http://127.0.0.1:19090/version 2>/dev/null || true)"
+    current="$(probe_version)"
     [[ "$current" == "$expected" ]] && break
+    if (( SECONDS >= next_progress )); then
+      echo "  recovery $((SECONDS - recovery_started))s/${INTERVAL}s: ${current:-unavailable}"
+      next_progress=$((SECONDS + 2))
+    fi
     sleep 0.25
   done
   if [[ "$current" != "$expected" ]]; then

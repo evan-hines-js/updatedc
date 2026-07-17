@@ -320,6 +320,10 @@ pub fn make_writable(path: &Path) -> R {
         permissions.set_mode(permissions.mode() | 0o200);
     }
     #[cfg(windows)]
+    // This API is dangerous on Unix because it can grant write access broadly;
+    // this branch only exists on Windows, where clearing FILE_ATTRIBUTE_READONLY
+    // is exactly the operation the tampering fixture requires.
+    #[allow(clippy::permissions_set_readonly_false)]
     permissions.set_readonly(false);
     std::fs::set_permissions(path, permissions).map_err(str_err)
 }
