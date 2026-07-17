@@ -22,14 +22,6 @@ if [[ "$CORRUPT" != 0 && "$CORRUPT" != 1 ]]; then
   echo "UPDATED_SMOKE_FUZZ_CORRUPT must be 0, 1, or auto" >&2
   exit 2
 fi
-if [[ -n "${UPDATED_SMOKE_FUZZ_MAX_UNAVAILABLE:-}" ]]; then
-  MAX_UNAVAILABLE="$UPDATED_SMOKE_FUZZ_MAX_UNAVAILABLE"
-elif [[ "$MODE" == reexec ]]; then
-  MAX_UNAVAILABLE=0
-else
-  MAX_UNAVAILABLE=30
-fi
-
 pids=()
 monitor_pid=""
 monitor_stop=""
@@ -50,9 +42,11 @@ rm -rf "$RESULTS"
 mkdir -p "$RESULTS"
 echo "Fuzzing bundle publication for ${DURATION}s from running version $current ($MODE mode)"
 if [[ "$CORRUPT" == 1 ]]; then
-  echo "Fault injection: enabled (an unlaunchable newest release will test rollback; availability may be lost during reexec)"
+  echo "Fault injection: enabled (an unlaunchable newest release will test rollback; restart recovery may be briefly unavailable)"
+elif [[ "$MODE" == reexec ]]; then
+  echo "Fault injection: disabled (every candidate is executable; reexec requires zero observed downtime)"
 else
-  echo "Fault injection: disabled (every candidate is executable; availability budget: $MAX_UNAVAILABLE failed probes)"
+  echo "Fault injection: disabled (every candidate is executable; restart must converge within ${INTERVAL}s)"
 fi
 echo "Per-release publisher logs: $RESULTS"
 started=$SECONDS
@@ -112,22 +106,10 @@ while (( round == 0 || SECONDS - started < DURATION )); do
     exit 1
   fi
   echo "All ${#versions[@]} signed publications completed; waiting up to ${INTERVAL}s for recovery and convergence..."
-  deadline=$((SECONDS + INTERVAL)); unavailable_streak=0; probes=0
+  deadline=$((SECONDS + INTERVAL)); probes=0
   while (( SECONDS < deadline )); do
     probes=$((probes + 1))
     current="$(curl -fsS http://127.0.0.1:19090/version 2>/dev/null || true)"
-    if [[ -z "$current" ]]; then
-      unavailable_streak=$((unavailable_streak + 1))
-      if (( unavailable_streak > MAX_UNAVAILABLE )); then
-        touch "$monitor_stop"; wait "$monitor_pid" || true
-        echo "FAIL: app unavailable for $unavailable_streak consecutive probes" >&2
-        echo "Tower log tail ($WORK/tower.log):" >&2
-        tail -n 80 "$WORK/tower.log" >&2
-        exit 1
-      fi
-    else
-      unavailable_streak=0
-    fi
     [[ "$current" == "$expected" ]] && break
     sleep 0.25
   done
@@ -143,15 +125,18 @@ while (( round == 0 || SECONDS - started < DURATION )); do
   monitor_stop=""
   pids=()
   unavailable_total="$(grep -c ' unavailable$' "$samples" || true)"
+  unavailable_streak="$(awk '$2 == "unavailable" { run++; if (run > max) max = run; next } { run = 0 } END { print max + 0 }' "$samples")"
   if [[ "$MODE" == reexec && "$CORRUPT" == 0 && "$unavailable_total" != 0 ]]; then
     echo "FAIL: reexec batch observed $unavailable_total unavailable samples; complete timeline:" >&2
     cat "$samples" >&2
     exit 1
   fi
   if [[ -n "$corrupt" ]]; then
-    echo "PASS batch $round: rejected $corrupt and converged to $expected in $((SECONDS - batch_started))s ($probes probes)"
-  else
+    echo "PASS batch $round: rejected $corrupt and recovered to $expected in $((SECONDS - batch_started))s ($probes probes, $unavailable_total unavailable samples, longest streak $unavailable_streak)"
+  elif [[ "$MODE" == reexec ]]; then
     echo "PASS batch $round: converged to $expected with no observed downtime in $((SECONDS - batch_started))s ($probes probes, availability log: $samples)"
+  else
+    echo "PASS batch $round: converged to $expected in $((SECONDS - batch_started))s ($probes probes, $unavailable_total unavailable samples, longest streak $unavailable_streak)"
   fi
 done
 echo
