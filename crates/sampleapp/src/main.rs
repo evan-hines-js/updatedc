@@ -1,13 +1,12 @@
 //! Update-unaware HTTP fixture. `restart` works on every OS; Unix `reexec` drains
 //! requests and replaces the process image while preserving its PID and socket.
 
-#[cfg(unix)]
 use std::io::{Read, Write};
-#[cfg(unix)]
 use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener};
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -48,7 +47,6 @@ const LISTEN_FD_ENV: &str = "SAMPLEAPP_LISTEN_FD";
 static RELOAD: AtomicBool = AtomicBool::new(false);
 /// In-flight request count, so a reload drains outstanding responses before the
 /// exec replaces this image.
-#[cfg(unix)]
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn run(reexec_capable: bool) {
@@ -114,7 +112,6 @@ pub fn run(reexec_capable: bool) {
         eprintln!("sampleapp: set_nonblocking: {e}");
         std::process::exit(1);
     }
-    #[cfg(unix)]
     loop {
         #[cfg(unix)]
         if RELOAD.swap(false, Ordering::SeqCst) {
@@ -163,7 +160,6 @@ fn acquire_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     Ok(socket.into())
 }
 
-#[cfg(unix)]
 fn handle(mut stream: TcpStream) {
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).unwrap_or(0);
