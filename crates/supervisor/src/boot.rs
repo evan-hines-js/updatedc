@@ -63,18 +63,27 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
     //    enforce the committed hash (drift). On first install the boot plan has already
     //    matched the on-disk bytes to the installer-provisioned baseline digest and will
     //    commit that same digest before launch.
-    if let Some(tx) = &s.journal {
-        reconcile_transaction(&mut plan, s, tx);
-    } else if let Some(sha) = &committed_sha {
-        enforce_committed(&mut plan, s, sha);
-        if plan.fail_closed.is_some() {
-            return plan;
+    // A journal that reconciled as *committed* left the binary alone: its update is durable
+    // and its pending record is authoritative, so the unconfirmed-update rules below still
+    // govern it. Any other journal outcome spoke for the binary itself.
+    let pending_is_authoritative = match (&s.journal, &committed_sha) {
+        (Some(tx), _) => reconcile_transaction(&mut plan, s, tx) == Recovery::Committed,
+        (None, Some(sha)) => {
+            enforce_committed(&mut plan, s, sha);
+            if plan.fail_closed.is_some() {
+                return plan;
+            }
+            true
         }
-    }
+        (None, None) => true,
+    };
 
-    // 3. Resolve an unconfirmed committed update — but only when nothing is in flight
-    //    (a journal means the transaction above already spoke for the binary).
-    if s.journal.is_none() {
+    // 3. Resolve an unconfirmed committed update. This must run whenever the pending record
+    //    is live, journal or not: `gather_situation` consumes the crash marker to build this
+    //    Situation, so skipping the check *destroys* the evidence rather than deferring it —
+    //    the crash would be silently forgiven and the bad release confirmed on the next pass,
+    //    with its rollback image dropped and nothing left to revert to.
+    if pending_is_authoritative {
         if let (Some(p), Some(sha)) = (&pending, &committed_sha) {
             confirm_or_revert(&mut plan, s, p, sha);
         }
@@ -94,10 +103,12 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
 
 /// Reconcile an interrupted update transaction against the on-disk binary. Whatever the
 /// outcome, the journal is spent and must be removed once the reconciliation is performed.
-fn reconcile_transaction(plan: &mut Plan, s: &Situation, tx: &Transaction) {
+/// Returns how it classified, so the caller knows whether the binary was left as committed.
+fn reconcile_transaction(plan: &mut Plan, s: &Situation, tx: &Transaction) -> Recovery {
     plan.clear_journal = true;
     let disk = s.disk_sha.as_deref().unwrap_or_default();
-    match transaction::classify_recovery(tx, disk, plan.current.as_deref()) {
+    let recovery = transaction::classify_recovery(tx, disk, plan.current.as_deref());
+    match &recovery {
         Recovery::Committed => {
             // The commit wrote its pending record atomically; only the journal removal was
             // left. There is nothing to reconcile — the loop confirms the update later.
@@ -131,6 +142,7 @@ fn reconcile_transaction(plan: &mut Plan, s: &Situation, tx: &Transaction) {
             }
         }
     }
+    recovery
 }
 
 /// Enforce that the on-disk binary matches the committed hash before running it.
@@ -428,6 +440,67 @@ mod tests {
         assert_eq!(
             plan.commit,
             Some(InstalledState::confirmed("1.0.0".into(), "oldsha".into()))
+        );
+    }
+
+    #[test]
+    fn a_surviving_journal_does_not_forgive_a_crash_inside_the_window() {
+        // `update.rs` deliberately tolerates a failed journal delete after a commit ("the
+        // next boot's recovery will remove it"), and a kill in the commit→clear window
+        // leaves the same state: a spent journal beside a live pending record. The crash
+        // marker is consumed to build this Situation, so if the one-strike rule is skipped
+        // here the evidence is destroyed, not deferred — the crash-looping release would be
+        // confirmed on the next pass and its rollback image dropped.
+        let mut s = pending("2.0.0", "newsha", "1.0.0", "oldsha", 1_000_000);
+        s.journal = Some(tx("1.0.0", "2.0.0"));
+        s.disk_sha = Some("newsha".into()); // the swap landed: classify_recovery => Committed
+        s.app_crashed = true;
+
+        let plan = plan_boot(&s);
+        assert!(plan.clear_journal, "the spent journal is still removed");
+        assert_eq!(
+            plan.binary,
+            BinaryFix::RestoreCommitted {
+                sha: "oldsha".into()
+            },
+            "the crash must revert the binary exactly as it does without a journal"
+        );
+        assert_eq!(plan.reject_app, vec!["newsha".to_string()]);
+        assert_eq!(plan.current.as_deref(), Some("1.0.0"));
+        assert!(
+            !plan.drop_rollback,
+            "a reverting boot must keep the image it just restored from"
+        );
+    }
+
+    #[test]
+    fn a_surviving_journal_still_confirms_a_healthy_update_past_its_window() {
+        let mut s = pending("2.0.0", "newsha", "1.0.0", "oldsha", 1);
+        s.journal = Some(tx("1.0.0", "2.0.0"));
+        s.disk_sha = Some("newsha".into());
+        let plan = plan_boot(&s);
+        assert!(plan.clear_journal);
+        assert_eq!(
+            plan.commit,
+            Some(InstalledState::confirmed("2.0.0".into(), "newsha".into())),
+            "a survived window confirms whether or not a spent journal is present"
+        );
+        assert!(plan.drop_rollback);
+    }
+
+    #[test]
+    fn an_uncommitted_journal_still_owns_the_binary_decision() {
+        // Guard the other side of the fix: when the transaction did NOT commit, its own
+        // reconciliation decides the binary — the pending path must not also weigh in.
+        let mut s = pending("2.0.0", "newsha", "1.0.0", "oldsha", 1_000_000);
+        s.journal = Some(tx("1.0.0", "2.0.0"));
+        s.disk_sha = Some("oldsha".into()); // never swapped
+        s.app_crashed = true;
+        let plan = plan_boot(&s);
+        assert_eq!(
+            plan.binary,
+            BinaryFix::DropRollback,
+            "the never-swapped recovery still owns the binary"
         );
     }
 

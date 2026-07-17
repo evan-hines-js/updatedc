@@ -46,8 +46,19 @@ fn create_temp_with(
     ))
 }
 
+/// The directory holding `path`, as an fsync target. `Path::parent` returns `Some("")`
+/// — never `None` — for a bare relative filename, and the empty path cannot be opened,
+/// so both that case and a true parentless path resolve to the current directory.
+/// Every durable primitive derives its fsync target through here.
+pub fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = parent_dir(path);
     let (mut tmp, tmp_path) = create_temp(dir, prefix)?;
     if let Err(e) = tmp.write_all(data).and_then(|_| tmp.sync_all()) {
         let _ = fs::remove_file(&tmp_path);
@@ -67,7 +78,7 @@ pub fn remove_file(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     }
-    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+    sync_dir(parent_dir(path))
 }
 
 /// Replace `to` with `from`, tolerating the short-lived executable/file locks seen
@@ -124,6 +135,39 @@ mod tests {
         atomic_write(&p, ".test-", b"first").unwrap();
         atomic_write(&p, ".test-", b"second-longer").unwrap();
         assert_eq!(fs::read(p).unwrap(), b"second-longer");
+    }
+
+    #[test]
+    fn parent_dir_resolves_a_bare_filename_to_the_current_directory() {
+        // Path::parent yields Some("") for a bare filename, so a naive
+        // `parent().unwrap_or(".")` hands sync_dir an unopenable empty path and reports
+        // an already-committed write as failed.
+        assert_eq!(Path::new("state").parent(), Some(Path::new("")));
+        assert_eq!(parent_dir(Path::new("state")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("/")), Path::new("."));
+        assert_eq!(
+            parent_dir(Path::new("/var/lib/state")),
+            Path::new("/var/lib")
+        );
+    }
+
+    #[test]
+    fn durable_operations_on_a_bare_relative_path_report_success() {
+        // A relative `application.state` makes every derived path bare; a committed write
+        // reported as Err drives callers into bogus crash recovery.
+        let d = dir("relative");
+        struct RestoreDir(std::path::PathBuf);
+        impl Drop for RestoreDir {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).expect("restore test working directory");
+            }
+        }
+        let restore = RestoreDir(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&d).unwrap();
+        atomic_write(Path::new("bare.state"), ".test-", b"payload").unwrap();
+        remove_file(Path::new("bare.state")).unwrap();
+        drop(restore);
+        assert!(!d.join("bare.state").exists());
     }
 
     #[test]

@@ -331,11 +331,63 @@ impl Channel {
     }
 
     pub fn read_request(&mut self) -> control::Result<control::Request> {
-        control::Request::read(&mut self.read)
+        control::Request::read(&mut TimeoutReader(&mut self.read))
     }
 
     pub fn send_response(&mut self, resp: &control::Response) -> control::Result<()> {
         resp.write(&mut self.write)
+    }
+}
+
+/// How long a single control-channel read may stall the guardian's one thread before it
+/// gives up on the frame. Mirrors the Unix end's `SO_RCVTIMEO`, which is likewise per-read.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds a blocking pipe read. An anonymous pipe cannot carry a receive timeout, and
+/// `ReadFile` on one blocks until at least a byte arrives — so peek until something is
+/// buffered, and give up at the deadline. `ReadFile` never waits for more than the bytes
+/// already present, so once the peek sees any, the read cannot block.
+///
+/// Without this, a supervisor that writes one byte and stops would block the guardian's only
+/// thread inside `read_exact` forever, stranding its shutdown signal, its application-crash
+/// check, and its readiness deadline while it still owns the application.
+struct TimeoutReader<'a>(&'a mut std::fs::File);
+
+impl std::io::Read for TimeoutReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let handle = self.0.as_raw_handle() as HANDLE;
+        let deadline = std::time::Instant::now() + READ_TIMEOUT;
+        loop {
+            let mut available: u32 = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            // A failed peek means a broken pipe (the supervisor is gone) or a real error:
+            // let the read itself surface it, so a closed peer still reads as a clean close
+            // at a frame boundary rather than as a timeout.
+            if ok == 0 || available > 0 {
+                return self.0.read(buf);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "control channel read timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 

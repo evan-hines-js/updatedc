@@ -337,12 +337,14 @@ mod file_store_tests {
         store.clear_journal().unwrap();
         assert!(store.journal().unwrap().is_none());
 
-        // Rejections round-trip.
-        assert!(!store.is_rejected("v2"));
-        store.reject("v2").unwrap();
-        assert!(store.is_rejected("v2"));
-        store.clear_rejection("v2").unwrap();
-        assert!(!store.is_rejected("v2"));
+        // Rejections round-trip. The record is keyed by content hash, so this exercises a
+        // real digest — the store must never persist a key its own reload would refuse.
+        let rejected_sha = sha256_file(&paths.download).unwrap_or_else(|_| v1.clone());
+        assert!(!store.is_rejected(&rejected_sha));
+        store.reject(&rejected_sha).unwrap();
+        assert!(store.is_rejected(&rejected_sha));
+        store.clear_rejection(&rejected_sha).unwrap();
+        assert!(!store.is_rejected(&rejected_sha));
 
         // Swap retains the previous bytes as the rollback image; verify then restore.
         std::fs::write(&paths.download, b"v2-bytes").unwrap();

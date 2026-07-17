@@ -1318,6 +1318,7 @@ version = "0.1.0"
 dependencies = [
  "control",
  "foundation",
+ "libc",
  "reqwest",
  "rustls",
  "tokio",
@@ -1654,6 +1655,7 @@ dependencies = [
 name = "updated-oneshot"
 version = "0.1.0"
 dependencies = [
+ "foundation",
  "rustls",
  "tokio",
  "updated",

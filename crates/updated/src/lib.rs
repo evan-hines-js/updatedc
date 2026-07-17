@@ -1,6 +1,6 @@
 //! Reusable client-side installation primitives shared by the supervisor:
 //! crash-safe filesystem replacement, a single-instance lock, the health-proof
-//! constants, structured logging, health-rejection tracking, the committed
+//! constants, health-rejection tracking, the committed
 //! installed-state record, and the shared operator-config loader (which also resolves
 //! the tower's canonical on-disk paths).
 //!
@@ -16,8 +16,18 @@ pub mod env;
 pub mod hash;
 pub mod health;
 pub mod lock;
-pub mod log;
 pub mod rand;
 pub mod reject;
 pub mod state;
 pub mod transaction;
+
+/// Deserialize an optional value while still requiring the field itself to exist.
+/// Serde otherwise treats a missing `Option<T>` as `None`, creating an implicit legacy
+/// schema alongside the current durable format.
+pub(crate) fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}

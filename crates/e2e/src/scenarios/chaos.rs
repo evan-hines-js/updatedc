@@ -23,9 +23,9 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
 
         // Commit installed=1.0.0 so the supervisor applies 1.0.0 -> 2.0.0.
         let sha = sha256_hex(&app);
-        std::fs::write(
-            with_suffix(&app, ".installed"),
-            format!(r#"{{"version":"1.0.0","sha256":"{sha}"}}"#),
+        updated::state::write_installed(
+            &with_suffix(&app, ".installed"),
+            &updated::state::InstalledState::confirmed("1.0.0".into(), sha),
         )
         .map_err(str_err)?;
 

@@ -21,7 +21,9 @@ mod windows {
     use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{ERROR_INVALID_DATA, NO_ERROR};
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, NO_ERROR,
+    };
     use windows_sys::Win32::System::Console::{
         AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
         CTRL_BREAK_EVENT,
@@ -106,12 +108,25 @@ mod windows {
             return;
         }
         STATUS.store(handle, Ordering::SeqCst);
-        report(SERVICE_START_PENDING, 0, 5_000);
-        report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
+        report(SERVICE_START_PENDING, 0, 5_000, NO_ERROR);
+        report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0, NO_ERROR);
+        // Report the outcome to the SCM, not just to stderr: `sc failure`/`sc failureflag`
+        // recovery actions (see deploy/windows/install-selfupdate-supervisor.bat) fire only
+        // on a STOPPED report carrying a non-zero exit code. Reporting a clean stop after a
+        // failure leaves the whole tower down with the SCM believing all is well.
         let exit = run_service();
-        report(SERVICE_STOPPED, 0, 0);
-        if let Err(e) = exit {
+        if let Err(e) = &exit {
             eprintln!("selfupdate-service: {e}");
+        }
+        report(SERVICE_STOPPED, 0, 0, exit_code(&exit));
+    }
+
+    /// The SCM exit code for a service outcome: `NO_ERROR` for a requested stop, else
+    /// `ERROR_SERVICE_SPECIFIC_ERROR` (which directs the SCM to `dwServiceSpecificExitCode`).
+    fn exit_code(outcome: &Result<(), String>) -> u32 {
+        match outcome {
+            Ok(()) => NO_ERROR,
+            Err(_) => ERROR_SERVICE_SPECIFIC_ERROR,
         }
     }
 
@@ -123,11 +138,20 @@ mod windows {
     ) -> u32 {
         if control == SERVICE_CONTROL_STOP {
             STOP.store(true, Ordering::SeqCst);
-            report(SERVICE_STOP_PENDING, 0, STOP_GRACE.as_millis() as u32);
+            report(
+                SERVICE_STOP_PENDING,
+                0,
+                STOP_GRACE.as_millis() as u32,
+                NO_ERROR,
+            );
         }
         NO_ERROR
     }
 
+    /// Restarting a bootstrap that will not spawn is the SCM's job, not ours: reporting the
+    /// failure (see `report`) triggers the `sc failure` recovery actions the installer
+    /// configures, which retry with escalating backoff and give up cleanly. Retrying in
+    /// here as well would be a second restart path that reports success while looping.
     fn run_service() -> Result<(), String> {
         while !STOP.load(Ordering::SeqCst) {
             let mut child = spawn_bootstrap()?;
@@ -192,7 +216,12 @@ mod windows {
             .map_err(|e| format!("launching bootstrap {:?}: {e}", args.bootstrap))
     }
 
-    fn report(state: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u32) {
+    fn report(
+        state: SERVICE_STATUS_CURRENT_STATE,
+        accepted: u32,
+        wait_hint: u32,
+        win32_exit_code: u32,
+    ) {
         let handle = STATUS.load(Ordering::SeqCst);
         if handle.is_null() {
             return;
@@ -201,12 +230,9 @@ mod windows {
             dwServiceType: SERVICE_WIN32_OWN_PROCESS,
             dwCurrentState: state,
             dwControlsAccepted: accepted,
-            dwWin32ExitCode: if state == SERVICE_STOPPED {
-                NO_ERROR
-            } else {
-                0
-            },
-            dwServiceSpecificExitCode: 0,
+            dwWin32ExitCode: win32_exit_code,
+            // Only consulted when dwWin32ExitCode is ERROR_SERVICE_SPECIFIC_ERROR.
+            dwServiceSpecificExitCode: u32::from(win32_exit_code == ERROR_SERVICE_SPECIFIC_ERROR),
             dwCheckPoint: 0,
             dwWaitHint: wait_hint,
         };

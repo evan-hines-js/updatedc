@@ -9,6 +9,7 @@ name = "updated-oneshot"
 path = "src/main.rs"
 
 [dependencies]
+foundation = { path = "../foundation" }
 updated = { path = "../updated" }
 updated-tuf = { path = "../updated-tuf" }
 # The TUF client is async; the updater needs a runtime only to drive one refresh.

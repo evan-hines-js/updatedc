@@ -23,3 +23,8 @@ control = { path = "../control" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+
+# Re-arming FD_CLOEXEC on the inherited control-channel endpoint, so it stops at this
+# process instead of leaking into the operator's reload command.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

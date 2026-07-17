@@ -389,8 +389,15 @@ fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Resul
     }
     if !candidate {
         if let Some(initial) = &cfg.initial_supervisor {
-            if std::fs::canonicalize(path).ok() == std::fs::canonicalize(initial).ok() {
-                return Ok(());
+            // Both sides must resolve: comparing `.ok()` would make two *failures* compare
+            // equal (None == None) and wave the path through without ever reaching the
+            // staging-directory check below.
+            if let (Ok(resolved), Ok(initial)) =
+                (std::fs::canonicalize(path), std::fs::canonicalize(initial))
+            {
+                if resolved == initial {
+                    return Ok(());
+                }
             }
         }
     }

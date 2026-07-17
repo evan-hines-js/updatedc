@@ -17,6 +17,7 @@ use crate::apply;
 /// Version + the sha256 (hex) of the bytes that version was installed from, plus an
 /// optional [`Pending`] record while a just-committed update is still proving itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstalledState {
     pub version: String,
     pub sha256: String,
@@ -26,13 +27,14 @@ pub struct InstalledState {
     /// steady-state install and a first install (nothing to revert to). Folded into this
     /// atomic record so the commit and its rollback intent land together — there is no
     /// separate "arm" step to be interrupted.
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required_option")]
     pub pending: Option<Pending>,
 }
 
 /// The rollback intent of an unconfirmed update: the version to revert to and when the
 /// update committed (for the confirmation window).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pending {
     pub previous_version: String,
     pub previous_sha256: String,
@@ -146,13 +148,21 @@ mod tests {
     }
 
     #[test]
-    fn pending_defaults_to_none_for_old_records() {
-        let path = tmp("legacy");
+    fn obsolete_records_are_rejected_instead_of_migrated() {
+        let path = tmp("obsolete");
         std::fs::write(&path, br#"{"version":"1.0.0","sha256":"aa"}"#).unwrap();
-        match read_installed(&path) {
-            Installed::Present(s) => assert!(s.pending.is_none()),
-            _ => panic!("expected Present"),
-        }
+        assert!(matches!(read_installed(&path), Installed::Invalid));
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_instead_of_silently_ignored() {
+        let path = tmp("unknown-field");
+        std::fs::write(
+            &path,
+            br#"{"version":"1.0.0","sha256":"aa","pending":null,"retired":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(read_installed(&path), Installed::Invalid));
     }
 
     #[test]

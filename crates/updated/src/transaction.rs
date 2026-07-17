@@ -12,11 +12,12 @@ use crate::apply;
 
 /// Durable intent for an in-flight executable replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Transaction {
     pub old_sha256: String,
     pub new_sha256: String,
     pub to_version: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "crate::required_option")]
     pub from_version: Option<String>,
 }
 
@@ -89,8 +90,13 @@ pub fn classify_binary(
     }
 }
 
+/// Digest equality. The empty string is not a digest — callers substitute it for "this
+/// file could not be hashed" (`store.binary_sha().unwrap_or_default()`) — so it matches
+/// nothing, *including another empty string*. Letting unknown equal unknown would classify
+/// an unhashable binary as a clean `NeverSwapped`/`Ready` and skip the very drift check
+/// that must refuse to run bytes the supervisor cannot verify.
 fn hash_eq(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
 }
 
 #[cfg(test)]
@@ -126,6 +132,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unhashable_binary_never_classifies_as_clean() {
+        // Callers pass "" for a binary they could not hash (unreadable, EIO, stale handle).
+        // "Unknown == unknown" must not read as a match: that would call an unverifiable
+        // binary `NeverSwapped`/`Ready`, drop the rollback image, skip the drift check, and
+        // launch bytes nothing ever verified.
+        let mut unhashable = tx();
+        unhashable.old_sha256 = String::new();
+        assert_eq!(
+            classify_recovery(&unhashable, "", Some("1.0.0")),
+            Recovery::RestorePredecessor,
+            "an unhashable disk and an unhashable predecessor must not agree"
+        );
+        assert_eq!(
+            classify_binary(Some(""), None, ""),
+            BinaryAction::FailClosed,
+            "an unhashable binary is never Ready"
+        );
+        assert_eq!(
+            classify_binary(Some("new"), Some(""), ""),
+            BinaryAction::FailClosed
+        );
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("tx-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -147,6 +177,27 @@ mod tests {
 
         clear(&path).unwrap();
         assert_eq!(read(&path).unwrap(), None, "cleared journal reads as None");
+    }
+
+    #[test]
+    fn obsolete_or_unknown_journal_shapes_are_rejected() {
+        let path = tmp("strict-schema");
+        std::fs::write(
+            &path,
+            br#"{"old_sha256":"old","new_sha256":"new","to_version":"2.0.0"}"#,
+        )
+        .unwrap();
+        assert!(read(&path).is_err(), "from_version is required");
+
+        std::fs::write(
+            &path,
+            br#"{"old_sha256":"old","new_sha256":"new","to_version":"2.0.0","from_version":"1.0.0","legacy":true}"#,
+        )
+        .unwrap();
+        assert!(
+            read(&path).is_err(),
+            "unknown fields are not a second schema"
+        );
     }
 
     #[test]

@@ -7,9 +7,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use foundation::log::{error, info, warn};
 use updated::config::{config_path, with_suffix, Config};
 use updated::lock::InstanceLock;
-use updated::log::{error, info, warn};
 use updated::reject::Rejections;
 use updated::state::{
     provision_baseline, read_installed, write_installed, Installed, InstalledState,
@@ -124,9 +124,21 @@ fn acquire_lock(path: &Path) -> Option<InstanceLock> {
 /// when another updater holds the lock). Fails closed on drift or corrupt state,
 /// exactly as the update path's final check does, so a contending updater can never
 /// cause unverified bytes to run.
+///
+/// This path holds no lock, so it is strictly read-only: a binary that disagrees with
+/// committed state is far more likely to be the lock holder's in-flight swap than real
+/// drift, and repairing it here would clobber that swap. Refuse to run instead and let
+/// the holder finish; the next launch takes the lock and repairs any genuine drift.
 fn verify_committed(paths: &updated::config::Paths) -> Result<(), String> {
     match read_installed(&paths.state) {
-        Installed::Present(s) => ensure_runnable(&paths.binary, &s.sha256),
+        Installed::Present(s) => hash::file_matches(&paths.binary, &s.sha256)
+            .then_some(())
+            .ok_or_else(|| {
+                "on-disk binary does not match committed state while another updater holds the \
+                 lock; refusing to run (the contending updater is mid-swap, or the binary drifted \
+                 — the next launch repairs it under the lock)"
+                    .to_string()
+            }),
         Installed::Missing => Err(
             "installed state is missing; another updater did not finish provisioning the installer baseline — refusing to run".into(),
         ),
@@ -516,6 +528,49 @@ mod tests {
             std::fs::read(&bin).unwrap(),
             b"GOOD",
             "restored the committed image from the rollback copy"
+        );
+    }
+
+    // --- verify_committed: the unlocked path never writes ---
+
+    #[test]
+    fn verify_committed_is_read_only_while_a_contender_holds_the_lock() {
+        // The exact mid-swap window of a lock holder: it has swapped NEW in and kept OLD
+        // at <binary>.old, but has not yet recorded NEW as installed. Repairing here would
+        // overwrite the holder's freshly-swapped binary and delete its rollback image,
+        // making the holder's own re-verification fail and reject a valid signed release.
+        let d = dir("verify-contended");
+        let paths = updated::config::Paths {
+            binary: d.join("app"),
+            download: d.join("app.download"),
+            state: d.join("app.installed"),
+            datastore: d.join("app.installed.tuf"),
+            journal: d.join("app.transaction"),
+            rejected: d.join("app.rejected"),
+            app_token: d.join("app.installed.apptoken"),
+        };
+        std::fs::write(&paths.binary, b"NEW").unwrap();
+        std::fs::write(apply::old_path(&paths.binary), b"OLD").unwrap();
+        let old_sha = sha(&apply::old_path(&paths.binary));
+        write_installed(
+            &paths.state,
+            &InstalledState::confirmed("1.0.0".into(), old_sha),
+        )
+        .unwrap();
+
+        assert!(
+            verify_committed(&paths).is_err(),
+            "a binary that disagrees with committed state must be refused, not repaired"
+        );
+        assert_eq!(
+            std::fs::read(&paths.binary).unwrap(),
+            b"NEW",
+            "the contender's swapped-in binary is left untouched"
+        );
+        assert_eq!(
+            std::fs::read(apply::old_path(&paths.binary)).unwrap(),
+            b"OLD",
+            "the contender's rollback image is left untouched"
         );
     }
 }

@@ -285,10 +285,18 @@ pub(crate) async fn roll_back<T: Control + Health>(
     tower.before_swap();
     ensure_old_binary(store, &tx.old_sha256)?;
     tower.activate()?;
-    // The restored binary is the previous version, so we require liveness + the
-    // launch token but not a version match (we are going backward). This must
-    // hold for every restart mode: an unhealthy rollback is not a completed one.
-    if !tower.became_healthy(None).await {
+    // Prove the rollback landed with the same evidence the forward path demands. A reload
+    // keeps the PID and the launch token, so under that strategy the token proves nothing
+    // about *which* image is answering: without the predecessor's version, an app that
+    // never re-execed would have the just-rejected new version answer this probe and pass
+    // it — leaving the release recorded as rolled back and rejected while it is still the
+    // one running. A stop/start relaunch mints a fresh token, which already identifies it.
+    let version_proof = if tower.requires_version_proof() {
+        tx.from_version.as_deref()
+    } else {
+        None
+    };
+    if !tower.became_healthy(version_proof).await {
         tower.quiesce();
         return Err(io::Error::other(
             "restored application failed its rollback health check",
@@ -347,6 +355,11 @@ pub(crate) fn run_reload(command: &[String], binary: &Path, pid: u32) -> io::Res
             "{binary}" => cmd.arg(binary),
             _ => cmd.arg(arg),
         };
+    }
+    // The reload command is operator code, not a party to the guardian contract: strip the
+    // same control-plane environment the managed application is launched without.
+    for key in crate::app::CONTROL_PLANE_ENV {
+        cmd.env_remove(key);
     }
     let status = cmd
         .env(env::CHILD_PID, &pid)

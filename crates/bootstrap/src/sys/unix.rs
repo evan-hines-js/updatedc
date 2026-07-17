@@ -223,6 +223,12 @@ fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> Ready {
 
 // ------------------------------ the control channel ------------------------------
 
+/// How long a single control-channel read or write may stall the guardian's one thread
+/// before it gives up on the frame. Generous next to any honest exchange (both ends are
+/// local and the frames are tiny), and short next to the readiness gate and the stop grace
+/// it must keep servicing.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The guardian's end of the inherited control channel: a connected `socketpair` whose
 /// other end survives the supervisor's exec (its descriptor number is passed in the
 /// environment). When the supervisor dies the channel closes, which is how the guardian
@@ -239,8 +245,16 @@ impl Channel {
         // The child's end must survive its exec; the guardian's end stays close-on-exec so
         // it never leaks into the application's fork.
         clear_cloexec(child)?;
+        let stream = unsafe { UnixStream::from_raw_fd(guardian) };
+        // The guardian serves everything — the supervisor channel, the shutdown signal, the
+        // application-crash check, the readiness deadline — from one thread, so no channel
+        // operation may block it indefinitely. The supervisor is the less-trusted end and
+        // the one being replaced: a half-written frame or an unread response must cost the
+        // guardian a bounded stall, never the application.
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
         Ok(Channel {
-            stream: unsafe { UnixStream::from_raw_fd(guardian) },
+            stream,
             child_fd: child,
         })
     }

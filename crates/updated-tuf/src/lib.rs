@@ -228,7 +228,7 @@ impl TrustedRepository {
                 target.path, self.config.target_limit
             )));
         }
-        let dir = destination.parent().unwrap_or_else(|| Path::new("."));
+        let dir = foundation::durable::parent_dir(destination);
         let (file, temporary) = foundation::durable::create_temp(dir, ".target-")
             .map_err(|e| Error::Local(format!("creating target staging file: {e}")))?;
         let mut file = tokio::fs::File::from_std(file);

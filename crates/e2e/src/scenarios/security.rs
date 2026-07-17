@@ -120,8 +120,11 @@ pub(crate) fn drift_fail_closed(ctx: &Ctx) -> R {
     // Commit installed state pinning the (correct) binary hash, then tamper the
     // binary out of band so it no longer matches.
     let sha = sha256_hex(&app);
-    let state = format!(r#"{{"version":"1.0.0","sha256":"{sha}"}}"#);
-    std::fs::write(with_suffix(&app, ".installed"), state).map_err(str_err)?;
+    updated::state::write_installed(
+        &with_suffix(&app, ".installed"),
+        &updated::state::InstalledState::confirmed("1.0.0".into(), sha.clone()),
+    )
+    .map_err(str_err)?;
     {
         use std::io::Write;
         std::fs::OpenOptions::new()

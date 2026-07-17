@@ -51,7 +51,7 @@ fn atomic_install_file(target: &Path, source: &Path) -> io::Result<()> {
 }
 
 fn swap(target: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let dir = foundation::durable::parent_dir(target);
     let tmp_path = stage(dir, target, write)?;
     // The rollback image must be durable before replacement.
     if let Err(e) = backup(target) {
@@ -78,7 +78,7 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
 }
 
 fn install(target: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let dir = foundation::durable::parent_dir(target);
     let tmp_path = stage(dir, target, write)?;
     if let Err(e) = replace_path(&tmp_path, target) {
         let _ = fs::remove_file(&tmp_path);
@@ -123,7 +123,7 @@ fn stage(
 
 fn backup(target: &Path) -> io::Result<()> {
     let old = old_path(target);
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let dir = foundation::durable::parent_dir(target);
     let _ = fs::remove_file(&old);
     fs::copy(target, &old)?;
     // Reopen writable to fsync it: `FlushFileBuffers` (what `sync_all` issues on

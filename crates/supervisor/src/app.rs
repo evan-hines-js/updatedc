@@ -72,19 +72,31 @@ pub(crate) fn start(guardian: Guardian, opts: &Options) -> io::Result<App> {
     Ok(app)
 }
 
+/// The guardian⇄supervisor launch contract, as it appears in this process's own
+/// environment. Only the supervisor is a party to it: neither the managed application nor
+/// the operator's reload command may see the control endpoint, the readiness nonce, or the
+/// chaos injection point, so every process this supervisor causes to be launched is
+/// stripped of all of it.
+pub(crate) const CONTROL_PLANE_ENV: &[&str] = &[
+    control::CONTROL_ENV,
+    control::READY_NONCE_ENV,
+    control::STATE_DIR_ENV,
+    control::APP_PID_ENV,
+    env::CHAOS_POINT,
+];
+
+pub(crate) fn is_control_plane_env(key: &std::ffi::OsStr) -> bool {
+    CONTROL_PLANE_ENV
+        .iter()
+        .any(|candidate| key == std::ffi::OsStr::new(candidate))
+}
+
 /// Build the application launch spec: the configured command, plus the full environment
 /// the guardian should apply — the supervisor's own environment with the control-channel
 /// plumbing stripped and the per-launch health token added.
 fn app_spec(command: &[String], health_token: &str) -> CommandSpec {
-    let stripped = [
-        control::CONTROL_ENV,
-        control::READY_NONCE_ENV,
-        control::STATE_DIR_ENV,
-        control::APP_PID_ENV,
-        env::CHAOS_POINT,
-    ];
     let mut envs: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(k, _)| !stripped.iter().any(|s| k.to_str() == Some(s)))
+        .filter(|(key, _)| !is_control_plane_env(key))
         .collect();
     envs.push((
         OsString::from(env::HEALTH_TOKEN),

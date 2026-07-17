@@ -22,7 +22,12 @@ pub(crate) fn window_passed(pending: &Pending, window: Duration, now: u64) -> bo
 /// wake to confirm even when the update interval is longer.
 pub(crate) fn window_remaining(pending: &Pending, window: Duration, now: u64) -> Duration {
     let ends_at = pending.committed_at.saturating_add(window.as_secs());
-    Duration::from_secs(ends_at.saturating_sub(now))
+    // Clamped to the window itself: more than that is never a legitimate answer, and a
+    // `committed_at` in the future — a backward clock step across a reboot, or a corrupt
+    // record, the installed state being plain JSON with no integrity check — would otherwise
+    // return a near-`u64::MAX` duration that panics `Instant + Duration` in the loop's sleep,
+    // turning a bad timestamp into a diagnostic-free crash loop on every boot.
+    Duration::from_secs(ends_at.saturating_sub(now)).min(window)
 }
 
 // ============================== boot state machine ==============================
@@ -155,6 +160,14 @@ mod tests {
             Duration::from_secs(20)
         );
         assert!(!window_passed(&pending(), window, 1119));
+        // A `committed_at` in the future must not produce a duration that panics the
+        // loop's `Instant + Duration`; at most one window of waiting is ever correct.
+        let future = Pending {
+            committed_at: u64::MAX - 1,
+            ..pending()
+        };
+        assert_eq!(window_remaining(&future, window, 1000), window);
+        let _ = std::time::Instant::now() + window_remaining(&future, window, 1000);
         // At and past the deadline: no time remains, and it counts as passed.
         assert_eq!(window_remaining(&pending(), window, 1120), Duration::ZERO);
         assert_eq!(window_remaining(&pending(), window, 5000), Duration::ZERO);

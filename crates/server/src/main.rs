@@ -221,12 +221,21 @@ async fn respond_file(
     mut file: tokio::fs::File,
     range_start: Option<usize>,
 ) {
-    let Ok(length) = file.metadata().await.map(|m| m.len()) else {
+    // Only a regular file has a body. `File::open` on a directory succeeds on Unix and its
+    // stat reports a non-zero size, so without this a directory URL answers 200 with a
+    // Content-Length that no body can ever satisfy — the client sees a truncated response
+    // and a premature close instead of a 404.
+    let Ok(metadata) = file.metadata().await else {
         respond_status(stream, 404, b"not found").await;
         return;
     };
+    if !metadata.is_file() {
+        respond_status(stream, 404, b"not found").await;
+        return;
+    }
+    let length = metadata.len();
     let start = range_start.map(|n| n as u64).filter(|&n| n <= length);
-    let (header, offset) = match start {
+    let (header, offset, count) = match start {
         Some(start) => {
             let remaining = length - start;
             let hdr = format!(
@@ -236,7 +245,7 @@ async fn respond_file(
                 length,
                 remaining
             );
-            (hdr, start)
+            (hdr, start, remaining)
         }
         _ => {
             let hdr = format!(
@@ -244,7 +253,7 @@ async fn respond_file(
                  Content-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
                 length
             );
-            (hdr, 0)
+            (hdr, 0, length)
         }
     };
     if file.seek(std::io::SeekFrom::Start(offset)).await.is_err()
@@ -252,14 +261,26 @@ async fn respond_file(
     {
         return;
     }
+    // Hold the body to exactly the length just declared. The size is a stat taken before
+    // the first read, and the dev publisher rewrites metadata in place under live readers
+    // (tough's editor truncates the same inode rather than renaming), so a file that grows
+    // or shrinks mid-stream would otherwise desync the response from its own header.
     let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let Ok(n) = file.read(&mut chunk).await else {
+    let mut remaining = count;
+    while remaining > 0 {
+        let want = remaining.min(chunk.len() as u64) as usize;
+        let Ok(n) = file.read(&mut chunk[..want]).await else {
             return;
         };
-        if n == 0 || write_with_timeout(stream, &chunk[..n]).await.is_err() {
-            break;
+        if n == 0 {
+            // Short of the declared length: drop the connection rather than complete a
+            // truncated body as though it were whole.
+            return;
         }
+        if write_with_timeout(stream, &chunk[..n]).await.is_err() {
+            return;
+        }
+        remaining -= n as u64;
     }
     let _ = stream.flush().await;
 }
@@ -342,6 +363,75 @@ mod tests {
         assert!(resolve(&root, "/a/../../etc").is_none());
         assert!(resolve(&root, "/.publish.lock").is_none());
         assert!(resolve(&root, "/keys/root.pk8").is_none());
+    }
+
+    /// Serve one request against a real socket and return the raw response.
+    async fn get(root: &Path, request: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let root = root.to_path_buf();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = serve_conn(stream, &root).await;
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn serve_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("server-serve-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("targets")).unwrap();
+        std::fs::create_dir_all(root.join("metadata")).unwrap();
+        std::fs::write(root.join("targets/app"), b"0123456789").unwrap();
+        std::fs::canonicalize(root).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_not_a_body() {
+        // `File::open` on a directory succeeds on Unix and stats non-zero, which would
+        // otherwise answer 200 with a Content-Length and then zero bytes.
+        let root = serve_root("dir");
+        let response = get(&root, "GET /metadata HTTP/1.1\r\n\r\n").await;
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "a directory must 404, got: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_body_matches_the_declared_content_length() {
+        let root = serve_root("exact");
+        let response = get(&root, "GET /targets/app HTTP/1.1\r\n\r\n").await;
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let declared: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            declared,
+            body.len(),
+            "declared length must equal body bytes"
+        );
+        assert_eq!(body, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn a_resume_serves_exactly_the_remaining_bytes() {
+        let root = serve_root("resume");
+        let response = get(
+            &root,
+            "GET /targets/app HTTP/1.1\r\nRange: bytes=4-\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 206"), "got: {response:?}");
+        assert!(response.contains("Content-Length: 6"), "got: {response:?}");
+        assert!(response.ends_with("456789"), "got: {response:?}");
     }
 
     #[test]

@@ -195,6 +195,19 @@ struct Conn {
     stream: std::os::unix::net::UnixStream,
 }
 
+/// Mark `fd` close-on-exec, so it is not inherited by anything this process launches.
+#[cfg(unix)]
+fn set_cloexec(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 impl Conn {
     fn inherit() -> Result<Conn, String> {
@@ -205,9 +218,14 @@ impl Conn {
             .ok_or_else(|| format!("{CONTROL_ENV} is not a valid descriptor"))?;
         // Safety: the guardian created this socketpair end and handed us its number
         // across exec; nothing else owns it.
-        Ok(Conn {
-            stream: unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) },
-        })
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        // The guardian cleared FD_CLOEXEC so this endpoint would survive *our* exec. Re-arm
+        // it now that we own it, so it stops here: nothing we launch is a party to the
+        // control protocol, and a descendant of the operator's reload command holding this
+        // fd could drive the guardian directly — a single `Stop` frame would take the
+        // application down with no crash recorded and nothing to relaunch it.
+        set_cloexec(fd).map_err(|e| format!("securing the control channel endpoint: {e}"))?;
+        Ok(Conn { stream })
     }
 
     fn reader(&mut self) -> &mut std::os::unix::net::UnixStream {

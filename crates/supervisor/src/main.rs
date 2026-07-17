@@ -218,22 +218,34 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
     loop {
         // An unconfirmed update that ran its whole window without crashing is confirmed.
-        if pending
+        let confirm_due = pending
             .as_ref()
-            .is_some_and(|p| window_passed(p, opts.timeouts.confirmation_window, now_unix()))
-            && confirm_update(&mut store)
-        {
-            pending = None;
-            log(&format!(
-                "update {} confirmed; confirmation window passed",
-                current.as_deref().unwrap_or("?")
-            ));
+            .is_some_and(|p| window_passed(p, opts.timeouts.confirmation_window, now_unix()));
+        let mut confirm_failed = false;
+        if confirm_due {
+            if confirm_update(&mut store) {
+                pending = None;
+                log(&format!(
+                    "update {} confirmed; confirmation window passed",
+                    current.as_deref().unwrap_or("?")
+                ));
+            } else {
+                confirm_failed = true;
+            }
         }
 
         let now = Instant::now();
         // Wake when the confirmation window ends even if the update interval is longer.
         let app_wait = if let Some(p) = pending.as_ref() {
-            window_remaining(p, opts.timeouts.confirmation_window, now_unix())
+            if confirm_failed {
+                // The window has already elapsed, so `window_remaining` is zero and the
+                // wait would fall to its 100ms floor: a confirm that cannot be persisted (a
+                // full or read-only state dir) would re-attempt — and re-warn — ten times a
+                // second for as long as the fault lasts. Retry on the normal cadence.
+                opts.timeouts.check_interval
+            } else {
+                window_remaining(p, opts.timeouts.confirmation_window, now_unix())
+            }
         } else if updates_enabled {
             loop_state.next_app_check.saturating_duration_since(now)
         } else {
@@ -463,11 +475,11 @@ fn application_check_due(
 }
 
 fn log(msg: &str) {
-    updated::log::info("supervisor", msg);
+    foundation::log::info("supervisor", msg);
 }
 fn warn(msg: &str) {
-    updated::log::warn("supervisor", msg);
+    foundation::log::warn("supervisor", msg);
 }
 fn error(msg: &str) {
-    updated::log::error("supervisor", msg);
+    foundation::log::error("supervisor", msg);
 }

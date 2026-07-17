@@ -239,6 +239,8 @@ struct FakeTower {
     health_i: std::cell::Cell<usize>,
     before_swaps: usize,
     quiesces: usize,
+    /// The `expected_version` handed to each health probe, in order.
+    proofs: std::cell::RefCell<Vec<Option<String>>>,
 }
 
 impl FakeTower {
@@ -252,6 +254,7 @@ impl FakeTower {
             health_i: std::cell::Cell::new(0),
             before_swaps: 0,
             quiesces: 0,
+            proofs: std::cell::RefCell::new(Vec::new()),
         }
     }
     fn health_script(mut self, script: Vec<bool>) -> Self {
@@ -261,6 +264,14 @@ impl FakeTower {
     fn activate_script(mut self, script: Vec<bool>) -> Self {
         self.activate = script;
         self
+    }
+    /// Model the reload strategy, which cannot tell versions apart by launch token.
+    fn reload_strategy(mut self) -> Self {
+        self.version_proof = true;
+        self
+    }
+    fn proofs(&self) -> Vec<Option<String>> {
+        self.proofs.borrow().clone()
     }
 }
 
@@ -291,7 +302,10 @@ impl Control for FakeTower {
 }
 
 impl Health for FakeTower {
-    async fn became_healthy(&self, _expected_version: Option<&str>) -> bool {
+    async fn became_healthy(&self, expected_version: Option<&str>) -> bool {
+        self.proofs
+            .borrow_mut()
+            .push(expected_version.map(str::to_string));
         let i = self.health_i.get();
         self.health_i.set(i + 1);
         scripted(&self.health, i)
@@ -364,6 +378,54 @@ fn a_post_commit_journal_clear_failure_still_reports_committed() {
     assert!(
         store.journal_present(),
         "the journal survives the failed clear, for recovery to remove"
+    );
+}
+
+#[test]
+fn a_reload_rollback_proves_the_predecessor_is_the_image_answering() {
+    // Reload keeps the PID and the launch token, so the token proves nothing about which
+    // image replies. Without the predecessor's version as proof, an app that never re-execed
+    // back would have the just-rejected NEW version answer the rollback probe and pass it —
+    // recording 1.0.0 as live and rejecting 2.0.0 while 2.0.0 is what is actually running.
+    let mut store = ready_to_apply();
+    let mut tower = FakeTower::healthy()
+        .reload_strategy()
+        .health_script(vec![false, true]); // forward probe fails, rollback probe succeeds
+    let outcome = block_on(apply_update(
+        &mut tower,
+        &mut store,
+        "NEW",
+        "2.0.0",
+        Some("1.0.0"),
+    ))
+    .unwrap();
+    assert!(matches!(outcome, Outcome::RolledBack));
+    assert_eq!(
+        tower.proofs(),
+        vec![Some("2.0.0".to_string()), Some("1.0.0".to_string())],
+        "the forward probe proves 2.0.0, the rollback probe must prove 1.0.0"
+    );
+}
+
+#[test]
+fn a_stop_start_rollback_relies_on_the_fresh_launch_token() {
+    // The counterpart: a stop/start relaunch mints a new token, which already identifies the
+    // process, so no version header is demanded of the application.
+    let mut store = ready_to_apply();
+    let mut tower = FakeTower::healthy().health_script(vec![false, true]);
+    let outcome = block_on(apply_update(
+        &mut tower,
+        &mut store,
+        "NEW",
+        "2.0.0",
+        Some("1.0.0"),
+    ))
+    .unwrap();
+    assert!(matches!(outcome, Outcome::RolledBack));
+    assert_eq!(
+        tower.proofs(),
+        vec![None, None],
+        "stop/start demands no version header in either direction"
     );
 }
 
@@ -546,6 +608,49 @@ fn run_reload_maps_the_command_exit_status_to_success_or_error() {
         1
     )
     .is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reload_does_not_leak_the_control_plane_to_the_operator_command() {
+    // The operator's reload command is not a party to the guardian contract. A descendant
+    // that learned the control endpoint could send `Stop` and take the application down
+    // with no crash recorded — so it must not see the endpoint, the readiness nonce, or the
+    // state dir, exactly as the managed application does not (app.rs's CONTROL_PLANE_ENV).
+    use std::path::Path;
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+    let restore = RestoreEnv(
+        crate::app::CONTROL_PLANE_ENV
+            .iter()
+            .map(|&key| (key, std::env::var_os(key)))
+            .collect(),
+    );
+    for key in crate::app::CONTROL_PLANE_ENV {
+        std::env::set_var(key, "leaked");
+    }
+    // `sh` here is the test's own assertion harness; run_reload itself execs argv directly.
+    let script = crate::app::CONTROL_PLANE_ENV
+        .iter()
+        .map(|k| format!("test -z \"${k}\""))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let result = run_reload(&["sh".into(), "-c".into(), script], Path::new("/app"), 1);
+    drop(restore);
+    assert!(
+        result.is_ok(),
+        "the reload command must inherit none of the control-plane environment"
+    );
 }
 
 // ================================= full fuzzing =================================

@@ -272,16 +272,36 @@ fn read_frame(r: &mut impl Read) -> Result<Vec<u8>> {
     match r.read(&mut len[..1]) {
         Ok(0) => return Err(Error::Closed),
         Ok(_) => {}
+        // Nothing arrived within the transport's read timeout. The channel is merely idle
+        // and still frame-aligned, so this is an ordinary i/o condition the reader retries.
         Err(e) => return Err(Error::Io(e)),
     }
-    r.read_exact(&mut len[1..])?;
+    // Past that first byte the peer has committed to a frame. A stall from here is a
+    // *truncated* frame, not an idle channel: the stream is desynced and no later read can
+    // resume it, so report it as malformed. Without this a peer that sends one byte and
+    // stops would block a single-threaded reader inside `read_exact` forever — the guardian
+    // would stop servicing its shutdown signal, its application-crash check, and its
+    // readiness deadline, all while holding the application.
+    read_framed(r, &mut len[1..])?;
     let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME {
         return Err(Error::Malformed("frame exceeds MAX_FRAME"));
     }
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    read_framed(r, &mut buf)?;
     Ok(buf)
+}
+
+/// Read the remainder of a frame the peer has already begun. A timeout here means the peer
+/// stalled mid-frame, which is unrecoverable for a stream protocol — the reader cannot know
+/// where the next frame starts — so it is malformed rather than a retryable i/o error.
+fn read_framed(r: &mut impl Read, buf: &mut [u8]) -> Result<()> {
+    r.read_exact(buf).map_err(|e| match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            Error::Malformed("peer stalled mid-frame")
+        }
+        _ => Error::Io(e),
+    })
 }
 
 // ── primitive codecs ───────────────────────────────────────────────────────────
@@ -813,6 +833,48 @@ mod tests {
             get_spec(&buf, &mut at).unwrap().env.len(),
             MAX_ITEMS as usize
         );
+    }
+
+    /// A reader whose peer sent `sent` and then stalled forever, with a read timeout set —
+    /// exactly the guardian's socketpair end.
+    #[cfg(unix)]
+    fn stalled_peer(sent: &[u8]) -> Result<Vec<u8>> {
+        use std::io::Write;
+        let (mut writer, mut reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .unwrap();
+        writer.write_all(sent).unwrap();
+        writer.flush().unwrap();
+        let frame = read_frame(&mut reader);
+        drop(writer); // keep the peer alive across the read, then release it
+        frame
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_that_stalls_mid_frame_is_malformed_not_a_wedge() {
+        // One byte makes the channel readable, so the reader commits to a frame — and then
+        // the peer says nothing more. This must return, not block the guardian's only
+        // thread forever (which would strand its shutdown signal, crash check, and
+        // readiness deadline while it still owns the application).
+        assert!(
+            matches!(stalled_peer(&[0x00]), Err(Error::Malformed(_))),
+            "a truncated length prefix is a desynced stream, not an idle channel"
+        );
+        // The same for a complete length prefix whose body never arrives.
+        assert!(matches!(
+            stalled_peer(&[0x00, 0x00, 0x00, 0x08, 0x01]),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_channel_is_a_retryable_io_condition() {
+        // Nothing sent at all: the channel is merely quiet and still frame-aligned, so the
+        // reader must not mistake it for a protocol violation and tear the supervisor down.
+        assert!(matches!(stalled_peer(&[]), Err(Error::Io(_))));
     }
 
     #[test]
