@@ -15,8 +15,6 @@ use crate::rand;
 use crate::sys::{Channel, Ready};
 use control::{Nonce, Request, Response, APP_PID_ENV, CONTROL_ENV, READY_NONCE_ENV, STATE_DIR_ENV};
 
-/// How long a supervisor gets to exit after a stop request before it is killed.
-const STOP_GRACE: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
 
 /// A launched supervisor and the guardian's end of its control channel.
@@ -24,6 +22,7 @@ pub struct Supervisor {
     child: Child,
     channel: Channel,
     nonce: Nonce,
+    stop_grace: Duration,
 }
 
 impl Supervisor {
@@ -36,6 +35,7 @@ impl Supervisor {
         config: &Path,
         state_dir: &Path,
         app_pid: Option<u32>,
+        stop_grace: Duration,
     ) -> io::Result<Supervisor> {
         let mut channel = Channel::create()?;
         let nonce = rand::nonce();
@@ -62,6 +62,7 @@ impl Supervisor {
             child,
             channel,
             nonce,
+            stop_grace,
         })
     }
 
@@ -78,7 +79,7 @@ impl Supervisor {
     /// application — the guardian owns that separately.
     pub fn stop(&mut self) {
         crate::sys::terminate_gracefully(self.child.id());
-        let deadline = Instant::now() + STOP_GRACE;
+        let deadline = Instant::now() + self.stop_grace;
         while Instant::now() < deadline {
             match self.child.try_wait() {
                 Ok(Some(_)) => return,

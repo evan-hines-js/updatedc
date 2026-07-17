@@ -19,6 +19,11 @@ SERVER_PID="$WORK/server.pid"
 REPO_LOG="$WORK/repository.log"
 TOWER_LOG="$WORK/tower.log"
 PLATFORM="macos-$(case "$(uname -m)" in arm64) echo aarch64;; x86_64) echo x86_64;; *) echo "unsupported Mac architecture: $(uname -m)" >&2; exit 1;; esac)"
+CHECK_INTERVAL="${UPDATED_SMOKE_CHECK_INTERVAL:-2s}"
+HEALTH_GRACE="${UPDATED_SMOKE_HEALTH_GRACE:-10s}"
+CONFIRMATION_WINDOW="${UPDATED_SMOKE_CONFIRMATION_WINDOW:-10s}"
+STOP_GRACE_SECONDS="${UPDATED_SMOKE_STOP_GRACE_SECONDS:-10}"
+LAUNCHD_THROTTLE_SECONDS="${UPDATED_SMOKE_LAUNCHD_THROTTLE_SECONDS:-10}"
 
 usage() {
   cat <<EOF
@@ -33,6 +38,15 @@ Usage: scripts/macos-smoke.sh <command> [argument]
   reset                 Stop and delete this smoke test's state under target/
 
 Optional environment: UPDATED_SMOKE_DIR (default: target/macos-smoke)
+                      UPDATED_SMOKE_PUBLISH_NO_WAIT=1 returns after publishing
+                      UPDATED_SMOKE_REUSE_ARTIFACT=1 reuses an existing version artifact
+                      UPDATED_SMOKE_PREPARE_ONLY=1 builds without publishing
+                      UPDATED_SMOKE_ALLOW_LOWER_PUBLISH=1 permits downgrade metadata
+                      UPDATED_SMOKE_CHECK_INTERVAL (default: 2s)
+                      UPDATED_SMOKE_HEALTH_GRACE (default: 10s)
+                      UPDATED_SMOKE_CONFIRMATION_WINDOW (default: 10s)
+                      UPDATED_SMOKE_STOP_GRACE_SECONDS (default: 10)
+                      UPDATED_SMOKE_LAUNCHD_THROTTLE_SECONDS (default: 10)
 EOF
 }
 
@@ -136,9 +150,9 @@ health_url = "http://127.0.0.1:19090/healthz"
 $reload_config
 
 [timeouts]
-check_interval = "2s"
-health_grace = "10s"
-confirmation_window = "10s"
+check_interval = "$CHECK_INTERVAL"
+health_grace = "$HEALTH_GRACE"
+confirmation_window = "$CONFIRMATION_WINDOW"
 EOF
 
   : >"$REPO_LOG"
@@ -157,9 +171,11 @@ EOF
     <string>--supervisor-config</string><string>$CONFIG</string>
     <string>--supervisor</string><string>$BIN/supervisor</string>
     <string>--ready-timeout</string><string>30</string>
+    <string>--stop-grace</string><string>$STOP_GRACE_SECONDS</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>$LAUNCHD_THROTTLE_SECONDS</integer>
   <key>StandardOutPath</key><string>$TOWER_LOG</string>
   <key>StandardErrorPath</key><string>$TOWER_LOG</string>
 </dict></plist>
@@ -190,13 +206,26 @@ publish() {
     echo "Cannot publish an update: the managed application is unavailable; run '$0 status' and '$0 logs'." >&2
     return 1
   fi
-  build_app "$version" "$artifact"
+  if [[ "${UPDATED_SMOKE_REUSE_ARTIFACT:-0}" == "1" && -x "$artifact" ]]; then
+    : # A stress publisher can reuse bytes prepared for this exact version.
+  else
+    build_app "$version" "$artifact"
+  fi
+  if [[ "${UPDATED_SMOKE_PREPARE_ONLY:-0}" == "1" ]]; then
+    echo "Prepared sampleapp $version at $artifact; not published."
+    return
+  fi
   "$BIN/server" publish --repo "$REPO" --keys "$KEYS" \
     --product app --channel stable --version "$version" \
     --target "$PLATFORM=$artifact"
-  if semver_is_lower "$version" "$current"; then
+  if semver_is_lower "$version" "$current" &&
+      [[ "${UPDATED_SMOKE_ALLOW_LOWER_PUBLISH:-0}" != "1" ]]; then
     echo "Update not selected: $version is below running version $current; downgrades are not supported." >&2
     return 1
+  fi
+  if [[ "${UPDATED_SMOKE_PUBLISH_NO_WAIT:-0}" == "1" ]]; then
+    echo "Published $version; not waiting for the background supervisor."
+    return
   fi
   echo "Published $version; waiting for the background supervisor..."
   for _ in {1..60}; do

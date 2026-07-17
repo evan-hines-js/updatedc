@@ -58,6 +58,7 @@ fn parse_args() -> Result<guardian::Config, String> {
     let mut supervisor_config: Option<PathBuf> = None;
     let mut initial_supervisor: Option<PathBuf> = None;
     let mut ready_timeout = Duration::from_secs(45);
+    let mut stop_grace = Duration::from_secs(10);
 
     let mut args = std::env::args_os().skip(1);
     while let Some(flag) = args.next() {
@@ -66,13 +67,8 @@ fn parse_args() -> Result<guardian::Config, String> {
             "--state-dir" => state_dir = Some(next_path(&mut args, flag)?),
             "--supervisor-config" => supervisor_config = Some(next_path(&mut args, flag)?),
             "--supervisor" => initial_supervisor = Some(next_path(&mut args, flag)?),
-            "--ready-timeout" => {
-                let secs = args
-                    .next()
-                    .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
-                    .ok_or("--ready-timeout needs a whole number of seconds")?;
-                ready_timeout = Duration::from_secs(secs);
-            }
+            "--ready-timeout" => ready_timeout = next_seconds(&mut args, flag)?,
+            "--stop-grace" => stop_grace = next_seconds(&mut args, flag)?,
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -94,6 +90,7 @@ fn parse_args() -> Result<guardian::Config, String> {
         supervisor_config,
         initial_supervisor,
         ready_timeout,
+        stop_grace,
     })
 }
 
@@ -106,15 +103,26 @@ fn next_path(
         .ok_or_else(|| format!("{flag} needs a path"))
 }
 
+fn next_seconds(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    flag: &str,
+) -> Result<Duration, String> {
+    args.next()
+        .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("{flag} needs a whole number of seconds"))
+}
+
 fn usage() {
     eprintln!(
         "bootstrap — the update tower's root and the application's permanent guardian\n\n\
          usage: bootstrap --state-dir <dir> --supervisor-config <path.toml> \\\n\
-         \x20                [--supervisor <path>] [--ready-timeout <secs>]\n\n\
+         \x20                [--supervisor <path>] [--ready-timeout <secs>] [--stop-grace <secs>]\n\n\
          --state-dir          where the guardian keeps ownership + supervisor pointers\n\
          --supervisor-config  operator config, passed verbatim to each supervisor\n\
          --supervisor         initial supervisor binary (first boot only; seeds the pointer)\n\
-         --ready-timeout      how long a replacement supervisor has to prove ready (default 45s)"
+         --ready-timeout      how long a replacement supervisor has to prove ready (default 45s)\n\
+         --stop-grace         graceful process-stop deadline before a hard kill (default 10s)"
     );
 }
 

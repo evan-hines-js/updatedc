@@ -98,10 +98,41 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  macos-publish-fuzz:
+    name: macOS concurrent publish fuzz
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start production-shaped update tower
+        env:
+          UPDATED_SMOKE_CHECK_INTERVAL: 1s
+          UPDATED_SMOKE_HEALTH_GRACE: 2s
+          UPDATED_SMOKE_CONFIRMATION_WINDOW: 2s
+          UPDATED_SMOKE_STOP_GRACE_SECONDS: 1
+          UPDATED_SMOKE_LAUNCHD_THROTTLE_SECONDS: 1
+        run: ./scripts/macos-smoke.sh start
+      - name: Fuzz concurrent version publication and convergence
+        run: ./scripts/macos-publish-fuzz.sh
+      - name: Preserve failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-publish-fuzz-logs
+          path: |
+            target/macos-smoke/*.log
+            target/macos-smoke/publish-fuzz-results/
+          if-no-files-found: warn
+      - name: Stop update tower and remove smoke state
+        if: always()
+        run: ./scripts/macos-smoke.sh reset
+
   release:
     name: Publish rolling release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, trivy]
+    needs: [test, trivy, macos-publish-fuzz]
     runs-on: ubuntu-latest
     permissions:
       contents: write

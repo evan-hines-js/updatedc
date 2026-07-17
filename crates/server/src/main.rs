@@ -7,6 +7,7 @@
 //!
 //! Publishing is an offline/CI operation; a deployed client never runs it.
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -100,9 +101,26 @@ async fn publish(args: &[String]) -> R {
     for t in &targets {
         println!("  {}", t.name);
     }
+
+    // `publish` is commonly invoked as many short-lived CLI processes (the
+    // smoke fuzzer does exactly that), so an in-process mutex is insufficient.
+    // Keep the development server's single-writer policy here rather than in
+    // the reusable TUF authoring library.
+    let _publish_lock = lock_publisher(&repo_dir)?;
     repo::add_release(&repo_dir, &keys, targets, expiry_days).await?;
     println!("published {product} {version} on channel {channel}");
     Ok(())
+}
+
+fn lock_publisher(repo_dir: &Path) -> std::io::Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(repo_dir.join(".publish.lock"))?;
+    lock.lock()?;
+    Ok(lock)
 }
 
 // --- serve ------------------------------------------------------------------
@@ -289,5 +307,31 @@ mod tests {
                 "macos-aarch64=./b".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn publisher_lock_excludes_other_publishers() {
+        let dir = std::env::temp_dir().join(format!(
+            "updated-server-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = lock_publisher(&dir).unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(".publish.lock"))
+            .unwrap();
+        assert!(matches!(
+            second.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        drop(first);
+        second.try_lock().unwrap();
+        drop(second);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

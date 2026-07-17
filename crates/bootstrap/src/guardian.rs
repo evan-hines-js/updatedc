@@ -24,10 +24,6 @@ use crate::supervisor::{Link, Supervisor};
 
 /// How often the serve loop wakes to re-check the application, the supervisor, and shutdown.
 const SERVE_POLL_MS: i32 = 100;
-/// Grace before a hard kill when stopping the application (for an update swap, or a
-/// clean service stop). The init system's own stop timeout is the outer bound.
-const APP_STOP_GRACE: Duration = Duration::from_secs(10);
-
 /// The guardian's configuration, all from the command line — it parses no config file
 /// (that is the supervisor's job; the path is passed through opaquely).
 pub struct Config {
@@ -37,6 +33,8 @@ pub struct Config {
     /// Seed for `desired-supervisor` on first boot, if not already recorded.
     pub initial_supervisor: Option<PathBuf>,
     pub ready_timeout: Duration,
+    /// Grace before hard-killing an application or supervisor during shutdown.
+    pub stop_grace: Duration,
 }
 
 /// Exponential backoff for relaunching a failed supervisor.
@@ -127,7 +125,7 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
 
     // Transparent clean stop: forward it down to the application.
     info("stop requested; stopping the application and exiting");
-    app.stop(APP_STOP_GRACE);
+    app.stop(cfg.stop_grace);
     Ok(0)
 }
 
@@ -159,8 +157,13 @@ fn run_supervisor(
     // so it adopts rather than launching a duplicate.
     let app_pid = if app.is_running() { app.pid() } else { None };
 
-    let mut sup = match Supervisor::launch(&binary, &cfg.supervisor_config, &cfg.state_dir, app_pid)
-    {
+    let mut sup = match Supervisor::launch(
+        &binary,
+        &cfg.supervisor_config,
+        &cfg.state_dir,
+        app_pid,
+        cfg.stop_grace,
+    ) {
         Ok(sup) => sup,
         Err(e) => {
             if let Some(path) = &candidate {
@@ -294,7 +297,7 @@ fn dispatch<L: Link>(
     pending_replace: &mut Option<PathBuf>,
 ) -> control::Result<()> {
     let response = match req {
-        Request::Launch(spec) => match app.launch(&spec, APP_STOP_GRACE) {
+        Request::Launch(spec) => match app.launch(&spec, cfg.stop_grace) {
             Ok(pid) => {
                 info(&format!("launched application pid {pid}"));
                 Response::Launched { pid }
@@ -305,7 +308,7 @@ fn dispatch<L: Link>(
             }
         },
         Request::Stop => {
-            app.stop(APP_STOP_GRACE);
+            app.stop(cfg.stop_grace);
             Response::Ok
         }
         Request::ReplaceSupervisor(path) => {
@@ -514,6 +517,7 @@ mod tests {
             supervisor_config: PathBuf::from("/etc/supervisor.toml"),
             initial_supervisor: initial,
             ready_timeout: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(10),
         }
     }
 

@@ -602,6 +602,20 @@ For production-shaped local macOS validation, `scripts/macos-smoke.sh publish
 log messages as a control protocol. It checks the live version and fails immediately
 when asked to publish a version below the running version. Downgrades are not supported.
 
+After starting the smoke tower, `scripts/macos-publish-fuzz.sh` concurrently publishes
+bursts of three or four fresh random versions. It continues as soon as the application
+selects the greatest published version, completing as many bursts as possible in ten
+minutes and allowing the last started burst to finish. Every burst has a 30-second
+convergence timeout, and every burst is generated above the preceding maximum so each
+successful check represents a real upgrade. Each burst also publishes a corrupt executable
+above its valid releases, requiring guardian restart, recovery rejection and rollback
+before selection of the greatest valid version. The smoke tower's check interval, health
+grace, confirmation window, guardian process-stop grace, and launchd restart throttle are
+configurable with `UPDATED_SMOKE_*` variables so CI can exercise this realistic path
+rapidly. The fuzzer fails immediately if more than 30 consecutive availability probes fail.
+Fuzz duration, timeout, batch-size range, availability limit, and version-major prefix are
+configurable through `UPDATED_SMOKE_FUZZ_*` variables.
+
 ### Durable state files
 
 The important files are all atomically written beside the configured state or
