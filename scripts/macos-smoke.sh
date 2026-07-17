@@ -18,7 +18,12 @@ CONFIG="$WORK/config.toml"
 SERVER_PID="$WORK/server.pid"
 REPO_LOG="$WORK/repository.log"
 TOWER_LOG="$WORK/tower.log"
-PLATFORM="macos-$(case "$(uname -m)" in arm64) echo aarch64;; x86_64) echo x86_64;; *) echo "unsupported Mac architecture: $(uname -m)" >&2; exit 1;; esac)"
+MACHINE="$(uname -m)"
+case "$MACHINE" in
+  arm64) PLATFORM="macos-aarch64" ;;
+  x86_64) PLATFORM="macos-x86_64" ;;
+  *) echo "unsupported Mac architecture: $MACHINE" >&2; exit 1 ;;
+esac
 CHECK_INTERVAL="${UPDATED_SMOKE_CHECK_INTERVAL:-2s}"
 HEALTH_GRACE="${UPDATED_SMOKE_HEALTH_GRACE:-10s}"
 CONFIRMATION_WINDOW="${UPDATED_SMOKE_CONFIRMATION_WINDOW:-10s}"
