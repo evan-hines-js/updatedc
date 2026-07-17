@@ -10,9 +10,12 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::{timeout, Duration};
 use updated_tuf::repo::{self, PublishTarget};
 
 type R = Result<(), Box<dyn std::error::Error>>;
@@ -131,11 +134,14 @@ async fn serve(args: &[String]) -> R {
     let root = tokio::fs::canonicalize(&repo_dir).await?;
 
     let listener = TcpListener::bind(&addr).await?;
+    let connections = Arc::new(Semaphore::new(128));
     println!("serving {} on http://{addr}", root.display());
     loop {
         let (stream, _) = listener.accept().await?;
+        let permit = connections.clone().acquire_owned().await?;
         let root = root.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = serve_conn(stream, &root).await;
         });
     }
@@ -145,16 +151,21 @@ async fn serve_conn(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
     // Read request headers (bounded).
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
+                break;
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
-            break;
-        }
-    }
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "request header timeout"))??;
     let head = String::from_utf8_lossy(&buf);
     let path = head
         .lines()
@@ -171,8 +182,8 @@ async fn serve_conn(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
     });
 
     match resolve(root, path) {
-        Some(file) => match tokio::fs::read(&file).await {
-            Ok(body) => respond(&mut stream, body, range_start).await,
+        Some(file) => match tokio::fs::File::open(&file).await {
+            Ok(file) => respond_file(&mut stream, file, range_start).await,
             Err(_) => respond_status(&mut stream, 404, b"not found").await,
         },
         None => respond_status(&mut stream, 404, b"not found").await,
@@ -186,11 +197,16 @@ async fn serve_conn(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
 fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
     let path = path.split('?').next().unwrap_or(path);
     let mut out = root.to_path_buf();
-    for part in path.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        if part == ".." || part.contains('\\') {
+    let mut parts = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".");
+    let namespace = parts.next()?;
+    if !matches!(namespace, "metadata" | "targets") {
+        return None;
+    }
+    out.push(namespace);
+    for part in parts {
+        if part == ".." || part.contains('\\') || part.starts_with('.') {
             return None;
         }
         out.push(part);
@@ -200,31 +216,58 @@ fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
     canonical.starts_with(root).then_some(canonical)
 }
 
-async fn respond(stream: &mut TcpStream, body: Vec<u8>, range_start: Option<usize>) {
-    match range_start {
-        Some(start) if start <= body.len() => {
-            let slice = &body[start..];
+async fn respond_file(
+    stream: &mut TcpStream,
+    mut file: tokio::fs::File,
+    range_start: Option<usize>,
+) {
+    let Ok(length) = file.metadata().await.map(|m| m.len()) else {
+        respond_status(stream, 404, b"not found").await;
+        return;
+    };
+    let start = range_start.map(|n| n as u64).filter(|&n| n <= length);
+    let (header, offset) = match start {
+        Some(start) => {
+            let remaining = length - start;
             let hdr = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\n\
                  Content-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len().saturating_sub(1),
-                body.len(),
-                slice.len()
+                length.saturating_sub(1),
+                length,
+                remaining
             );
-            let _ = stream.write_all(hdr.as_bytes()).await;
-            let _ = stream.write_all(slice).await;
+            (hdr, start)
         }
         _ => {
             let hdr = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
                  Content-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
-                body.len()
+                length
             );
-            let _ = stream.write_all(hdr.as_bytes()).await;
-            let _ = stream.write_all(&body).await;
+            (hdr, 0)
+        }
+    };
+    if file.seek(std::io::SeekFrom::Start(offset)).await.is_err()
+        || write_with_timeout(stream, header.as_bytes()).await.is_err()
+    {
+        return;
+    }
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let Ok(n) = file.read(&mut chunk).await else {
+            return;
+        };
+        if n == 0 || write_with_timeout(stream, &chunk[..n]).await.is_err() {
+            break;
         }
     }
     let _ = stream.flush().await;
+}
+
+async fn write_with_timeout(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+    timeout(Duration::from_secs(30), stream.write_all(bytes))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "response write timeout"))?
 }
 
 async fn respond_status(stream: &mut TcpStream, code: u16, body: &[u8]) {
@@ -283,10 +326,13 @@ mod tests {
 
     #[test]
     fn resolve_allows_nested_target_paths() {
-        let root = std::env::temp_dir();
-        // A nested, non-escaping path resolves under root (file need not exist for
-        // the traversal checks, but canonicalize requires it, so use root itself).
-        assert!(resolve(&std::fs::canonicalize(&root).unwrap(), "/").is_some());
+        let root = std::env::temp_dir().join(format!("server-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("targets/products")).unwrap();
+        std::fs::create_dir_all(root.join("metadata")).unwrap();
+        std::fs::write(root.join("targets/products/app"), b"target").unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        assert!(resolve(&root, "/targets/products/app").is_some());
+        assert!(resolve(&root, "/metadata").is_some());
     }
 
     #[test]
@@ -294,6 +340,8 @@ mod tests {
         let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         assert!(resolve(&root, "/../etc/passwd").is_none());
         assert!(resolve(&root, "/a/../../etc").is_none());
+        assert!(resolve(&root, "/.publish.lock").is_none());
+        assert!(resolve(&root, "/keys/root.pk8").is_none());
     }
 
     #[test]

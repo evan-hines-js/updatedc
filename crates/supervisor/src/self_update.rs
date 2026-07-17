@@ -9,14 +9,14 @@ pub(crate) struct SelfUpdateState {
 }
 
 impl SelfUpdateState {
-    pub(crate) fn load(opts: &Options) -> Self {
+    pub(crate) fn load(opts: &Options) -> io::Result<Self> {
         let path = opts.supervisor_update.state_dir.join("supervisor-rejected");
         // Effectively-permanent suppression: the remedy for a bad supervisor release is
         // a corrected republish (new bytes ⇒ new hash), not the passage of time.
-        SelfUpdateState {
+        Ok(SelfUpdateState {
             next_check: Instant::now(),
-            rejected: Rejections::load(&path, updated::reject::REJECT_TTL),
-        }
+            rejected: Rejections::load(&path, updated::reject::REJECT_TTL)?,
+        })
     }
 
     pub(crate) fn due(&self, now: Instant) -> bool {

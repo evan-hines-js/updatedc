@@ -637,7 +637,9 @@ The portable default is stop → swap → start. On Unix, `application.reload_co
 may instead trigger a same-PID re-exec that preserves listening sockets. It receives
 `UPDATED_CHILD_PID` and `UPDATED_BINARY`; `application.health_url` is required,
 and readiness must echo both the launch token and `X-Updated-Version`. Commands
-that fork or hand off to another PID are unsupported.
+that fork or hand off to another PID are unsupported. The value is an argv array,
+executed directly without a shell; exact `{pid}` and `{binary}` arguments expand to
+the managed process ID and binary path.
 
 Production deployments run `bootstrap --state-dir ... --supervisor-config ... --supervisor ...` under
 systemd, launchd, or Windows SCM. Direct supervisor execution is rejected, and

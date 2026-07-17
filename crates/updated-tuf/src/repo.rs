@@ -264,6 +264,28 @@ pub async fn add_release(
         validate_target_name(&pt.name)?;
     }
 
+    // Snapshot each caller-owned artifact once into exclusive repository staging. The
+    // signed hash and the eventually published bytes are both read from this immutable
+    // copy, so a concurrent build/cleanup process cannot change the source between hash
+    // and publication.
+    let mut staged = StagedArtifacts::default();
+    for pt in &targets {
+        let (file, path) = foundation::durable::create_temp(&targets_dir, ".publish-")
+            .map_err(|e| err("creating artifact staging file", e))?;
+        let mut dst = tokio::fs::File::from_std(file);
+        let mut src = tokio::fs::File::open(&pt.source)
+            .await
+            .map_err(|e| err("opening target artifact", e))?;
+        tokio::io::copy(&mut src, &mut dst)
+            .await
+            .map_err(|e| err("staging target artifact", e))?;
+        dst.sync_all()
+            .await
+            .map_err(|e| err("syncing target artifact", e))?;
+        drop(dst);
+        staged.0.push(path);
+    }
+
     // Load the current repository to learn its metadata versions (bump = +1).
     let root = tokio::fs::read(&root_path)
         .await
@@ -292,8 +314,8 @@ pub async fn add_release(
         .timestamp_version(next_timestamp)
         .timestamp_expires(expires);
 
-    for pt in &targets {
-        let mut target = Target::from_path(&pt.source)
+    for (pt, staged_path) in targets.iter().zip(&staged.0) {
+        let mut target = Target::from_path(staged_path)
             .await
             .map_err(|e| err("hashing target", e))?;
         for (k, v) in &pt.custom {
@@ -314,22 +336,41 @@ pub async fn add_release(
         .map_err(|e| err("signing release", e))?;
 
     // Place artifacts, then write metadata (timestamp is the visibility commit).
-    for pt in &targets {
+    for (pt, staged_path) in targets.iter().zip(&staged.0) {
         let dest = targets_dir.join(&pt.name);
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| err("creating target dir", e))?;
         }
-        tokio::fs::copy(&pt.source, &dest)
-            .await
-            .map_err(|e| err("copying target artifact", e))?;
+        foundation::durable::replace(staged_path, &dest)
+            .map_err(|e| err("publishing target artifact", e))?;
+        foundation::durable::sync_dir(dest.parent().unwrap_or(&targets_dir))
+            .map_err(|e| err("syncing target directory", e))?;
     }
     signed
         .write(&metadata_dir)
         .await
         .map_err(|e| err("writing release metadata", e))?;
     Ok(())
+}
+
+#[derive(Default)]
+struct StagedArtifacts(Vec<PathBuf>);
+
+impl Drop for StagedArtifacts {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: removing publish staging file {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn load_signer(path: &Path) -> Result<impl Sign> {

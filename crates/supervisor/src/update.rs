@@ -256,7 +256,7 @@ pub(crate) async fn apply_update<T: Control + Health>(
     chaos.crossing(boundary::STATE_COMMITTED);
     // A first install has no predecessor to revert to; drop the rollback copy.
     if first_install {
-        store.drop_rollback();
+        store.drop_rollback()?;
     }
     // The update is durable now: the binary is swapped and the installed state (with its
     // pending intent) is committed. Failing to delete the spent journal must NOT report the
@@ -321,7 +321,7 @@ pub(crate) enum Restart {
     StopStart,
     /// Zero-downtime: swap in place while the server keeps serving, then run an operator
     /// command that signals it to re-exec into the new binary (same PID).
-    Reload { command: String },
+    Reload { command: Vec<String> },
 }
 
 impl Restart {
@@ -333,22 +333,23 @@ impl Restart {
     }
 }
 
-/// Run the operator's reload command, exposing the application PID and binary path.
-pub(crate) fn run_reload(command: &str, binary: &Path, pid: u32) -> io::Result<()> {
-    #[cfg(unix)]
-    let mut cmd = {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(command);
-        c
-    };
-    #[cfg(windows)]
-    let mut cmd = {
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
-        c
-    };
+/// Run the configured reload executable directly. Placeholder expansion is exact-token
+/// only, keeping argument boundaries stable and eliminating implicit shell evaluation.
+pub(crate) fn run_reload(command: &[String], binary: &Path, pid: u32) -> io::Result<()> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "reload command is empty"))?;
+    let pid = pid.to_string();
+    let mut cmd = Command::new(program);
+    for arg in args {
+        match arg.as_str() {
+            "{pid}" => cmd.arg(&pid),
+            "{binary}" => cmd.arg(binary),
+            _ => cmd.arg(arg),
+        };
+    }
     let status = cmd
-        .env(env::CHILD_PID, pid.to_string())
+        .env(env::CHILD_PID, &pid)
         .env(env::BINARY, binary)
         .status()?;
     if status.success() {

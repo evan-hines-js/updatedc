@@ -119,6 +119,23 @@ async fn publish_then_verify_and_download() {
     repo.download_target(&found, &out).await.unwrap();
     assert_eq!(std::fs::read(&out).unwrap(), b"hello-app-1.0.0");
 
+    // A pre-planted destination symlink is replaced as a directory entry; its target is
+    // never opened or truncated by the privileged download path.
+    #[cfg(unix)]
+    {
+        let victim = tmp.join("victim");
+        let redirected = tmp.join("redirected-download");
+        std::fs::write(&victim, b"do-not-touch").unwrap();
+        std::os::unix::fs::symlink(&victim, &redirected).unwrap();
+        repo.download_target(&found, &redirected).await.unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"hello-app-1.0.0");
+        assert!(!std::fs::symlink_metadata(&redirected)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     // The target byte cap fails closed when exceeded, and is inclusive at exactly the
     // target size (the boundary the streaming check enforces).
     let mut tight = client_config(&repo_dir);

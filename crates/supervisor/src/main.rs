@@ -140,7 +140,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let guardian = Guardian::connect().map_err(|e| format!("connecting to the guardian: {e}"))?;
     let guardian_state = guardian::state_dir();
 
-    let mut store = FileStore::open(opts.paths.clone(), opts.timeouts.retry_after);
+    let mut store = FileStore::open(opts.paths.clone(), opts.timeouts.retry_after)?;
 
     // Gather the whole world into a Situation and let the pure boot planner decide
     // everything: recovery, drift enforcement, crash rejection, pending confirm/revert,
@@ -161,7 +161,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let updates_enabled = plan.updates_enabled;
     let mut current = plan.current.clone();
 
-    let mut self_update = SelfUpdateState::load(&opts);
+    let mut self_update = SelfUpdateState::load(&opts)?;
 
     // Perform the plan's durable reconciliation (binary, rejections, commit), yielding the
     // still-unconfirmed update (if any) for the loop to confirm once its window passes.
@@ -352,9 +352,15 @@ fn gather_situation(
         disk_sha: store.binary_sha(),
         old_sha: store.rollback_sha(),
         journal: store.journal()?,
-        app_crashed: guardian_state.is_some_and(guardian::take_crash_marker),
+        app_crashed: match guardian_state {
+            Some(state) => guardian::take_crash_marker(state)?,
+            None => false,
+        },
         app_running: guardian::adopted_app_pid(),
-        bad_supervisor: guardian_state.and_then(guardian::take_rejected_supervisor),
+        bad_supervisor: match guardian_state {
+            Some(state) => guardian::take_rejected_supervisor(state)?,
+            None => None,
+        },
         confirm_window: opts.timeouts.confirmation_window,
         now: now_unix(),
     })
@@ -399,7 +405,7 @@ fn apply_store_plan(plan: &Plan, store: &mut dyn Store) -> io::Result<()> {
     match &plan.binary {
         BinaryFix::None => {}
         BinaryFix::RestoreCommitted { sha } => store.restore_committed(sha)?,
-        BinaryFix::DropRollback => store.drop_rollback(),
+        BinaryFix::DropRollback => store.drop_rollback()?,
     }
     if plan.clear_journal {
         store.clear_journal()?;
@@ -408,7 +414,7 @@ fn apply_store_plan(plan: &Plan, store: &mut dyn Store) -> io::Result<()> {
         store.reject(hash)?;
     }
     if plan.drop_rollback {
-        store.drop_rollback();
+        store.drop_rollback()?;
     }
     Ok(())
 }
@@ -437,7 +443,11 @@ fn confirm_update(store: &mut dyn Store) -> bool {
             return false;
         }
     }
-    store.drop_rollback();
+    if let Err(e) = store.drop_rollback() {
+        warn(&format!(
+            "update confirmed but rollback cleanup failed: {e}"
+        ));
+    }
     true
 }
 

@@ -19,7 +19,7 @@ const DESIRED_FILE: &str = "desired-supervisor";
 
 /// The committed supervisor binary path. `None` on first boot (the installer or the
 /// `--supervisor` flag seeds it).
-pub fn desired_supervisor(state_dir: &Path) -> Option<PathBuf> {
+pub fn desired_supervisor(state_dir: &Path) -> std::io::Result<Option<PathBuf>> {
     read_pointer(&state_dir.join(DESIRED_FILE))
 }
 
@@ -27,14 +27,32 @@ pub fn set_desired_supervisor(state_dir: &Path, path: &Path) -> std::io::Result<
     write_pointer(&state_dir.join(DESIRED_FILE), path)
 }
 
-fn read_pointer(path: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(path).ok()?;
+fn read_pointer(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let mut lines = text.lines();
-    if lines.next()? != "supervisor-v1" {
-        return None;
+    if lines.next() != Some("supervisor-v1") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid desired-supervisor header",
+        ));
     }
-    let p = lines.next()?;
-    (!p.is_empty()).then(|| PathBuf::from(p))
+    let p = lines.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "desired-supervisor path is missing",
+        )
+    })?;
+    if p.is_empty() || lines.next().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "desired-supervisor record is malformed",
+        ));
+    }
+    Ok(Some(PathBuf::from(p)))
 }
 
 fn write_pointer(path: &Path, target: &Path) -> std::io::Result<()> {
@@ -87,10 +105,20 @@ mod tests {
     #[test]
     fn desired_supervisor_pointer_round_trips() {
         let d = dir("desired");
-        assert!(desired_supervisor(&d).is_none());
+        assert!(desired_supervisor(&d).unwrap().is_none());
         let p = d.join("supervisors/deadbeef/supervisor");
         set_desired_supervisor(&d, &p).unwrap();
-        assert_eq!(desired_supervisor(&d), Some(p));
+        assert_eq!(desired_supervisor(&d).unwrap(), Some(p));
+    }
+
+    #[test]
+    fn corrupt_pointer_is_an_error_not_first_boot() {
+        let d = dir("corrupt-desired");
+        std::fs::write(d.join(DESIRED_FILE), b"not-a-pointer\n").unwrap();
+        assert_eq!(
+            desired_supervisor(&d).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

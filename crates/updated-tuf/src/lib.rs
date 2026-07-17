@@ -222,9 +222,16 @@ impl TrustedRepository {
                 ))
             })?;
 
-        let mut file = tokio::fs::File::create(destination)
-            .await
-            .map_err(|e| Error::Local(format!("creating {}: {e}", destination.display())))?;
+        if target.length > self.config.target_limit {
+            return Err(Error::Trust(format!(
+                "target {} exceeded the {} byte limit",
+                target.path, self.config.target_limit
+            )));
+        }
+        let dir = destination.parent().unwrap_or_else(|| Path::new("."));
+        let (file, temporary) = foundation::durable::create_temp(dir, ".target-")
+            .map_err(|e| Error::Local(format!("creating target staging file: {e}")))?;
+        let mut file = tokio::fs::File::from_std(file);
         let mut written = 0u64;
         tokio::pin!(stream);
         let result = async {
@@ -256,9 +263,27 @@ impl TrustedRepository {
         .await;
         if result.is_err() {
             drop(file);
-            let _ = tokio::fs::remove_file(destination).await;
+            if let Err(cleanup) = tokio::fs::remove_file(&temporary).await {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    return Err(Error::Local(format!(
+                        "{result:?}; also removing partial target {} failed: {cleanup}",
+                        temporary.display()
+                    )));
+                }
+            }
+            return result;
         }
-        result
+        drop(file);
+        foundation::durable::replace(&temporary, destination).map_err(|e| {
+            let _ = std::fs::remove_file(&temporary);
+            Error::Local(format!(
+                "installing staged target {}: {e}",
+                destination.display()
+            ))
+        })?;
+        foundation::durable::sync_dir(dir)
+            .map_err(|e| Error::Local(format!("syncing target directory: {e}")))?;
+        Ok(())
     }
 }
 

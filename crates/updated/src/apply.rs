@@ -9,8 +9,8 @@ pub fn old_path(target: &Path) -> PathBuf {
     crate::config::with_suffix(target, ".old")
 }
 
-pub fn cleanup_previous(target: &Path) {
-    let _ = fs::remove_file(old_path(target));
+pub fn cleanup_previous(target: &Path) -> io::Result<()> {
+    remove_file_durable(&old_path(target))
 }
 
 /// Restore the previous binary saved during the last update. Streams from
@@ -222,7 +222,7 @@ mod tests {
 
         // Committing the update drops the rollback image.
         assert!(old_path(&target).exists());
-        cleanup_previous(&target);
+        cleanup_previous(&target).unwrap();
         assert!(
             !old_path(&target).exists(),
             "cleanup removes the rollback copy"

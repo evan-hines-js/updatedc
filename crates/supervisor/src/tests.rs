@@ -516,7 +516,7 @@ fn restart_mode_names_are_stable() {
     assert_eq!(Restart::StopStart.name(), "stop-start");
     assert_eq!(
         Restart::Reload {
-            command: "reexec".into()
+            command: vec!["reexec".into()]
         }
         .name(),
         "reload-command"
@@ -529,11 +529,23 @@ fn run_reload_maps_the_command_exit_status_to_success_or_error() {
     // The zero-downtime reload succeeds only if the operator command signalling the app to
     // re-exec exits cleanly; a nonzero exit is a failed reload (→ rollback).
     use std::path::Path;
-    assert!(run_reload("exit 0", Path::new("/app"), 1).is_ok());
+    assert!(run_reload(&["true".into()], Path::new("/app"), 1).is_ok());
     assert!(
-        run_reload("exit 7", Path::new("/app"), 1).is_err(),
+        run_reload(&["false".into()], Path::new("/app"), 1).is_err(),
         "a nonzero reload-command exit is an error"
     );
+    assert!(run_reload(
+        &["test".into(), "{pid}".into(), "=".into(), "42".into()],
+        Path::new("/app"),
+        42
+    )
+    .is_ok());
+    assert!(run_reload(
+        &["test".into(), "{binary}".into(), "=".into(), "/app".into()],
+        Path::new("/app"),
+        1
+    )
+    .is_ok());
 }
 
 // ================================= full fuzzing =================================

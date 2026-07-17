@@ -197,11 +197,11 @@ fn recover_transaction(paths: &updated::config::Paths) -> io::Result<()> {
     };
     let disk_sha = hash::sha256_file(&paths.binary).unwrap_or_default();
     match transaction::classify_recovery(&tx, &disk_sha, committed_version.as_deref()) {
-        Recovery::Committed | Recovery::NeverSwapped => apply::cleanup_previous(&paths.binary),
+        Recovery::Committed | Recovery::NeverSwapped => apply::cleanup_previous(&paths.binary)?,
         Recovery::RestorePredecessor => {
             apply::rollback(&paths.binary)?;
             hash::verify_file(&paths.binary, &tx.old_sha256)?;
-            apply::cleanup_previous(&paths.binary);
+            apply::cleanup_previous(&paths.binary)?;
         }
     }
     transaction::clear(&paths.journal)?;
@@ -220,7 +220,8 @@ async fn update_to_newest(
         .await
         .map_err(|e| format!("repository unavailable: {e}"))?;
 
-    let mut rejected = Rejections::load(&paths.rejected, cfg.timeouts.retry_after);
+    let mut rejected = Rejections::load(&paths.rejected, cfg.timeouts.retry_after)
+        .map_err(|e| format!("reading rejection state: {e}"))?;
     let policy = DefaultPolicy::current(
         cfg.application.product.clone(),
         cfg.application.channel.clone(),
@@ -297,7 +298,12 @@ async fn update_to_newest(
             &format!("{version} committed but clearing its journal failed ({e}); next launch will finish cleanup"),
         );
     }
-    apply::cleanup_previous(&paths.binary);
+    if let Err(e) = apply::cleanup_previous(&paths.binary) {
+        warn(
+            COMPONENT,
+            &format!("{version} committed but rollback cleanup failed: {e}"),
+        );
+    }
     if let Err(e) = rejected.clear(&sha) {
         warn(
             COMPONENT,
@@ -330,7 +336,8 @@ fn ensure_runnable(binary: &Path, committed_sha: &str) -> Result<(), String> {
             apply::rollback(binary).map_err(|e| format!("restoring committed binary: {e}"))?;
             hash::verify_file(binary, sha)
                 .map_err(|e| format!("verifying restored committed binary: {e}"))?;
-            apply::cleanup_previous(binary);
+            apply::cleanup_previous(binary)
+                .map_err(|e| format!("cleaning restored rollback image: {e}"))?;
             Ok(())
         }
         BinaryAction::FailClosed => Err(

@@ -129,21 +129,42 @@ pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
 
 /// Read and clear the guardian's crash marker: `true` if the last application exit was a
 /// crash (so an unconfirmed update should revert to its predecessor).
-pub(crate) fn take_crash_marker(state_dir: &Path) -> bool {
+pub(crate) fn take_crash_marker(state_dir: &Path) -> std::io::Result<bool> {
     let path = state_dir.join(control::CRASH_MARKER_FILE);
-    let present = path.exists();
-    let _ = std::fs::remove_file(&path);
-    present
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            updated::apply::remove_file_durable(&path)?;
+            Ok(true)
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("crash marker {} is not a regular file", path.display()),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Read and clear the guardian's rejected-supervisor marker: the path of a candidate
 /// supervisor that failed its readiness gate, so this supervisor records the rejection.
-pub(crate) fn take_rejected_supervisor(state_dir: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn take_rejected_supervisor(
+    state_dir: &Path,
+) -> std::io::Result<Option<std::path::PathBuf>> {
     let path = state_dir.join(control::REJECTED_SUPERVISOR_FILE);
-    let content = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    updated::apply::remove_file_durable(&path)?;
     let trimmed = content.trim();
-    (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+    if trimmed.is_empty() || content.lines().count() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rejected-supervisor marker is malformed",
+        ));
+    }
+    Ok(Some(std::path::PathBuf::from(trimmed)))
 }
 
 fn read_ready_nonce() -> Result<Nonce, String> {
@@ -232,5 +253,35 @@ impl Conn {
 
     fn writer(&mut self) -> &mut std::fs::File {
         &mut self.writer
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("supervisor-markers-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn crash_marker_is_consumed_once() {
+        let state = dir("crash");
+        std::fs::write(state.join(control::CRASH_MARKER_FILE), b"crashed\n").unwrap();
+        assert!(take_crash_marker(&state).unwrap());
+        assert!(!take_crash_marker(&state).unwrap());
+    }
+
+    #[test]
+    fn malformed_markers_fail_closed() {
+        let state = dir("malformed");
+        std::fs::create_dir(state.join(control::CRASH_MARKER_FILE)).unwrap();
+        assert!(take_crash_marker(&state).is_err());
+        std::fs::write(state.join(control::REJECTED_SUPERVISOR_FILE), b"one\ntwo\n").unwrap();
+        assert!(take_rejected_supervisor(&state).is_err());
     }
 }

@@ -139,9 +139,11 @@ fn run_supervisor(
 ) -> Result<Cycle, String> {
     let binary = match &candidate {
         Some(path) => path.clone(),
-        None => record::desired_supervisor(&cfg.state_dir).ok_or_else(|| {
-            "no committed supervisor recorded and none supplied (--supervisor)".to_string()
-        })?,
+        None => record::desired_supervisor(&cfg.state_dir)
+            .map_err(|e| format!("reading committed supervisor pointer: {e}"))?
+            .ok_or_else(|| {
+                "no committed supervisor recorded and none supplied (--supervisor)".to_string()
+            })?,
     };
     validate_supervisor_path(cfg, &binary, candidate.is_some())?;
 
@@ -362,8 +364,9 @@ fn dispatch<L: Link>(
 
 /// On first boot, record the supplied initial supervisor as the committed one.
 fn seed_desired_supervisor(cfg: &Config) -> Result<(), String> {
-    if record::desired_supervisor(&cfg.state_dir).is_some() {
-        let committed = record::desired_supervisor(&cfg.state_dir).expect("checked above");
+    if let Some(committed) = record::desired_supervisor(&cfg.state_dir)
+        .map_err(|e| format!("reading committed supervisor pointer: {e}"))?
+    {
         return validate_supervisor_path(cfg, &committed, false);
     }
     let initial = cfg
@@ -711,7 +714,7 @@ mod tests {
         .unwrap();
         assert!(committed, "the matching nonce commits the candidate");
         assert_eq!(
-            record::desired_supervisor(&c.state_dir),
+            record::desired_supervisor(&c.state_dir).unwrap(),
             Some(cand),
             "commits exactly the candidate path"
         );
@@ -738,7 +741,7 @@ mod tests {
         .unwrap();
         assert!(!committed, "a wrong nonce must not commit");
         assert!(
-            record::desired_supervisor(&c.state_dir).is_none(),
+            record::desired_supervisor(&c.state_dir).unwrap().is_none(),
             "the desired pointer is untouched"
         );
         assert_eq!(
@@ -767,7 +770,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            record::desired_supervisor(&c.state_dir).is_none(),
+            record::desired_supervisor(&c.state_dir).unwrap().is_none(),
             "an already-committed serve never re-commits"
         );
     }
@@ -827,7 +830,7 @@ mod tests {
             "a committed candidate is never rejected"
         );
         assert_eq!(
-            record::desired_supervisor(&c.state_dir),
+            record::desired_supervisor(&c.state_dir).unwrap(),
             Some(cand),
             "and it was committed"
         );
@@ -858,7 +861,7 @@ mod tests {
         record::set_desired_supervisor(&c.state_dir, &existing).unwrap();
         seed_desired_supervisor(&c).unwrap();
         assert_eq!(
-            record::desired_supervisor(&c.state_dir),
+            record::desired_supervisor(&c.state_dir).unwrap(),
             Some(existing),
             "an existing pointer is left put"
         );
@@ -871,7 +874,10 @@ mod tests {
         std::fs::write(&initial, b"binary").unwrap();
         let c = cfg(dir, Some(initial.clone()));
         seed_desired_supervisor(&c).unwrap();
-        assert_eq!(record::desired_supervisor(&c.state_dir), Some(initial));
+        assert_eq!(
+            record::desired_supervisor(&c.state_dir).unwrap(),
+            Some(initial)
+        );
     }
 
     #[test]
@@ -887,5 +893,19 @@ mod tests {
             Some(PathBuf::from("/no/such/supervisor")),
         );
         assert!(seed_desired_supervisor(&c).is_err());
+    }
+
+    #[test]
+    fn seed_never_overwrites_a_corrupt_committed_pointer() {
+        let state = temp_dir("seed-corrupt");
+        let initial = state.join("initial-supervisor");
+        std::fs::write(&initial, b"initial").unwrap();
+        std::fs::write(state.join("desired-supervisor"), b"corrupt\n").unwrap();
+        let c = cfg(state.clone(), Some(initial));
+        assert!(seed_desired_supervisor(&c).is_err());
+        assert_eq!(
+            std::fs::read(state.join("desired-supervisor")).unwrap(),
+            b"corrupt\n"
+        );
     }
 }

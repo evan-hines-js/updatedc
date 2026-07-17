@@ -1665,6 +1665,7 @@ name = "updated-tuf"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "foundation",
  "futures",
  "hex",
  "jiff",

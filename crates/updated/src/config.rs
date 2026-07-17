@@ -61,9 +61,10 @@ pub struct Application {
     /// Readiness probe; omit for liveness-only (survive the health grace = healthy).
     #[serde(default)]
     pub health_url: Option<String>,
-    /// Zero-downtime reload command (Unix, requires `health_url`); omit for stop/start.
+    /// Zero-downtime reload executable and arguments (Unix, requires `health_url`).
+    /// Exact `{pid}` and `{binary}` arguments are expanded without invoking a shell.
     #[serde(default)]
-    pub reload_command: Option<String>,
+    pub reload_command: Option<Vec<String>>,
     /// Installed-target record location; defaults to `<binary>.installed`.
     #[serde(default)]
     pub state: Option<PathBuf>,
@@ -150,6 +151,14 @@ impl Config {
         }
         if self.application.reload_command.is_some() && self.application.health_url.is_none() {
             return Err("application.reload_command requires application.health_url".into());
+        }
+        if self
+            .application
+            .reload_command
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            return Err("application.reload_command must name an executable".into());
         }
         if let Some(v) = &self.application.current_version {
             semver::Version::parse(v).map_err(|e| format!("application.current_version: {e}"))?;
@@ -443,7 +452,7 @@ mod tests {
             [application]
             product = "app"
             command = ["app"]
-            reload_command = "kill -HUP $UPDATED_CHILD_PID"
+            reload_command = ["kill", "-HUP", "{pid}"]
             "#,
         );
         // Parses, but validation rejects it (Unix) or the platform guard does.
@@ -465,7 +474,7 @@ mod tests {
                 product = "app"
                 command = ["app"]
                 health_url = "http://127.0.0.1:9/healthz"
-                reload_command = "kill -HUP $UPDATED_CHILD_PID"
+                reload_command = ["kill", "-HUP", "{pid}"]
                 "#,
             )
             .unwrap();

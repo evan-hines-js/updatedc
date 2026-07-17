@@ -242,7 +242,7 @@ pub struct Sup {
     check_interval: Option<String>,
     health_grace: Option<String>,
     confirmation_window: Option<String>,
-    reload_command: Option<String>,
+    reload_command: Option<Vec<String>>,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
     /// Override the supervisor binary the guardian runs (self-update tests supply a
@@ -300,8 +300,8 @@ impl Sup {
         self.confirmation_window = Some(s.into());
         self
     }
-    pub fn reload(mut self, cmd: &str) -> Self {
-        self.reload_command = Some(cmd.into());
+    pub fn reload(mut self, command: Vec<String>) -> Self {
+        self.reload_command = Some(command);
         self
     }
     pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
@@ -339,7 +339,10 @@ impl Sup {
             t += &format!("health_url = {}\n", lit(u));
         }
         if let Some(c) = &self.reload_command {
-            t += &format!("reload_command = {}\n", lit(c));
+            t += &format!(
+                "reload_command = [{}]\n",
+                c.iter().map(|arg| lit(arg)).collect::<Vec<_>>().join(", ")
+            );
         }
         let mut to = String::new();
         for (k, v) in [

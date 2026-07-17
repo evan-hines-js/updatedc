@@ -46,7 +46,7 @@ pub(crate) trait Store {
     /// rollback copy. The single reinstatement path, used by rollback and drift recovery.
     fn restore_committed(&mut self, sha: &str) -> io::Result<()>;
     /// Drop the `<binary>.old` rollback image (an update confirmed, or never swapped).
-    fn drop_rollback(&mut self);
+    fn drop_rollback(&mut self) -> io::Result<()>;
 }
 
 // ================================= real: FileStore =================================
@@ -60,9 +60,9 @@ pub(crate) struct FileStore {
 }
 
 impl FileStore {
-    pub(crate) fn open(paths: Paths, retry_after: std::time::Duration) -> Self {
-        let rejected = Rejections::load(&paths.rejected, retry_after);
-        FileStore { paths, rejected }
+    pub(crate) fn open(paths: Paths, retry_after: std::time::Duration) -> io::Result<Self> {
+        let rejected = Rejections::load(&paths.rejected, retry_after)?;
+        Ok(FileStore { paths, rejected })
     }
 }
 
@@ -111,11 +111,11 @@ impl Store for FileStore {
     fn restore_committed(&mut self, sha: &str) -> io::Result<()> {
         updated::apply::rollback(&self.paths.binary)?;
         verify_file(&self.paths.binary, sha)?;
-        updated::apply::cleanup_previous(&self.paths.binary);
+        updated::apply::cleanup_previous(&self.paths.binary)?;
         Ok(())
     }
-    fn drop_rollback(&mut self) {
-        updated::apply::cleanup_previous(&self.paths.binary);
+    fn drop_rollback(&mut self) -> io::Result<()> {
+        updated::apply::cleanup_previous(&self.paths.binary)
     }
 }
 
@@ -274,8 +274,9 @@ impl Store for MemStore {
         self.binary = Some(old);
         Ok(())
     }
-    fn drop_rollback(&mut self) {
+    fn drop_rollback(&mut self) -> io::Result<()> {
         self.rollback = None;
+        Ok(())
     }
 }
 
@@ -310,7 +311,8 @@ mod file_store_tests {
         std::fs::write(&paths.binary, b"v1-bytes").unwrap();
         let v1 = sha256_file(&paths.binary).unwrap();
 
-        let mut store = FileStore::open(paths.clone(), std::time::Duration::from_secs(3600));
+        let mut store =
+            FileStore::open(paths.clone(), std::time::Duration::from_secs(3600)).unwrap();
 
         // Reads reflect disk: binary hash present, no rollback, no state, no journal.
         assert_eq!(store.binary_sha(), Some(v1.clone()));
@@ -377,7 +379,7 @@ mod file_store_tests {
         std::fs::write(&paths.download, b"v3-bytes").unwrap();
         store.swap_in_staged().unwrap();
         assert!(store.rollback_sha().is_some());
-        store.drop_rollback();
+        store.drop_rollback().unwrap();
         assert!(store.rollback_sha().is_none());
 
         let _ = std::fs::remove_dir_all(&dir);

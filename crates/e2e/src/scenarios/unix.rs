@@ -55,7 +55,7 @@ pub(crate) fn zero_downtime_reexec(ctx: &Ctx) -> R {
     .check_interval("1s")
     .health_grace("2s")
     .health(svc)
-    .reload("kill -HUP $UPDATED_CHILD_PID")
+    .reload(vec!["kill".into(), "-HUP".into(), "{pid}".into()])
     .guardian()?;
     let _sup = Proc::spawn("supervisor", &mut cmd)?;
     if !wait_for_version(svc, "1.0.0", 25) {
