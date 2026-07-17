@@ -12,20 +12,12 @@ pub(crate) fn parse_args() -> Result<Options, String> {
     // one-shot updater never re-derive them by hand and drift apart.
     let paths = cfg.resolve_paths()?;
 
-    let restart = match &cfg.application.reload_command {
-        Some(command) => Restart::Reload {
-            command: command.clone(),
-        },
-        None => Restart::StopStart,
-    };
-
     let supervisor_update = build_supervisor_update(&cfg)?;
     Ok(Options {
         repository: cfg.repository,
         application: cfg.application,
         timeouts: cfg.timeouts,
         paths,
-        restart,
         supervisor_update,
     })
 }

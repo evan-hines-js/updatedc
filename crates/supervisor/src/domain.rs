@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use updated::bundle::ReleaseId;
 pub(crate) use updated::state::{Installed, InstalledState, Pending};
 pub(crate) use updated::transaction::Transaction;
 
@@ -37,12 +38,10 @@ pub(crate) struct Situation {
     /// The committed installed-state slot — version, authorizing hash, and any pending
     /// (unconfirmed) update — or missing/invalid.
     pub installed: Installed,
-    /// First-install baseline from config (`application.current_version`).
-    pub baseline: Option<InstalledState>,
-    /// Hash of the on-disk application binary (`None` if unreadable / absent).
-    pub disk_sha: Option<String>,
-    /// Hash of the retained `<binary>.old` rollback copy, if present.
-    pub old_sha: Option<String>,
+    /// The release named by the durable active-release record.
+    pub active: Option<ReleaseId>,
+    /// Whether the active release directory and every manifested file verify.
+    pub active_verified: bool,
     /// The in-flight update transaction, if a journal is present.
     pub journal: Option<Transaction>,
     /// The guardian's crash marker: the last application exit was a crash.
@@ -65,9 +64,9 @@ pub(crate) struct Plan {
     pub fail_closed: Option<String>,
     pub updates_enabled: bool,
     pub current: Option<String>,
-    /// Stop the running (uncommitted) application before reconciling its binary.
+    /// Stop the running application before changing its active release.
     pub quiesce: bool,
-    pub binary: BinaryFix,
+    pub release: ReleaseFix,
     /// Remove the transaction journal after reconciling it (an in-flight update was
     /// resolved). Never set for a plain drift/steady-state boot, which has no journal.
     pub clear_journal: bool,
@@ -78,9 +77,6 @@ pub(crate) struct Plan {
     /// Installed-state to (re)write — set to confirm an update (clear pending) or to
     /// commit the predecessor on a revert.
     pub commit: Option<InstalledState>,
-    /// Drop the `<binary>.old` rollback image (an update was confirmed, or a first
-    /// install has nothing to revert to).
-    pub drop_rollback: bool,
     pub acquire: Acquire,
     pub notes: Vec<Note>,
 }
@@ -100,17 +96,12 @@ impl Plan {
     }
 }
 
-/// How to make the on-disk application binary match committed state before running it.
+/// How to make active-release match committed state before running it.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) enum BinaryFix {
-    /// The binary already matches committed state; leave it.
+pub(crate) enum ReleaseFix {
     #[default]
     None,
-    /// Roll `<binary>.old` back over the binary and verify it hashes to `sha`. Used both
-    /// to reverse an uncommitted swap and to revert a confirmed-then-crashing update.
-    RestoreCommitted { sha: String },
-    /// Drop the `<binary>.old` rollback copy (an update that never swapped).
-    DropRollback,
+    Activate(ReleaseId),
 }
 
 /// How the shell takes charge of the application after reconciling state.
@@ -142,8 +133,11 @@ mod tests {
 
     fn pending() -> Pending {
         Pending {
-            previous_version: "1.0.0".into(),
-            previous_sha256: "aa".into(),
+            previous_release: updated::bundle::ReleaseId {
+                version: "1.0.0".into(),
+                manifest_sha256: "aa".into(),
+            },
+            previous_archive_sha256: "archive-aa".into(),
             committed_at: 1000,
         }
     }

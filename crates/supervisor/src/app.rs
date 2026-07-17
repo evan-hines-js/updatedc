@@ -38,7 +38,7 @@ impl App {
     pub(crate) fn launch(&mut self, opts: &Options) -> io::Result<()> {
         let token = updated::rand::token()?;
         write_app_token(&opts.paths.app_token, &token)?;
-        let spec = app_spec(&opts.application.command, &token);
+        let spec = app_spec(opts, &token)?;
         let pid = self.guardian.launch(&spec).map_err(io::Error::other)?;
         self.pid = pid;
         self.health_token = token;
@@ -60,7 +60,7 @@ pub(crate) fn adopt(guardian: Guardian, opts: &Options, pid: u32) -> App {
     }
 }
 
-/// Launch a fresh application from the committed binary.
+/// Launch a fresh application from the active release entrypoint.
 pub(crate) fn start(guardian: Guardian, opts: &Options) -> io::Result<App> {
     let mut app = App {
         guardian,
@@ -94,7 +94,11 @@ pub(crate) fn is_control_plane_env(key: &std::ffi::OsStr) -> bool {
 /// Build the application launch spec: the configured command, plus the full environment
 /// the guardian should apply — the supervisor's own environment with the control-channel
 /// plumbing stripped and the per-launch health token added.
-fn app_spec(command: &[String], health_token: &str) -> CommandSpec {
+fn app_spec(opts: &Options, health_token: &str) -> io::Result<CommandSpec> {
+    let release = updated::bundle::read_active(&opts.paths.active_release)?
+        .ok_or_else(|| io::Error::other("active-release is missing"))?;
+    let (_, entrypoint) = updated::bundle::read_release(&opts.paths.versions, &release)?;
+    let release_dir = opts.paths.versions.join(release.directory_name());
     let mut envs: Vec<(OsString, OsString)> = std::env::vars_os()
         .filter(|(key, _)| !is_control_plane_env(key))
         .collect();
@@ -102,12 +106,16 @@ fn app_spec(command: &[String], health_token: &str) -> CommandSpec {
         OsString::from(env::HEALTH_TOKEN),
         OsString::from(health_token),
     ));
-    CommandSpec {
-        program: OsString::from(&command[0]),
-        args: command[1..].iter().map(OsString::from).collect(),
+    envs.push((
+        OsString::from(env::INSTALL_ROOT),
+        opts.paths.install_root.as_os_str().into(),
+    ));
+    Ok(CommandSpec {
+        program: entrypoint.into_os_string(),
+        args: opts.application.args.iter().map(OsString::from).collect(),
         env: envs,
-        cwd: None,
-    }
+        cwd: Some(release_dir.into_os_string()),
+    })
 }
 
 fn write_app_token(path: &Path, token: &str) -> io::Result<()> {
@@ -125,7 +133,7 @@ fn clear_app_token(path: &Path) {
 }
 
 /// Ask the guardian to stop the application (it escalates to a hard kill), then clear the
-/// persisted token. Used to quiesce the app before swapping its binary during an update.
+/// persisted token. Used to quiesce the app before activating a release.
 pub(crate) fn stop(app: &mut App, app_token: &Path) {
     let _ = app.guardian.stop();
     clear_app_token(app_token);

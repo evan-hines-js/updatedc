@@ -11,6 +11,7 @@
 //! ownership and boot-safe identity now live in the guardian (`bootstrap`), not here.
 
 pub mod apply;
+pub mod bundle;
 pub mod config;
 pub mod env;
 pub mod hash;

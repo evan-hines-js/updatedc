@@ -1,7 +1,9 @@
 //! Development TUF publisher and static repository server (the mock CDN).
 //!
 //! - `init`    mint the four ed25519 role keys and an empty signed repository.
-//! - `publish` add a release: register per-platform targets and re-sign
+//! - `publish-app` build and publish application bundles.
+//! - `install-app` seed an installer-verified application bundle.
+//! - `publish-supervisor` publish supervisor bootstrap binaries.
 //!   targets/snapshot/timestamp.
 //! - `serve`   serve the repository directory over HTTP for clients to refresh.
 //!
@@ -28,11 +30,15 @@ async fn main() {
 
     let result = match cmd {
         "init" => init(rest).await,
-        "publish" => publish(rest).await,
+        "publish-app" => publish(rest, true).await,
+        "install-app" => install_app(rest),
+        "publish-supervisor" => publish(rest, false).await,
         "serve" => serve(rest).await,
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
-            eprintln!("usage: server <init|publish|serve> [flags]");
+            eprintln!(
+                "usage: server <init|install-app|publish-app|publish-supervisor|serve> [flags]"
+            );
             exit(2);
         }
     };
@@ -40,6 +46,52 @@ async fn main() {
         eprintln!("error: {e}");
         exit(1);
     }
+}
+
+fn install_app(args: &[String]) -> R {
+    let install_root =
+        PathBuf::from(flag(args, "--install-root").ok_or("--install-root <dir> is required")?);
+    let source = PathBuf::from(flag(args, "--bundle").ok_or("--bundle <dir> is required")?);
+    let product = flag(args, "--product").ok_or("--product <name> is required")?;
+    let version = flag(args, "--version").ok_or("--version <semver> is required")?;
+    semver::Version::parse(&version).map_err(|e| format!("invalid --version: {e}"))?;
+    let platform = flag(args, "--platform").ok_or("--platform <os>-<arch> is required")?;
+    let entrypoint =
+        flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
+    let state_dir = install_root.join("state");
+    let staging = install_root.join("staging");
+    let versions = install_root.join("versions");
+    std::fs::create_dir_all(&state_dir)?;
+    let archive = staging.join("installer-bundle.tar.zst");
+    updated::bundle::create_bundle(
+        &source,
+        &archive,
+        &product,
+        &version,
+        &platform,
+        &entrypoint,
+    )?;
+    let staged = updated::bundle::stage_bundle(
+        &archive,
+        &staging,
+        &versions,
+        &updated::bundle::ExpectedBundle {
+            product: &product,
+            version: &version,
+            platform: &platform,
+        },
+        &Default::default(),
+    )?;
+    updated::bundle::write_active(&install_root.join("active-release"), &staged.id)?;
+    updated::state::write_installed(
+        &state_dir.join("installed.json"),
+        &updated::state::InstalledState::confirmed(staged.id, staged.archive_sha256),
+    )?;
+    println!(
+        "installed {product} {version} into {}",
+        install_root.display()
+    );
+    Ok(())
 }
 
 // --- init -------------------------------------------------------------------
@@ -65,39 +117,81 @@ async fn init(args: &[String]) -> R {
 
 // --- publish ----------------------------------------------------------------
 
-async fn publish(args: &[String]) -> R {
+async fn publish(args: &[String], application_bundle: bool) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
     let product = flag(args, "--product").ok_or("--product <name> is required")?;
     let channel = flag(args, "--channel").unwrap_or_else(|| "stable".into());
     let version = flag(args, "--version").ok_or("--version <semver> is required")?;
     semver::Version::parse(&version).map_err(|e| format!("invalid --version: {e}"))?;
-    let component = flag(args, "--component").unwrap_or_else(|| product.clone());
+    let component = if application_bundle {
+        product.clone()
+    } else {
+        "supervisor".into()
+    };
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
 
-    // `--target <os>-<arch>=<path>`, repeatable.
-    let raw = flags_all(args, "--target");
+    let artifact_flag = if application_bundle {
+        "--bundle"
+    } else {
+        "--target"
+    };
+    let raw = flags_all(args, artifact_flag);
     if raw.is_empty() {
-        return Err("at least one --target <os>-<arch>=<path> is required".into());
+        return Err(format!("at least one {artifact_flag} <os>-<arch>=<path> is required").into());
     }
     let keys = repo::Keys::in_dir(&keys_dir);
+    let _publish_lock = lock_publisher(&repo_dir)?;
 
     let mut targets = Vec::new();
     for t in &raw {
-        let (platform, path) = t
+        let (platform, source) = t
             .split_once('=')
-            .ok_or_else(|| format!("--target must be <os>-<arch>=<path>, got {t:?}"))?;
+            .ok_or_else(|| format!("{artifact_flag} must be <os>-<arch>=<path>, got {t:?}"))?;
         let (os, arch) = platform
             .split_once('-')
             .ok_or_else(|| format!("platform must be <os>-<arch>, got {platform:?}"))?;
+        let path = if application_bundle {
+            let archive = repo_dir
+                .join(".bundle-build")
+                .join(format!("{product}-{version}-{platform}.tar.zst"));
+            let input = Path::new(source);
+            let prepared;
+            let input = if input.is_file() {
+                prepared = repo_dir
+                    .join(".bundle-build")
+                    .join(format!("tree-{product}-{version}-{platform}"));
+                if prepared.exists() {
+                    std::fs::remove_dir_all(&prepared)?;
+                }
+                let entrypoint =
+                    flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
+                let destination = prepared.join(&entrypoint);
+                std::fs::create_dir_all(destination.parent().ok_or("entrypoint has no parent")?)?;
+                std::fs::create_dir_all(prepared.join("config"))?;
+                std::fs::copy(input, destination)?;
+                std::fs::write(
+                    prepared.join("config/release.toml"),
+                    format!("version = {version:?}\n"),
+                )?;
+                prepared.as_path()
+            } else {
+                input
+            };
+            updated::bundle::create_bundle(
+                input,
+                &archive,
+                &product,
+                &version,
+                platform,
+                &flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?,
+            )?;
+            archive
+        } else {
+            PathBuf::from(source)
+        };
         targets.push(PublishTarget::application(
-            &product,
-            &channel,
-            &version,
-            os,
-            arch,
-            &component,
-            PathBuf::from(path),
+            &product, &channel, &version, os, arch, &component, path,
         ));
     }
 
@@ -109,7 +203,6 @@ async fn publish(args: &[String]) -> R {
     // smoke fuzzer does exactly that), so an in-process mutex is insufficient.
     // Keep the development server's single-writer policy here rather than in
     // the reusable TUF authoring library.
-    let _publish_lock = lock_publisher(&repo_dir)?;
     repo::add_release(&repo_dir, &keys, targets, expiry_days).await?;
     println!("published {product} {version} on channel {channel}");
     Ok(())
@@ -344,6 +437,43 @@ fn flags_all(args: &[String], name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_seed_uses_the_canonical_bundle_layout() {
+        let root = std::env::temp_dir().join(format!("server-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let install = root.join("install");
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::create_dir_all(source.join("config")).unwrap();
+        std::fs::write(source.join("bin/app"), b"fixture").unwrap();
+        std::fs::write(source.join("config/release.toml"), b"version = \"1.0.0\"\n").unwrap();
+        let args = vec![
+            "--install-root".into(),
+            install.display().to_string(),
+            "--bundle".into(),
+            source.display().to_string(),
+            "--product".into(),
+            "app".into(),
+            "--version".into(),
+            "1.0.0".into(),
+            "--platform".into(),
+            "macos-aarch64".into(),
+            "--entrypoint".into(),
+            "bin/app".into(),
+        ];
+        install_app(&args).unwrap();
+        let state = match updated::state::read_installed(&install.join("state/installed.json")) {
+            updated::state::Installed::Present(state) => state,
+            _ => panic!("installer did not write strict installed state"),
+        };
+        assert_eq!(
+            updated::bundle::read_active(&install.join("active-release")).unwrap(),
+            Some(state.release.clone())
+        );
+        updated::bundle::read_release(&install.join("versions"), &state.release).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn resolve_allows_nested_target_paths() {

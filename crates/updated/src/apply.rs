@@ -1,68 +1,11 @@
-//! Crash-safe replacement of a stopped executable. Sibling temporary files keep
-//! renames atomic; `<target>.old` remains available until commit.
+//! Durable atomic file primitives shared by state records and supervisor self-update.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn old_path(target: &Path) -> PathBuf {
-    crate::config::with_suffix(target, ".old")
-}
-
-pub fn cleanup_previous(target: &Path) -> io::Result<()> {
-    remove_file_durable(&old_path(target))
-}
-
-/// Restore the previous binary saved during the last update. Streams from
-/// `<target>.old`, and deliberately does not rotate the rejected binary into the
-/// rollback slot: the known-good image stays available until the transaction is
-/// durably committed.
-pub fn rollback(target: &Path) -> io::Result<()> {
-    let old = old_path(target);
-    if !old.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no rollback binary at {}", old.display()),
-        ));
-    }
-    atomic_install_file(target, &old)
-}
-
 fn create_temp(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
     foundation::durable::create_temp(dir, prefix)
-}
-
-/// Atomically replace a stopped target while retaining `<target>.old` for rollback.
-pub fn atomic_swap_file(target: &Path, source: &Path) -> io::Result<()> {
-    swap(target, |tmp| {
-        let mut source = File::open(source)?;
-        io::copy(&mut source, tmp).map(|_| ())
-    })
-}
-
-/// Atomically install the staged `source` at `target`, streamed. Unlike
-/// [`atomic_swap_file`], no `<target>.old` rollback file is created — this backs
-/// [`rollback`], which restores the previous image from `<target>.old`.
-fn atomic_install_file(target: &Path, source: &Path) -> io::Result<()> {
-    install(target, |tmp| {
-        let mut source = File::open(source)?;
-        io::copy(&mut source, tmp).map(|_| ())
-    })
-}
-
-fn swap(target: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
-    let dir = foundation::durable::parent_dir(target);
-    let tmp_path = stage(dir, target, write)?;
-    // The rollback image must be durable before replacement.
-    if let Err(e) = backup(target) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    if let Err(e) = replace_path(&tmp_path, target) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    sync_dir(dir)
 }
 
 /// Install `source`'s bytes as `target`, atomically and with the executable bit
@@ -121,18 +64,6 @@ fn stage(
     Ok(tmp_path)
 }
 
-fn backup(target: &Path) -> io::Result<()> {
-    let old = old_path(target);
-    let dir = foundation::durable::parent_dir(target);
-    let _ = fs::remove_file(&old);
-    fs::copy(target, &old)?;
-    // Reopen writable to fsync it: `FlushFileBuffers` (what `sync_all` issues on
-    // Windows) requires a writable handle, so a read-only `File::open` fails there
-    // with ERROR_ACCESS_DENIED. Unix `fsync` accepts a read-only fd, which hid this.
-    OpenOptions::new().write(true).open(&old)?.sync_all()?;
-    sync_dir(dir) // the .old entry must be durable before the swap commits
-}
-
 /// Atomically replace `to` with `from`, retrying a *transient* lock. Our staged
 /// `from` is untouched when a replace fails, so retrying is always safe. This is
 /// production hardening, not a test crutch: real deployments hit it — Windows
@@ -189,49 +120,6 @@ mod tests {
     }
 
     #[test]
-    fn atomic_swap_replaces_and_keeps_rollback() {
-        let dir = std::env::temp_dir().join(format!("swap-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("app");
-        fs::write(&target, b"OLD").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&target, PermissionsExt::from_mode(0o755)).unwrap();
-        }
-
-        let source = dir.join("staged");
-        fs::write(&source, b"NEW-BINARY-CONTENTS").unwrap();
-        atomic_swap_file(&target, &source).unwrap();
-
-        assert_eq!(fs::read(&target).unwrap(), b"NEW-BINARY-CONTENTS");
-        assert_eq!(
-            fs::read(old_path(&target)).unwrap(),
-            b"OLD",
-            "rollback copy preserved"
-        );
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&target).unwrap().permissions().mode();
-            // The target's own 0o755 must be carried over verbatim (not widened to
-            // 0o777, nor collapsed to 0o700), with the executable bits forced on.
-            assert_eq!(mode & 0o777, 0o755, "mode preserved + executable: {mode:o}");
-        }
-
-        // Committing the update drops the rollback image.
-        assert!(old_path(&target).exists());
-        cleanup_previous(&target).unwrap();
-        assert!(
-            !old_path(&target).exists(),
-            "cleanup removes the rollback copy"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn remove_durable_is_idempotent() {
         let dir = std::env::temp_dir().join(format!("rm-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -247,28 +135,6 @@ mod tests {
             remove_file_durable(&dir).is_err(),
             "a directory is not a silently-absent file"
         );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rollback_restores_previous() {
-        let dir = std::env::temp_dir().join(format!("rollback-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("app");
-        fs::write(&target, b"v1").unwrap();
-
-        let source = dir.join("staged");
-        fs::write(&source, b"v2").unwrap();
-        atomic_swap_file(&target, &source).unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"v2");
-
-        rollback(&target).unwrap();
-        assert_eq!(
-            fs::read(&target).unwrap(),
-            b"v1",
-            "rolled back to previous bytes"
-        );
-
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -307,7 +173,6 @@ mod tests {
 
         install_executable(&target, &source).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"CANDIDATE");
-        assert!(!old_path(&target).exists(), "keeps no rollback copy");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

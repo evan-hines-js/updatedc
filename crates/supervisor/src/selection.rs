@@ -41,6 +41,34 @@ pub(crate) async fn check_application(
     };
     let version = staged.version;
     let sha = staged.sha256;
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let release = match updated::bundle::stage_bundle(
+        &opts.paths.download,
+        &opts.paths.staging,
+        &opts.paths.versions,
+        &updated::bundle::ExpectedBundle {
+            product: &opts.application.product,
+            version: &version,
+            platform: &platform,
+        },
+        &updated::bundle::BundleLimits {
+            archive_bytes: opts.repository.target_limit,
+            ..Default::default()
+        },
+    ) {
+        Ok(release) => release,
+        Err(error) => {
+            warn(&format!(
+                "staging application bundle {version} failed: {error}"
+            ));
+            if let Err(reject_error) = store.reject(&sha) {
+                return AppOutcome::Fatal(format!(
+                    "rejecting malformed application bundle {version}: {reject_error}"
+                ));
+            }
+            return AppOutcome::Unchanged;
+        }
+    };
 
     let from = current.as_deref().unwrap_or("none");
     log(&format!("applying update {from} -> {version}"));
@@ -48,7 +76,7 @@ pub(crate) async fn check_application(
     // `app` is released before the arms below read `app.pid()`.
     let outcome = {
         let mut tower = LiveTower::new(app, opts);
-        apply_update(&mut tower, store, &sha, &version, current.as_deref()).await
+        apply_update(&mut tower, store, &release.id, &sha).await
     };
     match outcome {
         Ok(Outcome::Committed) => {
@@ -60,7 +88,7 @@ pub(crate) async fn check_application(
             log(&format!("upgraded to {version} (pid {})", app.pid()));
             AppOutcome::Upgraded { version }
         }
-        Ok(Outcome::RolledBack) => {
+        Ok(failure @ (Outcome::RolledBack | Outcome::RejectedBeforeActivation)) => {
             // Persist the rejection BEFORE logging the rollback, so the log reflects a
             // durable outcome: a crash in this window must not leave a "rolling back"
             // record with no rejection actually recorded (it would just re-apply the
@@ -73,13 +101,15 @@ pub(crate) async fn check_application(
                     "persisting rejection for rolled-back {version}: {e}"
                 ));
             }
-            warn(&format!(
-                "rolling back to {from}: update to {version} failed its health check"
-            ));
-            AppOutcome::Unchanged
-        }
-        Ok(Outcome::Aborted) => {
-            log("update aborted before swap; keeping current version");
+            match failure {
+                Outcome::RolledBack => warn(&format!(
+                    "rolling back to {from}: update to {version} failed activation or health"
+                )),
+                Outcome::RejectedBeforeActivation => warn(&format!(
+                    "rejected {version} before activation; {from} remains running"
+                )),
+                Outcome::Committed => unreachable!(),
+            }
             AppOutcome::Unchanged
         }
         Err(e) => {

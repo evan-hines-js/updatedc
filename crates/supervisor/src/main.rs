@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{with_suffix, Application, Paths, Repository, Timeouts};
+use updated::config::{with_suffix, Activation, Application, Paths, Repository, Timeouts};
 use updated::{apply, env, health};
 mod app;
 mod boot;
@@ -46,9 +46,8 @@ struct Options {
     repository: Repository,
     application: Application,
     timeouts: Timeouts,
-    /// Canonical application binary and every state file derived from it.
+    /// Canonical bundle installation layout.
     paths: Paths,
-    restart: Restart,
     supervisor_update: SupervisorUpdate,
 }
 
@@ -178,12 +177,12 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     log(&format!(
         "supervisor {SELF_VERSION} supervising {:?} (product {} channel {}, installed {}, updates {}, restart {}, check every {}s)",
-        opts.paths.binary,
+        opts.paths.install_root,
         opts.application.product,
         opts.application.channel,
         current.as_deref().unwrap_or("none"),
         if updates_enabled { "enabled" } else { "DISABLED" },
-        opts.restart.name(),
+        opts.application.activation.name(),
         opts.timeouts.check_interval.as_secs()
     ));
 
@@ -353,16 +352,14 @@ fn gather_situation(
     store: &dyn Store,
     guardian_state: Option<&Path>,
 ) -> io::Result<Situation> {
+    let active = store.active_release()?;
+    let active_verified = active
+        .as_ref()
+        .is_some_and(|release| store.verify_release(release).is_ok());
     Ok(Situation {
         installed: store.installed(),
-        baseline: opts
-            .application
-            .current_version
-            .as_ref()
-            .zip(opts.application.current_sha256.as_ref())
-            .map(|(version, sha256)| InstalledState::confirmed(version.clone(), sha256.clone())),
-        disk_sha: store.binary_sha(),
-        old_sha: store.rollback_sha(),
+        active,
+        active_verified,
         journal: store.journal()?,
         app_crashed: match guardian_state {
             Some(state) => guardian::take_crash_marker(state)?,
@@ -379,8 +376,7 @@ fn gather_situation(
 }
 
 /// Perform a boot [`Plan`]'s durable reconciliation and return the still-unconfirmed
-/// update (if any) for the loop to watch. Ordered so the binary is reconciled before the
-/// installed-state commit: a revert restores the rollback image, then records it.
+/// update (if any) for the loop to watch.
 fn execute_boot_plan(
     plan: &Plan,
     opts: &Options,
@@ -389,7 +385,7 @@ fn execute_boot_plan(
     self_update: &mut SelfUpdateState,
 ) -> io::Result<Option<Pending>> {
     if plan.quiesce {
-        warn("stopping the uncommitted candidate before reconciling its binary");
+        warn("stopping the uncommitted candidate before reconciling its release");
         let _ = guardian.stop();
         let _ = std::fs::remove_file(&opts.paths.app_token);
     }
@@ -400,33 +396,22 @@ fn execute_boot_plan(
     Ok(installed_pending(store))
 }
 
-/// Apply the durable half of a boot [`Plan`] to the [`Store`], in order: reconcile the
-/// binary, then clear the spent journal, record rejections, commit the installed state,
-/// and drop a confirmed update's rollback image. The guardian quiesce and supervisor
-/// rejection are the shell's; keeping this pure over the store is what a `MemStore` proves.
+/// Apply the durable half of a boot [`Plan`] to the [`Store`].
 fn apply_store_plan(plan: &Plan, store: &mut dyn Store) -> io::Result<()> {
-    // Record the intended end-state FIRST. A revert's binary fix (`restore_committed`)
-    // destroys the `<binary>.old` rollback image, and — unlike an in-flight transaction — a
-    // pending-revert has no journal to fall back on. Committing before the destructive
-    // restore keeps a crash in that window recoverable: the boot drift-check restores the
-    // committed bytes from the still-present rollback image. (Reconcile plans set no commit,
-    // so their journal-covered ordering is unchanged.)
+    // Commit the intended state before activation; immutable predecessor releases remain
+    // available if a crash interrupts pointer reconciliation.
     if let Some(state) = &plan.commit {
         store.commit_installed(state)?;
     }
-    match &plan.binary {
-        BinaryFix::None => {}
-        BinaryFix::RestoreCommitted { sha } => store.restore_committed(sha)?,
-        BinaryFix::DropRollback => store.drop_rollback()?,
+    match &plan.release {
+        ReleaseFix::None => {}
+        ReleaseFix::Activate(release) => store.activate(release)?,
     }
     if plan.clear_journal {
         store.clear_journal()?;
     }
     for hash in &plan.reject_app {
         store.reject(hash)?;
-    }
-    if plan.drop_rollback {
-        store.drop_rollback()?;
     }
     Ok(())
 }
@@ -439,26 +424,19 @@ fn installed_pending(store: &dyn Store) -> Option<Pending> {
     }
 }
 
-/// Confirm the current update: clear its pending record and drop the rollback image.
+/// Confirm the current update by clearing its pending record.
 /// Returns `true` only once the confirmation is durable, so callers must keep their
 /// in-memory pending intent (and continue suppressing updates) after a write failure.
 fn confirm_update(store: &mut dyn Store) -> bool {
     if let Installed::Present(mut st) = store.installed() {
         st.pending = None;
         if let Err(e) = store.commit_installed(&st) {
-            // Could not durably clear the pending intent. Keep the rollback image: while the
-            // on-disk record still shows the update as pending, a crash must still be able to
-            // revert to a real binary. Retried on the next confirmation tick or at boot.
+            // Could not durably clear the pending intent; retry on the next tick or boot.
             warn(&format!(
                 "could not durably confirm the update ({e}); will retry"
             ));
             return false;
         }
-    }
-    if let Err(e) = store.drop_rollback() {
-        warn(&format!(
-            "update confirmed but rollback cleanup failed: {e}"
-        ));
     }
     true
 }

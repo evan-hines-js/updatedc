@@ -21,7 +21,15 @@ pub const HEALTH_TOKEN: &str = "UPDATED_HEALTH_TOKEN";
 /// PID of the running child, exposed to the operator's reload command.
 pub const CHILD_PID: &str = "UPDATED_CHILD_PID";
 /// Path of the newly-installed binary, exposed to the operator's reload command.
-pub const BINARY: &str = "UPDATED_BINARY";
+pub const INSTALL_ROOT: &str = "UPDATED_INSTALL_ROOT";
+/// Immutable directory of the release the command is being asked to activate.
+pub const CANDIDATE: &str = "UPDATED_CANDIDATE";
+/// Immutable directory of the release currently being replaced.
+pub const PREDECESSOR: &str = "UPDATED_PREDECESSOR";
+/// Semantic version of [`CANDIDATE`].
+pub const CANDIDATE_VERSION: &str = "UPDATED_CANDIDATE_VERSION";
+/// Semantic version of [`PREDECESSOR`].
+pub const PREDECESSOR_VERSION: &str = "UPDATED_PREDECESSOR_VERSION";
 
 // ── test-only fault injection ──────────────────────────────────────────────────
 
@@ -34,7 +42,16 @@ mod tests {
 
     #[test]
     fn every_var_is_prefixed() {
-        for var in [HEALTH_TOKEN, CHILD_PID, BINARY, CHAOS_POINT] {
+        for var in [
+            HEALTH_TOKEN,
+            CHILD_PID,
+            INSTALL_ROOT,
+            CANDIDATE,
+            PREDECESSOR,
+            CANDIDATE_VERSION,
+            PREDECESSOR_VERSION,
+            CHAOS_POINT,
+        ] {
             assert!(
                 var.starts_with("UPDATED_"),
                 "{var} must use the UPDATED_ prefix"

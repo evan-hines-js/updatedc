@@ -10,6 +10,7 @@ members = [
     "crates/supervisor",
     "crates/oneshot",
     "crates/sampleapp",
+    "crates/sampleapp-reexec",
     "crates/e2e",
     "crates/windows-service",
 ]
@@ -50,6 +51,8 @@ url = "2"
 aws-lc-rs = "1"      # the one crypto lib: SHA-256, ed25519 keygen, secure RNG
 jiff = "0.2"         # timestamps for TUF metadata expiry
 futures = "0.3"      # stream combinators for verified target downloads
+tar = "0.4"          # deterministic bundle construction and streaming extraction
+zstd = "0.13"        # the sole application bundle compression format
 # Async HTTP for the supervisor's localhost health probe (no TLS needed).
 reqwest = { version = "0.13", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

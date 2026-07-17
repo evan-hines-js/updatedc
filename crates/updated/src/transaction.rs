@@ -9,16 +9,15 @@ use std::io;
 use std::path::Path;
 
 use crate::apply;
+use crate::bundle::ReleaseId;
 
 /// Durable intent for an in-flight executable replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
-    pub old_sha256: String,
-    pub new_sha256: String,
-    pub to_version: String,
-    #[serde(deserialize_with = "crate::required_option")]
-    pub from_version: Option<String>,
+    pub previous_release: ReleaseId,
+    pub candidate_release: ReleaseId,
+    pub candidate_archive_sha256: String,
 }
 
 /// The recovery action implied by a journal, the live binary, and committed state.
@@ -34,16 +33,16 @@ pub enum Recovery {
 
 pub fn classify_recovery(
     tx: &Transaction,
-    disk_sha: &str,
-    committed_version: Option<&str>,
+    active: Option<&ReleaseId>,
+    committed: Option<&ReleaseId>,
 ) -> Recovery {
-    if hash_eq(disk_sha, &tx.new_sha256) {
-        if committed_version == Some(tx.to_version.as_str()) {
+    if active == Some(&tx.candidate_release) {
+        if committed == Some(&tx.candidate_release) {
             Recovery::Committed
         } else {
             Recovery::RestorePredecessor
         }
-    } else if hash_eq(disk_sha, &tx.old_sha256) {
+    } else if active == Some(&tx.previous_release) {
         Recovery::NeverSwapped
     } else {
         Recovery::RestorePredecessor
@@ -68,91 +67,47 @@ pub fn clear(path: &Path) -> io::Result<()> {
     apply::remove_file_durable(path)
 }
 
-/// Pure drift decision shared by boot planning and one-shot execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryAction {
-    Ready,
-    RestoreRollback,
-    FailClosed,
-}
-
-pub fn classify_binary(
-    live_sha: Option<&str>,
-    rollback_sha: Option<&str>,
-    committed_sha: &str,
-) -> BinaryAction {
-    if live_sha.is_some_and(|sha| hash_eq(sha, committed_sha)) {
-        BinaryAction::Ready
-    } else if rollback_sha.is_some_and(|sha| hash_eq(sha, committed_sha)) {
-        BinaryAction::RestoreRollback
-    } else {
-        BinaryAction::FailClosed
-    }
-}
-
-/// Digest equality. The empty string is not a digest — callers substitute it for "this
-/// file could not be hashed" (`store.binary_sha().unwrap_or_default()`) — so it matches
-/// nothing, *including another empty string*. Letting unknown equal unknown would classify
-/// an unhashable binary as a clean `NeverSwapped`/`Ready` and skip the very drift check
-/// that must refuse to run bytes the supervisor cannot verify.
-fn hash_eq(a: &str, b: &str) -> bool {
-    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn release(version: &str, digest: &str) -> ReleaseId {
+        ReleaseId {
+            version: version.into(),
+            manifest_sha256: digest.into(),
+        }
+    }
+
     fn tx() -> Transaction {
         Transaction {
-            old_sha256: "old".into(),
-            new_sha256: "new".into(),
-            to_version: "2.0.0".into(),
-            from_version: Some("1.0.0".into()),
+            previous_release: release("1.0.0", "old"),
+            candidate_release: release("2.0.0", "new"),
+            candidate_archive_sha256: "archive".into(),
         }
     }
 
     #[test]
-    fn recovery_is_derived_from_disk_and_commit() {
+    fn recovery_is_derived_from_active_pointer_and_commit() {
+        let tx = tx();
         assert_eq!(
-            classify_recovery(&tx(), "NEW", Some("2.0.0")),
+            classify_recovery(
+                &tx,
+                Some(&tx.candidate_release),
+                Some(&tx.candidate_release)
+            ),
             Recovery::Committed
         );
         assert_eq!(
-            classify_recovery(&tx(), "new", Some("1.0.0")),
+            classify_recovery(&tx, Some(&tx.candidate_release), Some(&tx.previous_release)),
             Recovery::RestorePredecessor
         );
         assert_eq!(
-            classify_recovery(&tx(), "OLD", Some("1.0.0")),
+            classify_recovery(&tx, Some(&tx.previous_release), Some(&tx.previous_release)),
             Recovery::NeverSwapped
         );
         assert_eq!(
-            classify_recovery(&tx(), "torn", Some("1.0.0")),
+            classify_recovery(&tx, None, Some(&tx.previous_release)),
             Recovery::RestorePredecessor
-        );
-    }
-
-    #[test]
-    fn an_unhashable_binary_never_classifies_as_clean() {
-        // Callers pass "" for a binary they could not hash (unreadable, EIO, stale handle).
-        // "Unknown == unknown" must not read as a match: that would call an unverifiable
-        // binary `NeverSwapped`/`Ready`, drop the rollback image, skip the drift check, and
-        // launch bytes nothing ever verified.
-        let mut unhashable = tx();
-        unhashable.old_sha256 = String::new();
-        assert_eq!(
-            classify_recovery(&unhashable, "", Some("1.0.0")),
-            Recovery::RestorePredecessor,
-            "an unhashable disk and an unhashable predecessor must not agree"
-        );
-        assert_eq!(
-            classify_binary(Some(""), None, ""),
-            BinaryAction::FailClosed,
-            "an unhashable binary is never Ready"
-        );
-        assert_eq!(
-            classify_binary(Some("new"), Some(""), ""),
-            BinaryAction::FailClosed
         );
     }
 
@@ -184,14 +139,7 @@ mod tests {
         let path = tmp("strict-schema");
         std::fs::write(
             &path,
-            br#"{"old_sha256":"old","new_sha256":"new","to_version":"2.0.0"}"#,
-        )
-        .unwrap();
-        assert!(read(&path).is_err(), "from_version is required");
-
-        std::fs::write(
-            &path,
-            br#"{"old_sha256":"old","new_sha256":"new","to_version":"2.0.0","from_version":"1.0.0","legacy":true}"#,
+            br#"{"previous_release":{"version":"1","manifest_sha256":"a"},"candidate_release":{"version":"2","manifest_sha256":"b"},"candidate_archive_sha256":"c","legacy":true}"#,
         )
         .unwrap();
         assert!(
@@ -207,21 +155,5 @@ mod tests {
         let d = std::env::temp_dir().join(format!("tx-{}-isdir", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         assert!(read(&d).is_err());
-    }
-
-    #[test]
-    fn binary_classifier_restores_verified_bytes_or_fails_closed() {
-        assert_eq!(
-            classify_binary(Some("good"), None, "GOOD"),
-            BinaryAction::Ready
-        );
-        assert_eq!(
-            classify_binary(Some("bad"), Some("good"), "GOOD"),
-            BinaryAction::RestoreRollback
-        );
-        assert_eq!(
-            classify_binary(Some("bad"), None, "good"),
-            BinaryAction::FailClosed
-        );
     }
 }

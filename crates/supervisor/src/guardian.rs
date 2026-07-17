@@ -80,7 +80,7 @@ impl Guardian {
     }
 
     /// Stop the application (the guardian escalates to a hard kill). Used to quiesce it
-    /// before swapping its binary during an update.
+    /// before activating a release during an update.
     pub(crate) fn stop(&mut self) -> Result<(), String> {
         self.require(control::CAP_STOP_APP, "STOP")?;
         self.expect_ok(&Request::Stop, "STOP")

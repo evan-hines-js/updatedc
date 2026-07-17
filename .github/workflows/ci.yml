@@ -129,10 +129,30 @@ jobs:
         if: always()
         run: ./scripts/macos-smoke.sh reset
 
+  linux-haproxy-e2e:
+    name: Linux real HAProxy binary reload
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install HAProxy test dependencies
+        run: sudo apt-get update && sudo apt-get install -y haproxy
+      - name: Exercise real master-worker binary upgrades
+        run: ./scripts/linux-haproxy-e2e.sh
+      - name: Preserve failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-haproxy-e2e-logs
+          path: target/haproxy-e2e/*.log
+          if-no-files-found: warn
+
   release:
     name: Publish rolling release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, trivy, macos-publish-fuzz]
+    needs: [test, trivy, macos-publish-fuzz, linux-haproxy-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+path = "src/main.rs"
+
 [[bin]]
 name = "sampleapp"
-path = "src/main.rs"
+path = "src/bin/sampleapp.rs"
 
 [dependencies]
 updated = { path = "../updated" }
+serde.workspace = true
+toml.workspace = true
 # SO_REUSEADDR so a fresh instance can rebind the port immediately after the
 # supervisor stops the previous one.
 socket2 = "0.5"

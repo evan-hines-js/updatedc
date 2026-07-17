@@ -43,7 +43,10 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     // app's args): a real swap whose application crashes before commit. The guardian rolls
     // it up; the restarted supervisor rejects the crashing release and recovers to v2.
     ctx.publish(&dir, "app", "3.0.0", &ctx.server.clone())?;
-    if !sup.wait_for_log("update 3.0.0 crashed before commit; rejecting it", 40) {
+    if !sup.wait_for_log(
+        "restoring predecessor 2.0.0 after interrupted activation of 3.0.0",
+        40,
+    ) {
         return fail("supervisor did not reject the crashing v3.0.0 on recovery");
     }
     if !wait_for_version(svc, "2.0.0", 15) {
@@ -115,8 +118,7 @@ pub(crate) fn app_post_health_crash_reverts(ctx: &Ctx) -> R {
         kill_stray(&app);
         return fail("service did not recover to v1.0.0 after the revert");
     }
-    let rejected =
-        std::fs::read_to_string(with_suffix(&app, ".installed.rejected")).unwrap_or_default();
+    let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
     kill_stray(&app);
     if rejected.trim().is_empty() {
         return fail("the crashing release's hash was not rejected");

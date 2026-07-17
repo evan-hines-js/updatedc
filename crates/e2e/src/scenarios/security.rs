@@ -69,14 +69,6 @@ pub(crate) fn tampered_first_install_fails_closed(ctx: &Ctx) -> R {
     std::fs::copy(&v1, &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
-    {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&app)
-            .and_then(|mut f| f.write_all(b"TAMPERED-BEFORE-FIRST-LAUNCH"))
-            .map_err(str_err)?;
-    }
     let _server = ctx.serve(&dir, srv)?;
     let cmd = Sup::new(
         ctx,
@@ -85,23 +77,35 @@ pub(crate) fn tampered_first_install_fails_closed(ctx: &Ctx) -> R {
         "app",
         appcmd(&app, &["--addr", "127.0.0.1:0"]),
     )
-    .baseline_sha256(sha256_hex(&v1))
     .health_grace("1s")
     .guardian()?;
+    let active = updated::bundle::read_active(&dir.join("install/active-release"))
+        .map_err(str_err)?
+        .ok_or("seed did not activate a release")?;
+    let release_dir = dir.join("install/versions").join(active.directory_name());
+    {
+        use std::io::Write;
+        make_writable(&release_dir.join("config/release.toml"))?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(release_dir.join("config/release.toml"))
+            .and_then(|mut file| file.write_all(b"tampered = true\n"))
+            .map_err(str_err)?;
+    }
     let tower = Service::spawn("bad-baseline", &cmd);
     if !wait_until(10, || {
-        tower.log_contains("does not match its configured SHA-256")
+        tower.log_contains("release file type or size drifted")
     }) {
         return fail("no first-install trust failure was logged");
     }
     let log = tower.captured_log();
-    if log.contains("started application pid") || with_suffix(&app, ".installed").exists() {
+    if log.contains("started application pid") {
         return fail(format!(
             "tampered baseline reached application launch or committed state:\n{log}"
         ));
     }
     drop(tower);
-    kill_stray(&app);
+    kill_stray(&dir.join("install"));
     ok("a tampered first-install binary was rejected before execution");
     Ok(())
 }
@@ -117,25 +121,8 @@ pub(crate) fn drift_fail_closed(ctx: &Ctx) -> R {
     std::fs::copy(&v1, &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
 
-    // Commit installed state pinning the (correct) binary hash, then tamper the
-    // binary out of band so it no longer matches.
-    let sha = sha256_hex(&app);
-    updated::state::write_installed(
-        &with_suffix(&app, ".installed"),
-        &updated::state::InstalledState::confirmed("1.0.0".into(), sha.clone()),
-    )
-    .map_err(str_err)?;
-    {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&app)
-            .and_then(|mut f| f.write_all(b"TAMPER"))
-            .map_err(str_err)?;
-    }
-    let tampered_sha = sha256_hex(&app);
-
-    // Drift is checked at startup, before any TUF fetch; no server needed.
+    // Build the command first (which seeds the immutable release), then tamper a
+    // manifested file out of band.
     let cmd = Sup::new(
         ctx,
         &dir,
@@ -145,20 +132,30 @@ pub(crate) fn drift_fail_closed(ctx: &Ctx) -> R {
     )
     .health_grace("1s")
     .guardian()?;
+    let active = updated::bundle::read_active(&dir.join("install/active-release"))
+        .map_err(str_err)?
+        .ok_or("seed did not activate a release")?;
+    let (_, installed_entrypoint) =
+        updated::bundle::read_release(&dir.join("install/versions"), &active).map_err(str_err)?;
+    {
+        use std::io::Write;
+        make_writable(&installed_entrypoint)?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&installed_entrypoint)
+            .and_then(|mut f| f.write_all(b"TAMPER"))
+            .map_err(str_err)?;
+    }
+    // Drift is checked at startup, before any TUF fetch; no server needed.
     let tower = Service::spawn("drift", &cmd);
-    if !wait_until(10, || tower.log_contains("refusing to run drifted bytes")) {
+    if !wait_until(10, || {
+        tower.log_contains("release file type or size drifted")
+    }) {
         return fail("no fail-closed drift message was logged");
     }
     let log = tower.captured_log();
-    let state_unchanged = matches!(
-        updated::state::read_installed(&with_suffix(&app, ".installed")),
-        updated::state::Installed::Present(ref state)
-            if state.version == "1.0.0" && state.sha256 == sha
-    );
-    if log.contains("started application pid")
-        || !state_unchanged
-        || sha256_hex(&app) != tampered_sha
-    {
+    let state_unchanged = matches!(updated::state::read_installed(&dir.join("install/state/installed.json")), updated::state::Installed::Present(ref state) if state.release == active);
+    if log.contains("started application pid") || !state_unchanged {
         return fail(format!(
             "drift rejection launched or mutated the managed installation:\n{log}"
         ));

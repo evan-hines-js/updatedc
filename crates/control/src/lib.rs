@@ -184,7 +184,7 @@ pub enum Request {
     /// Launch the application from this exact spec.
     Launch(CommandSpec),
     /// Stop the application (SIGTERM to its group on Unix; terminate on Windows). Used
-    /// to quiesce it before swapping its binary during an update — an *intentional*
+    /// to quiesce it before activating a release during an update — an *intentional*
     /// exit, which the guardian does not treat as a crash.
     Stop,
     /// Hand off to the staged replacement supervisor at this opaque path.

@@ -105,7 +105,7 @@ CDN, or a deployed daemon.
 The repository includes compact stand-ins for the external infrastructure so the
 entire topology can be run locally without cloud services:
 
-- `server init` and `server publish` are a development TUF publisher. They create
+- `server init`, `server publish-app`, and `server publish-supervisor` are development TUF publisher commands. They create
   real role keys and real signed metadata, but are intentionally simple CLI tools,
   not a production signing service or key-management system.
 - `server serve` is the mock metadata origin and binary CDN. It serves the signed
@@ -412,12 +412,12 @@ Publish a release. Targets are declared per platform as `<os>-<arch>=<path>`; th
 server records them under `products/<product>/<channel>/<version>/<os>-<arch>/…`:
 
 ```sh
-target/release/server publish --repo ./repo --keys ./keys \
+target/release/server publish-app --repo ./repo --keys ./keys \
   --product app --version 1.0.0 \
-  --target linux-x86_64=./app-linux-x86_64 \
-  --target linux-aarch64=./app-linux-aarch64 \
-  --target macos-aarch64=./app-macos-aarch64 \
-  --target windows-x86_64=./app-windows-x86_64.exe
+  --entrypoint bin/app \
+  --bundle linux-x86_64=./release-linux-x86_64 \
+  --bundle linux-aarch64=./release-linux-aarch64 \
+  --bundle macos-aarch64=./release-macos-aarch64
 ```
 
 Serve the repository through the local metadata/target origin:
@@ -450,9 +450,8 @@ targets_url  = "http://127.0.0.1:8080/targets/"
 
 [application]
 product         = "app"
-current_version = "1.0.0"
-current_sha256  = "<sha256 of ./deploy/app>"
-command         = ["./deploy/app", "--your-app-argument", "value"]
+install_root    = "/var/lib/example-app"
+args            = ["--your-app-argument", "value"]
 health_url      = "http://127.0.0.1:9090/healthz"
 
 [timeouts]
@@ -595,26 +594,12 @@ adopts the guardian-owned application before signalling readiness. The bootstrap
 keeps no pending activation journal: it advances `desired-supervisor` only after
 readiness succeeds, so a bootstrap restart naturally relaunches the last committed path.
 
-### macOS smoke test
+### End-to-end validation
 
-For production-shaped local macOS validation, `scripts/macos-smoke.sh publish
-<version>` waits for the requested application version without treating supervisor
-log messages as a control protocol. It checks the live version and fails immediately
-when asked to publish a version below the running version. Downgrades are not supported.
-
-After starting the smoke tower, `scripts/macos-publish-fuzz.sh` concurrently publishes
-bursts of three or four fresh random versions. It continues as soon as the application
-selects the greatest published version, completing as many bursts as possible in one
-minutes and allowing the last started burst to finish. Every burst has a 30-second
-convergence timeout, and every burst is generated above the preceding maximum so each
-successful check represents a real upgrade. Each burst also publishes a corrupt executable
-above its valid releases, requiring guardian restart, recovery rejection and rollback
-before selection of the greatest valid version. The smoke tower's check interval, health
-grace, confirmation window, guardian process-stop grace, and launchd restart throttle are
-configurable with `UPDATED_SMOKE_*` variables so CI can exercise this realistic path
-rapidly. The fuzzer fails immediately if more than 30 consecutive availability probes fail.
-Fuzz duration, timeout, batch-size range, availability limit, and version-major prefix are
-configurable through `UPDATED_SMOKE_FUZZ_*` variables.
+`cargo run -p e2e --release` is the single cross-platform system test. It publishes real
+bundles, exercises stop/start and same-PID HUP upgrades, and adversarially crashes every
+durable activation boundary. A process lock prevents overlapping runs from sharing its
+ports or `target/e2e-work` directory.
 
 ### Durable state files
 
@@ -623,23 +608,38 @@ inside the bootstrap `--state-dir`:
 
 | State | Purpose |
 | --- | --- |
-| `*.installed` | committed application version/digest plus optional pending rollback intent |
-| `*.transaction` / `*.old` | in-flight application transaction and rollback image |
-| `*.rejected` | failed digests, aged out after `retry_after` |
-| `*.apptoken` | current application launch's health token |
+| `app/active-release` | atomically selected immutable application release |
+| `app/versions/<release-id>/` | manifested, verified application release trees |
+| `app/state/installed.json` | committed release/archive identity plus optional pending rollback intent |
+| `app/state/transaction.json` | in-flight pointer activation transaction |
+| `app/state/rejected` | failed archive digests, aged out after `retry_after` |
+| `app/state/app-token` | current application launch's health token |
 | `desired-supervisor` | guardian's atomically committed supervisor path |
 | `app-crashed` / `rejected-supervisor` | one-shot guardian markers consumed by the supervisor |
 | `supervisors/<content-id>/` | verified supervisor candidates staged by content hash |
 
-### Restart strategies
+### Activation
 
-The portable default is stop → swap → start. On Unix, `application.reload_command`
-may instead trigger a same-PID re-exec that preserves listening sockets. It receives
-`UPDATED_CHILD_PID` and `UPDATED_BINARY`; `application.health_url` is required,
-and readiness must echo both the launch token and `X-Updated-Version`. Commands
-that fork or hand off to another PID are unsupported. The value is an argv array,
-executed directly without a shell; exact `{pid}` and `{binary}` arguments expand to
-the managed process ID and binary path.
+The portable default is stop → activate → start. Unix services with a HAProxy-like
+master/worker interface can select structured same-PID reexec activation:
+
+```toml
+[application.activation]
+mode = "reexec"
+preflight_command = ["{candidate}/bin/app", "--check", "{candidate}/config/app.toml"]
+command = ["/usr/local/libexec/activate-app", "{candidate}", "{install_root}", "{pid}"]
+```
+
+`preflight_command` is optional and runs before the transaction journal, active pointer,
+stable files, or live process are touched. `command` is required and is used symmetrically
+to activate the candidate and to restore the predecessor. Both are argv arrays executed
+directly without a shell. Placeholders expand within an argument: `{candidate}`,
+`{predecessor}`, `{candidate_version}` (or `{version}`), `{predecessor_version}`,
+`{install_root}`, and `{pid}`. The same values are also exposed through `UPDATED_*`
+environment variables.
+
+The master PID must remain guardian-owned and unchanged. Readiness must echo both the
+launch token and `X-Updated-Version`; command success alone never commits an update.
 
 Production deployments run `bootstrap --state-dir ... --supervisor-config ... --supervisor ...` under
 systemd, launchd, or Windows SCM. Direct supervisor execution is rejected, and
@@ -656,7 +656,7 @@ supervisor replacement is always part of the managed update loop.
   against a local administrator.
 - The deliberately minimal bootstrap is not updated over the air; its replacement
   belongs to the installer or package manager.
-- Zero-downtime reloads are Unix-only (they rely on the server re-execing in
+- Zero-downtime reexec activation is Unix-only (it relies on the server re-execing in
   place); on Windows every strategy is the stop/swap/start restart.
 - The dev server serves a repository from disk; production should use object
   storage or a CDN with immutable versioned metadata and conditional timestamp

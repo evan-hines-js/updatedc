@@ -49,25 +49,47 @@ pub struct Application {
     pub product: String,
     #[serde(default = "stable")]
     pub channel: String,
-    /// First-install baseline version, used only until an update commits real state.
+    /// Root containing active-release, immutable versions, staging, and durable state.
+    pub install_root: PathBuf,
+    /// Arguments appended to the manifest-owned entrypoint.
     #[serde(default)]
-    pub current_version: Option<String>,
-    /// Installer-provisioned SHA-256 of the first-install baseline. Required together
-    /// with `current_version` when no installed-state record exists.
-    #[serde(default)]
-    pub current_sha256: Option<String>,
-    /// The managed program and its arguments; element 0 is the binary path.
-    pub command: Vec<String>,
+    pub args: Vec<String>,
     /// Readiness probe; omit for liveness-only (survive the health grace = healthy).
     #[serde(default)]
     pub health_url: Option<String>,
-    /// Zero-downtime reload executable and arguments (Unix, requires `health_url`).
-    /// Exact `{pid}` and `{binary}` arguments are expanded without invoking a shell.
+    /// How a staged release enters service. The default is a portable stop/start;
+    /// reexec keeps the existing master alive and delegates its program-specific
+    /// handoff to explicit argv commands.
     #[serde(default)]
-    pub reload_command: Option<Vec<String>>,
-    /// Installed-target record location; defaults to `<binary>.installed`.
-    #[serde(default)]
-    pub state: Option<PathBuf>,
+    pub activation: Activation,
+}
+
+/// The one application activation model. Commands are argv arrays executed without a
+/// shell; exact-token placeholders are expanded by the supervisor.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Activation {
+    /// Stop the managed process and launch the candidate entrypoint.
+    #[default]
+    StopStart,
+    /// Keep the master PID alive while operator code projects and activates a candidate.
+    Reexec {
+        /// Optional candidate validation, run before journaling, pointer mutation, or
+        /// touching the live process. Failure rejects the candidate without rollback.
+        #[serde(default)]
+        preflight_command: Option<Vec<String>>,
+        /// Symmetric handoff command, used for both forward activation and rollback.
+        command: Vec<String>,
+    },
+}
+
+impl Activation {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Activation::StopStart => "stop-start",
+            Activation::Reexec { .. } => "reexec",
+        }
+    }
 }
 
 fn stable() -> String {
@@ -143,35 +165,27 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.application.command.is_empty() {
-            return Err("application.command must name the program to run".into());
+        if !self.application.install_root.is_absolute() {
+            return Err("application.install_root must be absolute".into());
         }
-        if self.application.reload_command.is_some() && !cfg!(unix) {
-            return Err("application.reload_command is supported only on Unix".into());
-        }
-        if self.application.reload_command.is_some() && self.application.health_url.is_none() {
-            return Err("application.reload_command requires application.health_url".into());
-        }
-        if self
-            .application
-            .reload_command
-            .as_ref()
-            .is_some_and(Vec::is_empty)
+        if let Activation::Reexec {
+            preflight_command,
+            command,
+        } = &self.application.activation
         {
-            return Err("application.reload_command must name an executable".into());
-        }
-        if let Some(v) = &self.application.current_version {
-            semver::Version::parse(v).map_err(|e| format!("application.current_version: {e}"))?;
-        }
-        if self.application.current_version.is_some() != self.application.current_sha256.is_some() {
-            return Err("application.current_version and application.current_sha256 must be configured together".into());
-        }
-        if let Some(sha) = &self.application.current_sha256 {
-            if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !cfg!(unix) {
+                return Err("application.activation reexec mode is supported only on Unix".into());
+            }
+            if self.application.health_url.is_none() {
                 return Err(
-                    "application.current_sha256 must be a 64-character hexadecimal SHA-256 digest"
-                        .into(),
+                    "application.activation reexec mode requires application.health_url".into(),
                 );
+            }
+            if command.is_empty() {
+                return Err("application.activation.command must name a command".into());
+            }
+            if preflight_command.as_ref().is_some_and(Vec::is_empty) {
+                return Err("application.activation.preflight_command must name a command".into());
             }
         }
         for (name, value) in [
@@ -206,72 +220,50 @@ impl Config {
     }
 }
 
-/// The canonical on-disk layout the tower derives from `[application]` +
-/// `[repository]`: the (canonicalized) binary, its committed-state record, the TUF
-/// metadata cache, the update staging file, and the transaction / rejected / app-token
-/// siblings. Every consumer — the supervisor and the one-shot updater — resolves through
-/// [`Config::resolve_paths`] so none of them re-derive `<binary>.installed` or
-/// `<state>.tuf` by hand and drift apart.
+/// The one canonical immutable-release layout shared by supervisor and one-shot mode.
 #[derive(Debug, Clone)]
 pub struct Paths {
-    /// The managed binary (absolute; `application.command[0]` canonicalized).
-    pub binary: PathBuf,
-    /// Committed installed-target record (`application.state`, else `<binary>.installed`).
-    pub state: PathBuf,
-    /// Persistent TUF metadata cache (`repository.datastore`, else `<state>.tuf`).
-    pub datastore: PathBuf,
-    /// Where a verified target is streamed before the swap (`<binary>.download`).
+    pub install_root: PathBuf,
+    pub versions: PathBuf,
+    pub staging: PathBuf,
+    pub active_release: PathBuf,
     pub download: PathBuf,
-    /// The update transaction journal (`<state>.transaction`).
+    pub state: PathBuf,
+    pub datastore: PathBuf,
     pub journal: PathBuf,
-    /// Persisted hashes of releases that failed their health check (`<state>.rejected`).
     pub rejected: PathBuf,
-    /// The current app launch's health token, persisted so a replacement supervisor
-    /// that re-adopts the running app can still verify its health responses
-    /// (`<state>.apptoken`). The guardian owns the process; this is the one bit of
-    /// per-launch app state the supervisor keeps.
     pub app_token: PathBuf,
 }
 
 impl Config {
-    /// Resolve the canonical [`Paths`], applying the tower-wide defaults. The binary
-    /// is canonicalized, so it must already exist (the installer places the baseline).
+    /// Resolve the canonical bundle layout. The installer creates `install_root` and
+    /// seeds its first active release before starting the service.
     pub fn resolve_paths(&self) -> Result<Paths, String> {
-        let binary = std::fs::canonicalize(&self.application.command[0]).map_err(|e| {
-            format!(
-                "cannot resolve application binary {:?}: {e} (use an absolute path)",
-                self.application.command[0]
-            )
-        })?;
-        let state = self
-            .application
-            .state
-            .clone()
-            .unwrap_or_else(|| default_state_path(&binary));
+        let install_root = self.application.install_root.clone();
+        let state_dir = install_root.join("state");
+        let state = state_dir.join("installed.json");
         let datastore = self
             .repository
             .datastore
             .clone()
-            .unwrap_or_else(|| with_suffix(&state, ".tuf"));
+            .unwrap_or_else(|| state_dir.join("tuf"));
         Ok(Paths {
-            download: with_suffix(&binary, ".download"),
-            journal: with_suffix(&state, ".transaction"),
-            rejected: with_suffix(&state, ".rejected"),
-            app_token: with_suffix(&state, ".apptoken"),
+            versions: install_root.join("versions"),
+            staging: install_root.join("staging"),
+            active_release: install_root.join("active-release"),
+            download: install_root.join("staging/bundle.download"),
+            journal: state_dir.join("transaction.json"),
+            rejected: state_dir.join("rejected"),
+            app_token: state_dir.join("app-token"),
             datastore,
             state,
-            binary,
+            install_root,
         })
     }
 }
 
-/// Default committed-state record for an application binary.
-fn default_state_path(binary: &Path) -> PathBuf {
-    with_suffix(binary, ".installed")
-}
-
-/// Append `suffix` to a path's final component — `foo` + `.old` ⇒ `foo.old`. The
-/// tower's one way to name a sibling of a state or binary file.
+/// Append `suffix` to a path's final component. Used for independent lock/download
+/// siblings in the supervisor self-update path.
 pub fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
     let mut value = base.as_os_str().to_os_string();
     value.push(suffix);
@@ -382,7 +374,7 @@ mod tests {
             targets_url = "http://x/t/"
             [application]
             product = "app"
-            command = ["app"]
+            install_root = "/app"
             [timeouts]
             check_interval = 0
             "#,
@@ -404,7 +396,7 @@ mod tests {
             targets_url = "http://x/t/"
             [application]
             product = "app"
-            command = ["app"]
+            install_root = "/app"
         "#;
         let mut cfg: Config = toml::from_str(base).unwrap();
         cfg.timeouts.health_successes = 0;
@@ -425,7 +417,8 @@ mod tests {
             targets_url = "http://x/t/"
             [application]
             product = "app"
-            command = ["app", "--addr", "127.0.0.1:9090"]
+            install_root = "/app"
+            args = ["--addr", "127.0.0.1:9090"]
             [timeouts]
             health_grace = "2m"
             "#,
@@ -442,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_without_health_url_is_rejected() {
+    fn reexec_without_health_url_is_rejected() {
         let cfg: Result<Config, _> = toml::from_str(
             r#"
             [repository]
@@ -451,8 +444,10 @@ mod tests {
             targets_url = "http://x/t/"
             [application]
             product = "app"
-            command = ["app"]
-            reload_command = ["kill", "-HUP", "{pid}"]
+            install_root = "/app"
+            [application.activation]
+            mode = "reexec"
+            command = ["kill", "-HUP", "{pid}"]
             "#,
         );
         // Parses, but validation rejects it (Unix) or the platform guard does.
@@ -460,7 +455,7 @@ mod tests {
             assert!(cfg.validate().is_err());
         }
 
-        // With health_url present, a reload_command is valid on Unix — the case that
+        // With health_url present, reexec is valid on Unix — the case that
         // distinguishes the Unix-only platform guard from an unconditional reject.
         #[cfg(unix)]
         {
@@ -472,9 +467,11 @@ mod tests {
                 targets_url = "http://x/t/"
                 [application]
                 product = "app"
-                command = ["app"]
+                install_root = "/app"
                 health_url = "http://127.0.0.1:9/healthz"
-                reload_command = ["kill", "-HUP", "{pid}"]
+                [application.activation]
+                mode = "reexec"
+                command = ["kill", "-HUP", "{pid}"]
                 "#,
             )
             .unwrap();
@@ -483,44 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn installer_baseline_requires_a_version_and_valid_digest_pair() {
-        let base = r#"
-            [repository]
-            root = "/r"
-            metadata_url = "http://x/m/"
-            targets_url = "http://x/t/"
-            [application]
-            product = "app"
-            command = ["app"]
-        "#;
-        let mut cfg: Config = toml::from_str(base).unwrap();
-        cfg.application.current_version = Some("1.0.0".into());
-        assert!(cfg.validate().unwrap_err().contains("configured together"));
-
-        cfg.application.current_sha256 = Some("not-a-digest".into());
-        assert!(cfg.validate().unwrap_err().contains("64-character"));
-
-        // Right charset but wrong length is still rejected: the guard is "wrong length
-        // OR non-hex", not "wrong length AND non-hex".
-        cfg.application.current_sha256 = Some("a".repeat(63));
-        assert!(cfg.validate().unwrap_err().contains("64-character"));
-        // Right length but non-hex is rejected too.
-        cfg.application.current_sha256 = Some("g".repeat(64));
-        assert!(cfg.validate().unwrap_err().contains("64-character"));
-
-        cfg.application.current_sha256 = Some("a".repeat(64));
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn resolve_paths_derives_the_canonical_sibling_layout() {
+    fn resolve_paths_derives_the_canonical_install_layout() {
         let dir = std::env::temp_dir().join(format!("cfg-paths-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("app");
-        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-
-        let mut cfg: Config = toml::from_str(
+        let cfg: Config = toml::from_str(
             r#"
             [repository]
             root = "/r"
@@ -528,22 +492,26 @@ mod tests {
             targets_url = "http://x/t/"
             [application]
             product = "app"
-            command = ["app"]
+            install_root = "/placeholder"
             "#,
         )
         .unwrap();
-        cfg.application.command = vec![bin.to_str().unwrap().to_string()];
+        let mut cfg = cfg;
+        cfg.application.install_root = dir.clone();
 
         let paths = cfg.resolve_paths().unwrap();
-        let canon = std::fs::canonicalize(&bin).unwrap();
-        // Absent [application].state, the record defaults to `<binary>.installed`, and
-        // every sibling is derived from it — not left empty.
-        assert_eq!(paths.state, with_suffix(&canon, ".installed"));
-        assert_eq!(paths.datastore, with_suffix(&paths.state, ".tuf"));
-        assert_eq!(paths.download, with_suffix(&canon, ".download"));
-        assert_eq!(paths.journal, with_suffix(&paths.state, ".transaction"));
-        assert_eq!(paths.rejected, with_suffix(&paths.state, ".rejected"));
-        assert_eq!(paths.app_token, with_suffix(&paths.state, ".apptoken"));
+        assert_eq!(paths.install_root, dir);
+        assert_eq!(paths.versions, paths.install_root.join("versions"));
+        assert_eq!(
+            paths.active_release,
+            paths.install_root.join("active-release")
+        );
+        assert_eq!(paths.state, paths.install_root.join("state/installed.json"));
+        assert_eq!(paths.datastore, paths.install_root.join("state/tuf"));
+        assert_eq!(
+            paths.download,
+            paths.install_root.join("staging/bundle.download")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

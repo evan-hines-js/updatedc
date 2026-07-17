@@ -1,7 +1,7 @@
 # /etc/selfupdate/config.toml — one operator config for the whole update tower.
 # The bootstrap receives its state directory, initial supervisor path, and this
-# supervisor config as command-line arguments. Install this file read-only beside
-# the pinned TUF root. The packager substitutes both application tokens.
+# supervisor config as command-line arguments. The installer seeds install_root
+# with a verified initial bundle before starting the service.
 
 [repository]
 root         = "/etc/selfupdate/root.json" # installer-pinned trust anchor (read-only)
@@ -11,9 +11,8 @@ targets_url  = "https://updates.example.com/targets/"
 [application]
 product         = "app"
 channel         = "stable"
-current_version = "@APPLICATION_VERSION@"
-current_sha256  = "@APPLICATION_SHA256@"
-command         = ["/var/lib/selfupdate/app", "--addr", "127.0.0.1:9090"]
+install_root    = "/var/lib/selfupdate/app"
+args            = ["--addr", "127.0.0.1:9090"]
 health_url      = "http://127.0.0.1:9090/healthz"   # omit for liveness-only
 # Authenticated application target versions below the installed version are denied.
 

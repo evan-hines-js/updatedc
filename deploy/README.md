@@ -79,26 +79,21 @@ swap.
 | `/etc/selfupdate/root.json` | Installer-pinned TUF root — the anchor of trust, read-only |
 | `/var/lib/selfupdate/` (Linux), `/usr/local/var/selfupdate/` (macOS) | Writable guardian state: `desired-supervisor`, crash/rejection markers, and content-addressed `supervisors/` candidates; application state and the TUF cache live beside paths selected in `config.toml` |
 
-Because the supervisor and application binaries are what self-update, they live in
-the writable state directory. The two things that must never be forged — the
+Because supervisor candidates and immutable application bundles self-update, they live
+in writable state directories. The two things that must never be forged — the
 bootstrap and the pinned TUF root — stay read-only. A leaked or misused role key
 still cannot make a client run anything the pinned root's roles did not sign.
 
-The installer places the initial supervisor and `app` binary, pins the TUF root,
-and embeds `application.current_version` plus the SHA-256 of those exact application
-bytes as `application.current_sha256` in the supervisor config. It passes the
-initial supervisor with `bootstrap --supervisor`; the bootstrap seeds its durable
-pointer on first launch. After that the system is self-sustaining.
+The installer places the initial supervisor, pins the TUF root, and stages a verified
+initial application bundle into `application.install_root`, including `active-release`
+and `state/installed.json`. It passes the initial supervisor with
+`bootstrap --supervisor`; the bootstrap seeds its durable supervisor pointer on first
+launch. After that the system is self-sustaining.
 
-**Offline-capable, fail-closed first start.** When no installed-state record exists,
-the supervisor verifies the installer-placed binary against the version/digest pair in
-the read-only config, then atomically creates `<app>.installed`. This needs no network.
-If either config value is absent, the pair is malformed, or the bytes do not match, the
-application is not executed. A package may instead pre-provision the equivalent JSON
-record `{"version":"<packaged version>","sha256":"<hex digest of the binary>"}`;
-subsequent starts use that same committed-state path. The installer is already trusted
-to place the binary and pinned TUF root, so embedding its exact digest introduces no new
-trust authority and prevents accidental trust-on-first-use behavior.
+**Offline-capable, fail-closed first start.** The supervisor requires the installer-seeded
+release, strict installed record, and active pointer. It verifies every manifested file
+before launch and refuses missing, corrupt, or drifted state; it never synthesizes trust
+from loose executable bytes. No network is required to launch the verified active bundle.
 
 ## Linux (systemd)
 
@@ -147,13 +142,6 @@ edit the paths at its top, then run it from an elevated prompt:
 ```bat
 :: from an Administrator command prompt
 windows\install-selfupdate-supervisor.bat
-```
-
-An elevated Windows E2E test exercises the actual SCM control path, including clean
-tower shutdown and relaunch after stop/start:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy\windows\test-scm-e2e.ps1
 ```
 
 The template runs under the restricted `NT SERVICE\SelfUpdateSupervisor` virtual

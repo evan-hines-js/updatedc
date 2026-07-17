@@ -35,7 +35,8 @@ pub(crate) fn oneshot_updates_on_launch(ctx: &Ctx) -> R {
     }
     // The committed record must name the version it launched, so the NEXT launch
     // starts from 2.0.0 rather than re-updating.
-    let state = std::fs::read_to_string(with_suffix(&app, ".installed")).unwrap_or_default();
+    let state =
+        std::fs::read_to_string(dir.join("install/state/installed.json")).unwrap_or_default();
     kill_stray(&app);
     if !state.contains("\"version\":\"2.0.0\"") {
         return fail(format!(

@@ -1,82 +1,107 @@
-# Artifact Bundle Support Plan
+# Bundle-Only Installation Design
 
-## Summary
+## Decision
 
-Bundle support can be added without replacing the updater architecture. The existing
-TUF trust chain, release selection, durable journal, boot reconciliation, guardian,
-health gate, confirmation window, rejection list, and supervisor self-update all
-remain useful.
+`updated` installs exactly one artifact type: a signed application bundle.
 
-The fundamental change is to make an immutable **release directory**, rather than one
-application binary, the unit of installation and rollback.
+A bundle is a platform-specific archive containing an immutable release directory,
+including its executable entrypoint and any release-owned configuration or assets.
+Installation stages and verifies the complete directory, then atomically changes one
+`active-release` record. Rollback changes that record back to the verified predecessor.
 
-The recommended first implementation publishes one archive per supported
-OS/architecture, extracts it into an immutable version directory, and atomically
-switches a small `active-release` record. If a bundle contains multiple Rust agent
-binaries, a small Rust bundle runner can present them to the existing guardian as one
-managed application.
+There is deliberately no single-binary mode, artifact-kind enum, compatibility decoder,
+binary-to-bundle migration, or mixed rollback. This project is pre-launch: existing state
+may be deleted and installations reseeded with an initial bundle.
 
-## Estimated size and effort
+The existing TUF trust chain, release selection, guardian, health gate, confirmation
+window, rejection list, durable journal, boot planner, supervisor self-update, and chaos
+testing remain. Their application artifact vocabulary changes from a mutable executable
+to an immutable release directory.
 
-These estimates include production-style error handling and tests consistent with the
-current repository.
+## Why this is the only installation model
 
-| Area | Production code | Test code | Notes |
-|---|---:|---:|---|
-| Bundle manifest and validation | 250-400 lines | 200-300 lines | Schema, hashes, paths, entrypoint, limits |
-| Safe archive extraction | 250-450 lines | 250-400 lines | Traversal, links, duplicates, permissions, limits |
-| Immutable release-directory store | 350-550 lines | 300-450 lines | Stage, verify, activate, restore, cleanup |
-| Generalized state and transaction types | 150-250 lines | 150-250 lines | Release IDs instead of only binary hashes |
-| Supervisor and boot integration | 200-350 lines | 250-400 lines | Selection, activation, reconciliation, drift |
-| Configuration and publishing changes | 150-250 lines | 100-200 lines | Bundle layout, TUF custom metadata, CLI |
-| Bundle runner | 300-500 lines | 250-400 lines | Process group, shutdown, aggregate readiness |
-| End-to-end scenarios and fixtures | 50-100 lines | 400-700 lines | Update, crash, rollback, tampering, cleanup |
-| **Total** | **1,700-2,850 lines** | **1,900-3,100 lines** | **Approximately 3,600-5,950 lines overall** |
+An executable rarely remains the complete product forever. It eventually acquires
+templates, schemas, web assets, helper programs, default policy, or dynamic libraries.
+Treating the directory as the release unit gives all of those files the same trust,
+activation, confirmation, and rollback boundary.
 
-A narrow proof of concept could be around 1,000-1,500 total lines by supporting only
-one archive format, stop/start activation, one entrypoint, and minimal cleanup. That
-would demonstrate the design.
+The model also improves a one-executable application:
 
-Expected focused implementation time:
+- activation is a small atomic pointer write rather than replacement of live bytes;
+- old and new releases coexist and remain independently verifiable;
+- rollback never reconstructs a directory file by file;
+- Windows executable locks do not affect application activation;
+- a crash cannot expose a partially populated active release;
+- the state machine has one artifact identity and one recovery path.
 
-- 3-5 engineering days for a working cross-platform MVP with unit tests.
-- 1-2 weeks for repository-quality implementation, failure injection, end-to-end
-  coverage, documentation, and real Windows/macOS/Linux validation.
-- Additional time for signing/notarization, installer changes, and production soak
-  testing. Those are release-engineering tasks rather than core bundle mechanics.
+## Scope
 
-## Proposed on-disk layout
+The first implementation supports:
+
+- one `.tar.zst` archive per OS and architecture;
+- one strict manifest schema;
+- regular files and directories only;
+- one application entrypoint;
+- portable stop/start activation and opt-in Unix HUP/re-exec activation with the
+  existing same-PID, socket-preserving zero-downtime guarantee;
+- immutable release-owned files;
+- external mutable operator configuration and application data;
+- health-gated commit and confirmation-window rollback;
+- bounded retention and garbage collection.
+
+The first implementation does not support:
+
+- legacy binary targets or state;
+- multiple archive formats;
+- symlinks, hard links, devices, FIFOs, or sockets in bundles;
+- lifecycle shell scripts;
+- delta updates;
+- mutation inside an installed release;
+- independent component rollout channels;
+- irreversible data migrations;
+- arbitrary multi-process orchestration.
+
+A bundle runner should be added only when a real product requires multiple coordinated
+processes. It is not part of the initial bundle mechanism.
+
+## On-disk layout
 
 ```text
 install/
-  bootstrap                         # installer-owned and immutable
+  bootstrap                         # installer-owned, permanent guardian
   guardian-state/
     desired-supervisor
     supervisors/
   application/
-    active-release                  # atomically replaced text/JSON record
+    active-release                  # atomically replaced ReleaseId record
     versions/
       2.3.0-a31c9f.../
         manifest.json
         bin/
-          node-agent
-          telemetry-agent
+          application
+        config/
+          release.toml
       2.4.0-91be72.../
         manifest.json
         bin/
-          node-agent
-          telemetry-agent
+          application
+        config/
+          release.toml
     staging/
     state/
       installed.json
       transaction.json
-      rejected.json
-  config/                           # mutable, not part of a release
-  data/                             # mutable, not part of a release
+      rejected
+  config/                            # mutable operator configuration
+  data/                              # mutable application data
 ```
 
-`active-release` should contain a content-bound release ID, not an arbitrary path. For
-example:
+`versions/` and `staging/` must be on the same filesystem so a completely verified
+staging directory can be renamed into place atomically. Release directories become
+read-only after staging and are never edited or reused.
+
+`active-release` is an ordinary strict JSON record rather than a symlink or junction, so
+the existing durable atomic-write primitive works consistently across supported systems:
 
 ```json
 {
@@ -85,84 +110,178 @@ example:
 }
 ```
 
-An ordinary file is preferable to a symlink/junction because the existing durable
-atomic-write implementation works consistently across Windows, macOS, and Linux.
-Version directories are immutable after staging. Activation never overwrites their
-contents.
+The directory name is derived from this content-bound identity. It is never accepted as
+an arbitrary path.
 
-## Release artifact format
+## Release-owned and operator-owned configuration
 
-Publish one `.tar.zst` (or ZIP, if preferred for tooling) per platform as a single TUF
-target:
+The distinction is explicit:
 
-```text
-agent-suite-2.4.0-linux-x86_64.tar.zst
-agent-suite-2.4.0-linux-aarch64.tar.zst
-agent-suite-2.4.0-macos-aarch64.tar.zst
-agent-suite-2.4.0-windows-x86_64.tar.zst
+- Release-owned configuration is part of the signed bundle, immutable, and rolls back
+  with the release. Examples include embedded schema versions, default rules, or the
+  sample application's release identity.
+- Operator configuration lives outside `versions/`, remains mutable, and is never
+  overwritten by an update. Examples include listen addresses, credentials, and local
+  policy.
+- Application data also lives outside `versions/`.
+
+The supervisor launches the entrypoint with the active release directory as its working
+directory. Relative release-owned paths therefore resolve within that immutable tree.
+Any external operator-config or data paths are passed explicitly as absolute arguments or
+environment variables.
+
+## Same-PID zero-downtime activation
+
+Stop/start remains the portable default. A Unix service with a HAProxy-like master/worker
+interface uses the single structured reexec path:
+
+```toml
+[application.activation]
+mode = "reexec"
+preflight_command = ["{candidate}/bin/app", "--check"] # optional
+command = ["kill", "-HUP", "{pid}"]
 ```
 
-Using one archive avoids a partially acquired multi-target release. TUF already
-authenticates the archive's name, length, and SHA-256. The internal manifest provides
-defense in depth and describes how to run the bundle.
+Preflight happens before any durable or live mutation. The activation command is arbitrary
+argv and is applied symmetrically on upgrade and rollback; health, expected-version proof,
+unchanged guardian ownership, and durable rejection constrain its outcome.
 
-Example `manifest.json`:
+The immutable-directory model changes one detail: a running process cannot re-exec its
+original `argv[0]`, because that path still names the predecessor release. A reload-capable
+application must instead know the stable application install root. On HUP it:
+
+1. stops accepting new work while retaining its listening socket;
+2. drains in-flight requests;
+3. reads the stable `active-release` record;
+4. resolves the candidate manifest and entrypoint beneath `versions/<release-id>`;
+5. changes its working directory to that candidate release directory;
+6. `exec`s the candidate entrypoint in the same PID while preserving the listener;
+7. starts serving with release-owned files, including `config/release.toml`, from the
+   candidate directory.
+
+The supervisor remains the authority that validates and activates the candidate before
+signalling HUP. The application's pointer read is a cooperative handoff mechanism, not a
+second installation policy: it accepts only the exact current `active-release` and fails
+closed if it cannot resolve it. The stable install-root path is supplied at initial launch
+through a dedicated argument or non-secret environment variable and remains unchanged
+across releases.
+
+Forward activation is:
+
+1. stage and completely verify the candidate bundle;
+2. write the transaction journal;
+3. atomically switch `active-release` to the candidate;
+4. execute the configured reload command, normally HUP;
+5. require health to report the candidate version read from the candidate's bundled config;
+6. commit installed state only after that proof.
+
+If reload execution or candidate health fails, the supervisor atomically switches
+`active-release` back to the predecessor, sends HUP again, and requires the same PID to
+report the predecessor's bundled-config version before recording rollback. Thus rollback
+is zero-downtime as well. A reload-capable app that exits instead of completing either
+handoff falls into the existing guardian crash and boot-recovery path.
+
+The supervisor must never treat PID continuity, a successful `kill`, or generic health as
+version proof. Reload health must include the exact expected release version because the
+launch token does not change during a same-PID re-exec.
+
+## End-to-end sample application
+
+The E2E application must demonstrate a real directory release rather than a binary
+wrapped in an archive.
+
+Each published sample bundle contains:
+
+```text
+manifest.json
+bin/sampleapp[.exe]
+config/release.toml
+```
+
+`config/release.toml` contains the release version:
+
+```toml
+version = "2.0.0"
+```
+
+The sample application reads `config/release.toml` at startup and reports that value from
+its health/version endpoint. Its reported version must not come from a compile-time
+constant, command-line version flag, environment variable, executable filename, or TUF
+metadata.
+
+On Unix, the sample's re-exec mode also receives the stable application install root. Its
+HUP handler re-reads `active-release`, resolves the newly active sample entrypoint, changes
+to that release directory, and re-execs it while preserving the listening socket. It must
+not reuse the executable path or working directory captured at the predecessor's startup.
+
+Prefer using the same sample-app executable bytes across multiple fixture releases while
+changing only `config/release.toml`. This proves that selection, activation, health
+verification, confirmation, and rollback operate on the bundle identity and its assets,
+not accidentally on an executable hash.
+
+The current E2E scenarios retain their behavioral assertions with bundle facts:
+
+- initial provisioning activates the installer-seeded bundle;
+- unattended update switches the active release and the app reports the new config value;
+- failed health restores the predecessor directory and its config value;
+- a post-health crash within the confirmation window restores the predecessor;
+- rejection is keyed by authenticated archive digest;
+- drift/tampering of any manifested file fails closed;
+- transaction-boundary chaos converges to one complete verified release;
+- supervisor crash and self-update preserve the running application;
+- locking prevents concurrent activation;
+- one-shot execution resolves the entrypoint from the active bundle.
+
+## Archive and manifest
+
+Publish one `.tar.zst` target per platform:
+
+```text
+products/app/stable/2.4.0/linux-x86_64/bundle.tar.zst
+products/app/stable/2.4.0/linux-aarch64/bundle.tar.zst
+products/app/stable/2.4.0/macos-aarch64/bundle.tar.zst
+products/app/stable/2.4.0/windows-x86_64/bundle.tar.zst
+```
+
+TUF authenticates the archive name, size, digest, version, product, channel, OS, and
+architecture. There is no `kind` field because every application release is a bundle.
+
+The archive contains a strict `manifest.json`:
 
 ```json
 {
   "schema": 1,
-  "product": "agent-suite",
+  "product": "app",
   "version": "2.4.0",
-  "platform": "windows-x86_64",
-  "entrypoint": "bin/bundle-runner.exe",
+  "platform": "linux-x86_64",
+  "entrypoint": "bin/application",
   "files": [
     {
-      "path": "bin/bundle-runner.exe",
-      "sha256": "...",
-      "size": 1810432,
-      "executable": true
-    },
-    {
-      "path": "bin/rust-agent.exe",
+      "path": "bin/application",
       "sha256": "...",
       "size": 5242880,
       "executable": true
     },
     {
-      "path": "bin/node-agent.exe",
+      "path": "config/release.toml",
       "sha256": "...",
-      "size": 5242880,
-      "executable": true
+      "size": 18,
+      "executable": false
     }
   ]
 }
 ```
 
-TUF custom metadata should add a release kind and manifest schema while retaining the
-current product, channel, OS, architecture, and version policy fields:
+The schema rejects unknown fields and any schema number other than the one implemented.
+The manifest itself is not listed as a file; its canonical bytes are hashed to form the
+`manifest_sha256` in `ReleaseId`.
 
-```json
-{
-  "kind": "bundle",
-  "manifest_schema": 1
-}
-```
+The manifest must agree with authenticated TUF metadata for product, version, and
+platform. The entrypoint must name exactly one declared executable regular file.
 
-Single-binary targets remain valid with `kind = "binary"` (or by treating a missing
-kind as binary), which gives a backward-compatible migration path.
+## Core domain model
 
-## Required code changes
-
-### 1. Add bundle domain types to `updated`
-
-Add modules such as:
-
-```text
-crates/updated/src/bundle.rs
-crates/updated/src/release.rs
-```
-
-Core types:
+The shared `updated` crate owns the only application artifact vocabulary:
 
 ```rust
 pub struct ReleaseId {
@@ -175,35 +294,63 @@ pub struct BundleManifest {
     pub product: String,
     pub version: String,
     pub platform: String,
-    pub entrypoint: PathBuf,
+    pub entrypoint: RelativePath,
     pub files: Vec<ManifestFile>,
 }
 
 pub struct ManifestFile {
-    pub path: PathBuf,
+    pub path: RelativePath,
     pub sha256: String,
     pub size: u64,
     pub executable: bool,
 }
 ```
 
-Responsibilities:
+`RelativePath` is validated at construction and cannot represent an absolute path,
+prefix, empty component, `.` component, or `..` component.
 
-- Parse with a documented schema and reject unknown incompatible schema versions.
-- Validate product, version, platform, and entrypoint.
-- Enforce maximum archive size, expanded size, file count, and individual file size.
-- Calculate a stable manifest digest and derive the release directory name.
-- Verify that the extracted tree exactly matches the manifest.
-- Reject missing, duplicate, and unexpected files.
+There is no `ArtifactId`, `ReleaseKind`, `Binary` variant, or dispatch by installation
+kind. `ReleaseId` is used directly everywhere.
 
-### 2. Implement safe staging and extraction
+## Strict durable state
 
-Add a staging API to `updated`, near the existing `apply` functionality:
+All durable records have one current schema and reject missing or unknown fields.
+
+```rust
+pub struct InstalledState {
+    pub release: ReleaseId,
+    pub archive_sha256: String,
+    pub pending: Option<Pending>, // field required; value may be null
+}
+
+pub struct Pending {
+    pub previous_release: ReleaseId,
+    pub previous_archive_sha256: String,
+    pub committed_at: u64,
+}
+
+pub struct Transaction {
+    pub previous_release: ReleaseId,
+    pub candidate_release: ReleaseId,
+    pub candidate_archive_sha256: String,
+}
+```
+
+State from the binary implementation is invalid by design. Development and test state is
+deleted; installers seed a complete initial bundle and current records.
+
+The archive digest is the rejection identity because it is authenticated before local
+parsing. The manifest digest identifies the immutable installed tree. Persisting both
+makes their relationship explicit and diagnosable.
+
+## Safe staging and extraction
+
+`updated` exposes one staging operation:
 
 ```rust
 pub fn stage_bundle(
     archive: &Path,
-    staging_root: &Path,
+    roots: &ReleaseRoots,
     expected: &ExpectedRelease,
     limits: &BundleLimits,
 ) -> io::Result<StagedRelease>;
@@ -211,422 +358,227 @@ pub fn stage_bundle(
 
 It must:
 
-1. Create a unique staging directory on the same filesystem as `versions/`.
-2. Parse and validate the manifest before activation.
-3. Stream extraction rather than loading the archive into memory.
-4. Reject absolute paths, `..`, platform prefixes, and path escape after joining.
-5. Reject symlinks, hard links, devices, FIFOs, and other non-regular entries for v1.
-6. Reject duplicate paths and case-fold collisions relevant to Windows/macOS.
-7. Enforce compressed and expanded byte limits and file-count limits.
-8. Create files without following links and with restrictive initial permissions.
-9. Verify every file's size and SHA-256 while extracting.
-10. Set executable permissions from the manifest on Unix.
-11. Reject undeclared archive members and missing declared members.
-12. Flush files and directories where supported.
-13. Atomically rename the complete staging directory into `versions/<release-id>`.
-14. Remove incomplete staging directories on ordinary errors; leave enough journaled
-    evidence for recovery once activation begins.
+1. Create a uniquely named, owner-only staging directory beneath `staging/`.
+2. Stream decompression and extraction without loading the archive into memory.
+3. Enforce compressed size, expanded size, file count, path length, and per-file limits.
+4. Reject absolute paths, platform prefixes, empty components, `.`, `..`, and escapes.
+5. Reject symlinks, hard links, devices, FIFOs, sockets, sparse files, and unknown types.
+6. Reject duplicate paths and Unicode/case-fold collisions relevant to supported filesystems.
+7. Create new files without following links and with restrictive initial permissions.
+8. Require `manifest.json` exactly once and parse its strict schema.
+9. Verify manifest identity against TUF-authenticated product, version, and platform.
+10. Hash and size-check every declared file while extracting.
+11. Reject missing, undeclared, reordered-conflicting, or trailing archive members.
+12. Apply executable permissions from the manifest on Unix; ignore archive mode bits.
+13. Verify the entrypoint is a declared executable regular file within the release.
+14. Flush files and directories where supported.
+15. Atomically rename the complete staging directory to `versions/<release-id>`.
+16. Treat an existing destination as valid only after complete re-verification.
 
-Archive parsing is the main new dependency. Prefer a small, actively maintained Rust
-implementation with streaming support and no external system library requirement.
+No extraction code may canonicalize through attacker-controlled links. Validation and
+creation operate component by component beneath an already-open trusted staging root.
 
-### 3. Generalize application paths
+## Store and activation
 
-`Config::resolve_paths` currently derives `download`, state, and rollback locations
-from `application.command[0]`. Add a configured application installation root:
-
-```toml
-[application]
-kind = "bundle"
-install_root = "/var/lib/agent-suite/application"
-command = ["bin/bundle-runner"]
-```
-
-Extend `Paths` with:
-
-```rust
-pub install_root: PathBuf,
-pub versions: PathBuf,
-pub staging: PathBuf,
-pub active_release: PathBuf,
-pub download: PathBuf,
-```
-
-For bundle applications, `command[0]` is relative to the active version directory.
-Arguments remain configuration and are not interpolated from untrusted manifest data.
-
-The existing binary path resolution remains unchanged when `kind = "binary"`.
-
-### 4. Generalize installed state and the transaction journal
-
-The current state records one SHA-256 and `Transaction` records `old_sha256` and
-`new_sha256`. Introduce an artifact identity while preserving deserialization of old
-records:
-
-```rust
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ArtifactId {
-    Binary { sha256: String },
-    Bundle { release: ReleaseId },
-}
-
-pub struct Transaction {
-    pub old: Option<ArtifactId>,
-    pub new: ArtifactId,
-    pub from_version: Option<String>,
-    pub to_version: String,
-}
-```
-
-`InstalledState` and `Pending` receive the corresponding artifact IDs. Old JSON with a
-top-level `sha256` must continue to decode as `ArtifactId::Binary` so existing clients
-can upgrade their supervisor before receiving a bundle.
-
-The journal does not need a detailed phase field if recovery remains derived from
-durable disk facts, as it is today. For bundles those facts are:
-
-- The active-release record.
-- Presence and validity of the old release directory.
-- Presence and validity of the new release directory.
-- The installed state.
-- The transaction journal.
-
-### 5. Extend the `Store` port rather than bypassing it
-
-The current `Store` trait is the right seam, but its binary-specific methods need
-artifact-level equivalents. One possible shape is:
+The supervisor store becomes release-specific rather than artifact-generic:
 
 ```rust
 trait Store {
     fn installed(&self) -> Installed;
     fn journal(&self) -> io::Result<Option<Transaction>>;
-    fn active_artifact(&self) -> io::Result<Option<ArtifactId>>;
-    fn rollback_artifact(&self) -> io::Result<Option<ArtifactId>>;
-    fn is_rejected(&self, digest: &str) -> bool;
+    fn active_release(&self) -> io::Result<Option<ReleaseId>>;
+    fn is_rejected(&self, archive_sha256: &str) -> bool;
 
+    fn verify_release(&self, release: &ReleaseId) -> io::Result<()>;
+    fn activate(&mut self, release: &ReleaseId) -> io::Result<()>;
     fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()>;
     fn write_journal(&mut self, tx: &Transaction) -> io::Result<()>;
     fn clear_journal(&mut self) -> io::Result<()>;
-    fn reject(&mut self, digest: &str) -> io::Result<()>;
-    fn clear_rejection(&mut self, digest: &str) -> io::Result<()>;
-
-    fn verify_active(&self, expected: &ArtifactId) -> io::Result<()>;
-    fn activate_staged(&mut self, expected: &ArtifactId) -> io::Result<()>;
-    fn restore_committed(&mut self, expected: &ArtifactId) -> io::Result<()>;
-    fn drop_rollback(&mut self);
+    fn reject(&mut self, archive_sha256: &str) -> io::Result<()>;
+    fn clear_rejection(&mut self, archive_sha256: &str) -> io::Result<()>;
 }
 ```
 
-Implementation options:
+There is one `FileStore` and one test `MemStore`. Neither has binary methods or bundle
+branches. `activate` only durably replaces `active-release`; it never mutates a version
+directory.
 
-- Keep one `FileStore` that dispatches on `ArtifactId`. This minimizes call-site churn.
-- Split it into `BinaryStore` and `BundleStore` behind the same trait. This gives
-  cleaner internals and is preferable once bundle behavior stabilizes.
+## Update transaction
 
-`MemStore` must model both variants so the existing state-machine and fault-injection
-tests continue to operate without filesystem setup.
+The application update sequence remains one durable transaction:
 
-For a bundle:
+1. Refuse to begin while an old journal is unresolved.
+2. Download the TUF-authenticated archive durably.
+3. Safely extract, validate, and publish the immutable candidate directory.
+4. Write the transaction naming predecessor, candidate, and archive digest.
+5. Stop or quiesce the application.
+6. Atomically switch `active-release` to the candidate.
+7. Re-verify the active release and resolve its entrypoint.
+8. Start it with the release directory as working directory, or signal the existing PID
+   to re-read `active-release` and re-exec the candidate entrypoint.
+9. Require health and exact version proof. The E2E sample proves the version from its
+   bundled config.
+10. Commit installed state with pending predecessor intent.
+11. Clear the transaction journal.
+12. Retain the predecessor until the confirmation window passes.
 
-- `active_artifact` reads and validates `active-release`.
-- `verify_active` verifies the manifest and complete immutable directory.
-- `activate_staged` atomically writes `active-release` to the candidate ID.
-- `restore_committed` atomically writes it back to the predecessor ID and verifies it.
-- `drop_rollback` marks the predecessor eligible for garbage collection; it need not
-  synchronously delete a large directory on the confirmation path.
+Extraction happens before the journal because an unreferenced staging failure cannot
+affect the active application. Once the journal exists, boot recovery owns every outcome.
 
-### 6. Reuse `apply_update`
+## Boot reconciliation
 
-`supervisor::update::apply_update` is already expressed mostly in terms of the `Store`,
-`Control`, and `Health` ports. Change its SHA argument to an artifact identity:
+Recovery is derived from durable facts rather than an incremented phase field:
 
-```rust
-pub(crate) async fn apply_update<T: Control + Health>(
-    tower: &mut T,
-    store: &mut dyn Store,
-    candidate: &ArtifactId,
-    to_version: &str,
-    from_version: Option<&str>,
-) -> io::Result<Outcome>;
-```
-
-The sequence remains:
-
-1. Refuse to start if an old journal is unreconciled.
-2. Write the old/new transaction.
-3. Stop or quiesce the application.
-4. Activate the staged artifact.
-5. Re-verify the active artifact.
-6. Start the application.
-7. Require health and version proof.
-8. Commit installed state with pending rollback intent.
-9. Clear the journal.
-10. Retain the predecessor until the confirmation window passes.
-
-The chaos boundaries can retain their meaning. Rename `BINARY_SWAPPED` to an
-artifact-neutral name such as `ARTIFACT_ACTIVATED`, while accepting the old environment
-name temporarily if external tests use it.
-
-### 7. Adapt boot planning and reconciliation
-
-`Situation`, `BinaryFix`, and the boot planner currently reason about live and rollback
-binary hashes. Generalize them to artifact IDs and artifact actions:
-
-```rust
-pub enum ArtifactFix {
-    None,
-    RestoreCommitted { artifact: ArtifactId },
-}
-```
-
-The decision table remains the same:
-
-| Journal | Active artifact | Installed artifact | Result |
+| Journal | Active release | Installed release | Result |
 |---|---|---|---|
-| None | Matches installed | Same | Normal boot |
-| None | Differs | Same | Restore predecessor if valid, otherwise fail closed |
-| Present | Old | Old | Activation did not commit; discard candidate/journal |
-| Present | New | Old | Interrupted before state commit; restore old |
-| Present | New | New | State committed; clear spent journal |
-| Any | Unverifiable | Any | Fail closed unless verified predecessor can be restored |
+| None | Matches installed | Same | Verify and launch |
+| None | Differs or corrupt | Same | Restore installed release if valid, otherwise fail closed |
+| Present | Previous | Previous | Activation did not land; clear journal |
+| Present | Candidate | Previous | Restore previous; clear journal after durable restoration |
+| Present | Candidate | Candidate | Commit landed; clear spent journal |
+| Any | Unverifiable | Any | Restore a verified referenced predecessor or fail closed |
 
-A pending bundle that crashes within its confirmation window switches
-`active-release` back, records the candidate archive/manifest digest as rejected, and
-restarts the predecessor exactly as the current binary rollback does.
+A crash during the pending confirmation window activates the predecessor, verifies it,
+commits it as installed, rejects the candidate archive digest, and relaunches. A healthy
+candidate surviving the window clears `pending` and makes the predecessor eligible for
+garbage collection.
 
-### 8. Extend TUF selection and publication
+The planner vocabulary becomes `ReleaseFix`/`ReleaseId`; all binary hash and rollback-file
+concepts are removed.
 
-`VerifiedTarget.custom` already carries the metadata needed to distinguish artifacts.
-Extend `SelectedRelease`:
+## Launch resolution
 
-```rust
-pub enum ReleaseKind {
-    Binary,
-    Bundle { manifest_schema: u32 },
-}
+The supervisor reads `active-release`, locates `versions/<release-id>`, verifies the
+manifest, and resolves the manifest entrypoint beneath that exact directory. It passes an
+absolute entrypoint and the release directory as `cwd` through the existing guardian
+control request.
 
-pub struct SelectedRelease {
-    pub target: VerifiedTarget,
-    pub version: String,
-    pub sha256: String,
-    pub kind: ReleaseKind,
-}
-```
+For reload mode, it instead passes the stable install root to the initially launched
+application and invokes the configured reload command after activation. Placeholder and
+environment vocabulary becomes release-oriented (`{release}`, `{entrypoint}`, and stable
+install root) rather than retaining the obsolete `{binary}` contract. HUP itself remains
+the normal command; the application discovers the candidate through `active-release`.
 
-`stage_release` should continue downloading to a durable temporary path. Bundle
-extraction happens only after the TUF-authenticated archive finishes downloading.
+The guardian remains deliberately ignorant of bundles and manifests. It owns processes,
+not installation policy. No control-protocol extension is needed because `CommandSpec`
+already carries an arbitrary program and working directory.
 
-Extend the repository publisher/server CLI to accept bundle targets and populate the
-custom metadata. No new online server service is required: the existing static TUF
-metadata and target origins remain sufficient.
+## Publishing and selection
 
-Reject a target when:
+The publisher accepts a prepared release directory, validates or generates its manifest,
+creates a deterministic `.tar.zst`, and publishes it as the platform's application target.
+Archive construction must use stable ordering and normalized metadata.
 
-- Its `kind` is unsupported.
-- Its manifest schema is unsupported.
-- Its custom metadata disagrees with the internal manifest.
-- Its platform selection does not match the client.
+`SelectedRelease` always represents a bundle and contains:
 
-Continue keying rejections by authenticated target digest. A corrected republish of
-the same semantic version with new bytes can therefore be selected, preserving current
-behavior.
+- authenticated target capability;
+- semantic version;
+- archive SHA-256 and length;
+- product, channel, OS, and architecture.
 
-### 9. Resolve the active entrypoint at launch time
+There is no target-kind fallback. A target without the complete current metadata is invalid.
 
-The guardian ultimately needs an absolute program path. For a bundle, the supervisor
-resolves:
+## Garbage collection
 
-```text
-versions/<active-release>/<configured relative command>
-```
+Garbage collection may never remove:
 
-It must canonicalize the version directory and entrypoint and prove that both remain
-inside the expected immutable release directory. The command must identify a file
-declared executable in the verified manifest.
+- the active release;
+- the installed release;
+- a pending predecessor;
+- either release named by a journal;
+- a directory still beneath `staging/`.
 
-Pass that path through the existing guardian launch/replace control boundary. If the
-control request already transports an arbitrary program path, only the supervisor's
-path resolution changes. Otherwise, extend the protocol with a backward-compatible
-optional bundle-relative command or a new capability-negotiated request version.
+After confirmation, retain the active release and a small configurable number of previous
+confirmed releases within a disk budget. Cleanup runs outside the commit path. Startup may
+remove old abandoned staging directories only after proving that no journal references them.
 
-Do not make the guardian parse archives or trust manifests. Its job remains process
-custody; the supervisor supplies an already verified absolute entrypoint.
+## One-shot mode
 
-### 10. Add a bundle runner
+`updated-oneshot` uses the same store, staging, state, transaction, recovery, and entrypoint
+resolution code:
 
-For the initial implementation, ship a small Rust executable as the bundle entrypoint:
+1. acquire the instance lock;
+2. reconcile a journal;
+3. select, download, and stage a bundle;
+4. journal and activate it;
+5. verify and commit installed state;
+6. execute the active entrypoint with the release directory as `cwd`.
 
-```text
-guardian
-  -> bundle-runner
-       -> node-agent
-       -> telemetry-agent
-```
-
-The bundle runner should:
-
-- Read a declarative component list from the verified manifest or a separate verified
-  bundle configuration.
-- Start each required child without a shell.
-- Pass only configured environment variables and external config/data paths.
-- Put children into the appropriate Unix process group or Windows Job Object.
-- Forward graceful shutdown and enforce a bounded forced-stop timeout.
-- Treat an unexpected required-child exit as bundle failure.
-- Expose aggregate readiness/health and the release version expected by the supervisor.
-- Emit component-qualified logs.
-- Avoid restarting a permanently failing child forever inside the confirmation window;
-  surface failure so the existing updater rollback policy can act.
-
-This keeps the guardian and supervisor responsible for one managed process. A future
-version can extend the control protocol for independently managed components if the
-product needs partial restarts or per-agent rollout policy.
-
-### 11. Garbage collection
-
-Garbage collection must never remove:
-
-- The active release.
-- The pending rollback predecessor.
-- Any release named by an active transaction journal.
-- A directory currently being staged.
-
-After confirmation, retain the active release and a configurable number of previously
-confirmed releases, subject to a disk budget. Run deletion asynchronously or during a
-later maintenance tick so confirmation does not block on deleting a large release
-tree.
-
-On startup, safely remove abandoned staging directories older than a configured age,
-provided no journal references them.
-
-### 12. Preserve the oneshot mode
-
-`updated-oneshot` can support bundles with the same store and release abstractions:
-
-1. Acquire the existing instance lock.
-2. Reconcile any transaction.
-3. Download and stage a bundle.
-4. Write the journal.
-5. Change `active-release`.
-6. Verify and commit installed state.
-7. Execute the resolved bundle entrypoint.
-
-As today, oneshot cannot health-monitor a candidate after replacing itself unless it
-remains as a parent process. Document that limitation or initially restrict bundle
-health-confirmation support to supervised mode.
-
-## Compatibility and rollout sequence
-
-Bundle support should be deployed in two releases:
-
-### Phase 1: bundle-capable infrastructure, still publishing binaries
-
-- Deploy a supervisor that can deserialize both old and new state/journal formats.
-- Add artifact-neutral store and boot-planning behavior.
-- Retain the existing binary installation path as the default.
-- Add bundle configuration validation but do not enable it for clients.
-
-### Phase 2: publish bundle targets
-
-- Publish `kind = "bundle"` targets only after the installed supervisor reports a
-  bundle-capable control/state schema.
-- Configure an `install_root` and relative bundle entrypoint.
-- Let the first bundle update transition from `ArtifactId::Binary` to
-  `ArtifactId::Bundle` while retaining the old binary as the pending predecessor.
-- Confirm and garbage-collect the old binary only after the normal health window.
-
-If mixed binary-to-bundle rollback makes the first implementation too risky, require
-the installer to provision an initial bundle directory and make bundle mode a fresh
-installation boundary. That reduces migration code but is less seamless.
+As today, one-shot mode cannot observe a post-exec confirmation window. Its install commit
+is immediate. Supervised mode remains the choice when health-gated rollback is required.
 
 ## Required tests
 
-### Manifest and extraction unit tests
+### Manifest and extraction
 
-- Valid archive stages to the expected release ID.
-- Absolute and parent-traversal paths are rejected.
-- Symlinks, hard links, device files, and duplicate paths are rejected.
-- Case-fold path collisions are rejected.
-- Missing, extra, truncated, oversized, and hash-mismatched files are rejected.
-- Unsupported schema/product/platform is rejected.
-- Executable permissions are applied on Unix.
-- Extraction failure never creates an activatable version directory.
+- valid archive stages to the expected `ReleaseId`;
+- absolute, parent, prefixed, empty, and overlong paths are rejected;
+- links and non-regular entries are rejected;
+- duplicate and case-fold-colliding paths are rejected;
+- missing, extra, truncated, oversized, and hash-mismatched files are rejected;
+- unknown manifest fields and schema values are rejected;
+- product, version, platform, and entrypoint mismatches are rejected;
+- Unix executable permissions come only from the manifest;
+- extraction failure never creates an activatable release.
 
-### Store and transaction tests
+### Store and recovery
 
-- Activation atomically changes only `active-release`.
-- Old and new release directories remain immutable.
-- Rollback switches back to the exact predecessor.
-- Active-record corruption fails closed.
-- Missing/corrupt active directory restores a verified predecessor when possible.
-- Garbage collection preserves all live transaction references.
-- Old binary state and journal JSON remain readable.
+- activation changes only `active-release`;
+- installed directories remain immutable;
+- rollback activates the exact predecessor;
+- corrupt active state fails closed;
+- a verified predecessor restores a missing or corrupt candidate;
+- every journal/active/installed combination follows the recovery table;
+- garbage collection preserves every live reference;
+- obsolete binary state and journals are rejected.
 
-### Existing state-machine tests
+### End to end
 
-Run the current planner and transaction tests against both binary and bundle artifact
-fixtures. Preserve fault injection at every existing chaos boundary and add failures
-during extraction and active-record replacement.
-
-### End-to-end scenarios
-
-- Bundle update starts every configured Rust agent binary.
-- Both report the expected release version.
-- A bad child causes aggregate health failure and rollback.
-- A crash during the confirmation window rolls back on boot.
-- A tampered archive is rejected by TUF before extraction.
-- A valid archive with malicious paths is rejected locally.
-- A valid archive with a bad internal file hash is rejected locally.
-- Killing the supervisor at every transaction boundary converges safely.
-- Supervisor self-update still works while managing a bundle.
+- the sample app reads its version from bundled `config/release.toml`;
+- updating changes the reported config version;
+- rollback restores the predecessor's reported config version;
+- using identical executable bytes across releases still updates correctly;
+- Unix HUP reload re-execs the active bundle entrypoint in the same PID and drops no requests;
+- HUP rollback re-execs the predecessor bundle in the same PID and proves its config version;
+- reload cannot commit when health still reports the predecessor config version;
+- tampering with the executable, manifest, or config fails closed;
+- malicious archives never publish a version directory;
+- health failure and a post-health crash revert and reject the bundle;
+- killing the supervisor at every transaction boundary converges safely;
+- supervisor crash, self-update, locking, reload where supported, and one-shot behavior remain correct;
 - Windows SCM, launchd, and systemd stop/restart behavior remains clean.
-- A bundle remains usable when the update origin is unavailable.
 
-## Security and operational decisions
+## Implementation order
 
-The following decisions should be explicit before implementation:
+1. Change the sample app to read release version from `config/release.toml`.
+2. Add strict manifest, `RelativePath`, `ReleaseId`, limits, and archive extraction.
+3. Replace binary paths/state/journal with the bundle-only release model.
+4. Replace binary swapping with immutable staging and `active-release` activation.
+5. Generalize the boot planner terminology and recovery facts to releases.
+6. Update publisher and TUF selection to emit and require bundle targets.
+7. Convert supervisor, HUP/re-exec, and one-shot launch resolution.
+8. Convert all unit, fault-injection, and E2E fixtures, including zero-downtime reload and rollback.
+9. Remove every binary-install module, field, test, flag, and documentation path.
+10. Run formatting, strict lint, workspace tests, full E2E, and all platform CI.
 
-1. **Archive format:** assume `tar.zst` for streaming and cross-platform consistency.
-2. **Rust linkage:** prefer self-contained binaries and explicitly package any required
-   dynamic libraries or external assets in the manifest.
-3. **Code signing:** TUF authenticates distribution, but macOS notarization and Windows
-   Authenticode may still be required by deployment policy.
-4. **Migrations:** require backward-compatible data migrations during the rollback
-   window; irreversible migrations need a separate coordinated mechanism.
-5. **Mutable data:** prohibit writes inside immutable version directories.
-6. **Configuration:** keep operator configuration outside the signed bundle unless the
-   release owns a separate default configuration that is copied, never edited in place.
-7. **Disk budget:** set archive, expanded-tree, staging, and retained-release limits.
-8. **Bundle identity:** use the authenticated archive digest for rejection and the
-   manifest digest for the installed directory identity; persist both if operational
-   diagnostics need the mapping.
-
-## Non-goals for the first version
-
-- Delta or peer-to-peer downloads.
-- Updating individual files in an active bundle.
-- Independent rollout channels for components within one bundle.
-- Hot reload of arbitrary multi-process bundles.
-- Automatic rollback of irreversible database migrations.
-- Arbitrary lifecycle scripts executed as a shell.
-- Sharing files between immutable release directories through links.
-
-These can be added later without changing the immutable-directory and active-record
-model.
+Each step must leave only one active design. Temporary compatibility branches should not
+be merged.
 
 ## Definition of done
 
-Bundle support is ready when:
+Bundle installation is complete when:
 
-- A TUF-authenticated archive can be selected, bounded, downloaded, safely extracted,
-  and completely verified on all supported platforms.
-- Activation changes one durable active-release record rather than mutating live files.
-- Every existing transaction interruption point converges to either the verified old or
-  verified new release.
-- A failed health check and a crash within the confirmation window restore the complete
-  predecessor bundle.
-- All configured Rust agents are launched and stopped as one process tree.
-- The old single-binary configuration and state remain supported through the migration
-  release.
-- Unit, fault-injection, cross-platform E2E, Windows SCM, launchd, and systemd tests pass.
-- The deployment documentation covers directory ownership, disk limits, code signing,
-  external config/data, and migration compatibility.
+- every application target is a TUF-authenticated bundle;
+- every bundle is bounded, safely extracted, fully manifested, and immutable;
+- activation and rollback each change one durable `active-release` record;
+- application state and journals contain only strict bundle release identities;
+- every crash boundary converges to one complete verified release;
+- health failure and confirmation-window crash restore the complete predecessor;
+- the E2E sample reports the version read from its bundled configuration file;
+- identical sample executable bytes can represent multiple releases through different signed config;
+- Unix HUP update and rollback retain the same PID, preserve the listening socket, prove
+  the active bundle's config version, and drop no requests under load;
+- no binary installation, migration, target-kind, mixed rollback, or compatibility code remains;
+- unit, fuzz/fault-injection, cross-platform E2E, Windows SCM, launchd, and systemd checks pass;
+- deployment documentation explains immutable releases, external mutable state, permissions,
+  disk limits, and reseeding.

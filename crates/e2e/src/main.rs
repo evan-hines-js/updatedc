@@ -19,9 +19,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-// The tower's own path-suffix helper — the same one resolve_paths derives its
-// sibling paths with — so the scenarios name on-disk files exactly as the product does.
-use updated::config::with_suffix;
 
 fn main() {
     if let Err(e) = run() {
@@ -99,6 +96,14 @@ fn scenarios() -> Vec<Scenario> {
             "zero-downtime reexec reload drops no requests under load",
             zero_downtime_reexec,
         ));
+        s.push((
+            "an unexecutable reexec candidate is rejected without downtime; the next release upgrades",
+            reexec_rejects_unexecutable_without_downtime,
+        ));
+        s.push((
+            "a failed reexec preflight touches no live or durable activation state",
+            reexec_preflight_rejects_without_activation,
+        ));
     }
     // Chaos recovery runs last: it replays every transaction boundary, so it is by
     // far the slowest scenario.
@@ -114,8 +119,18 @@ fn run() -> R {
     step("build workspace binaries");
     ctx.build()?;
     // Build the two application versions once; scenarios reuse them.
-    ctx.build_app("1.0.0")?;
-    ctx.build_app("2.0.0")?;
+    let app_v1 = ctx.build_app("1.0.0")?;
+    let app_v2 = ctx.build_app("2.0.0")?;
+    if sha256_hex(&app_v1) != sha256_hex(&app_v2) {
+        return fail(
+            "sample app binaries differ; release identity must come only from bundle config",
+        );
+    }
+    let reexec_v1 = ctx.build_reexec_app("1.0.0")?;
+    let reexec_v2 = ctx.build_reexec_app("2.0.0")?;
+    if sha256_hex(&reexec_v1) != sha256_hex(&reexec_v2) {
+        return fail("reexec sample binaries differ; release identity must come only from config");
+    }
     // Two distinguishable supervisor builds for the self-update scenarios.
     ctx.build_supervisor("1.0.0")?;
     ctx.build_supervisor("2.0.0")?;
@@ -206,6 +221,11 @@ fn app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
     ctx.work.join(format!("build/app-{v}{}", ctx.exe))
 }
 
+#[cfg(unix)]
+fn reexec_app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
+    ctx.work.join(format!("build/reexec-app-{v}{}", ctx.exe))
+}
+
 fn supervisor_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
     ctx.work.join(format!("build/supervisor-{v}{}", ctx.exe))
 }
@@ -235,14 +255,15 @@ pub struct Sup {
     oneshot_bin: PathBuf,
     dir: PathBuf,
     product: String,
-    current_version: String,
-    current_sha256: String,
-    command: Vec<String>,
+    install_root: PathBuf,
+    seed_binary: PathBuf,
+    args: Vec<String>,
     health_url: Option<String>,
     check_interval: Option<String>,
     health_grace: Option<String>,
     confirmation_window: Option<String>,
-    reload_command: Option<Vec<String>>,
+    reexec_command: Option<Vec<String>>,
+    preflight_command: Option<Vec<String>>,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
     /// Override the supervisor binary the guardian runs (self-update tests supply a
@@ -254,10 +275,7 @@ impl Sup {
     /// The tower managing `command` (the app binary + args) against the repo under
     /// `dir` served at `srv`, for `product`.
     pub fn new(ctx: &Ctx, dir: &Path, srv: &str, product: &str, command: Vec<String>) -> Self {
-        let current_sha256 = command
-            .first()
-            .map(|path| sha256_hex(Path::new(path)))
-            .unwrap_or_default();
+        let seed_binary = PathBuf::from(command.first().expect("app command requires binary"));
         Sup {
             root: ctx.root(dir),
             meta_url: ctx.meta_url(srv),
@@ -267,22 +285,19 @@ impl Sup {
             oneshot_bin: ctx.oneshot.clone(),
             dir: dir.to_path_buf(),
             product: product.into(),
-            current_version: "1.0.0".into(),
-            current_sha256,
-            command,
+            install_root: dir.join("install"),
+            seed_binary,
+            args: command.into_iter().skip(1).collect(),
             health_url: None,
             check_interval: None,
             health_grace: None,
             confirmation_window: None,
-            reload_command: None,
+            reexec_command: None,
+            preflight_command: None,
             supervisor_check_interval: None,
             ready_timeout: None,
             supervisor_override: None,
         }
-    }
-    pub fn baseline_sha256(mut self, sha256: String) -> Self {
-        self.current_sha256 = sha256;
-        self
     }
     pub fn health(mut self, svc: &str) -> Self {
         self.health_url = Some(format!("http://{svc}/healthz"));
@@ -300,8 +315,12 @@ impl Sup {
         self.confirmation_window = Some(s.into());
         self
     }
-    pub fn reload(mut self, command: Vec<String>) -> Self {
-        self.reload_command = Some(command);
+    pub fn reexec(mut self, command: Vec<String>) -> Self {
+        self.reexec_command = Some(command);
+        self
+    }
+    pub fn preflight(mut self, command: Vec<String>) -> Self {
+        self.preflight_command = Some(command);
         self
     }
     pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
@@ -325,24 +344,34 @@ impl Sup {
     }
 
     fn write_config(&self) -> R<PathBuf> {
+        self.seed_install()?;
         let mut t = format!(
-            "[repository]\nroot = {}\nmetadata_url = {}\ntargets_url = {}\n\n[application]\nproduct = {}\ncurrent_version = {}\ncurrent_sha256 = {}\ncommand = [{}]\n",
+            "[repository]\nroot = {}\nmetadata_url = {}\ntargets_url = {}\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
             lit(&self.root.display().to_string()),
             lit(&self.meta_url),
             lit(&self.targets_url),
             lit(&self.product),
-            lit(&self.current_version),
-            lit(&self.current_sha256),
-            self.command.iter().map(|s| lit(s)).collect::<Vec<_>>().join(", "),
+            lit(&self.install_root.display().to_string()),
+            self.args.iter().map(|s| lit(s)).collect::<Vec<_>>().join(", "),
         );
         if let Some(u) = &self.health_url {
             t += &format!("health_url = {}\n", lit(u));
         }
-        if let Some(c) = &self.reload_command {
+        if let Some(c) = &self.reexec_command {
             t += &format!(
-                "reload_command = [{}]\n",
+                "\n[application.activation]\nmode = \"reexec\"\ncommand = [{}]\n",
                 c.iter().map(|arg| lit(arg)).collect::<Vec<_>>().join(", ")
             );
+            if let Some(preflight) = &self.preflight_command {
+                t += &format!(
+                    "preflight_command = [{}]\n",
+                    preflight
+                        .iter()
+                        .map(|arg| lit(arg))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
         let mut to = String::new();
         for (k, v) in [
@@ -366,6 +395,65 @@ impl Sup {
         ));
         std::fs::write(&path, t).map_err(str_err)?;
         Ok(path)
+    }
+
+    fn seed_install(&self) -> R {
+        let paths = updated::config::Paths {
+            install_root: self.install_root.clone(),
+            versions: self.install_root.join("versions"),
+            staging: self.install_root.join("staging"),
+            active_release: self.install_root.join("active-release"),
+            download: self.install_root.join("staging/bundle.download"),
+            state: self.install_root.join("state/installed.json"),
+            datastore: self.install_root.join("state/tuf"),
+            journal: self.install_root.join("state/transaction.json"),
+            rejected: self.install_root.join("state/rejected"),
+            app_token: self.install_root.join("state/app-token"),
+        };
+        if matches!(
+            updated::state::read_installed(&paths.state),
+            updated::state::Installed::Present(_)
+        ) {
+            return Ok(());
+        }
+        let prepared = self.install_root.join("seed-source");
+        std::fs::create_dir_all(prepared.join("bin")).map_err(str_err)?;
+        std::fs::create_dir_all(prepared.join("config")).map_err(str_err)?;
+        let entrypoint = format!("bin/app{}", if cfg!(windows) { ".exe" } else { "" });
+        std::fs::copy(&self.seed_binary, prepared.join(&entrypoint)).map_err(str_err)?;
+        std::fs::write(
+            prepared.join("config/release.toml"),
+            "version = \"1.0.0\"\n",
+        )
+        .map_err(str_err)?;
+        std::fs::create_dir_all(self.install_root.join("state")).map_err(str_err)?;
+        updated::bundle::create_bundle(
+            &prepared,
+            &paths.download,
+            &self.product,
+            "1.0.0",
+            &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            &entrypoint,
+        )
+        .map_err(str_err)?;
+        let staged = updated::bundle::stage_bundle(
+            &paths.download,
+            &paths.staging,
+            &paths.versions,
+            &updated::bundle::ExpectedBundle {
+                product: &self.product,
+                version: "1.0.0",
+                platform: &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            },
+            &Default::default(),
+        )
+        .map_err(str_err)?;
+        updated::bundle::write_active(&paths.active_release, &staged.id).map_err(str_err)?;
+        updated::state::write_installed(
+            &paths.state,
+            &updated::state::InstalledState::confirmed(staged.id, staged.archive_sha256),
+        )
+        .map_err(str_err)
     }
 
     /// A guardian command: `bootstrap --state-dir <dir> --supervisor-config <cfg>

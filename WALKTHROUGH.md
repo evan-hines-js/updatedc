@@ -64,64 +64,9 @@ cargo test --workspace
 CI runs the end-to-end system on Linux, Intel and ARM macOS, and Windows. Windows CI
 also installs and controls the program through the native Service Control Manager.
 
-On macOS, `scripts/macos-smoke.sh` provides a production-shaped local deployment using
-a real user LaunchAgent (`launchd → bootstrap → supervisor → sampleapp`) rather than
-starting the processes directly. It builds and provisions version 1.0.0, creates and
-serves a signed local repository, then lets the background supervisor discover and
-install a newly published release:
-
-```sh
-scripts/macos-smoke.sh start
-scripts/macos-smoke.sh publish 2.0.0
-scripts/macos-smoke.sh status
-scripts/macos-smoke.sh logs       # optional: follow repository and tower logs
-scripts/macos-smoke.sh reset      # unload and remove the disposable state
-```
-
-The default `start` uses portable stop/swap/start behavior. On macOS, start the
-sample app in its same-PID, socket-preserving reexec mode to validate a zero-downtime
-update instead:
-
-```sh
-scripts/macos-smoke.sh reset
-scripts/macos-smoke.sh start reexec
-scripts/macos-smoke.sh publish 2.0.0
-```
-
-After `start`, the managed sample server is available on port `19090`:
-
-```sh
-curl -fsS http://127.0.0.1:19090/version
-curl -fsS http://127.0.0.1:19090/healthz
-```
-
-To watch availability during an update, leave this running in another terminal and
-then run `scripts/macos-smoke.sh publish 2.0.0`:
-
-```sh
-while true; do
-  version=$(curl -fsS http://127.0.0.1:19090/version 2>/dev/null || echo unavailable)
-  printf '%s  %s\n' "$(date +%H:%M:%S)" "$version"
-  sleep 0.25
-done
-```
-
-The two smoke paths demonstrate different availability guarantees:
-
-- `start` uses portable stop/swap/start. At a 250 ms polling interval, expect roughly
-  0–5 `unavailable` samples during the bounded replacement window. While this is portable, slow starting apps will see a downtime window equal to their startup time. From experience, this would be from 5 seconds to minutes depending on the type of application. For slow starting apps, it is recommended to handle HUP if lower downtime is needed.
-
-- `start reexec` sends the configured HUP signal. The process reexecs in place while
-  preserving its PID and listener; expect 0 unavailable samples.
-
-In both cases the loop switches from the old version to the new one after the health
-gate succeeds. Exact portable-mode timing depends on the machine and scheduler.
-
-`publish` waits for the requested version while checking that the LaunchAgent remains
-active. A requested version below the live version fails immediately because
-downgrades are not supported; this check uses the live endpoint, not supervisor log
-text. Other failures report the version that remained active and point to
-`scripts/macos-smoke.sh logs`. Files are isolated under `target/macos-smoke/` by default.
+The E2E harness covers both portable stop/activate/start and Unix same-PID HUP re-exec.
+The HUP scenario continuously probes availability and asserts that the listener and PID
+survive while the application re-reads its version from the newly active bundle config.
 
 ## Suggested code tour
 

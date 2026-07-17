@@ -26,14 +26,17 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     {
         let cmd = make()?;
         let sup = Service::spawn("reject-1", &cmd);
-        if !sup.wait_for_log("update 2.0.0 crashed before commit; rejecting it", 30) {
+        if !sup.wait_for_log(
+            "restoring predecessor 1.0.0 after interrupted activation of 2.0.0",
+            30,
+        ) {
             return fail("the crashing v2 was not rejected on recovery");
         }
         if !wait_for_version(svc, "1.0.0", 20) {
             return fail("the tower did not recover to v1.0.0 after rejecting v2");
         }
         let persisted = wait_until(10, || {
-            std::fs::metadata(with_suffix(&app, ".installed.rejected"))
+            std::fs::metadata(dir.join("install/state/rejected"))
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         });
@@ -42,7 +45,10 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
         }
     }
     // Reap any orphaned app before the second tower reuses the port (macOS only).
-    kill_stray(&app);
+    kill_stray(&dir.join("install"));
+    if !wait_until(10, || http_text(&format!("http://{svc}/version")).is_none()) {
+        return fail("first rejection tower did not release its application port");
+    }
 
     // Run 2 (a fresh tower): must NOT reapply the known-bad v2.
     {
@@ -56,7 +62,7 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
             return fail("restart re-applied the known-bad v2");
         }
     }
-    kill_stray(&app);
+    kill_stray(&dir.join("install"));
     ok("a crashing release was rejected on recovery and NOT reapplied after a restart");
     Ok(())
 }

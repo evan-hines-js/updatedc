@@ -66,6 +66,7 @@ pub fn tee(label: &str, stream: Option<impl Read + Send + 'static>, buf: &LogBuf
 
 /// Shared paths and build outputs for one run.
 pub struct Ctx {
+    _run_lock: std::fs::File,
     pub root: PathBuf,
     pub work: PathBuf,
     pub server: PathBuf,
@@ -88,6 +89,16 @@ impl Ctx {
             .ok_or("cannot locate workspace root")?
             .to_path_buf();
         let work = root.join("target/e2e-work");
+        let run_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("target/e2e.lock"))
+            .map_err(str_err)?;
+        run_lock
+            .lock()
+            .map_err(|error| format!("another E2E run owns the shared ports/workdir: {error}"))?;
         // An interrupted prior run can leave durable app processes behind (on Unix
         // they outlive their supervisor by design); reap them so they don't hold a
         // port this run needs.
@@ -97,8 +108,12 @@ impl Ctx {
         let exe = if cfg!(windows) { ".exe" } else { "" };
         let bin = |name: &str| root.join(format!("target/release/{name}{exe}"));
         Ok(Ctx {
+            _run_lock: run_lock,
             server: bin("server"),
-            supervisor: bin("supervisor"),
+            // The canonical chaos-enabled supervisor is copied here by `build()`.
+            // Versioned self-update fixture builds reuse Cargo's target path, so no
+            // scenario may execute that mutable build output directly.
+            supervisor: work.join(format!("build/supervisor-chaos{exe}")),
             bootstrap: bin("bootstrap"),
             oneshot: bin("updated-oneshot"),
             platkey: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -137,20 +152,37 @@ impl Ctx {
                 "--features",
                 "chaos",
             ],
-        )
+        )?;
+        let built = self
+            .root
+            .join(format!("target/release/supervisor{}", self.exe));
+        std::fs::copy(built, &self.supervisor).map_err(str_err)?;
+        Ok(())
     }
 
-    /// Build `sampleapp` with a baked version and copy it to `build/app-<v><exe>`.
+    /// Build one version-agnostic sample binary. Release identity lives in its bundle config.
     pub fn build_app(&self, version: &str) -> R<PathBuf> {
-        cargo(
-            &self.root,
-            Some(("APP_VERSION", version)),
-            &["build", "--release", "-p", "sampleapp"],
-        )?;
+        cargo(&self.root, None, &["build", "--release", "-p", "sampleapp"])?;
         let src = self
             .root
             .join(format!("target/release/sampleapp{}", self.exe));
         let dst = self.work.join(format!("build/app-{version}{}", self.exe));
+        std::fs::copy(&src, &dst).map_err(str_err)?;
+        Ok(dst)
+    }
+
+    pub fn build_reexec_app(&self, version: &str) -> R<PathBuf> {
+        cargo(
+            &self.root,
+            None,
+            &["build", "--release", "-p", "sampleapp-reexec"],
+        )?;
+        let src = self
+            .root
+            .join(format!("target/release/sampleapp-reexec{}", self.exe));
+        let dst = self
+            .work
+            .join(format!("build/reexec-app-{version}{}", self.exe));
         std::fs::copy(&src, &dst).map_err(str_err)?;
         Ok(dst)
     }
@@ -217,22 +249,27 @@ impl Ctx {
 
     /// Publish a per-platform release of `source` for `product` at `version`.
     pub fn publish(&self, dir: &Path, product: &str, version: &str, source: &Path) -> R {
-        run(Command::new(&self.server)
-            .arg("publish")
+        let application = product != "supervisor";
+        let mut command = Command::new(&self.server);
+        command
+            .arg(if application {
+                "publish-app"
+            } else {
+                "publish-supervisor"
+            })
             .arg("--repo")
             .arg(dir.join("repo"))
             .arg("--keys")
             .arg(dir.join("keys"))
-            .args([
-                "--product",
-                product,
-                "--version",
-                version,
-                "--component",
-                product,
-            ])
-            .arg("--target")
-            .arg(format!("{}={}", self.platkey, source.display())))
+            .args(["--product", product, "--version", version])
+            .arg(if application { "--bundle" } else { "--target" })
+            .arg(format!("{}={}", self.platkey, source.display()));
+        if application {
+            command
+                .arg("--entrypoint")
+                .arg(format!("bin/app{}", self.exe));
+        }
+        run(&mut command)
     }
 
     /// Serve the TUF repository at `dir/repo`; the returned handle keeps it alive.
@@ -272,6 +309,19 @@ impl Ctx {
 /// path can never disagree on a digest; an unreadable file yields an empty string.
 pub fn sha256_hex(path: &Path) -> String {
     updated::hash::sha256_file(path).unwrap_or_default()
+}
+
+/// Make an immutable fixture file writable so a test can simulate out-of-band tampering.
+pub fn make_writable(path: &Path) -> R {
+    let mut permissions = std::fs::metadata(path).map_err(str_err)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(windows)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).map_err(str_err)
 }
 
 /// GET `url`, returning the body on a 2xx response.
@@ -641,13 +691,18 @@ pub fn run(cmd: &mut Command) -> R {
 /// can orphan the app's own process group; `pkill -f` reaps it. Harmless elsewhere.
 pub fn kill_stray(path: &Path) {
     #[cfg(unix)]
-    let _ = Command::new("pkill")
-        .arg("-9")
-        .arg("-f")
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    {
+        let install = path.parent().map(|parent| parent.join("install"));
+        for pattern in std::iter::once(path).chain(install.as_deref()) {
+            let _ = Command::new("pkill")
+                .arg("-9")
+                .arg("-f")
+                .arg(pattern)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
     #[cfg(windows)]
     let _ = path; // the guardian's Job Object already tore the app down.
 }
