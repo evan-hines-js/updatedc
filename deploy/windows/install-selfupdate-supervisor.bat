@@ -1,6 +1,6 @@
 :: Native Windows SCM deployment for the self-update tower. Run from an elevated
-:: Administrator command prompt after replacing the paths/version tokens in the
-:: installed config.toml.
+:: Administrator command prompt after installing the bootstrap, supervisor, pinned
+:: root, operator config, and initial manifested application bundle.
 @echo off
 setlocal
 

@@ -6,12 +6,12 @@ part of self-update is preserving a runnable, trusted version when a process, ma
 network request, or candidate fails at the worst possible time.
 
 > **This is not an installer or package manager.** An installer must first place the
-> bootstrap, supervisor or one-shot launcher, initial application binary, read-only
-> configuration, and pinned TUF root; record the baseline version and SHA-256; create
-> the restricted service identity and writable state directory; and register any
+> bootstrap, supervisor or one-shot launcher, initial application bundle, read-only
+> configuration, and pinned TUF root; seed strict installed and `active-release`
+> records; create the restricted service identity and writable state directory; and register any
 > systemd, launchd, Windows SCM, shortcut, or file-association integration. `updated`
 > takes responsibility only after that trust and filesystem boundary exists: it keeps
-> the provisioned application current, verifies every replacement, and recovers or
+> the provisioned application current, verifies every candidate bundle, and recovers or
 > rolls back failed updates. Replacing the bootstrap, changing machine-wide packaging,
 > or repairing a broken initial installation remains the installer's responsibility.
 
@@ -19,12 +19,12 @@ network request, or candidate fails at the worst possible time.
 
 The system updates an arbitrary, update-unaware application on Linux, macOS, and
 Windows. A signed TUF repository describes releases. A supervisor selects and
-downloads the correct target, then performs a journaled, health-gated replacement.
+downloads the correct target, then performs journaled, health-gated release activation.
 A tiny, network-free bootstrap owns the processes and safely replaces the supervisor
 itself.
 
 ```text
-OS init system
+outer lifecycle owner (service manager, login item, or desktop launcher)
     └── bootstrap (permanent guardian; no network or release policy)
           ├── supervisor (TUF, selection, transactions, health, rollback)
           └── managed application (does not know about the updater)
@@ -39,7 +39,7 @@ The main guarantees are:
 
 - A release cannot execute until its TUF metadata chain, platform attributes,
   length, and digest have been verified.
-- An interrupted application replacement converges on startup to either the last
+- An interrupted application activation converges on startup to either the last
   committed version or the fully verified candidate; it does not trust partial state.
 - An unhealthy candidate is rolled back and rejected by content hash.
 - A supervisor candidate is staged at a new content-addressed path and committed by
@@ -64,9 +64,11 @@ cargo test --workspace
 CI runs the end-to-end system on Linux, Intel and ARM macOS, and Windows. Windows CI
 also installs and controls the program through the native Service Control Manager.
 
-The E2E harness covers both portable stop/activate/start and Unix same-PID HUP re-exec.
-The HUP scenario continuously probes availability and asserts that the listener and PID
-survive while the application re-reads its version from the newly active bundle config.
+The E2E harness covers both portable stop/activate/start and Unix reexec activation.
+The reexec scenario continuously probes availability and asserts that the managed master
+PID survives while the application adopts the newly active bundle. A real HAProxy
+master-worker test independently proves the contract against an unmodified third-party
+service rather than relying only on the sample fixture.
 
 ## Suggested code tour
 
@@ -90,8 +92,7 @@ Follow `check_application` in `crates/supervisor/src/selection.rs` into
 ```text
 verify candidate
   → persist journal
-  → preserve rollback image
-  → atomically replace executable
+  → atomically activate the immutable release directory
   → start/reload candidate
   → require consecutive authenticated health successes
   → commit installed state
@@ -99,15 +100,15 @@ verify candidate
 ```
 
 Any pre-commit health or activation failure restores the predecessor and durably
-rejects the failed bytes. `crates/updated/src/apply.rs` contains the filesystem
-operations; `crates/updated/src/transaction.rs` classifies on-disk state after an
-interruption; `crates/supervisor/src/boot.rs` turns that classification into a
-recovery plan.
+rejects the failed archive. `crates/updated/src/bundle.rs` owns strict bundle creation,
+extraction, verification, immutable release storage, and `active-release` operations;
+`crates/updated/src/transaction.rs` classifies durable state after an interruption;
+`crates/supervisor/src/boot.rs` turns that classification into a recovery plan.
 
-The invariant to look for is: **the durable record never claims a binary is committed
-unless the bytes at the application path match that record's digest**. Where a write
-cannot be completed, the journal or rollback image is retained so the next start can
-finish recovery.
+The invariant to look for is: **the durable record never claims a release is committed
+unless every manifested file in that immutable release verifies and `active-release`
+names it**. Where a durable transition cannot be completed, the journal and predecessor
+release remain available so the next start can finish recovery.
 
 ### 3. Update the updater
 
@@ -152,10 +153,13 @@ problem one level up. The bootstrap is intentionally small and installer-owned; 
 contains no network, cryptography, or release selection, so its change rate and attack
 surface remain low.
 
-**What does seamless mean here?** The default is a brief stop/swap/start protected by
-a health gate. Cooperative Unix services can use the reload path for same-PID,
-zero-downtime replacement. Windows uses stop/swap/start. Supervisor replacement keeps
-the application running on every platform.
+**What does seamless mean here?** The default is a brief stop/activate/start protected
+by a health gate. Cooperative Unix services can use a configurable HAProxy-style reexec
+command: the supervisor preflights the candidate, switches `active-release`, invokes the
+command, and requires the same guardian-owned PID plus exact candidate-version health
+before committing. Socket continuity is the managed program's master/worker contract,
+not hidden updater behavior. Windows uses stop/activate/start. Supervisor replacement
+keeps the application running on every platform.
 
 **What happens when the repository is unavailable?** The installed application keeps
 running. Transport failures back off and retry; trust failures fail closed and are not
@@ -163,36 +167,35 @@ reclassified as ordinary network errors.
 
 ## Native desktop applications
 
-The system was initially designed for long-running daemons, but the same verified
-replacement primitives can support conventional native desktop applications such as
-Discord-style clients. The natural integration is for the application's installer to
-place `updated-oneshot` as its launcher:
+The same verified bundle primitives support conventional native desktop applications
+such as Discord-style clients. For an update-on-launch product, the application's
+installer can place `updated-oneshot` behind its shortcut or login item:
 
 ```text
 user opens application
   → launcher acquires the update lock
   → reconcile any interrupted replacement
   → refresh and verify signed metadata
-  → atomically install an eligible update, if available
-  → verify the executable against committed state
+  → stage and atomically activate an eligible bundle, if available
+  → verify the complete active release against committed state
   → exec the desktop application
 ```
 
 Network unavailability does not prevent launch: the wrapper verifies and runs the
-currently committed binary. Because replacement happens before the GUI process starts,
+currently committed bundle. Because activation happens before the GUI process starts,
 there is no need to overwrite a running executable or keep a permanent supervisor
 alive. Concurrent launches serialize on the same installation lock.
 
 An application with an always-running tray process or background agent can instead use
-the bootstrap/supervisor model: request a clean application shutdown, replace the
-verified files, start the candidate, and commit only after an application-specific
-readiness check succeeds. Multi-process desktop applications need a launcher-owned
-shutdown contract so every process releases the installation before replacement.
+the bootstrap/supervisor model under a login item, desktop startup host, launchd, or SCM:
+request a clean shutdown, activate the verified candidate bundle, start it, and commit
+only after an application-specific readiness check succeeds. Multi-process desktop
+applications need a launcher-owned shutdown contract so every process releases the
+installation before activation.
 
 Production desktop packaging still needs platform integration outside this project:
-preserve macOS code signing/notarization and Windows Authenticode packaging, update an
-application bundle or installation directory as one release unit, respect per-user vs.
-machine-wide permissions, and integrate shortcuts/protocol handlers with the launcher.
+preserve macOS code signing/notarization and Windows Authenticode packaging, respect
+per-user vs. machine-wide permissions, and integrate shortcuts/protocol handlers with the launcher.
 TUF authenticates the published release, but it does not replace those OS packaging
 and identity requirements.
 
@@ -205,7 +208,7 @@ and identity requirements.
 - Local state is not monotonic hardware-backed storage. A local administrator is
   inside the trust boundary and can reset the installation to its provisioned baseline.
 - Unix can fsync directory entries; Windows has a narrower sudden-power-loss guarantee.
-  Atomic replacement still prevents execution of a torn file, and digest checks make
+  Atomic pointer replacement prevents selection of a torn release, and digest checks make
   inconsistent surviving state fail closed.
 - The reference deployment runs the updater and managed program under one restricted
   OS identity. A hostile managed program would require a separate account or sandbox.

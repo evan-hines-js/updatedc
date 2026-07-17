@@ -3,16 +3,16 @@
 [![CI](https://github.com/evan-hines-js/updated/actions/workflows/ci.yml/badge.svg)](https://github.com/evan-hines-js/updated/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-`updated` is a small, production-oriented update daemon for Linux, macOS, and
-Windows. It keeps arbitrary, update-unaware executables current with a simple
-operational model: publish once, let each daemon verify and apply independently,
+`updated` is production-oriented update infrastructure for Linux, macOS, and
+Windows. It keeps arbitrary, update-unaware applications current with a simple
+operational model: publish once, let each installation verify and apply independently,
 and automatically recover or roll back when an update cannot be trusted or run.
-Its supervisor installs releases from a signed
+Its supervisor installs immutable application bundles from a signed
 [TUF](https://theupdateframework.io/) repository — authenticating the full
 metadata chain, streaming the platform target with hash/length verification,
-replacing the managed executable through a durable transaction, and rolling back
-when the new process fails its health check. The managed program does not need to
-know how the update protocol works.
+atomically activating the complete verified release directory through a durable
+transaction, and rolling back when the new process fails its health check. The
+managed program does not need to know how the update protocol works.
 
 The supervisor is itself replaceable without interrupting the application. A small,
 network-free bootstrap permanently owns the application, readiness-gates a
@@ -40,8 +40,9 @@ cargo run -p e2e
 Exit code 0 means every scenario passed. The harness writes disposable state under
 `target/e2e-work/`.
 
-For an actual installation, build the client binaries and start the bootstrap—not
-the supervisor—under systemd, launchd, or Windows SCM:
+For a supervised installation, build the client binaries and start the bootstrap—not
+the supervisor—under an outer lifecycle owner such as systemd, launchd, Windows SCM,
+or a desktop startup host:
 
 ```sh
 cargo build --release -p bootstrap -p supervisor
@@ -61,7 +62,7 @@ periodically polls `metadata_url` to refresh that signed state. Only when it sel
 an eligible release does it fetch the corresponding object beneath `targets_url`.
 
 Metadata and target delivery are separate planes. Metadata is small and
-freshness-sensitive; release binaries are large, immutable, and safe to cache for a
+freshness-sensitive; release bundles are large, immutable, and safe to cache for a
 long time. They therefore usually use separate origins or CDN behaviors in
 production, even though a small installation may serve both URL prefixes from one
 bucket or hostname.
@@ -72,7 +73,7 @@ flowchart TB
 
     subgraph Delivery[Production distribution]
         M[Metadata endpoint<br/>root, timestamp, snapshot, targets<br/>short freshness-aware cache]
-        T[Target endpoint<br/>immutable release binaries<br/>object storage + CDN]
+    T[Target endpoint<br/>immutable release bundles<br/>object storage + CDN]
     end
 
     F[Supervisor fleet<br/>machine 1 · machine 2 · … · machine N]
@@ -82,7 +83,7 @@ flowchart TB
     F -->|poll metadata_url| M
     M -->|signed metadata response| F
     F -->|GET authenticated target from targets_url| T
-    T -->|binary bytes| F
+    T -->|bundle bytes| F
 ```
 
 The metadata endpoint can be static object storage, a CDN, or an API backed by
@@ -108,7 +109,7 @@ entire topology can be run locally without cloud services:
 - `server init`, `server publish-app`, and `server publish-supervisor` are development TUF publisher commands. They create
   real role keys and real signed metadata, but are intentionally simple CLI tools,
   not a production signing service or key-management system.
-- `server serve` is the mock metadata origin and binary CDN. It serves the signed
+- `server serve` is the mock metadata origin and target CDN. It serves the signed
   repository directory over HTTP, deliberately collapsing both delivery planes
   into one process for local development, smoke tests, and system validation. In
   production, publish that directory to hardened object storage and CDN
@@ -124,17 +125,21 @@ entire topology can be run locally without cloud services:
 ## Guarantees exercised in CI
 
 - TUF root rotation, expiry, rollback protection, and target hash/length verification
-- Fail-closed rejection of a tampered root, drifted binary, or corrupt candidate
+- Fail-closed rejection of a tampered root, drifted manifested file, or corrupt candidate
 - Durable application commit-or-rollback recovery at every transaction boundary
 - Health-gated application rollback and post-commit confirmation
 - Readiness-gated supervisor pointer replacement with rollback
 - Same-PID application re-adoption after supervisor crash or self-update
 - Instance locking and persisted rejection of bad releases
-- Zero-downtime same-PID reload under load on Unix
+- Configurable HAProxy-style reexec with same-PID and zero-downtime assertions on Unix
+- Real HAProxy master-worker binary reload on Linux
+- Concurrent macOS publication fuzzing in restart and reexec modes
 - Native Windows Service Control Manager lifecycle coverage
 
 ## Documentation
 
+- [Five-minute system walkthrough](WALKTHROUGH.md)
+- [Bundle-only application architecture](BUNDLE_SUPPORT.md)
 - [Deployment guide](deploy/README.md)
 - [Reference configuration](deploy/config.toml)
 - [Trust model](#trust-model)
@@ -153,7 +158,7 @@ entire topology can be run locally without cloud services:
   chain verifies, with hash/length checked while streaming
 - Downgrade refusal and platform matching as a post-authentication policy
 - An external supervisor that can update an otherwise update-unaware program
-- A durable stop → swap → health-check → commit-or-rollback install transaction,
+- A durable stage → activate → health-check → commit-or-rollback install transaction,
   recovered deterministically after a crash at any boundary
 - A supervisor that also updates itself (its own TUF product target) by staging
   the new version into content-addressed storage and letting a tiny, installer-owned
@@ -162,7 +167,7 @@ entire topology can be run locally without cloud services:
 - Crash-safe recovery: the permanent guardian retains the application while a
   restarted supervisor re-adopts it through the control channel
 - The same primitives repackaged for a program that is *not* a daemon: an
-  `updated-oneshot` mode that verifies and swaps in the newest release at launch
+  `updated-oneshot` mode that verifies and activates the newest release at launch
   and then `exec`s the program — no supervision loop, for CLIs and batch jobs
 - A production-shaped local validation environment, including signed metadata,
   immutable artifacts, healthy and broken application releases, and a supervisor
@@ -180,16 +185,16 @@ The load-bearing design choices are documented here so operators can evaluate th
 system rather than infer its guarantees from implementation details.
 
 **Is the program being updated one we can modify to update itself, or an arbitrary
-binary?**
+application?**
 Assumed arbitrary and update-*unaware*. So the updater is an external *supervisor*
-that wraps any executable; the managed program needs no cooperation. (A server can
-optionally opt into a zero-downtime reload, but nothing requires it.)
+that launches the entrypoint from a signed bundle; the managed program needs no
+cooperation for restart activation. A Unix service may optionally implement a
+HAProxy-like master/worker reexec contract for zero-downtime activation.
 
 **Who updates the updater — isn't it turtles all the way down?**
-Assumed the hierarchy must terminate at something we neither ship nor have to keep
-current: the OS init system (systemd / launchd / Windows SCM). Just above it sits a
-tiny, installer-owned **bootstrap** — the one binary we ship that the init system
-manages. It does the absolute minimum (own the application, launch the committed
+Assumed the hierarchy must terminate at an outer lifecycle owner that is updated
+independently: an OS service manager, login item, or desktop launcher. Just above it
+sits a tiny, installer-owned **bootstrap**. It does the absolute minimum (own the application, launch the committed
 supervisor pointer, and advance it only after a staged replacement proves ready)
 and speaks no network or TUF, so it should never itself need updating — which is
 what lets the chain terminate rather than sprout another self-updating turtle. The
@@ -204,10 +209,12 @@ freshness, and rollback protection — built on the mature `tough` library so th
 security-critical verification isn't hand-rolled.
 
 **Does "seamlessly replaced" mean zero downtime?**
-Assumed a brief, health-gated restart (stop → swap → start) is fine for most
-programs. Zero-downtime is an opt-in reload — the server re-execs in place, keeping
-its listening socket — for programs that support it; the e2e proves it drops no
-requests under load.
+Assumed a brief, health-gated restart (stop → activate → start) is fine for most
+programs. Zero-downtime is an opt-in Unix reexec contract. The updater can preflight
+the candidate, switch the release pointer, invoke any configured argv command, and
+verify same-PID/exact-version health; the managed master process is responsible for
+preserving sockets and draining workers. Both the sample fixture under load and real
+HAProxy master-worker mode are tested.
 
 **Must the application stay up when the *supervisor* restarts (crash or
 self-update)?**
@@ -222,12 +229,13 @@ otherwise roll back to the previous version and remember the release as rejected
 
 **What if the machine crashes mid-install?**
 It must recover from a process or ordinary OS crash. A transaction journal records
-the swap; on startup the supervisor reconciles from the on-disk hash and either
-finishes or reverses the update — exercised at every transaction boundary in the
+the intended pointer activation; on startup the supervisor reconciles the journal,
+installed state, `active-release`, and verified release directories and either finishes
+or reverses the update — exercised at every transaction boundary in the
 e2e. Unix fsyncs the containing directories so the ordering survives sudden power
 loss; Windows lacks an equivalent directory fsync here, so an abrupt power loss at a
 narrow commit boundary could lose a just-created or just-deleted journal entry. Even
-then, atomic replacement never installs a torn file and the signed hashes keep any
+then, atomic pointer replacement never selects a partial release and manifested hashes keep any
 inconsistent surviving state fail-closed rather than silently trusted.
 
 **Can an attacker force a downgrade to a known-vulnerable version?**
@@ -246,9 +254,10 @@ Assumed Windows, macOS, and Linux on x86-64 and aarch64. Targets are selected by
 suite on all three operating systems.
 
 **How is the very first version trusted?**
-Assumed the installer places the initial binary, pins the TUF root, and embeds its
-baseline version plus exact SHA-256 — the one out-of-band step, after which the system is
-self-sustaining.
+Assumed the installer places the bootstrap and initial supervisor, pins the TUF root,
+and seeds a complete verified initial application bundle plus strict installed state
+and `active-release` record. That is the one out-of-band step, after which the system
+is self-sustaining and can start offline.
 
 **Can the supervisor run without the bootstrap?**
 No. The bootstrap is the supervisor's required process owner and safe replacement
@@ -259,7 +268,7 @@ channel and hands verified candidates to the bootstrap for readiness-gated activ
 
 ```mermaid
 flowchart TD
-    I[OS init system<br/>systemd / launchd / Windows SCM]
+    I[Outer lifecycle owner<br/>service manager · login item · desktop launcher]
     B[Bootstrap<br/>permanent process guardian]
     S[Supervisor<br/>update policy + transaction state machine]
     A[Managed application]
@@ -281,11 +290,11 @@ The crates have narrow responsibilities:
 | Crate | Responsibility |
 | --- | --- |
 | `updated-tuf` | The async TUF client (load pinned root, refresh, find + download verified targets), the offline repository builder (mint/sign root, publish releases), the default platform + downgrade policy, and release **selection** (`select`: the newest eligible target, shared by the supervisor and one-shot) |
-| `updated` | Post-verification core shared across the tower: the durable transaction journal and recovery/binary classifiers (`transaction`), crash-safe filesystem replacement (`apply`), atomic installed state with pending rollback intent (`state`), instance locking, CSPRNG tokens, file digests, health constants, logging, rejection tracking, and the shared operator-config loader + path resolver |
+| `updated` | Post-verification core shared across the tower: strict bundle manifests and extraction, immutable release storage, the `active-release` pointer, durable transaction/recovery classification, installed state with pending rollback intent, instance locking, CSPRNG tokens, file digests, health constants, logging, rejection tracking, and the shared operator-config loader + path resolver |
 | `control` | Frozen, std-only bootstrap⇄supervisor protocol and capability negotiation |
 | `bootstrap` | The installer-owned permanent guardian: own the application, run the committed supervisor, readiness-gate a staged replacement, and atomically advance the supervisor pointer. No network, TUF, or release policy |
 | `supervisor` | Periodic TUF refresh and selection, application update planning/transactions, health policy, durable state, rollback decisions, and staging its own next version for the bootstrap |
-| `updated-oneshot` | Optional update-on-launch shell for a CLI, batch job, or on-demand tool. It uses the same journaled swap, recovery classifier, drift policy, and installed-state format, then commits directly to confirmed state and `exec`s — no supervision loop, health gate, confirmation window, or bootstrap |
+| `updated-oneshot` | Optional update-on-launch shell for a CLI, batch job, or desktop launcher. It uses the same bundle store, journaled activation, recovery classifier, drift policy, and installed-state format, then commits directly to confirmed state and `exec`s the active entrypoint — no supervision loop, health gate, confirmation window, or bootstrap |
 | `server` | Development TUF publisher (`init`/`publish`) and static repository server (`serve`) — the mock CDN |
 | `sampleapp` | An update-unaware HTTP service used by the end-to-end demo |
 | `e2e` | One cross-platform Rust harness that stands up a TUF repository and drives the full update, self-update, crash-recovery, and TUF/hardening scenarios |
@@ -381,12 +390,12 @@ Run the complete end-to-end system validation — the same binary on every OS:
 cargo run -p e2e
 ```
 
-It builds the release binaries, stands up a real TUF repository, then drives real
+It builds the workspace programs, stands up a real TUF repository, then drives real
 scenarios against it: an unattended application upgrade, health-gated rollback of
 a broken release, supervisor self-update, crash recovery at every transaction
 boundary, and hardening/TUF fail-closed cases (a tampered pinned root, a drifted
-binary, the instance lock, persisted rejection). On Unix it also verifies a
-zero-downtime reload under load. Work files are written under `target/e2e-work/`;
+manifested release file, the instance lock, persisted rejection). On Unix it also
+verifies a zero-downtime reexec under load. Work files are written under `target/e2e-work/`;
 exit 0 means every scenario passed.
 
 The harness owns fixed localhost ports and the shared `target/e2e-work/` tree.
@@ -426,9 +435,20 @@ Serve the repository through the local metadata/target origin:
 target/release/server serve --repo ./repo --addr 127.0.0.1:8080
 ```
 
-Install an initial supervisor, then start the bootstrap against it. The supervisor
-pins the config's `root`, refreshes the
-metadata chain, and installs the newest `app` target for this platform. All
+Seed the initial application bundle, install an initial supervisor, then start the
+bootstrap against it. The initial bundle is an installer trust boundary and is required
+for offline, fail-closed first start:
+
+```sh
+target/release/server install-app \
+  --install-root /var/lib/example-app \
+  --bundle ./release-linux-x86_64 \
+  --product app --version 1.0.0 --platform linux-x86_64 \
+  --entrypoint bin/app
+```
+
+The supervisor verifies that seeded release before launch, pins the config's `root`,
+and subsequently refreshes the metadata chain for updates. All
 configuration — repository, application command, policy, timeouts — lives in one
 TOML file (`updated::config`; see `deploy/config.toml`). Bootstrap ownership paths
 stay explicit command-line arguments:
@@ -475,13 +495,13 @@ every client.
 
 | Mechanism | What it guarantees |
 | --- | --- |
-| Installer baseline | With no installed state, both modes require a configured SemVer + SHA-256 pair, match it against the local executable, and atomically commit it before execution. Missing or mismatched provisioning fails closed and does not require network access. |
+| Installer baseline | The installer seeds a manifested release directory, strict installed state, and `active-release`. Startup verifies every manifested file before execution; missing or mismatched provisioning fails closed without requiring network access. |
 | TUF refresh | A pinned root authenticates timestamp → snapshot → targets; expiry and metadata-version checks resist freeze and rollback attacks. |
 | Selection policy | Targets are ordered by SemVer, newest first. Only the configured product/channel and local OS/architecture are eligible; the current version and rejected hashes are skipped. Versions below the installed version are refused. |
-| Verified download | `tough` streams to a staging file with signed length and SHA-256 checks; the installed bytes are hashed again before execution. |
-| Crash-recoverable replacement | A flushed journal and rollback copy precede the atomic rename. Startup compares hashes and either confirms the commit or restores the old binary. Unix also fsyncs directory entries; see the Windows power-loss qualification above. |
-| Health gate | A process must remain alive or answer HTTP readiness with a per-launch token. Reload mode must also report the signed candidate version. |
-| Pending confirmation | A newly committed application retains its previous image; one crash within the window restores and rejects the candidate. |
+| Verified bundle staging | `tough` authenticates the archive while streaming; extraction then enforces strict paths, types, limits, manifest identity, and every file's size and digest before publishing an immutable release directory. |
+| Crash-recoverable activation | A flushed journal precedes atomic replacement of `active-release`. Startup derives recovery from the journal, installed state, pointer, and verified immutable releases. |
+| Health gate | A process must remain alive or answer HTTP readiness with a per-launch token. Reexec mode must also report the exact signed candidate version while retaining the guardian-owned PID. |
+| Pending confirmation | A newly committed application retains a reference to its immutable predecessor; one crash within the window reactivates it and rejects the candidate archive. |
 | Process adoption | The bootstrap owns the application and lets replacement supervisors adopt its current PID through the authenticated control channel. |
 | Supervisor pointer | The bootstrap runs `desired-supervisor` and readiness-gates content-addressed candidates, so even a binary that cannot start rolls back. |
 
@@ -492,70 +512,58 @@ before release selection or application launch:
 ```mermaid
 flowchart TD
     Start([Supervisor starts]) --> V{Installed state}
-    V -->|missing| B{Installer baseline<br/>matches binary?}
-    V -->|invalid| Failed[Fail closed]
-    V -->|valid| L[Load committed version,<br/>digest, and pending intent]
-    B -->|yes| BC[Commit baseline]
-    B -->|no| Failed
-
-    L --> J{Journal present?}
-    BC --> J
-    J -->|yes| R{Classify disk bytes}
-    R -->|new hash and target committed| CJ[Clear spent journal]
-    R -->|old hash| NJ[Drop stale rollback copy<br/>and clear journal]
-    R -->|other or uncommitted new hash| RB[Restore predecessor<br/>and verify its hash]
-    CJ --> Ready{Pending intent?}
-    NJ --> Ready
-    RB --> Current[Current]
-
-    J -->|no| D{Binary matches<br/>committed digest?}
-    D -->|yes| Ready
-    D -->|no, rollback matches| DR[Restore committed binary] --> Ready
-    D -->|no safe image| Failed
-
-    Ready -->|no| Current
-    Ready -->|yes| Pending[Pending confirmation]
-
-    Pending -->|application crashed| PR[Restore and reject candidate] --> Current
-    Pending -->|window passed| PC[Confirm and drop rollback] --> Current
+    V -->|missing or invalid| Failed[Fail closed]
+    V -->|valid| A{Active release verifies?}
+    A -->|no| Restore[Reactivate verified<br/>committed release]
+    A -->|yes| J{Journal present?}
+    Restore --> J
+    J -->|no| Ready{Pending intent?}
+    J -->|candidate active,<br/>candidate not committed| Rollback[Reactivate predecessor<br/>and clear journal]
+    J -->|previous active| Clear[Clear transaction<br/>that never landed]
+    J -->|candidate committed| Spent[Clear spent journal]
+    Rollback --> Ready
+    Clear --> Ready
+    Spent --> Ready
+    Ready -->|no| Current[Current]
+    Ready -->|crash within window| Revert[Reactivate predecessor<br/>and reject candidate] --> Current
+    Ready -->|window passed| Confirm[Confirm release] --> Current
 ```
 
 Once boot recovery reaches `Current`, an update follows a separate, smaller
-transaction. The journal is written before the executable changes, and the signed
-digest is checked again after the swap:
+transaction. Extraction completes before the journal exists; once journaled, every
+outcome is recoverable by switching between already verified immutable releases:
 
 ```mermaid
 flowchart TD
-    Current[Current] -->|eligible signed release| Staged[Staged download]
+    Current[Current] -->|eligible signed release| Staged[Verify and publish<br/>immutable release]
     Staged --> Journal[Write transaction journal]
-    Journal --> Swap[Atomically swap binary]
-    Swap --> Verify{Installed hash matches?}
-
-    Journal -->|swap fails| Recover[Recover predecessor]
+    Journal --> Quiesce[Stop app or keep<br/>reexec master serving]
+    Quiesce --> Activate[Atomically switch<br/>active-release]
+    Activate --> Verify{Release verifies?}
+    Journal -->|activation fails| Recover[Reactivate predecessor]
     Verify -->|no| Recover
     Recover --> Current
 
     Verify -->|yes, one-shot| OneShot[Commit confirmed state<br/>and clear journal]
     OneShot --> Current
 
-    Verify -->|yes, supervisor| Activate[Activate and health-check]
-    Activate -->|failed| Recover
-    Activate -->|healthy first install| First[Commit confirmed state<br/>and clear journal]
-    First --> Current
-    Activate -->|healthy update| Commit{Commit state with<br/>pending rollback intent}
+    Verify -->|yes, supervisor| Launch[Start or invoke reexec command]
+    Launch --> Health{Healthy exact release?}
+    Health -->|no| Recover
+    Health -->|yes| Commit{Commit state with<br/>pending predecessor intent}
     Commit -->|write failed| Restart[Exit and recover on restart]
     Restart --> Recover
     Commit -->|written| Pending[Pending confirmation]
     Pending -->|window passed| Confirm[Confirm and drop rollback]
     Confirm --> Current
-    Pending -->|application crashed| Revert[Restore predecessor<br/>and reject candidate]
+    Pending -->|application crashed| Revert[Reactivate predecessor<br/>and reject candidate]
     Revert --> Current
 ```
 
-`Pending` is durable, not an in-memory timer. The installed-state record and the
-predecessor image remain intact until confirmation succeeds. While pending, the
-supervisor suppresses new updates so a second transaction cannot overwrite the only
-rollback image. One-shot mode has no resident process to observe, so it commits a
+`Pending` is durable, not an in-memory timer. The installed-state record and immutable
+predecessor release remain intact until confirmation succeeds. While pending, the
+supervisor suppresses new updates and retains the predecessor reference until the
+window resolves. One-shot mode has no resident process to observe, so it commits a
 verified update directly to confirmed `Current` before executing the program.
 
 ### Release selection
@@ -597,7 +605,7 @@ readiness succeeds, so a bootstrap restart naturally relaunches the last committ
 ### End-to-end validation
 
 `cargo run -p e2e --release` is the single cross-platform system test. It publishes real
-bundles, exercises stop/start and same-PID HUP upgrades, and adversarially crashes every
+bundles, exercises stop/start and same-PID reexec upgrades, and adversarially crashes every
 durable activation boundary. A process lock prevents overlapping runs from sharing its
 ports or `target/e2e-work` directory.
 
@@ -641,9 +649,10 @@ environment variables.
 The master PID must remain guardian-owned and unchanged. Readiness must echo both the
 launch token and `X-Updated-Version`; command success alone never commits an update.
 
-Production deployments run `bootstrap --state-dir ... --supervisor-config ... --supervisor ...` under
-systemd, launchd, or Windows SCM. Direct supervisor execution is rejected, and
-supervisor replacement is always part of the managed update loop.
+Supervised deployments run `bootstrap --state-dir ... --supervisor-config ... --supervisor ...`
+under an outer lifecycle owner such as systemd, launchd, Windows SCM, or a desktop
+startup host. Direct supervisor execution is rejected, and supervisor replacement is
+always part of the managed update loop.
 
 ## Current limitations
 
@@ -656,8 +665,8 @@ supervisor replacement is always part of the managed update loop.
   against a local administrator.
 - The deliberately minimal bootstrap is not updated over the air; its replacement
   belongs to the installer or package manager.
-- Zero-downtime reexec activation is Unix-only (it relies on the server re-execing in
-  place); on Windows every strategy is the stop/swap/start restart.
+- Zero-downtime reexec activation is Unix-only and requires a cooperative HAProxy-like
+  master/worker contract; on Windows application activation is stop/activate/start.
 - The dev server serves a repository from disk; production should use object
   storage or a CDN with immutable versioned metadata and conditional timestamp
   replacement. Example systemd, launchd, and Windows SCM integration is under

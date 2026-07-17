@@ -7,6 +7,9 @@
 root         = "/etc/selfupdate/root.json" # installer-pinned trust anchor (read-only)
 metadata_url = "https://updates.example.com/metadata/"
 targets_url  = "https://updates.example.com/targets/"
+# datastore defaults to <install_root>/state/tuf
+metadata_limit = 1048576       # maximum bytes for one metadata document
+target_limit   = 536870912     # maximum compressed target bytes
 
 [application]
 product         = "app"
@@ -15,6 +18,12 @@ install_root    = "/var/lib/selfupdate/app"
 args            = ["--addr", "127.0.0.1:9090"]
 health_url      = "http://127.0.0.1:9090/healthz"   # omit for liveness-only
 # Authenticated application target versions below the installed version are denied.
+# Activation defaults to portable stop/activate/start. A Unix HAProxy-like service can
+# opt into reexec by adding the following table. Commands are argv arrays, not shell text:
+# [application.activation]
+# mode = "reexec"
+# preflight_command = ["{candidate}/bin/app", "--check"] # optional
+# command = ["kill", "-USR2", "{pid}"]
 
 # All optional; defaults shown. Durations accept "15s", "5m", "2h", or bare seconds.
 [timeouts]
@@ -25,5 +34,6 @@ health_successes    = 1       # consecutive good health answers required to trus
                               #   (a readiness successThreshold); raise to confirm sustained health
 health_interval     = "1s"    # spacing between those confirmation probes (ignored when successes = 1)
 retry_after         = "5m"    # how often a health-failed release is retried (not blocked forever)
+refresh_retry       = "5s"    # retry delay after a repository refresh failure
 confirmation_window = "2m"   # a crash before this elapses reverts the committed update
 supervisor_check_interval = "1h" # how often to check for a supervisor release

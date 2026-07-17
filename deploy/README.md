@@ -1,13 +1,15 @@
-# Deployment: running the bootstrap under the OS init system
+# Deployment: supervised service adapters
 
-An update hierarchy must terminate somewhere. These templates run the tiny,
-installer-owned **bootstrap guardian** under the host's init system. The guardian
+An update hierarchy must terminate at an independently managed lifecycle owner. These
+templates run the tiny, installer-owned **bootstrap guardian** under systemd, launchd,
+or Windows SCM. A desktop product can provide the same start/relaunch/stop contract
+through a login item or startup host. The guardian
 owns both the replaceable **supervisor** and the managed application. The supervisor
 selects releases and requests application lifecycle operations through the guardian,
 but it is never the application's process parent.
 
 ```
-  init system ──manages──► bootstrap guardian
+  outer lifecycle owner ──manages──► bootstrap guardian
                                   ├──owns/readiness-gates──► supervisor
                                   └──owns──────────────────► application
 
@@ -18,18 +20,19 @@ but it is never the application's process parent.
   The supervisor verifies and journal-updates the application through the guardian.
 ```
 
-The verbs on the arrows are intentional. The init system **manages** the
+The verbs on the arrows are intentional. The outer lifecycle owner **manages** the
 guardian's process lifecycle. The guardian **activates** supervisor releases: it
 launches a staged candidate, waits for it to prove it can run, and either commits
 its path or retains the previous pointer — but it never updates *itself*. The
-supervisor **updates** the application with an in-place, journaled swap, but asks the
-guardian to stop, start, or adopt that application. It also stages its own next
+supervisor **updates** the application through journaled immutable-bundle activation,
+but asks the guardian to stop, start, or adopt that application. It also stages its own next
 version for the guardian to activate. Supervisor releases use the reserved
 `supervisor` product on the application's configured channel.
 
-Ending the hierarchy at the init system (systemd / launchd / SCM) is the whole
-point: it is present on every target, restarts a process that exits, and is updated
-by the OS vendor — a real root. The bootstrap is the one thing we ship that it
+Ending the hierarchy at an independently updated lifecycle owner is the point. On a
+service installation that owner is systemd, launchd, or SCM; on a desktop it can be a
+login item or launcher. It starts and relaunches the bootstrap without participating in
+release policy. The bootstrap is the one thing we ship that it
 manages, and the bootstrap is small, network-unaware, and does so little that it
 changes only with the installer — so the chain terminates without another
 self-updating turtle.
@@ -60,16 +63,16 @@ nor the application outlives its permanent guardian.
 ### Terminology invariant
 
 In this documentation, **owns** means OS process parent and lifetime boundary,
-**manages** means init-system process lifecycle (start, stop, restart),
+**manages** means outer process lifecycle (start, stop, restart),
 **activates** means launch-a-candidate-and-commit-or-roll-back, and **updates**
 means release installation, verification, commit, and rollback. Do not describe an
-init system as updating anything: it manages the bootstrap. Do not describe the
+outer lifecycle owner as updating anything: it manages the bootstrap. Do not describe the
 supervisor as owning the application: it requests lifecycle operations from the
 guardian. Do not describe the application as "self-updating": the supervisor owns
 that transaction. The one component whose replacement is gated by proof-of-execution
 is the supervisor, and
-the guardian — not the init system, and not the supervisor itself — performs that
-swap.
+the guardian — not the outer lifecycle owner, and not the supervisor itself — performs
+that activation.
 
 ## Layout assumed by the templates
 
@@ -79,7 +82,7 @@ swap.
 | `/etc/selfupdate/root.json` | Installer-pinned TUF root — the anchor of trust, read-only |
 | `/var/lib/selfupdate/` (Linux), `/usr/local/var/selfupdate/` (macOS) | Writable guardian state: `desired-supervisor`, crash/rejection markers, and content-addressed `supervisors/` candidates; application state and the TUF cache live beside paths selected in `config.toml` |
 
-Because supervisor candidates and immutable application bundles self-update, they live
+Because supervisor candidates and immutable application bundles are updated, they live
 in writable state directories. The two things that must never be forged — the
 bootstrap and the pinned TUF root — stay read-only. A leaked or misused role key
 still cannot make a client run anything the pinned root's roles did not sign.
@@ -105,8 +108,7 @@ journalctl -u selfupdate-supervisor -f      # watch bootstrap + supervisor + app
 ```
 
 Install `config.toml` read-only alongside the pinned root:
-`install -m0644 config.toml /etc/selfupdate/config.toml` (substitute the version
-version and digest tokens first).
+`install -m0644 config.toml /etc/selfupdate/config.toml`.
 
 **Updating the supervisor:** publish a signed supervisor release on its channel;
 the running supervisor stages it under `supervisors/<content-id>/` and exits, and the
@@ -155,14 +157,13 @@ separate OS identity or sandbox and a platform-specific launch/control bridge, w
 this reference supervisor deliberately leaves out.
 
 The bootstrap binary itself is installer-owned and read-only (place it under
-`C:\Program Files\selfupdate`). Because supervisor candidates and the application
-binary self-update, place the bootstrap state directory (`C:\ProgramData\selfupdate`) where the
-service account can write and grant it write access to only that
+`C:\Program Files\selfupdate`). Because supervisor candidates and immutable application
+bundles update in writable storage, place the bootstrap state directory
+(`C:\ProgramData\selfupdate`) where the service account can write and grant it write access to only that
 (`icacls ... /grant "NT SERVICE\SelfUpdateSupervisor:(OI)(CI)M"`). Keep the pinned
 TUF root administrator-owned and read-only. This mirrors the systemd
 `User=selfupdate` + `ReadWritePaths=` and launchd `UserName=_selfupdate` templates.
 
-Replace `APPLICATION_VERSION` with the exact semver of the application the installer
-packaged. The initial supervisor path is passed directly; its own version is baked
-into that executable at build time. Never default the trusted application baseline
-to `0.0.0`.
+The initial supervisor path is passed directly; its own version is baked into that
+executable at build time. The installer must seed the exact initial bundle identity and
+must never synthesize a trusted baseline from loose files.

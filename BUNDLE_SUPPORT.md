@@ -1,4 +1,4 @@
-# Bundle-Only Installation Design
+# Bundle-Only Installation Architecture
 
 ## Decision
 
@@ -13,10 +13,9 @@ There is deliberately no single-binary mode, artifact-kind enum, compatibility d
 binary-to-bundle migration, or mixed rollback. This project is pre-launch: existing state
 may be deleted and installations reseeded with an initial bundle.
 
-The existing TUF trust chain, release selection, guardian, health gate, confirmation
+The TUF trust chain, release selection, guardian, health gate, confirmation
 window, rejection list, durable journal, boot planner, supervisor self-update, and chaos
-testing remain. Their application artifact vocabulary changes from a mutable executable
-to an immutable release directory.
+testing all use this release-directory vocabulary.
 
 ## Why this is the only installation model
 
@@ -36,20 +35,18 @@ The model also improves a one-executable application:
 
 ## Scope
 
-The first implementation supports:
+The implementation supports:
 
 - one `.tar.zst` archive per OS and architecture;
 - one strict manifest schema;
 - regular files and directories only;
 - one application entrypoint;
-- portable stop/start activation and opt-in Unix HUP/re-exec activation with the
-  existing same-PID, socket-preserving zero-downtime guarantee;
+- portable stop/start activation and opt-in Unix HAProxy-style reexec activation;
 - immutable release-owned files;
 - external mutable operator configuration and application data;
 - health-gated commit and confirmation-window rollback;
-- bounded retention and garbage collection.
 
-The first implementation does not support:
+The implementation does not support:
 
 - legacy binary targets or state;
 - multiple archive formats;
@@ -61,8 +58,8 @@ The first implementation does not support:
 - irreversible data migrations;
 - arbitrary multi-process orchestration.
 
-A bundle runner should be added only when a real product requires multiple coordinated
-processes. It is not part of the initial bundle mechanism.
+A bundle runner belongs in a future product-specific layer only if a real deployment
+requires multiple coordinated processes. It is not part of this bundle mechanism.
 
 ## On-disk layout
 
@@ -132,8 +129,8 @@ environment variables.
 
 ## Same-PID zero-downtime activation
 
-Stop/start remains the portable default. A Unix service with a HAProxy-like master/worker
-interface uses the single structured reexec path:
+Stop/start is the portable default. A Unix service with a HAProxy-like master/worker
+interface can use the single structured reexec path:
 
 ```toml
 [application.activation]
@@ -146,43 +143,40 @@ Preflight happens before any durable or live mutation. The activation command is
 argv and is applied symmetrically on upgrade and rollback; health, expected-version proof,
 unchanged guardian ownership, and durable rejection constrain its outcome.
 
-The immutable-directory model changes one detail: a running process cannot re-exec its
-original `argv[0]`, because that path still names the predecessor release. A reload-capable
-application must instead know the stable application install root. On HUP it:
-
-1. stops accepting new work while retaining its listening socket;
-2. drains in-flight requests;
-3. reads the stable `active-release` record;
-4. resolves the candidate manifest and entrypoint beneath `versions/<release-id>`;
-5. changes its working directory to that candidate release directory;
-6. `exec`s the candidate entrypoint in the same PID while preserving the listener;
-7. starts serving with release-owned files, including `config/release.toml`, from the
-   candidate directory.
-
 The supervisor remains the authority that validates and activates the candidate before
-signalling HUP. The application's pointer read is a cooperative handoff mechanism, not a
-second installation policy: it accepts only the exact current `active-release` and fails
-closed if it cannot resolve it. The stable install-root path is supplied at initial launch
-through a dedicated argument or non-secret environment variable and remains unchanged
-across releases.
+invoking the command. The command decides how a particular master/worker program adopts
+that already verified release. For example:
+
+- the sample reexec fixture reads the stable `active-release` record, resolves the
+  candidate entrypoint, and execs it while retaining its listener; or
+- the real HAProxy adapter atomically projects the candidate executable and configuration
+  into stable runtime paths, then sends `SIGUSR2` to the master.
+
+Those are application adapters, not alternate installation policies. They receive exact
+candidate, predecessor, install-root, version, and PID values through placeholders and
+`UPDATED_*` environment variables. The configured command is invoked symmetrically for
+forward activation and rollback. It must leave the guardian-owned master PID alive;
+health must prove the exact release before the supervisor commits.
 
 Forward activation is:
 
 1. stage and completely verify the candidate bundle;
 2. write the transaction journal;
 3. atomically switch `active-release` to the candidate;
-4. execute the configured reload command, normally HUP;
+4. execute the configured reexec command;
 5. require health to report the candidate version read from the candidate's bundled config;
 6. commit installed state only after that proof.
 
-If reload execution or candidate health fails, the supervisor atomically switches
-`active-release` back to the predecessor, sends HUP again, and requires the same PID to
-report the predecessor's bundled-config version before recording rollback. Thus rollback
-is zero-downtime as well. A reload-capable app that exits instead of completing either
+If command execution or candidate health fails, the supervisor atomically switches
+`active-release` back to the predecessor, invokes the same command again, and requires
+the same PID to report the predecessor version before recording rollback. Thus rollback
+uses the same activation command to restore it, and proves predecessor health. Whether
+that rollback is zero-downtime depends on the managed program preserving its listener
+and draining workers correctly. A reload-capable app that exits instead of completing either
 handoff falls into the existing guardian crash and boot-recovery path.
 
 The supervisor must never treat PID continuity, a successful `kill`, or generic health as
-version proof. Reload health must include the exact expected release version because the
+version proof. Reexec health must include the exact expected release version because the
 launch token does not change during a same-PID re-exec.
 
 ## End-to-end sample application
@@ -440,11 +434,9 @@ Recovery is derived from durable facts rather than an incremented phase field:
 
 A crash during the pending confirmation window activates the predecessor, verifies it,
 commits it as installed, rejects the candidate archive digest, and relaunches. A healthy
-candidate surviving the window clears `pending` and makes the predecessor eligible for
-garbage collection.
+candidate surviving the window clears `pending`; automatic cleanup is future work.
 
-The planner vocabulary becomes `ReleaseFix`/`ReleaseId`; all binary hash and rollback-file
-concepts are removed.
+The planner uses `ReleaseFix`/`ReleaseId`; binary hash and rollback-file concepts are absent.
 
 ## Launch resolution
 
@@ -453,11 +445,12 @@ manifest, and resolves the manifest entrypoint beneath that exact directory. It 
 absolute entrypoint and the release directory as `cwd` through the existing guardian
 control request.
 
-For reload mode, it instead passes the stable install root to the initially launched
-application and invokes the configured reload command after activation. Placeholder and
-environment vocabulary becomes release-oriented (`{release}`, `{entrypoint}`, and stable
-install root) rather than retaining the obsolete `{binary}` contract. HUP itself remains
-the normal command; the application discovers the candidate through `active-release`.
+For reexec mode, the supervisor invokes the configured command after pointer activation.
+Its exact placeholder vocabulary is `{candidate}`, `{predecessor}`, `{candidate_version}`
+(or `{version}`), `{predecessor_version}`, `{install_root}`, and `{pid}`. The corresponding
+`UPDATED_*` environment variables carry the same values. An adapter may let the application
+discover the release through `active-release`, or project candidate files into stable runtime
+paths before signalling a third-party master such as HAProxy.
 
 The guardian remains deliberately ignorant of bundles and manifests. It owns processes,
 not installation policy. No control-protocol extension is needed because `CommandSpec`
@@ -478,9 +471,10 @@ Archive construction must use stable ordering and normalized metadata.
 
 There is no target-kind fallback. A target without the complete current metadata is invalid.
 
-## Garbage collection
+## Future garbage collection constraints
 
-Garbage collection may never remove:
+Automatic release garbage collection is not currently implemented. When added, it may
+never remove:
 
 - the active release;
 - the installed release;
@@ -488,9 +482,8 @@ Garbage collection may never remove:
 - either release named by a journal;
 - a directory still beneath `staging/`.
 
-After confirmation, retain the active release and a small configurable number of previous
-confirmed releases within a disk budget. Cleanup runs outside the commit path. Startup may
-remove old abandoned staging directories only after proving that no journal references them.
+It should retain the active release and a configurable number of previous confirmed
+releases within a disk budget, and must run outside the commit path.
 
 ## One-shot mode
 
@@ -529,7 +522,6 @@ is immediate. Supervised mode remains the choice when health-gated rollback is r
 - corrupt active state fails closed;
 - a verified predecessor restores a missing or corrupt candidate;
 - every journal/active/installed combination follows the recovery table;
-- garbage collection preserves every live reference;
 - obsolete binary state and journals are rejected.
 
 ### End to end
@@ -548,25 +540,9 @@ is immediate. Supervised mode remains the choice when health-gated rollback is r
 - supervisor crash, self-update, locking, reload where supported, and one-shot behavior remain correct;
 - Windows SCM, launchd, and systemd stop/restart behavior remains clean.
 
-## Implementation order
+## Implemented invariants
 
-1. Change the sample app to read release version from `config/release.toml`.
-2. Add strict manifest, `RelativePath`, `ReleaseId`, limits, and archive extraction.
-3. Replace binary paths/state/journal with the bundle-only release model.
-4. Replace binary swapping with immutable staging and `active-release` activation.
-5. Generalize the boot planner terminology and recovery facts to releases.
-6. Update publisher and TUF selection to emit and require bundle targets.
-7. Convert supervisor, HUP/re-exec, and one-shot launch resolution.
-8. Convert all unit, fault-injection, and E2E fixtures, including zero-downtime reload and rollback.
-9. Remove every binary-install module, field, test, flag, and documentation path.
-10. Run formatting, strict lint, workspace tests, full E2E, and all platform CI.
-
-Each step must leave only one active design. Temporary compatibility branches should not
-be merged.
-
-## Definition of done
-
-Bundle installation is complete when:
+The current implementation and tests enforce that:
 
 - every application target is a TUF-authenticated bundle;
 - every bundle is bounded, safely extracted, fully manifested, and immutable;
@@ -576,9 +552,11 @@ Bundle installation is complete when:
 - health failure and confirmation-window crash restore the complete predecessor;
 - the E2E sample reports the version read from its bundled configuration file;
 - identical sample executable bytes can represent multiple releases through different signed config;
-- Unix HUP update and rollback retain the same PID, preserve the listening socket, prove
-  the active bundle's config version, and drop no requests under load;
+- Unix reexec retains the guardian-owned master PID and proves the active bundle's exact
+  version; the sample fixture demonstrates socket preservation under load and the Linux
+  integration test exercises real HAProxy master-worker reload;
 - no binary installation, migration, target-kind, mixed rollback, or compatibility code remains;
-- unit, fuzz/fault-injection, cross-platform E2E, Windows SCM, launchd, and systemd checks pass;
+- unit, fuzz/fault-injection, cross-platform E2E, Windows SCM, macOS launchd, and real
+  Linux HAProxy checks run in CI;
 - deployment documentation explains immutable releases, external mutable state, permissions,
   disk limits, and reseeding.
