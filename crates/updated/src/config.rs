@@ -331,6 +331,14 @@ fn parse_duration(s: &str) -> Option<Duration> {
 mod tests {
     use super::*;
 
+    fn make_install_root_native(cfg: &mut Config) {
+        cfg.application.install_root = if cfg!(windows) {
+            PathBuf::from(r"C:\app")
+        } else {
+            PathBuf::from("/app")
+        };
+    }
+
     #[test]
     fn durations_parse_human_and_bare() {
         assert_eq!(parse_duration("15s"), Some(Duration::from_secs(15)));
@@ -366,7 +374,7 @@ mod tests {
 
     #[test]
     fn unsafe_zero_timeouts_are_rejected() {
-        let cfg: Config = toml::from_str(
+        let mut cfg: Config = toml::from_str(
             r#"
             [repository]
             root = "/r"
@@ -380,6 +388,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        make_install_root_native(&mut cfg);
 
         assert_eq!(
             cfg.validate().unwrap_err(),
@@ -399,17 +408,19 @@ mod tests {
             install_root = "/app"
         "#;
         let mut cfg: Config = toml::from_str(base).unwrap();
+        make_install_root_native(&mut cfg);
         cfg.timeouts.health_successes = 0;
         assert!(cfg.validate().unwrap_err().contains("health_successes"));
 
         let mut cfg: Config = toml::from_str(base).unwrap();
+        make_install_root_native(&mut cfg);
         cfg.repository.target_limit = 0;
         assert!(cfg.validate().unwrap_err().contains("target_limit"));
     }
 
     #[test]
     fn omitted_timeouts_take_defaults_partial_override() {
-        let cfg: Config = toml::from_str(
+        let mut cfg: Config = toml::from_str(
             r#"
             [repository]
             root = "/etc/selfupdate/root.json"
@@ -424,6 +435,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        make_install_root_native(&mut cfg);
         cfg.validate().unwrap();
         // Overridden field takes the file value; the rest fall back to defaults.
         assert_eq!(cfg.timeouts.health_grace, Duration::from_secs(120));
