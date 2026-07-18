@@ -172,6 +172,9 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # `gh release` resolves the repository from the checkout. Artifact-only jobs have
+      # no Git context and fail with "not a git repository" before uploading anything.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: updated-*
