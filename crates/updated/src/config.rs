@@ -76,6 +76,17 @@ pub struct RepositoryAssignment {
     pub provider_set: TargetReference,
 }
 
+/// Minimal per-node routing document. A node begins with only the routing trust root,
+/// repository URL, and path to this document; the exact opaque config reference leads
+/// it to the full [`RepositoryAssignment`]. Why that reference changes is exclusively a
+/// control-plane concern.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeAssignment {
+    pub schema: u32,
+    pub config: TargetReference,
+}
+
 /// A content-addressed reference to a target authenticated by release-repository TUF
 /// metadata. Both fields must match; a path that is republished with different bytes
 /// never silently satisfies an older deployment document.
@@ -188,23 +199,7 @@ pub struct RepositorySource {
 
 impl Repository {
     pub fn resolve(&self, assignment: RepositoryAssignment) -> Result<RepositorySource, String> {
-        if assignment.schema != 2 {
-            return Err(format!(
-                "unsupported repository assignment schema {}",
-                assignment.schema
-            ));
-        }
-        if assignment.deployment.is_empty() {
-            return Err("repository assignment deployment must not be empty".into());
-        }
-        for (name, reference) in [
-            ("application", &assignment.application),
-            ("provider_set", &assignment.provider_set),
-        ] {
-            if !valid_target_reference(reference) {
-                return Err(format!("repository assignment {name} reference is invalid"));
-            }
-        }
+        assignment.validate()?;
         Ok(RepositorySource {
             root: self.root.clone(),
             metadata_url: assignment.metadata_url,
@@ -213,6 +208,46 @@ impl Repository {
             target_limit: self.target_limit,
             transport_timeout: self.transport_timeout,
         })
+    }
+}
+
+impl RepositoryAssignment {
+    /// Validate the signed assignment contract independently of node-local repository
+    /// configuration. Producers call the same validator as consumers before signing.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 2 {
+            return Err(format!(
+                "unsupported repository assignment schema {}",
+                self.schema
+            ));
+        }
+        if self.deployment.is_empty() {
+            return Err("repository assignment deployment must not be empty".into());
+        }
+        for (name, reference) in [
+            ("application", &self.application),
+            ("provider_set", &self.provider_set),
+        ] {
+            if !valid_target_reference(reference) {
+                return Err(format!("repository assignment {name} reference is invalid"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl NodeAssignment {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 1 {
+            return Err(format!(
+                "unsupported node assignment schema {}",
+                self.schema
+            ));
+        }
+        if !valid_target_reference(&self.config) {
+            return Err("node assignment config reference is invalid".into());
+        }
+        Ok(())
     }
 }
 

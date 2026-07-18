@@ -247,9 +247,17 @@ impl TrustedRepository {
         routing.download_target(&target, &paths.assignment).await?;
         let bytes = tokio::fs::read(&paths.assignment)
             .await
-            .map_err(|e| Error::Local(format!("reading verified routing assignment: {e}")))?;
+            .map_err(|e| Error::Local(format!("reading verified node assignment: {e}")))?;
+        let node: updated::config::NodeAssignment = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Trust(format!("invalid node assignment: {e}")))?;
+        node.validate().map_err(Error::Trust)?;
+        let config = routing.exact_target(&node.config)?;
+        routing.download_target(&config, &paths.assignment).await?;
+        let bytes = tokio::fs::read(&paths.assignment)
+            .await
+            .map_err(|e| Error::Local(format!("reading verified config bundle: {e}")))?;
         let assignment: updated::config::RepositoryAssignment = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Trust(format!("invalid repository assignment: {e}")))?;
+            .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
         let assignment_key = assignment_identity(&assignment);
         let assignment_store = paths.datastore.join(&assignment_key);
         let source = repository_config

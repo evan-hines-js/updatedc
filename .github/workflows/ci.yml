@@ -162,10 +162,24 @@ jobs:
           path: target/haproxy-e2e/*.log
           if-no-files-found: warn
 
+  updatec-e2e:
+    name: updatec (Kind + MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+        with: {install_only: true}
+      - run: ./scripts/kind-updatec-e2e.sh
+      - if: failure()
+        run: kubectl -n updated-system logs deployment/updatec || true
+
   release:
     name: Publish immutable release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, trivy, windows-scm-e2e, macos-publish-fuzz, linux-haproxy-e2e]
+    needs: [test, trivy, windows-scm-e2e, macos-publish-fuzz, linux-haproxy-e2e, updatec-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

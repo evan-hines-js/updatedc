@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: updatec, namespace: updated-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: updatec, namespace: updated-system}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["updated.dev"]
+    resources: ["updatedgroups", "updatednodes", "updatedrepositories"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: updatec, namespace: updated-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: updatec}
+subjects:
+  - {kind: ServiceAccount, name: updatec, namespace: updated-system}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: updatec, namespace: updated-system}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: updatec}}
+  template:
+    metadata: {labels: {app: updatec}}
+    spec:
+      serviceAccountName: updatec
+      securityContext:
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: updatec
+          image: updatec:kind
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          env:
+            - {name: UPDATED_NAMESPACE, value: updated-system}
+            - {name: UPDATED_REPOSITORY, value: default}
+            - {name: RUST_LOG, value: info}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/updatec}
+      volumes:
+        - name: state
+          persistentVolumeClaim: {claimName: updatec-state}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: updatec-state, namespace: updated-system}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 1Gi}

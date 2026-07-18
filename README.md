@@ -72,6 +72,12 @@ Control-plane authors should start with the normative
 [control-plane API contract](CONTROLPLANE_API_CONTRACT.md) and its
 [JSON Schemas](schemas).
 
+The included Kubernetes control plane is `updatec`: `UpdatedNode` records may represent
+agents anywhere, and `updatec` maps their control-plane labels to signed, opaque config
+bundle references published through TUF. Agents never know why their config changed.
+Installation, CRD examples, trust bootstrapping, verification, and recovery are documented
+in the authoritative [Kubernetes operator guide](deploy/kubernetes/README.md).
+
 ## Activation modes
 
 ### Portable restart

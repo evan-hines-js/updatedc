@@ -69,7 +69,8 @@ async fn publish_assignment(args: &[String]) -> R {
     let application = target_reference(args, "application")?;
     let provider_set = target_reference(args, "provider-set")?;
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
-    let source = repo_dir.join(".assignment-build.json");
+    let config_source = repo_dir.join(".config-build.json");
+    let node_source = repo_dir.join(".node-build.json");
     let assignment = updated::config::RepositoryAssignment {
         schema: 2,
         deployment,
@@ -78,22 +79,47 @@ async fn publish_assignment(args: &[String]) -> R {
         application,
         provider_set,
     };
-    foundation::durable::atomic_write(&source, ".assignment-", &serde_json::to_vec(&assignment)?)?;
+    assignment.validate()?;
+    let config_bytes = serde_json::to_vec(&assignment)?;
+    let config_sha256 = updated::hash::sha256_bytes(&config_bytes);
+    let (prefix, node_id) = name
+        .rsplit_once("/nodes/")
+        .filter(|(prefix, node)| !prefix.is_empty() && !node.is_empty())
+        .ok_or("--name must use <prefix>/nodes/<node>.json")?;
+    let config_name = format!("{prefix}/configs/{config_sha256}.json");
+    let node = updated::config::NodeAssignment {
+        schema: 1,
+        config: updated::config::TargetReference {
+            path: config_name.clone(),
+            sha256: config_sha256,
+        },
+    };
+    node.validate()?;
+    foundation::durable::atomic_write(&config_source, ".config-", &config_bytes)?;
+    foundation::durable::atomic_write(&node_source, ".node-", &serde_json::to_vec(&node)?)?;
     let keys = repo::Keys::in_dir(&keys_dir);
     let _publish_lock = lock_publisher(&repo_dir)?;
     repo::add_release(
         &repo_dir,
         &keys,
-        vec![PublishTarget {
-            name: name.clone(),
-            source: source.clone(),
-            custom: Default::default(),
-        }],
+        vec![
+            PublishTarget {
+                name: config_name,
+                source: config_source.clone(),
+                custom: Default::default(),
+            },
+            PublishTarget {
+                name: name.clone(),
+                source: node_source.clone(),
+                custom: Default::default(),
+            },
+        ],
         expiry_days,
     )
     .await?;
-    let _ = std::fs::remove_file(source);
-    println!("published routing assignment {name}");
+    let _ = std::fs::remove_file(config_source);
+    let _ = std::fs::remove_file(node_source);
+    println!("published routing node bundle {name} for {node_id}");
     Ok(())
 }
 
