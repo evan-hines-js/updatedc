@@ -163,13 +163,13 @@ while (( round == 0 || SECONDS - started < DURATION )); do
     corrupt_attempt="$(awk -F '\t' -v version="$corrupt" '$1 == "preflight" && $3 == version { id=$2 } END { print id }' "$DEPLOY_STATE/attempts.log")"
     rollback_deadline=$((SECONDS + 15))
     while (( SECONDS < rollback_deadline )); do
-      if [[ -n "$corrupt_attempt" ]] && awk -F '\t' -v id="$corrupt_attempt" '$1 == "rollback" && $2 == id { found=1 } END { exit !found }' "$DEPLOY_STATE/attempts.log"; then
+      if [[ -n "$corrupt_attempt" && -e "$DEPLOY_STATE/effects/$corrupt_attempt/rollback" ]]; then
         break
       fi
       sleep 0.25
       corrupt_attempt="$(awk -F '\t' -v version="$corrupt" '$1 == "preflight" && $3 == version { id=$2 } END { print id }' "$DEPLOY_STATE/attempts.log")"
     done
-    if [[ -z "$corrupt_attempt" ]] || ! awk -F '\t' -v id="$corrupt_attempt" '$1 == "rollback" && $2 == id { found=1 } END { exit !found }' "$DEPLOY_STATE/attempts.log"; then
+    if [[ -z "$corrupt_attempt" || ! -e "$DEPLOY_STATE/effects/$corrupt_attempt/rollback" ]]; then
       echo "FAIL: corrupt release was rejected without completing the complex deployment rollback" >&2
       exit 1
     fi

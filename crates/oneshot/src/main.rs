@@ -4,13 +4,13 @@ use foundation::log::{error, info, warn};
 use std::io;
 use std::path::Path;
 use std::process::{Command, ExitCode};
-use updated::bundle::{read_active, write_active, ExpectedBundle};
+use updated::bundle::{read_active, write_active};
 use updated::config::{config_path, Config, Paths};
 use updated::lock::InstanceLock;
 use updated::provider::BundleStore;
 use updated::reject::Rejections;
 use updated::state::{read_installed, Installed, InstalledState};
-use updated_tuf::{DefaultPolicy, TrustedRepository};
+use updated_tuf::TrustedRepository;
 
 fn main() -> ExitCode {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -57,35 +57,39 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
         TrustedRepository::assigned(&config.routing, &config.repository, &config.storage, paths)
             .await
             .map_err(|error| format!("loading repository: {error}"))?;
-    let policy = DefaultPolicy::current(&config.application.product, &config.application.channel);
-    let Some(selected) = repository
-        .assigned_application(&policy, Some(&installed.release.version))
-        .map_err(|error| format!("selecting desired application: {error}"))?
-    else {
-        return Ok(());
+    let prepared = match update_client::prepare_assigned_application(
+        update_client::ApplicationRequest {
+            repository: &repository,
+            application: &config.application,
+            repository_config: &config.repository,
+            paths,
+            current_version: Some(&installed.release.version),
+        },
+        |sha256| rejected.is_rejected(sha256),
+    )
+    .await
+    {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            if let Some((version, archive_sha256)) = error.rejected_archive() {
+                rejected.reject(archive_sha256).map_err(|reject_error| {
+                    format!(
+                        "{error}; rejecting malformed application bundle {version} also failed: {reject_error}"
+                    )
+                })?;
+            }
+            return Err(error.to_string());
+        }
     };
-    if rejected.is_rejected(&selected.sha256) {
-        return Ok(());
-    }
-    repository
-        .stage_release(&selected, &paths.download)
-        .await
-        .map_err(|error| format!("downloading bundle {}: {error}", selected.version))?;
-    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let provider = BundleStore::for_app(paths).with_target_limit(config.repository.target_limit);
-    let staged = provider
-        .install(
-            &paths.download,
-            &ExpectedBundle {
-                product: &config.application.product,
-                version: &selected.version,
-                platform: &platform,
-            },
-        )
-        .map_err(|error| format!("staging bundle {}: {error}", selected.version))?;
-    updated::on_launch::activate(paths, installed, staged.id, selected.sha256.clone())
-        .map_err(|error| error.to_string())?;
-    if let Err(error) = rejected.clear(&selected.sha256) {
+    updated::on_launch::activate(
+        paths,
+        installed,
+        prepared.release,
+        prepared.archive_sha256.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    if let Err(error) = rejected.clear(&prepared.archive_sha256) {
         warn(
             "oneshot",
             &format!("could not clear stale rejection: {error}"),
@@ -95,7 +99,7 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
         "oneshot",
         &format!(
             "updated {} -> {}",
-            installed.release.version, selected.version
+            installed.release.version, prepared.version
         ),
     );
     Ok(())

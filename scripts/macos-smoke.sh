@@ -185,7 +185,11 @@ need_macos() { [[ "$(uname -s)" == Darwin ]] || { echo "This smoke test requires
 is_loaded() { launchctl print "$SERVICE" >/dev/null 2>&1; }
 
 stop_all() {
-  if is_loaded; then launchctl bootout "$DOMAIN" "$PLIST"; fi
+  if is_loaded; then
+    # Address the registered job directly. The plist may already have been replaced or
+    # removed after a failed run; cleanup must not depend on that mutable input surviving.
+    launchctl bootout "$SERVICE" 2>/dev/null || true
+  fi
   if [[ -f "$SERVER_PID" ]]; then
     local pid; pid="$(<"$SERVER_PID")"
     if kill -0 "$pid" 2>/dev/null; then kill "$pid"; fi

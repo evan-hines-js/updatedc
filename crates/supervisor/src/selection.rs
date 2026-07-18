@@ -43,14 +43,6 @@ async fn stage_lifecycle_provider(
                 provider.capability
             ));
         }
-        repo.download_target(&target, &opts.paths.provider_download)
-            .await
-            .map_err(|e| {
-                format!(
-                    "acquiring {:?} provider override failed: {e}",
-                    provider.capability
-                )
-            })?;
         let product = target
             .custom
             .get("product")
@@ -62,16 +54,30 @@ async fn stage_lifecycle_provider(
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("provider {:?} metadata has no version", provider.capability))?;
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-        let staged = updated::provider::BundleStore::for_lifecycle(&opts.paths)
-            .with_target_limit(opts.repository.target_limit)
-            .install(
-                &opts.paths.provider_download,
-                &updated::bundle::ExpectedBundle { product, version, platform: &platform },
-            ).map_err(|e| {
-            if let Err(reject_error) = store.reject(&sha) {
-                return format!("staging {:?} provider override failed: {e}; recording its rejection also failed: {reject_error}", provider.capability);
+        let provider_store = updated::provider::BundleStore::for_lifecycle(&opts.paths)
+            .with_target_limit(opts.repository.target_limit);
+        let staged = update_client::acquire_verified_bundle(
+            repo,
+            &target,
+            &opts.paths.provider_download,
+            &provider_store,
+            &updated::bundle::ExpectedBundle {
+                product,
+                version,
+                platform: &platform,
+            },
+        )
+        .await
+        .map_err(|error| {
+            if matches!(&error, update_client::AcquireBundleError::Invalid { .. }) {
+                if let Err(reject_error) = store.reject(&sha) {
+                    return format!("staging {:?} provider override failed: {error}; recording its rejection also failed: {reject_error}", provider.capability);
+                }
             }
-            format!("staging {:?} provider override failed and its bytes were rejected: {e}", provider.capability)
+            format!(
+                "acquiring {:?} provider override failed: {error}",
+                provider.capability
+            )
         })?;
         match provider.capability {
             updated::config::ProviderCapability::Lifecycle => {
@@ -96,10 +102,6 @@ pub(crate) async fn check_application(
     app: &mut App,
     current: &Option<String>,
 ) -> AppOutcome {
-    let policy = DefaultPolicy::current(
-        opts.application.product.clone(),
-        opts.application.channel.clone(),
-    );
     // A persisted rejection applies to the failed bytes only (keyed by hash), so it
     // pins the installation neither below a healthy intermediate release nor against
     // a corrected republish of the same version.
@@ -126,52 +128,37 @@ pub(crate) async fn check_application(
     // transaction when the assigned application version is already running. In
     // particular, a corrected or nondeterministically repacked target with the same
     // version cannot be its own rollback predecessor.
-    let selected = match repo.assigned_application(&policy, current.as_deref()) {
-        Ok(Some(selected)) => selected,
-        Ok(None) => return AppOutcome::Unchanged,
-        Err(error) => {
-            warn(&format!("selecting desired application failed: {error}"));
-            return AppOutcome::Unchanged;
-        }
-    };
-    if store.is_rejected(&selected.sha256) {
-        return AppOutcome::Unchanged;
-    }
     // Every provider is now present before downloading the application. Nothing
     // below this point writes transaction intent or touches the live deployment.
-    if let Err(error) = repo.stage_release(&selected, &opts.paths.download).await {
-        warn(&format!("acquiring application release failed: {error}"));
-        return AppOutcome::Unchanged;
-    }
-    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let release = match updated::provider::BundleStore::for_app(&opts.paths)
-        .with_target_limit(opts.repository.target_limit)
-        .install(
-            &opts.paths.download,
-            &updated::bundle::ExpectedBundle {
-                product: &opts.application.product,
-                version: &selected.version,
-                platform: &platform,
-            },
-        ) {
-        Ok(release) => release,
+    let prepared = match update_client::prepare_assigned_application(
+        update_client::ApplicationRequest {
+            repository: repo,
+            application: &opts.application,
+            repository_config: &opts.repository,
+            paths: &opts.paths,
+            current_version: current.as_deref(),
+        },
+        |sha256| store.is_rejected(sha256),
+    )
+    .await
+    {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return AppOutcome::Unchanged,
         Err(error) => {
-            warn(&format!(
-                "staging application bundle {} failed: {error}",
-                selected.version
-            ));
-            if let Err(reject_error) = store.reject(&selected.sha256) {
-                return AppOutcome::Fatal(format!(
-                    "rejecting malformed application bundle {}: {reject_error}",
-                    selected.version
-                ));
+            if let Some((version, archive_sha256)) = error.rejected_archive() {
+                if let Err(reject_error) = store.reject(archive_sha256) {
+                    return AppOutcome::Fatal(format!(
+                        "rejecting malformed application bundle {version}: {reject_error}"
+                    ));
+                }
             }
+            warn(&error.to_string());
             return AppOutcome::Unchanged;
         }
     };
 
     let from = current.as_deref().unwrap_or("none");
-    log(&format!("applying update {from} -> {}", selected.version));
+    log(&format!("applying update {from} -> {}", prepared.version));
     // Drive the transaction over the live-application port; scope the tower so its borrow of
     // `app` is released before the arms below read `app.pid()`.
     let outcome = {
@@ -179,27 +166,27 @@ pub(crate) async fn check_application(
         apply_update(
             &mut tower,
             store,
-            &release.id,
-            &selected.sha256,
+            &prepared.release,
+            &prepared.archive_sha256,
             lifecycle.clone(),
         )
         .await
     };
     match outcome {
         Ok(Outcome::Committed) => {
-            if let Err(e) = store.clear_rejection(&selected.sha256) {
+            if let Err(e) = store.clear_rejection(&prepared.archive_sha256) {
                 warn(&format!(
                     "upgraded to {}, but clearing its stale rejection failed: {e}",
-                    selected.version
+                    prepared.version
                 ));
             }
             log(&format!(
                 "upgraded to {} (pid {})",
-                selected.version,
+                prepared.version,
                 app.pid()
             ));
             AppOutcome::Upgraded {
-                version: selected.version,
+                version: prepared.version,
             }
         }
         Ok(failure @ (Outcome::RolledBack | Outcome::RejectedBeforeActivation)) => {
@@ -208,11 +195,11 @@ pub(crate) async fn check_application(
             match failure {
                 Outcome::RolledBack => warn(&format!(
                     "rolling back to {from}: update to {} failed activation or health",
-                    selected.version
+                    prepared.version
                 )),
                 Outcome::RejectedBeforeActivation => warn(&format!(
                     "rejected {} before activation; {from} remains running",
-                    selected.version
+                    prepared.version
                 )),
                 Outcome::Committed => unreachable!(),
                 Outcome::Deferred => unreachable!(),
@@ -222,7 +209,7 @@ pub(crate) async fn check_application(
         Ok(Outcome::Deferred) => {
             warn(&format!(
                 "deferred update to {}; operator lifecycle state was not ready",
-                selected.version
+                prepared.version
             ));
             AppOutcome::Unchanged
         }

@@ -4,6 +4,7 @@ members = [
     "crates/foundation",
     "crates/updated",
     "crates/updated-tuf",
+    "crates/update-client",
     "crates/control",
     "crates/server",
     "crates/bootstrap",
@@ -26,7 +27,7 @@ license = "MIT"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# One operator config file shared by the supervisor and one-shot updater.
+# One strict operator config file shared by every update front end.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 semver = "1"
 hex = "0.4"

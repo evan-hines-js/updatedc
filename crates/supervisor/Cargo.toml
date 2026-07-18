@@ -18,6 +18,7 @@ chaos = []
 foundation = { path = "../foundation" }
 updated = { path = "../updated" }
 updated-tuf = { path = "../updated-tuf" }
+update-client = { path = "../update-client" }
 # The disposable supervisor drives the guardian over the frozen control protocol.
 control = { path = "../control" }
 tokio = { workspace = true }

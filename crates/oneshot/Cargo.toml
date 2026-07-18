@@ -12,8 +12,8 @@ path = "src/main.rs"
 foundation = { path = "../foundation" }
 updated = { path = "../updated" }
 updated-tuf = { path = "../updated-tuf" }
+update-client = { path = "../update-client" }
 # The TUF client is async; the updater needs a runtime only to drive one refresh.
 tokio = { workspace = true }
 # Install the workspace's single aws-lc-rs crypto provider for the TUF HTTP client.
 rustls = { workspace = true }
-serde_json = { workspace = true }
