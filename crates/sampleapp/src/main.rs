@@ -89,24 +89,6 @@ pub fn run(reexec_capable: bool) {
         std::process::id()
     );
 
-    // Test hook: a release that passes its health check and then dies. When this
-    // build's version matches `--crash-version`, exit after `--crash-after-ms`
-    // (default 5s) — long enough to pass the health gate — to exercise the
-    // supervisor's post-commit unconfirmed-update revert. No effect on other versions.
-    if flag(&args, "--crash-version").as_deref() == Some(version()) {
-        let after = flag(&args, "--crash-after-ms")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5000);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(after));
-            eprintln!(
-                "sampleapp {}: simulated post-health crash after {after}ms",
-                version()
-            );
-            std::process::exit(1);
-        });
-    }
-
     // Nonblocking accept so the loop can act on a pending reload signal promptly.
     if let Err(e) = listener.set_nonblocking(true) {
         eprintln!("sampleapp: set_nonblocking: {e}");
@@ -170,10 +152,12 @@ fn handle(mut stream: TcpStream) {
     // guardian ownership and adoption use the OS-derived child PID over `control` and
     // never depend on this endpoint.
     let pid = std::process::id().to_string();
+    let crash = path == "/crash";
     let (code, body) = match path {
         "/version" => (200, version()),
         "/healthz" => (200, "ok"),
         "/pid" => (200, pid.as_str()),
+        "/crash" => (200, "crashing"),
         _ => (404, "not found"),
     };
     let reason = if code == 200 { "OK" } else { "Not Found" };
@@ -195,6 +179,10 @@ fn handle(mut stream: TcpStream) {
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
+    if crash {
+        eprintln!("sampleapp {}: explicitly triggered test crash", version());
+        std::process::exit(1);
+    }
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {

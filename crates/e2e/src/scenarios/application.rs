@@ -74,30 +74,11 @@ pub(crate) fn app_post_health_crash_reverts(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
 
-    // The child args serve both versions; only v2's baked-in version matches
-    // `--crash-version`, so v2 exits ~4s after launch — after the 2s health grace,
-    // i.e. a post-commit crash the health gate cannot see. v1 ignores the flag.
-    let cmd = Sup::new(
-        ctx,
-        &dir,
-        srv,
-        "app",
-        appcmd(
-            &app,
-            &[
-                "--addr",
-                svc,
-                "--crash-version",
-                "2.0.0",
-                "--crash-after-ms",
-                "4000",
-            ],
-        ),
-    )
-    .check_interval("2s")
-    .health_grace("2s")
-    .health(svc)
-    .guardian()?;
+    let cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+        .check_interval("2s")
+        .health_grace("2s")
+        .health(svc)
+        .guardian()?;
     // The init system restarts the tower when the app crashes; on that boot the supervisor
     // sees the unconfirmed update crashed and reverts it (one strike).
     let sup = Service::spawn("tower", &cmd);
@@ -109,7 +90,14 @@ pub(crate) fn app_post_health_crash_reverts(ctx: &Ctx) -> R {
     ok("v1.0.0 live");
 
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
-    // v2 commits (passes health), then crashes within its window; the supervisor reverts.
+    // Trigger the crash only after the durable commit. A timer from process start races
+    // lifecycle finalization on loaded CI and can accidentally test interrupted activation.
+    if !sup.wait_for_log("upgraded to 2.0.0", 60)
+        || http_text(&format!("http://{svc}/crash")).as_deref() != Some("crashing")
+    {
+        kill_stray(&app);
+        return fail("could not trigger the committed v2.0.0 test crash");
+    }
     if !sup.wait_for_log("reverting to 1.0.0", 60) {
         kill_stray(&app);
         return fail("supervisor did not revert the crashing v2.0.0");
@@ -147,16 +135,19 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
         ctx.publish(&dir, "app", "1.0.0", &v1)?;
         servers.push(ctx.serve(&dir, repository_addr)?);
 
-        let mut args = vec!["--addr", service_addr];
-        if fails {
-            args.extend(["--crash-version", "2.0.0", "--crash-after-ms", "4000"]);
-        }
-        let command = Sup::new(ctx, &dir, repository_addr, "app", appcmd(&app, &args))
-            .check_interval("1s")
-            .health_grace("2s")
-            .confirmation_window("8s")
-            .health(service_addr)
-            .guardian()?;
+        let confirmation_window = if fails { "120s" } else { "8s" };
+        let command = Sup::new(
+            ctx,
+            &dir,
+            repository_addr,
+            "app",
+            appcmd(&app, &["--addr", service_addr]),
+        )
+        .check_interval("1s")
+        .health_grace("2s")
+        .confirmation_window(confirmation_window)
+        .health(service_addr)
+        .guardian()?;
         services.push((name, dir, app, service_addr, Service::spawn(name, &command)));
     }
 
@@ -170,6 +161,11 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
     }
     if !wait_for_version("127.0.0.1:21130", "2.0.0", 30) {
         return fail("healthy peer did not commit 2.0.0");
+    }
+    if !services[1].4.wait_for_log("upgraded to 2.0.0", 60)
+        || http_text("http://127.0.0.1:21131/crash").as_deref() != Some("crashing")
+    {
+        return fail("could not trigger the failing peer's committed v2.0.0 crash");
     }
     if !services[1].4.wait_for_log("reverting to 1.0.0", 60)
         || !wait_for_version("127.0.0.1:21131", "1.0.0", 20)

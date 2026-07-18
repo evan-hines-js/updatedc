@@ -118,29 +118,13 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             fixture.display().to_string(),
         ];
 
-        let mut cmd = Sup::new(
-            ctx,
-            &dir,
-            &srv,
-            "app",
-            appcmd(
-                &app,
-                &[
-                    "--addr",
-                    &svc,
-                    "--crash-version",
-                    "2.0.0",
-                    "--crash-after-ms",
-                    "4000",
-                ],
-            ),
-        )
-        .health(&svc)
-        .check_interval("1s")
-        .health_grace("2s")
-        .confirmation_window("30s")
-        .lifecycle(fixture_command)
-        .guardian()?;
+        let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+            .health(&svc)
+            .check_interval("1s")
+            .health_grace("2s")
+            .confirmation_window("120s")
+            .lifecycle(fixture_command)
+            .guardian()?;
         cmd.env("UPDATED_CHAOS_POINT", point);
         let tower = Service::spawn("rollback-chaos", &cmd);
 
@@ -151,6 +135,21 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             kill_stray(&dir.join("install"));
             return fail(format!(
                 "rollback case {point} never began its update transaction; log:\n{log}"
+            ));
+        }
+
+        // This scenario is specifically about rollback of a committed, unconfirmed
+        // release. Trigger its crash from that durable state instead of racing a timer
+        // against provider finalization on a contended Linux runner.
+        if !tower.wait_for_log("upgraded to 2.0.0", RECOVERY_TIMEOUT)
+            || http_text(&format!("http://{svc}/crash")).as_deref() != Some("crashing")
+        {
+            let log = tower.captured_log();
+            drop(tower);
+            drop(server);
+            kill_stray(&dir.join("install"));
+            return fail(format!(
+                "rollback case {point} could not trigger its post-commit crash; log:\n{log}"
             ));
         }
 
