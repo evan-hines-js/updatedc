@@ -50,11 +50,11 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
 
     let boot = Proc::spawn("guardian", &mut tower(ctx, &dir, srv, svc, &app, &sup_v1)?)?;
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("app never came up under the tower");
     }
-    if !boot.wait_for_log("started application pid", 10) {
+    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
         return fail("supervisor did not record the application launch");
     }
     let pid1 = pid_number_after(&boot.captured_log(), "started application pid")
@@ -66,10 +66,12 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     // readiness gate, the new supervisor adopts the running app and proves ready, and
     // the guardian commits the desired-supervisor pointer.
     ctx.publish(&dir, "supervisor", "2.0.0", &supervisor_v(ctx, "2.0.0"))?;
-    let committed = boot.wait_for_log("committed as the supervisor", 45);
+    let committed = boot.wait_for_log("committed as the supervisor", EVENT_TIMEOUT);
     // The new supervisor adopts the app the guardian already owns — no restart.
-    let adopted =
-        committed && wait_until(15, || boot.log_contains("adopted the running application"));
+    let adopted = committed
+        && wait_until(EVENT_TIMEOUT, || {
+            boot.log_contains("adopted the running application")
+        });
 
     let pid2 = pid_after(&boot.captured_log(), "adopted the running application");
     let undisturbed = adopted && pid2 == Some(pid1) && pid_alive(pid1);
@@ -118,11 +120,11 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
 
     let boot = Proc::spawn("guardian", &mut tower(ctx, &dir, srv, svc, &app, &sup_v1)?)?;
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("app never came up under the tower");
     }
-    if !boot.wait_for_log("started application pid", 10) {
+    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
         return fail("supervisor did not record the application launch");
     }
     let pid1 = pid_number_after(&boot.captured_log(), "started application pid")
@@ -137,11 +139,11 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     std::fs::write(&broken, b"NOT-A-RUNNABLE-SUPERVISOR-BINARY\n").map_err(str_err)?;
     ctx.publish(&dir, "supervisor", "2.0.0", &broken)?;
 
-    let rejected = boot.wait_for_log("rejecting", 40);
+    let rejected = boot.wait_for_log("rejecting", EVENT_TIMEOUT);
     // No loop: once the candidate is rejected, the supervisor must stop re-staging it.
     std::thread::sleep(Duration::from_secs(6));
-    let recorded = boot.wait_for_log("recorded rejected supervisor candidate", 5);
-    let served = wait_for_version(svc, "1.0.0", 5);
+    let recorded = boot.wait_for_log("recorded rejected supervisor candidate", EVENT_TIMEOUT);
+    let served = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);
     let pid2 = pid_after(&boot.captured_log(), "adopted the running application");
     let desired = desired_supervisor(&dir)?;
     kill_stray(&app);
@@ -188,7 +190,9 @@ pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
     ctx.publish(&dir, "supervisor", "1.0.0", &sup_v1)?;
     let _server = ctx.serve(&dir, srv)?;
     let boot = Proc::spawn("guardian", &mut tower(ctx, &dir, srv, svc, &app, &sup_v1)?)?;
-    if !wait_for_version(svc, "1.0.0", 25) || !boot.wait_for_log("started application pid", 10) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT)
+        || !boot.wait_for_log("started application pid", EVENT_TIMEOUT)
+    {
         kill_stray(&app);
         return fail("tower did not establish its baseline");
     }
@@ -196,10 +200,11 @@ pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
         .ok_or("could not read the guardian-reported application PID")?;
 
     ctx.publish(&dir, "supervisor", "2.0.0", &unstable)?;
-    let began_confirmation = boot.wait_for_log("beginning its confirmation window", 40);
-    let rejected = boot.wait_for_log("exited before confirmation; rejecting it", 10);
-    let predecessor_returned = boot.wait_for_log("recorded rejected supervisor candidate", 10);
-    let still_serving = wait_for_version(svc, "1.0.0", 5);
+    let began_confirmation = boot.wait_for_log("beginning its confirmation window", EVENT_TIMEOUT);
+    let rejected = boot.wait_for_log("exited before confirmation; rejecting it", EVENT_TIMEOUT);
+    let predecessor_returned =
+        boot.wait_for_log("recorded rejected supervisor candidate", EVENT_TIMEOUT);
+    let still_serving = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);
     let adopted_pid = pid_after(&boot.captured_log(), "adopted the running application");
     let desired = desired_supervisor(&dir)?;
     kill_stray(&app);

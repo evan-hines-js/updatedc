@@ -25,11 +25,11 @@ pub(crate) fn oneshot_updates_on_launch(ctx: &Ctx) -> R {
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc])).oneshot()?;
     let one = Proc::spawn("oneshot", &mut cmd)?;
 
-    if !wait_for_version(svc, "2.0.0", 30) {
+    if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("updated-oneshot did not update to v2.0.0 and launch it");
     }
-    if !one.wait_for_log("updated 1.0.0 -> 2.0.0", 5) {
+    if !one.wait_for_log("updated 1.0.0 -> 2.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("updated-oneshot did not report applying the update");
     }
@@ -71,11 +71,11 @@ pub(crate) fn oneshot_launches_without_repository(ctx: &Ctx) -> R {
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc])).oneshot()?;
     let one = Proc::spawn("oneshot", &mut cmd)?;
 
-    if !wait_for_version(svc, "1.0.0", 30) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("updated-oneshot did not launch the current version when the repo was down");
     }
-    let skipped = one.wait_for_log("update skipped", 5);
+    let skipped = one.wait_for_log("update skipped", EVENT_TIMEOUT);
     kill_stray(&app);
     if !skipped {
         return fail("updated-oneshot did not report skipping the update with no repository");

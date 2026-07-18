@@ -74,7 +74,7 @@ pub(crate) fn zero_downtime_reexec(ctx: &Ctx) -> R {
     .reexec(hup_transition())
     .guardian()?;
     let _sup = Proc::spawn("supervisor", &mut cmd)?;
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("service never came up at v1.0.0");
     }
     let initial_pid = http_text(&format!("http://{svc}/pid")).ok_or("missing initial PID")?;
@@ -109,7 +109,7 @@ pub(crate) fn zero_downtime_reexec(ctx: &Ctx) -> R {
 
     std::thread::sleep(Duration::from_secs(2));
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
-    let reached = wait_for_version(svc, "2.0.0", 20);
+    let reached = wait_for_version(svc, "2.0.0", EVENT_TIMEOUT);
     std::thread::sleep(Duration::from_secs(1));
     stop.store(true, Ordering::Relaxed);
     for w in workers {
@@ -171,13 +171,13 @@ pub(crate) fn reexec_preflight_rejects_without_activation(ctx: &Ctx) -> R {
     .reexec(preflight_rejecting_hup_transition())
     .guardian()?;
     let tower = Proc::spawn("reexec-preflight", &mut cmd)?;
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("preflight fixture never started");
     }
     let pid = http_text(&format!("http://{svc}/pid")).ok_or("missing initial PID")?;
 
     ctx.publish(&dir, "app", "2.0.0", &app)?;
-    let rejected = wait_until(20, || {
+    let rejected = wait_until(EVENT_TIMEOUT, || {
         tower.log_contains("rejected 2.0.0 before activation")
             && http_text(&format!("http://{svc}/version")).as_deref() == Some("1.0.0")
     });
@@ -192,7 +192,7 @@ pub(crate) fn reexec_preflight_rejects_without_activation(ctx: &Ctx) -> R {
     }
 
     ctx.publish(&dir, "app", "3.0.0", &app)?;
-    if !wait_for_version(svc, "3.0.0", 20) {
+    if !wait_for_version(svc, "3.0.0", EVENT_TIMEOUT) {
         return fail("valid release after a preflight rejection did not activate");
     }
     if http_text(&format!("http://{svc}/pid")).as_deref() != Some(pid.as_str()) {
@@ -239,7 +239,7 @@ pub(crate) fn reexec_rejects_unexecutable_without_downtime(ctx: &Ctx) -> R {
     .reexec(hup_transition())
     .guardian()?;
     let _tower = Proc::spawn("reexec-reject", &mut cmd)?;
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("reexec rejection fixture never started");
     }
     let pid = http_text(&format!("http://{svc}/pid")).ok_or("missing initial PID")?;
@@ -277,14 +277,14 @@ pub(crate) fn reexec_rejects_unexecutable_without_downtime(ctx: &Ctx) -> R {
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).map_err(str_err)?;
     }
     ctx.publish(&dir, "app", "2.0.0", &bad)?;
-    let rejected = wait_until(20, || {
+    let rejected = wait_until(EVENT_TIMEOUT, || {
         std::fs::metadata(dir.join("install/state/rejected"))
             .map(|metadata| metadata.len() > 0)
             .unwrap_or(false)
             && http_text(&format!("http://{svc}/version")).as_deref() == Some("1.0.0")
     });
     ctx.publish(&dir, "app", "3.0.0", &app)?;
-    let upgraded = wait_for_version(svc, "3.0.0", 20);
+    let upgraded = wait_for_version(svc, "3.0.0", EVENT_TIMEOUT);
     stop.store(true, Ordering::Relaxed);
     let _ = worker.join();
     let final_pid = http_text(&format!("http://{svc}/pid"));

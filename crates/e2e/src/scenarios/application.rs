@@ -24,18 +24,21 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     // next boot (the guardian rolls the crash up and exits), not by an in-process rollback.
     let sup = Service::spawn("tower", &cmd);
 
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("service never came up at v1.0.0");
     }
     ok("v1.0.0 live from the TUF repository");
 
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
-    if !wait_for_version(svc, "2.0.0", 30) {
+    if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         return fail("service did not upgrade to v2.0.0");
     }
     ok("unattended upgrade to v2.0.0");
 
-    if !sup.wait_for_log("update 2.0.0 confirmed; confirmation window passed", 15) {
+    if !sup.wait_for_log(
+        "update 2.0.0 confirmed; confirmation window passed",
+        EVENT_TIMEOUT,
+    ) {
         return fail("v2.0.0 was not confirmed before the next update");
     }
 
@@ -49,7 +52,7 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     ) {
         return fail("supervisor did not reject the crashing v3.0.0 on recovery");
     }
-    if !wait_for_version(svc, "2.0.0", 15) {
+    if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         return fail("service did not recover to v2.0.0 after the crashing v3.0.0");
     }
     ok("broken v3.0.0 applied, crashed before commit, was rejected, and the tower recovered to v2.0.0");
@@ -83,7 +86,7 @@ pub(crate) fn app_post_health_crash_reverts(ctx: &Ctx) -> R {
     // sees the unconfirmed update crashed and reverts it (one strike).
     let sup = Service::spawn("tower", &cmd);
 
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("service never came up at v1.0.0");
     }
@@ -92,17 +95,17 @@ pub(crate) fn app_post_health_crash_reverts(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
     // Trigger the crash only after the durable commit. A timer from process start races
     // lifecycle finalization on loaded CI and can accidentally test interrupted activation.
-    if !sup.wait_for_log("upgraded to 2.0.0", 60)
+    if !sup.wait_for_log("upgraded to 2.0.0", EVENT_TIMEOUT)
         || http_text(&format!("http://{svc}/crash")).as_deref() != Some("crashing")
     {
         kill_stray(&app);
         return fail("could not trigger the committed v2.0.0 test crash");
     }
-    if !sup.wait_for_log("reverting to 1.0.0", 60) {
+    if !sup.wait_for_log("reverting to 1.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("supervisor did not revert the crashing v2.0.0");
     }
-    if !wait_for_version(svc, "1.0.0", 20) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         kill_stray(&app);
         return fail("service did not recover to v1.0.0 after the revert");
     }
@@ -152,30 +155,34 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
     }
 
     for (_, _, _, address, _) in &services {
-        if !wait_for_version(address, "1.0.0", 25) {
+        if !wait_for_version(address, "1.0.0", EVENT_TIMEOUT) {
             return fail(format!("node at {address} did not start at 1.0.0"));
         }
     }
     for (_, dir, _, _, _) in &services {
         ctx.publish(dir, "app", "2.0.0", &v2)?;
     }
-    if !wait_for_version("127.0.0.1:21130", "2.0.0", 30) {
+    if !wait_for_version("127.0.0.1:21130", "2.0.0", EVENT_TIMEOUT) {
         return fail("healthy peer did not commit 2.0.0");
     }
-    if !services[1].4.wait_for_log("upgraded to 2.0.0", 60)
+    if !services[1]
+        .4
+        .wait_for_log("upgraded to 2.0.0", EVENT_TIMEOUT)
         || http_text("http://127.0.0.1:21131/crash").as_deref() != Some("crashing")
     {
         return fail("could not trigger the failing peer's committed v2.0.0 crash");
     }
-    if !services[1].4.wait_for_log("reverting to 1.0.0", 60)
-        || !wait_for_version("127.0.0.1:21131", "1.0.0", 20)
+    if !services[1]
+        .4
+        .wait_for_log("reverting to 1.0.0", EVENT_TIMEOUT)
+        || !wait_for_version("127.0.0.1:21131", "1.0.0", EVENT_TIMEOUT)
     {
         return fail("failing peer did not roll back to 1.0.0");
     }
-    if !services[0]
-        .4
-        .wait_for_log("update 2.0.0 confirmed; confirmation window passed", 20)
-        || !wait_for_version("127.0.0.1:21130", "2.0.0", 5)
+    if !services[0].4.wait_for_log(
+        "update 2.0.0 confirmed; confirmation window passed",
+        EVENT_TIMEOUT,
+    ) || !wait_for_version("127.0.0.1:21130", "2.0.0", EVENT_TIMEOUT)
     {
         return fail("healthy peer was incorrectly rolled back with its failing peer");
     }

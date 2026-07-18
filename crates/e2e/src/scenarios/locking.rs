@@ -16,10 +16,10 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
         .health(svc)
         .guardian()?;
     let first = Proc::spawn("supervisor-1", &mut first_cmd)?;
-    if !wait_for_version(svc, "1.0.0", 25) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("first supervisor never came up");
     }
-    if !first.wait_for_log("started application pid", 10) {
+    if !first.wait_for_log("started application pid", EVENT_TIMEOUT) {
         return fail("first supervisor did not record the application launch");
     }
     let first_pid = pid_number_after(&first.captured_log(), "started application pid")
@@ -36,11 +36,11 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     .health_grace("1s")
     .guardian()?;
     let second = Service::spawn("supervisor-2", &second_cmd);
-    if !second.wait_for_log("already owns this install", 10) {
+    if !second.wait_for_log("already owns this install", EVENT_TIMEOUT) {
         return fail("second supervisor was not refused with the expected lock message");
     }
     let second_log = second.captured_log();
-    let first_still_live = wait_for_version(svc, "1.0.0", 5);
+    let first_still_live = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);
     let pid_unchanged = pid_alive(first_pid);
     if second_log.contains("started application pid") || !first_still_live || !pid_unchanged {
         return fail(format!(

@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 /// Fail the scenario with a message (and a non-zero exit via `main`'s `Result`).
 pub type R<T = ()> = Result<T, String>;
 
+/// Failure ceiling for positive E2E events. Pollers return immediately on success;
+/// this only prevents a resource-starved CI runner from turning latency into a flake.
+pub const EVENT_TIMEOUT: u64 = 120;
+
 pub fn fail<T>(msg: impl Into<String>) -> R<T> {
     Err(msg.into())
 }
@@ -392,7 +396,7 @@ impl Ctx {
                 .arg(dir.join("repo"))
                 .args(["--addr", addr]),
         )?;
-        if !server.wait_for_log("serving ", 10) {
+        if !server.wait_for_log("serving ", EVENT_TIMEOUT) {
             let exited = server.has_exited();
             let output = server.captured_log();
             return fail(format!(

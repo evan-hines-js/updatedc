@@ -3,8 +3,8 @@ use super::super::*;
 // Failure deadlines, not reaction delays. Every helper polls and returns as soon as its
 // condition is true. Keep these generous for contended Linux CI while the supervisor
 // itself uses one-second checks and bounded transport retries.
-const TRANSACTION_START_TIMEOUT: u64 = 30;
-const RECOVERY_TIMEOUT: u64 = 45;
+const TRANSACTION_START_TIMEOUT: u64 = 120;
+const RECOVERY_TIMEOUT: u64 = 120;
 
 /// Crash the supervisor at every application-update transaction boundary; the guardian
 /// relaunches it and recovery (driven by the on-disk journal) drives the update to a

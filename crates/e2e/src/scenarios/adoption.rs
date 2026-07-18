@@ -22,12 +22,12 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
             .health(svc)
             .guardian()?,
     )?;
-    if !wait_for_version(svc, "1.0.0", 60) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("app never came up under the tower");
     }
     // Wait until the supervisor has launched the app (so the guardian's "launched
     // supervisor" line with the PID is present), then read that supervisor PID.
-    if !boot.wait_for_log("started application pid", 15) {
+    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
         return fail("the supervisor never reported launching the application");
     }
     let initial_log = boot.captured_log();
@@ -39,15 +39,17 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
     // Crash ONLY the supervisor (not the guardian, not the app). The guardian owns the
     // app, so it keeps running; the guardian relaunches a fresh supervisor.
     kill_pid(sup_pid);
-    if !wait_for_version(svc, "1.0.0", 15) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("the application did not survive the supervisor crash");
     }
 
     // The guardian relaunches the supervisor (a second "launched supervisor"), and the
     // new supervisor adopts the still-running app rather than launching a duplicate.
-    let relaunched = wait_until(30, || boot.log_count("launched supervisor") >= 2);
-    let adopted =
-        relaunched && wait_until(15, || boot.log_contains("adopted the running application"));
+    let relaunched = wait_until(EVENT_TIMEOUT, || boot.log_count("launched supervisor") >= 2);
+    let adopted = relaunched
+        && wait_until(EVENT_TIMEOUT, || {
+            boot.log_contains("adopted the running application")
+        });
     if !adopted {
         return fail(format!(
             "the guardian did not relaunch the supervisor to re-adopt the app; exited={}, log:\n{}",
@@ -55,7 +57,7 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
             boot.captured_log()
         ));
     }
-    if !wait_for_version(svc, "1.0.0", 30) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("app not serving after the supervisor relaunch");
     }
     let pid2 = pid_after(&boot.captured_log(), "adopted the running application")
@@ -98,10 +100,10 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
             .guardian()?,
     )?;
 
-    if !wait_for_version(svc, "1.0.0", 60) {
+    if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("app never came up under the tower");
     }
-    if !boot.wait_for_log("started application pid", 15) {
+    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
         return fail("the supervisor never reported launching the application");
     }
     let app_pid = pid_number_after(&boot.captured_log(), "started application pid")
@@ -120,9 +122,9 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
     // The guardian reaps the supervisor and the app, then exits — all WITHOUT any external
     // reaper. Assert the whole tree is gone before dropping `boot` (whose own teardown would
     // otherwise mask a leak).
-    let app_gone = wait_until(15, || !pid_alive(app_pid));
-    let sup_gone = sup_pid.is_none_or(|s| wait_until(5, || !pid_alive(s)));
-    let guardian_exited = wait_until(5, || boot.has_exited());
+    let app_gone = wait_until(EVENT_TIMEOUT, || !pid_alive(app_pid));
+    let sup_gone = sup_pid.is_none_or(|s| wait_until(EVENT_TIMEOUT, || !pid_alive(s)));
+    let guardian_exited = wait_until(EVENT_TIMEOUT, || boot.has_exited());
 
     if !app_gone || !sup_gone || !guardian_exited {
         // Reap any leak so a failure here does not poison later scenarios.

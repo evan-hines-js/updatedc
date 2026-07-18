@@ -28,14 +28,14 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
         let sup = Service::spawn("reject-1", &cmd);
         if !sup.wait_for_log(
             "restoring predecessor 1.0.0 after interrupted activation of 2.0.0",
-            30,
+            EVENT_TIMEOUT,
         ) {
             return fail("the crashing v2 was not rejected on recovery");
         }
-        if !wait_for_version(svc, "1.0.0", 20) {
+        if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
             return fail("the tower did not recover to v1.0.0 after rejecting v2");
         }
-        let persisted = wait_until(10, || {
+        let persisted = wait_until(EVENT_TIMEOUT, || {
             std::fs::metadata(dir.join("install/state/rejected"))
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
@@ -46,7 +46,9 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     }
     // Reap any orphaned app before the second tower reuses the port (macOS only).
     kill_stray(&dir.join("install"));
-    if !wait_until(10, || http_text(&format!("http://{svc}/version")).is_none()) {
+    if !wait_until(EVENT_TIMEOUT, || {
+        http_text(&format!("http://{svc}/version")).is_none()
+    }) {
         return fail("first rejection tower did not release its application port");
     }
 
@@ -54,7 +56,7 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     {
         let cmd = make()?;
         let sup = Service::spawn("reject-2", &cmd);
-        if !wait_for_version(svc, "1.0.0", 20) {
+        if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
             return fail("v1.0.0 did not come back up on restart");
         }
         std::thread::sleep(Duration::from_secs(4));

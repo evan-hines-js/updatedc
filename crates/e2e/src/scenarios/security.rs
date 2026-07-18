@@ -31,7 +31,9 @@ pub(crate) fn tampered_root_fails_closed(ctx: &Ctx) -> R {
     // Wait for both independent outcomes. Do not match a generic word such as
     // "root": the scenario's own `badroot` path appears in the startup log and can
     // satisfy such a predicate before the application launch or TUF refresh occurs.
-    if !wait_until(15, || tampered_root_converged(&tower.captured_log())) {
+    if !wait_until(EVENT_TIMEOUT, || {
+        tampered_root_converged(&tower.captured_log())
+    }) {
         return fail(format!(
             "tampered root did not converge to a running baseline plus fail-closed TUF result:\n{}",
             tower.captured_log()
