@@ -38,7 +38,7 @@ authenticate archive
   → write the transaction journal
   → atomically switch active-release
   → start or reexec the candidate
-  → require health and exact-version proof
+  → require health (plus exact-version proof for reexec)
   → commit, or reactivate and reject the predecessor
 ```
 
@@ -80,14 +80,21 @@ operator-defined command adopts the active candidate:
 ```toml
 [application.activation]
 mode = "reexec"
-preflight_command = ["{candidate}/bin/app", "--check"] # optional
-command = ["/usr/local/libexec/activate-app", "{candidate}", "{install_root}", "{pid}"]
+[application.transition]
+command = ["/usr/local/libexec/transition-app"]
+timeout = "5m"
 ```
 
-Commands are argv arrays executed without a shell. The same command is used for forward
-activation and rollback. The supervisor commits only if the master PID is unchanged and
-authenticated health reports the exact expected version. Socket preservation and worker
-draining are the managed program's master/worker contract.
+The command is direct argv, never shell text, and receives one of `preflight`, `drain`,
+`prepare`, `activate`, `finalize`, or `rollback` in `UPDATED_TRANSITION_PHASE`, plus a
+stable `UPDATED_TRANSITION_ID` and candidate/predecessor paths. It must be idempotent.
+The same API also supports site work around portable restarts; only reexec requires it.
+The supervisor commits only if the master PID is unchanged and authenticated health
+reports the exact expected version.
+
+See [TRANSITION_WRAPPERS.md](TRANSITION_WRAPPERS.md) for copy/paste AI prompts that map
+an existing deployment runbook or script set onto this protocol. Operators configure
+only the generated dispatcher; it can delegate internally to existing site scripts.
 
 CI exercises both the socket-preserving sample fixture and real HAProxy master-worker
 binary reload with `SIGUSR2`.
@@ -150,6 +157,16 @@ target/release/server publish-app --repo ./repo --keys ./keys \
 target/release/server serve --repo ./repo --addr 127.0.0.1:8080
 ```
 
+Publish each node's small routing assignment into the routing TUF repository. In
+production the control plane writes these targets and the CDN serves them:
+
+```sh
+target/release/server publish-assignment --repo ./routing-repo --keys ./routing-keys \
+  --name assignments/node-123.json \
+  --metadata-url https://cdn.example.com/groups/canary/metadata/ \
+  --targets-url https://cdn.example.com/groups/canary/targets/
+```
+
 An installer seeds the initial bundle before starting the tower:
 
 ```sh
@@ -163,10 +180,13 @@ target/release/server install-app \
 ## Configuration
 
 ```toml
+[routing]
+root = "/etc/example-app/routing-root.json"
+base_url = "https://updates.example.com/routing/"
+assignment = "assignments/node-123.json"
+
 [repository]
-root = "/etc/example-app/root.json"
-metadata_url = "https://updates.example.com/metadata/"
-targets_url = "https://updates.example.com/targets/"
+root = "/etc/example-app/releases-root.json"
 
 [application]
 product = "app"
@@ -183,6 +203,13 @@ confirmation_window = "2m"
 
 All application-owned release paths resolve beneath `install_root`; mutable operator
 configuration and application data belong outside immutable `versions/` directories.
+
+`routing.base_url` is the node's only configured repository URL. The updater derives
+its `metadata/` and `targets/` endpoints, verifies the exact assignment target through
+TUF, then uses the two release-repository URLs in that strict document. It resolves the
+assignment on every update check, so a control-plane group change takes effect without
+restarting the node. The release root remains pinned locally: routing selects a repository,
+not a new trust authority.
 See [deploy/config.toml](deploy/config.toml) for every option.
 
 Run the bootstrap—not the supervisor—under the chosen lifecycle owner:

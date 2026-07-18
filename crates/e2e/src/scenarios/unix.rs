@@ -1,4 +1,20 @@
 use super::super::*;
+
+fn hup_transition() -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "case \"$UPDATED_TRANSITION_PHASE\" in activate) exec kill -HUP \"$UPDATED_CHILD_PID\" ;; *) exit 0 ;; esac".into(),
+    ]
+}
+
+fn preflight_rejecting_hup_transition() -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "case \"$UPDATED_TRANSITION_PHASE\" in preflight) test \"$UPDATED_CANDIDATE_VERSION\" != 2.0.0 ;; activate) exec kill -HUP \"$UPDATED_CHILD_PID\" ;; *) exit 0 ;; esac".into(),
+    ]
+}
 pub(crate) fn key_perms(ctx: &Ctx) -> R {
     use std::os::unix::fs::PermissionsExt;
     let dir = ctx.work.join("keyperms");
@@ -55,7 +71,7 @@ pub(crate) fn zero_downtime_reexec(ctx: &Ctx) -> R {
     .check_interval("1s")
     .health_grace("2s")
     .health(svc)
-    .reexec(vec!["kill".into(), "-HUP".into(), "{pid}".into()])
+    .reexec(hup_transition())
     .guardian()?;
     let _sup = Proc::spawn("supervisor", &mut cmd)?;
     if !wait_for_version(svc, "1.0.0", 25) {
@@ -122,8 +138,8 @@ pub(crate) fn zero_downtime_reexec(ctx: &Ctx) -> R {
     Ok(())
 }
 
-/// Preflight is outside the activation transaction: a failure must not write a journal,
-/// flip the active pointer, or invoke the command that signals the live master.
+/// Preflight starts the durable attempt but remains before activation: a failure must
+/// durably abort and clear its journal, never flip the active pointer or signal the master.
 pub(crate) fn reexec_preflight_rejects_without_activation(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21112", "127.0.0.1:21113");
     let dir = ctx.work.join("reexec-preflight");
@@ -152,14 +168,7 @@ pub(crate) fn reexec_preflight_rejects_without_activation(ctx: &Ctx) -> R {
     .check_interval("1s")
     .health_grace("2s")
     .health(svc)
-    .preflight(vec![
-        "sh".into(),
-        "-c".into(),
-        "test \"$1\" != 2.0.0".into(),
-        "preflight".into(),
-        "{candidate_version}".into(),
-    ])
-    .reexec(vec!["kill".into(), "-HUP".into(), "{pid}".into()])
+    .reexec(preflight_rejecting_hup_transition())
     .guardian()?;
     let tower = Proc::spawn("reexec-preflight", &mut cmd)?;
     if !wait_for_version(svc, "1.0.0", 25) {
@@ -227,7 +236,7 @@ pub(crate) fn reexec_rejects_unexecutable_without_downtime(ctx: &Ctx) -> R {
     .check_interval("1s")
     .health_grace("2s")
     .health(svc)
-    .reexec(vec!["kill".into(), "-HUP".into(), "{pid}".into()])
+    .reexec(hup_transition())
     .guardian()?;
     let _tower = Proc::spawn("reexec-reject", &mut cmd)?;
     if !wait_for_version(svc, "1.0.0", 25) {

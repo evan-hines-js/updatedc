@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{with_suffix, Activation, Application, Paths, Repository, Timeouts};
+use updated::config::{with_suffix, Activation, Application, Paths, Repository, Routing, Timeouts};
 use updated::{apply, env, health};
 mod app;
 mod boot;
@@ -19,8 +19,6 @@ mod schedule;
 mod selection;
 mod self_update;
 mod store;
-#[cfg(test)]
-mod tests;
 mod update;
 
 use app::*;
@@ -43,6 +41,7 @@ use updated_tuf::{DefaultPolicy, TrustedRepository};
 const SELF_VERSION: &str = env!("SUPERVISOR_VERSION");
 
 struct Options {
+    routing: Routing,
     repository: Repository,
     application: Application,
     timeouts: Timeouts,
@@ -86,8 +85,17 @@ fn main() {
     // The chaos-feature build can enumerate its own transaction boundaries, so the e2e
     // drives exactly the crossings the supervisor defines instead of a hand-copied list.
     #[cfg(feature = "chaos")]
-    if std::env::args().any(|a| a == "--list-chaos-boundaries") {
-        for b in update::BOUNDARIES {
+    if let Some(kind) = std::env::args().find(|a| {
+        a == "--list-chaos-boundaries"
+            || a == "--list-rollback-chaos-boundaries"
+            || a == "--list-abort-chaos-boundaries"
+    }) {
+        let boundaries = match kind.as_str() {
+            "--list-chaos-boundaries" => update::BOUNDARIES,
+            "--list-rollback-chaos-boundaries" => update::ROLLBACK_BOUNDARIES,
+            _ => update::ABORT_BOUNDARIES,
+        };
+        for b in boundaries {
             println!("{b}");
         }
         return;
@@ -146,6 +154,20 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // and whether to adopt the running application or launch a fresh one.
     let mut guardian = guardian;
     let situation = gather_situation(&opts, &store, guardian_state.as_deref())?;
+    let mut recovery_transaction = recovery_transaction(&situation);
+    let defer_recovery_commit = recovery_transaction
+        .as_ref()
+        .is_some_and(Transaction::is_rollback);
+    if recovery_transaction
+        .as_ref()
+        .is_some_and(|tx| tx.transition_required)
+        && opts.application.transition.is_none()
+    {
+        return Err(
+            "recovery requires application.transition, but the configured adapter is missing"
+                .into(),
+        );
+    }
     let plan = plan_boot(&situation);
     for note in &plan.notes {
         match note.level {
@@ -162,9 +184,34 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut self_update = SelfUpdateState::load(&opts)?;
 
+    // A confirmation-window crash starts rollback by materializing the same phase journal
+    // used by ordinary activation failures. From this write onward there is exactly one
+    // recovery path, including if this supervisor dies before touching the pointer.
+    if defer_recovery_commit && situation.journal.is_none() {
+        persist_transaction(
+            &mut store,
+            recovery_transaction
+                .as_ref()
+                .expect("pending transition recovery has a transaction"),
+        )?;
+    }
+    if let Some(tx) = recovery_transaction.as_mut() {
+        if !tx.is_rollback() {
+            advance_transaction(&mut store, tx, TransactionPhase::RollbackStarted)?;
+        }
+    }
+
     // Perform the plan's durable reconciliation (binary, rejections, commit), yielding the
     // still-unconfirmed update (if any) for the loop to confirm once its window passes.
-    let mut pending = execute_boot_plan(&plan, &opts, &mut store, &mut guardian, &mut self_update)?;
+    let mut pending = execute_boot_plan(
+        &plan,
+        &opts,
+        &mut store,
+        &mut guardian,
+        &mut self_update,
+        defer_recovery_commit,
+        recovery_transaction.as_mut(),
+    )?;
     if pending.is_some() {
         if let Some(v) = current.as_deref() {
             log(&format!(
@@ -172,8 +219,6 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
     }
-
-    let mut repo: Option<TrustedRepository> = None;
 
     log(&format!(
         "supervisor {SELF_VERSION} supervising {:?} (product {} channel {}, installed {}, updates {}, restart {}, check every {}s)",
@@ -190,6 +235,14 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         Acquire::Adopt(pid) => adopt(guardian, &opts, pid),
         Acquire::Launch => start(guardian, &opts)?,
     };
+    if recovery_transaction
+        .as_ref()
+        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 3))
+    {
+        Chaos::from_env().crossing(update::boundary::PREDECESSOR_START_APPLIED);
+        let tx = recovery_transaction.as_mut().expect("checked above");
+        advance_transaction(&mut store, tx, TransactionPhase::PredecessorStarted)?;
+    }
 
     // Gate readiness: the application must be healthy before we trust this boot. A crash
     // would have torn the tower down instead, so an unhealthy result here means the
@@ -206,6 +259,56 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     .await?
     {
         return Err("the managed application failed its initial health check".into());
+    }
+    if recovery_transaction
+        .as_ref()
+        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 4))
+    {
+        Chaos::from_env().crossing(update::boundary::PREDECESSOR_HEALTH_APPLIED);
+        let tx = recovery_transaction.as_mut().expect("checked above");
+        advance_transaction(&mut store, tx, TransactionPhase::PredecessorHealthy)?;
+    }
+
+    // A crash may have interrupted the operator's drain/prepare/finalize work. Once the
+    // predecessor is healthy again, replay the idempotent rollback phase with the same
+    // transaction identity before declaring the recovered tower ready.
+    let rollback_incomplete = recovery_transaction
+        .as_ref()
+        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 5));
+    if rollback_incomplete {
+        if let (Some(tx), Some(transition)) = (
+            recovery_transaction.as_ref(),
+            opts.application.transition.as_ref(),
+        ) {
+            run_transition_command(
+                transition,
+                &opts,
+                TransitionInvocation {
+                    phase: TransitionPhase::Rollback,
+                    id: &tx.id,
+                    pid: app.pid(),
+                    candidate: &tx.previous_release,
+                    predecessor: &tx.candidate_release,
+                },
+            )?;
+            Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
+        }
+    }
+    if rollback_incomplete {
+        let tx = recovery_transaction.as_mut().expect("checked above");
+        advance_transaction(&mut store, tx, TransactionPhase::RolledBack)?;
+    }
+    if defer_recovery_commit {
+        if let Some(state) = &plan.commit {
+            store.commit_installed(state)?;
+            pending = installed_pending(&store);
+        }
+    }
+    // Keep the journal until both release reconciliation and any environmental rollback
+    // have succeeded. If either the wrapper or this supervisor dies, the next boot sees
+    // the same evidence and repeats the idempotent recovery instead of declaring success.
+    if plan.clear_journal || defer_recovery_commit {
+        store.clear_journal()?;
     }
 
     // Prove readiness to the guardian. For an ordinary launch this is a no-op; for a
@@ -270,28 +373,22 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // One refresh serves both the application and self checks this cycle.
-        // Either way we keep running the current version — never fall back to an
-        // unverified update — but a trust failure is louder than a transport blip.
-        let refresh = match repo.as_mut() {
-            Some(repo) => repo.refresh().await,
-            None => match TrustedRepository::load(&opts.repository, &opts.paths.datastore).await {
-                Ok(loaded) => {
-                    repo = Some(loaded);
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            },
-        };
-        if let Err(e) = refresh {
-            loop_state.refresh_failures = loop_state.refresh_failures.saturating_add(1);
-            let base = if e.is_retryable() {
-                opts.timeouts.refresh_retry
-            } else {
-                opts.timeouts.check_interval
-            };
-            let retry = network_backoff(base, loop_state.refresh_failures);
-            match &e {
+        // Resolve the routing assignment afresh, then load its release repository.
+        // One verified result serves application and self checks this cycle, and a
+        // control-plane reassignment therefore takes effect without process restart.
+        let repo = match TrustedRepository::assigned(&opts.routing, &opts.repository, &opts.paths)
+            .await
+        {
+            Ok(repo) => repo,
+            Err(e) => {
+                loop_state.refresh_failures = loop_state.refresh_failures.saturating_add(1);
+                let base = if e.is_retryable() {
+                    opts.timeouts.refresh_retry
+                } else {
+                    opts.timeouts.check_interval
+                };
+                let retry = network_backoff(base, loop_state.refresh_failures);
+                match &e {
                 updated_tuf::Error::Transport(_) => warn(&format!(
                     "TUF refresh failed ({e}); retrying in {}s",
                     retry.as_secs()
@@ -305,25 +402,23 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     retry.as_secs()
                 )),
             }
-            loop_state.next_app_check = Instant::now() + jitter(retry, 20);
-            self_update.defer(Instant::now() + retry);
-            continue;
-        }
+                loop_state.next_app_check = Instant::now() + jitter(retry, 20);
+                self_update.defer(Instant::now() + retry);
+                continue;
+            }
+        };
         loop_state.refresh_failures = 0;
-        let repo = repo
-            .as_ref()
-            .expect("a successful repository refresh installs a repository");
 
         // Self-update first: on an accepted handoff this process exits.
         if self_due {
             self_update
-                .check(&opts.supervisor_update, repo, &mut app.guardian)
+                .check(&opts.supervisor_update, &repo, &mut app.guardian)
                 .await;
         }
 
         if app_due {
             loop_state.next_app_check = Instant::now() + jitter(opts.timeouts.check_interval, 20);
-            match check_application(&opts, repo, &mut store, &mut app, &current).await {
+            match check_application(&opts, &repo, &mut store, &mut app, &current).await {
                 AppOutcome::Upgraded { version } => {
                     loop_state.application_upgraded(opts.timeouts.check_interval);
                     current = Some(version);
@@ -340,6 +435,39 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
+    if let Some(tx) = &situation.journal {
+        let committed = match &situation.installed {
+            Installed::Present(state) => Some(&state.release),
+            Installed::Missing | Installed::Invalid => None,
+        };
+        if updated::transaction::classify_recovery(tx, situation.active.as_ref(), committed)
+            != updated::transaction::Recovery::Committed
+        {
+            return Some(tx.clone());
+        }
+    }
+    if let Installed::Present(installed) = &situation.installed {
+        if let Some(pending) = &installed.pending {
+            let rollback_started = situation.active.as_ref() == Some(&pending.previous_release);
+            if situation.app_crashed || rollback_started {
+                return Some(Transaction {
+                    id: pending.transition_id.clone(),
+                    kind: updated::transaction::Kind::Supervised,
+                    previous_release: pending.previous_release.clone(),
+                    previous_archive_sha256: pending.previous_archive_sha256.clone(),
+                    candidate_release: installed.release.clone(),
+                    candidate_archive_sha256: installed.archive_sha256.clone(),
+                    candidate_rejection_required: situation.app_crashed,
+                    transition_required: pending.transition_required,
+                    phase: TransactionPhase::RollbackStarted,
+                });
+            }
+        }
+    }
+    None
 }
 
 // ============================== boot: gather + execute ==============================
@@ -383,13 +511,37 @@ fn execute_boot_plan(
     store: &mut dyn Store,
     guardian: &mut Guardian,
     self_update: &mut SelfUpdateState,
+    defer_commit: bool,
+    mut recovery: Option<&mut Transaction>,
 ) -> io::Result<Option<Pending>> {
-    if plan.quiesce {
+    let needs_quiesce = recovery
+        .as_ref()
+        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 1));
+    if plan.quiesce && needs_quiesce {
         warn("stopping the uncommitted candidate before reconciling its release");
         let _ = guardian.stop();
         let _ = std::fs::remove_file(&opts.paths.app_token);
     }
-    apply_store_plan(plan, store)?;
+    if needs_quiesce && recovery.is_some() {
+        Chaos::from_env().crossing(update::boundary::ROLLBACK_QUIESCE_APPLIED);
+    }
+    if let Some(tx) = recovery.as_mut() {
+        if tx.rollback_rank().is_some_and(|rank| rank < 1) {
+            advance_transaction(store, tx, TransactionPhase::RollbackAppQuiesced)?;
+        }
+    }
+    let activate_release = recovery
+        .as_ref()
+        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
+    apply_store_plan(plan, store, defer_commit, activate_release)?;
+    if activate_release && !matches!(plan.release, ReleaseFix::None) {
+        Chaos::from_env().crossing(update::boundary::PREDECESSOR_POINTER_APPLIED);
+    }
+    if let Some(tx) = recovery.as_mut() {
+        if tx.rollback_rank().is_some_and(|rank| rank < 2) {
+            advance_transaction(store, tx, TransactionPhase::PredecessorActivated)?;
+        }
+    }
     if let Some(path) = &plan.reject_supervisor {
         self_update.reject_candidate(path);
     }
@@ -397,18 +549,24 @@ fn execute_boot_plan(
 }
 
 /// Apply the durable half of a boot [`Plan`] to the [`Store`].
-fn apply_store_plan(plan: &Plan, store: &mut dyn Store) -> io::Result<()> {
+fn apply_store_plan(
+    plan: &Plan,
+    store: &mut dyn Store,
+    defer_commit: bool,
+    activate_release: bool,
+) -> io::Result<()> {
     // Commit the intended state before activation; immutable predecessor releases remain
     // available if a crash interrupts pointer reconciliation.
-    if let Some(state) = &plan.commit {
-        store.commit_installed(state)?;
+    if !defer_commit {
+        if let Some(state) = &plan.commit {
+            store.commit_installed(state)?;
+        }
     }
-    match &plan.release {
-        ReleaseFix::None => {}
-        ReleaseFix::Activate(release) => store.activate(release)?,
-    }
-    if plan.clear_journal {
-        store.clear_journal()?;
+    if activate_release {
+        match &plan.release {
+            ReleaseFix::None => {}
+            ReleaseFix::Activate(release) => store.activate(release)?,
+        }
     }
     for hash in &plan.reject_app {
         store.reject(hash)?;

@@ -1,7 +1,7 @@
 //! Environment variable names the update tower still uses, in one place.
 //!
 //! The program that *sets* a variable and the program that *reads* it — the
-//! supervisor, the managed application, the operator reload command, the tests — all
+//! supervisor, the managed application, the operator transition adapter, the tests — all
 //! reference these constants instead of string literals, so a rename can never desync
 //! them. All share the `UPDATED_` prefix.
 //!
@@ -16,11 +16,11 @@
 /// supervisor knows the answer came from the exact process it launched.
 pub const HEALTH_TOKEN: &str = "UPDATED_HEALTH_TOKEN";
 
-// ── supervisor → operator reload command (zero-downtime strategy) ──────────────
+// ── supervisor → operator transition adapter ──────────────────────────────────
 
-/// PID of the running child, exposed to the operator's reload command.
+/// PID of the running child, exposed to the operator's transition adapter.
 pub const CHILD_PID: &str = "UPDATED_CHILD_PID";
-/// Path of the newly-installed binary, exposed to the operator's reload command.
+/// Root of the managed installation, exposed to the operator's transition adapter.
 pub const INSTALL_ROOT: &str = "UPDATED_INSTALL_ROOT";
 /// Immutable directory of the release the command is being asked to activate.
 pub const CANDIDATE: &str = "UPDATED_CANDIDATE";
@@ -30,6 +30,10 @@ pub const PREDECESSOR: &str = "UPDATED_PREDECESSOR";
 pub const CANDIDATE_VERSION: &str = "UPDATED_CANDIDATE_VERSION";
 /// Semantic version of [`PREDECESSOR`].
 pub const PREDECESSOR_VERSION: &str = "UPDATED_PREDECESSOR_VERSION";
+/// Stable content-derived identity for one update attempt and its recovery retries.
+pub const TRANSITION_ID: &str = "UPDATED_TRANSITION_ID";
+/// Lifecycle phase requested from the operator transition adapter.
+pub const TRANSITION_PHASE: &str = "UPDATED_TRANSITION_PHASE";
 
 // ── test-only fault injection ──────────────────────────────────────────────────
 
@@ -50,6 +54,8 @@ mod tests {
             PREDECESSOR,
             CANDIDATE_VERSION,
             PREDECESSOR_VERSION,
+            TRANSITION_ID,
+            TRANSITION_PHASE,
             CHAOS_POINT,
         ] {
             assert!(

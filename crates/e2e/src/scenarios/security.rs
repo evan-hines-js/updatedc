@@ -9,14 +9,14 @@ pub(crate) fn tampered_root_fails_closed(ctx: &Ctx) -> R {
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
 
-    // Corrupt the installer-pinned root the client anchors trust on.
+    let _server = ctx.serve(&dir, srv)?;
+    // Publish the routing assignment before corrupting the installer-pinned root;
+    // repository authoring itself correctly refuses to operate through a corrupt root.
     let root = ctx.root(&dir);
     let mut bytes = std::fs::read(&root).map_err(str_err)?;
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;
     std::fs::write(&root, &bytes).map_err(str_err)?;
-
-    let _server = ctx.serve(&dir, srv)?;
     let cmd = Sup::new(
         ctx,
         &dir,

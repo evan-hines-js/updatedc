@@ -21,8 +21,28 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
     plan.updates_enabled = true;
     plan.current = Some(state.release.version.clone());
 
+    let pending_revert_in_progress = state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| s.active.as_ref() == Some(&pending.previous_release));
     let pending_authoritative = if let Some(tx) = &s.journal {
         reconcile_transaction(&mut plan, s, tx, &state) == Recovery::Committed
+    } else if pending_revert_in_progress {
+        // A prior supervisor restored the predecessor pointer but crashed before the
+        // external rollback and final state commit. Preserve that direction: never
+        // "repair" the pointer back to the failed candidate.
+        let pending = state.pending.as_ref().expect("checked above");
+        plan.release = ReleaseFix::Activate(pending.previous_release.clone());
+        plan.commit = Some(InstalledState::confirmed(
+            pending.previous_release.clone(),
+            pending.previous_archive_sha256.clone(),
+        ));
+        plan.current = Some(pending.previous_release.version.clone());
+        plan.warn(format!(
+            "recovery: completing rollback from {} to {}",
+            state.release.version, pending.previous_release.version
+        ));
+        false
     } else {
         enforce_installed(&mut plan, s, &state);
         if plan.fail_closed.is_some() {
@@ -54,6 +74,9 @@ fn reconcile_transaction(
     plan.clear_journal = true;
     let recovery =
         transaction::classify_recovery(tx, situation.active.as_ref(), Some(&installed.release));
+    if tx.candidate_rejection_required {
+        plan.reject_app.push(tx.candidate_archive_sha256.clone());
+    }
     match recovery {
         Recovery::Committed => plan.info(format!(
             "recovery: release {} was already committed",
@@ -66,7 +89,7 @@ fn reconcile_transaction(
         Recovery::RestorePredecessor => {
             plan.quiesce = situation.app_running.is_some();
             plan.release = ReleaseFix::Activate(tx.previous_release.clone());
-            if situation.app_crashed {
+            if situation.app_crashed && !tx.candidate_rejection_required {
                 plan.reject_app.push(tx.candidate_archive_sha256.clone());
             }
             plan.warn(format!(
@@ -74,6 +97,13 @@ fn reconcile_transaction(
                 tx.previous_release.version, tx.candidate_release.version
             ));
         }
+    }
+    if tx.is_rollback() {
+        plan.commit = Some(InstalledState::confirmed(
+            tx.previous_release.clone(),
+            tx.previous_archive_sha256.clone(),
+        ));
+        plan.current = Some(tx.previous_release.version.clone());
     }
     recovery
 }
@@ -165,9 +195,15 @@ mod tests {
         situation.active = Some(candidate.clone());
         situation.app_crashed = true;
         situation.journal = Some(Transaction {
+            id: "transition".into(),
+            kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
+            previous_archive_sha256: "archive-one".into(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_required: false,
+            transition_required: false,
+            phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
         assert_eq!(plan.release, ReleaseFix::Activate(release("1.0.0", "one")));
@@ -180,11 +216,98 @@ mod tests {
         let candidate = release("2.0.0", "two");
         situation.active = Some(candidate.clone());
         situation.journal = Some(Transaction {
+            id: "transition".into(),
+            kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
+            previous_archive_sha256: "archive-one".into(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_required: false,
+            transition_required: false,
+            phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
         assert!(plan.reject_app.is_empty());
+    }
+
+    #[test]
+    fn journaled_rejection_survives_consuming_the_crash_marker() {
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.active = Some(predecessor.clone());
+        situation.installed = Installed::Present(InstalledState {
+            release: candidate.clone(),
+            archive_sha256: "archive-two".into(),
+            pending: None,
+        });
+        situation.app_crashed = false;
+        situation.journal = Some(Transaction {
+            id: "transition".into(),
+            kind: updated::transaction::Kind::Supervised,
+            previous_release: predecessor,
+            previous_archive_sha256: "archive-one".into(),
+            candidate_release: candidate,
+            candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_required: true,
+            transition_required: false,
+            phase: TransactionPhase::RollbackStarted,
+        });
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(plan.reject_app, vec!["archive-two"]);
+    }
+
+    #[test]
+    fn journaled_rejection_is_replayed_when_activation_never_started() {
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.journal = Some(Transaction {
+            id: "transition".into(),
+            kind: updated::transaction::Kind::Supervised,
+            previous_release: predecessor,
+            previous_archive_sha256: "archive-one".into(),
+            candidate_release: candidate,
+            candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_required: true,
+            transition_required: false,
+            phase: TransactionPhase::PreflightStarted,
+        });
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(plan.release, ReleaseFix::None);
+        assert_eq!(plan.reject_app, vec!["archive-two"]);
+        assert!(plan.clear_journal);
+    }
+
+    #[test]
+    fn pending_rollback_already_pointing_at_predecessor_never_reactivates_candidate() {
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.active = Some(predecessor.clone());
+        situation.installed = Installed::Present(InstalledState {
+            release: candidate,
+            archive_sha256: "archive-two".into(),
+            pending: Some(Pending {
+                transition_id: "transition".into(),
+                previous_release: predecessor.clone(),
+                previous_archive_sha256: "archive-one".into(),
+                committed_at: 100,
+                transition_required: true,
+            }),
+        });
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(plan.release, ReleaseFix::Activate(predecessor.clone()));
+        assert_eq!(plan.current.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            plan.commit,
+            Some(InstalledState::confirmed(predecessor, "archive-one".into()))
+        );
     }
 }

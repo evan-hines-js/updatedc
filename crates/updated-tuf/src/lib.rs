@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use aws_lc_rs::digest::{digest, SHA256};
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Duration};
@@ -75,7 +76,8 @@ fn classify(e: tough::error::Error) -> Error {
 
 #[cfg(test)]
 mod error_tests {
-    use super::{transport_timeout, Error};
+    use super::{assignment_identity, transport_timeout, validate_release_url, Error};
+    use updated::config::RepositoryAssignment;
 
     #[test]
     fn only_transport_is_retryable() {
@@ -108,6 +110,36 @@ mod error_tests {
         assert!(error.is_retryable());
         assert!(error.to_string().contains("timed out after 30s"));
     }
+
+    #[test]
+    fn assigned_repositories_have_independent_stable_datastores() {
+        let assignment = |metadata: &str, targets: &str| RepositoryAssignment {
+            schema: 1,
+            metadata_url: metadata.into(),
+            targets_url: targets.into(),
+        };
+        let a = assignment("https://cdn/a/metadata/", "https://cdn/a/targets/");
+        let b = assignment("https://cdn/b/metadata/", "https://cdn/b/targets/");
+        assert_eq!(assignment_identity(&a), assignment_identity(&a));
+        assert_ne!(assignment_identity(&a), assignment_identity(&b));
+        assert_eq!(assignment_identity(&a).len(), 64);
+    }
+
+    #[test]
+    fn assigned_endpoints_are_bounded_http_base_urls() {
+        assert!(validate_release_url("metadata_url", "https://cdn.example/metadata/").is_ok());
+        for invalid in [
+            "file:///tmp/metadata/",
+            "https://user:pass@cdn.example/metadata/",
+            "https://cdn.example/metadata/#fragment",
+            "https://cdn.example/metadata",
+        ] {
+            assert!(
+                validate_release_url("metadata_url", invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 }
 
 /// A target whose existence, length, and hashes are authenticated by the current
@@ -126,22 +158,79 @@ pub struct VerifiedTarget {
 /// A loaded, verified TUF repository. Each [`load`](Self::load) /
 /// [`refresh`](Self::refresh) performs the complete TUF refresh workflow.
 pub struct TrustedRepository {
-    config: updated::config::Repository,
+    config: updated::config::RepositorySource,
     datastore: PathBuf,
     repo: Repository,
 }
 
 impl TrustedRepository {
-    /// Load from the tower's single operator configuration and canonical path layout.
-    pub async fn from_config(
-        cfg: &updated::config::Config,
+    /// Resolve the node's exact, TUF-verified routing assignment and then load the
+    /// selected release repository. Repeating this operation is how a running node
+    /// observes control-plane group changes without restart.
+    pub async fn assigned(
+        routing_config: &updated::config::Routing,
+        repository_config: &updated::config::Repository,
         paths: &updated::config::Paths,
     ) -> Result<Self, Error> {
-        Self::load(&cfg.repository, &paths.datastore).await
+        if !routing_config.base_url.ends_with('/') {
+            return Err(Error::Local(
+                "routing.base_url must end with '/' so metadata/ and targets/ are children".into(),
+            ));
+        }
+        let base = Url::parse(&routing_config.base_url)
+            .map_err(|e| Error::Local(format!("routing.base_url: {e}")))?;
+        if !matches!(base.scheme(), "http" | "https")
+            || base.cannot_be_a_base()
+            || !base.username().is_empty()
+            || base.password().is_some()
+            || base.fragment().is_some()
+        {
+            return Err(Error::Local(
+                "routing.base_url must be an HTTP(S) base URL without credentials or a fragment"
+                    .into(),
+            ));
+        }
+        let metadata_url = base
+            .join("metadata/")
+            .map_err(|e| Error::Local(format!("routing metadata URL: {e}")))?;
+        let targets_url = base
+            .join("targets/")
+            .map_err(|e| Error::Local(format!("routing targets URL: {e}")))?;
+        let routing = updated::config::RepositorySource {
+            root: routing_config.root.clone(),
+            metadata_url: metadata_url.to_string(),
+            targets_url: targets_url.to_string(),
+            metadata_limit: routing_config.metadata_limit,
+            target_limit: 64 * 1024,
+        };
+        let routing = Self::load(&routing, &paths.routing_datastore).await?;
+        let target = routing
+            .all_targets()
+            .into_iter()
+            .find(|target| target.path == routing_config.assignment)
+            .ok_or_else(|| {
+                Error::Trust(format!(
+                    "routing assignment {} is absent from verified metadata",
+                    routing_config.assignment
+                ))
+            })?;
+        routing.download_target(&target, &paths.assignment).await?;
+        let bytes = tokio::fs::read(&paths.assignment)
+            .await
+            .map_err(|e| Error::Local(format!("reading verified routing assignment: {e}")))?;
+        let assignment: updated::config::RepositoryAssignment = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Trust(format!("invalid repository assignment: {e}")))?;
+        let assignment_store = paths.datastore.join(assignment_identity(&assignment));
+        let source = repository_config
+            .resolve(assignment)
+            .map_err(Error::Trust)?;
+        validate_release_url("metadata_url", &source.metadata_url)?;
+        validate_release_url("targets_url", &source.targets_url)?;
+        Self::load(&source, &assignment_store).await
     }
     /// Load the pinned root and refresh the full metadata chain.
     pub async fn load(
-        config: &updated::config::Repository,
+        config: &updated::config::RepositorySource,
         datastore: &Path,
     ) -> Result<Self, Error> {
         let repo = Self::load_repo(config, datastore).await?;
@@ -160,7 +249,7 @@ impl TrustedRepository {
     }
 
     async fn load_repo(
-        config: &updated::config::Repository,
+        config: &updated::config::RepositorySource,
         datastore: &Path,
     ) -> Result<Repository, Error> {
         let root = tokio::fs::read(&config.root).await.map_err(|e| {
@@ -285,6 +374,35 @@ impl TrustedRepository {
             .map_err(|e| Error::Local(format!("syncing target directory: {e}")))?;
         Ok(())
     }
+}
+
+fn assignment_identity(assignment: &updated::config::RepositoryAssignment) -> String {
+    // Length-prefix the fields so different endpoint pairs cannot have an ambiguous
+    // concatenation. The digest is only a private directory name; the signed assignment
+    // and TUF metadata remain the authority.
+    let mut bytes = Vec::with_capacity(
+        assignment.metadata_url.len() + assignment.targets_url.len() + 2 * size_of::<u64>(),
+    );
+    bytes.extend_from_slice(&(assignment.metadata_url.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(assignment.metadata_url.as_bytes());
+    bytes.extend_from_slice(&(assignment.targets_url.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(assignment.targets_url.as_bytes());
+    hex::encode(digest(&SHA256, &bytes).as_ref())
+}
+
+fn validate_release_url(name: &str, raw: &str) -> Result<(), Error> {
+    let url = Url::parse(raw).map_err(|e| Error::Trust(format!("assignment {name}: {e}")))?;
+    if !raw.ends_with('/') || !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+        return Err(Error::Trust(format!(
+            "assignment {name} must be an HTTP(S) base URL ending with '/'"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(Error::Trust(format!(
+            "assignment {name} must not contain credentials or a fragment"
+        )));
+    }
+    Ok(())
 }
 
 fn transport_timeout(operation: &str) -> Error {

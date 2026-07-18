@@ -96,9 +96,25 @@ impl Ctx {
             .truncate(false)
             .open(root.join("target/e2e.lock"))
             .map_err(str_err)?;
-        run_lock
-            .lock()
-            .map_err(|error| format!("another E2E run owns the shared ports/workdir: {error}"))?;
+        let lock_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match run_lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < lock_deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return fail(
+                        "another E2E run still owns target/e2e.lock after 10s; stop that run before retrying",
+                    );
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return fail(format!(
+                        "acquiring the E2E shared ports/workdir lock: {error}"
+                    ));
+                }
+            }
+        }
         // An interrupted prior run can leave durable app processes behind (on Unix
         // they outlive their supervisor by design); reap them so they don't hold a
         // port this run needs.
@@ -217,12 +233,26 @@ impl Ctx {
     /// truth: the chaos scenario drives exactly the supervisor's crossings, so a boundary
     /// added or renamed on one side can never silently go untested on the other.
     pub fn chaos_boundaries(&self) -> R<Vec<String>> {
+        self.list_chaos_boundaries("--list-chaos-boundaries")
+    }
+
+    pub fn rollback_chaos_boundaries(&self) -> R<Vec<String>> {
+        self.list_chaos_boundaries("--list-rollback-chaos-boundaries")
+    }
+
+    pub fn abort_chaos_boundaries(&self) -> R<Vec<String>> {
+        self.list_chaos_boundaries("--list-abort-chaos-boundaries")
+    }
+
+    fn list_chaos_boundaries(&self, flag: &str) -> R<Vec<String>> {
         let out = Command::new(&self.supervisor)
-            .arg("--list-chaos-boundaries")
+            .arg(flag)
             .output()
             .map_err(str_err)?;
         if !out.status.success() {
-            return fail("`supervisor --list-chaos-boundaries` failed (chaos feature not built?)");
+            return fail(format!(
+                "`supervisor {flag}` failed (chaos feature not built?)"
+            ));
         }
         let list: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -274,6 +304,15 @@ impl Ctx {
 
     /// Serve the TUF repository at `dir/repo`; the returned handle keeps it alive.
     pub fn serve(&self, dir: &Path, addr: &str) -> R<Proc> {
+        run(Command::new(&self.server)
+            .arg("publish-assignment")
+            .arg("--repo")
+            .arg(dir.join("repo"))
+            .arg("--keys")
+            .arg(dir.join("keys"))
+            .args(["--name", "assignments/node.json"])
+            .args(["--metadata-url", &self.meta_url(addr)])
+            .args(["--targets-url", &self.targets_url(addr)]))?;
         Proc::spawn(
             "server",
             Command::new(&self.server)

@@ -101,15 +101,22 @@ try {
     & (Join-Path $bin 'server.exe') publish-app --repo $repo --keys $keys --product app `
         --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }
+    & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
+        --name assignments/node.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
+        --targets-url "http://127.0.0.1:$repoPort/targets/"
+    if ($LASTEXITCODE) { throw 'publishing routing assignment failed' }
 
     $serverProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
         -ArgumentList @('serve', '--repo', $repo, '--addr', "127.0.0.1:$repoPort")
     $rootJson = Join-Path $repo 'metadata\root.json'
     $configText = @"
+[routing]
+root = '$($rootJson.Replace("'", "''"))'
+base_url = 'http://127.0.0.1:$repoPort/'
+assignment = 'assignments/node.json'
+
 [repository]
 root = '$($rootJson.Replace("'", "''"))'
-metadata_url = 'http://127.0.0.1:$repoPort/metadata/'
-targets_url = 'http://127.0.0.1:$repoPort/targets/'
 
 [application]
 product = 'app'

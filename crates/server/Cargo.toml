@@ -9,7 +9,9 @@ name = "server"
 path = "src/main.rs"
 
 [dependencies]
+foundation = { path = "../foundation" }
 updated = { path = "../updated" }
 updated-tuf = { path = "../updated-tuf" }
 tokio = { workspace = true }
 semver = { workspace = true }
+serde_json = { workspace = true }

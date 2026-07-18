@@ -107,6 +107,22 @@ mkdir -p "$BIN" "$WORK/guardian-state"
 cp "$ROOT/target/release/"{server,bootstrap,supervisor} "$BIN/"
 cp "$ROOT/scripts/haproxy-activate.sh" "$BIN/activate"
 chmod 0755 "$BIN/activate"
+cat >"$BIN/transition" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${UPDATED_TRANSITION_PHASE:?}" in
+  preflight)
+    exec "$UPDATED_CANDIDATE/bin/haproxy" -c -f "$UPDATED_CANDIDATE/config/haproxy.cfg"
+    ;;
+  activate)
+    exec "$(dirname "$0")/activate" "$UPDATED_CANDIDATE" "$UPDATED_INSTALL_ROOT/runtime" "$UPDATED_CHILD_PID"
+    ;;
+  drain|prepare|finalize|rollback)
+    exit 0
+    ;;
+esac
+EOF
+chmod 0755 "$BIN/transition"
 
 "$BIN/server" init --repo "$REPO" --keys "$KEYS"
 for version in 1.0.0 2.0.0 4.0.0; do make_config "$WORK/bundle-$version" "$version"; done
@@ -133,12 +149,18 @@ done
 "$BIN/server" install-app --install-root "$INSTALL" --product app --version 1.0.0 \
   --platform linux-x86_64 --bundle "$WORK/bundle-1.0.0" --entrypoint bin/launch
 publish 1.0.0 "$WORK/bundle-1.0.0"
+"$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
+  --name assignments/node.json \
+  --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/" \
+  --targets-url "http://127.0.0.1:$REPO_PORT/targets/"
 
 cat >"$CONFIG" <<EOF
+[routing]
+root = "$REPO/metadata/root.json"
+base_url = "http://127.0.0.1:$REPO_PORT/"
+assignment = "assignments/node.json"
 [repository]
 root = "$REPO/metadata/root.json"
-metadata_url = "http://127.0.0.1:$REPO_PORT/metadata/"
-targets_url = "http://127.0.0.1:$REPO_PORT/targets/"
 [application]
 product = "app"
 channel = "stable"
@@ -146,8 +168,9 @@ install_root = "$INSTALL"
 health_url = "http://127.0.0.1:$HTTP_PORT/"
 [application.activation]
 mode = "reexec"
-preflight_command = ["{candidate}/bin/haproxy", "-c", "-f", "{candidate}/config/haproxy.cfg"]
-command = ["$BIN/activate", "{candidate}", "{install_root}/runtime", "{pid}"]
+[application.transition]
+command = ["$BIN/transition"]
+timeout = "10s"
 [timeouts]
 check_interval = "1s"
 health_grace = "4s"
@@ -180,6 +203,22 @@ wait_version 2.0.0
 new_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "HAProxy did not replace its worker"
 [[ "$(stat -Lc '%d:%i' "/proc/$master_pid/exe")" != "$initial_exe_inode" ]] || fail "master did not re-exec the candidate binary inode"
 
+# The updater provides at-least-once adapter execution across the unavoidable
+# action/journal-write crash gap. Prove this real adapter converges when the exact same
+# activation is replayed, rather than relying only on the purpose-built sample server.
+release2="$(find "$INSTALL/versions" -maxdepth 1 -type d -name '2.0.0-*' -print -quit)"
+[[ -n "$release2" ]] || fail "could not locate the immutable HAProxy 2.0.0 release"
+for _ in 1 2; do
+  UPDATED_TRANSITION_PHASE=activate \
+  UPDATED_TRANSITION_ID=haproxy-idempotency-replay \
+  UPDATED_CANDIDATE="$release2" \
+  UPDATED_INSTALL_ROOT="$INSTALL" \
+  UPDATED_CHILD_PID="$master_pid" \
+    "$BIN/transition"
+  wait_version 2.0.0
+done
+[[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "idempotent activation replay changed the HAProxy master PID"
+
 preflight_worker="$new_worker"
 preflight_inode="$(stat -Lc '%d:%i' "/proc/$master_pid/exe")"
 publish 3.0.0 "$WORK/bundle-3.0.0"
@@ -197,4 +236,4 @@ wait_version 4.0.0
 kill "$TRAFFIC_PID"; wait "$TRAFFIC_PID" 2>/dev/null || true; TRAFFIC_PID=""
 [[ ! -s "$TRAFFIC_LOG" ]] || fail "traffic failed during HAProxy upgrades"
 
-echo "PASS: real HAProxy upgraded its binary by SIGUSR2 with stable master PID $master_pid, worker turnover, preflight rejection, and zero failed probes"
+echo "PASS: real HAProxy upgraded by SIGUSR2 with stable master PID $master_pid, safe duplicate activation, worker turnover, preflight rejection, and zero failed probes"

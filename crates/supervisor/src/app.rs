@@ -74,7 +74,7 @@ pub(crate) fn start(guardian: Guardian, opts: &Options) -> io::Result<App> {
 
 /// The guardian⇄supervisor launch contract, as it appears in this process's own
 /// environment. Only the supervisor is a party to it: neither the managed application nor
-/// the operator's reload command may see the control endpoint, the readiness nonce, or the
+/// the operator's transition adapter may see the control endpoint, the readiness nonce, or the
 /// chaos injection point, so every process this supervisor causes to be launched is
 /// stripped of all of it.
 pub(crate) const CONTROL_PLANE_ENV: &[&str] = &[

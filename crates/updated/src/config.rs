@@ -4,7 +4,7 @@
 //! which reads it. Every timeout has a default, so `[timeouts]` — and any field within
 //! it — may be omitted.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,27 +12,84 @@ use std::time::Duration;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub routing: Routing,
     pub repository: Repository,
     pub application: Application,
     #[serde(default)]
     pub timeouts: Timeouts,
 }
 
-/// The signed TUF repository the application and self targets come from.
+/// Bootstrap trust for the small routing repository. `base_url` is the only
+/// repository URL configured on a node; its `metadata/` and `targets/` children
+/// contain a TUF repository whose verified assignment selects the release CDN.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Routing {
+    pub root: PathBuf,
+    pub base_url: String,
+    /// Exact TUF target to resolve (for example `assignments/node-123.json`).
+    pub assignment: String,
+    #[serde(default)]
+    pub datastore: Option<PathBuf>,
+    #[serde(default = "meg")]
+    pub metadata_limit: u64,
+}
+
+/// Locally pinned trust and resource limits for the repository selected by the
+/// routing assignment. Its URLs deliberately do not live in local config.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repository {
     /// Installer-pinned trust anchor (read-only).
     pub root: PathBuf,
-    pub metadata_url: String,
-    pub targets_url: String,
-    /// Persistent TUF metadata cache; defaults to `<state>.tuf`.
+    /// Parent of per-assigned-repository TUF metadata caches; defaults to
+    /// `<install_root>/state/tuf`.
     #[serde(default)]
     pub datastore: Option<PathBuf>,
     #[serde(default = "meg")]
     pub metadata_limit: u64,
     #[serde(default = "half_gib")]
     pub target_limit: u64,
+}
+
+/// Strict payload carried as a verified target in the routing repository.
+/// TUF supplies authenticity, expiry, and rollback protection; this document
+/// supplies only the two release-repository transport endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryAssignment {
+    pub schema: u32,
+    pub metadata_url: String,
+    pub targets_url: String,
+}
+
+/// Fully resolved repository input. Values of this type are constructed only
+/// after parsing a TUF-verified [`RepositoryAssignment`].
+#[derive(Debug, Clone)]
+pub struct RepositorySource {
+    pub root: PathBuf,
+    pub metadata_url: String,
+    pub targets_url: String,
+    pub metadata_limit: u64,
+    pub target_limit: u64,
+}
+
+impl Repository {
+    pub fn resolve(&self, assignment: RepositoryAssignment) -> Result<RepositorySource, String> {
+        if assignment.schema != 1 {
+            return Err(format!(
+                "unsupported repository assignment schema {}",
+                assignment.schema
+            ));
+        }
+        Ok(RepositorySource {
+            root: self.root.clone(),
+            metadata_url: assignment.metadata_url,
+            targets_url: assignment.targets_url,
+            metadata_limit: self.metadata_limit,
+            target_limit: self.target_limit,
+        })
+    }
 }
 
 fn meg() -> u64 {
@@ -59,35 +116,48 @@ pub struct Application {
     pub health_url: Option<String>,
     /// How a staged release enters service. The default is a portable stop/start;
     /// reexec keeps the existing master alive and delegates its program-specific
-    /// handoff to explicit argv commands.
+    /// handoff to the transition adapter.
     #[serde(default)]
     pub activation: Activation,
+    /// Optional operator-owned adapter for site-specific lifecycle work such as
+    /// draining application work, waiting for mounts, or changing load-balancer membership.
+    #[serde(default)]
+    pub transition: Option<Transition>,
 }
 
-/// The one application activation model. Commands are argv arrays executed without a
-/// shell; exact-token placeholders are expanded by the supervisor.
+/// One command, invoked with an explicit phase. This is deliberately not a set of
+/// unrelated shell hooks: every phase receives the same argv, environment,
+/// timeout, and transaction identity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Transition {
+    pub command: Vec<String>,
+    #[serde(default = "transition_timeout", deserialize_with = "de_dur")]
+    pub timeout: Duration,
+}
+
+fn transition_timeout() -> Duration {
+    Duration::from_secs(300)
+}
+
+/// The one application activation model. The transition command is direct argv; its
+/// inputs are supplied exclusively through the documented `UPDATED_*` environment.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Activation {
     /// Stop the managed process and launch the candidate entrypoint.
     #[default]
     StopStart,
-    /// Keep the master PID alive while operator code projects and activates a candidate.
-    Reexec {
-        /// Optional candidate validation, run before journaling, pointer mutation, or
-        /// touching the live process. Failure rejects the candidate without rollback.
-        #[serde(default)]
-        preflight_command: Option<Vec<String>>,
-        /// Symmetric handoff command, used for both forward activation and rollback.
-        command: Vec<String>,
-    },
+    /// Keep the master PID alive. The transition command's `activate` and `rollback`
+    /// phases perform the program-specific handoff.
+    Reexec,
 }
 
 impl Activation {
     pub fn name(&self) -> &'static str {
         match self {
             Activation::StopStart => "stop-start",
-            Activation::Reexec { .. } => "reexec",
+            Activation::Reexec => "reexec",
         }
     }
 }
@@ -168,11 +238,7 @@ impl Config {
         if !self.application.install_root.is_absolute() {
             return Err("application.install_root must be absolute".into());
         }
-        if let Activation::Reexec {
-            preflight_command,
-            command,
-        } = &self.application.activation
-        {
+        if let Activation::Reexec = &self.application.activation {
             if !cfg!(unix) {
                 return Err("application.activation reexec mode is supported only on Unix".into());
             }
@@ -181,11 +247,18 @@ impl Config {
                     "application.activation reexec mode requires application.health_url".into(),
                 );
             }
-            if command.is_empty() {
-                return Err("application.activation.command must name a command".into());
+            if self.application.transition.is_none() {
+                return Err(
+                    "application.activation reexec mode requires application.transition".into(),
+                );
             }
-            if preflight_command.as_ref().is_some_and(Vec::is_empty) {
-                return Err("application.activation.preflight_command must name a command".into());
+        }
+        if let Some(transition) = &self.application.transition {
+            if transition.command.is_empty() {
+                return Err("application.transition.command must name a command".into());
+            }
+            if transition.timeout.is_zero() {
+                return Err("application.transition.timeout must be greater than zero".into());
             }
         }
         for (name, value) in [
@@ -213,6 +286,21 @@ impl Config {
         if self.repository.metadata_limit == 0 {
             return Err("repository.metadata_limit must be greater than zero".into());
         }
+        if self.routing.metadata_limit == 0 {
+            return Err("routing.metadata_limit must be greater than zero".into());
+        }
+        if self.routing.assignment.is_empty()
+            || self.routing.assignment.starts_with('/')
+            || self.routing.assignment.contains(['\\', ':'])
+            || self.routing.assignment.chars().any(char::is_control)
+            || self
+                .routing
+                .assignment
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err("routing.assignment must be a non-empty safe relative target path".into());
+        }
         if self.repository.target_limit == 0 {
             return Err("repository.target_limit must be greater than zero".into());
         }
@@ -230,6 +318,8 @@ pub struct Paths {
     pub download: PathBuf,
     pub state: PathBuf,
     pub datastore: PathBuf,
+    pub routing_datastore: PathBuf,
+    pub assignment: PathBuf,
     pub journal: PathBuf,
     pub rejected: PathBuf,
     pub app_token: PathBuf,
@@ -247,6 +337,11 @@ impl Config {
             .datastore
             .clone()
             .unwrap_or_else(|| state_dir.join("tuf"));
+        let routing_datastore = self
+            .routing
+            .datastore
+            .clone()
+            .unwrap_or_else(|| state_dir.join("routing-tuf"));
         Ok(Paths {
             versions: install_root.join("versions"),
             staging: install_root.join("staging"),
@@ -256,6 +351,8 @@ impl Config {
             rejected: state_dir.join("rejected"),
             app_token: state_dir.join("app-token"),
             datastore,
+            routing_datastore,
+            assignment: state_dir.join("repository-assignment.json"),
             state,
             install_root,
         })
@@ -351,6 +448,31 @@ mod tests {
     }
 
     #[test]
+    fn assignment_is_strict_and_cannot_replace_the_pinned_root() {
+        let assignment: RepositoryAssignment = serde_json::from_str(
+            r#"{"schema":1,"metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/"}"#,
+        )
+        .unwrap();
+        let repository = Repository {
+            root: PathBuf::from("/pinned-root.json"),
+            datastore: None,
+            metadata_limit: meg(),
+            target_limit: half_gib(),
+        };
+        let source = repository.resolve(assignment).unwrap();
+        assert_eq!(source.root, PathBuf::from("/pinned-root.json"));
+
+        let unknown = r#"{"schema":1,"metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/","root":"evil"}"#;
+        assert!(serde_json::from_str::<RepositoryAssignment>(unknown).is_err());
+        let future = RepositoryAssignment {
+            schema: 2,
+            metadata_url: "https://cdn/m/".into(),
+            targets_url: "https://cdn/t/".into(),
+        };
+        assert!(repository.resolve(future).is_err());
+    }
+
+    #[test]
     fn negative_duration_is_rejected() {
         #[derive(Debug, Deserialize)]
         #[allow(dead_code)]
@@ -376,10 +498,12 @@ mod tests {
     fn unsafe_zero_timeouts_are_rejected() {
         let mut cfg: Config = toml::from_str(
             r#"
+            [routing]
+            root = "/r"
+            base_url = "http://x/"
+            assignment = "assignments/node.json"
             [repository]
             root = "/r"
-            metadata_url = "http://x/m/"
-            targets_url = "http://x/t/"
             [application]
             product = "app"
             install_root = "/app"
@@ -399,10 +523,12 @@ mod tests {
     #[test]
     fn zero_health_threshold_and_limits_are_rejected() {
         let base = r#"
+            [routing]
+            root = "/r"
+            base_url = "http://x/"
+            assignment = "assignments/node.json"
             [repository]
             root = "/r"
-            metadata_url = "http://x/m/"
-            targets_url = "http://x/t/"
             [application]
             product = "app"
             install_root = "/app"
@@ -422,10 +548,12 @@ mod tests {
     fn omitted_timeouts_take_defaults_partial_override() {
         let mut cfg: Config = toml::from_str(
             r#"
+            [routing]
+            root = "/etc/selfupdate/root.json"
+            base_url = "http://x/"
+            assignment = "assignments/node.json"
             [repository]
             root = "/etc/selfupdate/root.json"
-            metadata_url = "http://x/m/"
-            targets_url = "http://x/t/"
             [application]
             product = "app"
             install_root = "/app"
@@ -450,16 +578,19 @@ mod tests {
     fn reexec_without_health_url_is_rejected() {
         let cfg: Result<Config, _> = toml::from_str(
             r#"
+            [routing]
+            root = "/r"
+            base_url = "http://x/"
+            assignment = "assignments/node.json"
             [repository]
             root = "/r"
-            metadata_url = "http://x/m/"
-            targets_url = "http://x/t/"
             [application]
             product = "app"
             install_root = "/app"
             [application.activation]
             mode = "reexec"
-            command = ["kill", "-HUP", "{pid}"]
+            [application.transition]
+            command = ["/transition"]
             "#,
         );
         // Parses, but validation rejects it (Unix) or the platform guard does.
@@ -473,17 +604,20 @@ mod tests {
         {
             let cfg: Config = toml::from_str(
                 r#"
+                [routing]
+                root = "/r"
+                base_url = "http://x/"
+                assignment = "assignments/node.json"
                 [repository]
                 root = "/r"
-                metadata_url = "http://x/m/"
-                targets_url = "http://x/t/"
                 [application]
                 product = "app"
                 install_root = "/app"
                 health_url = "http://127.0.0.1:9/healthz"
                 [application.activation]
                 mode = "reexec"
-                command = ["kill", "-HUP", "{pid}"]
+                [application.transition]
+                command = ["/transition"]
                 "#,
             )
             .unwrap();
@@ -498,10 +632,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cfg: Config = toml::from_str(
             r#"
+            [routing]
+            root = "/r"
+            base_url = "http://x/"
+            assignment = "assignments/node.json"
             [repository]
             root = "/r"
-            metadata_url = "http://x/m/"
-            targets_url = "http://x/t/"
             [application]
             product = "app"
             install_root = "/placeholder"

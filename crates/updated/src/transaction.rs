@@ -15,9 +15,162 @@ use crate::bundle::ReleaseId;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
+    /// Fresh identity for this attempt. Stable across crash recovery, different for a
+    /// later retry of the same candidate/predecessor pair.
+    pub id: String,
+    pub kind: Kind,
     pub previous_release: ReleaseId,
+    pub previous_archive_sha256: String,
     pub candidate_release: ReleaseId,
     pub candidate_archive_sha256: String,
+    /// Recovery must durably reject the candidate before this transaction may be
+    /// cleared. This records policy intent that cannot safely be reconstructed from
+    /// one-shot process-exit markers on a later recovery boot.
+    pub candidate_rejection_required: bool,
+    /// Recovery must replay the operator transition adapter before clearing this intent.
+    pub transition_required: bool,
+    /// Last state-machine operation known to have completed durably. Recovery replays
+    /// the next operation; adapters are idempotent across the action/journal-write gap.
+    pub phase: Phase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Phase {
+    Started,
+    PreflightStarted,
+    PreflightPassed,
+    Drained,
+    AppQuiesced,
+    Prepared,
+    CandidateActivated,
+    CandidateVerified,
+    CandidateStarted,
+    CandidateHealthy,
+    Finalized,
+    Committed,
+    RollbackStarted,
+    RollbackAppQuiesced,
+    PredecessorActivated,
+    PredecessorStarted,
+    PredecessorHealthy,
+    RolledBack,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Kind {
+    Supervised,
+    OnLaunch,
+}
+
+impl Transaction {
+    pub fn validate(&self) -> io::Result<()> {
+        if self.id.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction id must not be empty",
+            ));
+        }
+        if self.kind == Kind::OnLaunch && self.candidate_rejection_required {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "on-launch transactions cannot require supervised candidate rejection",
+            ));
+        }
+        let valid = match self.kind {
+            Kind::Supervised => self.phase != Phase::Started,
+            Kind::OnLaunch => matches!(
+                self.phase,
+                Phase::Started
+                    | Phase::CandidateActivated
+                    | Phase::CandidateVerified
+                    | Phase::Committed
+            ),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "transaction kind {:?} cannot have phase {:?}",
+                    self.kind, self.phase
+                ),
+            ))
+        }
+    }
+
+    pub fn is_rollback(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::RollbackStarted
+                | Phase::RollbackAppQuiesced
+                | Phase::PredecessorActivated
+                | Phase::PredecessorStarted
+                | Phase::PredecessorHealthy
+                | Phase::RolledBack
+                | Phase::Aborted
+        )
+    }
+
+    /// Position in the recovery path. This lets a fresh supervisor resume after the
+    /// last durable boundary without re-running an operation already recorded complete.
+    pub fn rollback_rank(&self) -> Option<u8> {
+        match self.phase {
+            Phase::RollbackStarted => Some(0),
+            Phase::RollbackAppQuiesced => Some(1),
+            Phase::PredecessorActivated => Some(2),
+            Phase::PredecessorStarted => Some(3),
+            Phase::PredecessorHealthy => Some(4),
+            Phase::RolledBack | Phase::Aborted => Some(5),
+            _ => None,
+        }
+    }
+
+    pub fn advance(&mut self, next: Phase) -> io::Result<()> {
+        let supervised_forward = self.kind == Kind::Supervised
+            && matches!(
+                (self.phase, next),
+                (Phase::PreflightStarted, Phase::PreflightPassed)
+                    | (Phase::PreflightPassed, Phase::Drained)
+                    | (Phase::Drained, Phase::AppQuiesced)
+                    | (Phase::AppQuiesced, Phase::Prepared)
+                    | (Phase::Prepared, Phase::CandidateActivated)
+                    | (Phase::CandidateActivated, Phase::CandidateVerified)
+                    | (Phase::CandidateVerified, Phase::CandidateStarted)
+                    | (Phase::CandidateStarted, Phase::CandidateHealthy)
+                    | (Phase::CandidateHealthy, Phase::Finalized)
+                    | (Phase::Finalized, Phase::Committed)
+            );
+        let on_launch_forward = self.kind == Kind::OnLaunch
+            && matches!(
+                (self.phase, next),
+                (Phase::Started, Phase::CandidateActivated)
+                    | (Phase::CandidateActivated, Phase::CandidateVerified)
+                    | (Phase::CandidateVerified, Phase::Committed)
+            );
+        let begin_rollback = next == Phase::RollbackStarted
+            && !matches!(self.phase, Phase::Committed | Phase::RolledBack);
+        let rollback = matches!(
+            (self.phase, next),
+            (Phase::RollbackStarted, Phase::RollbackAppQuiesced)
+                | (Phase::RollbackAppQuiesced, Phase::PredecessorActivated)
+                | (Phase::PredecessorActivated, Phase::PredecessorStarted)
+                | (Phase::PredecessorStarted, Phase::PredecessorHealthy)
+                | (Phase::PredecessorHealthy, Phase::RolledBack)
+                | (Phase::RollbackStarted, Phase::Aborted)
+        );
+        if !(supervised_forward || on_launch_forward || begin_rollback || rollback) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid transaction phase {:?} -> {next:?}", self.phase),
+            ));
+        }
+        self.phase = next;
+        Ok(())
+    }
 }
 
 /// The recovery action implied by a journal, the live binary, and committed state.
@@ -36,30 +189,49 @@ pub fn classify_recovery(
     active: Option<&ReleaseId>,
     committed: Option<&ReleaseId>,
 ) -> Recovery {
-    if active == Some(&tx.candidate_release) {
-        if committed == Some(&tx.candidate_release) {
+    let commit_may_have_landed = match tx.kind {
+        Kind::Supervised => matches!(tx.phase, Phase::Finalized | Phase::Committed),
+        Kind::OnLaunch => matches!(tx.phase, Phase::CandidateVerified | Phase::Committed),
+    };
+    match tx.phase {
+        _ if commit_may_have_landed
+            && active == Some(&tx.candidate_release)
+            && committed == Some(&tx.candidate_release) =>
+        {
             Recovery::Committed
-        } else {
-            Recovery::RestorePredecessor
         }
-    } else if active == Some(&tx.previous_release) {
-        Recovery::NeverSwapped
-    } else {
-        Recovery::RestorePredecessor
+        Phase::Started
+        | Phase::PreflightStarted
+        | Phase::PreflightPassed
+        | Phase::Drained
+        | Phase::AppQuiesced
+        | Phase::Prepared
+            if active == Some(&tx.previous_release) =>
+        {
+            Recovery::NeverSwapped
+        }
+        Phase::RolledBack | Phase::Aborted if active == Some(&tx.previous_release) => {
+            Recovery::NeverSwapped
+        }
+        _ => Recovery::RestorePredecessor,
     }
 }
 
 pub fn read(path: &Path) -> io::Result<Option<Transaction>> {
     match std::fs::read(path) {
-        Ok(raw) => serde_json::from_slice(&raw)
-            .map(Some)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+        Ok(raw) => {
+            let transaction: Transaction = serde_json::from_slice(&raw)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            transaction.validate()?;
+            Ok(Some(transaction))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }
 
 pub fn write(path: &Path, tx: &Transaction) -> io::Result<()> {
+    tx.validate()?;
     apply::atomic_write(path, &serde_json::to_vec(tx).map_err(io::Error::other)?)
 }
 
@@ -80,15 +252,22 @@ mod tests {
 
     fn tx() -> Transaction {
         Transaction {
+            id: "transaction-id".into(),
+            kind: Kind::Supervised,
             previous_release: release("1.0.0", "old"),
+            previous_archive_sha256: "previous-archive".into(),
             candidate_release: release("2.0.0", "new"),
             candidate_archive_sha256: "archive".into(),
+            candidate_rejection_required: false,
+            transition_required: true,
+            phase: Phase::PreflightStarted,
         }
     }
 
     #[test]
     fn recovery_is_derived_from_active_pointer_and_commit() {
-        let tx = tx();
+        let mut tx = tx();
+        tx.phase = Phase::Committed;
         assert_eq!(
             classify_recovery(
                 &tx,
@@ -97,10 +276,12 @@ mod tests {
             ),
             Recovery::Committed
         );
+        tx.phase = Phase::CandidateActivated;
         assert_eq!(
             classify_recovery(&tx, Some(&tx.candidate_release), Some(&tx.previous_release)),
             Recovery::RestorePredecessor
         );
+        tx.phase = Phase::PreflightPassed;
         assert_eq!(
             classify_recovery(&tx, Some(&tx.previous_release), Some(&tx.previous_release)),
             Recovery::NeverSwapped
@@ -109,6 +290,74 @@ mod tests {
             classify_recovery(&tx, None, Some(&tx.previous_release)),
             Recovery::RestorePredecessor
         );
+
+        tx.phase = Phase::Finalized;
+        assert_eq!(
+            classify_recovery(
+                &tx,
+                Some(&tx.candidate_release),
+                Some(&tx.candidate_release)
+            ),
+            Recovery::Committed,
+            "a crash after installed-state commit but before its phase write is committed"
+        );
+
+        tx.kind = Kind::OnLaunch;
+        tx.phase = Phase::CandidateVerified;
+        assert_eq!(
+            classify_recovery(
+                &tx,
+                Some(&tx.candidate_release),
+                Some(&tx.candidate_release)
+            ),
+            Recovery::Committed
+        );
+    }
+
+    #[test]
+    fn each_transaction_kind_accepts_only_its_explicit_path() {
+        let mut supervised = tx();
+        for phase in [
+            Phase::PreflightPassed,
+            Phase::Drained,
+            Phase::AppQuiesced,
+            Phase::Prepared,
+            Phase::CandidateActivated,
+            Phase::CandidateVerified,
+            Phase::CandidateStarted,
+            Phase::CandidateHealthy,
+            Phase::Finalized,
+            Phase::Committed,
+        ] {
+            supervised.advance(phase).unwrap();
+        }
+        assert!(supervised.advance(Phase::RollbackStarted).is_err());
+
+        let mut on_launch = tx();
+        on_launch.kind = Kind::OnLaunch;
+        on_launch.phase = Phase::Started;
+        assert!(on_launch.advance(Phase::CandidateActivated).is_ok());
+        assert!(on_launch.advance(Phase::CandidateVerified).is_ok());
+        assert!(on_launch.advance(Phase::Committed).is_ok());
+        assert!(on_launch.advance(Phase::Finalized).is_err());
+    }
+
+    #[test]
+    fn rollback_records_every_completed_recovery_operation() {
+        let mut transaction = tx();
+        transaction.phase = Phase::CandidateHealthy;
+        for (phase, rank) in [
+            (Phase::RollbackStarted, 0),
+            (Phase::RollbackAppQuiesced, 1),
+            (Phase::PredecessorActivated, 2),
+            (Phase::PredecessorStarted, 3),
+            (Phase::PredecessorHealthy, 4),
+            (Phase::RolledBack, 5),
+        ] {
+            transaction.advance(phase).unwrap();
+            assert_eq!(transaction.rollback_rank(), Some(rank));
+        }
+        assert!(transaction.advance(Phase::PredecessorStarted).is_err());
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -145,6 +394,31 @@ mod tests {
         assert!(
             read(&path).is_err(),
             "unknown fields are not a second schema"
+        );
+    }
+
+    #[test]
+    fn phase_must_belong_to_the_declared_transaction_kind() {
+        let path = tmp("kind-phase");
+        let mut invalid = tx();
+        invalid.phase = Phase::Started;
+        assert!(write(&path, &invalid).is_err());
+
+        invalid.kind = Kind::OnLaunch;
+        invalid.phase = Phase::Drained;
+        assert!(write(&path, &invalid).is_err());
+    }
+
+    #[test]
+    fn on_launch_cannot_carry_supervised_rejection_policy() {
+        let mut invalid = tx();
+        invalid.kind = Kind::OnLaunch;
+        invalid.phase = Phase::Started;
+        invalid.candidate_rejection_required = true;
+
+        assert_eq!(
+            invalid.validate().unwrap_err().to_string(),
+            "on-launch transactions cannot require supervised candidate rejection"
         );
     }
 

@@ -1,7 +1,7 @@
 //! End-to-end proof: author a TUF repo with the builder, then load it as a client
 //! over `file://` URLs and verify + download a target through the full TUF chain.
 
-use updated::config::Repository;
+use updated::config::RepositorySource;
 use updated_tuf::policy::DefaultPolicy;
 use updated_tuf::{repo, TrustedRepository};
 
@@ -23,17 +23,16 @@ async fn author(tmp: &std::path::Path) -> (std::path::PathBuf, repo::Keys, Strin
     (repo_dir, keys, path)
 }
 
-fn client_config(repo_dir: &std::path::Path) -> Repository {
+fn client_config(repo_dir: &std::path::Path) -> RepositorySource {
     let url = |sub: &str| {
         url::Url::from_directory_path(std::fs::canonicalize(repo_dir.join(sub)).unwrap())
             .unwrap()
             .to_string()
     };
-    Repository {
+    RepositorySource {
         metadata_url: url("metadata"),
         targets_url: url("targets"),
         root: repo_dir.join("metadata/root.json"),
-        datastore: None,
         metadata_limit: 1024 * 1024,
         target_limit: 100 * 1024 * 1024,
     }

@@ -7,7 +7,7 @@ network request, or candidate fails at the worst possible time.
 
 > **This is not an installer or package manager.** An installer must first place the
 > bootstrap, supervisor or one-shot launcher, initial application bundle, read-only
-> configuration, and pinned TUF root; seed strict installed and `active-release`
+> configuration, and pinned routing/release TUF roots; seed strict installed and `active-release`
 > records; create the restricted service identity and writable state directory; and register any
 > systemd, launchd, Windows SCM, shortcut, or file-association integration. `updated`
 > takes responsibility only after that trust and filesystem boundary exists: it keeps
@@ -18,8 +18,9 @@ network request, or candidate fails at the worst possible time.
 ## Five-minute overview
 
 The system updates an arbitrary, update-unaware application on Linux, macOS, and
-Windows. A signed TUF repository describes releases. A supervisor selects and
-downloads the correct target, then performs journaled, health-gated release activation.
+Windows. A small signed routing repository assigns the node to a signed release
+repository. A supervisor resolves that assignment, selects and downloads the correct
+target, then performs journaled, health-gated release activation.
 A tiny, network-free bootstrap owns the processes and safely replaces the supervisor
 itself.
 
@@ -75,8 +76,11 @@ service rather than relying only on the sample fixture.
 ### 1. Authenticate and select a release
 
 Start in `crates/updated-tuf/src/lib.rs` and `crates/updated-tuf/src/select.rs`.
-`TrustedRepository` loads the installer-pinned root, lets `tough` verify and rotate
-the TUF metadata chain, exposes only verified targets, and streams the chosen target
+`TrustedRepository::assigned` derives `metadata/` and `targets/` from the one configured
+routing base URL, verifies the node's exact assignment target, and loads the assigned
+release repository under a separately pinned root. It repeats assignment resolution on
+each check so control-plane group changes are live. `tough` verifies and rotates each
+TUF metadata chain, exposes only verified targets, and streams the chosen target
 under configured size and transport-time limits. `crates/updated-tuf/src/policy.rs`
 then applies product, channel, OS, architecture, SemVer, and downgrade policy to
 authenticated metadata.
@@ -91,10 +95,14 @@ Follow `check_application` in `crates/supervisor/src/selection.rs` into
 
 ```text
 verify candidate
-  → persist journal
+  → run read-only preflight
+  → persist a phase journal
+  → drain → quiesce → prepare
   → atomically activate the immutable release directory
+  → re-verify its manifested bytes
   → start/reload candidate
   → require consecutive authenticated health successes
+  → finalize
   → commit installed state
   → retain rollback intent for a confirmation window
 ```
@@ -102,7 +110,8 @@ verify candidate
 Any pre-commit health or activation failure restores the predecessor and durably
 rejects the failed archive. `crates/updated/src/bundle.rs` owns strict bundle creation,
 extraction, verification, immutable release storage, and `active-release` operations;
-`crates/updated/src/transaction.rs` classifies durable state after an interruption;
+`crates/updated/src/transaction.rs` records the last completed boundary and classifies
+durable state after an interruption;
 `crates/supervisor/src/boot.rs` turns that classification into a recovery plan.
 
 The invariant to look for is: **the durable record never claims a release is committed
@@ -134,8 +143,14 @@ The most representative tests are:
 - `crates/e2e/src/scenarios/application.rs` — update, failed health, crash, and rollback.
 - `crates/e2e/src/scenarios/self_update.rs` — successful and rejected supervisor replacement.
 - `crates/e2e/src/scenarios/locking.rs` — competing updater instances.
-- `crates/supervisor/src/tests.rs` — deterministic transaction fault injection and
-  state-machine invariants.
+- `crates/supervisor/src/update.rs` unit tests — deterministic transaction fault injection.
+- `crates/updated/src/transaction.rs` unit tests — phase and recovery invariants.
+
+The chaos suite enumerates its forward and rollback injection points from the chaos-built
+supervisor itself. It crashes both after an action and after the matching durable phase,
+then uses a cross-platform transition fixture to assert the exact phase/transaction-ID
+sequence. A replay in the action/journal gap must keep one logical effect; already
+journaled phases must not be invoked again. These cases run on Windows, macOS, and Linux.
 
 ## Reliability design rationale
 

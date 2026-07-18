@@ -55,7 +55,7 @@ fn run() -> Result<(), String> {
 async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> Result<(), String> {
     let mut rejected = Rejections::load(&paths.rejected, config.timeouts.retry_after)
         .map_err(|error| format!("loading rejections: {error}"))?;
-    let repository = TrustedRepository::load(&config.repository, &paths.datastore)
+    let repository = TrustedRepository::assigned(&config.routing, &config.repository, paths)
         .await
         .map_err(|error| format!("loading repository: {error}"))?;
     let policy = DefaultPolicy::current(&config.application.product, &config.application.channel);
@@ -87,19 +87,34 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
         },
     )
     .map_err(|error| format!("staging bundle {}: {error}", selected.version))?;
-    let tx = updated::transaction::Transaction {
+    let mut tx = updated::transaction::Transaction {
+        id: updated::rand::token().map_err(|error| error.to_string())?,
+        kind: updated::transaction::Kind::OnLaunch,
         previous_release: installed.release.clone(),
+        previous_archive_sha256: installed.archive_sha256.clone(),
         candidate_release: staged.id.clone(),
         candidate_archive_sha256: selected.sha256.clone(),
+        candidate_rejection_required: false,
+        transition_required: false,
+        phase: updated::transaction::Phase::Started,
     };
     transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
     write_active(&paths.active_release, &staged.id).map_err(|error| error.to_string())?;
+    tx.advance(updated::transaction::Phase::CandidateActivated)
+        .map_err(|error| error.to_string())?;
+    transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
     read_release(&paths.versions, &staged.id).map_err(|error| error.to_string())?;
+    tx.advance(updated::transaction::Phase::CandidateVerified)
+        .map_err(|error| error.to_string())?;
+    transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
     write_installed(
         &paths.state,
         &InstalledState::confirmed(staged.id, selected.sha256.clone()),
     )
     .map_err(|error| error.to_string())?;
+    tx.advance(updated::transaction::Phase::Committed)
+        .map_err(|error| error.to_string())?;
+    transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
     transaction::clear(&paths.journal).map_err(|error| error.to_string())?;
     if let Err(error) = rejected.clear(&selected.sha256) {
         warn(

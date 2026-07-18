@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use updated::bundle::ReleaseId;
 pub(crate) use updated::state::{Installed, InstalledState, Pending};
-pub(crate) use updated::transaction::Transaction;
+pub(crate) use updated::transaction::{Phase as TransactionPhase, Transaction};
 
 /// Whether a [`Pending`] update's confirmation window has passed as of `now` (unix secs).
 pub(crate) fn window_passed(pending: &Pending, window: Duration, now: u64) -> bool {
@@ -133,11 +133,13 @@ mod tests {
 
     fn pending() -> Pending {
         Pending {
+            transition_id: "transition".into(),
             previous_release: updated::bundle::ReleaseId {
                 version: "1.0.0".into(),
                 manifest_sha256: "aa".into(),
             },
             previous_archive_sha256: "archive-aa".into(),
+            transition_required: false,
             committed_at: 1000,
         }
     }
@@ -157,6 +159,7 @@ mod tests {
         // A `committed_at` in the future must not produce a duration that panics the
         // loop's `Instant + Duration`; at most one window of waiting is ever correct.
         let future = Pending {
+            transition_id: "transition".into(),
             committed_at: u64::MAX - 1,
             ..pending()
         };

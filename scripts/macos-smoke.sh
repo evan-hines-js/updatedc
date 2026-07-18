@@ -105,12 +105,28 @@ start() {
     --platform "$PLATFORM" --bundle "$baseline" --entrypoint bin/app
   "$BIN/server" publish-app --repo "$REPO" --keys "$KEYS" --product app \
     --version 1.0.0 --bundle "$PLATFORM=$baseline" --entrypoint bin/app
-  if [[ "$mode" == reexec ]]; then reload=$'\n[application.activation]\nmode = "reexec"\ncommand = ["kill", "-HUP", "{pid}"]'; fi
+  "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
+    --name assignments/node.json \
+    --metadata-url http://127.0.0.1:18080/metadata/ \
+    --targets-url http://127.0.0.1:18080/targets/
+  if [[ "$mode" == reexec ]]; then
+    cat >"$BIN/transition" <<'EOF'
+#!/bin/sh
+case "$UPDATED_TRANSITION_PHASE" in
+  activate) exec kill -HUP "$UPDATED_CHILD_PID" ;;
+  *) exit 0 ;;
+esac
+EOF
+    chmod 0755 "$BIN/transition"
+    reload=$'\n[application.activation]\nmode = "reexec"\n\n[application.transition]\ncommand = ["'$BIN'/transition"]\ntimeout = "10s"'
+  fi
   cat >"$CONFIG" <<EOF
+[routing]
+root = "$REPO/metadata/root.json"
+base_url = "http://127.0.0.1:18080/"
+assignment = "assignments/node.json"
 [repository]
 root = "$REPO/metadata/root.json"
-metadata_url = "http://127.0.0.1:18080/metadata/"
-targets_url = "http://127.0.0.1:18080/targets/"
 [application]
 product = "app"
 channel = "stable"

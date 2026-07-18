@@ -4,7 +4,7 @@
 //! - `publish-app` build and publish application bundles.
 //! - `install-app` seed an installer-verified application bundle.
 //! - `publish-supervisor` publish supervisor bootstrap binaries.
-//!   targets/snapshot/timestamp.
+//! - `publish-assignment` publish verified release-repository endpoints.
 //! - `serve`   serve the repository directory over HTTP for clients to refresh.
 //!
 //! Publishing is an offline/CI operation; a deployed client never runs it.
@@ -33,11 +33,12 @@ async fn main() {
         "publish-app" => publish(rest, true).await,
         "install-app" => install_app(rest),
         "publish-supervisor" => publish(rest, false).await,
+        "publish-assignment" => publish_assignment(rest).await,
         "serve" => serve(rest).await,
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|install-app|publish-app|publish-supervisor|serve> [flags]"
+                "usage: server <init|install-app|publish-app|publish-supervisor|publish-assignment|serve> [flags]"
             );
             exit(2);
         }
@@ -46,6 +47,38 @@ async fn main() {
         eprintln!("error: {e}");
         exit(1);
     }
+}
+
+async fn publish_assignment(args: &[String]) -> R {
+    let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
+    let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
+    let name = flag(args, "--name").ok_or("--name <target-path> is required")?;
+    let metadata_url = flag(args, "--metadata-url").ok_or("--metadata-url <url> is required")?;
+    let targets_url = flag(args, "--targets-url").ok_or("--targets-url <url> is required")?;
+    let expiry_days = flag_i64(args, "--expiry-days", 365)?;
+    let source = repo_dir.join(".assignment-build.json");
+    let assignment = updated::config::RepositoryAssignment {
+        schema: 1,
+        metadata_url,
+        targets_url,
+    };
+    foundation::durable::atomic_write(&source, ".assignment-", &serde_json::to_vec(&assignment)?)?;
+    let keys = repo::Keys::in_dir(&keys_dir);
+    let _publish_lock = lock_publisher(&repo_dir)?;
+    repo::add_release(
+        &repo_dir,
+        &keys,
+        vec![PublishTarget {
+            name: name.clone(),
+            source: source.clone(),
+            custom: Default::default(),
+        }],
+        expiry_days,
+    )
+    .await?;
+    let _ = std::fs::remove_file(source);
+    println!("published routing assignment {name}");
+    Ok(())
 }
 
 fn install_app(args: &[String]) -> R {

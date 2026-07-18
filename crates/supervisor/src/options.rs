@@ -14,6 +14,7 @@ pub(crate) fn parse_args() -> Result<Options, String> {
 
     let supervisor_update = build_supervisor_update(&cfg)?;
     Ok(Options {
+        routing: cfg.routing,
         repository: cfg.repository,
         application: cfg.application,
         timeouts: cfg.timeouts,

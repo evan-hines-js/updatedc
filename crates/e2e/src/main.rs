@@ -21,11 +21,65 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--transition-fixture") {
+        if let Err(error) = run_transition_fixture() {
+            eprintln!("transition fixture: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = run() {
         eprintln!("\x1b[1;31mFAIL: {e}\x1b[0m");
         std::process::exit(1);
     }
     println!("\n\x1b[1;32mSUCCESS: all scenarios passed\x1b[0m");
+}
+
+/// Cross-platform operator-adapter fixture. Every call is recorded, while a create-new
+/// marker models an idempotent side effect that may happen only once per (transaction,
+/// phase), even when crash recovery necessarily replays the command.
+fn run_transition_fixture() -> R {
+    use std::io::Write;
+
+    let root = std::env::args()
+        .nth(2)
+        .map(PathBuf::from)
+        .ok_or("missing fixture state directory")?;
+    let mode = std::env::args().nth(3).unwrap_or_default();
+    let phase = std::env::var("UPDATED_TRANSITION_PHASE").map_err(|error| error.to_string())?;
+    let id = std::env::var("UPDATED_TRANSITION_ID").map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
+    let mut attempts = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("attempts.log"))
+        .map_err(str_err)?;
+    writeln!(attempts, "{phase}\t{id}").map_err(str_err)?;
+
+    let marker = root.join("effects").join(format!("{id}-{phase}"));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(mut file) => {
+            writeln!(file, "{id}").map_err(str_err)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(str_err(error)),
+    }
+    if phase == "drain" {
+        let fail_once = mode == "fail-first-drain"
+            && std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(root.join("drain-failure-injected"))
+                .is_ok();
+        if mode == "fail-drain" || fail_once {
+            return fail("injected drain failure");
+        }
+    }
+    Ok(())
 }
 
 /// A named scenario. To add one: write an `fn(&Ctx) -> R` that asserts its own
@@ -110,6 +164,18 @@ fn scenarios() -> Vec<Scenario> {
     s.push((
         "crash at every update boundary; a fresh supervisor recovers",
         chaos_recovery,
+    ));
+    s.push((
+        "crash before and after every rollback boundary; recovery remains resumable",
+        rollback_chaos_recovery,
+    ));
+    s.push((
+        "crash after an aborted drain does not replay completed transition scripts",
+        aborted_transition_chaos_recovery,
+    ));
+    s.push((
+        "recovery keeps an attempt ID while a later retry receives a fresh one",
+        transition_attempt_ids_are_scoped,
     ));
     s
 }
@@ -248,8 +314,7 @@ fn lit(s: &str) -> String {
 /// else; there is no way to run the supervisor standalone.
 pub struct Sup {
     root: PathBuf,
-    meta_url: String,
-    targets_url: String,
+    repository_base_url: String,
     supervisor_bin: PathBuf,
     guardian_bin: PathBuf,
     oneshot_bin: PathBuf,
@@ -262,8 +327,8 @@ pub struct Sup {
     check_interval: Option<String>,
     health_grace: Option<String>,
     confirmation_window: Option<String>,
-    reexec_command: Option<Vec<String>>,
-    preflight_command: Option<Vec<String>>,
+    transition_command: Option<Vec<String>>,
+    reexec: bool,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
     /// Override the supervisor binary the guardian runs (self-update tests supply a
@@ -278,8 +343,7 @@ impl Sup {
         let seed_binary = PathBuf::from(command.first().expect("app command requires binary"));
         Sup {
             root: ctx.root(dir),
-            meta_url: ctx.meta_url(srv),
-            targets_url: ctx.targets_url(srv),
+            repository_base_url: format!("http://{srv}/"),
             supervisor_bin: ctx.supervisor.clone(),
             guardian_bin: ctx.bootstrap.clone(),
             oneshot_bin: ctx.oneshot.clone(),
@@ -292,8 +356,8 @@ impl Sup {
             check_interval: None,
             health_grace: None,
             confirmation_window: None,
-            reexec_command: None,
-            preflight_command: None,
+            transition_command: None,
+            reexec: false,
             supervisor_check_interval: None,
             ready_timeout: None,
             supervisor_override: None,
@@ -316,11 +380,12 @@ impl Sup {
         self
     }
     pub fn reexec(mut self, command: Vec<String>) -> Self {
-        self.reexec_command = Some(command);
+        self.reexec = true;
+        self.transition_command = Some(command);
         self
     }
-    pub fn preflight(mut self, command: Vec<String>) -> Self {
-        self.preflight_command = Some(command);
+    pub fn transition(mut self, command: Vec<String>) -> Self {
+        self.transition_command = Some(command);
         self
     }
     pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
@@ -346,10 +411,10 @@ impl Sup {
     fn write_config(&self) -> R<PathBuf> {
         self.seed_install()?;
         let mut t = format!(
-            "[repository]\nroot = {}\nmetadata_url = {}\ntargets_url = {}\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
+            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/node.json'\n\n[repository]\nroot = {}\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
             lit(&self.root.display().to_string()),
-            lit(&self.meta_url),
-            lit(&self.targets_url),
+            lit(&self.repository_base_url),
+            lit(&self.root.display().to_string()),
             lit(&self.product),
             lit(&self.install_root.display().to_string()),
             self.args.iter().map(|s| lit(s)).collect::<Vec<_>>().join(", "),
@@ -357,21 +422,14 @@ impl Sup {
         if let Some(u) = &self.health_url {
             t += &format!("health_url = {}\n", lit(u));
         }
-        if let Some(c) = &self.reexec_command {
+        if let Some(c) = &self.transition_command {
+            if self.reexec {
+                t += "\n[application.activation]\nmode = \"reexec\"\n";
+            }
             t += &format!(
-                "\n[application.activation]\nmode = \"reexec\"\ncommand = [{}]\n",
+                "\n[application.transition]\ncommand = [{}]\ntimeout = \"5s\"\n",
                 c.iter().map(|arg| lit(arg)).collect::<Vec<_>>().join(", ")
             );
-            if let Some(preflight) = &self.preflight_command {
-                t += &format!(
-                    "preflight_command = [{}]\n",
-                    preflight
-                        .iter()
-                        .map(|arg| lit(arg))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
         }
         let mut to = String::new();
         for (k, v) in [
@@ -406,6 +464,8 @@ impl Sup {
             download: self.install_root.join("staging/bundle.download"),
             state: self.install_root.join("state/installed.json"),
             datastore: self.install_root.join("state/tuf"),
+            routing_datastore: self.install_root.join("state/routing-tuf"),
+            assignment: self.install_root.join("state/repository-assignment.json"),
             journal: self.install_root.join("state/transaction.json"),
             rejected: self.install_root.join("state/rejected"),
             app_token: self.install_root.join("state/app-token"),

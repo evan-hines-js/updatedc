@@ -89,18 +89,8 @@ pub(crate) async fn check_application(
             AppOutcome::Upgraded { version }
         }
         Ok(failure @ (Outcome::RolledBack | Outcome::RejectedBeforeActivation)) => {
-            // Persist the rejection BEFORE logging the rollback, so the log reflects a
-            // durable outcome: a crash in this window must not leave a "rolling back"
-            // record with no rejection actually recorded (it would just re-apply the
-            // bad release on the next check).
-            if let Err(e) = store.reject(&sha) {
-                error(&format!(
-                    "rolled back {version}, but could not durably reject its bytes: {e}"
-                ));
-                return AppOutcome::Fatal(format!(
-                    "persisting rejection for rolled-back {version}: {e}"
-                ));
-            }
+            // The transaction persisted rejection before beginning any rollback. This
+            // layer reports the already-durable result; it never owns transaction state.
             match failure {
                 Outcome::RolledBack => warn(&format!(
                     "rolling back to {from}: update to {version} failed activation or health"
@@ -109,7 +99,14 @@ pub(crate) async fn check_application(
                     "rejected {version} before activation; {from} remains running"
                 )),
                 Outcome::Committed => unreachable!(),
+                Outcome::Deferred => unreachable!(),
             }
+            AppOutcome::Unchanged
+        }
+        Ok(Outcome::Deferred) => {
+            warn(&format!(
+                "deferred update to {version}; operator transition state was not ready"
+            ));
             AppOutcome::Unchanged
         }
         Err(e) => {

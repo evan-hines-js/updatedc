@@ -397,7 +397,9 @@ fn validate_target_name(name: &str) -> Result<()> {
             && !part.contains(['\\', ':'])
             && !part.chars().any(char::is_control)
     };
-    if parts.len() != 6 || parts[0] != "products" || !parts.iter().all(|p| safe(p)) {
+    let known_layout = (parts.len() == 6 && parts[0] == "products")
+        || (parts.len() == 2 && parts[0] == "assignments" && parts[1].ends_with(".json"));
+    if !known_layout || !parts.iter().all(|p| safe(p)) {
         return Err(RepoError(format!("unsafe target path {name:?}")));
     }
     Ok(())
@@ -460,8 +462,10 @@ mod tests {
     }
 
     #[test]
-    fn target_names_are_confined_to_the_product_layout() {
+    fn target_names_are_confined_to_known_layouts() {
         assert!(validate_target_name("products/app/stable/1.0.0/linux-x86_64/app").is_ok());
+        assert!(validate_target_name("assignments/node-123.json").is_ok());
+        assert!(validate_target_name("assignments/group/node.json").is_err());
         assert!(validate_target_name("products/../../outside/stable/1.0/app").is_err());
         assert!(validate_target_name("products/app/stable/1.0/linux/app/extra").is_err());
         assert!(validate_target_name("products/app/stable/1.0/linux/app\\evil").is_err());

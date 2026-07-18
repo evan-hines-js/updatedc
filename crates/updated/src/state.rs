@@ -34,13 +34,34 @@ pub struct InstalledState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pending {
+    pub transition_id: String,
     pub previous_release: ReleaseId,
     pub previous_archive_sha256: String,
+    /// A crash rollback requires the operator transition adapter.
+    pub transition_required: bool,
     /// Unix seconds when the update committed.
     pub committed_at: u64,
 }
 
 impl InstalledState {
+    fn validate(&self) -> io::Result<()> {
+        if let Some(pending) = &self.pending {
+            if pending.transition_id.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending transition id must not be empty",
+                ));
+            }
+            if pending.previous_release == self.release {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending predecessor must differ from the installed release",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// A confirmed install (no pending rollback).
     pub fn confirmed(release: ReleaseId, archive_sha256: String) -> Self {
         InstalledState {
@@ -64,8 +85,8 @@ pub enum Installed {
 pub fn read_installed(path: &Path) -> Installed {
     match std::fs::read(path) {
         Ok(raw) => match serde_json::from_slice::<InstalledState>(&raw) {
-            Ok(s) => Installed::Present(s),
-            Err(_) => Installed::Invalid,
+            Ok(s) if s.validate().is_ok() => Installed::Present(s),
+            Ok(_) | Err(_) => Installed::Invalid,
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Installed::Missing,
         Err(_) => Installed::Invalid,
@@ -74,6 +95,7 @@ pub fn read_installed(path: &Path) -> Installed {
 
 /// Atomically and durably write the committed record.
 pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
+    state.validate()?;
     apply::atomic_write(path, &serde_json::to_vec(state).map_err(io::Error::other)?)
 }
 
@@ -100,11 +122,13 @@ mod tests {
                 },
                 archive_sha256: "abcd".into(),
                 pending: Some(Pending {
+                    transition_id: "transition".into(),
                     previous_release: ReleaseId {
                         version: "2.3.3".into(),
                         manifest_sha256: "old-manifest".into(),
                     },
                     previous_archive_sha256: "beef".into(),
+                    transition_required: true,
                     committed_at: 1_700_000_000,
                 }),
             },
