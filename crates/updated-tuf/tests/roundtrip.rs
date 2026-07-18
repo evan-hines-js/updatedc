@@ -260,5 +260,28 @@ async fn publish_then_verify_and_download() {
     );
     assert!(!repo_dir.join("targets").join(assignment_name).exists());
 
+    // Exact-set publication removes obsolete logical routes from the new metadata while
+    // retaining immutable objects needed by readers of older metadata generations.
+    let exact = tmp.join("exact-assignment");
+    std::fs::write(&exact, b"only current route").unwrap();
+    repo::replace_release(
+        &repo_dir,
+        &keys,
+        vec![repo::PublishTarget {
+            name: "assignments/nodes/current.json".into(),
+            source: exact,
+            custom: Default::default(),
+        }],
+        365,
+    )
+    .await
+    .unwrap();
+    let replaced = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds-replaced"))
+        .await
+        .unwrap();
+    let current = replaced.all_targets();
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].path, "assignments/nodes/current.json");
+
     let _ = std::fs::remove_dir_all(&tmp);
 }

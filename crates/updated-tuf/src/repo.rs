@@ -255,6 +255,28 @@ pub async fn add_release(
     targets: Vec<PublishTarget>,
     expiry_days: i64,
 ) -> Result<()> {
+    publish_release(repo_dir, keys, targets, expiry_days, false).await
+}
+
+/// Publish an exact target set, removing every target that is not in `targets` from
+/// the new metadata generation. Immutable target objects remain on disk for readers
+/// pinned to an older metadata snapshot.
+pub async fn replace_release(
+    repo_dir: &Path,
+    keys: &Keys,
+    targets: Vec<PublishTarget>,
+    expiry_days: i64,
+) -> Result<()> {
+    publish_release(repo_dir, keys, targets, expiry_days, true).await
+}
+
+async fn publish_release(
+    repo_dir: &Path,
+    keys: &Keys,
+    targets: Vec<PublishTarget>,
+    expiry_days: i64,
+    replace_targets: bool,
+) -> Result<()> {
     let metadata_dir = repo_dir.join("metadata");
     let targets_dir = repo_dir.join("targets");
     let root_path = metadata_dir.join("root.json");
@@ -313,6 +335,12 @@ pub async fn add_release(
         .snapshot_expires(expires)
         .timestamp_version(next_timestamp)
         .timestamp_expires(expires);
+
+    if replace_targets {
+        editor
+            .clear_targets()
+            .map_err(|e| err("clearing previous targets", e))?;
+    }
 
     for (pt, staged_path) in targets.iter().zip(&staged.0) {
         let mut target = Target::from_path(staged_path)
@@ -468,7 +496,7 @@ fn validate_target_name(name: &str) -> Result<()> {
         || (parts.len() == 2 && parts[0] == "provider-sets" && parts[1].ends_with(".json"))
         || (parts.len() == 3
             && parts[0] == "assignments"
-            && matches!(parts[1], "groups" | "nodes")
+            && matches!(parts[1], "configs" | "nodes")
             && parts[2].ends_with(".json"));
     if !known_layout || !parts.iter().all(|p| safe(p)) {
         return Err(RepoError(format!("unsafe target path {name:?}")));
