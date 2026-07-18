@@ -72,6 +72,41 @@ pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
     sync_dir(dir)
 }
 
+/// Copy a verified executable into a fresh sibling file, persist its final mode,
+/// and atomically install it at `target`.
+pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
+    let dir = parent_dir(target);
+    let (mut tmp, tmp_path) = create_temp(dir, ".executable-")?;
+    let staged = File::open(source)
+        .and_then(|mut source| io::copy(&mut source, &mut tmp))
+        .and_then(|_| tmp.sync_all());
+    if let Err(error) = staged {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    drop(tmp);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(target)
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+            .unwrap_or(0o755);
+        if let Err(error) = fs::set_permissions(&tmp_path, PermissionsExt::from_mode(mode | 0o700))
+            .and_then(|_| File::open(&tmp_path)?.sync_all())
+        {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = replace(&tmp_path, target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    sync_dir(dir)
+}
+
 pub fn remove_file(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
@@ -135,6 +170,26 @@ mod tests {
         atomic_write(&p, ".test-", b"first").unwrap();
         atomic_write(&p, ".test-", b"second-longer").unwrap();
         assert_eq!(fs::read(p).unwrap(), b"second-longer");
+    }
+
+    #[test]
+    fn executable_install_uses_the_canonical_durable_path() {
+        let root = dir("executable");
+        let source = root.join("download");
+        let target = root.join("supervisor");
+        fs::write(&source, b"verified bytes").unwrap();
+
+        install_executable(&target, &source).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"verified bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                fs::metadata(target).unwrap().permissions().mode() & 0o100,
+                0
+            );
+        }
     }
 
     #[test]

@@ -98,7 +98,7 @@ impl Rejections {
             out.push_str(&ts.to_string());
             out.push('\n');
         }
-        crate::apply::atomic_write(&self.path, out.as_bytes())
+        foundation::durable::atomic_write(&self.path, ".rejections-", out.as_bytes())
     }
 }
 

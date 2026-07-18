@@ -6,10 +6,6 @@ pub(crate) enum AppOutcome {
     Fatal(String),
 }
 
-fn assignment_is_current(current: &Option<String>, assigned_version: &str) -> bool {
-    current.as_deref() == Some(assigned_version)
-}
-
 async fn stage_lifecycle_provider(
     opts: &Options,
     repo: &TrustedRepository,
@@ -107,24 +103,6 @@ pub(crate) async fn check_application(
     // A persisted rejection applies to the failed bytes only (keyed by hash), so it
     // pins the installation neither below a healthy intermediate release nor against
     // a corrected republish of the same version.
-    let Some(assignment) = repo.assignment() else {
-        return AppOutcome::Fatal("release repository has no desired deployment".into());
-    };
-    let target = match repo.exact_target(&assignment.application) {
-        Ok(target) => target,
-        Err(error) => {
-            warn(&format!("resolving desired application failed: {error}"));
-            return AppOutcome::Unchanged;
-        }
-    };
-    let version = match target
-        .custom
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some(version) => version.to_string(),
-        None => return AppOutcome::Fatal("desired application metadata has no version".into()),
-    };
     // Provider-only deployment revisions reconcile here as well. Staging is
     // content-addressed and side-effect free; no lifecycle phase runs until an app
     // transaction consumes this exact resolved provider.
@@ -148,22 +126,20 @@ pub(crate) async fn check_application(
     // transaction when the assigned application version is already running. In
     // particular, a corrected or nondeterministically repacked target with the same
     // version cannot be its own rollback predecessor.
-    if assignment_is_current(current, &version) {
-        return AppOutcome::Unchanged;
-    }
-    if let Err(error) = policy.authorize(current.as_deref(), &target) {
-        warn(&format!(
-            "desired application was rejected by policy: {error}"
-        ));
-        return AppOutcome::Unchanged;
-    }
-    let sha = target_sha(&target);
-    if store.is_rejected(&sha) {
+    let selected = match repo.assigned_application(&policy, current.as_deref()) {
+        Ok(Some(selected)) => selected,
+        Ok(None) => return AppOutcome::Unchanged,
+        Err(error) => {
+            warn(&format!("selecting desired application failed: {error}"));
+            return AppOutcome::Unchanged;
+        }
+    };
+    if store.is_rejected(&selected.sha256) {
         return AppOutcome::Unchanged;
     }
     // Every provider is now present before downloading the application. Nothing
     // below this point writes transaction intent or touches the live deployment.
-    if let Err(error) = repo.download_target(&target, &opts.paths.download).await {
+    if let Err(error) = repo.stage_release(&selected, &opts.paths.download).await {
         warn(&format!("acquiring application release failed: {error}"));
         return AppOutcome::Unchanged;
     }
@@ -174,18 +150,20 @@ pub(crate) async fn check_application(
             &opts.paths.download,
             &updated::bundle::ExpectedBundle {
                 product: &opts.application.product,
-                version: &version,
+                version: &selected.version,
                 platform: &platform,
             },
         ) {
         Ok(release) => release,
         Err(error) => {
             warn(&format!(
-                "staging application bundle {version} failed: {error}"
+                "staging application bundle {} failed: {error}",
+                selected.version
             ));
-            if let Err(reject_error) = store.reject(&sha) {
+            if let Err(reject_error) = store.reject(&selected.sha256) {
                 return AppOutcome::Fatal(format!(
-                    "rejecting malformed application bundle {version}: {reject_error}"
+                    "rejecting malformed application bundle {}: {reject_error}",
+                    selected.version
                 ));
             }
             return AppOutcome::Unchanged;
@@ -193,32 +171,48 @@ pub(crate) async fn check_application(
     };
 
     let from = current.as_deref().unwrap_or("none");
-    log(&format!("applying update {from} -> {version}"));
+    log(&format!("applying update {from} -> {}", selected.version));
     // Drive the transaction over the live-application port; scope the tower so its borrow of
     // `app` is released before the arms below read `app.pid()`.
     let outcome = {
         let mut tower = DefaultProvider::new(app, opts, lifecycle.as_ref());
-        apply_update(&mut tower, store, &release.id, &sha, lifecycle.clone()).await
+        apply_update(
+            &mut tower,
+            store,
+            &release.id,
+            &selected.sha256,
+            lifecycle.clone(),
+        )
+        .await
     };
     match outcome {
         Ok(Outcome::Committed) => {
-            if let Err(e) = store.clear_rejection(&sha) {
+            if let Err(e) = store.clear_rejection(&selected.sha256) {
                 warn(&format!(
-                    "upgraded to {version}, but clearing its stale rejection failed: {e}"
+                    "upgraded to {}, but clearing its stale rejection failed: {e}",
+                    selected.version
                 ));
             }
-            log(&format!("upgraded to {version} (pid {})", app.pid()));
-            AppOutcome::Upgraded { version }
+            log(&format!(
+                "upgraded to {} (pid {})",
+                selected.version,
+                app.pid()
+            ));
+            AppOutcome::Upgraded {
+                version: selected.version,
+            }
         }
         Ok(failure @ (Outcome::RolledBack | Outcome::RejectedBeforeActivation)) => {
             // The transaction persisted rejection before beginning any rollback. This
             // layer reports the already-durable result; it never owns transaction state.
             match failure {
                 Outcome::RolledBack => warn(&format!(
-                    "rolling back to {from}: update to {version} failed activation or health"
+                    "rolling back to {from}: update to {} failed activation or health",
+                    selected.version
                 )),
                 Outcome::RejectedBeforeActivation => warn(&format!(
-                    "rejected {version} before activation; {from} remains running"
+                    "rejected {} before activation; {from} remains running",
+                    selected.version
                 )),
                 Outcome::Committed => unreachable!(),
                 Outcome::Deferred => unreachable!(),
@@ -227,7 +221,8 @@ pub(crate) async fn check_application(
         }
         Ok(Outcome::Deferred) => {
             warn(&format!(
-                "deferred update to {version}; operator lifecycle state was not ready"
+                "deferred update to {}; operator lifecycle state was not ready",
+                selected.version
             ));
             AppOutcome::Unchanged
         }
@@ -235,18 +230,5 @@ pub(crate) async fn check_application(
             error(&format!("update transaction error: {e}"));
             AppOutcome::Fatal(e.to_string())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::assignment_is_current;
-
-    #[test]
-    fn a_republished_current_version_never_becomes_an_update_transaction() {
-        let current = Some("1.0.0".to_string());
-        assert!(assignment_is_current(&current, "1.0.0"));
-        assert!(!assignment_is_current(&current, "2.0.0"));
-        assert!(!assignment_is_current(&None, "1.0.0"));
     }
 }

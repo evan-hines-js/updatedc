@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
 
-use crate::apply;
 use crate::bundle::ReleaseId;
 use crate::state::LifecycleProviderRelease;
 
@@ -280,11 +279,15 @@ pub fn read(path: &Path) -> io::Result<Option<Transaction>> {
 
 pub fn write(path: &Path, tx: &Transaction) -> io::Result<()> {
     tx.validate()?;
-    apply::atomic_write(path, &serde_json::to_vec(tx).map_err(io::Error::other)?)
+    foundation::durable::atomic_write(
+        path,
+        ".transaction-",
+        &serde_json::to_vec(tx).map_err(io::Error::other)?,
+    )
 }
 
 pub fn clear(path: &Path) -> io::Result<()> {
-    apply::remove_file_durable(path)
+    foundation::durable::remove_file(path)
 }
 
 #[cfg(test)]

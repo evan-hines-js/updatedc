@@ -98,7 +98,7 @@ impl SelfUpdateState {
         let download = with_suffix(&path, ".download");
         repo.stage_release(selected, &download).await?;
         verify_file(&download, &selected.sha256)?;
-        apply::install_executable(&path, &download)?;
+        foundation::durable::install_executable(&path, &download)?;
         let _ = std::fs::remove_file(&download);
         log(&format!(
             "supervisor self-update {} staged at {}; handing off to the guardian",

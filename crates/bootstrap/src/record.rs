@@ -13,8 +13,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::durable;
-
 const DESIRED_FILE: &str = "desired-supervisor";
 
 /// The committed supervisor binary path. `None` on first boot (the installer or the
@@ -60,7 +58,7 @@ fn write_pointer(path: &Path, target: &Path) -> std::io::Result<()> {
         .to_str()
         .ok_or_else(|| std::io::Error::other("supervisor path is not valid UTF-8"))?;
     let body = format!("supervisor-v1\n{target}\n");
-    durable::atomic_write(path, body.as_bytes())
+    foundation::durable::atomic_write(path, ".guardian-", body.as_bytes())
 }
 
 /// Note that the last application exit was a crash (the guardian rolled its code up).
@@ -70,7 +68,11 @@ fn write_pointer(path: &Path, target: &Path) -> std::io::Result<()> {
 pub fn mark_app_crashed(state_dir: &Path) -> std::io::Result<()> {
     // Durable (atomic write + fsync), like the desired pointer: a crash marker lost to
     // power loss would let a crash-looping update come back up unreverted on reboot.
-    durable::atomic_write(&state_dir.join(control::CRASH_MARKER_FILE), b"")
+    foundation::durable::atomic_write(
+        &state_dir.join(control::CRASH_MARKER_FILE),
+        ".guardian-",
+        b"",
+    )
 }
 
 /// Note the path of a candidate supervisor that failed its readiness gate, for the
@@ -80,8 +82,9 @@ pub fn mark_rejected_supervisor(state_dir: &Path, candidate: &Path) -> std::io::
     if let Some(s) = candidate.to_str() {
         // Durable + atomic so a crash mid-write can't leave a truncated path and a power
         // loss can't drop the rejection (which would let the bad candidate be re-staged).
-        durable::atomic_write(
+        foundation::durable::atomic_write(
             &state_dir.join(control::REJECTED_SUPERVISOR_FILE),
+            ".guardian-",
             s.as_bytes(),
         )
     } else {

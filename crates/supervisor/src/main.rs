@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use updated::config::{
     with_suffix, Activation, Application, Paths, Repository, Routing, Storage, Timeouts,
 };
-use updated::{apply, env, health};
+use updated::{env, health};
 mod app;
 mod boot;
 mod domain;

@@ -22,7 +22,6 @@
 //! a duplicate.
 
 mod app;
-mod durable;
 mod guardian;
 mod log;
 mod rand;

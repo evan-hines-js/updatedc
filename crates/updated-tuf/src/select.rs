@@ -96,6 +96,36 @@ pub struct SelectedRelease {
 
 /// Shared select-and-download path used by supervised and one-shot modes.
 impl TrustedRepository {
+    /// Resolve and authorize the application pinned by the signed deployment
+    /// assignment. Unlike repository-wide selection, this never substitutes a
+    /// different target when the exact desired release is unavailable.
+    pub fn assigned_application(
+        &self,
+        policy: &DefaultPolicy,
+        current: Option<&str>,
+    ) -> Result<Option<SelectedRelease>, crate::Error> {
+        let assignment = self.assignment().ok_or_else(|| {
+            crate::Error::Trust("release repository has no desired deployment".into())
+        })?;
+        let target = self.exact_target(&assignment.application)?;
+        let version = policy
+            .candidate_version(&target)
+            .map_err(|error| crate::Error::Trust(error.to_string()))?
+            .to_string();
+        if current == Some(version.as_str()) {
+            return Ok(None);
+        }
+        policy
+            .authorize(current, &target)
+            .map_err(|error| crate::Error::Trust(error.to_string()))?;
+        let sha256 = target_sha(&target);
+        Ok(Some(SelectedRelease {
+            target,
+            version,
+            sha256,
+        }))
+    }
+
     pub fn select_release(
         &self,
         policy: &DefaultPolicy,

@@ -246,7 +246,11 @@ pub fn read_active(path: &Path) -> io::Result<Option<ReleaseId>> {
 }
 
 pub fn write_active(path: &Path, release: &ReleaseId) -> io::Result<()> {
-    crate::apply::atomic_write(path, &serde_json::to_vec(release).map_err(invalid)?)
+    foundation::durable::atomic_write(
+        path,
+        ".active-release-",
+        &serde_json::to_vec(release).map_err(invalid)?,
+    )
 }
 
 pub(crate) fn stage_bundle(

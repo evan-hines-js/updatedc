@@ -9,9 +9,7 @@ use updated::config::{config_path, Config, Paths};
 use updated::lock::InstanceLock;
 use updated::provider::BundleStore;
 use updated::reject::Rejections;
-use updated::state::{read_installed, write_installed, Installed, InstalledState};
-use updated::transaction::{self, Recovery};
-use updated_tuf::select::target_sha;
+use updated::state::{read_installed, Installed, InstalledState};
 use updated_tuf::{DefaultPolicy, TrustedRepository};
 
 fn main() -> ExitCode {
@@ -30,7 +28,8 @@ fn run() -> Result<(), String> {
     let paths = config.resolve_paths()?;
     let _lock = InstanceLock::acquire(&paths.install_root.join("state/instance.lock"))
         .map_err(|error| format!("another updater owns this install: {error}"))?;
-    reconcile(&paths).map_err(|error| format!("recovering bundle transaction: {error}"))?;
+    updated::on_launch::reconcile(&paths)
+        .map_err(|error| format!("recovering bundle transaction: {error}"))?;
     let installed = match read_installed(&paths.state) {
         Installed::Present(state) => state,
         Installed::Missing => {
@@ -59,32 +58,19 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
             .await
             .map_err(|error| format!("loading repository: {error}"))?;
     let policy = DefaultPolicy::current(&config.application.product, &config.application.channel);
-    let assignment = repository
-        .assignment()
-        .ok_or("release repository has no desired deployment")?;
-    let target = repository
-        .exact_target(&assignment.application)
-        .map_err(|error| format!("resolving desired application: {error}"))?;
-    let version = target
-        .custom
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("desired application metadata has no version")?
-        .to_string();
-    if version == installed.release.version {
+    let Some(selected) = repository
+        .assigned_application(&policy, Some(&installed.release.version))
+        .map_err(|error| format!("selecting desired application: {error}"))?
+    else {
         return Ok(());
-    }
-    policy
-        .authorize(Some(&installed.release.version), &target)
-        .map_err(|error| error.to_string())?;
-    let sha = target_sha(&target);
-    if rejected.is_rejected(&sha) {
+    };
+    if rejected.is_rejected(&selected.sha256) {
         return Ok(());
     }
     repository
-        .download_target(&target, &paths.download)
+        .stage_release(&selected, &paths.download)
         .await
-        .map_err(|error| format!("downloading bundle {version}: {error}"))?;
+        .map_err(|error| format!("downloading bundle {}: {error}", selected.version))?;
     let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let provider = BundleStore::for_app(paths).with_target_limit(config.repository.target_limit);
     let staged = provider
@@ -92,43 +78,14 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
             &paths.download,
             &ExpectedBundle {
                 product: &config.application.product,
-                version: &version,
+                version: &selected.version,
                 platform: &platform,
             },
         )
-        .map_err(|error| format!("staging bundle {version}: {error}"))?;
-    let mut tx = updated::transaction::Transaction {
-        id: updated::rand::token().map_err(|error| error.to_string())?,
-        kind: updated::transaction::Kind::OnLaunch,
-        previous_release: installed.release.clone(),
-        previous_archive_sha256: installed.archive_sha256.clone(),
-        candidate_release: staged.id.clone(),
-        candidate_archive_sha256: sha.clone(),
-        candidate_rejection_required: false,
-        lifecycle: None,
-        phase: updated::transaction::Phase::Started,
-    };
-    transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
-    write_active(&paths.active_release, &staged.id).map_err(|error| error.to_string())?;
-    tx.advance(updated::transaction::Phase::CandidateActivated)
+        .map_err(|error| format!("staging bundle {}: {error}", selected.version))?;
+    updated::on_launch::activate(paths, installed, staged.id, selected.sha256.clone())
         .map_err(|error| error.to_string())?;
-    transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
-    provider
-        .resolve(&staged.id)
-        .map_err(|error| error.to_string())?;
-    tx.advance(updated::transaction::Phase::CandidateVerified)
-        .map_err(|error| error.to_string())?;
-    transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
-    write_installed(
-        &paths.state,
-        &InstalledState::confirmed(staged.id, sha.clone()),
-    )
-    .map_err(|error| error.to_string())?;
-    tx.advance(updated::transaction::Phase::Committed)
-        .map_err(|error| error.to_string())?;
-    transaction::write(&paths.journal, &tx).map_err(|error| error.to_string())?;
-    transaction::clear(&paths.journal).map_err(|error| error.to_string())?;
-    if let Err(error) = rejected.clear(&sha) {
+    if let Err(error) = rejected.clear(&selected.sha256) {
         warn(
             "oneshot",
             &format!("could not clear stale rejection: {error}"),
@@ -136,28 +93,12 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
     }
     info(
         "oneshot",
-        &format!("updated {} -> {}", installed.release.version, version),
+        &format!(
+            "updated {} -> {}",
+            installed.release.version, selected.version
+        ),
     );
     Ok(())
-}
-
-fn reconcile(paths: &Paths) -> io::Result<()> {
-    let Some(tx) = transaction::read(&paths.journal)? else {
-        return Ok(());
-    };
-    let active = read_active(&paths.active_release)?;
-    let committed = match read_installed(&paths.state) {
-        Installed::Present(state) => Some(state.release),
-        Installed::Missing | Installed::Invalid => None,
-    };
-    match transaction::classify_recovery(&tx, active.as_ref(), committed.as_ref()) {
-        Recovery::Committed | Recovery::NeverSwapped => {}
-        Recovery::RestorePredecessor => {
-            BundleStore::for_app(paths).resolve(&tx.previous_release)?;
-            write_active(&paths.active_release, &tx.previous_release)?;
-        }
-    }
-    transaction::clear(&paths.journal)
 }
 
 fn verify_active(paths: &Paths, installed: &InstalledState) -> io::Result<()> {

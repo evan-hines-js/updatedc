@@ -9,7 +9,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::apply;
 use crate::bundle::ReleaseId;
 
 /// Exact independently signed lifecycle provider pinned to an update attempt.
@@ -116,7 +115,11 @@ pub fn read_installed(path: &Path) -> Installed {
 /// Atomically and durably write the committed record.
 pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
     state.validate()?;
-    apply::atomic_write(path, &serde_json::to_vec(state).map_err(io::Error::other)?)
+    foundation::durable::atomic_write(
+        path,
+        ".state-",
+        &serde_json::to_vec(state).map_err(io::Error::other)?,
+    )
 }
 
 #[cfg(test)]

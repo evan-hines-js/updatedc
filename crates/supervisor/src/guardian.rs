@@ -133,7 +133,7 @@ pub(crate) fn take_crash_marker(state_dir: &Path) -> std::io::Result<bool> {
     let path = state_dir.join(control::CRASH_MARKER_FILE);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            updated::apply::remove_file_durable(&path)?;
+            foundation::durable::remove_file(&path)?;
             Ok(true)
         }
         Ok(_) => Err(std::io::Error::new(
@@ -156,7 +156,7 @@ pub(crate) fn take_rejected_supervisor(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    updated::apply::remove_file_durable(&path)?;
+    foundation::durable::remove_file(&path)?;
     let trimmed = content.trim();
     if trimmed.is_empty() || content.lines().count() != 1 {
         return Err(std::io::Error::new(

@@ -10,7 +10,6 @@
 //! on disk, plus the small OS glue the supervisor needs. Application process
 //! ownership and boot-safe identity now live in the guardian (`bootstrap`), not here.
 
-pub mod apply;
 pub mod bundle;
 pub mod config;
 pub mod env;
@@ -18,6 +17,7 @@ pub mod gc;
 pub mod hash;
 pub mod health;
 pub mod lock;
+pub mod on_launch;
 pub mod provider;
 pub mod rand;
 pub mod reject;

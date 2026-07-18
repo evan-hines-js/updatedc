@@ -120,7 +120,7 @@ fn app_spec(opts: &Options, health_token: &str) -> io::Result<CommandSpec> {
 }
 
 fn write_app_token(path: &Path, token: &str) -> io::Result<()> {
-    apply::atomic_write(path, token.as_bytes())
+    foundation::durable::atomic_write(path, ".app-token-", token.as_bytes())
 }
 
 fn read_app_token(path: &Path) -> io::Result<String> {
@@ -135,7 +135,7 @@ fn read_app_token(path: &Path) -> io::Result<String> {
 }
 
 fn clear_app_token(path: &Path) -> io::Result<()> {
-    updated::apply::remove_file_durable(path)
+    foundation::durable::remove_file(path)
 }
 
 /// Ask the guardian to stop the application (it escalates to a hard kill), then clear the
