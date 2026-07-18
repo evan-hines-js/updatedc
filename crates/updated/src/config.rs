@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use url::{Host, Url};
 
 /// The whole configuration, deserialized from the TOML file.
 #[derive(Debug, Deserialize)]
@@ -370,6 +371,9 @@ impl Config {
         if !self.application.install_root.is_absolute() {
             return Err("application.install_root must be absolute".into());
         }
+        if let Some(raw) = &self.application.health_url {
+            validate_health_url(raw)?;
+        }
         if let Activation::Reexec = &self.application.activation {
             if !cfg!(unix) {
                 return Err("application.activation reexec mode is supported only on Unix".into());
@@ -506,18 +510,57 @@ pub fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
 /// prints usage and exits; `prog` names the binary in that message. Returns the
 /// config path, or an `Err` usage string the caller reports before exiting.
 pub fn config_path(prog: &str) -> Result<PathBuf, String> {
-    let mut args = std::env::args().skip(1);
+    config_path_from(prog, std::env::args_os().skip(1))
+}
+
+fn config_path_from(
+    prog: &str,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let usage = || format!("usage: {prog} --config <path.toml>");
+    let mut args = args.into_iter();
     match args.next().as_deref() {
-        Some("--config") => args
-            .next()
-            .map(PathBuf::from)
-            .ok_or_else(|| "--config needs a path".into()),
-        Some("-h") | Some("--help") => {
-            println!("usage: {prog} --config <path.toml>");
+        Some(value) if value == "--config" => {
+            let path = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| "--config needs a path".to_string())?;
+            if args.next().is_some() {
+                return Err(format!("unexpected trailing argument; {}", usage()));
+            }
+            Ok(path)
+        }
+        Some(value) if value == "-h" || value == "--help" => {
+            println!("{}", usage());
             std::process::exit(0);
         }
-        _ => Err(format!("usage: {prog} --config <path.toml>")),
+        _ => Err(usage()),
     }
+}
+
+fn validate_health_url(raw: &str) -> Result<(), String> {
+    let url = Url::parse(raw).map_err(|error| format!("application.health_url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.cannot_be_a_base()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "application.health_url must be an HTTP(S) URL without credentials or a fragment"
+                .into(),
+        );
+    }
+    let loopback = match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(_)) => false,
+        None => false,
+    };
+    if !loopback {
+        return Err("application.health_url must use a numeric loopback address".into());
+    }
+    Ok(())
 }
 
 /// Human-friendly durations: `"15s"`, `"5m"`, `"2h"`, `"500ms"`, or a bare integer
@@ -558,6 +601,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     fn make_install_root_native(cfg: &mut Config) {
         cfg.application.install_root = if cfg!(windows) {
@@ -773,6 +817,33 @@ mod tests {
         assert_eq!(cfg.routing.transport_timeout, Duration::from_secs(30));
         assert_eq!(cfg.repository.transport_timeout, Duration::from_secs(30));
         assert_eq!(cfg.application.channel, "stable");
+    }
+
+    #[test]
+    fn config_path_rejects_every_trailing_argument() {
+        let args = ["--config", "config.toml", "--typo"]
+            .into_iter()
+            .map(OsString::from);
+        assert!(config_path_from("supervisor", args)
+            .unwrap_err()
+            .contains("unexpected trailing argument"));
+    }
+
+    #[test]
+    fn health_url_is_loopback_and_redirect_safe_by_construction() {
+        for valid in ["http://127.0.0.1:9090/healthz", "http://[::1]:9090/healthz"] {
+            validate_health_url(valid).unwrap();
+        }
+        for invalid in [
+            "http://example.com/healthz",
+            "http://localhost/healthz",
+            "file:///tmp/healthy",
+            "http://user:secret@localhost/healthz",
+            "http://localhost/healthz#fragment",
+            "not a url",
+        ] {
+            assert!(validate_health_url(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

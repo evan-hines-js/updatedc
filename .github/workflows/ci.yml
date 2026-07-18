@@ -12,9 +12,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Scan dependencies, secrets, and configuration
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -41,15 +41,15 @@ jobs:
             release: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
       # aws-lc-rs (via the `tough` TUF client) builds its C with CMake on every
       # OS — preinstalled on the runners — plus NASM on Windows MSVC, which is not.
       - if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-      - uses: Swatinem/rust-cache@v2
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       # Compile and run the test artifacts first. Clippy then reuses Cargo's
       # dependency artifacts and analyzes only this workspace's code.
@@ -85,7 +85,7 @@ jobs:
           )
           Compress-Archive -Path $files -DestinationPath "dist/updated-${{ matrix.release }}.zip"
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: updated-${{ matrix.release }}
           path: dist/*
@@ -96,11 +96,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       # aws-lc-rs requires NASM when building for Windows MSVC.
-      - uses: ilammy/setup-nasm@v1
-      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Exercise native service registration, durable bootstrap state, clean
       # application shutdown, and relaunch after an SCM service restart.
       - name: Exercise the native SCM lifecycle
@@ -116,9 +116,9 @@ jobs:
       matrix:
         mode: [restart, reexec]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Start production-shaped update tower
         env:
           UPDATED_SMOKE_CHECK_INTERVAL: 1s
@@ -131,7 +131,7 @@ jobs:
         run: ./scripts/macos-publish-fuzz.sh
       - name: Preserve failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-publish-fuzz-${{ matrix.mode }}-logs
           path: |
@@ -147,33 +147,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install HAProxy test dependencies
         run: sudo apt-get update && sudo apt-get install -y haproxy
       - name: Exercise real master-worker binary upgrades
         run: ./scripts/linux-haproxy-e2e.sh
       - name: Preserve failure diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-haproxy-e2e-logs
           path: target/haproxy-e2e/*.log
           if-no-files-found: warn
 
   release:
-    name: Publish rolling release
+    name: Publish immutable release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test, trivy, windows-scm-e2e, macos-publish-fuzz, linux-haproxy-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: updated-*
           path: dist
@@ -193,11 +192,16 @@ jobs:
               exit 1
             }
           done
-      - name: Move the edge tag to this verified build
-        run: |
-          git tag --force edge "$GITHUB_SHA"
-          git push --force origin refs/tags/edge
-      - name: Publish four platform packages
+      - name: Generate release checksums
+        working-directory: dist
+        run: sha256sum updated-* > SHA256SUMS
+      - name: Attest release packages and checksums
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/updated-*
+            dist/SHA256SUMS
+      - name: Publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -206,22 +210,14 @@ jobs:
             dist/updated-macos-x86_64.tar.gz
             dist/updated-macos-aarch64.tar.gz
             dist/updated-windows-x86_64.zip
+            dist/SHA256SUMS
           )
-          if gh release view edge >/dev/null 2>&1; then
-            gh release upload edge "${packages[@]}" --clobber
-            gh release edit edge \
-              --title "Latest main build" \
-              --notes "Automated build of main at $GITHUB_SHA." \
-              --prerelease
-          else
-            gh release create edge "${packages[@]}" \
-              --target "$GITHUB_SHA" \
-              --title "Latest main build" \
-              --notes "Automated build of main at $GITHUB_SHA." \
-              --prerelease
-          fi
-
-          release_assets="$(gh release view edge --json assets --jq '.assets[].name')"
+          release_tag="build-$GITHUB_SHA"
+          gh release create "$release_tag" "${packages[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "Verified build $GITHUB_SHA" \
+            --notes "Immutable, attested build of main at $GITHUB_SHA."
+          release_assets="$(gh release view "$release_tag" --json assets --jq '.assets[].name')"
           for package in "${packages[@]}"; do
             name="${package##*/}"
             grep -Fxq "$name" <<<"$release_assets" || {

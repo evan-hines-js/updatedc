@@ -1228,6 +1228,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "foundation",
+ "same-file",
  "semver",
  "serde_json",
  "tokio",
@@ -1685,6 +1686,7 @@ dependencies = [
  "serde_json",
  "tar",
  "toml",
+ "url",
  "zstd",
 ]
 

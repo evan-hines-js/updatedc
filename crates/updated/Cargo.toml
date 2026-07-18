@@ -17,3 +17,4 @@ aws-lc-rs = { workspace = true }
 hex = { workspace = true }
 tar = { workspace = true }
 zstd = { workspace = true }
+url = { workspace = true }

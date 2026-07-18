@@ -281,7 +281,6 @@ markers, and content-addressed supervisor candidates.
   identity. Containing a hostile managed program requires a separate account or sandbox.
 - Unix reexec requires a cooperative HAProxy-like master/worker lifecycle. Windows uses
   stop/activate/start for application updates.
-- Automatic old-release garbage collection is not yet implemented.
 - The included publisher and HTTP server are development components, not production
   signing or distribution infrastructure.
 - Production desktop deployment still requires platform packaging, macOS signing and

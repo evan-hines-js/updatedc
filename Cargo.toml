@@ -47,6 +47,7 @@ tokio = { version = "1", features = [
     "sync",
 ] }
 url = "2"
+same-file = "1"
 # Pinned to match tough's own versions so the trees unify (no duplicates).
 aws-lc-rs = "1"      # the one crypto lib: SHA-256, ed25519 keygen, secure RNG
 jiff = "0.2"         # timestamps for TUF metadata expiry
@@ -70,3 +71,7 @@ windows-sys = { version = "0.59", features = [
 
 [profile.release]
 strip = true
+panic = "abort"
+overflow-checks = true
+lto = "thin"
+codegen-units = 1

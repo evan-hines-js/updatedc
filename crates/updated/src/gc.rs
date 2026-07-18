@@ -73,7 +73,7 @@ pub fn prune_directories(
     }
     entries.sort_by_key(|entry| entry.modified);
     let mut count = entries.len();
-    let mut bytes = entries.iter().map(|entry| entry.bytes).sum::<u64>();
+    let mut bytes = saturating_sum(entries.iter().map(|entry| entry.bytes));
     let mut removed = 0;
     for entry in entries {
         if count <= max_inactive && bytes <= max_inactive_bytes {
@@ -88,6 +88,12 @@ pub fn prune_directories(
         foundation::durable::sync_dir(root)?;
     }
     Ok(removed)
+}
+
+fn saturating_sum(values: impl IntoIterator<Item = u64>) -> u64 {
+    values
+        .into_iter()
+        .fold(0u64, |total, value| total.saturating_add(value))
 }
 
 fn tree_bytes(root: &Path) -> io::Result<u64> {
@@ -191,5 +197,11 @@ mod tests {
             .file_type()
             .is_symlink());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn byte_accounting_saturates_instead_of_wrapping() {
+        let entries = [u64::MAX, 1];
+        assert_eq!(saturating_sum(entries), u64::MAX);
     }
 }

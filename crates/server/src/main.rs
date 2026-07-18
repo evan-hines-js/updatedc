@@ -423,11 +423,8 @@ where
         },
     };
 
-    match resolve(root, path) {
-        Some(file) => match tokio::fs::File::open(&file).await {
-            Ok(file) => respond_file(&mut stream, file, range_start).await,
-            Err(_) => respond_status(&mut stream, 404, b"not found").await,
-        },
+    match open_repository_file(root, path) {
+        Some(file) => respond_file(&mut stream, tokio::fs::File::from_std(file), range_start).await,
         None => respond_status(&mut stream, 404, b"not found").await,
     }
     Ok(())
@@ -436,7 +433,7 @@ where
 /// Map a request path to a file inside `root`, rejecting traversal. Slashes are
 /// allowed (TUF target paths are nested); `..` components and absolute escapes
 /// are not.
-fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
+fn open_repository_file(root: &Path, path: &str) -> Option<std::fs::File> {
     let path = path.split('?').next().unwrap_or(path);
     let mut out = root.to_path_buf();
     let mut parts = path
@@ -453,9 +450,16 @@ fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
         }
         out.push(part);
     }
-    // Must stay within root.
+    // Open before validating and compare stable file identities afterward. If an attacker
+    // swaps any ancestor or symlink during resolution, the opened handle and validated
+    // canonical path refer to different files and the request fails closed.
+    let file = std::fs::File::open(&out).ok()?;
+    let opened = same_file::Handle::from_file(file.try_clone().ok()?).ok()?;
     let canonical = std::fs::canonicalize(&out).ok()?;
-    canonical.starts_with(root).then_some(canonical)
+    if !canonical.starts_with(root) || same_file::Handle::from_path(&canonical).ok()? != opened {
+        return None;
+    }
+    Some(file)
 }
 
 async fn respond_file<S>(stream: &mut S, mut file: tokio::fs::File, range_start: Option<u64>)
@@ -653,17 +657,28 @@ mod tests {
         std::fs::create_dir_all(root.join("metadata")).unwrap();
         std::fs::write(root.join("targets/products/app"), b"target").unwrap();
         let root = std::fs::canonicalize(root).unwrap();
-        assert!(resolve(&root, "/targets/products/app").is_some());
-        assert!(resolve(&root, "/metadata").is_some());
+        assert!(open_repository_file(&root, "/targets/products/app").is_some());
+        assert!(open_repository_file(&root, "/metadata").is_some());
     }
 
     #[test]
     fn resolve_rejects_traversal() {
         let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-        assert!(resolve(&root, "/../etc/passwd").is_none());
-        assert!(resolve(&root, "/a/../../etc").is_none());
-        assert!(resolve(&root, "/.publish.lock").is_none());
-        assert!(resolve(&root, "/keys/root.pk8").is_none());
+        assert!(open_repository_file(&root, "/../etc/passwd").is_none());
+        assert!(open_repository_file(&root, "/a/../../etc").is_none());
+        assert!(open_repository_file(&root, "/.publish.lock").is_none());
+        assert!(open_repository_file(&root, "/keys/root.pk8").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_open_rejects_symlinks_that_escape_the_root() {
+        let root = serve_root("escaping-symlink");
+        let outside = root.parent().unwrap().join("server-outside-target");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("targets/escape")).unwrap();
+        assert!(open_repository_file(&root, "/targets/escape").is_none());
+        std::fs::remove_file(outside).unwrap();
     }
 
     /// Serve one request through an in-memory transport so protocol unit tests do not

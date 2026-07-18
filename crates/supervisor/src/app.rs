@@ -172,13 +172,18 @@ pub(crate) async fn became_healthy(
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(io::Error::other)?;
     let mut readiness = Readiness::new(successes);
     let mut next_probe = Instant::now();
     while Instant::now() < deadline {
         if Instant::now() >= next_probe {
-            let ok = if let Ok(resp) = client.get(url).send().await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let request = client
+                .get(url)
+                .timeout(remaining.min(Duration::from_secs(1)));
+            let ok = if let Ok(resp) = request.send().await {
                 let status_ok = resp.status().is_success();
                 let header = |h: &str| resp.headers().get(h).and_then(|v| v.to_str().ok());
                 status_ok
