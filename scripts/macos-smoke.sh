@@ -89,6 +89,13 @@ publish() {
 start() {
   need_macos
   local mode="${1:-restart}" reload="" baseline
+  local check_interval="${UPDATED_SMOKE_CHECK_INTERVAL:-2s}"
+  local health_grace="${UPDATED_SMOKE_HEALTH_GRACE:-10s}"
+  local confirmation_window="${UPDATED_SMOKE_CONFIRMATION_WINDOW:-10s}"
+  local stop_grace="${UPDATED_SMOKE_STOP_GRACE_SECONDS:-2}"
+  local launchd_throttle="${UPDATED_SMOKE_LAUNCHD_THROTTLE_SECONDS:-2}"
+  [[ "$stop_grace" =~ ^[0-9]+$ ]] || { echo "UPDATED_SMOKE_STOP_GRACE_SECONDS must be a non-negative integer" >&2; exit 2; }
+  [[ "$launchd_throttle" =~ ^[1-9][0-9]*$ ]] || { echo "UPDATED_SMOKE_LAUNCHD_THROTTLE_SECONDS must be a positive integer" >&2; exit 2; }
   [[ "$mode" == restart || "$mode" == reexec ]] || { echo "mode must be restart or reexec" >&2; exit 2; }
   [[ ! -e "$WORK" ]] || { echo "Smoke state exists; run '$0 reset'." >&2; exit 1; }
   mkdir -p "$BIN" "$GUARDIAN_STATE"
@@ -135,9 +142,9 @@ args = ["--addr", "127.0.0.1:19090", "--reload-mode", "$mode"]
 health_url = "http://127.0.0.1:19090/healthz"
 $reload
 [timeouts]
-check_interval = "2s"
-health_grace = "10s"
-confirmation_window = "10s"
+check_interval = "$check_interval"
+health_grace = "$health_grace"
+confirmation_window = "$confirmation_window"
 EOF
   : >"$REPO_LOG"; : >"$TOWER_LOG"
   nohup "$BIN/server" serve --repo "$REPO" --addr 127.0.0.1:18080 >>"$REPO_LOG" 2>&1 &
@@ -149,20 +156,27 @@ EOF
 <key>Label</key><string>$LABEL</string><key>ProgramArguments</key><array>
 <string>$BIN/bootstrap</string><string>--state-dir</string><string>$GUARDIAN_STATE</string>
 <string>--supervisor-config</string><string>$CONFIG</string><string>--supervisor</string><string>$BIN/supervisor</string>
+<string>--stop-grace</string><string>$stop_grace</string>
 </array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>ThrottleInterval</key><integer>$launchd_throttle</integer>
 <key>StandardOutPath</key><string>$TOWER_LOG</string><key>StandardErrorPath</key><string>$TOWER_LOG</string>
 </dict></plist>
 EOF
   plutil -lint "$PLIST" >/dev/null
   launchctl bootstrap "$DOMAIN" "$PLIST"
-  for _ in {1..60}; do
+  for _ in {1..120}; do
     if [[ "$(curl -fsS http://127.0.0.1:19090/version 2>/dev/null || true)" == 1.0.0 ]]; then
       echo "Running manifested bundle 1.0.0 under launchd ($mode mode)"
       return
     fi
     sleep 0.25
   done
-  echo "Application did not become ready; inspect $TOWER_LOG" >&2; return 1
+  echo "Application did not become ready within 30s" >&2
+  echo "--- tower log ---" >&2
+  tail -n 120 "$TOWER_LOG" >&2 2>/dev/null || true
+  echo "--- repository log ---" >&2
+  tail -n 40 "$REPO_LOG" >&2 2>/dev/null || true
+  return 1
 }
 
 case "${1:-}" in

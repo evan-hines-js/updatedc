@@ -224,7 +224,7 @@ preflight_inode="$(stat -Lc '%d:%i' "/proc/$master_pid/exe")"
 publish 3.0.0 "$WORK/bundle-3.0.0"
 sleep 6
 [[ "$(curl -fsS "http://127.0.0.1:$HTTP_PORT/")" == 2.0.0 ]] || fail "invalid binary displaced the healthy release"
-grep -q 'failed preflight' "$TOWER_LOG" || fail "invalid binary preflight failure was not recorded"
+grep -q 'failed transition preflight' "$TOWER_LOG" || fail "invalid binary preflight failure was not recorded"
 grep -q 'rejected 3.0.0 before activation' "$TOWER_LOG" || fail "invalid binary was not rejected before activation"
 [[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "master PID changed during failed preflight"
 [[ "$(stat -Lc '%d:%i' "/proc/$master_pid/exe")" == "$preflight_inode" ]] || fail "failed preflight replaced the live executable"
