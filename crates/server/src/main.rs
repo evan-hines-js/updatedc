@@ -454,6 +454,9 @@ fn open_repository_file(root: &Path, path: &str) -> Option<std::fs::File> {
     // swaps any ancestor or symlink during resolution, the opened handle and validated
     // canonical path refer to different files and the request fails closed.
     let file = std::fs::File::open(&out).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let opened = same_file::Handle::from_file(file.try_clone().ok()?).ok()?;
     let canonical = std::fs::canonicalize(&out).ok()?;
     if !canonical.starts_with(root) || same_file::Handle::from_path(&canonical).ok()? != opened {
@@ -466,18 +469,12 @@ async fn respond_file<S>(stream: &mut S, mut file: tokio::fs::File, range_start:
 where
     S: AsyncWrite + Unpin,
 {
-    // Only a regular file has a body. `File::open` on a directory succeeds on Unix and its
-    // stat reports a non-zero size, so without this a directory URL answers 200 with a
-    // Content-Length that no body can ever satisfy — the client sees a truncated response
-    // and a premature close instead of a 404.
+    // The canonical repository opener admits regular files only. Metadata is read from
+    // the already-validated handle so the declared response length describes these bytes.
     let Ok(metadata) = file.metadata().await else {
         respond_status(stream, 404, b"not found").await;
         return;
     };
-    if !metadata.is_file() {
-        respond_status(stream, 404, b"not found").await;
-        return;
-    }
     let length = metadata.len();
     if range_start.is_some_and(|start| start >= length) {
         let hdr = format!(
@@ -658,7 +655,7 @@ mod tests {
         std::fs::write(root.join("targets/products/app"), b"target").unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         assert!(open_repository_file(&root, "/targets/products/app").is_some());
-        assert!(open_repository_file(&root, "/metadata").is_some());
+        assert!(open_repository_file(&root, "/metadata").is_none());
     }
 
     #[test]
