@@ -197,17 +197,11 @@ mod tests {
             )
             .unwrap();
         let installed_entrypoint = store.location(&staged.id).join("bin/app");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&installed_entrypoint, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        #[cfg(windows)]
-        {
-            let mut permissions = fs::metadata(&installed_entrypoint).unwrap().permissions();
-            permissions.set_readonly(false);
-            fs::set_permissions(&installed_entrypoint, permissions).unwrap();
-        }
+        fs::rename(
+            &installed_entrypoint,
+            installed_entrypoint.with_extension("trusted"),
+        )
+        .unwrap();
         fs::write(installed_entrypoint, b"tampered").unwrap();
         assert!(store.resolve(&staged.id).is_err());
         let _ = fs::remove_dir_all(root);

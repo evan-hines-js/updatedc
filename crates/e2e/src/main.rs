@@ -552,29 +552,38 @@ impl Sup {
                 .split_first()
                 .ok_or("lifecycle command requires an executable")?;
             let program = resolve_executable(program)?;
-            let mut published_source = program.clone();
-            let mut published_entrypoint = format!("bin/lifecycle{}", self.exe);
-            let mut signed_args = provider_args.to_vec();
             #[cfg(unix)]
-            if program.file_name().and_then(|name| name.to_str()) == Some("sh")
-                && provider_args.first().map(String::as_str) == Some("-c")
-                && provider_args.len() == 2
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let tree = self.dir.join("lifecycle-provider-source");
-                published_entrypoint = "bin/lifecycle".into();
-                published_source = tree.clone();
-                std::fs::create_dir_all(tree.join("bin")).map_err(str_err)?;
-                let entrypoint = tree.join(&published_entrypoint);
-                std::fs::write(&entrypoint, format!("#!/bin/sh\n{}\n", provider_args[1]))
-                    .map_err(str_err)?;
-                let mut permissions = std::fs::metadata(&entrypoint)
-                    .map_err(str_err)?
-                    .permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&entrypoint, permissions).map_err(str_err)?;
-                signed_args.clear();
-            }
+            let (published_source, published_entrypoint, signed_args) =
+                if program.file_name().and_then(|name| name.to_str()) == Some("sh")
+                    && provider_args.first().map(String::as_str) == Some("-c")
+                    && provider_args.len() == 2
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let tree = self.dir.join("lifecycle-provider-source");
+                    let published_entrypoint = "bin/lifecycle".to_string();
+                    std::fs::create_dir_all(tree.join("bin")).map_err(str_err)?;
+                    let entrypoint = tree.join(&published_entrypoint);
+                    std::fs::write(&entrypoint, format!("#!/bin/sh\n{}\n", provider_args[1]))
+                        .map_err(str_err)?;
+                    let mut permissions = std::fs::metadata(&entrypoint)
+                        .map_err(str_err)?
+                        .permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&entrypoint, permissions).map_err(str_err)?;
+                    (tree, published_entrypoint, Vec::new())
+                } else {
+                    (
+                        program.clone(),
+                        format!("bin/lifecycle{}", self.exe),
+                        provider_args.to_vec(),
+                    )
+                };
+            #[cfg(not(unix))]
+            let (published_source, published_entrypoint, signed_args) = (
+                program.clone(),
+                format!("bin/lifecycle{}", self.exe),
+                provider_args.to_vec(),
+            );
             let provider_product = format!("{}-lifecycle", self.product);
             harness::run(
                 Command::new(&self.server_bin)
