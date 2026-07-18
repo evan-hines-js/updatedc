@@ -54,9 +54,19 @@ wait_version() {
 wait_new_worker() {
   local master="$1" old="$2" found
   for _ in {1..100}; do
-    while read -r found; do
-      [[ -n "$found" && "$found" != "$old" ]] && { echo "$found"; return; }
-    done < <(pgrep -P "$master" || true)
+    found="$(pgrep -P "$master" 2>/dev/null | sort -n | tail -n1 || true)"
+    [[ -n "$found" && "$found" != "$old" ]] && { echo "$found"; return; }
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_master_loaded_runtime() {
+  local master="$1" expected actual
+  expected="$(stat -Lc '%d:%i' "$INSTALL/runtime/haproxy")"
+  for _ in {1..100}; do
+    actual="$(stat -Lc '%d:%i' "/proc/$master/exe" 2>/dev/null || true)"
+    [[ "$actual" == "$expected" ]] && return
     sleep 0.1
   done
   return 1
@@ -208,18 +218,22 @@ new_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "HAProxy did
 # activation is replayed, rather than relying only on the purpose-built sample server.
 release2="$(find "$INSTALL/versions" -maxdepth 1 -type d -name '2.0.0-*' -print -quit)"
 [[ -n "$release2" ]] || fail "could not locate the immutable HAProxy 2.0.0 release"
+replay_worker="$new_worker"
 for _ in 1 2; do
+  old_worker="$(pgrep -P "$master_pid" | sort -n | tail -n1)"
   UPDATED_TRANSITION_PHASE=activate \
   UPDATED_TRANSITION_ID=haproxy-idempotency-replay \
   UPDATED_CANDIDATE="$release2" \
   UPDATED_INSTALL_ROOT="$INSTALL" \
-  UPDATED_CHILD_PID="$master_pid" \
+    UPDATED_CHILD_PID="$master_pid" \
     "$BIN/transition"
+  replay_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "duplicate activation did not finish worker turnover"
+  wait_master_loaded_runtime "$master_pid" || fail "duplicate activation did not finish master re-exec"
   wait_version 2.0.0
 done
 [[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "idempotent activation replay changed the HAProxy master PID"
 
-preflight_worker="$new_worker"
+preflight_worker="$replay_worker"
 preflight_inode="$(stat -Lc '%d:%i' "/proc/$master_pid/exe")"
 publish 3.0.0 "$WORK/bundle-3.0.0"
 sleep 6

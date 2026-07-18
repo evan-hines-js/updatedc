@@ -125,7 +125,16 @@ case "$UPDATED_TRANSITION_PHASE" in
 esac
 EOF
     chmod 0755 "$BIN/transition"
-    reload=$'\n[application.activation]\nmode = "reexec"\n\n[application.transition]\ncommand = ["'$BIN'/transition"]\ntimeout = "10s"'
+    reload="$(cat <<EOF
+
+[application.activation]
+mode = "reexec"
+
+[application.transition]
+command = ["$BIN/transition"]
+timeout = "10s"
+EOF
+)"
   fi
   cat >"$CONFIG" <<EOF
 [routing]
