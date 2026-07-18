@@ -296,11 +296,17 @@ fn exec_active(args: &[String]) -> std::io::Error {
         Ok(None) => return std::io::Error::other("active release is missing"),
         Err(error) => return error,
     };
-    let (_, entrypoint) = match updated::bundle::read_release(&root.join("versions"), &release) {
-        Ok(found) => found,
-        Err(error) => return error,
-    };
-    let release_dir = root.join("versions").join(release.directory_name());
+    // Trust the committed tree (verified once at ingest) and resolve its entrypoint through
+    // the same default provider the tower uses — no full re-hash on every reload.
+    let launch =
+        match updated::provider::BundleStore::new(root.join("versions"), root.join("staging"))
+            .resolve(&release)
+        {
+            Ok(found) => found,
+            Err(error) => return error,
+        };
+    let entrypoint = launch.program;
+    let release_dir = launch.cwd;
     let previous_dir = match std::env::current_dir() {
         Ok(path) => path,
         Err(error) => return error,

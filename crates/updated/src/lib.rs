@@ -17,6 +17,7 @@ pub mod env;
 pub mod hash;
 pub mod health;
 pub mod lock;
+pub mod provider;
 pub mod rand;
 pub mod reject;
 pub mod state;

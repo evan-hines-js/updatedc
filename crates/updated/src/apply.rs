@@ -14,15 +14,8 @@ fn create_temp(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
 /// never overwrites the running supervisor. (TUF downloads are `0o600`, so the
 /// executable bit is set here.)
 pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
-    install(target, |dst| {
-        let mut src = File::open(source)?;
-        io::copy(&mut src, dst).map(|_| ())
-    })
-}
-
-fn install(target: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
     let dir = foundation::durable::parent_dir(target);
-    let tmp_path = stage(dir, target, write)?;
+    let tmp_path = stage(dir, target, source)?;
     if let Err(e) = replace_path(&tmp_path, target) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
@@ -30,16 +23,13 @@ fn install(target: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io
     sync_dir(dir)
 }
 
-/// Create a temp file next to `target`, run `write`, fsync it, and (on Unix)
-/// carry over the target's mode with the executable bit forced on. Returns the
-/// temp path, ready to rename over `target`.
-fn stage(
-    dir: &Path,
-    _target: &Path,
-    write: impl FnOnce(&mut File) -> io::Result<()>,
-) -> io::Result<PathBuf> {
+/// Copy `source` into a temp file next to `target`, fsync it, and (on Unix) carry
+/// over the target's mode with the executable bit forced on. Returns the temp path,
+/// ready to rename over `target`.
+fn stage(dir: &Path, _target: &Path, source: &Path) -> io::Result<PathBuf> {
     let (mut tmp, tmp_path) = create_temp(dir, ".update-")?;
-    if let Err(e) = write(&mut tmp).and_then(|_| tmp.sync_all()) {
+    let copy = File::open(source).and_then(|mut src| io::copy(&mut src, &mut tmp).map(|_| ()));
+    if let Err(e) = copy.and_then(|_| tmp.sync_all()) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
@@ -78,17 +68,12 @@ fn replace_path(from: &Path, to: &Path) -> io::Result<()> {
     foundation::durable::replace(from, to)
 }
 
-#[cfg(test)]
-fn is_transient_lock(e: &io::Error) -> bool {
-    foundation::durable::is_transient_lock(e)
-}
-
 fn sync_dir(dir: &Path) -> io::Result<()> {
     foundation::durable::sync_dir(dir)
 }
 
 /// Atomically write `data` to `path`, flushing its contents before replacement.
-/// Unix also fsyncs the containing directory; see [`sync_dir`] for the narrower
+/// Unix also fsyncs the containing directory; see `sync_dir` for the narrower
 /// Windows sudden-power-loss guarantee.
 pub fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
     foundation::durable::atomic_write(path, ".state-", data)
@@ -144,22 +129,34 @@ mod tests {
         // permission/space/not-found failure must not be treated as transient.
         #[cfg(unix)]
         {
-            assert!(is_transient_lock(&io::Error::from_raw_os_error(16))); // EBUSY
-            assert!(is_transient_lock(&io::Error::from_raw_os_error(26))); // ETXTBSY
+            assert!(foundation::durable::is_transient_lock(
+                &io::Error::from_raw_os_error(16)
+            )); // EBUSY
+            assert!(foundation::durable::is_transient_lock(
+                &io::Error::from_raw_os_error(26)
+            )); // ETXTBSY
         }
         #[cfg(windows)]
         {
-            assert!(is_transient_lock(&io::Error::from_raw_os_error(5))); // ACCESS_DENIED
-            assert!(is_transient_lock(&io::Error::from_raw_os_error(32))); // SHARING_VIOLATION
-            assert!(is_transient_lock(&io::Error::from_raw_os_error(33))); // LOCK_VIOLATION
+            assert!(foundation::durable::is_transient_lock(
+                &io::Error::from_raw_os_error(5)
+            )); // ACCESS_DENIED
+            assert!(foundation::durable::is_transient_lock(
+                &io::Error::from_raw_os_error(32)
+            )); // SHARING_VIOLATION
+            assert!(foundation::durable::is_transient_lock(
+                &io::Error::from_raw_os_error(33)
+            )); // LOCK_VIOLATION
         }
-        assert!(!is_transient_lock(&io::Error::from(
+        assert!(!foundation::durable::is_transient_lock(&io::Error::from(
             io::ErrorKind::NotFound
         )));
-        assert!(!is_transient_lock(&io::Error::from(
+        assert!(!foundation::durable::is_transient_lock(&io::Error::from(
             io::ErrorKind::PermissionDenied
         )));
-        assert!(!is_transient_lock(&io::Error::other("nope")));
+        assert!(!foundation::durable::is_transient_lock(&io::Error::other(
+            "nope"
+        )));
     }
 
     #[test]

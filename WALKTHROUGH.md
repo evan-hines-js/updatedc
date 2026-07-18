@@ -91,15 +91,16 @@ path or bypass platform and downgrade rules.
 ### 2. Apply an application update
 
 Follow `check_application` in `crates/supervisor/src/selection.rs` into
-`apply_update` in `crates/supervisor/src/update.rs`. The transaction is:
+`apply_update` in `crates/supervisor/src/update.rs`. The supervisor authenticates the
+download through TUF and hands the provider a *filepath* to the verified archive; the
+transaction then drives:
 
 ```text
-verify candidate
+ingest the verified archive into an immutable release (the provider decides what the bytes are)
   → run read-only preflight
   → persist a phase journal
-  → drain → quiesce → prepare
-  → atomically activate the immutable release directory
-  → re-verify its manifested bytes
+  → prepare → drain
+  → atomically switch active-release to the immutable release
   → start/reload candidate
   → require consecutive authenticated health successes
   → finalize
@@ -108,15 +109,19 @@ verify candidate
 ```
 
 Any pre-commit health or activation failure restores the predecessor and durably
-rejects the failed archive. `crates/updated/src/bundle.rs` owns strict bundle creation,
-extraction, verification, immutable release storage, and `active-release` operations;
-`crates/updated/src/transaction.rs` records the last completed boundary and classifies
-durable state after an interruption;
+rejects the failed archive. `crates/updated/src/provider.rs` is the default provider:
+the supervisor hands it the verified filepath and it optionally untars/unzips the signed
+bundle into an immutable release, verifies that tree once at ingest, and resolves its
+entrypoint — so the supervisor core carries no bundle-format knowledge, and the default
+provider can evolve independently of it. `crates/updated/src/bundle.rs` is that
+provider's format implementation (strict bundle creation, extraction, manifest
+verification, and `active-release` identity). `crates/updated/src/transaction.rs`
+records the last completed boundary and classifies durable state after an interruption;
 `crates/supervisor/src/boot.rs` turns that classification into a recovery plan.
 
 The invariant to look for is: **the durable record never claims a release is committed
 unless every manifested file in that immutable release verifies and `active-release`
-names it**. Where a durable transition cannot be completed, the journal and predecessor
+names it**. Where a durable lifecycle operation cannot be completed, the journal and predecessor
 release remain available so the next start can finish recovery.
 
 ### 3. Update the updater
@@ -148,7 +153,7 @@ The most representative tests are:
 
 The chaos suite enumerates its forward and rollback injection points from the chaos-built
 supervisor itself. It crashes both after an action and after the matching durable phase,
-then uses a cross-platform transition fixture to assert the exact phase/transaction-ID
+then uses a cross-platform lifecycle fixture to assert the exact phase/attempt-ID
 sequence. A replay in the action/journal gap must keep one logical effect; already
 journaled phases must not be invoked again. These cases run on Windows, macOS, and Linux.
 
@@ -223,8 +228,10 @@ and identity requirements.
 - Local state is not monotonic hardware-backed storage. A local administrator is
   inside the trust boundary and can reset the installation to its provisioned baseline.
 - Unix can fsync directory entries; Windows has a narrower sudden-power-loss guarantee.
-  Atomic pointer replacement prevents selection of a torn release, and digest checks make
-  inconsistent surviving state fail closed.
+  A committed release is immutable and never rewritten in place, so it cannot be torn after
+  commit; atomic pointer replacement prevents selecting a torn candidate, and a candidate is
+  digest-verified at its activation moment. Committed bytes are trusted once verified, not
+  re-hashed on every launch.
 - The reference deployment runs the updater and managed program under one restricted
   OS identity. A hostile managed program would require a separate account or sandbox.
 - Production packaging and signing-key operations are described but intentionally not

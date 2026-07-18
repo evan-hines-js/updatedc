@@ -8,22 +8,28 @@ pub(crate) enum Outcome {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum TransitionPhase {
+pub(crate) enum LifecyclePhase {
     Preflight,
     Drain,
     Prepare,
+    Stop,
     Activate,
+    Start,
+    Verify,
     Finalize,
     Rollback,
 }
 
-impl TransitionPhase {
+impl LifecyclePhase {
     fn name(self) -> &'static str {
         match self {
             Self::Preflight => "preflight",
             Self::Drain => "drain",
             Self::Prepare => "prepare",
+            Self::Stop => "stop",
             Self::Activate => "activate",
+            Self::Start => "start",
+            Self::Verify => "verify",
             Self::Finalize => "finalize",
             Self::Rollback => "rollback",
         }
@@ -78,63 +84,89 @@ impl Chaos {
 }
 
 /// The transaction boundaries chaos can crash at, as named constants. The crossing points
-/// in [`apply_update`] and the [`BOUNDARIES`] list the e2e enumerates both reference these,
+/// in [`apply_update`] and the `BOUNDARIES` list the e2e enumerates both reference these,
 /// so the two cannot drift — a crossing and its list entry are the *same* string.
 pub(crate) mod boundary {
     use crate::domain::TransactionPhase;
 
     pub const PREFLIGHT_APPLIED: &str = "preflight-applied";
     pub const PREFLIGHT_STARTED: &str = "preflight-started";
-    pub const PREFLIGHT_PASSED: &str = "preflight-passed";
-    pub const DRAINED: &str = "drained";
-    pub const DRAIN_APPLIED: &str = "drain-applied";
-    pub const APP_QUIESCE_APPLIED: &str = "app-quiesce-applied";
-    pub const APP_QUIESCED: &str = "app-quiesced";
+    pub const PREFLIGHT_COMPLETED: &str = "preflight-completed";
+    pub const PREPARE_STARTED: &str = "prepare-started";
     pub const PREPARED: &str = "prepared";
     pub const PREPARE_APPLIED: &str = "prepare-applied";
+    pub const DRAIN_STARTED: &str = "drain-started";
+    pub const DRAINED: &str = "drained";
+    pub const DRAIN_APPLIED: &str = "drain-applied";
+    pub const STOP_STARTED: &str = "stop-started";
+    pub const STOP_APPLIED: &str = "stop-applied";
+    pub const STOPPED: &str = "stopped";
+    pub const ACTIVATE_STARTED: &str = "activate-started";
     pub const CANDIDATE_POINTER_APPLIED: &str = "candidate-pointer-applied";
+    pub const CANDIDATE_LIFECYCLE_APPLIED: &str = "candidate-lifecycle-applied";
     pub const CANDIDATE_ACTIVATED: &str = "candidate-activated";
-    pub const CANDIDATE_VERIFY_APPLIED: &str = "candidate-verify-applied";
-    pub const CANDIDATE_VERIFIED: &str = "candidate-verified";
     pub const CANDIDATE_STARTED: &str = "candidate-started";
+    pub const START_STARTED: &str = "start-started";
     pub const CANDIDATE_START_APPLIED: &str = "candidate-start-applied";
     pub const CANDIDATE_HEALTHY: &str = "candidate-healthy";
+    pub const HEALTH_STARTED: &str = "health-started";
     pub const CANDIDATE_HEALTH_APPLIED: &str = "candidate-health-applied";
     pub const FINALIZED: &str = "finalized";
+    pub const FINALIZE_STARTED: &str = "finalize-started";
     pub const FINALIZE_APPLIED: &str = "finalize-applied";
     pub const COMMITTED: &str = "committed";
+    pub const COMMIT_STARTED: &str = "commit-started";
     pub const COMMIT_APPLIED: &str = "commit-applied";
     pub const ROLLBACK_STARTED: &str = "rollback-started";
-    pub const ROLLBACK_QUIESCE_APPLIED: &str = "rollback-quiesce-applied";
-    pub const ROLLBACK_APP_QUIESCED: &str = "rollback-app-quiesced";
+    pub const ROLLBACK_STOP_STARTED: &str = "rollback-stop-started";
+    pub const ROLLBACK_STOP_APPLIED: &str = "rollback-stop-applied";
+    pub const ROLLBACK_STOPPED: &str = "rollback-stopped";
+    pub const ROLLBACK_ACTIVATE_STARTED: &str = "rollback-activate-started";
     pub const PREDECESSOR_POINTER_APPLIED: &str = "predecessor-pointer-applied";
+    pub const PREDECESSOR_LIFECYCLE_APPLIED: &str = "predecessor-lifecycle-applied";
     pub const PREDECESSOR_ACTIVATED: &str = "predecessor-activated";
     pub const PREDECESSOR_START_APPLIED: &str = "predecessor-start-applied";
     pub const PREDECESSOR_STARTED: &str = "predecessor-started";
+    pub const ROLLBACK_START_STARTED: &str = "rollback-start-started";
     pub const PREDECESSOR_HEALTH_APPLIED: &str = "predecessor-health-applied";
     pub const PREDECESSOR_HEALTHY: &str = "predecessor-healthy";
-    pub const ROLLBACK_ADAPTER_APPLIED: &str = "rollback-adapter-applied";
+    pub const ROLLBACK_HEALTH_STARTED: &str = "rollback-health-started";
+    pub const ROLLBACK_FINALIZE_STARTED: &str = "rollback-finalize-started";
+    pub const ROLLBACK_ADAPTER_APPLIED: &str = "rollback-lifecycle-applied";
     pub const ROLLED_BACK: &str = "rolled-back";
     pub const ABORTED: &str = "aborted";
 
     pub fn durable_phase(phase: TransactionPhase) -> &'static str {
         match phase {
             TransactionPhase::PreflightStarted => PREFLIGHT_STARTED,
-            TransactionPhase::PreflightPassed => PREFLIGHT_PASSED,
-            TransactionPhase::Drained => DRAINED,
-            TransactionPhase::AppQuiesced => APP_QUIESCED,
+            TransactionPhase::PreflightCompleted => PREFLIGHT_COMPLETED,
+            TransactionPhase::PrepareStarted => PREPARE_STARTED,
             TransactionPhase::Prepared => PREPARED,
+            TransactionPhase::DrainStarted => DRAIN_STARTED,
+            TransactionPhase::Drained => DRAINED,
+            TransactionPhase::StopStarted => STOP_STARTED,
+            TransactionPhase::Stopped => STOPPED,
+            TransactionPhase::ActivateStarted => ACTIVATE_STARTED,
             TransactionPhase::CandidateActivated => CANDIDATE_ACTIVATED,
-            TransactionPhase::CandidateVerified => CANDIDATE_VERIFIED,
+            TransactionPhase::CandidateVerified => "on-launch-candidate-verified",
+            TransactionPhase::StartStarted => START_STARTED,
             TransactionPhase::CandidateStarted => CANDIDATE_STARTED,
+            TransactionPhase::HealthStarted => HEALTH_STARTED,
             TransactionPhase::CandidateHealthy => CANDIDATE_HEALTHY,
+            TransactionPhase::FinalizeStarted => FINALIZE_STARTED,
             TransactionPhase::Finalized => FINALIZED,
+            TransactionPhase::CommitStarted => COMMIT_STARTED,
             TransactionPhase::Committed => COMMITTED,
             TransactionPhase::RollbackStarted => ROLLBACK_STARTED,
-            TransactionPhase::RollbackAppQuiesced => ROLLBACK_APP_QUIESCED,
+            TransactionPhase::RollbackStopStarted => ROLLBACK_STOP_STARTED,
+            TransactionPhase::RollbackStopped => ROLLBACK_STOPPED,
+            TransactionPhase::RollbackActivateStarted => ROLLBACK_ACTIVATE_STARTED,
             TransactionPhase::PredecessorActivated => PREDECESSOR_ACTIVATED,
+            TransactionPhase::RollbackStartStarted => ROLLBACK_START_STARTED,
             TransactionPhase::PredecessorStarted => PREDECESSOR_STARTED,
+            TransactionPhase::RollbackHealthStarted => ROLLBACK_HEALTH_STARTED,
             TransactionPhase::PredecessorHealthy => PREDECESSOR_HEALTHY,
+            TransactionPhase::RollbackFinalizeStarted => ROLLBACK_FINALIZE_STARTED,
             TransactionPhase::RolledBack => ROLLED_BACK,
             TransactionPhase::Aborted => ABORTED,
             TransactionPhase::Started => "on-launch-started",
@@ -149,23 +181,30 @@ pub(crate) mod boundary {
 pub(crate) const BOUNDARIES: &[&str] = &[
     boundary::PREFLIGHT_STARTED,
     boundary::PREFLIGHT_APPLIED,
-    boundary::PREFLIGHT_PASSED,
-    boundary::DRAIN_APPLIED,
-    boundary::DRAINED,
-    boundary::APP_QUIESCE_APPLIED,
-    boundary::APP_QUIESCED,
+    boundary::PREFLIGHT_COMPLETED,
+    boundary::PREPARE_STARTED,
     boundary::PREPARE_APPLIED,
     boundary::PREPARED,
+    boundary::DRAIN_STARTED,
+    boundary::DRAIN_APPLIED,
+    boundary::DRAINED,
+    boundary::STOP_STARTED,
+    boundary::STOP_APPLIED,
+    boundary::STOPPED,
+    boundary::ACTIVATE_STARTED,
     boundary::CANDIDATE_POINTER_APPLIED,
+    boundary::CANDIDATE_LIFECYCLE_APPLIED,
     boundary::CANDIDATE_ACTIVATED,
-    boundary::CANDIDATE_VERIFY_APPLIED,
-    boundary::CANDIDATE_VERIFIED,
+    boundary::START_STARTED,
     boundary::CANDIDATE_START_APPLIED,
     boundary::CANDIDATE_STARTED,
+    boundary::HEALTH_STARTED,
     boundary::CANDIDATE_HEALTH_APPLIED,
     boundary::CANDIDATE_HEALTHY,
+    boundary::FINALIZE_STARTED,
     boundary::FINALIZE_APPLIED,
     boundary::FINALIZED,
+    boundary::COMMIT_STARTED,
     boundary::COMMIT_APPLIED,
     boundary::COMMITTED,
 ];
@@ -173,14 +212,20 @@ pub(crate) const BOUNDARIES: &[&str] = &[
 #[cfg(any(feature = "chaos", test))]
 pub(crate) const ROLLBACK_BOUNDARIES: &[&str] = &[
     boundary::ROLLBACK_STARTED,
-    boundary::ROLLBACK_QUIESCE_APPLIED,
-    boundary::ROLLBACK_APP_QUIESCED,
+    boundary::ROLLBACK_STOP_STARTED,
+    boundary::ROLLBACK_STOP_APPLIED,
+    boundary::ROLLBACK_STOPPED,
+    boundary::ROLLBACK_ACTIVATE_STARTED,
     boundary::PREDECESSOR_POINTER_APPLIED,
+    boundary::PREDECESSOR_LIFECYCLE_APPLIED,
     boundary::PREDECESSOR_ACTIVATED,
+    boundary::ROLLBACK_START_STARTED,
     boundary::PREDECESSOR_START_APPLIED,
     boundary::PREDECESSOR_STARTED,
+    boundary::ROLLBACK_HEALTH_STARTED,
     boundary::PREDECESSOR_HEALTH_APPLIED,
     boundary::PREDECESSOR_HEALTHY,
+    boundary::ROLLBACK_FINALIZE_STARTED,
     boundary::ROLLBACK_ADAPTER_APPLIED,
     boundary::ROLLED_BACK,
 ];
@@ -192,33 +237,33 @@ pub(crate) const ABORT_BOUNDARIES: &[&str] = &[boundary::ABORTED];
 //
 // What the transaction drives on the *live* side — the running application and its
 // readiness — behind a port, exactly as [`Store`] ports the durable side. The production
-// [`LiveTower`] performs the configured [`Restart`] mode over the guardian-owned [`App`]; a
+// [`DefaultProvider`] performs the configured `Restart` mode over the guardian-owned [`App`]; a
 // test fake scripts control outcomes and health, so every fault path of [`apply_update`] is
 // provable without a guardian, an HTTP server, or a real process.
 
 /// Bring a staged release into (or back out of) service — the two hand-off moments plus the
 /// quiesce a failed rollback needs. The port the transaction drives; the sole restart
-/// abstraction (the [`Restart`] mode is data the [`LiveTower`] adapter acts on).
-pub(crate) trait Control {
-    /// Whether this transaction depends on an operator adapter during crash recovery.
-    fn transition_required(&self) -> bool;
-    /// Invoke the optional operator-owned environmental transition adapter.
-    fn transition(
+/// abstraction (the `Restart` mode is data the [`DefaultProvider`] lifecycle acts on).
+pub(crate) trait DeploymentProvider {
+    /// Invoke the optional operator-owned lifecycle provider.
+    fn lifecycle(
         &mut self,
-        phase: TransitionPhase,
-        transition_id: &str,
+        phase: LifecyclePhase,
+        lifecycle_attempt_id: &str,
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()>;
-    /// Quiesce before activation: StopStart stops the app; reload keeps it serving.
-    fn before_activation(&mut self);
-    /// Put the active release into service: launch fresh, or signal a same-PID re-exec.
+    /// Stop the predecessor when the activation strategy requires a process stop.
+    fn stop(&mut self);
+    /// Apply the selected release to the surrounding service environment.
     fn activate(
         &mut self,
-        transition_id: &str,
+        lifecycle_attempt_id: &str,
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()>;
+    /// Start the selected release when activation requires a fresh process.
+    fn start(&mut self) -> io::Result<()>;
     /// Stop the app — used when a rollback itself fails its health check.
     fn quiesce(&mut self);
     /// A same-PID reload keeps the launch token, so readiness must additionally prove the
@@ -236,77 +281,132 @@ pub(crate) trait Health {
     ) -> impl std::future::Future<Output = bool>;
 }
 
-/// The production adapter: `Control` performs the configured [`Restart`] mode over the
+/// The production lifecycle: `DeploymentProvider` performs the configured `Restart` mode over the
 /// guardian-owned [`App`]; `Health` is the real HTTP readiness probe.
-pub(crate) struct LiveTower<'a> {
+pub(crate) struct DefaultProvider<'a> {
     app: &'a mut App,
     opts: &'a Options,
+    phases: LoadedPhaseProvider<'a>,
 }
 
-impl<'a> LiveTower<'a> {
-    pub(crate) fn new(app: &'a mut App, opts: &'a Options) -> Self {
-        LiveTower { app, opts }
+/// One lifecycle protocol with two loading strategies. The default implementation is
+/// statically linked into this supervisor; an external implementation is the same
+/// protocol resolved from a signed bundle. Callers never branch around the provider.
+enum LoadedPhaseProvider<'a> {
+    BuiltIn(BuiltInPhases),
+    External {
+        release: &'a updated::state::LifecycleProviderRelease,
+        opts: &'a Options,
+    },
+}
+
+struct BuiltInPhases;
+
+impl BuiltInPhases {
+    fn invoke(&self, _invocation: LifecycleInvocation<'_>) -> io::Result<()> {
+        Ok(())
     }
 }
 
-impl Control for LiveTower<'_> {
-    fn transition_required(&self) -> bool {
-        self.opts.application.transition.is_some()
+impl<'a> LoadedPhaseProvider<'a> {
+    fn load(
+        opts: &'a Options,
+        external: Option<&'a updated::state::LifecycleProviderRelease>,
+    ) -> Self {
+        match external {
+            Some(release) => Self::External { release, opts },
+            None => Self::BuiltIn(BuiltInPhases),
+        }
     }
-    fn transition(
+
+    fn invoke(&self, invocation: LifecycleInvocation<'_>) -> io::Result<()> {
+        match self {
+            Self::BuiltIn(provider) => provider.invoke(invocation),
+            Self::External { release, opts } => run_lifecycle_command(release, opts, invocation),
+        }
+    }
+}
+
+pub(crate) fn invoke_deployment_provider(
+    external: Option<&updated::state::LifecycleProviderRelease>,
+    opts: &Options,
+    invocation: LifecycleInvocation<'_>,
+) -> io::Result<()> {
+    LoadedPhaseProvider::load(opts, external).invoke(invocation)
+}
+
+impl<'a> DefaultProvider<'a> {
+    /// The built-in provider is part of this binary, never an independently upgraded
+    /// artifact. Exposing this constant prevents inventing a second version source.
+    pub(crate) const VERSION: &'static str = SELF_VERSION;
+
+    pub(crate) fn new(
+        app: &'a mut App,
+        opts: &'a Options,
+        lifecycle: Option<&'a updated::state::LifecycleProviderRelease>,
+    ) -> Self {
+        DefaultProvider {
+            app,
+            opts,
+            phases: LoadedPhaseProvider::load(opts, lifecycle),
+        }
+    }
+}
+
+impl DeploymentProvider for DefaultProvider<'_> {
+    fn lifecycle(
         &mut self,
-        phase: TransitionPhase,
-        transition_id: &str,
+        phase: LifecyclePhase,
+        lifecycle_attempt_id: &str,
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()> {
-        let Some(transition) = &self.opts.application.transition else {
-            return Ok(());
-        };
-        run_transition_command(
-            transition,
-            self.opts,
-            TransitionInvocation {
-                phase,
-                id: transition_id,
-                pid: self.app.pid(),
-                candidate,
-                predecessor,
-            },
-        )
+        self.phases.invoke(LifecycleInvocation {
+            phase,
+            id: lifecycle_attempt_id,
+            pid: Some(self.app.pid()),
+            candidate,
+            predecessor,
+        })
     }
-    fn before_activation(&mut self) {
+    fn stop(&mut self) {
         match &self.opts.application.activation {
             // StopStart quiesces the app before activation; a reload keeps serving.
-            Activation::StopStart => stop(self.app, &self.opts.paths.app_token),
+            Activation::StopStart => stop(&mut self.app.guardian, &self.opts.paths.app_token),
             Activation::Reexec => {}
         }
     }
     fn activate(
         &mut self,
-        transition_id: &str,
+        lifecycle_attempt_id: &str,
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()> {
+        let pid =
+            matches!(self.opts.application.activation, Activation::Reexec).then(|| self.app.pid());
+        self.phases.invoke(LifecycleInvocation {
+            phase: LifecyclePhase::Activate,
+            id: lifecycle_attempt_id,
+            pid,
+            candidate,
+            predecessor,
+        })
+    }
+    fn start(&mut self) -> io::Result<()> {
         match &self.opts.application.activation {
             Activation::StopStart => self.app.launch(self.opts),
-            Activation::Reexec => self.transition(
-                TransitionPhase::Activate,
-                transition_id,
-                candidate,
-                predecessor,
-            ),
+            Activation::Reexec => Ok(()),
         }
     }
     fn quiesce(&mut self) {
-        stop(self.app, &self.opts.paths.app_token);
+        stop(&mut self.app.guardian, &self.opts.paths.app_token);
     }
     fn requires_version_proof(&self) -> bool {
         matches!(self.opts.application.activation, Activation::Reexec)
     }
 }
 
-impl Health for LiveTower<'_> {
+impl Health for DefaultProvider<'_> {
     async fn became_healthy(&self, expected_version: Option<&str>) -> bool {
         // A probe-infrastructure error (a client that will not even build) is a health
         // failure like any other: fail closed to a rollback rather than propagate.
@@ -326,12 +426,13 @@ impl Health for LiveTower<'_> {
 // ================================ the transaction ================================
 
 /// Drive one application update through the durable transaction, over the [`Store`] and
-/// live-application ([`Control`] + [`Health`]) ports.
-pub(crate) async fn apply_update<T: Control + Health>(
+/// live-application ([`DeploymentProvider`] + [`Health`]) ports.
+pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     tower: &mut T,
     store: &mut dyn Store,
     candidate: &updated::bundle::ReleaseId,
     candidate_archive_sha256: &str,
+    lifecycle: Option<updated::state::LifecycleProviderRelease>,
 ) -> io::Result<Outcome> {
     // Recovery belongs to the boot state machine. A live supervisor must never mutate
     // recovery evidence or restore an executable underneath a guardian-owned process.
@@ -348,14 +449,6 @@ pub(crate) async fn apply_update<T: Control + Health>(
         _ => return Err(io::Error::other("a verified installed release is required")),
     };
     let chaos = Chaos::from_env();
-    if let Err(error) = store.verify_release(candidate) {
-        warn(&format!(
-            "candidate {} failed manifest verification before preflight ({error})",
-            candidate.version
-        ));
-        store.reject(candidate_archive_sha256)?;
-        return Ok(Outcome::RejectedBeforeActivation);
-    }
     let mut tx = Transaction {
         id: updated::rand::token()?,
         kind: updated::transaction::Kind::Supervised,
@@ -364,18 +457,18 @@ pub(crate) async fn apply_update<T: Control + Health>(
         candidate_release: candidate.clone(),
         candidate_archive_sha256: candidate_archive_sha256.to_string(),
         candidate_rejection_required: false,
-        transition_required: tower.transition_required(),
+        lifecycle: lifecycle.map(Box::new),
         phase: TransactionPhase::PreflightStarted,
     };
     persist_transaction(store, &tx)?;
-    if let Err(error) = tower.transition(
-        TransitionPhase::Preflight,
+    if let Err(error) = tower.lifecycle(
+        LifecyclePhase::Preflight,
         &tx.id,
         candidate,
         &installed.release,
     ) {
         warn(&format!(
-            "candidate {} failed transition preflight ({error}); the running release was not touched",
+            "candidate {} failed lifecycle preflight ({error}); the running release was not touched",
             candidate.version
         ));
         require_candidate_rejection(store, &mut tx)?;
@@ -383,23 +476,29 @@ pub(crate) async fn apply_update<T: Control + Health>(
         return Ok(Outcome::RejectedBeforeActivation);
     }
     chaos.crossing(boundary::PREFLIGHT_APPLIED);
-    if let Err(error) = store.verify_release(candidate) {
-        warn(&format!(
-            "candidate {} changed during preflight ({error}); the running release was not touched",
-            candidate.version
-        ));
-        require_candidate_rejection(store, &mut tx)?;
-        abort_before_activation(tower, store, &mut tx)?;
-        return Ok(Outcome::RejectedBeforeActivation);
-    }
-    advance_transaction(store, &mut tx, TransactionPhase::PreflightPassed)?;
+    advance_transaction(store, &mut tx, TransactionPhase::PreflightCompleted)?;
 
-    if let Err(error) = tower.transition(
-        TransitionPhase::Drain,
+    advance_transaction(store, &mut tx, TransactionPhase::PrepareStarted)?;
+    if let Err(error) = tower.lifecycle(
+        LifecyclePhase::Prepare,
         &tx.id,
         candidate,
         &installed.release,
     ) {
+        warn(&format!(
+            "candidate {} was deferred while preparing its environment ({error}); the running release remains active",
+            candidate.version
+        ));
+        abort_before_activation(tower, store, &mut tx)?;
+        return Ok(Outcome::Deferred);
+    }
+    chaos.crossing(boundary::PREPARE_APPLIED);
+    advance_transaction(store, &mut tx, TransactionPhase::Prepared)?;
+
+    advance_transaction(store, &mut tx, TransactionPhase::DrainStarted)?;
+    if let Err(error) =
+        tower.lifecycle(LifecyclePhase::Drain, &tx.id, candidate, &installed.release)
+    {
         warn(&format!(
             "candidate {} was deferred while draining ({error}); the running release remains active",
             candidate.version
@@ -410,27 +509,21 @@ pub(crate) async fn apply_update<T: Control + Health>(
     chaos.crossing(boundary::DRAIN_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::Drained)?;
 
-    // Hand-off part 1: stop the application (StopStart) or nothing (a reload strategy).
-    tower.before_activation();
-    chaos.crossing(boundary::APP_QUIESCE_APPLIED);
-    advance_transaction(store, &mut tx, TransactionPhase::AppQuiesced)?;
-
-    if let Err(error) = tower.transition(
-        TransitionPhase::Prepare,
-        &tx.id,
-        candidate,
-        &installed.release,
-    ) {
+    advance_transaction(store, &mut tx, TransactionPhase::StopStarted)?;
+    if let Err(error) = tower.lifecycle(LifecyclePhase::Stop, &tx.id, candidate, &installed.release)
+    {
         warn(&format!(
-            "candidate {} was deferred while preparing its environment ({error})",
+            "candidate {} was deferred before stopping its predecessor ({error})",
             candidate.version
         ));
-        roll_back(tower, store, &mut tx).await?;
+        abort_before_activation(tower, store, &mut tx)?;
         return Ok(Outcome::Deferred);
     }
-    chaos.crossing(boundary::PREPARE_APPLIED);
-    advance_transaction(store, &mut tx, TransactionPhase::Prepared)?;
+    tower.stop();
+    chaos.crossing(boundary::STOP_APPLIED);
+    advance_transaction(store, &mut tx, TransactionPhase::Stopped)?;
 
+    advance_transaction(store, &mut tx, TransactionPhase::ActivateStarted)?;
     if let Err(e) = store.activate(candidate) {
         warn(&format!("release activation failed before commit ({e})"));
         require_candidate_rejection(store, &mut tx)?;
@@ -438,23 +531,24 @@ pub(crate) async fn apply_update<T: Control + Health>(
         return Ok(Outcome::RolledBack);
     }
     chaos.crossing(boundary::CANDIDATE_POINTER_APPLIED);
-    advance_transaction(store, &mut tx, TransactionPhase::CandidateActivated)?;
 
-    // Re-verify the installed bytes against the signed digest before executing.
-    if let Err(e) = store.verify_release(candidate) {
-        warn(&format!(
-            "active release failed manifest verification ({e})"
-        ));
+    if let Err(e) = tower.activate(&tx.id, candidate, &tx.previous_release) {
+        warn(&format!("activating the new version failed ({e})"));
         require_candidate_rejection(store, &mut tx)?;
         roll_back(tower, store, &mut tx).await?;
         return Ok(Outcome::RolledBack);
     }
-    chaos.crossing(boundary::CANDIDATE_VERIFY_APPLIED);
-    advance_transaction(store, &mut tx, TransactionPhase::CandidateVerified)?;
-
-    // Hand-off part 2: start a fresh application, or trigger the server's own reload.
-    if let Err(e) = tower.activate(&tx.id, candidate, &tx.previous_release) {
-        warn(&format!("activating the new version failed ({e})"));
+    chaos.crossing(boundary::CANDIDATE_LIFECYCLE_APPLIED);
+    advance_transaction(store, &mut tx, TransactionPhase::CandidateActivated)?;
+    advance_transaction(store, &mut tx, TransactionPhase::StartStarted)?;
+    if let Err(e) = tower.start() {
+        warn(&format!("starting the new version failed ({e})"));
+        require_candidate_rejection(store, &mut tx)?;
+        roll_back(tower, store, &mut tx).await?;
+        return Ok(Outcome::RolledBack);
+    }
+    if let Err(e) = tower.lifecycle(LifecyclePhase::Start, &tx.id, candidate, &installed.release) {
+        warn(&format!("candidate start provider phase failed ({e})"));
         require_candidate_rejection(store, &mut tx)?;
         roll_back(tower, store, &mut tx).await?;
         return Ok(Outcome::RolledBack);
@@ -462,6 +556,7 @@ pub(crate) async fn apply_update<T: Control + Health>(
     chaos.crossing(boundary::CANDIDATE_START_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::CandidateStarted)?;
 
+    advance_transaction(store, &mut tx, TransactionPhase::HealthStarted)?;
     let version_proof = tower
         .requires_version_proof()
         .then_some(candidate.version.as_str());
@@ -470,17 +565,29 @@ pub(crate) async fn apply_update<T: Control + Health>(
         roll_back(tower, store, &mut tx).await?;
         return Ok(Outcome::RolledBack);
     }
+    if let Err(e) = tower.lifecycle(
+        LifecyclePhase::Verify,
+        &tx.id,
+        candidate,
+        &installed.release,
+    ) {
+        warn(&format!("candidate verify provider phase failed ({e})"));
+        require_candidate_rejection(store, &mut tx)?;
+        roll_back(tower, store, &mut tx).await?;
+        return Ok(Outcome::RolledBack);
+    }
     chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::CandidateHealthy)?;
 
-    if let Err(error) = tower.transition(
-        TransitionPhase::Finalize,
+    advance_transaction(store, &mut tx, TransactionPhase::FinalizeStarted)?;
+    if let Err(error) = tower.lifecycle(
+        LifecyclePhase::Finalize,
         &tx.id,
         candidate,
         &installed.release,
     ) {
         warn(&format!(
-            "candidate {} failed transition finalization ({error})",
+            "candidate {} failed lifecycle finalization ({error})",
             candidate.version
         ));
         roll_back(tower, store, &mut tx).await?;
@@ -494,12 +601,13 @@ pub(crate) async fn apply_update<T: Control + Health>(
     // separate "arm" step to be interrupted — if a crash lands after this, the pending
     // record is already durable; if before, the journal reactivates the predecessor.
     let pending = Some(Pending {
-        transition_id: tx.id.clone(),
+        lifecycle_attempt_id: tx.id.clone(),
         previous_release: installed.release,
         previous_archive_sha256: installed.archive_sha256,
         committed_at: now_unix(),
-        transition_required: tx.transition_required,
+        lifecycle: tx.lifecycle.clone(),
     });
+    advance_transaction(store, &mut tx, TransactionPhase::CommitStarted)?;
     store.commit_installed(&InstalledState {
         release: candidate.clone(),
         archive_sha256: candidate_archive_sha256.to_string(),
@@ -522,16 +630,16 @@ pub(crate) async fn apply_update<T: Control + Health>(
 }
 
 /// Undo operator-side work when neither the active release nor its process changed.
-/// Every pre-activation exit uses this state-machine path so an interrupted adapter
+/// Every pre-activation exit uses this state-machine path so an interrupted lifecycle
 /// rollback remains recoverable through the ordinary boot journal.
-fn abort_before_activation<T: Control>(
+fn abort_before_activation<T: DeploymentProvider>(
     tower: &mut T,
     store: &mut dyn Store,
     tx: &mut Transaction,
 ) -> io::Result<()> {
     advance_transaction(store, tx, TransactionPhase::RollbackStarted)?;
-    tower.transition(
-        TransitionPhase::Rollback,
+    tower.lifecycle(
+        LifecyclePhase::Rollback,
         &tx.id,
         &tx.previous_release,
         &tx.candidate_release,
@@ -555,20 +663,37 @@ fn require_candidate_rejection(store: &mut dyn Store, tx: &mut Transaction) -> i
 /// reload strategy rolls back with zero downtime too). This is the only in-process
 /// rollback — for an update whose new version stayed *alive* but never became healthy; a
 /// crash instead tears the tower down and recovery rolls back on the next boot.
-pub(crate) async fn roll_back<T: Control + Health>(
+async fn roll_back<T: DeploymentProvider + Health>(
     tower: &mut T,
     store: &mut dyn Store,
     tx: &mut Transaction,
 ) -> io::Result<()> {
     let chaos = Chaos::from_env();
     advance_transaction(store, tx, TransactionPhase::RollbackStarted)?;
-    tower.before_activation();
-    chaos.crossing(boundary::ROLLBACK_QUIESCE_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::RollbackAppQuiesced)?;
+    advance_transaction(store, tx, TransactionPhase::RollbackStopStarted)?;
+    tower.lifecycle(
+        LifecyclePhase::Stop,
+        &tx.id,
+        &tx.previous_release,
+        &tx.candidate_release,
+    )?;
+    tower.stop();
+    chaos.crossing(boundary::ROLLBACK_STOP_APPLIED);
+    advance_transaction(store, tx, TransactionPhase::RollbackStopped)?;
+    advance_transaction(store, tx, TransactionPhase::RollbackActivateStarted)?;
     store.activate(&tx.previous_release)?;
     chaos.crossing(boundary::PREDECESSOR_POINTER_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::PredecessorActivated)?;
     tower.activate(&tx.id, &tx.previous_release, &tx.candidate_release)?;
+    chaos.crossing(boundary::PREDECESSOR_LIFECYCLE_APPLIED);
+    advance_transaction(store, tx, TransactionPhase::PredecessorActivated)?;
+    advance_transaction(store, tx, TransactionPhase::RollbackStartStarted)?;
+    tower.start()?;
+    tower.lifecycle(
+        LifecyclePhase::Start,
+        &tx.id,
+        &tx.previous_release,
+        &tx.candidate_release,
+    )?;
     chaos.crossing(boundary::PREDECESSOR_START_APPLIED);
     advance_transaction(store, tx, TransactionPhase::PredecessorStarted)?;
     // Prove the rollback landed with the same evidence the forward path demands. A reload
@@ -577,21 +702,30 @@ pub(crate) async fn roll_back<T: Control + Health>(
     // never re-execed would have the just-rejected new version answer this probe and pass
     // it — leaving the release recorded as rolled back and rejected while it is still the
     // one running. A stop/start relaunch mints a fresh token, which already identifies it.
+    let rollback_version = tx.previous_release.version.clone();
     let version_proof = if tower.requires_version_proof() {
-        Some(tx.previous_release.version.as_str())
+        Some(rollback_version.as_str())
     } else {
         None
     };
+    advance_transaction(store, tx, TransactionPhase::RollbackHealthStarted)?;
     if !tower.became_healthy(version_proof).await {
         tower.quiesce();
         return Err(io::Error::other(
             "restored application failed its rollback health check",
         ));
     }
+    tower.lifecycle(
+        LifecyclePhase::Verify,
+        &tx.id,
+        &tx.previous_release,
+        &tx.candidate_release,
+    )?;
     chaos.crossing(boundary::PREDECESSOR_HEALTH_APPLIED);
     advance_transaction(store, tx, TransactionPhase::PredecessorHealthy)?;
-    tower.transition(
-        TransitionPhase::Rollback,
+    advance_transaction(store, tx, TransactionPhase::RollbackFinalizeStarted)?;
+    tower.lifecycle(
+        LifecyclePhase::Rollback,
         &tx.id,
         &tx.previous_release,
         &tx.candidate_release,
@@ -617,42 +751,46 @@ pub(crate) fn persist_transaction(store: &mut dyn Store, tx: &Transaction) -> io
     Ok(())
 }
 
-/// Invoke the single operator transition adapter with a stable phase and transaction
+/// Invoke the single operator lifecycle provider with a stable phase and transaction
 /// identity. Commands are direct argv, never shell text. A bounded wait prevents a
 /// wedged enterprise integration from wedging the updater forever.
-pub(crate) struct TransitionInvocation<'a> {
-    pub(crate) phase: TransitionPhase,
+pub(crate) struct LifecycleInvocation<'a> {
+    pub(crate) phase: LifecyclePhase,
     pub(crate) id: &'a str,
-    pub(crate) pid: u32,
+    pub(crate) pid: Option<u32>,
     pub(crate) candidate: &'a updated::bundle::ReleaseId,
     pub(crate) predecessor: &'a updated::bundle::ReleaseId,
 }
 
-pub(crate) fn run_transition_command(
-    transition: &updated::config::Transition,
+pub(crate) fn run_lifecycle_command(
+    lifecycle: &updated::state::LifecycleProviderRelease,
     opts: &Options,
-    invocation: TransitionInvocation<'_>,
+    invocation: LifecycleInvocation<'_>,
 ) -> io::Result<()> {
-    let TransitionInvocation {
+    let LifecycleInvocation {
         phase,
-        id: transition_id,
+        id: lifecycle_attempt_id,
         pid,
         candidate,
         predecessor,
     } = invocation;
-    let command = &transition.command;
-    let timeout = transition.timeout;
+    let resolved =
+        updated::provider::BundleStore::for_lifecycle(&opts.paths).resolve(&lifecycle.release)?;
+    if resolved.product != lifecycle.product {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged lifecycle manifest has the wrong product",
+        ));
+    }
+    let timeout = Duration::from_millis(lifecycle.timeout_millis);
     let phase_name = phase.name();
-    let (program, args) = command.split_first().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "transition command is empty")
-    })?;
-    let pid = pid.to_string();
-    let candidate_dir = opts.paths.versions.join(candidate.directory_name());
-    let predecessor_dir = opts.paths.versions.join(predecessor.directory_name());
-    let mut cmd = Command::new(program);
-    cmd.args(args);
+    let app_provider = updated::provider::BundleStore::for_app(&opts.paths);
+    let candidate_dir = app_provider.location(candidate);
+    let predecessor_dir = app_provider.location(predecessor);
+    let mut cmd = Command::new(resolved.program);
+    cmd.args(&lifecycle.args);
     // A wrapper commonly waits on vendor CLIs, curl, or mount helpers. Give the whole
-    // adapter tree its own group so a timeout cannot kill only the shell and orphan the
+    // lifecycle tree its own group so a timeout cannot kill only the shell and orphan the
     // foreground operation. Windows wrappers must obey the no-background-child contract.
     #[cfg(unix)]
     {
@@ -662,20 +800,24 @@ pub(crate) fn run_transition_command(
     for key in crate::app::CONTROL_PLANE_ENV {
         cmd.env_remove(key);
     }
-    let mut child = cmd
-        .env(env::TRANSITION_PHASE, phase_name)
-        .env(env::TRANSITION_ID, transition_id)
-        .env(env::CHILD_PID, &pid)
+    let command = cmd
+        .env(env::LIFECYCLE_PHASE, phase_name)
+        .env(env::LIFECYCLE_ATTEMPT_ID, lifecycle_attempt_id)
         .env(env::INSTALL_ROOT, &opts.paths.install_root)
         .env(env::CANDIDATE, &candidate_dir)
         .env(env::PREDECESSOR, &predecessor_dir)
         .env(env::CANDIDATE_VERSION, &candidate.version)
-        .env(env::PREDECESSOR_VERSION, &predecessor.version)
-        .spawn()?;
+        .env(env::PREDECESSOR_VERSION, &predecessor.version);
+    if let Some(pid) = pid {
+        command.env(env::CHILD_PID, pid.to_string());
+    } else {
+        command.env_remove(env::CHILD_PID);
+    }
+    let mut child = command.spawn()?;
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "transition timeout is too large",
+            "lifecycle timeout is too large",
         )
     })?;
     loop {
@@ -684,7 +826,7 @@ pub(crate) fn run_transition_command(
                 Ok(())
             } else {
                 Err(io::Error::other(format!(
-                    "transition {phase_name} exited with {status}"
+                    "lifecycle {phase_name} exited with {status}"
                 )))
             };
         }
@@ -701,7 +843,7 @@ pub(crate) fn run_transition_command(
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "transition {phase_name} exceeded its {}s timeout",
+                    "lifecycle {phase_name} exceeded its {}s timeout",
                     timeout.as_secs_f64()
                 ),
             ));
@@ -718,6 +860,35 @@ mod tests {
         updated::bundle::ReleaseId {
             version: version.into(),
             manifest_sha256: digest.into(),
+        }
+    }
+
+    #[test]
+    fn built_in_provider_is_supervisor_versioned_and_accepts_the_full_phase_protocol() {
+        assert_eq!(DefaultProvider::VERSION, SELF_VERSION);
+        let candidate = release("2.0.0", "two");
+        let predecessor = release("1.0.0", "one");
+        let provider = BuiltInPhases;
+        for phase in [
+            LifecyclePhase::Preflight,
+            LifecyclePhase::Prepare,
+            LifecyclePhase::Drain,
+            LifecyclePhase::Stop,
+            LifecyclePhase::Activate,
+            LifecyclePhase::Start,
+            LifecyclePhase::Verify,
+            LifecyclePhase::Finalize,
+            LifecyclePhase::Rollback,
+        ] {
+            provider
+                .invoke(LifecycleInvocation {
+                    phase,
+                    id: "attempt",
+                    pid: Some(42),
+                    candidate: &candidate,
+                    predecessor: &predecessor,
+                })
+                .unwrap();
         }
     }
 
@@ -778,9 +949,6 @@ mod tests {
         fn clear_rejection(&mut self, _: &str) -> io::Result<()> {
             Ok(())
         }
-        fn verify_release(&self, _: &updated::bundle::ReleaseId) -> io::Result<()> {
-            Ok(())
-        }
         fn activate(&mut self, release: &updated::bundle::ReleaseId) -> io::Result<()> {
             self.active = release.clone();
             Ok(())
@@ -791,33 +959,48 @@ mod tests {
     struct FakeTower {
         phases: Vec<&'static str>,
         fail_drain: bool,
+        fail_stop: bool,
         fail_finalize: bool,
         fail_rollback: bool,
+        fail_first_start_phase: bool,
+        start_phase_calls: usize,
+        fail_first_verify_phase: bool,
+        verify_phase_calls: usize,
         fail_first_activation: bool,
         activations: usize,
     }
 
-    impl Control for FakeTower {
-        fn transition_required(&self) -> bool {
-            true
-        }
-        fn transition(
+    impl DeploymentProvider for FakeTower {
+        fn lifecycle(
             &mut self,
-            phase: TransitionPhase,
+            phase: LifecyclePhase,
             _: &str,
             _: &updated::bundle::ReleaseId,
             _: &updated::bundle::ReleaseId,
         ) -> io::Result<()> {
             self.phases.push(phase.name());
-            if (matches!(phase, TransitionPhase::Drain) && self.fail_drain)
-                || (matches!(phase, TransitionPhase::Finalize) && self.fail_finalize)
-                || (matches!(phase, TransitionPhase::Rollback) && self.fail_rollback)
+            if matches!(phase, LifecyclePhase::Start) {
+                self.start_phase_calls += 1;
+            }
+            if matches!(phase, LifecyclePhase::Verify) {
+                self.verify_phase_calls += 1;
+            }
+            if (matches!(phase, LifecyclePhase::Drain) && self.fail_drain)
+                || (matches!(phase, LifecyclePhase::Stop) && self.fail_stop)
+                || (matches!(phase, LifecyclePhase::Finalize) && self.fail_finalize)
+                || (matches!(phase, LifecyclePhase::Rollback) && self.fail_rollback)
+                || (matches!(phase, LifecyclePhase::Start)
+                    && self.fail_first_start_phase
+                    && self.start_phase_calls == 1)
+                || (matches!(phase, LifecyclePhase::Verify)
+                    && self.fail_first_verify_phase
+                    && self.verify_phase_calls == 1)
             {
-                return Err(io::Error::other("injected transition failure"));
+                return Err(io::Error::other("injected lifecycle failure"));
             }
             Ok(())
         }
-        fn before_activation(&mut self) {}
+        fn stop(&mut self) {}
         fn activate(
             &mut self,
             _: &str,
@@ -828,6 +1011,9 @@ mod tests {
             if self.fail_first_activation && self.activations == 1 {
                 return Err(io::Error::other("injected activation failure"));
             }
+            Ok(())
+        }
+        fn start(&mut self) -> io::Result<()> {
             Ok(())
         }
         fn quiesce(&mut self) {}
@@ -852,12 +1038,12 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(&mut tower, &mut store, &candidate, "archive-two")
+        let outcome = apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
             .await
             .unwrap();
 
         assert!(matches!(outcome, Outcome::Deferred));
-        assert_eq!(tower.phases, ["preflight", "drain", "rollback"]);
+        assert_eq!(tower.phases, ["preflight", "prepare", "drain", "rollback"]);
         assert_eq!(tower.activations, 0);
         assert!(store.journal.is_none());
     }
@@ -874,7 +1060,7 @@ mod tests {
         };
 
         assert!(
-            apply_update(&mut tower, &mut store, &candidate, "archive-two")
+            apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
                 .await
                 .is_err()
         );
@@ -891,14 +1077,26 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(&mut tower, &mut store, &candidate, "archive-two")
+        let outcome = apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
             .await
             .unwrap();
 
         assert!(matches!(outcome, Outcome::Deferred));
         assert_eq!(
             tower.phases,
-            ["preflight", "drain", "prepare", "finalize", "rollback"]
+            [
+                "preflight",
+                "prepare",
+                "drain",
+                "stop",
+                "start",
+                "verify",
+                "finalize",
+                "stop",
+                "start",
+                "verify",
+                "rollback",
+            ]
         );
         assert_eq!(
             tower.activations, 2,
@@ -916,6 +1114,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_stop_phase_defers_before_the_guardian_or_active_pointer_is_touched() {
+        let previous = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = MemoryStore::new(previous.clone());
+        let mut provider = FakeTower {
+            fail_stop: true,
+            ..Default::default()
+        };
+
+        let outcome = apply_update(&mut provider, &mut store, &candidate, "archive-two", None)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, Outcome::Deferred));
+        assert_eq!(store.active, previous);
+        assert_eq!(provider.activations, 0);
+        assert_eq!(
+            provider.phases,
+            ["preflight", "prepare", "drain", "stop", "rollback"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_start_or_verify_phase_rolls_back_through_the_same_provider() {
+        for failure in [LifecyclePhase::Start, LifecyclePhase::Verify] {
+            let previous = release("1.0.0", "one");
+            let candidate = release("2.0.0", "two");
+            let mut store = MemoryStore::new(previous.clone());
+            let mut provider = FakeTower {
+                fail_first_start_phase: matches!(failure, LifecyclePhase::Start),
+                fail_first_verify_phase: matches!(failure, LifecyclePhase::Verify),
+                ..Default::default()
+            };
+
+            let outcome = apply_update(&mut provider, &mut store, &candidate, "archive-two", None)
+                .await
+                .unwrap();
+
+            assert!(matches!(outcome, Outcome::RolledBack));
+            assert_eq!(store.active, previous);
+            assert_eq!(store.rejected, ["archive-two"]);
+            assert!(provider
+                .phases
+                .ends_with(&["stop", "start", "verify", "rollback"]));
+        }
+    }
+
+    #[tokio::test]
     async fn candidate_failure_is_rejected_before_rollback_can_fail() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
@@ -927,7 +1173,7 @@ mod tests {
         };
 
         assert!(
-            apply_update(&mut tower, &mut store, &candidate, "archive-two")
+            apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
                 .await
                 .is_err()
         );
@@ -953,22 +1199,34 @@ mod tests {
             .collect();
         assert_eq!(catalog.len(), catalog.iter().collect::<HashSet<_>>().len());
         for phase in [
-            TransactionPhase::PreflightPassed,
             TransactionPhase::PreflightStarted,
-            TransactionPhase::Drained,
-            TransactionPhase::AppQuiesced,
+            TransactionPhase::PreflightCompleted,
+            TransactionPhase::PrepareStarted,
             TransactionPhase::Prepared,
+            TransactionPhase::DrainStarted,
+            TransactionPhase::Drained,
+            TransactionPhase::StopStarted,
+            TransactionPhase::Stopped,
+            TransactionPhase::ActivateStarted,
             TransactionPhase::CandidateActivated,
-            TransactionPhase::CandidateVerified,
+            TransactionPhase::StartStarted,
             TransactionPhase::CandidateStarted,
+            TransactionPhase::HealthStarted,
             TransactionPhase::CandidateHealthy,
+            TransactionPhase::FinalizeStarted,
             TransactionPhase::Finalized,
+            TransactionPhase::CommitStarted,
             TransactionPhase::Committed,
             TransactionPhase::RollbackStarted,
-            TransactionPhase::RollbackAppQuiesced,
+            TransactionPhase::RollbackStopStarted,
+            TransactionPhase::RollbackStopped,
+            TransactionPhase::RollbackActivateStarted,
             TransactionPhase::PredecessorActivated,
+            TransactionPhase::RollbackStartStarted,
             TransactionPhase::PredecessorStarted,
+            TransactionPhase::RollbackHealthStarted,
             TransactionPhase::PredecessorHealthy,
+            TransactionPhase::RollbackFinalizeStarted,
             TransactionPhase::RolledBack,
             TransactionPhase::Aborted,
         ] {

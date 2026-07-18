@@ -21,7 +21,7 @@ mod windows;
 pub use windows::*;
 
 /// The contained application process — the guardian's one port to a running child. The
-/// per-platform adapters ([`unix`]/[`windows`]) implement it over their native containment
+/// per-platform adapters (`unix`/`windows`) implement it over their native containment
 /// (process group + `PR_SET_PDEATHSIG` on Unix, a kill-on-close Job Object on Windows);
 /// [`spawn`] is the factory. Expressing it as a trait keeps the two adapters honest — they
 /// must satisfy the same contract — and lets a fake drive [`App`](crate::app::App) in tests
@@ -43,15 +43,6 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Whether the init system has asked the guardian to stop.
 pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
-}
-
-/// The readiness of the polled control channel — platform-agnostic, so the single-threaded
-/// guardian serve loop reads the same on every target.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Ready {
-    Readable,
-    TimedOut,
-    Closed,
 }
 
 /// Called from the platform signal handler; async-signal-safe (a single atomic store).

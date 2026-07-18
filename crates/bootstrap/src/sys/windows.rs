@@ -294,7 +294,7 @@ impl Channel {
         }
     }
 
-    pub fn poll_readable(&self, timeout_ms: i32) -> super::Ready {
+    pub fn poll_readable(&self, timeout_ms: i32) -> bool {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::Pipes::PeekNamedPipe;
         // Anonymous pipes are not waitable for readability, so peek for buffered bytes,
@@ -314,13 +314,15 @@ impl Channel {
                 )
             };
             if ok == 0 {
-                return super::Ready::Closed; // broken pipe: supervisor gone.
+                // Broken pipe: the supervisor is gone. Report "not readable" and let the
+                // serve loop observe the death through the supervisor's exit status.
+                return false;
             }
             if available > 0 {
-                return super::Ready::Readable;
+                return true;
             }
             if std::time::Instant::now() >= deadline {
-                return super::Ready::TimedOut;
+                return false;
             }
             std::thread::sleep(Duration::from_millis(10));
         }

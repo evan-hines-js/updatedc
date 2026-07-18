@@ -1,0 +1,14 @@
+{
+  "schema": 2,
+  "deployment": "production-web-2026-07-18.1",
+  "metadata_url": "https://cdn.example.com/tuf/metadata/",
+  "targets_url": "https://cdn.example.com/tuf/targets/",
+  "application": {
+    "path": "products/web/stable/2.7.1/linux-x86_64/app",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "provider_set": {
+    "path": "provider-sets/web-linux-v4.json",
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  }
+}

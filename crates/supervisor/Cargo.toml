@@ -23,8 +23,9 @@ control = { path = "../control" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+serde_json = { workspace = true }
 
 # Re-arming FD_CLOEXEC on the inherited control-channel endpoint, so it stops at this
-# process instead of leaking into the operator's transition adapter.
+# process instead of leaking into the operator's lifecycle provider.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

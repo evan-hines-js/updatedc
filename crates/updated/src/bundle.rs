@@ -6,10 +6,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use crate::hash::sha256_file;
+use crate::hash::{is_sha256_hex, sha256_bytes, sha256_file};
 
-pub const MANIFEST_FILE: &str = "manifest.json";
-pub const MANIFEST_SCHEMA: u32 = 1;
+pub(crate) const MANIFEST_FILE: &str = "manifest.json";
+pub(crate) const MANIFEST_SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,7 +19,7 @@ pub struct ReleaseId {
 }
 
 impl ReleaseId {
-    pub fn directory_name(&self) -> String {
+    pub(crate) fn directory_name(&self) -> String {
         format!("{}-{}", self.version, self.manifest_sha256)
     }
 
@@ -31,7 +31,7 @@ impl ReleaseId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BundleManifest {
+pub(crate) struct BundleManifest {
     pub schema: u32,
     pub product: String,
     pub version: String,
@@ -42,7 +42,7 @@ pub struct BundleManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ManifestFile {
+pub(crate) struct ManifestFile {
     pub path: String,
     pub sha256: String,
     pub size: u64,
@@ -50,7 +50,7 @@ pub struct ManifestFile {
 }
 
 #[derive(Debug, Clone)]
-pub struct BundleLimits {
+pub(crate) struct BundleLimits {
     pub archive_bytes: u64,
     pub expanded_bytes: u64,
     pub file_bytes: u64,
@@ -81,8 +81,6 @@ pub struct ExpectedBundle<'a> {
 pub struct StagedRelease {
     pub id: ReleaseId,
     pub archive_sha256: String,
-    pub directory: PathBuf,
-    pub entrypoint: PathBuf,
 }
 
 /// Build the canonical deterministic application archive from a prepared release tree.
@@ -95,7 +93,7 @@ pub fn create_bundle(
     version: &str,
     platform: &str,
     entrypoint: &str,
-) -> io::Result<BundleManifest> {
+) -> io::Result<()> {
     semver::Version::parse(version).map_err(invalid)?;
     validate_relative(entrypoint, 1024)?;
     let metadata = fs::symlink_metadata(source)?;
@@ -146,11 +144,11 @@ pub fn create_bundle(
     }
     let encoder = tar.into_inner()?;
     encoder.finish()?.sync_all()?;
-    Ok(manifest)
+    Ok(())
 }
 
 impl BundleManifest {
-    pub fn parse(bytes: &[u8], expected: &ExpectedBundle<'_>) -> io::Result<Self> {
+    pub(crate) fn parse(bytes: &[u8], expected: &ExpectedBundle<'_>) -> io::Result<Self> {
         let manifest: Self = serde_json::from_slice(bytes).map_err(invalid)?;
         if manifest.schema != MANIFEST_SCHEMA {
             return Err(invalid("unsupported bundle manifest schema"));
@@ -193,15 +191,21 @@ impl BundleManifest {
         Ok(())
     }
 
-    pub fn id(&self, bytes: &[u8]) -> io::Result<ReleaseId> {
+    pub(crate) fn id(&self, bytes: &[u8]) -> io::Result<ReleaseId> {
         Ok(ReleaseId {
             version: self.version.clone(),
-            manifest_sha256: sha256_bytes(bytes)?,
+            manifest_sha256: sha256_bytes(bytes),
         })
     }
 }
 
-pub fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, PathBuf)> {
+/// Resolve a committed release's manifest and entrypoint by identity, *without* re-hashing
+/// the tree. The manifest's own bytes are bound to the release id (their digest must equal
+/// `id.manifest_sha256`), so this proves we are pointing at the release we committed — it
+/// trusts the already-verified tree rather than re-reading every file. Use on the
+/// steady-state path (launching the committed release); use [`read_release`] where
+/// untrusted or freshly written bytes must be fully re-verified.
+pub(crate) fn read_manifest(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, PathBuf)> {
     id.validate()?;
     let directory = root.join(id.directory_name());
     let directory_meta = fs::symlink_metadata(&directory)?;
@@ -213,12 +217,21 @@ pub fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, 
     manifest.validate_shape()?;
     if manifest.schema != MANIFEST_SCHEMA
         || manifest.version != id.version
-        || !sha256_bytes(&bytes)?.eq_ignore_ascii_case(&id.manifest_sha256)
+        || !sha256_bytes(&bytes).eq_ignore_ascii_case(&id.manifest_sha256)
     {
         return Err(invalid("release identity does not match its manifest"));
     }
-    verify_tree(&directory, &manifest)?;
     let entrypoint = directory.join(&manifest.entrypoint);
+    Ok((manifest, entrypoint))
+}
+
+/// Like [`read_manifest`], but also re-hashes every manifested file against the manifest.
+/// This is the fail-closed check applied to bytes *entering* the trusted set — freshly
+/// extracted downloads and a candidate at its activation/commit moment. A committed,
+/// already-verified release is not re-hashed again on the steady-state launch path.
+pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, PathBuf)> {
+    let (manifest, entrypoint) = read_manifest(root, id)?;
+    verify_tree(&root.join(id.directory_name()), &manifest)?;
     Ok((manifest, entrypoint))
 }
 
@@ -234,7 +247,7 @@ pub fn write_active(path: &Path, release: &ReleaseId) -> io::Result<()> {
     crate::apply::atomic_write(path, &serde_json::to_vec(release).map_err(invalid)?)
 }
 
-pub fn stage_bundle(
+pub(crate) fn stage_bundle(
     archive: &Path,
     staging_root: &Path,
     versions_root: &Path,
@@ -254,25 +267,19 @@ pub fn stage_bundle(
         let id = manifest.id(&bytes)?;
         let destination = versions_root.join(id.directory_name());
         if destination.exists() {
-            let (_, entrypoint) = read_release(versions_root, &id)?;
+            // Already ingested under this content id, so it was verified when first staged;
+            // trust it (its run directory may since have drifted with logs/state). Confirm
+            // it still resolves by identity, without re-hashing the tree.
+            read_manifest(versions_root, &id)?;
             fs::remove_dir_all(&stage)?;
-            return Ok(StagedRelease {
-                id,
-                archive_sha256,
-                directory: destination,
-                entrypoint,
-            });
+            return Ok(StagedRelease { id, archive_sha256 });
         }
         foundation::durable::sync_dir(&stage)?;
         fs::rename(&stage, &destination)?;
         foundation::durable::sync_dir(versions_root)?;
-        let (_, entrypoint) = read_release(versions_root, &id)?;
-        Ok(StagedRelease {
-            id,
-            archive_sha256,
-            directory: destination,
-            entrypoint,
-        })
+        // Re-verify the freshly published tree against its manifest.
+        read_release(versions_root, &id)?;
+        Ok(StagedRelease { id, archive_sha256 })
     });
     if result.is_err() {
         let _ = fs::remove_dir_all(&stage);
@@ -335,7 +342,7 @@ fn extract(
         }
         file.write_all(&bytes)?;
         file.sync_all()?;
-        let digest = sha256_bytes(&bytes)?;
+        let digest = sha256_bytes(&bytes);
         if path == MANIFEST_FILE {
             manifest_bytes = Some(bytes);
         } else if extracted.insert(path, (size, digest)).is_some() {
@@ -431,7 +438,7 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-pub fn verify_tree(directory: &Path, manifest: &BundleManifest) -> io::Result<()> {
+pub(crate) fn verify_tree(directory: &Path, manifest: &BundleManifest) -> io::Result<()> {
     let mut actual = Vec::new();
     collect_release_files(directory, directory, &mut actual)?;
     actual.sort();
@@ -515,15 +522,10 @@ fn validate_relative(path: &str, max: usize) -> io::Result<()> {
 }
 
 fn validate_digest(value: &str) -> io::Result<()> {
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_sha256_hex(value) {
         return Err(invalid("invalid SHA-256 digest"));
     }
     Ok(())
-}
-
-fn sha256_bytes(bytes: &[u8]) -> io::Result<String> {
-    use aws_lc_rs::digest::{digest, SHA256};
-    Ok(hex::encode(digest(&SHA256, bytes).as_ref()))
 }
 
 #[cfg(unix)]
@@ -592,14 +594,15 @@ mod tests {
             &BundleLimits::default(),
         )
         .unwrap();
+        let dir = root.join("versions").join(staged.id.directory_name());
         assert_eq!(
-            fs::read(staged.directory.join("config/release.toml")).unwrap(),
+            fs::read(dir.join("config/release.toml")).unwrap(),
             b"version = \"2.0.0\"\n"
         );
-        assert_eq!(staged.entrypoint, staged.directory.join("bin/app"));
-        read_release(&root.join("versions"), &staged.id).unwrap();
+        let (_, entrypoint) = read_release(&root.join("versions"), &staged.id).unwrap();
+        assert_eq!(entrypoint, dir.join("bin/app"));
 
-        fs::write(staged.directory.join("undeclared"), b"drift").unwrap();
+        fs::write(dir.join("undeclared"), b"drift").unwrap();
         assert!(read_release(&root.join("versions"), &staged.id).is_err());
     }
 

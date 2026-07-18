@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://updated.dev/schemas/provider-set.schema.json",
+  "title": "Updated Provider Set",
+  "description": "Signed, immutable capability overrides for the supervisor-owned built-in provider.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "overrides"],
+  "properties": {
+    "schema": { "const": 2 },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "overrides": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/override" }
+    }
+  },
+  "$defs": {
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability", "artifact", "args", "timeout_millis"],
+      "properties": {
+        "capability": { "enum": ["lifecycle"] },
+        "artifact": {
+          "$ref": "https://updated.dev/schemas/target-reference.schema.json"
+        },
+        "args": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "type": "string", "maxLength": 16384 }
+        },
+        "timeout_millis": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
+        }
+      }
+    }
+  }
+}

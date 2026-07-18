@@ -40,8 +40,6 @@ pub(crate) struct Situation {
     pub installed: Installed,
     /// The release named by the durable active-release record.
     pub active: Option<ReleaseId>,
-    /// Whether the active release directory and every manifested file verify.
-    pub active_verified: bool,
     /// The in-flight update transaction, if a journal is present.
     pub journal: Option<Transaction>,
     /// The guardian's crash marker: the last application exit was a crash.
@@ -133,13 +131,13 @@ mod tests {
 
     fn pending() -> Pending {
         Pending {
-            transition_id: "transition".into(),
+            lifecycle_attempt_id: "attempt".into(),
             previous_release: updated::bundle::ReleaseId {
                 version: "1.0.0".into(),
                 manifest_sha256: "aa".into(),
             },
             previous_archive_sha256: "archive-aa".into(),
-            transition_required: false,
+            lifecycle: None,
             committed_at: 1000,
         }
     }
@@ -159,7 +157,7 @@ mod tests {
         // A `committed_at` in the future must not produce a duration that panics the
         // loop's `Instant + Duration`; at most one window of waiting is ever correct.
         let future = Pending {
-            transition_id: "transition".into(),
+            lifecycle_attempt_id: "attempt".into(),
             committed_at: u64::MAX - 1,
             ..pending()
         };

@@ -299,20 +299,30 @@ impl Ctx {
                 .arg("--entrypoint")
                 .arg(format!("bin/app{}", self.exe));
         }
-        run(&mut command)
+        run(&mut command)?;
+        if application {
+            let target = release_target(product, "stable", version, &self.platkey, product);
+            let sha = sha256_hex(&dir.join("repo/targets").join(&target));
+            std::fs::write(dir.join("desired-app"), format!("{target}\n{sha}\n"))
+                .map_err(str_err)?;
+            if let Ok(addr) = std::fs::read_to_string(dir.join("assignment-addr")) {
+                self.publish_current_assignment(dir, addr.trim(), version)?;
+            }
+        }
+        Ok(())
     }
 
     /// Serve the TUF repository at `dir/repo`; the returned handle keeps it alive.
     pub fn serve(&self, dir: &Path, addr: &str) -> R<Proc> {
         run(Command::new(&self.server)
-            .arg("publish-assignment")
+            .arg("publish-provider-set")
             .arg("--repo")
             .arg(dir.join("repo"))
             .arg("--keys")
             .arg(dir.join("keys"))
-            .args(["--name", "assignments/node.json"])
-            .args(["--metadata-url", &self.meta_url(addr)])
-            .args(["--targets-url", &self.targets_url(addr)]))?;
+            .args(["--id", "default"]))?;
+        std::fs::write(dir.join("assignment-addr"), addr).map_err(str_err)?;
+        self.publish_current_assignment(dir, addr, "initial")?;
         Proc::spawn(
             "server",
             Command::new(&self.server)
@@ -321,6 +331,33 @@ impl Ctx {
                 .arg(dir.join("repo"))
                 .args(["--addr", addr]),
         )
+    }
+
+    fn publish_current_assignment(&self, dir: &Path, addr: &str, deployment: &str) -> R {
+        let desired = std::fs::read_to_string(dir.join("desired-app")).map_err(str_err)?;
+        let mut desired = desired.lines();
+        let app_path = desired
+            .next()
+            .ok_or("desired application path is missing")?;
+        let app_sha = desired
+            .next()
+            .ok_or("desired application hash is missing")?;
+        let set_path = "provider-sets/default.json";
+        let set_sha = sha256_hex(&dir.join("repo/targets").join(set_path));
+        run(Command::new(&self.server)
+            .arg("publish-assignment")
+            .arg("--repo")
+            .arg(dir.join("repo"))
+            .arg("--keys")
+            .arg(dir.join("keys"))
+            .args(["--name", "assignments/nodes/node.json"])
+            .args(["--metadata-url", &self.meta_url(addr)])
+            .args(["--targets-url", &self.targets_url(addr)])
+            .args(["--deployment", deployment])
+            .args(["--application-path", app_path])
+            .args(["--application-sha256", app_sha])
+            .args(["--provider-set-path", set_path])
+            .args(["--provider-set-sha256", &set_sha]))
     }
 
     /// The installer-pinned root a client trusts for the repo under `dir`.
@@ -341,6 +378,16 @@ impl Ctx {
     }
 }
 
+pub fn release_target(
+    product: &str,
+    channel: &str,
+    version: &str,
+    platform: &str,
+    component: &str,
+) -> String {
+    format!("products/{product}/{channel}/{version}/{platform}/{component}")
+}
+
 // ------------------------------- HTTP polling -------------------------------
 
 /// Hex SHA-256 of a file — used to seed committed installed-target state. Delegates
@@ -348,23 +395,6 @@ impl Ctx {
 /// path can never disagree on a digest; an unreadable file yields an empty string.
 pub fn sha256_hex(path: &Path) -> String {
     updated::hash::sha256_file(path).unwrap_or_default()
-}
-
-/// Make an immutable fixture file writable so a test can simulate out-of-band tampering.
-pub fn make_writable(path: &Path) -> R {
-    let mut permissions = std::fs::metadata(path).map_err(str_err)?.permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(permissions.mode() | 0o200);
-    }
-    #[cfg(windows)]
-    // This API is dangerous on Unix because it can grant write access broadly;
-    // this branch only exists on Windows, where clearing FILE_ATTRIBUTE_READONLY
-    // is exactly the operation the tampering fixture requires.
-    #[allow(clippy::permissions_set_readonly_false)]
-    permissions.set_readonly(false);
-    std::fs::set_permissions(path, permissions).map_err(str_err)
 }
 
 /// GET `url`, returning the body on a 2xx response.
@@ -479,15 +509,6 @@ impl Proc {
     /// This process's own PID (e.g. the guardian's), so a test can signal it directly.
     pub fn pid(&self) -> u32 {
         self.child.id()
-    }
-
-    /// Kill just this process (not its whole group / job) and reap it, simulating
-    /// a supervisor crash while its managed child keeps running. On Unix the child
-    /// is in its own process group; on Windows it survives while this `Proc`'s job
-    /// handle is still open (its kill-on-close fires only when this `Proc` drops).
-    pub fn kill_main(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

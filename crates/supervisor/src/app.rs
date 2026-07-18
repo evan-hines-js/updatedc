@@ -74,7 +74,7 @@ pub(crate) fn start(guardian: Guardian, opts: &Options) -> io::Result<App> {
 
 /// The guardian⇄supervisor launch contract, as it appears in this process's own
 /// environment. Only the supervisor is a party to it: neither the managed application nor
-/// the operator's transition adapter may see the control endpoint, the readiness nonce, or the
+/// the operator's lifecycle provider may see the control endpoint, the readiness nonce, or the
 /// chaos injection point, so every process this supervisor causes to be launched is
 /// stripped of all of it.
 pub(crate) const CONTROL_PLANE_ENV: &[&str] = &[
@@ -97,8 +97,9 @@ pub(crate) fn is_control_plane_env(key: &std::ffi::OsStr) -> bool {
 fn app_spec(opts: &Options, health_token: &str) -> io::Result<CommandSpec> {
     let release = updated::bundle::read_active(&opts.paths.active_release)?
         .ok_or_else(|| io::Error::other("active-release is missing"))?;
-    let (_, entrypoint) = updated::bundle::read_release(&opts.paths.versions, &release)?;
-    let release_dir = opts.paths.versions.join(release.directory_name());
+    // The supervisor never parses the release: it asks the provider how to launch the
+    // identity it committed. The default provider resolves the manifested entrypoint.
+    let launch = updated::provider::BundleStore::for_app(&opts.paths).resolve(&release)?;
     let mut envs: Vec<(OsString, OsString)> = std::env::vars_os()
         .filter(|(key, _)| !is_control_plane_env(key))
         .collect();
@@ -111,10 +112,10 @@ fn app_spec(opts: &Options, health_token: &str) -> io::Result<CommandSpec> {
         opts.paths.install_root.as_os_str().into(),
     ));
     Ok(CommandSpec {
-        program: entrypoint.into_os_string(),
+        program: launch.program.into_os_string(),
         args: opts.application.args.iter().map(OsString::from).collect(),
         env: envs,
-        cwd: Some(release_dir.into_os_string()),
+        cwd: Some(launch.cwd.into_os_string()),
     })
 }
 
@@ -133,9 +134,10 @@ fn clear_app_token(path: &Path) {
 }
 
 /// Ask the guardian to stop the application (it escalates to a hard kill), then clear the
-/// persisted token. Used to quiesce the app before activating a release.
-pub(crate) fn stop(app: &mut App, app_token: &Path) {
-    let _ = app.guardian.stop();
+/// persisted health token. The single path for quiescing the running app — before
+/// activating a release, and when the boot planner stops an uncommitted candidate.
+pub(crate) fn stop(guardian: &mut Guardian, app_token: &Path) {
+    let _ = guardian.stop();
     clear_app_token(app_token);
 }
 

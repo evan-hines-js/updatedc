@@ -30,12 +30,26 @@ usage() {
 Usage: scripts/macos-smoke.sh <command> [argument]
   start [restart|reexec]  Seed bundle 1.0.0 and run it under a user LaunchAgent
   publish [version]       Publish a bundle update (default: 2.0.0)
+  assign [version]        Atomically select an already-published application target
   prepare [version]       Prepare, but do not publish, a versioned bundle tree
   status                  Show launchd and application state
   logs                    Follow repository and tower logs
   stop                     Stop the LaunchAgent and repository
   reset                    Stop and remove target/macos-smoke state
 EOF
+}
+
+sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+target_path() { printf 'products/app/stable/%s/%s/app' "$1" "$PLATFORM"; }
+publish_assignment() {
+  local version="$1" app_path set_path="provider-sets/default.json"
+  app_path="$(target_path "$version")"
+  "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
+    --name assignments/nodes/node.json --deployment "app-$version" \
+    --metadata-url http://127.0.0.1:18080/metadata/ \
+    --targets-url http://127.0.0.1:18080/targets/ \
+    --application-path "$app_path" --application-sha256 "$(sha256_file "$REPO/targets/$app_path")" \
+    --provider-set-path "$set_path" --provider-set-sha256 "$(sha256_file "$REPO/targets/$set_path")"
 }
 
 need_macos() { [[ "$(uname -s)" == Darwin ]] || { echo "This smoke test requires macOS/launchd." >&2; exit 1; }; }
@@ -75,6 +89,7 @@ publish() {
     --product app --channel stable --version "$version" \
     --bundle "$PLATFORM=$tree" --entrypoint bin/app
   if [[ "${UPDATED_SMOKE_PUBLISH_NO_WAIT:-0}" == 1 ]]; then return; fi
+  publish_assignment "$version"
   for _ in {1..80}; do
     if [[ "$(curl -fsS http://127.0.0.1:19090/version 2>/dev/null || true)" == "$version" ]]; then
       echo "Updated successfully: sampleapp $version"
@@ -88,7 +103,7 @@ publish() {
 
 start() {
   need_macos
-  local mode="${1:-restart}" reload="" baseline
+  local mode="${1:-restart}" reload="" baseline provider_path
   local check_interval="${UPDATED_SMOKE_CHECK_INTERVAL:-2s}"
   local health_grace="${UPDATED_SMOKE_HEALTH_GRACE:-10s}"
   local confirmation_window="${UPDATED_SMOKE_CONFIRMATION_WINDOW:-10s}"
@@ -112,35 +127,38 @@ start() {
     --platform "$PLATFORM" --bundle "$baseline" --entrypoint bin/app
   "$BIN/server" publish-app --repo "$REPO" --keys "$KEYS" --product app \
     --version 1.0.0 --bundle "$PLATFORM=$baseline" --entrypoint bin/app
-  "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
-    --name assignments/node.json \
-    --metadata-url http://127.0.0.1:18080/metadata/ \
-    --targets-url http://127.0.0.1:18080/targets/
+  "$BIN/server" publish-provider-set --repo "$REPO" --keys "$KEYS" --id default
   if [[ "$mode" == reexec ]]; then
-    cat >"$BIN/transition" <<'EOF'
+    cat >"$BIN/lifecycle" <<'EOF'
 #!/bin/sh
-case "$UPDATED_TRANSITION_PHASE" in
+case "$UPDATED_LIFECYCLE_PHASE" in
   activate) exec kill -HUP "$UPDATED_CHILD_PID" ;;
   *) exit 0 ;;
 esac
 EOF
-    chmod 0755 "$BIN/transition"
+    chmod 0755 "$BIN/lifecycle"
+    "$BIN/server" publish-provider-artifact --repo "$REPO" --keys "$KEYS" \
+      --product app-lifecycle --version 1.0.0 \
+      --bundle "$PLATFORM=$BIN/lifecycle" --entrypoint bin/lifecycle
+    provider_path="products/app-lifecycle/stable/1.0.0/$PLATFORM/app-lifecycle"
+    "$BIN/server" publish-provider-set --repo "$REPO" --keys "$KEYS" --id default \
+      --provider-path "$provider_path" \
+      --provider-sha256 "$(sha256_file "$REPO/targets/$provider_path")" \
+      --provider-timeout-ms 10000
     reload="$(cat <<EOF
 
 [application.activation]
 mode = "reexec"
 
-[application.transition]
-command = ["$BIN/transition"]
-timeout = "10s"
 EOF
 )"
   fi
+  publish_assignment 1.0.0
   cat >"$CONFIG" <<EOF
 [routing]
 root = "$REPO/metadata/root.json"
 base_url = "http://127.0.0.1:18080/"
-assignment = "assignments/node.json"
+assignment = "assignments/nodes/node.json"
 [repository]
 root = "$REPO/metadata/root.json"
 [application]
@@ -191,6 +209,7 @@ EOF
 case "${1:-}" in
   start) start "${2:-restart}" ;;
   publish) publish "${2:-2.0.0}" ;;
+  assign) publish_assignment "${2:-2.0.0}" ;;
   prepare) UPDATED_SMOKE_PREPARE_ONLY=1 publish "${2:-2.0.0}" ;;
   status) launchctl print "$SERVICE" 2>/dev/null | sed -n '1,35p' || true; curl -fsS http://127.0.0.1:19090/version || true; echo ;;
   logs) touch "$REPO_LOG" "$TOWER_LOG"; tail -n 100 -F "$REPO_LOG" "$TOWER_LOG" ;;

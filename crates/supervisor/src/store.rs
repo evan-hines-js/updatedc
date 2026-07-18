@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use updated::bundle::{read_active, read_release, write_active, ReleaseId};
+use updated::bundle::{read_active, write_active, ReleaseId};
 use updated::config::Paths;
 use updated::reject::Rejections;
 use updated::state::{read_installed, write_installed, Installed, InstalledState};
@@ -17,7 +17,6 @@ pub(crate) trait Store {
     fn clear_journal(&mut self) -> io::Result<()>;
     fn reject(&mut self, digest: &str) -> io::Result<()>;
     fn clear_rejection(&mut self, digest: &str) -> io::Result<()>;
-    fn verify_release(&self, release: &ReleaseId) -> io::Result<()>;
     fn activate(&mut self, release: &ReleaseId) -> io::Result<()>;
 }
 
@@ -66,11 +65,9 @@ impl Store for FileStore {
     fn clear_rejection(&mut self, digest: &str) -> io::Result<()> {
         self.rejected.clear(digest)
     }
-    fn verify_release(&self, release: &ReleaseId) -> io::Result<()> {
-        read_release(&self.paths.versions, release).map(|_| ())
-    }
     fn activate(&mut self, release: &ReleaseId) -> io::Result<()> {
-        self.verify_release(release)?;
+        // Verification is an ingest-time gate (see `stage_bundle`); the committed store is
+        // trusted here. Activation just moves the atomic active-release pointer.
         write_active(&self.paths.active_release, release)
     }
 }

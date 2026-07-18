@@ -101,9 +101,17 @@ try {
     & (Join-Path $bin 'server.exe') publish-app --repo $repo --keys $keys --product app `
         --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }
+    & (Join-Path $bin 'server.exe') publish-provider-set --repo $repo --keys $keys --id default
+    if ($LASTEXITCODE) { throw 'publishing provider set failed' }
+    $appTarget = 'products/app/stable/1.0.0/windows-x86_64/app'
+    $setTarget = 'provider-sets/default.json'
+    $appSha = (Get-FileHash -Algorithm SHA256 (Join-Path $repo "targets/$appTarget")).Hash.ToLowerInvariant()
+    $setSha = (Get-FileHash -Algorithm SHA256 (Join-Path $repo "targets/$setTarget")).Hash.ToLowerInvariant()
     & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
-        --name assignments/node.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
-        --targets-url "http://127.0.0.1:$repoPort/targets/"
+        --name assignments/nodes/node.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
+        --targets-url "http://127.0.0.1:$repoPort/targets/" --deployment initial `
+        --application-path $appTarget --application-sha256 $appSha `
+        --provider-set-path $setTarget --provider-set-sha256 $setSha
     if ($LASTEXITCODE) { throw 'publishing routing assignment failed' }
 
     $serverProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
@@ -113,7 +121,7 @@ try {
 [routing]
 root = '$($rootJson.Replace("'", "''"))'
 base_url = 'http://127.0.0.1:$repoPort/'
-assignment = 'assignments/node.json'
+assignment = 'assignments/nodes/node.json'
 
 [repository]
 root = '$($rootJson.Replace("'", "''"))'

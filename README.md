@@ -25,16 +25,21 @@ outer lifecycle owner (systemd, launchd, Windows SCM, login item, desktop launch
           └── application (launched from the active immutable bundle)
 ```
 
-The supervisor verifies and stages releases, but the bootstrap owns process lifetime.
-That separation lets a new supervisor prove readiness before its pointer is committed,
-while the application continues running under the bootstrap.
+The supervisor authenticates releases through TUF and hands the verified bytes to a
+provider; the bootstrap owns process lifetime. That separation lets a new supervisor
+prove readiness before its pointer is committed, while the application continues running
+under the bootstrap. The supervisor itself carries no knowledge of what it downloads: it
+proves the bytes are the exact selected target and hands the provider a filepath. The
+built-in default provider extracts and verifies the signed bundle into an immutable
+release and resolves its entrypoint — a linked shared library, not a runtime plugin, so
+it can evolve independently of the trust/transaction/health/rollback core.
 
 Application activation follows one durable path:
 
 ```text
-authenticate archive
-  → safely extract and verify every manifested file
-  → publish an immutable release directory
+authenticate the archive through TUF
+  → hand the verified filepath to the provider (the default provider extracts and
+    verifies the manifested bundle into an immutable release)
   → write the transaction journal
   → atomically switch active-release
   → start or reexec the candidate
@@ -42,8 +47,7 @@ authenticate archive
   → commit, or reactivate and reject the predecessor
 ```
 
-See [WALKTHROUGH.md](WALKTHROUGH.md) for a five-minute code tour and
-[BUNDLE_SUPPORT.md](BUNDLE_SUPPORT.md) for the complete release model.
+See [WALKTHROUGH.md](WALKTHROUGH.md) for a five-minute code tour.
 
 ## Guarantees
 
@@ -64,6 +68,10 @@ Trust is anchored by [TUF](https://theupdateframework.io/) through the `tough` c
 pinned-root rotation, threshold roles, expiry/freeze resistance, metadata rollback
 protection, and target hash/length verification are not reimplemented here.
 
+Control-plane authors should start with the normative
+[control-plane API contract](CONTROLPLANE_API_CONTRACT.md) and its
+[JSON Schemas](schemas).
+
 ## Activation modes
 
 ### Portable restart
@@ -80,19 +88,23 @@ operator-defined command adopts the active candidate:
 ```toml
 [application.activation]
 mode = "reexec"
-[application.transition]
-command = ["/usr/local/libexec/transition-app"]
-timeout = "5m"
 ```
 
-The command is direct argv, never shell text, and receives one of `preflight`, `drain`,
-`prepare`, `activate`, `finalize`, or `rollback` in `UPDATED_TRANSITION_PHASE`, plus a
-stable `UPDATED_TRANSITION_ID` and candidate/predecessor paths. It must be idempotent.
-The same API also supports site work around portable restarts; only reexec requires it.
+The supervisor contains the `default` provider implementation, whose version is the
+supervisor version. A desired deployment may reference an immutable provider-set
+document that pins a separately signed capability override, argv, and timeout. Built-in
+and executable providers receive the same phases; external loading is an override, not
+a second update path. The manifested entrypoint receives one of `preflight`, `prepare`,
+`drain`, `stop`, `activate`, `start`, `verify`, `finalize`, or `rollback` in
+`UPDATED_LIFECYCLE_PHASE`, plus a
+stable `UPDATED_LIFECYCLE_ATTEMPT_ID` and candidate/predecessor paths. It must be idempotent.
+The same lifecycle API supports both portable restarts and reexec. Preparation completes
+before draining; activation work runs after stop and before a fresh start when using the
+portable strategy.
 The supervisor commits only if the master PID is unchanged and authenticated health
 reports the exact expected version.
 
-See [TRANSITION_WRAPPERS.md](TRANSITION_WRAPPERS.md) for copy/paste AI prompts that map
+See [LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md) for copy/paste AI prompts that map
 an existing deployment runbook or script set onto this protocol. Operators configure
 only the generated dispatcher; it can delegate internally to existing site scripts.
 
@@ -126,8 +138,8 @@ cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 
 The E2E harness creates a real signed repository and disposable towers under
-`target/e2e-work/`. It covers application upgrade and rollback, first-install and
-on-disk tampering, offline launch, rejection persistence, transaction-boundary crashes,
+`target/e2e-work/`. It covers application upgrade and rollback, a tampered trust root,
+offline launch, rejection persistence, transaction-boundary crashes,
 locking, supervisor adoption/self-update, one-shot launch, and Unix zero-downtime reexec.
 
 CI additionally runs:
@@ -157,14 +169,20 @@ target/release/server publish-app --repo ./repo --keys ./keys \
 target/release/server serve --repo ./repo --addr 127.0.0.1:8080
 ```
 
-Publish each node's small routing assignment into the routing TUF repository. In
-production the control plane writes these targets and the CDN serves them:
+Publish immutable application/provider artifacts first, then a provider set, and finally
+the desired deployment assignment. Every reference includes its exact TUF target path
+and SHA-256, so CDN lag can delay a deployment but cannot mix generations:
 
 ```sh
 target/release/server publish-assignment --repo ./routing-repo --keys ./routing-keys \
-  --name assignments/node-123.json \
+  --name assignments/nodes/node-123.json \
+  --deployment deploy-42 \
   --metadata-url https://cdn.example.com/groups/canary/metadata/ \
-  --targets-url https://cdn.example.com/groups/canary/targets/
+  --targets-url https://cdn.example.com/groups/canary/targets/ \
+  --application-path products/app/stable/2.0.0/linux-x86_64/app \
+  --application-sha256 '<64 hex characters>' \
+  --provider-set-path provider-sets/web-7.json \
+  --provider-set-sha256 '<64 hex characters>'
 ```
 
 An installer seeds the initial bundle before starting the tower:
@@ -183,7 +201,7 @@ target/release/server install-app \
 [routing]
 root = "/etc/example-app/routing-root.json"
 base_url = "https://updates.example.com/routing/"
-assignment = "assignments/node-123.json"
+assignment = "assignments/nodes/node-123.json"
 
 [repository]
 root = "/etc/example-app/releases-root.json"
@@ -263,7 +281,6 @@ markers, and content-addressed supervisor candidates.
 ## Documentation
 
 - [System walkthrough](WALKTHROUGH.md)
-- [Bundle-only architecture](BUNDLE_SUPPORT.md)
 - [Deployment adapters](deploy/README.md)
 - [Reference configuration](deploy/config.toml)
 

@@ -1343,6 +1343,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rustls",
+ "serde_json",
  "tokio",
  "updated",
  "updated-tuf",
@@ -1692,6 +1693,7 @@ version = "0.1.0"
 dependencies = [
  "foundation",
  "rustls",
+ "serde_json",
  "tokio",
  "updated",
  "updated-tuf",

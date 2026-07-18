@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://updated.dev/schemas/desired-deployment.schema.json",
+  "title": "Updated Desired Deployment",
+  "description": "The signed routing document assigning an exact application and provider set to a node.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "deployment",
+    "metadata_url",
+    "targets_url",
+    "application",
+    "provider_set"
+  ],
+  "properties": {
+    "schema": { "const": 2 },
+    "deployment": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "metadata_url": {
+      "type": "string",
+      "pattern": "^https://[^\\s]+/$"
+    },
+    "targets_url": {
+      "type": "string",
+      "pattern": "^https://[^\\s]+/$"
+    },
+    "application": {
+      "$ref": "https://updated.dev/schemas/target-reference.schema.json"
+    },
+    "provider_set": {
+      "$ref": "https://updated.dev/schemas/target-reference.schema.json"
+    }
+  }
+}

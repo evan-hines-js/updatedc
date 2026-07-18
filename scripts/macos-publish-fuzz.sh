@@ -108,6 +108,20 @@ while (( round == 0 || SECONDS - started < DURATION )); do
     done
     exit 1
   fi
+  if [[ -n "$corrupt" ]]; then
+    "$SMOKE" assign "$corrupt" >/dev/null
+    reject_deadline=$((SECONDS + 30))
+    while (( SECONDS < reject_deadline )) && ! grep -q "rejected $corrupt" "$WORK/tower.log"; do
+      sleep 0.25
+    done
+    grep -q "rejected $corrupt" "$WORK/tower.log" || {
+      echo "FAIL: desired corrupt release $corrupt was not rejected" >&2
+      exit 1
+    }
+  fi
+  # The control plane, not the node, chooses the fallback. Publishing this exact
+  # assignment last also makes concurrent artifact publication ordering irrelevant.
+  "$SMOKE" assign "$expected" >/dev/null
   echo "All ${#versions[@]} signed publications completed; waiting up to ${INTERVAL}s for recovery and convergence..."
   recovery_started=$SECONDS
   deadline=$((recovery_started + INTERVAL)); probes=0; next_progress=$recovery_started

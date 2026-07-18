@@ -127,6 +127,70 @@ pub(crate) fn app_post_health_crash_reverts(ctx: &Ctx) -> R {
     Ok(())
 }
 
+pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
+    let root = ctx.work.join("group-peer-isolation");
+    let v1 = app_v(ctx, "1.0.0");
+    let v2 = app_v(ctx, "2.0.0");
+    let nodes = [
+        ("healthy", "127.0.0.1:21120", "127.0.0.1:21130", false),
+        ("failing", "127.0.0.1:21121", "127.0.0.1:21131", true),
+    ];
+    let mut services = Vec::new();
+    let mut servers = Vec::new();
+
+    for (name, repository_addr, service_addr, fails) in nodes {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).map_err(str_err)?;
+        let app = dir.join(format!("app{}", ctx.exe));
+        std::fs::copy(&v1, &app).map_err(str_err)?;
+        ctx.init_repo(&dir)?;
+        ctx.publish(&dir, "app", "1.0.0", &v1)?;
+        servers.push(ctx.serve(&dir, repository_addr)?);
+
+        let mut args = vec!["--addr", service_addr];
+        if fails {
+            args.extend(["--crash-version", "2.0.0", "--crash-after-ms", "4000"]);
+        }
+        let command = Sup::new(ctx, &dir, repository_addr, "app", appcmd(&app, &args))
+            .check_interval("1s")
+            .health_grace("2s")
+            .confirmation_window("8s")
+            .health(service_addr)
+            .guardian()?;
+        services.push((name, dir, app, service_addr, Service::spawn(name, &command)));
+    }
+
+    for (_, _, _, address, _) in &services {
+        if !wait_for_version(address, "1.0.0", 25) {
+            return fail(format!("node at {address} did not start at 1.0.0"));
+        }
+    }
+    for (_, dir, _, _, _) in &services {
+        ctx.publish(dir, "app", "2.0.0", &v2)?;
+    }
+    if !wait_for_version("127.0.0.1:21130", "2.0.0", 30) {
+        return fail("healthy peer did not commit 2.0.0");
+    }
+    if !services[1].4.wait_for_log("reverting to 1.0.0", 60)
+        || !wait_for_version("127.0.0.1:21131", "1.0.0", 20)
+    {
+        return fail("failing peer did not roll back to 1.0.0");
+    }
+    if !services[0]
+        .4
+        .wait_for_log("update 2.0.0 confirmed; confirmation window passed", 20)
+        || !wait_for_version("127.0.0.1:21130", "2.0.0", 5)
+    {
+        return fail("healthy peer was incorrectly rolled back with its failing peer");
+    }
+    for (_, _, app, _, _) in &services {
+        kill_stray(app);
+    }
+    drop(servers);
+    ok("one node rolled back locally while its group peer remained committed at 2.0.0");
+    Ok(())
+}
+
 // ===========================================================================
 // 2. A tampered pinned root is rejected at load (fail closed).
 // ===========================================================================

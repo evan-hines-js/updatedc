@@ -10,8 +10,6 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use super::Ready;
-
 /// A launched application process, contained so it dies with the guardian: it runs in its
 /// own process group (so the guardian can signal its whole tree) and, on Linux, sets
 /// `PR_SET_PDEATHSIG(SIGKILL)` so the kernel kills it if the guardian dies. There is no
@@ -202,7 +200,7 @@ pub fn terminate_gracefully(pid: u32) {
 
 /// Wait up to `timeout_ms` for `fd` to become readable, so the single-threaded guardian
 /// can watch the control channel while still periodically checking the app and supervisor.
-fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> Ready {
+fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
     let mut pfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -210,15 +208,14 @@ fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> Ready {
     };
     let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     if r <= 0 {
-        return Ready::TimedOut;
+        return false;
     }
     if pfd.revents & libc::POLLIN != 0 {
-        return Ready::Readable;
+        return true;
     }
-    if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-        return Ready::Closed;
-    }
-    Ready::TimedOut
+    // POLLHUP/POLLERR/POLLNVAL: the peer is gone. Report "not readable" and let the
+    // serve loop observe the death through the supervisor's exit status.
+    false
 }
 
 // ------------------------------ the control channel ------------------------------
@@ -273,7 +270,7 @@ impl Channel {
         }
     }
 
-    pub fn poll_readable(&self, timeout_ms: i32) -> Ready {
+    pub fn poll_readable(&self, timeout_ms: i32) -> bool {
         poll_readable(self.stream.as_raw_fd(), timeout_ms)
     }
 
@@ -337,10 +334,10 @@ mod tests {
 
         channel.send_hello().unwrap();
         assert_eq!(Hello::read(&mut peer).unwrap(), Hello::current());
-        assert_eq!(channel.poll_readable(0), Ready::TimedOut);
+        assert!(!channel.poll_readable(0));
 
         Request::Stop.write(&mut peer).unwrap();
-        assert_eq!(channel.poll_readable(100), Ready::Readable);
+        assert!(channel.poll_readable(100));
         assert_eq!(channel.read_request().unwrap(), Request::Stop);
 
         channel.send_response(&Response::Ok).unwrap();
@@ -348,7 +345,7 @@ mod tests {
         drop(peer);
         // A closed stream can report POLLIN together with POLLHUP; the read is the
         // authoritative observation that the peer is gone.
-        assert_eq!(channel.poll_readable(100), Ready::Readable);
+        assert!(channel.poll_readable(100));
         assert!(matches!(
             channel.read_request(),
             Err(control::Error::Closed)
@@ -379,7 +376,7 @@ mod tests {
         let [read, write] = socketpair_cloexec().unwrap();
         close_fd(read);
         close_fd(write);
-        assert_eq!(poll_readable(read, 0), Ready::Closed);
+        assert!(!poll_readable(read, 0));
     }
 
     #[test]

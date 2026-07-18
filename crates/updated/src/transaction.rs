@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::apply;
 use crate::bundle::ReleaseId;
+use crate::state::LifecycleProviderRelease;
 
 /// Durable intent for an in-flight executable replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,8 +28,9 @@ pub struct Transaction {
     /// cleared. This records policy intent that cannot safely be reconstructed from
     /// one-shot process-exit markers on a later recovery boot.
     pub candidate_rejection_required: bool,
-    /// Recovery must replay the operator transition adapter before clearing this intent.
-    pub transition_required: bool,
+    /// Recovery must replay the operator lifecycle provider before clearing this intent.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub lifecycle: Option<Box<LifecycleProviderRelease>>,
     /// Last state-machine operation known to have completed durably. Recovery replays
     /// the next operation; adapters are idempotent across the action/journal-write gap.
     pub phase: Phase,
@@ -39,21 +41,34 @@ pub struct Transaction {
 pub enum Phase {
     Started,
     PreflightStarted,
-    PreflightPassed,
-    Drained,
-    AppQuiesced,
+    PreflightCompleted,
+    PrepareStarted,
     Prepared,
+    DrainStarted,
+    Drained,
+    StopStarted,
+    Stopped,
+    ActivateStarted,
     CandidateActivated,
     CandidateVerified,
+    StartStarted,
     CandidateStarted,
+    HealthStarted,
     CandidateHealthy,
+    FinalizeStarted,
     Finalized,
+    CommitStarted,
     Committed,
     RollbackStarted,
-    RollbackAppQuiesced,
+    RollbackStopStarted,
+    RollbackStopped,
+    RollbackActivateStarted,
     PredecessorActivated,
+    RollbackStartStarted,
     PredecessorStarted,
+    RollbackHealthStarted,
     PredecessorHealthy,
+    RollbackFinalizeStarted,
     RolledBack,
     Aborted,
 }
@@ -78,6 +93,14 @@ impl Transaction {
                 io::ErrorKind::InvalidData,
                 "on-launch transactions cannot require supervised candidate rejection",
             ));
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            if lifecycle.product.is_empty() || lifecycle.timeout_millis == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transaction lifecycle identity is invalid",
+                ));
+            }
         }
         let valid = match self.kind {
             Kind::Supervised => self.phase != Phase::Started,
@@ -106,10 +129,15 @@ impl Transaction {
         matches!(
             self.phase,
             Phase::RollbackStarted
-                | Phase::RollbackAppQuiesced
+                | Phase::RollbackStopStarted
+                | Phase::RollbackStopped
+                | Phase::RollbackActivateStarted
                 | Phase::PredecessorActivated
+                | Phase::RollbackStartStarted
                 | Phase::PredecessorStarted
+                | Phase::RollbackHealthStarted
                 | Phase::PredecessorHealthy
+                | Phase::RollbackFinalizeStarted
                 | Phase::RolledBack
                 | Phase::Aborted
         )
@@ -120,11 +148,16 @@ impl Transaction {
     pub fn rollback_rank(&self) -> Option<u8> {
         match self.phase {
             Phase::RollbackStarted => Some(0),
-            Phase::RollbackAppQuiesced => Some(1),
-            Phase::PredecessorActivated => Some(2),
-            Phase::PredecessorStarted => Some(3),
-            Phase::PredecessorHealthy => Some(4),
-            Phase::RolledBack | Phase::Aborted => Some(5),
+            Phase::RollbackStopStarted => Some(1),
+            Phase::RollbackStopped => Some(2),
+            Phase::RollbackActivateStarted => Some(3),
+            Phase::PredecessorActivated => Some(4),
+            Phase::RollbackStartStarted => Some(5),
+            Phase::PredecessorStarted => Some(6),
+            Phase::RollbackHealthStarted => Some(7),
+            Phase::PredecessorHealthy => Some(8),
+            Phase::RollbackFinalizeStarted => Some(9),
+            Phase::RolledBack | Phase::Aborted => Some(10),
             _ => None,
         }
     }
@@ -133,16 +166,23 @@ impl Transaction {
         let supervised_forward = self.kind == Kind::Supervised
             && matches!(
                 (self.phase, next),
-                (Phase::PreflightStarted, Phase::PreflightPassed)
-                    | (Phase::PreflightPassed, Phase::Drained)
-                    | (Phase::Drained, Phase::AppQuiesced)
-                    | (Phase::AppQuiesced, Phase::Prepared)
-                    | (Phase::Prepared, Phase::CandidateActivated)
-                    | (Phase::CandidateActivated, Phase::CandidateVerified)
-                    | (Phase::CandidateVerified, Phase::CandidateStarted)
-                    | (Phase::CandidateStarted, Phase::CandidateHealthy)
-                    | (Phase::CandidateHealthy, Phase::Finalized)
-                    | (Phase::Finalized, Phase::Committed)
+                (Phase::PreflightStarted, Phase::PreflightCompleted)
+                    | (Phase::PreflightCompleted, Phase::PrepareStarted)
+                    | (Phase::PrepareStarted, Phase::Prepared)
+                    | (Phase::Prepared, Phase::DrainStarted)
+                    | (Phase::DrainStarted, Phase::Drained)
+                    | (Phase::Drained, Phase::StopStarted)
+                    | (Phase::StopStarted, Phase::Stopped)
+                    | (Phase::Stopped, Phase::ActivateStarted)
+                    | (Phase::ActivateStarted, Phase::CandidateActivated)
+                    | (Phase::CandidateActivated, Phase::StartStarted)
+                    | (Phase::StartStarted, Phase::CandidateStarted)
+                    | (Phase::CandidateStarted, Phase::HealthStarted)
+                    | (Phase::HealthStarted, Phase::CandidateHealthy)
+                    | (Phase::CandidateHealthy, Phase::FinalizeStarted)
+                    | (Phase::FinalizeStarted, Phase::Finalized)
+                    | (Phase::Finalized, Phase::CommitStarted)
+                    | (Phase::CommitStarted, Phase::Committed)
             );
         let on_launch_forward = self.kind == Kind::OnLaunch
             && matches!(
@@ -155,11 +195,16 @@ impl Transaction {
             && !matches!(self.phase, Phase::Committed | Phase::RolledBack);
         let rollback = matches!(
             (self.phase, next),
-            (Phase::RollbackStarted, Phase::RollbackAppQuiesced)
-                | (Phase::RollbackAppQuiesced, Phase::PredecessorActivated)
-                | (Phase::PredecessorActivated, Phase::PredecessorStarted)
-                | (Phase::PredecessorStarted, Phase::PredecessorHealthy)
-                | (Phase::PredecessorHealthy, Phase::RolledBack)
+            (Phase::RollbackStarted, Phase::RollbackStopStarted)
+                | (Phase::RollbackStopStarted, Phase::RollbackStopped)
+                | (Phase::RollbackStopped, Phase::RollbackActivateStarted)
+                | (Phase::RollbackActivateStarted, Phase::PredecessorActivated)
+                | (Phase::PredecessorActivated, Phase::RollbackStartStarted)
+                | (Phase::RollbackStartStarted, Phase::PredecessorStarted)
+                | (Phase::PredecessorStarted, Phase::RollbackHealthStarted)
+                | (Phase::RollbackHealthStarted, Phase::PredecessorHealthy)
+                | (Phase::PredecessorHealthy, Phase::RollbackFinalizeStarted)
+                | (Phase::RollbackFinalizeStarted, Phase::RolledBack)
                 | (Phase::RollbackStarted, Phase::Aborted)
         );
         if !(supervised_forward || on_launch_forward || begin_rollback || rollback) {
@@ -190,7 +235,7 @@ pub fn classify_recovery(
     committed: Option<&ReleaseId>,
 ) -> Recovery {
     let commit_may_have_landed = match tx.kind {
-        Kind::Supervised => matches!(tx.phase, Phase::Finalized | Phase::Committed),
+        Kind::Supervised => matches!(tx.phase, Phase::CommitStarted | Phase::Committed),
         Kind::OnLaunch => matches!(tx.phase, Phase::CandidateVerified | Phase::Committed),
     };
     match tx.phase {
@@ -202,10 +247,13 @@ pub fn classify_recovery(
         }
         Phase::Started
         | Phase::PreflightStarted
-        | Phase::PreflightPassed
-        | Phase::Drained
-        | Phase::AppQuiesced
+        | Phase::PreflightCompleted
+        | Phase::PrepareStarted
         | Phase::Prepared
+        | Phase::DrainStarted
+        | Phase::Drained
+        | Phase::StopStarted
+        | Phase::Stopped
             if active == Some(&tx.previous_release) =>
         {
             Recovery::NeverSwapped
@@ -259,7 +307,7 @@ mod tests {
             candidate_release: release("2.0.0", "new"),
             candidate_archive_sha256: "archive".into(),
             candidate_rejection_required: false,
-            transition_required: true,
+            lifecycle: None,
             phase: Phase::PreflightStarted,
         }
     }
@@ -281,7 +329,7 @@ mod tests {
             classify_recovery(&tx, Some(&tx.candidate_release), Some(&tx.previous_release)),
             Recovery::RestorePredecessor
         );
-        tx.phase = Phase::PreflightPassed;
+        tx.phase = Phase::PreflightCompleted;
         assert_eq!(
             classify_recovery(&tx, Some(&tx.previous_release), Some(&tx.previous_release)),
             Recovery::NeverSwapped
@@ -291,7 +339,7 @@ mod tests {
             Recovery::RestorePredecessor
         );
 
-        tx.phase = Phase::Finalized;
+        tx.phase = Phase::CommitStarted;
         assert_eq!(
             classify_recovery(
                 &tx,
@@ -318,15 +366,22 @@ mod tests {
     fn each_transaction_kind_accepts_only_its_explicit_path() {
         let mut supervised = tx();
         for phase in [
-            Phase::PreflightPassed,
-            Phase::Drained,
-            Phase::AppQuiesced,
+            Phase::PreflightCompleted,
+            Phase::PrepareStarted,
             Phase::Prepared,
+            Phase::DrainStarted,
+            Phase::Drained,
+            Phase::StopStarted,
+            Phase::Stopped,
+            Phase::ActivateStarted,
             Phase::CandidateActivated,
-            Phase::CandidateVerified,
+            Phase::StartStarted,
             Phase::CandidateStarted,
+            Phase::HealthStarted,
             Phase::CandidateHealthy,
+            Phase::FinalizeStarted,
             Phase::Finalized,
+            Phase::CommitStarted,
             Phase::Committed,
         ] {
             supervised.advance(phase).unwrap();
@@ -348,11 +403,16 @@ mod tests {
         transaction.phase = Phase::CandidateHealthy;
         for (phase, rank) in [
             (Phase::RollbackStarted, 0),
-            (Phase::RollbackAppQuiesced, 1),
-            (Phase::PredecessorActivated, 2),
-            (Phase::PredecessorStarted, 3),
-            (Phase::PredecessorHealthy, 4),
-            (Phase::RolledBack, 5),
+            (Phase::RollbackStopStarted, 1),
+            (Phase::RollbackStopped, 2),
+            (Phase::RollbackActivateStarted, 3),
+            (Phase::PredecessorActivated, 4),
+            (Phase::RollbackStartStarted, 5),
+            (Phase::PredecessorStarted, 6),
+            (Phase::RollbackHealthStarted, 7),
+            (Phase::PredecessorHealthy, 8),
+            (Phase::RollbackFinalizeStarted, 9),
+            (Phase::RolledBack, 10),
         ] {
             transaction.advance(phase).unwrap();
             assert_eq!(transaction.rollback_rank(), Some(rank));

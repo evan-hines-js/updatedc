@@ -6,7 +6,7 @@
 //! that is the init system's job. When the app exits on its own the guardian rolls the
 //! exit code up and the whole tower goes down, and the init system restarts it fresh.
 //!
-//! This is the platform-agnostic lifecycle over the [`Process`](crate::sys::Process) port;
+//! This is the platform-agnostic lifecycle over the [`Process`] port;
 //! the contained process itself (native launch, containment, stop, exit polling) lives in
 //! the per-platform adapter behind the [`sys`](crate::sys) seam.
 
@@ -18,7 +18,7 @@ use control::CommandSpec;
 use crate::sys::Process;
 
 /// How the guardian launches a contained process: `crate::sys::spawn` in production, a
-/// fake in tests — the [`Process`](crate::sys::Process) port's factory.
+/// fake in tests — the [`Process`] port's factory.
 type Spawn = fn(&CommandSpec) -> io::Result<Box<dyn Process>>;
 
 /// The guardian's view of the application: a running process, or none.

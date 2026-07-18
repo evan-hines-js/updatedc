@@ -1,12 +1,12 @@
 //! Environment variable names the update tower still uses, in one place.
 //!
 //! The program that *sets* a variable and the program that *reads* it — the
-//! supervisor, the managed application, the operator transition adapter, the tests — all
+//! supervisor, the managed application, the operator lifecycle provider, the tests — all
 //! reference these constants instead of string literals, so a rename can never desync
 //! them. All share the `UPDATED_` prefix.
 //!
 //! The guardian⇄supervisor launch contract (the control-channel endpoint, the
-//! readiness nonce, the state directory) lives in the frozen [`control`] crate, not
+//! readiness nonce, the state directory) lives in the frozen `control` crate, not
 //! here — the guardian depends on nothing in this crate.
 
 // ── supervisor → managed application: health proof ─────────────────────────────
@@ -16,11 +16,11 @@
 /// supervisor knows the answer came from the exact process it launched.
 pub const HEALTH_TOKEN: &str = "UPDATED_HEALTH_TOKEN";
 
-// ── supervisor → operator transition adapter ──────────────────────────────────
+// ── supervisor → operator lifecycle provider ───────────────────────────────────
 
-/// PID of the running child, exposed to the operator's transition adapter.
+/// PID of the running child, exposed to the operator's lifecycle provider.
 pub const CHILD_PID: &str = "UPDATED_CHILD_PID";
-/// Root of the managed installation, exposed to the operator's transition adapter.
+/// Root of the managed installation, exposed to the operator's lifecycle provider.
 pub const INSTALL_ROOT: &str = "UPDATED_INSTALL_ROOT";
 /// Immutable directory of the release the command is being asked to activate.
 pub const CANDIDATE: &str = "UPDATED_CANDIDATE";
@@ -31,9 +31,9 @@ pub const CANDIDATE_VERSION: &str = "UPDATED_CANDIDATE_VERSION";
 /// Semantic version of [`PREDECESSOR`].
 pub const PREDECESSOR_VERSION: &str = "UPDATED_PREDECESSOR_VERSION";
 /// Stable content-derived identity for one update attempt and its recovery retries.
-pub const TRANSITION_ID: &str = "UPDATED_TRANSITION_ID";
-/// Lifecycle phase requested from the operator transition adapter.
-pub const TRANSITION_PHASE: &str = "UPDATED_TRANSITION_PHASE";
+pub const LIFECYCLE_ATTEMPT_ID: &str = "UPDATED_LIFECYCLE_ATTEMPT_ID";
+/// Lifecycle phase requested from the operator lifecycle provider.
+pub const LIFECYCLE_PHASE: &str = "UPDATED_LIFECYCLE_PHASE";
 
 // ── test-only fault injection ──────────────────────────────────────────────────
 
@@ -54,8 +54,8 @@ mod tests {
             PREDECESSOR,
             CANDIDATE_VERSION,
             PREDECESSOR_VERSION,
-            TRANSITION_ID,
-            TRANSITION_PHASE,
+            LIFECYCLE_ATTEMPT_ID,
+            LIFECYCLE_PHASE,
             CHAOS_POINT,
         ] {
             assert!(

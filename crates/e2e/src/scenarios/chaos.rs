@@ -82,13 +82,13 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         ctx.publish(&dir, "app", "1.0.0", &v1)?;
         ctx.publish(&dir, "app", "2.0.0", &v2)?;
         let server = ctx.serve(&dir, &srv)?;
-        let fixture = dir.join("transition-fixture");
+        let fixture = dir.join("lifecycle-fixture");
         let fixture_command = vec![
             std::env::current_exe()
                 .map_err(str_err)?
                 .display()
                 .to_string(),
-            "--transition-fixture".into(),
+            "--lifecycle-fixture".into(),
             fixture.display().to_string(),
         ];
 
@@ -113,7 +113,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         .check_interval("1s")
         .health_grace("2s")
         .confirmation_window("30s")
-        .transition(fixture_command)
+        .lifecycle(fixture_command)
         .guardian()?;
         cmd.env("UPDATED_CHAOS_POINT", point);
         let tower = Service::spawn("rollback-chaos", &cmd);
@@ -138,14 +138,34 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             .collect();
         let ids: std::collections::HashSet<&str> = parsed.iter().map(|(_, id)| *id).collect();
         let count = |phase: &str| parsed.iter().filter(|(p, _)| *p == phase).count();
-        let expected_rollback_calls = usize::from(point == "rollback-adapter-applied") + 1;
+        let expected_rollback_calls = usize::from(point == "rollback-lifecycle-applied") + 1;
+        let expected_activate_calls = usize::from(point == "predecessor-lifecycle-applied") + 2;
+        let expected_stop_calls = usize::from(point == "rollback-stop-applied") + 2;
+        let expected_start_calls = usize::from(point == "predecessor-start-applied") + 2;
+        let expected_verify_calls = usize::from(point == "predecessor-health-applied") + 2;
         let phase_sequence: Vec<&str> = parsed.iter().map(|(phase, _)| *phase).collect();
-        let mut expected_sequence = vec!["preflight", "drain", "prepare", "finalize"];
+        let mut expected_sequence = vec![
+            "preflight",
+            "prepare",
+            "drain",
+            "stop",
+            "activate",
+            "start",
+            "verify",
+            "finalize",
+        ];
+        expected_sequence.extend(std::iter::repeat_n("stop", expected_stop_calls - 1));
+        expected_sequence.extend(std::iter::repeat_n("activate", expected_activate_calls - 1));
+        expected_sequence.extend(std::iter::repeat_n("start", expected_start_calls - 1));
+        expected_sequence.extend(std::iter::repeat_n("verify", expected_verify_calls - 1));
         expected_sequence.extend(std::iter::repeat_n("rollback", expected_rollback_calls));
-        let calls_are_minimal = ["preflight", "drain", "prepare", "finalize"]
+        let calls_are_minimal = ["preflight", "prepare", "drain", "finalize"]
             .iter()
             .all(|phase| count(phase) == 1)
-            && count("activate") == 0
+            && count("stop") == expected_stop_calls
+            && count("activate") == expected_activate_calls
+            && count("start") == expected_start_calls
+            && count("verify") == expected_verify_calls
             && count("rollback") == expected_rollback_calls
             && phase_sequence == expected_sequence
             && ids.len() == 1;
@@ -155,15 +175,25 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        let effects_are_idempotent = ["preflight", "drain", "prepare", "finalize", "rollback"]
-            .iter()
-            .all(|phase| {
-                effect_names
-                    .iter()
-                    .filter(|name| name.ends_with(&format!("-{phase}")))
-                    .count()
-                    == 1
-            });
+        let effects_are_idempotent = [
+            "preflight",
+            "prepare",
+            "drain",
+            "stop",
+            "activate",
+            "start",
+            "verify",
+            "finalize",
+            "rollback",
+        ]
+        .iter()
+        .all(|phase| {
+            effect_names
+                .iter()
+                .filter(|name| name.ends_with(&format!("-{phase}")))
+                .count()
+                == 1
+        });
         let log = tower.captured_log();
         drop(tower);
         drop(server);
@@ -189,7 +219,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
 
 /// A failed drain is a distinct terminal path: rollback has already restored external
 /// state, then `aborted` is journaled before cleanup. Crash in that final gap and prove
-/// recovery clears evidence without replaying any completed adapter phase.
+/// recovery clears evidence without replaying any completed lifecycle phase.
 pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
     let points = ctx.abort_chaos_boundaries()?;
     if points.as_slice() != ["aborted"] {
@@ -205,13 +235,13 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
     let server = ctx.serve(&dir, srv)?;
-    let fixture = dir.join("transition-fixture");
+    let fixture = dir.join("lifecycle-fixture");
     let fixture_command = vec![
         std::env::current_exe()
             .map_err(str_err)?
             .display()
             .to_string(),
-        "--transition-fixture".into(),
+        "--lifecycle-fixture".into(),
         fixture.display().to_string(),
         "fail-drain".into(),
     ];
@@ -219,7 +249,7 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
         .health(svc)
         .check_interval("5s")
         .health_grace("2s")
-        .transition(fixture_command)
+        .lifecycle(fixture_command)
         .guardian()?;
     cmd.env("UPDATED_CHAOS_POINT", "aborted");
     let tower = Proc::spawn("abort-chaos", &mut cmd)?;
@@ -241,7 +271,7 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
     drop(tower);
     drop(server);
     kill_stray(&dir.join("install"));
-    if !crash_seen || !durable || !live || phases != ["preflight", "drain", "rollback"] {
+    if !crash_seen || !durable || !live || phases != ["preflight", "prepare", "drain", "rollback"] {
         return fail(format!(
             "aborted recovery failed (crash_seen={crash_seen}, durable={durable}, live={live}, \
              phases={phases:?}); attempts:\n{attempts}\nlog:\n{log}"
@@ -256,7 +286,7 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
 /// idempotency cache from suppressing work belonging to a genuinely new attempt.
 pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21601", "127.0.0.1:21701");
-    let dir = ctx.work.join("transition-attempt-ids");
+    let dir = ctx.work.join("lifecycle-attempt-ids");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
     let app = dir.join(format!("app{}", ctx.exe));
@@ -265,13 +295,13 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
     let server = ctx.serve(&dir, srv)?;
-    let fixture = dir.join("transition-fixture");
+    let fixture = dir.join("lifecycle-fixture");
     let fixture_command = vec![
         std::env::current_exe()
             .map_err(str_err)?
             .display()
             .to_string(),
-        "--transition-fixture".into(),
+        "--lifecycle-fixture".into(),
         fixture.display().to_string(),
         "fail-first-drain".into(),
     ];
@@ -279,11 +309,11 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
         .health(svc)
         .check_interval("1s")
         .health_grace("2s")
-        .transition(fixture_command)
+        .lifecycle(fixture_command)
         .guardian()?;
     let tower = Proc::spawn("attempt-ids", &mut cmd)?;
     // Seeing v2 only proves candidate start/health; finalization runs afterward. Wait for
-    // both externally visible service convergence and the complete adapter contract so
+    // both externally visible service convergence and the complete lifecycle contract so
     // this assertion cannot sample a valid attempt halfway through its final phase.
     let upgraded = wait_until(35, || {
         let serving_v2 = http_text(&format!("http://{svc}/version")).as_deref() == Some("2.0.0");
@@ -324,8 +354,18 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
     if !upgraded
         || distinct.len() != 2
         || rollback_id != first_id
-        || first_phases != ["preflight", "drain", "rollback"]
-        || second_phases != ["preflight", "drain", "prepare", "finalize"]
+        || first_phases != ["preflight", "prepare", "drain", "rollback"]
+        || second_phases
+            != [
+                "preflight",
+                "prepare",
+                "drain",
+                "stop",
+                "activate",
+                "start",
+                "verify",
+                "finalize",
+            ]
     {
         return fail(format!(
             "attempt IDs were not scoped correctly (upgraded={upgraded}, distinct={}, \

@@ -21,9 +21,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--transition-fixture") {
-        if let Err(error) = run_transition_fixture() {
-            eprintln!("transition fixture: {error}");
+    if std::env::args().nth(1).as_deref() == Some("--lifecycle-fixture") {
+        if let Err(error) = run_lifecycle_fixture() {
+            eprintln!("lifecycle fixture: {error}");
             std::process::exit(1);
         }
         return;
@@ -35,10 +35,10 @@ fn main() {
     println!("\n\x1b[1;32mSUCCESS: all scenarios passed\x1b[0m");
 }
 
-/// Cross-platform operator-adapter fixture. Every call is recorded, while a create-new
+/// Cross-platform operator-lifecycle fixture. Every call is recorded, while a create-new
 /// marker models an idempotent side effect that may happen only once per (transaction,
 /// phase), even when crash recovery necessarily replays the command.
-fn run_transition_fixture() -> R {
+fn run_lifecycle_fixture() -> R {
     use std::io::Write;
 
     let root = std::env::args()
@@ -46,8 +46,8 @@ fn run_transition_fixture() -> R {
         .map(PathBuf::from)
         .ok_or("missing fixture state directory")?;
     let mode = std::env::args().nth(3).unwrap_or_default();
-    let phase = std::env::var("UPDATED_TRANSITION_PHASE").map_err(|error| error.to_string())?;
-    let id = std::env::var("UPDATED_TRANSITION_ID").map_err(|error| error.to_string())?;
+    let phase = std::env::var("UPDATED_LIFECYCLE_PHASE").map_err(|error| error.to_string())?;
+    let id = std::env::var("UPDATED_LIFECYCLE_ATTEMPT_ID").map_err(|error| error.to_string())?;
     std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
     let mut attempts = std::fs::OpenOptions::new()
         .create(true)
@@ -98,16 +98,12 @@ fn scenarios() -> Vec<Scenario> {
             app_post_health_crash_reverts,
         ),
         (
+            "two nodes receive one group release; only the failing node rolls back",
+            group_peer_failure_is_node_local,
+        ),
+        (
             "a tampered pinned root blocks updates but not the verified offline baseline",
             tampered_root_fails_closed,
-        ),
-        (
-            "a tampered first-install binary is rejected before execution",
-            tampered_first_install_fails_closed,
-        ),
-        (
-            "a drifted on-disk binary is refused at startup",
-            drift_fail_closed,
         ),
         (
             "a second supervisor on the same install is refused",
@@ -170,7 +166,7 @@ fn scenarios() -> Vec<Scenario> {
         rollback_chaos_recovery,
     ));
     s.push((
-        "crash after an aborted drain does not replay completed transition scripts",
+        "crash after an aborted drain does not replay completed lifecycle scripts",
         aborted_transition_chaos_recovery,
     ));
     s.push((
@@ -207,7 +203,13 @@ fn run() -> R {
     // would only wrap the same blocking work in a thread pool. Override the degree with
     // E2E_JOBS (E2E_JOBS=1 gives the old sequential order for debugging). The whole run
     // completes even when a scenario fails, so one run reports every failure.
-    let scenarios = scenarios();
+    let mut scenarios = scenarios();
+    if let Ok(filter) = std::env::var("E2E_FILTER") {
+        scenarios.retain(|(name, _)| name.contains(&filter));
+        if scenarios.is_empty() {
+            return fail(format!("E2E_FILTER matched no scenarios: {filter}"));
+        }
+    }
     let n = scenarios.len();
     let jobs = job_count(n);
     step(&format!("running {n} scenarios, up to {jobs} at a time"));
@@ -316,6 +318,9 @@ pub struct Sup {
     root: PathBuf,
     repository_base_url: String,
     supervisor_bin: PathBuf,
+    server_bin: PathBuf,
+    platform: String,
+    exe: &'static str,
     guardian_bin: PathBuf,
     oneshot_bin: PathBuf,
     dir: PathBuf,
@@ -327,7 +332,7 @@ pub struct Sup {
     check_interval: Option<String>,
     health_grace: Option<String>,
     confirmation_window: Option<String>,
-    transition_command: Option<Vec<String>>,
+    lifecycle_command: Option<Vec<String>>,
     reexec: bool,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
@@ -345,6 +350,9 @@ impl Sup {
             root: ctx.root(dir),
             repository_base_url: format!("http://{srv}/"),
             supervisor_bin: ctx.supervisor.clone(),
+            server_bin: ctx.server.clone(),
+            platform: ctx.platkey.clone(),
+            exe: ctx.exe,
             guardian_bin: ctx.bootstrap.clone(),
             oneshot_bin: ctx.oneshot.clone(),
             dir: dir.to_path_buf(),
@@ -356,7 +364,7 @@ impl Sup {
             check_interval: None,
             health_grace: None,
             confirmation_window: None,
-            transition_command: None,
+            lifecycle_command: None,
             reexec: false,
             supervisor_check_interval: None,
             ready_timeout: None,
@@ -381,11 +389,11 @@ impl Sup {
     }
     pub fn reexec(mut self, command: Vec<String>) -> Self {
         self.reexec = true;
-        self.transition_command = Some(command);
+        self.lifecycle_command = Some(command);
         self
     }
-    pub fn transition(mut self, command: Vec<String>) -> Self {
-        self.transition_command = Some(command);
+    pub fn lifecycle(mut self, command: Vec<String>) -> Self {
+        self.lifecycle_command = Some(command);
         self
     }
     pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
@@ -411,7 +419,7 @@ impl Sup {
     fn write_config(&self) -> R<PathBuf> {
         self.seed_install()?;
         let mut t = format!(
-            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/node.json'\n\n[repository]\nroot = {}\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
+            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/nodes/node.json'\n\n[repository]\nroot = {}\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
             lit(&self.root.display().to_string()),
             lit(&self.repository_base_url),
             lit(&self.root.display().to_string()),
@@ -422,14 +430,74 @@ impl Sup {
         if let Some(u) = &self.health_url {
             t += &format!("health_url = {}\n", lit(u));
         }
-        if let Some(c) = &self.transition_command {
+        if let Some(c) = &self.lifecycle_command {
+            let (program, provider_args) = c
+                .split_first()
+                .ok_or("lifecycle command requires an executable")?;
+            let program = resolve_executable(program)?;
+            let mut published_source = program.clone();
+            let mut published_entrypoint = format!("bin/lifecycle{}", self.exe);
+            let mut signed_args = provider_args.to_vec();
+            #[cfg(unix)]
+            if program.file_name().and_then(|name| name.to_str()) == Some("sh")
+                && provider_args.first().map(String::as_str) == Some("-c")
+                && provider_args.len() == 2
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let tree = self.dir.join("lifecycle-provider-source");
+                published_entrypoint = "bin/lifecycle".into();
+                published_source = tree.clone();
+                std::fs::create_dir_all(tree.join("bin")).map_err(str_err)?;
+                let entrypoint = tree.join(&published_entrypoint);
+                std::fs::write(&entrypoint, format!("#!/bin/sh\n{}\n", provider_args[1]))
+                    .map_err(str_err)?;
+                let mut permissions = std::fs::metadata(&entrypoint)
+                    .map_err(str_err)?
+                    .permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&entrypoint, permissions).map_err(str_err)?;
+                signed_args.clear();
+            }
+            let provider_product = format!("{}-lifecycle", self.product);
+            harness::run(
+                Command::new(&self.server_bin)
+                    .arg("publish-provider-artifact")
+                    .arg("--repo")
+                    .arg(self.dir.join("repo"))
+                    .arg("--keys")
+                    .arg(self.dir.join("keys"))
+                    .args(["--product", &provider_product, "--version", "1.0.0"])
+                    .arg("--bundle")
+                    .arg(format!("{}={}", self.platform, published_source.display()))
+                    .args(["--entrypoint", &published_entrypoint]),
+            )?;
+            let provider_path = harness::release_target(
+                &provider_product,
+                "stable",
+                "1.0.0",
+                &self.platform,
+                &provider_product,
+            );
+            let provider_sha = sha256_hex(&self.dir.join("repo/targets").join(&provider_path));
+            let mut provider_set = Command::new(&self.server_bin);
+            provider_set
+                .arg("publish-provider-set")
+                .arg("--repo")
+                .arg(self.dir.join("repo"))
+                .arg("--keys")
+                .arg(self.dir.join("keys"))
+                .args(["--id", "default"])
+                .args(["--provider-path", &provider_path])
+                .args(["--provider-sha256", &provider_sha])
+                .args(["--provider-timeout-ms", "5000"]);
+            for arg in &signed_args {
+                provider_set.args(["--provider-arg", arg]);
+            }
+            harness::run(&mut provider_set)?;
+            republish_assignment(self, "provider-default")?;
             if self.reexec {
                 t += "\n[application.activation]\nmode = \"reexec\"\n";
             }
-            t += &format!(
-                "\n[application.transition]\ncommand = [{}]\ntimeout = \"5s\"\n",
-                c.iter().map(|arg| lit(arg)).collect::<Vec<_>>().join(", ")
-            );
         }
         let mut to = String::new();
         for (k, v) in [
@@ -469,6 +537,9 @@ impl Sup {
             journal: self.install_root.join("state/transaction.json"),
             rejected: self.install_root.join("state/rejected"),
             app_token: self.install_root.join("state/app-token"),
+            provider_versions: self.install_root.join("providers/versions"),
+            provider_staging: self.install_root.join("providers/staging"),
+            provider_download: self.install_root.join("providers/staging/bundle.download"),
         };
         if matches!(
             updated::state::read_installed(&paths.state),
@@ -496,18 +567,16 @@ impl Sup {
             &entrypoint,
         )
         .map_err(str_err)?;
-        let staged = updated::bundle::stage_bundle(
-            &paths.download,
-            &paths.staging,
-            &paths.versions,
-            &updated::bundle::ExpectedBundle {
-                product: &self.product,
-                version: "1.0.0",
-                platform: &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            },
-            &Default::default(),
-        )
-        .map_err(str_err)?;
+        let staged = updated::provider::BundleStore::for_app(&paths)
+            .install(
+                &paths.download,
+                &updated::bundle::ExpectedBundle {
+                    product: &self.product,
+                    version: "1.0.0",
+                    platform: &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                },
+            )
+            .map_err(str_err)?;
         updated::bundle::write_active(&paths.active_release, &staged.id).map_err(str_err)?;
         updated::state::write_installed(
             &paths.state,
@@ -548,6 +617,54 @@ impl Sup {
         c.arg("--config").arg(cfg);
         Ok(c)
     }
+}
+
+fn republish_assignment(sup: &Sup, deployment: &str) -> R {
+    let desired = std::fs::read_to_string(sup.dir.join("desired-app")).map_err(str_err)?;
+    let mut desired = desired.lines();
+    let app_path = desired
+        .next()
+        .ok_or("desired application path is missing")?;
+    let app_sha = desired
+        .next()
+        .ok_or("desired application hash is missing")?;
+    let set_path = "provider-sets/default.json";
+    let set_sha = sha256_hex(&sup.dir.join("repo/targets").join(set_path));
+    harness::run(
+        Command::new(&sup.server_bin)
+            .arg("publish-assignment")
+            .arg("--repo")
+            .arg(sup.dir.join("repo"))
+            .arg("--keys")
+            .arg(sup.dir.join("keys"))
+            .args(["--name", "assignments/nodes/node.json"])
+            .args([
+                "--metadata-url",
+                &format!("{}metadata/", sup.repository_base_url),
+            ])
+            .args([
+                "--targets-url",
+                &format!("{}targets/", sup.repository_base_url),
+            ])
+            .args(["--deployment", deployment])
+            .args(["--application-path", app_path])
+            .args(["--application-sha256", app_sha])
+            .args(["--provider-set-path", set_path])
+            .args(["--provider-set-sha256", &set_sha]),
+    )
+}
+
+fn resolve_executable(program: &str) -> R<PathBuf> {
+    let path = PathBuf::from(program);
+    if path.components().count() > 1 {
+        return Ok(path);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| format!("lifecycle executable {program:?} was not found on PATH"))
 }
 
 #[cfg(test)]

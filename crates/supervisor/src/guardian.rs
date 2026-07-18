@@ -221,7 +221,7 @@ impl Conn {
         let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
         // The guardian cleared FD_CLOEXEC so this endpoint would survive *our* exec. Re-arm
         // it now that we own it, so it stops here: nothing we launch is a party to the
-        // control protocol, and a descendant of the operator's transition adapter holding this
+        // control protocol, and a descendant of the operator's lifecycle provider holding this
         // fd could drive the guardian directly — a single `Stop` frame would take the
         // application down with no crash recorded and nothing to relaunch it.
         set_cloexec(fd).map_err(|e| format!("securing the control channel endpoint: {e}"))?;

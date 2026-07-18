@@ -16,3 +16,4 @@ updated-tuf = { path = "../updated-tuf" }
 tokio = { workspace = true }
 # Install the workspace's single aws-lc-rs crypto provider for the TUF HTTP client.
 rustls = { workspace = true }
+serde_json = { workspace = true }

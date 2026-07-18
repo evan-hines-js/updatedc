@@ -3,7 +3,7 @@
 //! self-update) and the one-shot updater.
 //!
 //! It operates only on already-[`VerifiedTarget`]s and the signed custom metadata a
-//! [`TargetPolicy`] authorizes. The caller injects the rejection predicate (which
+//! [`DefaultPolicy`] authorizes. The caller injects the rejection predicate (which
 //! bytes to skip) and a sink for skip diagnostics, so this stays free of any
 //! logging or rejection-store dependency and can be tested in isolation.
 

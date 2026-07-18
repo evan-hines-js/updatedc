@@ -12,6 +12,17 @@ use serde::{Deserialize, Serialize};
 use crate::apply;
 use crate::bundle::ReleaseId;
 
+/// Exact independently signed lifecycle provider pinned to an update attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleProviderRelease {
+    pub product: String,
+    pub release: ReleaseId,
+    pub archive_sha256: String,
+    pub args: Vec<String>,
+    pub timeout_millis: u64,
+}
+
 /// Version + the sha256 (hex) of the bytes that version was installed from, plus an
 /// optional [`Pending`] record while a just-committed update is still proving itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,11 +45,12 @@ pub struct InstalledState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pending {
-    pub transition_id: String,
+    pub lifecycle_attempt_id: String,
     pub previous_release: ReleaseId,
     pub previous_archive_sha256: String,
-    /// A crash rollback requires the operator transition adapter.
-    pub transition_required: bool,
+    /// A crash rollback requires the operator lifecycle provider.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub lifecycle: Option<Box<LifecycleProviderRelease>>,
     /// Unix seconds when the update committed.
     pub committed_at: u64,
 }
@@ -46,16 +58,24 @@ pub struct Pending {
 impl InstalledState {
     fn validate(&self) -> io::Result<()> {
         if let Some(pending) = &self.pending {
-            if pending.transition_id.is_empty() {
+            if pending.lifecycle_attempt_id.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending transition id must not be empty",
+                    "pending lifecycle id must not be empty",
                 ));
             }
             if pending.previous_release == self.release {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "pending predecessor must differ from the installed release",
+                ));
+            }
+            if pending.lifecycle.as_ref().is_some_and(|lifecycle| {
+                lifecycle.product.is_empty() || lifecycle.timeout_millis == 0
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending lifecycle identity is invalid",
                 ));
             }
         }
@@ -122,13 +142,13 @@ mod tests {
                 },
                 archive_sha256: "abcd".into(),
                 pending: Some(Pending {
-                    transition_id: "transition".into(),
+                    lifecycle_attempt_id: "lifecycle".into(),
                     previous_release: ReleaseId {
                         version: "2.3.3".into(),
                         manifest_sha256: "old-manifest".into(),
                     },
                     previous_archive_sha256: "beef".into(),
-                    transition_required: true,
+                    lifecycle: None,
                     committed_at: 1_700_000_000,
                 }),
             },

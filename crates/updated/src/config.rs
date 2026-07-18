@@ -27,7 +27,7 @@ pub struct Config {
 pub struct Routing {
     pub root: PathBuf,
     pub base_url: String,
-    /// Exact TUF target to resolve (for example `assignments/node-123.json`).
+    /// Exact TUF target to resolve (for example `assignments/nodes/node-123.json`).
     pub assignment: String,
     #[serde(default)]
     pub datastore: Option<PathBuf>,
@@ -59,8 +59,112 @@ pub struct Repository {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryAssignment {
     pub schema: u32,
+    /// Monotonic, operator-visible identity of this desired deployment.
+    pub deployment: String,
     pub metadata_url: String,
     pub targets_url: String,
+    /// Exact application bytes selected by the control plane.
+    pub application: TargetReference,
+    /// Exact immutable provider-set document selected independently of the app.
+    pub provider_set: TargetReference,
+}
+
+/// A content-addressed reference to a target authenticated by release-repository TUF
+/// metadata. Both fields must match; a path that is republished with different bytes
+/// never silently satisfies an older deployment document.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetReference {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Immutable collection of overrides for capabilities normally supplied by the
+/// supervisor-owned built-in provider. The built-in provider is deliberately absent:
+/// it is compiled into, and has exactly the same version as, the supervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderSet {
+    pub schema: u32,
+    pub id: String,
+    pub overrides: Vec<ProviderOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderOverride {
+    pub capability: ProviderCapability,
+    pub artifact: TargetReference,
+    pub args: Vec<String>,
+    pub timeout_millis: u64,
+}
+
+/// Capabilities that can be replaced by a separately signed provider artifact.
+/// Adding a capability is an explicit supervisor protocol change; arbitrary names are
+/// never accepted and silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderCapability {
+    Lifecycle,
+}
+
+impl ProviderSet {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 2 {
+            return Err(format!("unsupported provider-set schema {}", self.schema));
+        }
+        let valid_id = !self.id.is_empty()
+            && self.id.len() <= 128
+            && self.id.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+            });
+        if !valid_id {
+            return Err("provider-set id is invalid".into());
+        }
+        if self.overrides.len() > 64 {
+            return Err("provider set has too many overrides".into());
+        }
+        let mut capabilities = std::collections::BTreeSet::new();
+        for provider in &self.overrides {
+            if !capabilities.insert(provider.capability) {
+                return Err(format!(
+                    "provider set contains duplicate {:?} overrides",
+                    provider.capability
+                ));
+            }
+            if !(1..=86_400_000).contains(&provider.timeout_millis) {
+                return Err(format!(
+                    "provider override {:?} has an invalid timeout",
+                    provider.capability
+                ));
+            }
+            if provider.args.len() > 256 || provider.args.iter().any(|arg| arg.len() > 16_384) {
+                return Err(format!(
+                    "provider override {:?} has invalid arguments",
+                    provider.capability
+                ));
+            }
+            if !valid_target_reference(&provider.artifact) {
+                return Err(format!(
+                    "provider override {:?} artifact reference is invalid",
+                    provider.capability
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_target_reference(reference: &TargetReference) -> bool {
+    !reference.path.is_empty()
+        && !reference.path.starts_with('/')
+        && !reference
+            .path
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+        && !reference.path.contains(['\\', ':'])
+        && !reference.path.chars().any(char::is_control)
+        && crate::hash::is_sha256_hex(&reference.sha256)
 }
 
 /// Fully resolved repository input. Values of this type are constructed only
@@ -76,11 +180,22 @@ pub struct RepositorySource {
 
 impl Repository {
     pub fn resolve(&self, assignment: RepositoryAssignment) -> Result<RepositorySource, String> {
-        if assignment.schema != 1 {
+        if assignment.schema != 2 {
             return Err(format!(
                 "unsupported repository assignment schema {}",
                 assignment.schema
             ));
+        }
+        if assignment.deployment.is_empty() {
+            return Err("repository assignment deployment must not be empty".into());
+        }
+        for (name, reference) in [
+            ("application", &assignment.application),
+            ("provider_set", &assignment.provider_set),
+        ] {
+            if !valid_target_reference(reference) {
+                return Err(format!("repository assignment {name} reference is invalid"));
+            }
         }
         Ok(RepositorySource {
             root: self.root.clone(),
@@ -116,39 +231,20 @@ pub struct Application {
     pub health_url: Option<String>,
     /// How a staged release enters service. The default is a portable stop/start;
     /// reexec keeps the existing master alive and delegates its program-specific
-    /// handoff to the transition adapter.
+    /// handoff to the lifecycle provider.
     #[serde(default)]
     pub activation: Activation,
-    /// Optional operator-owned adapter for site-specific lifecycle work such as
-    /// draining application work, waiting for mounts, or changing load-balancer membership.
-    #[serde(default)]
-    pub transition: Option<Transition>,
 }
 
-/// One command, invoked with an explicit phase. This is deliberately not a set of
-/// unrelated shell hooks: every phase receives the same argv, environment,
-/// timeout, and transaction identity.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Transition {
-    pub command: Vec<String>,
-    #[serde(default = "transition_timeout", deserialize_with = "de_dur")]
-    pub timeout: Duration,
-}
-
-fn transition_timeout() -> Duration {
-    Duration::from_secs(300)
-}
-
-/// The one application activation model. The transition command is direct argv; its
-/// inputs are supplied exclusively through the documented `UPDATED_*` environment.
+/// The one application activation model. The signed lifecycle entrypoint is direct argv;
+/// its inputs are supplied exclusively through the documented `UPDATED_*` environment.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Activation {
     /// Stop the managed process and launch the candidate entrypoint.
     #[default]
     StopStart,
-    /// Keep the master PID alive. The transition command's `activate` and `rollback`
+    /// Keep the master PID alive. The lifecycle provider's `activate` and `rollback`
     /// phases perform the program-specific handoff.
     Reexec,
 }
@@ -247,19 +343,6 @@ impl Config {
                     "application.activation reexec mode requires application.health_url".into(),
                 );
             }
-            if self.application.transition.is_none() {
-                return Err(
-                    "application.activation reexec mode requires application.transition".into(),
-                );
-            }
-        }
-        if let Some(transition) = &self.application.transition {
-            if transition.command.is_empty() {
-                return Err("application.transition.command must name a command".into());
-            }
-            if transition.timeout.is_zero() {
-                return Err("application.transition.timeout must be greater than zero".into());
-            }
         }
         for (name, value) in [
             ("timeouts.check_interval", self.timeouts.check_interval),
@@ -323,6 +406,9 @@ pub struct Paths {
     pub journal: PathBuf,
     pub rejected: PathBuf,
     pub app_token: PathBuf,
+    pub provider_versions: PathBuf,
+    pub provider_staging: PathBuf,
+    pub provider_download: PathBuf,
 }
 
 impl Config {
@@ -350,6 +436,9 @@ impl Config {
             journal: state_dir.join("transaction.json"),
             rejected: state_dir.join("rejected"),
             app_token: state_dir.join("app-token"),
+            provider_versions: install_root.join("providers/versions"),
+            provider_staging: install_root.join("providers/staging"),
+            provider_download: install_root.join("providers/staging/bundle.download"),
             datastore,
             routing_datastore,
             assignment: state_dir.join("repository-assignment.json"),
@@ -399,9 +488,6 @@ fn de_dur<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Duration, D::Error> 
         fn visit_str<E: Error>(self, s: &str) -> Result<Duration, E> {
             parse_duration(s).ok_or_else(|| E::custom(format!("invalid duration {s:?}")))
         }
-        fn visit_u64<E: Error>(self, n: u64) -> Result<Duration, E> {
-            Ok(Duration::from_secs(n))
-        }
         fn visit_i64<E: Error>(self, n: i64) -> Result<Duration, E> {
             let seconds =
                 u64::try_from(n).map_err(|_| E::custom("duration must not be negative"))?;
@@ -450,7 +536,7 @@ mod tests {
     #[test]
     fn assignment_is_strict_and_cannot_replace_the_pinned_root() {
         let assignment: RepositoryAssignment = serde_json::from_str(
-            r#"{"schema":1,"metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/"}"#,
+            r#"{"schema":2,"deployment":"d1","metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/","application":{"path":"app","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"provider_set":{"path":"providers","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
         )
         .unwrap();
         let repository = Repository {
@@ -462,14 +548,76 @@ mod tests {
         let source = repository.resolve(assignment).unwrap();
         assert_eq!(source.root, PathBuf::from("/pinned-root.json"));
 
-        let unknown = r#"{"schema":1,"metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/","root":"evil"}"#;
+        let unknown = r#"{"schema":2,"deployment":"d1","metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/","application":{"path":"app","sha256":"aa"},"provider_set":{"path":"providers","sha256":"bb"},"root":"evil"}"#;
         assert!(serde_json::from_str::<RepositoryAssignment>(unknown).is_err());
         let future = RepositoryAssignment {
-            schema: 2,
+            schema: 3,
+            deployment: "future".into(),
             metadata_url: "https://cdn/m/".into(),
             targets_url: "https://cdn/t/".into(),
+            application: TargetReference {
+                path: "app".into(),
+                sha256: "a".repeat(64),
+            },
+            provider_set: TargetReference {
+                path: "providers".into(),
+                sha256: "b".repeat(64),
+            },
         };
         assert!(repository.resolve(future).is_err());
+    }
+
+    fn provider_override(capability: ProviderCapability) -> ProviderOverride {
+        ProviderOverride {
+            capability,
+            artifact: TargetReference {
+                path: "providers/lifecycle.bundle".into(),
+                sha256: "a".repeat(64),
+            },
+            args: Vec::new(),
+            timeout_millis: 30_000,
+        }
+    }
+
+    #[test]
+    fn empty_provider_set_selects_the_supervisor_built_in_provider() {
+        ProviderSet {
+            schema: 2,
+            id: "built-in".into(),
+            overrides: Vec::new(),
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn provider_overrides_are_strict_unique_and_bounded() {
+        let provider = provider_override(ProviderCapability::Lifecycle);
+        let duplicate = ProviderSet {
+            schema: 2,
+            id: "duplicate".into(),
+            overrides: vec![provider.clone(), provider],
+        };
+        assert!(duplicate.validate().unwrap_err().contains("duplicate"));
+
+        let unknown = r#"{"schema":2,"id":"future","overrides":[{"capability":"future-capability","artifact":{"path":"provider","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"args":[],"timeout_millis":1}]}"#;
+        assert!(serde_json::from_str::<ProviderSet>(unknown).is_err());
+
+        let invalid_reference = ProviderSet {
+            schema: 2,
+            id: "unsafe".into(),
+            overrides: vec![ProviderOverride {
+                artifact: TargetReference {
+                    path: "../escape".into(),
+                    sha256: "a".repeat(64),
+                },
+                ..provider_override(ProviderCapability::Lifecycle)
+            }],
+        };
+        assert!(invalid_reference
+            .validate()
+            .unwrap_err()
+            .contains("artifact reference"));
     }
 
     #[test]
@@ -484,7 +632,7 @@ mod tests {
         let err = toml::from_str::<Wrapper>("duration = -1").unwrap_err();
         assert!(err.to_string().contains("must not be negative"));
 
-        // A bare integer deserializes through visit_u64 as whole seconds.
+        // A bare integer deserializes through visit_i64 as whole seconds.
         let ok = toml::from_str::<Wrapper>("duration = 42").unwrap();
         assert_eq!(ok.duration, Duration::from_secs(42));
 
@@ -501,7 +649,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/node.json"
+            assignment = "assignments/nodes/node.json"
             [repository]
             root = "/r"
             [application]
@@ -526,7 +674,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/node.json"
+            assignment = "assignments/nodes/node.json"
             [repository]
             root = "/r"
             [application]
@@ -551,7 +699,7 @@ mod tests {
             [routing]
             root = "/etc/selfupdate/root.json"
             base_url = "http://x/"
-            assignment = "assignments/node.json"
+            assignment = "assignments/nodes/node.json"
             [repository]
             root = "/etc/selfupdate/root.json"
             [application]
@@ -581,7 +729,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/node.json"
+            assignment = "assignments/nodes/node.json"
             [repository]
             root = "/r"
             [application]
@@ -589,8 +737,8 @@ mod tests {
             install_root = "/app"
             [application.activation]
             mode = "reexec"
-            [application.transition]
-            command = ["/transition"]
+            [application.lifecycle]
+            product = "app-lifecycle"
             "#,
         );
         // Parses, but validation rejects it (Unix) or the platform guard does.
@@ -607,7 +755,7 @@ mod tests {
                 [routing]
                 root = "/r"
                 base_url = "http://x/"
-                assignment = "assignments/node.json"
+                assignment = "assignments/nodes/node.json"
                 [repository]
                 root = "/r"
                 [application]
@@ -616,8 +764,6 @@ mod tests {
                 health_url = "http://127.0.0.1:9/healthz"
                 [application.activation]
                 mode = "reexec"
-                [application.transition]
-                command = ["/transition"]
                 "#,
             )
             .unwrap();
@@ -635,7 +781,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/node.json"
+            assignment = "assignments/nodes/node.json"
             [repository]
             root = "/r"
             [application]

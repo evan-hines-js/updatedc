@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generic reload-command adapter for HAProxy master-worker deployments. The signed
+# Generic reload-command provider for HAProxy master-worker deployments. The signed
 # bundle remains immutable; this atomically projects its binary and configuration
 # onto the stable paths HAProxy uses when SIGUSR2 makes the master re-exec itself.
 

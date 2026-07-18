@@ -237,7 +237,7 @@ fn serve<L: Link>(
             return Ok(Cycle::Continue);
         }
 
-        if let crate::sys::Ready::Readable = sup.poll_readable(SERVE_POLL_MS) {
+        if sup.poll_readable(SERVE_POLL_MS) {
             match sup.read_request() {
                 Ok(req) => {
                     if dispatch(
@@ -503,7 +503,7 @@ mod tests {
     struct FakeLink {
         nonce: control::Nonce,
         hello_ok: bool,
-        readable: RefCell<VecDeque<crate::sys::Ready>>,
+        readable: RefCell<VecDeque<bool>>,
         requests: VecDeque<control::Request>,
         exited: VecDeque<bool>,
         responses: Vec<control::Response>,
@@ -535,11 +535,8 @@ mod tests {
                 Err(control::Error::Closed)
             }
         }
-        fn poll_readable(&self, _timeout_ms: i32) -> crate::sys::Ready {
-            self.readable
-                .borrow_mut()
-                .pop_front()
-                .unwrap_or(crate::sys::Ready::TimedOut)
+        fn poll_readable(&self, _timeout_ms: i32) -> bool {
+            self.readable.borrow_mut().pop_front().unwrap_or(false)
         }
         fn read_request(&mut self) -> control::Result<control::Request> {
             self.requests.pop_front().ok_or(control::Error::Closed)
@@ -820,9 +817,7 @@ mod tests {
         let c = cfg(temp_dir("postready"), None);
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
-        sup.readable
-            .borrow_mut()
-            .push_back(crate::sys::Ready::Readable);
+        sup.readable.borrow_mut().push_back(true);
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(false); // still running right after readying...
         sup.exited.push_back(true); // ...then exits

@@ -12,7 +12,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use crate::rand;
-use crate::sys::{Channel, Ready};
+use crate::sys::Channel;
 use control::{Nonce, Request, Response, APP_PID_ENV, CONTROL_ENV, READY_NONCE_ENV, STATE_DIR_ENV};
 
 const POLL: Duration = Duration::from_millis(100);
@@ -100,7 +100,10 @@ impl Supervisor {
 pub trait Link {
     fn nonce(&self) -> Nonce;
     fn send_hello(&mut self) -> control::Result<()>;
-    fn poll_readable(&self, timeout_ms: i32) -> Ready;
+    /// `true` when the control channel has a request buffered to read within `timeout_ms`.
+    /// A timed-out or closed channel is `false`; peer death is observed via
+    /// [`exited`](Self::exited), not this call.
+    fn poll_readable(&self, timeout_ms: i32) -> bool;
     fn read_request(&mut self) -> control::Result<Request>;
     fn send_response(&mut self, resp: &Response) -> control::Result<()>;
     fn exited(&mut self) -> bool;
@@ -114,7 +117,7 @@ impl Link for Supervisor {
     fn send_hello(&mut self) -> control::Result<()> {
         self.channel.send_hello()
     }
-    fn poll_readable(&self, timeout_ms: i32) -> Ready {
+    fn poll_readable(&self, timeout_ms: i32) -> bool {
         self.channel.poll_readable(timeout_ms)
     }
     fn read_request(&mut self) -> control::Result<Request> {

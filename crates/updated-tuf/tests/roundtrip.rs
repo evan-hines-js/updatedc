@@ -66,7 +66,7 @@ async fn publish_then_verify_and_download() {
         assert_eq!(mode & 0o777, 0o600, "signing key is owner-only: {mode:o}");
     }
 
-    let mut repo = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds"))
+    let repo = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds"))
         .await
         .unwrap();
 
@@ -179,12 +179,17 @@ async fn publish_then_verify_and_download() {
         .await
         .unwrap();
 
-    repo.refresh().await.unwrap();
+    // Re-acquiring the repository against the same datastore — exactly what the
+    // supervisor and one-shot updater do each cycle — refreshes the metadata chain and
+    // surfaces the newly published release. There is one path to fresh metadata.
+    let repo = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds"))
+        .await
+        .unwrap();
     let found2 = repo
         .all_targets()
         .into_iter()
         .find(|t| t.path == path2)
-        .expect("refresh surfaces the newly published 2.0.0 release");
+        .expect("re-acquisition surfaces the newly published 2.0.0 release");
     assert_eq!(
         found2.custom.get("version").and_then(|v| v.as_str()),
         Some("2.0.0")

@@ -98,13 +98,12 @@ pub struct Hello {
     pub capabilities: Vec<u16>,
 }
 
-/// The negotiated result on the supervisor side: the shared major plus the set of
-/// capabilities the peer guardian advertised. All feature decisions go through
+/// The negotiated result on the supervisor side: the set of capabilities the peer
+/// guardian advertised. Negotiation fails closed unless a protocol major is shared, but
+/// the specific major is not retained — every feature decision goes through
 /// [`Capabilities::supports`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
-    pub major: u16,
-    pub guardian_minor: u16,
     caps: Vec<u16>,
 }
 
@@ -157,15 +156,14 @@ impl Hello {
     /// Negotiate from the supervisor's supported majors, choosing the highest shared
     /// one. `None` means no common major — an upgrade needs a bridge supervisor.
     pub fn negotiate(&self, supported_majors: &[u16]) -> Option<Capabilities> {
-        let major = self
-            .majors
+        // Require a shared protocol major, failing closed (`None`) when there is none.
+        // The chosen value itself is not retained; capabilities carry every decision.
+        self.majors
             .iter()
             .copied()
             .filter(|m| supported_majors.contains(m))
             .max()?;
         Some(Capabilities {
-            major,
-            guardian_minor: self.minor,
             caps: self.capabilities.clone(),
         })
     }
@@ -676,7 +674,6 @@ mod tests {
         let hello = Hello::read(&mut &wire[..]).unwrap();
         assert_eq!(hello, Hello::current());
         let caps = hello.negotiate(&[1]).expect("shared major 1");
-        assert_eq!(caps.major, 1);
         assert!(caps.supports(CAP_LAUNCH_APP_V1));
         assert!(caps.supports(CAP_REPLACE_SUPERVISOR_V1));
         assert!(!caps.supports(0xFFFF));
@@ -690,10 +687,9 @@ mod tests {
             capabilities: vec![CAP_LAUNCH_APP_V1],
         };
         assert!(hello.negotiate(&[1]).is_none());
-        assert_eq!(
-            hello.negotiate(&[1, 2, 3]).unwrap().major,
-            3,
-            "picks highest"
+        assert!(
+            hello.negotiate(&[1, 2, 3]).is_some(),
+            "a shared major negotiates"
         );
     }
 

@@ -106,7 +106,7 @@ impl Rejections {
 /// the same digest never occupies two entries. The single definition of what this record
 /// may hold, applied identically on read and write.
 fn digest_key(hash: &str) -> Result<String, String> {
-    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !crate::hash::is_sha256_hex(hash) {
         return Err(format!(
             "invalid rejection hash (expected a 64-character hexadecimal SHA-256 digest, got {} characters)",
             hash.len()

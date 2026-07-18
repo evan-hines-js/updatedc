@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://updated.dev/schemas/target-reference.schema.json",
+  "title": "Exact TUF Target Reference",
+  "description": "An immutable reference to one target authenticated by TUF metadata.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["path", "sha256"],
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:])[A-Za-z0-9._/-]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

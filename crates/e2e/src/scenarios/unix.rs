@@ -4,7 +4,7 @@ fn hup_transition() -> Vec<String> {
     vec![
         "sh".into(),
         "-c".into(),
-        "case \"$UPDATED_TRANSITION_PHASE\" in activate) exec kill -HUP \"$UPDATED_CHILD_PID\" ;; *) exit 0 ;; esac".into(),
+        "case \"$UPDATED_LIFECYCLE_PHASE\" in activate) exec kill -HUP \"$UPDATED_CHILD_PID\" ;; *) exit 0 ;; esac".into(),
     ]
 }
 
@@ -12,7 +12,7 @@ fn preflight_rejecting_hup_transition() -> Vec<String> {
     vec![
         "sh".into(),
         "-c".into(),
-        "case \"$UPDATED_TRANSITION_PHASE\" in preflight) test \"$UPDATED_CANDIDATE_VERSION\" != 2.0.0 ;; activate) exec kill -HUP \"$UPDATED_CHILD_PID\" ;; *) exit 0 ;; esac".into(),
+        "case \"$UPDATED_LIFECYCLE_PHASE\" in preflight) test \"$UPDATED_CANDIDATE_VERSION\" != 2.0.0 ;; activate) exec kill -HUP \"$UPDATED_CHILD_PID\" ;; *) exit 0 ;; esac".into(),
     ]
 }
 pub(crate) fn key_perms(ctx: &Ctx) -> R {

@@ -1,20 +1,19 @@
-# Generating a transition wrapper
+# Generating a lifecycle wrapper
 
 `updated` deliberately exposes one integration point instead of learning every
 application server, init system, load balancer, or enterprise runbook. Point an AI coding
 assistant at your current deployment procedure and this document. Ask it to generate one
-transition dispatcher that adapts that procedure to `updated`.
+lifecycle dispatcher that adapts that procedure to `updated`.
 
-The configured command is always singular:
-
-```toml
-[application.transition]
-command = ["/opt/example/libexec/updated-transition"]
-timeout = "10m"
-```
+The supervisor's statically linked `default` provider implements this same protocol and
+has exactly the supervisor version. This document describes an optional, separately
+versioned and signed executable override with one manifested entrypoint.
+The control plane puts its exact target reference, argv, and timeout in an immutable
+provider set, then references that set from the desired deployment. It is never selected
+from local node config or by a `latest` query.
 
 The dispatcher may call existing scripts or small phase-specific helpers internally.
-That factoring is private to the integration; `updated` still has one API and one command.
+That factoring is private to the integration; `updated` still has one API and one entrypoint.
 
 A nonzero `preflight` rejects those candidate bytes for the configured retry period.
 Failures after journaling cause deferral or rollback according to the transaction stage;
@@ -29,14 +28,15 @@ paste this prompt into your coding assistant:
 
 ```text
 Act as a production deployment engineer. Analyze the attached current deployment
-runbook, scripts, and service configuration. Generate one executable transition
+runbook, scripts, and service configuration. Generate one executable lifecycle
 dispatcher for the `updated` supervisor. Preserve the site's existing operational
 behavior, but do not implement artifact download, signature verification, release
 selection, process health gating, or durable rollback; `updated` owns those concerns.
 
 The dispatcher is invoked directly as argv, not through a shell. It reads:
-- UPDATED_TRANSITION_PHASE: preflight, drain, prepare, activate, finalize, or rollback
-- UPDATED_TRANSITION_ID: fresh identity for this attempt, stable across its recovery retries
+- UPDATED_LIFECYCLE_PHASE: preflight, prepare, drain, stop, activate, start, verify,
+  finalize, or rollback
+- UPDATED_LIFECYCLE_ATTEMPT_ID: fresh identity for this attempt, stable across its recovery retries
 - UPDATED_CHILD_PID: managed master/application PID
 - UPDATED_INSTALL_ROOT: mutable installation root
 - UPDATED_CANDIDATE and UPDATED_PREDECESSOR: immutable release directories
@@ -44,17 +44,22 @@ The dispatcher is invoked directly as argv, not through a shell. It reads:
 
 Map the current deployment operations onto these phases:
 - preflight: read-only validation of candidate compatibility and prerequisites
-- drain: remove or drain the currently serving instance before disruptive work
 - prepare: establish external prerequisites needed by the candidate
-- activate: only for reexec mode, make the existing master adopt the candidate
+- drain: remove or drain the currently serving instance before disruptive work
+- stop: last provider action while the predecessor PID is available
+- activate: apply environment changes while a stop-start app is down, or make a reexec
+  master adopt the candidate
+- start: post-launch integration after guardian start or the same-PID handoff
+- verify: provider-specific verification after the supervisor's independent health gate
 - finalize: restore traffic and finish external changes after candidate health passes
 - rollback: undo drain/prepare/finalize effects after failure or crash recovery
 
-For stop-start mode, `updated` itself stops and starts the process; activate should be a
-no-op. For reexec mode, activate must perform the program's same-PID master/worker reload.
+For stop-start mode, the supervisor asks the guardian to stop after `stop`, then asks it
+to launch the selected release before `start`.
+For reexec mode, activate performs the program's same-PID master/worker reload.
 
 Requirements:
-1. Be idempotent for repeated (phase, UPDATED_TRANSITION_ID) calls, including after a
+1. Be idempotent for repeated (phase, UPDATED_LIFECYCLE_ATTEMPT_ID) calls, including after a
    machine or supervisor crash. Treat rollback as safe even when an earlier phase did not
    finish. A later attempt after a completed rollback gets a new ID; never deduplicate by
    candidate/predecessor version alone.
@@ -79,7 +84,7 @@ Do not invent application-specific commands. Derive them from the attached mater
 mark missing facts as TODO failures in the generated wrapper.
 ```
 
-This prompt is intentionally strict. The generated code is an adapter around the site's
+This prompt is intentionally strict. The generated code is an provider around the site's
 known process, not an AI-designed deployment system.
 
 ## Add the matching shape
@@ -122,7 +127,7 @@ service configuration rather than copying a generic example.
 
 ```text
 The current deployment drains and restores traffic through an HTTP API. Reuse its
-authentication mechanism and idempotency support. Use UPDATED_TRANSITION_ID as the API's
+authentication mechanism and idempotency support. Use UPDATED_LIFECYCLE_ATTEMPT_ID as the API's
 idempotency/correlation key when possible. Drain must poll the API only until the node is
 out of rotation and its active work is below the documented threshold. Finalize restores
 traffic. Rollback restores the pre-update routing state and must tolerate already-restored
@@ -137,8 +142,8 @@ The service depends on external filesystems or generated local files. Preflight 
 perform read-only compatibility and availability checks. Prepare should wait with a
 bounded deadline for required mounts/secrets, then atomically generate mutable local
 configuration outside the immutable candidate directory. Record only the minimal state
-needed for idempotent rollback, keyed by UPDATED_TRANSITION_ID. Rollback removes or
-restores only resources owned by this transition and must not unmount or delete shared
+needed for idempotent rollback, keyed by UPDATED_LIFECYCLE_ATTEMPT_ID. Rollback removes or
+restores only resources owned by this lifecycle and must not unmount or delete shared
 resources it did not create.
 ```
 
@@ -159,7 +164,7 @@ After generation, give the result and the old process to a fresh AI session with
 adversarial review prompt:
 
 ```text
-Review this updated transition integration as if it will fail at every instruction and
+Review this updated lifecycle integration as if it will fail at every instruction and
 lose power between any two filesystem or API operations. Find cases that can cause
 traffic to remain drained, mutate an immutable release, activate the wrong version,
 signal the wrong PID, leak secrets, wait forever, report false success, or make rollback
@@ -171,17 +176,17 @@ review until no material issue remains. Do not weaken assertions to make tests p
 
 ## Operator acceptance checklist
 
-AI generation reduces adapter-writing effort; it does not remove staging validation.
+AI generation reduces provider-writing effort; it does not remove staging validation.
 Before rollout, verify:
 
-- every phase succeeds when called twice with the same transition ID;
+- every phase succeeds when called twice with the same lifecycle ID;
 - rollback is safe after each partially completed earlier phase;
 - a nonzero phase exit leaves or restores the predecessor as documented;
 - the configured timeout bounds hung scripts and network calls;
 - stop-start mode never starts/stops from the wrapper;
 - reexec mode preserves the master PID and listening sockets;
 - candidate and predecessor paths are never modified;
-- logs contain the transition ID but no credentials;
+- logs contain the lifecycle ID but no credentials;
 - the old deployment entrypoint has been removed or made incapable of bypassing this path;
 - real load, crash recovery, and the actual external systems pass in staging.
 

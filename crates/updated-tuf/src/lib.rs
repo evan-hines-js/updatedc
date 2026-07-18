@@ -11,7 +11,7 @@
 //! publishing releases. The dev/mock server uses it; a client never does.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aws_lc_rs::digest::{digest, SHA256};
 use futures::StreamExt;
@@ -114,15 +114,47 @@ mod error_tests {
     #[test]
     fn assigned_repositories_have_independent_stable_datastores() {
         let assignment = |metadata: &str, targets: &str| RepositoryAssignment {
-            schema: 1,
+            schema: 2,
+            deployment: "deployment".into(),
             metadata_url: metadata.into(),
             targets_url: targets.into(),
+            application: updated::config::TargetReference {
+                path: "app".into(),
+                sha256: "aa".into(),
+            },
+            provider_set: updated::config::TargetReference {
+                path: "providers".into(),
+                sha256: "bb".into(),
+            },
         };
         let a = assignment("https://cdn/a/metadata/", "https://cdn/a/targets/");
         let b = assignment("https://cdn/b/metadata/", "https://cdn/b/targets/");
         assert_eq!(assignment_identity(&a), assignment_identity(&a));
         assert_ne!(assignment_identity(&a), assignment_identity(&b));
         assert_eq!(assignment_identity(&a).len(), 64);
+    }
+
+    #[test]
+    fn deployment_changes_do_not_reset_the_tuf_rollback_history() {
+        let mut first = RepositoryAssignment {
+            schema: 2,
+            deployment: "deploy-1".into(),
+            metadata_url: "https://cdn/group/metadata/".into(),
+            targets_url: "https://cdn/group/targets/".into(),
+            application: updated::config::TargetReference {
+                path: "products/app/stable/1/linux-x86_64/app".into(),
+                sha256: "a".repeat(64),
+            },
+            provider_set: updated::config::TargetReference {
+                path: "provider-sets/1.json".into(),
+                sha256: "b".repeat(64),
+            },
+        };
+        let datastore = assignment_identity(&first);
+        first.deployment = "deploy-2".into();
+        first.application.sha256 = "c".repeat(64);
+        first.provider_set.sha256 = "d".repeat(64);
+        assert_eq!(datastore, assignment_identity(&first));
     }
 
     #[test]
@@ -155,12 +187,12 @@ pub struct VerifiedTarget {
     pub custom: serde_json::Value,
 }
 
-/// A loaded, verified TUF repository. Each [`load`](Self::load) /
-/// [`refresh`](Self::refresh) performs the complete TUF refresh workflow.
+/// A loaded, verified TUF repository. [`load`](Self::load) — and [`assigned`](Self::assigned),
+/// which resolves the routing assignment first — performs the complete TUF refresh workflow.
 pub struct TrustedRepository {
     config: updated::config::RepositorySource,
-    datastore: PathBuf,
     repo: Repository,
+    assignment: Option<updated::config::RepositoryAssignment>,
 }
 
 impl TrustedRepository {
@@ -222,11 +254,13 @@ impl TrustedRepository {
             .map_err(|e| Error::Trust(format!("invalid repository assignment: {e}")))?;
         let assignment_store = paths.datastore.join(assignment_identity(&assignment));
         let source = repository_config
-            .resolve(assignment)
+            .resolve(assignment.clone())
             .map_err(Error::Trust)?;
         validate_release_url("metadata_url", &source.metadata_url)?;
         validate_release_url("targets_url", &source.targets_url)?;
-        Self::load(&source, &assignment_store).await
+        let mut repository = Self::load(&source, &assignment_store).await?;
+        repository.assignment = Some(assignment);
+        Ok(repository)
     }
     /// Load the pinned root and refresh the full metadata chain.
     pub async fn load(
@@ -236,16 +270,9 @@ impl TrustedRepository {
         let repo = Self::load_repo(config, datastore).await?;
         Ok(Self {
             config: config.clone(),
-            datastore: datastore.to_owned(),
             repo,
+            assignment: None,
         })
-    }
-
-    /// Re-run the TUF refresh, picking up newer signed metadata (and rotated
-    /// roots) while enforcing rollback and expiration.
-    pub async fn refresh(&mut self) -> Result<(), Error> {
-        self.repo = Self::load_repo(&self.config, &self.datastore).await?;
-        Ok(())
     }
 
     async fn load_repo(
@@ -288,6 +315,40 @@ impl TrustedRepository {
             .all_targets()
             .map(|(name, target)| to_verified(name.raw(), target))
             .collect()
+    }
+
+    /// The exact desired deployment authenticated by the routing repository.
+    pub fn assignment(&self) -> Option<&updated::config::RepositoryAssignment> {
+        self.assignment.as_ref()
+    }
+
+    /// Resolve an exact target reference without version or "latest" selection.
+    pub fn exact_target(
+        &self,
+        reference: &updated::config::TargetReference,
+    ) -> Result<VerifiedTarget, Error> {
+        let target = self
+            .all_targets()
+            .into_iter()
+            .find(|target| target.path == reference.path)
+            .ok_or_else(|| {
+                Error::Trust(format!(
+                    "desired target {} is absent from verified metadata",
+                    reference.path
+                ))
+            })?;
+        let actual = target
+            .hashes
+            .get("sha256")
+            .map(hex::encode)
+            .ok_or_else(|| Error::Trust(format!("target {} has no sha256", target.path)))?;
+        if actual != reference.sha256 {
+            return Err(Error::Trust(format!(
+                "desired target {} has sha256 {}, expected {}",
+                target.path, actual, reference.sha256
+            )));
+        }
+        Ok(target)
     }
 
     /// Stream a verified target to `destination`. `tough` verifies length and
@@ -377,16 +438,14 @@ impl TrustedRepository {
 }
 
 fn assignment_identity(assignment: &updated::config::RepositoryAssignment) -> String {
-    // Length-prefix the fields so different endpoint pairs cannot have an ambiguous
-    // concatenation. The digest is only a private directory name; the signed assignment
-    // and TUF metadata remain the authority.
-    let mut bytes = Vec::with_capacity(
-        assignment.metadata_url.len() + assignment.targets_url.len() + 2 * size_of::<u64>(),
-    );
-    bytes.extend_from_slice(&(assignment.metadata_url.len() as u64).to_be_bytes());
-    bytes.extend_from_slice(assignment.metadata_url.as_bytes());
-    bytes.extend_from_slice(&(assignment.targets_url.len() as u64).to_be_bytes());
-    bytes.extend_from_slice(assignment.targets_url.as_bytes());
+    // Metadata rollback history belongs to a repository endpoint, not a deployment.
+    // Changing exact desired targets must reuse the same datastore or every rollout
+    // would accidentally reset TUF's remembered version floor.
+    let mut bytes = Vec::new();
+    for endpoint in [&assignment.metadata_url, &assignment.targets_url] {
+        bytes.extend_from_slice(&(endpoint.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(endpoint.as_bytes());
+    }
     hex::encode(digest(&SHA256, &bytes).as_ref())
 }
 

@@ -4,7 +4,8 @@
 //! - `publish-app` build and publish application bundles.
 //! - `install-app` seed an installer-verified application bundle.
 //! - `publish-supervisor` publish supervisor bootstrap binaries.
-//! - `publish-assignment` publish verified release-repository endpoints.
+//! - `publish-provider-set` publish an immutable exact provider collection.
+//! - `publish-assignment` publish an exact desired deployment last.
 //! - `serve`   serve the repository directory over HTTP for clients to refresh.
 //!
 //! Publishing is an offline/CI operation; a deployed client never runs it.
@@ -30,15 +31,16 @@ async fn main() {
 
     let result = match cmd {
         "init" => init(rest).await,
-        "publish-app" => publish(rest, true).await,
+        "publish-app" | "publish-provider-artifact" => publish(rest, true).await,
         "install-app" => install_app(rest),
         "publish-supervisor" => publish(rest, false).await,
+        "publish-provider-set" => publish_provider_set(rest).await,
         "publish-assignment" => publish_assignment(rest).await,
         "serve" => serve(rest).await,
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|install-app|publish-app|publish-supervisor|publish-assignment|serve> [flags]"
+                "usage: server <init|install-app|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|serve> [flags]"
             );
             exit(2);
         }
@@ -55,12 +57,18 @@ async fn publish_assignment(args: &[String]) -> R {
     let name = flag(args, "--name").ok_or("--name <target-path> is required")?;
     let metadata_url = flag(args, "--metadata-url").ok_or("--metadata-url <url> is required")?;
     let targets_url = flag(args, "--targets-url").ok_or("--targets-url <url> is required")?;
+    let deployment = flag(args, "--deployment").ok_or("--deployment <id> is required")?;
+    let application = target_reference(args, "application")?;
+    let provider_set = target_reference(args, "provider-set")?;
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
     let source = repo_dir.join(".assignment-build.json");
     let assignment = updated::config::RepositoryAssignment {
-        schema: 1,
+        schema: 2,
+        deployment,
         metadata_url,
         targets_url,
+        application,
+        provider_set,
     };
     foundation::durable::atomic_write(&source, ".assignment-", &serde_json::to_vec(&assignment)?)?;
     let keys = repo::Keys::in_dir(&keys_dir);
@@ -79,6 +87,65 @@ async fn publish_assignment(args: &[String]) -> R {
     let _ = std::fs::remove_file(source);
     println!("published routing assignment {name}");
     Ok(())
+}
+
+async fn publish_provider_set(args: &[String]) -> R {
+    let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
+    let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
+    let id = flag(args, "--id").ok_or("--id <provider-set-id> is required")?;
+    let overrides = if flag(args, "--provider-path").is_some() {
+        vec![updated::config::ProviderOverride {
+            capability: updated::config::ProviderCapability::Lifecycle,
+            artifact: target_reference(args, "provider")?,
+            args: flags_all(args, "--provider-arg"),
+            timeout_millis: flag(args, "--provider-timeout-ms")
+                .unwrap_or_else(|| "300000".into())
+                .parse()?,
+        }]
+    } else {
+        Vec::new()
+    };
+    let set = updated::config::ProviderSet {
+        schema: 2,
+        id: id.clone(),
+        overrides,
+    };
+    let source = repo_dir.join(".provider-set-build.json");
+    foundation::durable::atomic_write(&source, ".provider-set-", &serde_json::to_vec(&set)?)?;
+    let name = format!("provider-sets/{id}.json");
+    let keys = repo::Keys::in_dir(&keys_dir);
+    let _publish_lock = lock_publisher(&repo_dir)?;
+    repo::add_release(
+        &repo_dir,
+        &keys,
+        vec![PublishTarget {
+            name: name.clone(),
+            source: source.clone(),
+            custom: Default::default(),
+        }],
+        flag_i64(args, "--expiry-days", 365)?,
+    )
+    .await?;
+    let _ = std::fs::remove_file(source);
+    println!("published provider set {name}");
+    Ok(())
+}
+
+fn target_reference(
+    args: &[String],
+    prefix: &str,
+) -> Result<updated::config::TargetReference, Box<dyn std::error::Error>> {
+    let path = flag(args, &format!("--{prefix}-path"))
+        .ok_or_else(|| format!("--{prefix}-path <target> is required"))?;
+    let sha256 = flag(args, &format!("--{prefix}-sha256"))
+        .ok_or_else(|| format!("--{prefix}-sha256 <hex> is required"))?;
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("--{prefix}-sha256 must be 64 hexadecimal characters").into());
+    }
+    Ok(updated::config::TargetReference {
+        path,
+        sha256: sha256.to_ascii_lowercase(),
+    })
 }
 
 fn install_app(args: &[String]) -> R {
@@ -104,16 +171,15 @@ fn install_app(args: &[String]) -> R {
         &platform,
         &entrypoint,
     )?;
-    let staged = updated::bundle::stage_bundle(
+    // Seed the baseline through the same default provider the tower installs with, so
+    // the installer and the running system agree on exactly one ingest path.
+    let staged = updated::provider::BundleStore::new(versions, staging).install(
         &archive,
-        &staging,
-        &versions,
         &updated::bundle::ExpectedBundle {
             product: &product,
             version: &version,
             platform: &platform,
         },
-        &Default::default(),
     )?;
     updated::bundle::write_active(&install_root.join("active-release"), &staged.id)?;
     updated::state::write_installed(
@@ -504,7 +570,9 @@ mod tests {
             updated::bundle::read_active(&install.join("active-release")).unwrap(),
             Some(state.release.clone())
         );
-        updated::bundle::read_release(&install.join("versions"), &state.release).unwrap();
+        updated::provider::BundleStore::new(install.join("versions"), install.join("staging"))
+            .resolve(&state.release)
+            .unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 

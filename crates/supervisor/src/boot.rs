@@ -76,6 +76,10 @@ fn reconcile_transaction(
         transaction::classify_recovery(tx, situation.active.as_ref(), Some(&installed.release));
     if tx.candidate_rejection_required {
         plan.reject_app.push(tx.candidate_archive_sha256.clone());
+        plan.warn(format!(
+            "recovery: rejected {} after failed activation",
+            tx.candidate_release.version
+        ));
     }
     match recovery {
         Recovery::Committed => plan.info(format!(
@@ -91,6 +95,10 @@ fn reconcile_transaction(
             plan.release = ReleaseFix::Activate(tx.previous_release.clone());
             if situation.app_crashed && !tx.candidate_rejection_required {
                 plan.reject_app.push(tx.candidate_archive_sha256.clone());
+                plan.warn(format!(
+                    "recovery: rejected {} after failed activation",
+                    tx.candidate_release.version
+                ));
             }
             plan.warn(format!(
                 "recovery: restoring predecessor {} after interrupted activation of {}",
@@ -109,11 +117,12 @@ fn reconcile_transaction(
 }
 
 fn enforce_installed(plan: &mut Plan, situation: &Situation, installed: &InstalledState) {
-    if situation.active.as_ref() == Some(&installed.release) && situation.active_verified {
+    if situation.active.as_ref() == Some(&installed.release) {
         return;
     }
     // The installed release is immutable and remains the authoritative recovery target.
-    // The executor re-verifies it before changing active-release.
+    // The executor re-verifies it at the activation/commit moment before changing
+    // active-release; the steady-state pointer match above is trusted without a re-hash.
     plan.quiesce = situation.app_running.is_some();
     plan.release = ReleaseFix::Activate(installed.release.clone());
     plan.warn(format!(
@@ -171,7 +180,6 @@ mod tests {
                 "archive-one".into(),
             )),
             active: Some(current),
-            active_verified: true,
             journal: None,
             app_crashed: false,
             app_running: None,
@@ -195,19 +203,23 @@ mod tests {
         situation.active = Some(candidate.clone());
         situation.app_crashed = true;
         situation.journal = Some(Transaction {
-            id: "transition".into(),
+            id: "attempt".into(),
             kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
             previous_archive_sha256: "archive-one".into(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
             candidate_rejection_required: false,
-            transition_required: false,
+            lifecycle: None,
             phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
         assert_eq!(plan.release, ReleaseFix::Activate(release("1.0.0", "one")));
         assert_eq!(plan.reject_app, vec!["archive-two"]);
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.msg == "recovery: rejected 2.0.0 after failed activation"));
     }
 
     #[test]
@@ -216,14 +228,14 @@ mod tests {
         let candidate = release("2.0.0", "two");
         situation.active = Some(candidate.clone());
         situation.journal = Some(Transaction {
-            id: "transition".into(),
+            id: "attempt".into(),
             kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
             previous_archive_sha256: "archive-one".into(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
             candidate_rejection_required: false,
-            transition_required: false,
+            lifecycle: None,
             phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
@@ -243,14 +255,14 @@ mod tests {
         });
         situation.app_crashed = false;
         situation.journal = Some(Transaction {
-            id: "transition".into(),
+            id: "attempt".into(),
             kind: updated::transaction::Kind::Supervised,
             previous_release: predecessor,
             previous_archive_sha256: "archive-one".into(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
             candidate_rejection_required: true,
-            transition_required: false,
+            lifecycle: None,
             phase: TransactionPhase::RollbackStarted,
         });
 
@@ -265,14 +277,14 @@ mod tests {
         let candidate = release("2.0.0", "two");
         let mut situation = steady();
         situation.journal = Some(Transaction {
-            id: "transition".into(),
+            id: "attempt".into(),
             kind: updated::transaction::Kind::Supervised,
             previous_release: predecessor,
             previous_archive_sha256: "archive-one".into(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
             candidate_rejection_required: true,
-            transition_required: false,
+            lifecycle: None,
             phase: TransactionPhase::PreflightStarted,
         });
 
@@ -293,11 +305,11 @@ mod tests {
             release: candidate,
             archive_sha256: "archive-two".into(),
             pending: Some(Pending {
-                transition_id: "transition".into(),
+                lifecycle_attempt_id: "attempt".into(),
                 previous_release: predecessor.clone(),
                 previous_archive_sha256: "archive-one".into(),
                 committed_at: 100,
-                transition_required: true,
+                lifecycle: None,
             }),
         });
 

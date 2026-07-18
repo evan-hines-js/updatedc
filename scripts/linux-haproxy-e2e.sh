@@ -109,6 +109,18 @@ publish() {
   "$BIN/server" publish-app --repo "$REPO" --keys "$KEYS" --product app \
     --channel stable --version "$version" --bundle "linux-x86_64=$tree" \
     --entrypoint bin/launch
+  if [[ -f "$REPO/targets/provider-sets/default.json" ]]; then assign "$version"; fi
+}
+
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+assign() {
+  local version="$1" app_path="products/app/stable/$1/linux-x86_64/app" set_path="provider-sets/default.json"
+  "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
+    --name assignments/nodes/node.json --deployment "app-$version" \
+    --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/" \
+    --targets-url "http://127.0.0.1:$REPO_PORT/targets/" \
+    --application-path "$app_path" --application-sha256 "$(sha256_file "$REPO/targets/$app_path")" \
+    --provider-set-path "$set_path" --provider-set-sha256 "$(sha256_file "$REPO/targets/$set_path")"
 }
 
 rm -rf "$WORK"
@@ -117,24 +129,34 @@ mkdir -p "$BIN" "$WORK/guardian-state"
 cp "$ROOT/target/release/"{server,bootstrap,supervisor} "$BIN/"
 cp "$ROOT/scripts/haproxy-activate.sh" "$BIN/activate"
 chmod 0755 "$BIN/activate"
-cat >"$BIN/transition" <<'EOF'
+cat >"$BIN/lifecycle" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-case "${UPDATED_TRANSITION_PHASE:?}" in
+case "${UPDATED_LIFECYCLE_PHASE:?}" in
   preflight)
     exec "$UPDATED_CANDIDATE/bin/haproxy" -c -f "$UPDATED_CANDIDATE/config/haproxy.cfg"
     ;;
   activate)
     exec "$(dirname "$0")/activate" "$UPDATED_CANDIDATE" "$UPDATED_INSTALL_ROOT/runtime" "$UPDATED_CHILD_PID"
     ;;
-  drain|prepare|finalize|rollback)
+  drain|prepare|stop|start|verify|finalize|rollback)
     exit 0
     ;;
 esac
 EOF
-chmod 0755 "$BIN/transition"
+chmod 0755 "$BIN/lifecycle"
 
 "$BIN/server" init --repo "$REPO" --keys "$KEYS"
+mkdir -p "$WORK/adapter/bin"
+cp "$BIN/lifecycle" "$WORK/adapter/bin/lifecycle"
+cp "$BIN/activate" "$WORK/adapter/bin/activate"
+"$BIN/server" publish-provider-artifact --repo "$REPO" --keys "$KEYS" \
+  --product app-lifecycle --version 1.0.0 \
+  --bundle "linux-x86_64=$WORK/adapter" --entrypoint bin/lifecycle
+provider_path="products/app-lifecycle/stable/1.0.0/linux-x86_64/app-lifecycle"
+"$BIN/server" publish-provider-set --repo "$REPO" --keys "$KEYS" --id default \
+  --provider-path "$provider_path" --provider-sha256 "$(sha256_file "$REPO/targets/$provider_path")" \
+  --provider-timeout-ms 10000
 for version in 1.0.0 2.0.0 4.0.0; do make_config "$WORK/bundle-$version" "$version"; done
 make_config "$WORK/bundle-3.0.0" 3.0.0 invalid-binary
 
@@ -159,16 +181,12 @@ done
 "$BIN/server" install-app --install-root "$INSTALL" --product app --version 1.0.0 \
   --platform linux-x86_64 --bundle "$WORK/bundle-1.0.0" --entrypoint bin/launch
 publish 1.0.0 "$WORK/bundle-1.0.0"
-"$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
-  --name assignments/node.json \
-  --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/" \
-  --targets-url "http://127.0.0.1:$REPO_PORT/targets/"
 
 cat >"$CONFIG" <<EOF
 [routing]
 root = "$REPO/metadata/root.json"
 base_url = "http://127.0.0.1:$REPO_PORT/"
-assignment = "assignments/node.json"
+assignment = "assignments/nodes/node.json"
 [repository]
 root = "$REPO/metadata/root.json"
 [application]
@@ -178,9 +196,6 @@ install_root = "$INSTALL"
 health_url = "http://127.0.0.1:$HTTP_PORT/"
 [application.activation]
 mode = "reexec"
-[application.transition]
-command = ["$BIN/transition"]
-timeout = "10s"
 [timeouts]
 check_interval = "1s"
 health_grace = "4s"
@@ -213,20 +228,20 @@ wait_version 2.0.0
 new_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "HAProxy did not replace its worker"
 [[ "$(stat -Lc '%d:%i' "/proc/$master_pid/exe")" != "$initial_exe_inode" ]] || fail "master did not re-exec the candidate binary inode"
 
-# The updater provides at-least-once adapter execution across the unavoidable
-# action/journal-write crash gap. Prove this real adapter converges when the exact same
+# The updater provides at-least-once provider execution across the unavoidable
+# action/journal-write crash gap. Prove this real provider converges when the exact same
 # activation is replayed, rather than relying only on the purpose-built sample server.
 release2="$(find "$INSTALL/versions" -maxdepth 1 -type d -name '2.0.0-*' -print -quit)"
 [[ -n "$release2" ]] || fail "could not locate the immutable HAProxy 2.0.0 release"
 replay_worker="$new_worker"
 for _ in 1 2; do
   old_worker="$(pgrep -P "$master_pid" | sort -n | tail -n1)"
-  UPDATED_TRANSITION_PHASE=activate \
-  UPDATED_TRANSITION_ID=haproxy-idempotency-replay \
+  UPDATED_LIFECYCLE_PHASE=activate \
+  UPDATED_LIFECYCLE_ATTEMPT_ID=haproxy-idempotency-replay \
   UPDATED_CANDIDATE="$release2" \
   UPDATED_INSTALL_ROOT="$INSTALL" \
     UPDATED_CHILD_PID="$master_pid" \
-    "$BIN/transition"
+    "$BIN/lifecycle"
   replay_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "duplicate activation did not finish worker turnover"
   wait_master_loaded_runtime "$master_pid" || fail "duplicate activation did not finish master re-exec"
   wait_version 2.0.0
@@ -238,7 +253,7 @@ preflight_inode="$(stat -Lc '%d:%i' "/proc/$master_pid/exe")"
 publish 3.0.0 "$WORK/bundle-3.0.0"
 sleep 6
 [[ "$(curl -fsS "http://127.0.0.1:$HTTP_PORT/")" == 2.0.0 ]] || fail "invalid binary displaced the healthy release"
-grep -q 'failed transition preflight' "$TOWER_LOG" || fail "invalid binary preflight failure was not recorded"
+grep -q 'failed lifecycle preflight' "$TOWER_LOG" || fail "invalid binary preflight failure was not recorded"
 grep -q 'rejected 3.0.0 before activation' "$TOWER_LOG" || fail "invalid binary was not rejected before activation"
 [[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "master PID changed during failed preflight"
 [[ "$(stat -Lc '%d:%i' "/proc/$master_pid/exe")" == "$preflight_inode" ]] || fail "failed preflight replaced the live executable"

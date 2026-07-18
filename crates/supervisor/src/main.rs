@@ -75,10 +75,6 @@ impl LoopState {
             next_app_check: Instant::now() + jitter(check_interval, 20),
         }
     }
-
-    fn application_upgraded(&mut self, check_interval: Duration) {
-        self.next_app_check = Instant::now() + jitter(check_interval, 20);
-    }
 }
 
 fn main() {
@@ -158,16 +154,6 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let defer_recovery_commit = recovery_transaction
         .as_ref()
         .is_some_and(Transaction::is_rollback);
-    if recovery_transaction
-        .as_ref()
-        .is_some_and(|tx| tx.transition_required)
-        && opts.application.transition.is_none()
-    {
-        return Err(
-            "recovery requires application.transition, but the configured adapter is missing"
-                .into(),
-        );
-    }
     let plan = plan_boot(&situation);
     for note in &plan.notes {
         match note.level {
@@ -192,7 +178,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             &mut store,
             recovery_transaction
                 .as_ref()
-                .expect("pending transition recovery has a transaction"),
+                .expect("pending lifecycle recovery has a transaction"),
         )?;
     }
     if let Some(tx) = recovery_transaction.as_mut() {
@@ -212,6 +198,14 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         defer_recovery_commit,
         recovery_transaction.as_mut(),
     )?;
+    if matches!(opts.application.activation, Activation::StopStart) {
+        complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut(), None)?;
+        if let Some(tx) = recovery_transaction.as_mut() {
+            if tx.rollback_rank().is_some_and(|rank| rank < 5) {
+                advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
+            }
+        }
+    }
     if pending.is_some() {
         if let Some(v) = current.as_deref() {
             log(&format!(
@@ -221,7 +215,8 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log(&format!(
-        "supervisor {SELF_VERSION} supervising {:?} (product {} channel {}, installed {}, updates {}, restart {}, check every {}s)",
+        "supervisor {SELF_VERSION} (default provider {}) supervising {:?} (product {} channel {}, installed {}, updates {}, restart {}, check every {}s)",
+        DefaultProvider::VERSION,
         opts.paths.install_root,
         opts.application.product,
         opts.application.channel,
@@ -235,15 +230,45 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         Acquire::Adopt(pid) => adopt(guardian, &opts, pid),
         Acquire::Launch => start(guardian, &opts)?,
     };
+    if matches!(opts.application.activation, Activation::Reexec) {
+        complete_recovery_activation(
+            &opts,
+            &mut store,
+            recovery_transaction.as_mut(),
+            Some(app.pid()),
+        )?;
+        if let Some(tx) = recovery_transaction.as_mut() {
+            if tx.rollback_rank().is_some_and(|rank| rank < 5) {
+                advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
+            }
+        }
+    }
     if recovery_transaction
         .as_ref()
-        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 3))
+        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 6))
     {
+        let tx = recovery_transaction.as_ref().expect("checked above");
+        invoke_deployment_provider(
+            tx.lifecycle.as_deref(),
+            &opts,
+            LifecycleInvocation {
+                phase: LifecyclePhase::Start,
+                id: &tx.id,
+                pid: Some(app.pid()),
+                candidate: &tx.previous_release,
+                predecessor: &tx.candidate_release,
+            },
+        )?;
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_START_APPLIED);
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::PredecessorStarted)?;
     }
 
+    if let Some(tx) = recovery_transaction.as_mut() {
+        if tx.rollback_rank().is_some_and(|rank| rank < 7) {
+            advance_transaction(&mut store, tx, TransactionPhase::RollbackHealthStarted)?;
+        }
+    }
     // Gate readiness: the application must be healthy before we trust this boot. A crash
     // would have torn the tower down instead, so an unhealthy result here means the
     // process is alive but wedged — fail closed. For a candidate supervisor, failing this
@@ -262,8 +287,20 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     if recovery_transaction
         .as_ref()
-        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 4))
+        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 8))
     {
+        let tx = recovery_transaction.as_ref().expect("checked above");
+        invoke_deployment_provider(
+            tx.lifecycle.as_deref(),
+            &opts,
+            LifecycleInvocation {
+                phase: LifecyclePhase::Verify,
+                id: &tx.id,
+                pid: Some(app.pid()),
+                candidate: &tx.previous_release,
+                predecessor: &tx.candidate_release,
+            },
+        )?;
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_HEALTH_APPLIED);
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::PredecessorHealthy)?;
@@ -274,19 +311,26 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // transaction identity before declaring the recovered tower ready.
     let rollback_incomplete = recovery_transaction
         .as_ref()
-        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 5));
+        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 10));
     if rollback_incomplete {
-        if let (Some(tx), Some(transition)) = (
+        if let Some(tx) = recovery_transaction.as_mut() {
+            if tx.rollback_rank().is_some_and(|rank| rank < 9) {
+                advance_transaction(&mut store, tx, TransactionPhase::RollbackFinalizeStarted)?;
+            }
+        }
+        if let (Some(tx), Some(lifecycle)) = (
             recovery_transaction.as_ref(),
-            opts.application.transition.as_ref(),
+            recovery_transaction
+                .as_ref()
+                .and_then(|tx| tx.lifecycle.as_ref()),
         ) {
-            run_transition_command(
-                transition,
+            run_lifecycle_command(
+                lifecycle,
                 &opts,
-                TransitionInvocation {
-                    phase: TransitionPhase::Rollback,
+                LifecycleInvocation {
+                    phase: LifecyclePhase::Rollback,
                     id: &tx.id,
-                    pid: app.pid(),
+                    pid: Some(app.pid()),
                     candidate: &tx.previous_release,
                     predecessor: &tx.candidate_release,
                 },
@@ -420,7 +464,6 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             loop_state.next_app_check = Instant::now() + jitter(opts.timeouts.check_interval, 20);
             match check_application(&opts, &repo, &mut store, &mut app, &current).await {
                 AppOutcome::Upgraded { version } => {
-                    loop_state.application_upgraded(opts.timeouts.check_interval);
                     current = Some(version);
                     // The commit recorded the update as unconfirmed; pick it up so its
                     // window is watched and a crash is caught on the next boot.
@@ -454,20 +497,52 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
             let rollback_started = situation.active.as_ref() == Some(&pending.previous_release);
             if situation.app_crashed || rollback_started {
                 return Some(Transaction {
-                    id: pending.transition_id.clone(),
+                    id: pending.lifecycle_attempt_id.clone(),
                     kind: updated::transaction::Kind::Supervised,
                     previous_release: pending.previous_release.clone(),
                     previous_archive_sha256: pending.previous_archive_sha256.clone(),
                     candidate_release: installed.release.clone(),
                     candidate_archive_sha256: installed.archive_sha256.clone(),
                     candidate_rejection_required: situation.app_crashed,
-                    transition_required: pending.transition_required,
+                    lifecycle: pending.lifecycle.clone(),
                     phase: TransactionPhase::RollbackStarted,
                 });
             }
         }
     }
     None
+}
+
+fn complete_recovery_activation(
+    opts: &Options,
+    store: &mut dyn Store,
+    recovery: Option<&mut Transaction>,
+    pid: Option<u32>,
+) -> io::Result<()> {
+    let Some(tx) = recovery else {
+        return Ok(());
+    };
+    if tx.rollback_rank().is_none_or(|rank| rank >= 4) {
+        return Ok(());
+    }
+    if tx.lifecycle.is_none() && matches!(opts.application.activation, Activation::Reexec) {
+        return Err(io::Error::other(
+            "reexec rollback requires its pinned lifecycle provider",
+        ));
+    }
+    invoke_deployment_provider(
+        tx.lifecycle.as_deref(),
+        opts,
+        LifecycleInvocation {
+            phase: LifecyclePhase::Activate,
+            id: &tx.id,
+            pid,
+            candidate: &tx.previous_release,
+            predecessor: &tx.candidate_release,
+        },
+    )?;
+    Chaos::from_env().crossing(update::boundary::PREDECESSOR_LIFECYCLE_APPLIED);
+    advance_transaction(store, tx, TransactionPhase::PredecessorActivated)
 }
 
 // ============================== boot: gather + execute ==============================
@@ -481,13 +556,9 @@ fn gather_situation(
     guardian_state: Option<&Path>,
 ) -> io::Result<Situation> {
     let active = store.active_release()?;
-    let active_verified = active
-        .as_ref()
-        .is_some_and(|release| store.verify_release(release).is_ok());
     Ok(Situation {
         installed: store.installed(),
         active,
-        active_verified,
         journal: store.journal()?,
         app_crashed: match guardian_state {
             Some(state) => guardian::take_crash_marker(state)?,
@@ -514,33 +585,50 @@ fn execute_boot_plan(
     defer_commit: bool,
     mut recovery: Option<&mut Transaction>,
 ) -> io::Result<Option<Pending>> {
-    let needs_quiesce = recovery
-        .as_ref()
-        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 1));
-    if plan.quiesce && needs_quiesce {
-        warn("stopping the uncommitted candidate before reconciling its release");
-        let _ = guardian.stop();
-        let _ = std::fs::remove_file(&opts.paths.app_token);
-    }
-    if needs_quiesce && recovery.is_some() {
-        Chaos::from_env().crossing(update::boundary::ROLLBACK_QUIESCE_APPLIED);
-    }
     if let Some(tx) = recovery.as_mut() {
         if tx.rollback_rank().is_some_and(|rank| rank < 1) {
-            advance_transaction(store, tx, TransactionPhase::RollbackAppQuiesced)?;
+            advance_transaction(store, tx, TransactionPhase::RollbackStopStarted)?;
+        }
+    }
+    let needs_quiesce = recovery
+        .as_ref()
+        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
+    if needs_quiesce {
+        if let Some(tx) = recovery.as_ref() {
+            invoke_deployment_provider(
+                tx.lifecycle.as_deref(),
+                opts,
+                LifecycleInvocation {
+                    phase: LifecyclePhase::Stop,
+                    id: &tx.id,
+                    pid: guardian::adopted_app_pid(),
+                    candidate: &tx.previous_release,
+                    predecessor: &tx.candidate_release,
+                },
+            )?;
+        }
+    }
+    if plan.quiesce && needs_quiesce {
+        warn("stopping the uncommitted candidate before reconciling its release");
+        stop(guardian, &opts.paths.app_token);
+    }
+    if needs_quiesce && recovery.is_some() {
+        Chaos::from_env().crossing(update::boundary::ROLLBACK_STOP_APPLIED);
+    }
+    if let Some(tx) = recovery.as_mut() {
+        if tx.rollback_rank().is_some_and(|rank| rank < 2) {
+            advance_transaction(store, tx, TransactionPhase::RollbackStopped)?;
+        }
+        if tx.rollback_rank().is_some_and(|rank| rank < 3) {
+            advance_transaction(store, tx, TransactionPhase::RollbackActivateStarted)?;
         }
     }
     let activate_release = recovery
         .as_ref()
-        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
+        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 4));
     apply_store_plan(plan, store, defer_commit, activate_release)?;
     if activate_release && !matches!(plan.release, ReleaseFix::None) {
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_POINTER_APPLIED);
-    }
-    if let Some(tx) = recovery.as_mut() {
-        if tx.rollback_rank().is_some_and(|rank| rank < 2) {
-            advance_transaction(store, tx, TransactionPhase::PredecessorActivated)?;
-        }
     }
     if let Some(path) = &plan.reject_supervisor {
         self_update.reject_candidate(path);
