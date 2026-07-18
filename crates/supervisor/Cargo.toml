@@ -29,3 +29,6 @@ serde_json = { workspace = true }
 # process instead of leaking into the operator's lifecycle provider.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

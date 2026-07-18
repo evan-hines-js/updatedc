@@ -35,6 +35,7 @@ fn client_config(repo_dir: &std::path::Path) -> RepositorySource {
         root: repo_dir.join("metadata/root.json"),
         metadata_limit: 1024 * 1024,
         target_limit: 100 * 1024 * 1024,
+        transport_timeout: std::time::Duration::from_secs(5),
     }
 }
 
@@ -194,6 +195,70 @@ async fn publish_then_verify_and_download() {
         found2.custom.get("version").and_then(|v| v.as_str()),
         Some("2.0.0")
     );
+
+    // Republishing one logical name must not invalidate a reader that already trusted
+    // the previous metadata generation. Each generation resolves to its own immutable,
+    // digest-prefixed target object.
+    let assignment_name = "assignments/nodes/node.json";
+    let assignment_v1 = tmp.join("assignment-v1");
+    std::fs::write(&assignment_v1, b"assignment generation one").unwrap();
+    repo::add_release(
+        &repo_dir,
+        &keys,
+        vec![repo::PublishTarget {
+            name: assignment_name.into(),
+            source: assignment_v1,
+            custom: Default::default(),
+        }],
+        365,
+    )
+    .await
+    .unwrap();
+    let old = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds-old-assignment"))
+        .await
+        .unwrap();
+    let old_target = old
+        .all_targets()
+        .into_iter()
+        .find(|target| target.path == assignment_name)
+        .unwrap();
+
+    let assignment_v2 = tmp.join("assignment-v2");
+    std::fs::write(&assignment_v2, b"assignment generation two").unwrap();
+    repo::add_release(
+        &repo_dir,
+        &keys,
+        vec![repo::PublishTarget {
+            name: assignment_name.into(),
+            source: assignment_v2,
+            custom: Default::default(),
+        }],
+        365,
+    )
+    .await
+    .unwrap();
+
+    let old_out = tmp.join("old-assignment");
+    old.download_target(&old_target, &old_out).await.unwrap();
+    assert_eq!(
+        std::fs::read(old_out).unwrap(),
+        b"assignment generation one"
+    );
+    let new = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds-new-assignment"))
+        .await
+        .unwrap();
+    let new_target = new
+        .all_targets()
+        .into_iter()
+        .find(|target| target.path == assignment_name)
+        .unwrap();
+    let new_out = tmp.join("new-assignment");
+    new.download_target(&new_target, &new_out).await.unwrap();
+    assert_eq!(
+        std::fs::read(new_out).unwrap(),
+        b"assignment generation two"
+    );
+    assert!(!repo_dir.join("targets").join(assignment_name).exists());
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

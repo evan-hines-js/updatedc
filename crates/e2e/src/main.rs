@@ -48,6 +48,8 @@ fn run_lifecycle_fixture() -> R {
     let mode = std::env::args().nth(3).unwrap_or_default();
     let phase = std::env::var("UPDATED_LIFECYCLE_PHASE").map_err(|error| error.to_string())?;
     let id = std::env::var("UPDATED_LIFECYCLE_ATTEMPT_ID").map_err(|error| error.to_string())?;
+    let candidate_version =
+        std::env::var("UPDATED_CANDIDATE_VERSION").map_err(|error| error.to_string())?;
     std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
     let mut attempts = std::fs::OpenOptions::new()
         .create(true)
@@ -68,16 +70,115 @@ fn run_lifecycle_fixture() -> R {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(str_err(error)),
     }
-    if phase == "drain" {
-        let fail_once = mode == "fail-first-drain"
-            && std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(root.join("drain-failure-injected"))
-                .is_ok();
-        if mode == "fail-drain" || fail_once {
-            return fail("injected drain failure");
-        }
+    let fail_once_phase = mode.strip_prefix("fail-first-");
+    let fail_once = fail_once_phase == Some(phase.as_str())
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join(format!("{phase}-failure-injected")))
+            .is_ok();
+    if fail_once {
+        return fail(format!("injected one-shot {phase} failure"));
+    }
+    let fail_phase = mode.strip_prefix("fail-");
+    let fail_start_and_rollback = mode == "fail-start-and-rollback"
+        && (phase == "rollback" || (phase == "start" && candidate_version == "2.0.0"));
+    // Ordinary failure modes target the forward candidate only. Rollback reverses the
+    // candidate/predecessor variables, and must be allowed to start and verify the restored
+    // predecessor. The dedicated rollback mode is the exception used to prove that failed
+    // recovery remains durably held.
+    let fail_forward_candidate = candidate_version == "2.0.0" && fail_phase == Some(phase.as_str());
+    if fail_forward_candidate || fail_start_and_rollback {
+        return fail(format!("injected {phase} failure"));
+    }
+    if mode.starts_with("magnolia-shaped") {
+        // A stateful stand-in for a Java/WAR CMS adapter. Each phase verifies the durable
+        // prerequisite produced by the preceding phase, so running phases out of order is
+        // a hard failure rather than another marker in a directory.
+        let state = root.join("magnolia-state");
+        let live = state.join("live");
+        let backup = state.join("backups").join(&id);
+        std::fs::create_dir_all(&state).map_err(str_err)?;
+        // Real CMS/WAR upgrades spend meaningful time in backup, quiescence, startup,
+        // and migration. Keep CI deterministic while making timeout and ordering behavior
+        // observable instead of accidentally testing a zero-latency wrapper.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let require = |name: &str| -> R {
+            if state.join(name).is_file() {
+                Ok(())
+            } else {
+                fail(format!("Magnolia phase {phase} ran before {name}"))
+            }
+        };
+        let marker = match phase.as_str() {
+            "preflight" => {
+                if std::fs::read_to_string(live.join("content.db")).map_err(str_err)?
+                    != "baseline-content\n"
+                    || std::fs::read_to_string(live.join("app.war")).map_err(str_err)? != "1.0.0\n"
+                {
+                    return fail("Magnolia preflight found an invalid baseline");
+                }
+                "preflight-checked"
+            }
+            "prepare" => {
+                require("preflight-checked")?;
+                std::fs::create_dir_all(&backup).map_err(str_err)?;
+                std::fs::copy(live.join("content.db"), backup.join("content.db"))
+                    .map_err(str_err)?;
+                std::fs::copy(live.join("app.war"), backup.join("app.war")).map_err(str_err)?;
+                "backup-created"
+            }
+            "drain" => {
+                require("backup-created")?;
+                std::fs::write(live.join("draining"), b"true\n").map_err(str_err)?;
+                "authors-drained"
+            }
+            "stop" => {
+                require("authors-drained")?;
+                "tomcat-stopped"
+            }
+            "activate" => {
+                require("tomcat-stopped")?;
+                std::fs::write(live.join("app.war"), format!("{candidate_version}\n"))
+                    .map_err(str_err)?;
+                "war-activated"
+            }
+            "start" => {
+                require("war-activated")?;
+                if std::fs::read_to_string(live.join("app.war")).map_err(str_err)?
+                    != format!("{candidate_version}\n")
+                {
+                    return fail("Magnolia started with the wrong WAR");
+                }
+                "tomcat-started"
+            }
+            "verify" => {
+                require("tomcat-started")?;
+                "cms-health-verified"
+            }
+            "finalize" => {
+                require("cms-health-verified")?;
+                std::fs::write(
+                    live.join("content.db"),
+                    format!("migrated-{candidate_version}\n"),
+                )
+                .map_err(str_err)?;
+                if mode == "magnolia-shaped-fail-finalize" && candidate_version == "2.0.0" {
+                    return fail("injected Magnolia migration finalization failure");
+                }
+                let _ = std::fs::remove_file(live.join("draining"));
+                "migration-finalized"
+            }
+            "rollback" => {
+                std::fs::copy(backup.join("content.db"), live.join("content.db"))
+                    .map_err(str_err)?;
+                std::fs::copy(backup.join("app.war"), live.join("app.war")).map_err(str_err)?;
+                let _ = std::fs::remove_file(live.join("draining"));
+                "rollback-completed"
+            }
+            _ => return fail(format!("unknown Magnolia lifecycle phase {phase}")),
+        };
+        std::fs::write(state.join(marker), id.as_bytes()).map_err(str_err)?;
     }
     Ok(())
 }
@@ -113,6 +214,17 @@ fn scenarios() -> Vec<Scenario> {
             "a health-check-failed release stays rejected across a restart",
             persisted_rejection,
         ),
+        ("custom provider preflight failure is contained", provider_preflight_failure),
+        ("custom provider prepare failure is contained", provider_prepare_failure),
+        ("custom provider drain failure is contained", provider_drain_failure),
+        ("custom provider stop failure is contained", provider_stop_failure),
+        ("custom provider activate failure rolls back", provider_activate_failure),
+        ("custom provider start failure rolls back", provider_start_failure),
+        ("custom provider verify failure rolls back", provider_verify_failure),
+        ("custom provider finalize failure rolls back", provider_finalize_failure),
+            ("custom provider rollback failure remains recoverable", provider_rollback_failure),
+            ("a Magnolia-shaped Java upgrade wrapper completes every lifecycle step", magnolia_shaped_upgrade),
+            ("a failed Magnolia migration restores its WAR and content backup", magnolia_shaped_failed_migration_rolls_back),
         (
             "a supervisor crash does not disturb the app; the guardian relaunches it",
             supervisor_crash_preserves_app,
@@ -128,6 +240,10 @@ fn scenarios() -> Vec<Scenario> {
         (
             "an unlaunchable supervisor candidate is rolled back, rejected, and never retried",
             supervisor_self_update_rollback,
+        ),
+        (
+            "a ready supervisor that crashes during confirmation is rolled back without disturbing the app",
+            supervisor_post_ready_crash_rolls_back,
         ),
         (
             "updated-oneshot updates a non-daemon program to the newest release on launch",
@@ -183,19 +299,20 @@ fn run() -> R {
     // Build the two application versions once; scenarios reuse them.
     let app_v1 = ctx.build_app("1.0.0")?;
     let app_v2 = ctx.build_app("2.0.0")?;
-    if sha256_hex(&app_v1) != sha256_hex(&app_v2) {
+    if sha256_hex(&app_v1)? != sha256_hex(&app_v2)? {
         return fail(
             "sample app binaries differ; release identity must come only from bundle config",
         );
     }
     let reexec_v1 = ctx.build_reexec_app("1.0.0")?;
     let reexec_v2 = ctx.build_reexec_app("2.0.0")?;
-    if sha256_hex(&reexec_v1) != sha256_hex(&reexec_v2) {
+    if sha256_hex(&reexec_v1)? != sha256_hex(&reexec_v2)? {
         return fail("reexec sample binaries differ; release identity must come only from config");
     }
     // Two distinguishable supervisor builds for the self-update scenarios.
     ctx.build_supervisor("1.0.0")?;
     ctx.build_supervisor("2.0.0")?;
+    ctx.build_post_ready_crashing_supervisor("2.0.0")?;
 
     // Every scenario owns a unique working dir and unique ports, so they are safe to
     // run concurrently on a bounded worker pool. They are blocking process work
@@ -419,7 +536,7 @@ impl Sup {
     fn write_config(&self) -> R<PathBuf> {
         self.seed_install()?;
         let mut t = format!(
-            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/nodes/node.json'\n\n[repository]\nroot = {}\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
+            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/nodes/node.json'\ntransport_timeout = '5s'\n\n[repository]\nroot = {}\ntransport_timeout = '5s'\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
             lit(&self.root.display().to_string()),
             lit(&self.repository_base_url),
             lit(&self.root.display().to_string()),
@@ -478,7 +595,7 @@ impl Sup {
                 &self.platform,
                 &provider_product,
             );
-            let provider_sha = sha256_hex(&self.dir.join("repo/targets").join(&provider_path));
+            let provider_sha = target_sha256(&self.server_bin, &self.dir, &provider_path)?;
             let mut provider_set = Command::new(&self.server_bin);
             provider_set
                 .arg("publish-provider-set")
@@ -499,7 +616,9 @@ impl Sup {
                 t += "\n[application.activation]\nmode = \"reexec\"\n";
             }
         }
-        let mut to = String::new();
+        // Tests poll with generous failure deadlines, but the system under test must
+        // react quickly after a transient local-repository failure.
+        let mut to = "refresh_retry = '1s'\n".to_string();
         for (k, v) in [
             ("check_interval", &self.check_interval),
             ("health_grace", &self.health_grace),
@@ -510,9 +629,7 @@ impl Sup {
                 to += &format!("{k} = {}\n", lit(v));
             }
         }
-        if !to.is_empty() {
-            t += &format!("\n[timeouts]\n{to}");
-        }
+        t += &format!("\n[timeouts]\n{to}");
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let path = self.dir.join(format!(
@@ -605,7 +722,9 @@ impl Sup {
             .arg("--supervisor")
             .arg(&supervisor)
             .arg("--ready-timeout")
-            .arg(&ready_timeout);
+            .arg(&ready_timeout)
+            .arg("--confirm-timeout")
+            .arg("1");
         Ok(c)
     }
 
@@ -619,6 +738,27 @@ impl Sup {
     }
 }
 
+fn target_sha256(server: &Path, dir: &Path, name: &str) -> R<String> {
+    let output = Command::new(server)
+        .arg("target-sha256")
+        .arg("--repo")
+        .arg(dir.join("repo"))
+        .arg("--name")
+        .arg(name)
+        .output()
+        .map_err(str_err)?;
+    if !output.status.success() {
+        return fail(format!(
+            "reading target {name} digest failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8(output.stdout)
+        .map_err(|error| error.to_string())?
+        .trim()
+        .to_string())
+}
+
 fn republish_assignment(sup: &Sup, deployment: &str) -> R {
     let desired = std::fs::read_to_string(sup.dir.join("desired-app")).map_err(str_err)?;
     let mut desired = desired.lines();
@@ -629,7 +769,7 @@ fn republish_assignment(sup: &Sup, deployment: &str) -> R {
         .next()
         .ok_or("desired application hash is missing")?;
     let set_path = "provider-sets/default.json";
-    let set_sha = sha256_hex(&sup.dir.join("repo/targets").join(set_path));
+    let set_sha = target_sha256(&sup.server_bin, &sup.dir, set_path)?;
     harness::run(
         Command::new(&sup.server_bin)
             .arg("publish-assignment")

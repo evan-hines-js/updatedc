@@ -202,9 +202,11 @@ target/release/server install-app \
 root = "/etc/example-app/routing-root.json"
 base_url = "https://updates.example.com/routing/"
 assignment = "assignments/nodes/node-123.json"
+transport_timeout = "30s"
 
 [repository]
 root = "/etc/example-app/releases-root.json"
+transport_timeout = "30s"
 
 [application]
 product = "app"
@@ -212,6 +214,13 @@ channel = "stable"
 install_root = "/var/lib/example-app"
 args = ["--config", "/etc/example-app/app.toml"]
 health_url = "http://127.0.0.1:9090/healthz" # omit for liveness-only
+
+[storage]
+inactive_releases = 2
+inactive_providers = 2
+inactive_supervisors = 1
+inactive_repository_caches = 2
+inactive_bytes = 1073741824
 
 [timeouts]
 check_interval = "60s"
@@ -237,7 +246,8 @@ target/release/bootstrap \
   --state-dir /var/lib/example-app/guardian-state \
   --supervisor-config /etc/example-app/updated.toml \
   --supervisor /usr/lib/example-app/supervisor \
-  --ready-timeout 60
+  --ready-timeout 60 \
+  --confirm-timeout 30
 ```
 
 Platform templates and permission guidance are in [deploy/README.md](deploy/README.md).

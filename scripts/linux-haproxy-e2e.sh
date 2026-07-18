@@ -109,18 +109,18 @@ publish() {
   "$BIN/server" publish-app --repo "$REPO" --keys "$KEYS" --product app \
     --channel stable --version "$version" --bundle "linux-x86_64=$tree" \
     --entrypoint bin/launch
-  if [[ -f "$REPO/targets/provider-sets/default.json" ]]; then assign "$version"; fi
+  assign "$version"
 }
 
-sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+target_sha256() { "$BIN/server" target-sha256 --repo "$REPO" --name "$1"; }
 assign() {
   local version="$1" app_path="products/app/stable/$1/linux-x86_64/app" set_path="provider-sets/default.json"
   "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
     --name assignments/nodes/node.json --deployment "app-$version" \
     --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/" \
     --targets-url "http://127.0.0.1:$REPO_PORT/targets/" \
-    --application-path "$app_path" --application-sha256 "$(sha256_file "$REPO/targets/$app_path")" \
-    --provider-set-path "$set_path" --provider-set-sha256 "$(sha256_file "$REPO/targets/$set_path")"
+    --application-path "$app_path" --application-sha256 "$(target_sha256 "$app_path")" \
+    --provider-set-path "$set_path" --provider-set-sha256 "$(target_sha256 "$set_path")"
 }
 
 rm -rf "$WORK"
@@ -155,7 +155,7 @@ cp "$BIN/activate" "$WORK/adapter/bin/activate"
   --bundle "linux-x86_64=$WORK/adapter" --entrypoint bin/lifecycle
 provider_path="products/app-lifecycle/stable/1.0.0/linux-x86_64/app-lifecycle"
 "$BIN/server" publish-provider-set --repo "$REPO" --keys "$KEYS" --id default \
-  --provider-path "$provider_path" --provider-sha256 "$(sha256_file "$REPO/targets/$provider_path")" \
+  --provider-path "$provider_path" --provider-sha256 "$(target_sha256 "$provider_path")" \
   --provider-timeout-ms 10000
 for version in 1.0.0 2.0.0 4.0.0; do make_config "$WORK/bundle-$version" "$version"; done
 make_config "$WORK/bundle-3.0.0" 3.0.0 invalid-binary
@@ -187,8 +187,10 @@ cat >"$CONFIG" <<EOF
 root = "$REPO/metadata/root.json"
 base_url = "http://127.0.0.1:$REPO_PORT/"
 assignment = "assignments/nodes/node.json"
+transport_timeout = "5s"
 [repository]
 root = "$REPO/metadata/root.json"
+transport_timeout = "5s"
 [application]
 product = "app"
 channel = "stable"
@@ -200,6 +202,7 @@ mode = "reexec"
 check_interval = "1s"
 health_grace = "4s"
 retry_after = "60s"
+refresh_retry = "1s"
 confirmation_window = "2s"
 EOF
 

@@ -1,5 +1,6 @@
 //! The sole application artifact format: an immutable, manifested tar.zst release.
 
+use aws_lc_rs::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -10,6 +11,7 @@ use crate::hash::{is_sha256_hex, sha256_bytes, sha256_file};
 
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 pub(crate) const MANIFEST_SCHEMA: u32 = 1;
+const MANIFEST_BYTES_LIMIT: u64 = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -267,10 +269,10 @@ pub(crate) fn stage_bundle(
         let id = manifest.id(&bytes)?;
         let destination = versions_root.join(id.directory_name());
         if destination.exists() {
-            // Already ingested under this content id, so it was verified when first staged;
-            // trust it (its run directory may since have drifted with logs/state). Confirm
-            // it still resolves by identity, without re-hashing the tree.
-            read_manifest(versions_root, &id)?;
+            // A content-addressed directory is only reusable while its complete tree still
+            // matches the authenticated manifest. Do not let local drift become trusted just
+            // because the same release is downloaded again.
+            read_release(versions_root, &id)?;
             fs::remove_dir_all(&stage)?;
             return Ok(StagedRelease { id, archive_sha256 });
         }
@@ -335,16 +337,41 @@ fn extract(
             .write(true)
             .create_new(true)
             .open(&destination)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-        entry.read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != size {
-            return Err(invalid("truncated bundle member"));
-        }
-        file.write_all(&bytes)?;
+        let (bytes, digest) = if path == MANIFEST_FILE {
+            if size > MANIFEST_BYTES_LIMIT {
+                return Err(invalid("bundle manifest exceeds size limit"));
+            }
+            let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            entry.read_to_end(&mut bytes)?;
+            if bytes.len() as u64 != size {
+                return Err(invalid("truncated bundle member"));
+            }
+            file.write_all(&bytes)?;
+            let digest = sha256_bytes(&bytes);
+            (Some(bytes), digest)
+        } else {
+            let mut context = Context::new(&SHA256);
+            let mut written = 0u64;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = entry.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..read])?;
+                context.update(&buffer[..read]);
+                written = written
+                    .checked_add(read as u64)
+                    .ok_or_else(|| invalid("bundle member size overflow"))?;
+            }
+            if written != size {
+                return Err(invalid("truncated bundle member"));
+            }
+            (None, hex::encode(context.finish().as_ref()))
+        };
         file.sync_all()?;
-        let digest = sha256_bytes(&bytes);
         if path == MANIFEST_FILE {
-            manifest_bytes = Some(bytes);
+            manifest_bytes = bytes;
         } else if extracted.insert(path, (size, digest)).is_some() {
             return Err(invalid("duplicate bundle member"));
         }
@@ -604,6 +631,18 @@ mod tests {
 
         fs::write(dir.join("undeclared"), b"drift").unwrap();
         assert!(read_release(&root.join("versions"), &staged.id).is_err());
+        assert!(stage_bundle(
+            &archive,
+            &root.join("staging"),
+            &root.join("versions"),
+            &ExpectedBundle {
+                product: "app",
+                version: "2.0.0",
+                platform: "test-platform",
+            },
+            &BundleLimits::default(),
+        )
+        .is_err());
     }
 
     #[test]

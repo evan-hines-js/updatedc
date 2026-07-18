@@ -7,12 +7,14 @@
 root       = "/etc/selfupdate/routing-root.json" # installer-pinned routing trust anchor
 base_url   = "https://updates.example.com/routing/" # the node's only configured repository URL
 assignment = "assignments/nodes/node-123.json"
+transport_timeout = "30s" # overall metadata refresh and per-target progress deadline
 
 [repository]
 root         = "/etc/selfupdate/releases-root.json" # pinned release trust anchor (read-only)
 # datastore defaults to <install_root>/state/tuf
 metadata_limit = 1048576       # maximum bytes for one metadata document
 target_limit   = 536870912     # maximum compressed target bytes
+transport_timeout = "30s"      # tune lower for a fast, local repository
 
 [application]
 product         = "app"
@@ -25,6 +27,15 @@ health_url      = "http://127.0.0.1:9090/healthz"   # omit for liveness-only
 # opt into reexec by adding the following table. Commands are argv arrays, not shell text:
 # [application.activation]
 # mode = "reexec"
+
+# Retain a bounded number of inactive immutable objects. Active releases, rollback
+# predecessors, executing providers, and the running supervisor are always protected.
+[storage]
+inactive_releases          = 2
+inactive_providers         = 2
+inactive_supervisors       = 1
+inactive_repository_caches = 2
+inactive_bytes             = 1073741824
 
 # All optional; defaults shown. Durations accept "15s", "5m", "2h", or bare seconds.
 [timeouts]

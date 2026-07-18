@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::HashSet;
+use std::ffi::OsString;
 use updated::reject::Rejections;
 
 /// When to next check for a supervisor self-update, and which candidate hashes have
@@ -13,6 +15,7 @@ impl SelfUpdateState {
         let path = opts.supervisor_update.state_dir.join("supervisor-rejected");
         // Effectively-permanent suppression: the remedy for a bad supervisor release is
         // a corrected republish (new bytes ⇒ new hash), not the passage of time.
+        prune_supervisor_cache(opts);
         Ok(SelfUpdateState {
             next_check: Instant::now(),
             rejected: Rejections::load(&path, updated::reject::REJECT_TTL)?,
@@ -125,6 +128,25 @@ impl SelfUpdateState {
                 Ok(())
             }
         }
+    }
+}
+
+fn prune_supervisor_cache(opts: &Options) {
+    let root = opts.supervisor_update.state_dir.join("supervisors");
+    let protected: HashSet<OsString> = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().and_then(Path::file_name).map(OsString::from))
+        .into_iter()
+        .collect();
+    match updated::gc::prune_directories(
+        &root,
+        &protected,
+        opts.storage.inactive_supervisors,
+        opts.storage.inactive_bytes,
+    ) {
+        Ok(0) => {}
+        Ok(count) => log(&format!("removed {count} inactive supervisor candidate(s)")),
+        Err(error) => warn(&format!("could not prune supervisor candidates: {error}")),
     }
 }
 

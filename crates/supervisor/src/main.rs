@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{with_suffix, Activation, Application, Paths, Repository, Routing, Timeouts};
+use updated::config::{
+    with_suffix, Activation, Application, Paths, Repository, Routing, Storage, Timeouts,
+};
 use updated::{apply, env, health};
 mod app;
 mod boot;
@@ -45,6 +47,7 @@ struct Options {
     repository: Repository,
     application: Application,
     timeouts: Timeouts,
+    storage: Storage,
     /// Canonical bundle installation layout.
     paths: Paths,
     supervisor_update: SupervisorUpdate,
@@ -189,7 +192,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     // Perform the plan's durable reconciliation (binary, rejections, commit), yielding the
     // still-unconfirmed update (if any) for the loop to confirm once its window passes.
-    let mut pending = execute_boot_plan(
+    let mut pending = match execute_boot_plan(
         &plan,
         &opts,
         &mut store,
@@ -197,9 +200,26 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         &mut self_update,
         defer_recovery_commit,
         recovery_transaction.as_mut(),
-    )?;
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            return hold_recovery_after_provider_failure(
+                &shutdown,
+                format!("boot/update recovery hook failed: {error}"),
+            )
+            .await;
+        }
+    };
     if matches!(opts.application.activation, Activation::StopStart) {
-        complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut(), None)?;
+        if let Err(error) =
+            complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut(), None)
+        {
+            return hold_recovery_after_provider_failure(
+                &shutdown,
+                format!("predecessor activation recovery hook failed: {error}"),
+            )
+            .await;
+        }
         if let Some(tx) = recovery_transaction.as_mut() {
             if tx.rollback_rank().is_some_and(|rank| rank < 5) {
                 advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
@@ -227,16 +247,22 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let mut app = match plan.acquire {
-        Acquire::Adopt(pid) => adopt(guardian, &opts, pid),
+        Acquire::Adopt(pid) => adopt(guardian, &opts, pid)?,
         Acquire::Launch => start(guardian, &opts)?,
     };
     if matches!(opts.application.activation, Activation::Reexec) {
-        complete_recovery_activation(
+        if let Err(error) = complete_recovery_activation(
             &opts,
             &mut store,
             recovery_transaction.as_mut(),
             Some(app.pid()),
-        )?;
+        ) {
+            return hold_recovery_after_provider_failure(
+                &shutdown,
+                format!("predecessor activation recovery hook failed: {error}"),
+            )
+            .await;
+        }
         if let Some(tx) = recovery_transaction.as_mut() {
             if tx.rollback_rank().is_some_and(|rank| rank < 5) {
                 advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
@@ -248,7 +274,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 6))
     {
         let tx = recovery_transaction.as_ref().expect("checked above");
-        invoke_deployment_provider(
+        if let Err(error) = invoke_deployment_provider(
             tx.lifecycle.as_deref(),
             &opts,
             LifecycleInvocation {
@@ -258,7 +284,13 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 candidate: &tx.previous_release,
                 predecessor: &tx.candidate_release,
             },
-        )?;
+        ) {
+            return hold_recovery_after_provider_failure(
+                &shutdown,
+                format!("predecessor start recovery hook failed: {error}"),
+            )
+            .await;
+        }
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_START_APPLIED);
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::PredecessorStarted)?;
@@ -290,7 +322,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 8))
     {
         let tx = recovery_transaction.as_ref().expect("checked above");
-        invoke_deployment_provider(
+        if let Err(error) = invoke_deployment_provider(
             tx.lifecycle.as_deref(),
             &opts,
             LifecycleInvocation {
@@ -300,7 +332,13 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 candidate: &tx.previous_release,
                 predecessor: &tx.candidate_release,
             },
-        )?;
+        ) {
+            return hold_recovery_after_provider_failure(
+                &shutdown,
+                format!("predecessor verify recovery hook failed: {error}"),
+            )
+            .await;
+        }
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_HEALTH_APPLIED);
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::PredecessorHealthy)?;
@@ -324,7 +362,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .and_then(|tx| tx.lifecycle.as_ref()),
         ) {
-            run_lifecycle_command(
+            if let Err(error) = run_lifecycle_command(
                 lifecycle,
                 &opts,
                 LifecycleInvocation {
@@ -334,7 +372,13 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     candidate: &tx.previous_release,
                     predecessor: &tx.candidate_release,
                 },
-            )?;
+            ) {
+                return hold_recovery_after_provider_failure(
+                    &shutdown,
+                    format!("rollback recovery hook failed: {error}"),
+                )
+                .await;
+            }
             Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
         }
     }
@@ -354,11 +398,18 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if plan.clear_journal || defer_recovery_commit {
         store.clear_journal()?;
     }
+    garbage_collect(&opts, &store);
 
     // Prove readiness to the guardian. For an ordinary launch this is a no-op; for a
-    // candidate supervisor it is what commits the handoff (else the guardian rolls back).
+    // candidate it begins the guardian-owned stability window. Only surviving that
+    // independent window commits the handoff.
     if let Err(e) = app.signal_ready() {
         warn(&format!("could not signal readiness to the guardian: {e}"));
+    }
+    #[cfg(all(feature = "chaos", supervisor_chaos_exit_after_ready))]
+    {
+        eprintln!("supervisor: CHAOS: exiting after readiness, before guardian confirmation");
+        std::process::exit(137);
     }
 
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
@@ -375,6 +426,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     "update {} confirmed; confirmation window passed",
                     current.as_deref().unwrap_or("?")
                 ));
+                garbage_collect(&opts, &store);
             } else {
                 confirm_failed = true;
             }
@@ -420,8 +472,13 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // Resolve the routing assignment afresh, then load its release repository.
         // One verified result serves application and self checks this cycle, and a
         // control-plane reassignment therefore takes effect without process restart.
-        let repo = match TrustedRepository::assigned(&opts.routing, &opts.repository, &opts.paths)
-            .await
+        let repo = match TrustedRepository::assigned(
+            &opts.routing,
+            &opts.repository,
+            &opts.storage,
+            &opts.paths,
+        )
+        .await
         {
             Ok(repo) => repo,
             Err(e) => {
@@ -468,15 +525,77 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // The commit recorded the update as unconfirmed; pick it up so its
                     // window is watched and a crash is caught on the next boot.
                     pending = installed_pending(&store);
+                    garbage_collect(&opts, &store);
                 }
                 AppOutcome::Unchanged => {}
                 AppOutcome::Fatal(message) => {
-                    return Err(
-                        format!("update transaction requires boot recovery: {message}").into(),
-                    );
+                    return hold_recovery_after_provider_failure(
+                        &shutdown,
+                        format!("update transaction requires boot recovery: {message}"),
+                    )
+                    .await;
                 }
             }
         }
+    }
+}
+
+/// A recovery hook is operator code. If it fails, keep the existing application and
+/// durable transaction evidence in place, but do not let the guardian repeatedly restart
+/// this supervisor and replay the same non-idempotent boundary forever. The process stays
+/// alive until the service manager stops it (or the guardian rejects a not-ready candidate).
+async fn hold_recovery_after_provider_failure(
+    shutdown: &Arc<AtomicBool>,
+    reason: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    error(&format!(
+        "{reason}; recovery is held with its journal intact"
+    ));
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+fn garbage_collect(opts: &Options, store: &dyn Store) {
+    let Installed::Present(installed) = store.installed() else {
+        return;
+    };
+    let mut releases = vec![installed.release.clone()];
+    let mut providers = Vec::new();
+    if let Some(pending) = installed.pending {
+        releases.push(pending.previous_release);
+        if let Some(lifecycle) = pending.lifecycle {
+            providers.push(lifecycle.release);
+        }
+    }
+    match updated::gc::prune_releases(
+        &opts.paths.versions,
+        &releases,
+        opts.storage.inactive_releases,
+        opts.storage.inactive_bytes,
+    ) {
+        Ok(removed) if removed != 0 => {
+            log(&format!("removed {removed} inactive application releases"))
+        }
+        Ok(_) => {}
+        Err(error) => warn(&format!(
+            "garbage collecting application releases failed: {error}"
+        )),
+    }
+    match updated::gc::prune_releases(
+        &opts.paths.provider_versions,
+        &providers,
+        opts.storage.inactive_providers,
+        opts.storage.inactive_bytes,
+    ) {
+        Ok(removed) if removed != 0 => {
+            log(&format!("removed {removed} inactive lifecycle providers"))
+        }
+        Ok(_) => {}
+        Err(error) => warn(&format!(
+            "garbage collecting lifecycle providers failed: {error}"
+        )),
     }
 }
 
@@ -610,7 +729,7 @@ fn execute_boot_plan(
     }
     if plan.quiesce && needs_quiesce {
         warn("stopping the uncommitted candidate before reconciling its release");
-        stop(guardian, &opts.paths.app_token);
+        stop(guardian, &opts.paths.app_token)?;
     }
     if needs_quiesce && recovery.is_some() {
         Chaos::from_env().crossing(update::boundary::ROLLBACK_STOP_APPLIED);

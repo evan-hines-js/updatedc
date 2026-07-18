@@ -18,6 +18,7 @@ pub(crate) fn parse_args() -> Result<Options, String> {
         repository: cfg.repository,
         application: cfg.application,
         timeouts: cfg.timeouts,
+        storage: cfg.storage,
         paths,
         supervisor_update,
     })

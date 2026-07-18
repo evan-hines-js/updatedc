@@ -54,9 +54,10 @@ fn run() -> Result<(), String> {
 async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> Result<(), String> {
     let mut rejected = Rejections::load(&paths.rejected, config.timeouts.retry_after)
         .map_err(|error| format!("loading rejections: {error}"))?;
-    let repository = TrustedRepository::assigned(&config.routing, &config.repository, paths)
-        .await
-        .map_err(|error| format!("loading repository: {error}"))?;
+    let repository =
+        TrustedRepository::assigned(&config.routing, &config.repository, &config.storage, paths)
+            .await
+            .map_err(|error| format!("loading repository: {error}"))?;
     let policy = DefaultPolicy::current(&config.application.product, &config.application.channel);
     let assignment = repository
         .assignment()

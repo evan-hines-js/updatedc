@@ -10,14 +10,14 @@ use std::path::{Path, PathBuf};
 
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
-use tough::editor::signed::SignedRole;
+use tough::editor::signed::{PathExists, SignedRepository, SignedRole};
 use tough::editor::RepositoryEditor;
 use tough::key_source::{KeySource, LocalKeySource};
 use tough::schema::decoded::{Decoded, Hex};
 use tough::schema::key::Key;
 use tough::schema::{KeyHolder, RoleKeys, RoleType, Root, Target};
 use tough::sign::{parse_keypair, Sign};
-use tough::{FilesystemTransport, RepositoryLoader};
+use tough::{FilesystemTransport, RepositoryLoader, TargetName};
 use url::Url;
 
 /// An authoring error.
@@ -195,7 +195,10 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
     }
     let root = Root {
         spec_version: "1.0.0".to_string(),
-        consistent_snapshot: false,
+        // Mutable logical target names cannot be published atomically with metadata:
+        // an old client may otherwise fetch newly replaced bytes and fail their hash.
+        // Consistent snapshots make every client-visible target content-addressed.
+        consistent_snapshot: true,
         version: nz(1),
         expires,
         keys: root_keys,
@@ -240,10 +243,7 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
         ])
         .await
         .map_err(|e| err("signing initial metadata", e))?;
-    signed
-        .write(&metadata_dir)
-        .await
-        .map_err(|e| err("writing initial metadata", e))?;
+    publish_metadata(&signed, &metadata_dir).await?;
     Ok(())
 }
 
@@ -335,24 +335,91 @@ pub async fn add_release(
         .await
         .map_err(|e| err("signing release", e))?;
 
-    // Place artifacts, then write metadata (timestamp is the visibility commit).
+    // Publish immutable, digest-prefixed target objects before metadata can reference
+    // them. An old metadata snapshot continues fetching its old digest while a new one
+    // fetches the new digest, so concurrent readers never observe mixed generations.
     for (pt, staged_path) in targets.iter().zip(&staged.0) {
-        let dest = targets_dir.join(&pt.name);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| err("creating target dir", e))?;
-        }
-        foundation::durable::replace(staged_path, &dest)
-            .map_err(|e| err("publishing target artifact", e))?;
-        foundation::durable::sync_dir(dest.parent().unwrap_or(&targets_dir))
-            .map_err(|e| err("syncing target directory", e))?;
+        let name = TargetName::new(&pt.name).map_err(|e| err("parsing target name", e))?;
+        signed
+            .copy_target(staged_path, &targets_dir, PathExists::Skip, Some(&name))
+            .await
+            .map_err(|e| err("publishing consistent target artifact", e))?;
     }
-    signed
-        .write(&metadata_dir)
-        .await
-        .map_err(|e| err("writing release metadata", e))?;
+    foundation::durable::sync_dir(&targets_dir)
+        .map_err(|e| err("syncing consistent target directory", e))?;
+
+    publish_metadata(&signed, &metadata_dir).await?;
     Ok(())
+}
+
+/// Stage a complete signed metadata generation, publish immutable/versioned roles first,
+/// and atomically replace `timestamp.json` last as the sole visibility commit.
+async fn publish_metadata(signed: &SignedRepository, metadata_dir: &Path) -> Result<()> {
+    let parent = metadata_dir
+        .parent()
+        .ok_or_else(|| RepoError("metadata directory has no parent".into()))?;
+    let stage = parent.join(format!(".metadata-publish-{}", std::process::id()));
+    match tokio::fs::remove_dir_all(&stage).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(err("removing stale metadata staging", error)),
+    }
+    tokio::fs::create_dir(&stage)
+        .await
+        .map_err(|e| err("creating metadata staging", e))?;
+    if let Err(error) = signed.write(&stage).await {
+        let _ = tokio::fs::remove_dir_all(&stage).await;
+        return Err(err("staging signed metadata", error));
+    }
+
+    let result = (|| -> Result<()> {
+        let mut files = std::fs::read_dir(&stage)
+            .map_err(|e| err("reading metadata staging", e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| err("reading staged metadata entry", e))?;
+        files.sort_by_key(|entry| entry.file_name());
+        for entry in files
+            .iter()
+            .filter(|entry| entry.file_name() != "timestamp.json")
+        {
+            foundation::durable::replace(&entry.path(), &metadata_dir.join(entry.file_name()))
+                .map_err(|e| err("publishing immutable metadata", e))?;
+        }
+        let timestamp = stage.join("timestamp.json");
+        foundation::durable::replace(&timestamp, &metadata_dir.join("timestamp.json"))
+            .map_err(|e| err("committing metadata timestamp", e))?;
+        foundation::durable::sync_dir(metadata_dir)
+            .map_err(|e| err("syncing metadata directory", e))?;
+        Ok(())
+    })();
+    let _ = tokio::fs::remove_dir_all(&stage).await;
+    result
+}
+
+/// Read the authenticated SHA-256 for a logical target name from the current repository.
+/// Authoring tools use metadata as the single source of truth; targets exist only under
+/// their consistent-snapshot digest-prefixed paths.
+pub async fn target_sha256(repo_dir: &Path, name: &str) -> Result<String> {
+    validate_target_name(name)?;
+    let metadata_dir = repo_dir.join("metadata");
+    let targets_dir = repo_dir.join("targets");
+    let root = tokio::fs::read(metadata_dir.join("root.json"))
+        .await
+        .map_err(|e| err("reading root.json", e))?;
+    let repo = RepositoryLoader::new(&root, dir_url(&metadata_dir)?, dir_url(&targets_dir)?)
+        .transport(FilesystemTransport)
+        .expiration_enforcement(tough::ExpirationEnforcement::Unsafe)
+        .load()
+        .await
+        .map_err(|e| err("loading repository", e))?;
+    let name = TargetName::new(name).map_err(|e| err("parsing target name", e))?;
+    let target = repo
+        .targets()
+        .signed
+        .targets
+        .get(&name)
+        .ok_or_else(|| RepoError(format!("target {:?} is absent from metadata", name.raw())))?;
+    Ok(hex::encode(&target.hashes.sha256))
 }
 
 #[derive(Default)]

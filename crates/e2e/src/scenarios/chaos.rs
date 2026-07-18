@@ -1,5 +1,11 @@
 use super::super::*;
 
+// Failure deadlines, not reaction delays. Every helper polls and returns as soon as its
+// condition is true. Keep these generous for contended Linux CI while the supervisor
+// itself uses one-second checks and bounded transport retries.
+const TRANSACTION_START_TIMEOUT: u64 = 30;
+const RECOVERY_TIMEOUT: u64 = 45;
+
 /// Crash the supervisor at every application-update transaction boundary; the guardian
 /// relaunches it and recovery (driven by the on-disk journal) drives the update to a
 /// committed version. The chaos is one-shot, so the relaunched supervisor recovers
@@ -29,31 +35,51 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         cmd.env("UPDATED_CHAOS_POINT", point);
         let boot = Proc::spawn("chaos", &mut cmd)?;
 
+        // Repository refresh/provider staging happens before the transaction begins and
+        // may consume a full transport timeout on a saturated parallel CI runner. Do not
+        // charge that unrelated preparation time against the crash/recovery deadline.
+        if !boot.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+            let log = boot.captured_log();
+            drop(boot);
+            drop(server);
+            kill_stray(&dir.join("install"));
+            return fail(format!(
+                "update at {point} never reached the transaction boundary preparation gate; log:\n{log}"
+            ));
+        }
+
         // The supervisor applies the update, crashes once at `point`; the guardian
         // must observe that crash and launch a fresh supervisor. Merely seeing v2 at
         // the health endpoint is insufficient for the later boundaries: the new app
         // can become healthy just before the old supervisor dies.
-        let crash_seen = boot.wait_for_log(&format!("CHAOS: exiting at boundary \"{point}\""), 30);
-        let relaunched = wait_until(30, || boot.log_count("launched supervisor") >= 2);
+        let crash_seen = boot.wait_for_log(
+            &format!("CHAOS: exiting at boundary \"{point}\""),
+            RECOVERY_TIMEOUT,
+        );
+        let relaunched = wait_until(RECOVERY_TIMEOUT, || {
+            boot.log_count("launched supervisor") >= 2
+        });
 
         // Prove durable convergence as well as liveness: installed state names the
         // exact v2 bytes and the transaction journal is gone. This catches recovery
         // that briefly serves v2 but leaves a half-committed transaction on disk.
         let state_path = dir.join("install/state/installed.json");
         let journal_path = dir.join("install/state/transaction.json");
-        let durable = wait_until(40, || {
+        let durable = wait_until(RECOVERY_TIMEOUT, || {
             matches!(
                 updated::state::read_installed(&state_path),
                 updated::state::Installed::Present(ref state)
                     if state.release.version == "2.0.0"
             ) && !journal_path.exists()
         });
-        let live = wait_for_version(&svc, "2.0.0", 10);
+        let live = wait_for_version(&svc, "2.0.0", RECOVERY_TIMEOUT);
         let log = boot.captured_log();
         drop(boot);
         drop(server);
         kill_stray(&dir.join("install"));
-        let stopped = wait_until(10, || http_text(&format!("http://{svc}/version")).is_none());
+        let stopped = wait_until(RECOVERY_TIMEOUT, || {
+            http_text(&format!("http://{svc}/version")).is_none()
+        });
         if !crash_seen || !relaunched || !durable || !live || !stopped {
             return fail(format!(
                 "recovery at {point} was incomplete (crash_seen={crash_seen}, \
@@ -118,17 +144,30 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         cmd.env("UPDATED_CHAOS_POINT", point);
         let tower = Service::spawn("rollback-chaos", &cmd);
 
-        let crash_seen = tower.wait_for_log(&format!("CHAOS: exiting at boundary \"{point}\""), 45);
+        if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+            let log = tower.captured_log();
+            drop(tower);
+            drop(server);
+            kill_stray(&dir.join("install"));
+            return fail(format!(
+                "rollback case {point} never began its update transaction; log:\n{log}"
+            ));
+        }
+
+        let crash_seen = tower.wait_for_log(
+            &format!("CHAOS: exiting at boundary \"{point}\""),
+            RECOVERY_TIMEOUT,
+        );
         let state_path = dir.join("install/state/installed.json");
         let journal_path = dir.join("install/state/transaction.json");
-        let durable = wait_until(45, || {
+        let durable = wait_until(RECOVERY_TIMEOUT, || {
             matches!(
                 updated::state::read_installed(&state_path),
                 updated::state::Installed::Present(ref state)
                     if state.release.version == "1.0.0" && state.pending.is_none()
             ) && !journal_path.exists()
         });
-        let live = wait_for_version(&svc, "1.0.0", 15);
+        let live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
         let rejected = std::fs::read_to_string(dir.join("install/state/rejected"))
             .is_ok_and(|contents| !contents.trim().is_empty());
         let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
@@ -253,15 +292,24 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
         .guardian()?;
     cmd.env("UPDATED_CHAOS_POINT", "aborted");
     let tower = Proc::spawn("abort-chaos", &mut cmd)?;
-    let crash_seen = tower.wait_for_log("CHAOS: exiting at boundary \"aborted\"", 30);
-    let durable = wait_until(30, || {
+    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = tower.captured_log();
+        drop(tower);
+        drop(server);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "aborted-transition update never began its transaction; log:\n{log}"
+        ));
+    }
+    let crash_seen = tower.wait_for_log("CHAOS: exiting at boundary \"aborted\"", RECOVERY_TIMEOUT);
+    let durable = wait_until(RECOVERY_TIMEOUT, || {
         matches!(
             updated::state::read_installed(&dir.join("install/state/installed.json")),
             updated::state::Installed::Present(ref state)
                 if state.release.version == "1.0.0"
         ) && !dir.join("install/state/transaction.json").exists()
     });
-    let live = wait_for_version(svc, "1.0.0", 10);
+    let live = wait_for_version(svc, "1.0.0", RECOVERY_TIMEOUT);
     let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
     let phases: Vec<&str> = attempts
         .lines()
@@ -312,14 +360,33 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
         .lifecycle(fixture_command)
         .guardian()?;
     let tower = Proc::spawn("attempt-ids", &mut cmd)?;
+    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = tower.captured_log();
+        drop(tower);
+        drop(server);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "attempt-ID update never began its first transaction; log:\n{log}"
+        ));
+    }
     // Seeing v2 only proves candidate start/health; finalization runs afterward. Wait for
     // both externally visible service convergence and the complete lifecycle contract so
     // this assertion cannot sample a valid attempt halfway through its final phase.
-    let upgraded = wait_until(35, || {
+    let upgraded = wait_until(RECOVERY_TIMEOUT, || {
         let serving_v2 = http_text(&format!("http://{svc}/version")).as_deref() == Some("2.0.0");
-        let finalized = std::fs::read_to_string(fixture.join("attempts.log"))
-            .is_ok_and(|attempts| attempts.lines().any(|line| line.starts_with("finalize\t")));
-        serving_v2 && finalized
+        let two_attempts_finalized = std::fs::read_to_string(fixture.join("attempts.log"))
+            .is_ok_and(|attempts| {
+                let parsed = attempts
+                    .lines()
+                    .filter_map(|line| line.split_once('\t'))
+                    .collect::<Vec<_>>();
+                let distinct = parsed
+                    .iter()
+                    .map(|(_, id)| *id)
+                    .collect::<std::collections::HashSet<_>>();
+                distinct.len() == 2 && parsed.iter().any(|(phase, _)| *phase == "finalize")
+            });
+        serving_v2 && two_attempts_finalized
     });
     let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
     let parsed: Vec<(&str, &str)> = attempts
@@ -376,5 +443,339 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
         ));
     }
     ok("recovery reused its attempt ID and the post-abort retry received a fresh ID");
+    Ok(())
+}
+
+fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
+    let srv = format!("127.0.0.1:{}", 21800 + index);
+    let svc = format!("127.0.0.1:{}", 21900 + index);
+    let dir = ctx.work.join(format!("provider-failure-{phase}"));
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let app = dir.join(format!("app{}", ctx.exe));
+    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
+    let server = ctx.serve(&dir, &srv)?;
+    let fixture = dir.join("lifecycle-fixture");
+    let retryable = matches!(phase, "prepare" | "drain");
+    let mode = if phase == "rollback" {
+        "fail-start-and-rollback".to_string()
+    } else if retryable {
+        format!("fail-first-{phase}")
+    } else {
+        format!("fail-{phase}")
+    };
+    let fixture_command = vec![
+        std::env::current_exe()
+            .map_err(str_err)?
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        fixture.display().to_string(),
+        mode,
+    ];
+    let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+        .health(&svc)
+        .check_interval("1s")
+        .health_grace("2s")
+        .lifecycle(fixture_command)
+        .guardian()?;
+    let tower = Proc::spawn("provider-failure", &mut command)?;
+    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = tower.captured_log();
+        drop(tower);
+        drop(server);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "provider {phase} case never began its update transaction; log:\n{log}"
+        ));
+    }
+    let observed = wait_until(RECOVERY_TIMEOUT, || {
+        std::fs::read_to_string(fixture.join("attempts.log")).is_ok_and(|attempts| {
+            let saw_phase = attempts
+                .lines()
+                .any(|line| line.starts_with(&format!("{phase}\t")));
+            let saw_rollback = attempts.lines().any(|line| line.starts_with("rollback\t"));
+            saw_phase && saw_rollback
+        })
+    });
+    // A retryable one-shot failure can already have advanced to v2 by the time the
+    // attempts file is observed. Its completed rollback is the containment proof.
+    let predecessor_live = retryable || wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
+    // Only a failed rollback is unrecoverable in-process and must remain held with its
+    // journal. All other failures either reject the candidate or defer it after completing
+    // rollback. Prepare/drain fail once, then must complete under a fresh transaction ID.
+    let fresh_retry = !retryable
+        || wait_until(RECOVERY_TIMEOUT, || {
+            let attempts =
+                std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
+            attempts
+                .lines()
+                .filter_map(|line| line.split_once('\t'))
+                .filter(|(logged_phase, _)| *logged_phase == phase)
+                .map(|(_, id)| id)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= 2
+        }) && wait_for_version(&svc, "2.0.0", RECOVERY_TIMEOUT);
+    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
+    let held_without_replay = if phase == "rollback" {
+        std::thread::sleep(Duration::from_secs(2));
+        std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default() == attempts
+    } else {
+        true
+    };
+    let completed_journal_cleared = phase == "rollback"
+        || wait_until(RECOVERY_TIMEOUT, || {
+            !dir.join("install/state/transaction.json").is_file()
+        });
+    let journal_present = dir.join("install/state/transaction.json").is_file();
+    drop(tower);
+    drop(server);
+    kill_stray(&dir.join("install"));
+
+    if !observed || !predecessor_live {
+        return fail(format!(
+            "provider {phase} failure escaped containment (live={predecessor_live}); attempts:\n{attempts}"
+        ));
+    }
+    if !fresh_retry {
+        return fail(format!(
+            "provider {phase} deferral did not retry under a fresh transaction ID:\n{attempts}"
+        ));
+    }
+    if !held_without_replay {
+        return fail(format!(
+            "provider {phase} failure caused a recovery replay loop:\n{attempts}"
+        ));
+    }
+    if phase == "rollback" {
+        if !journal_present {
+            return fail("failed rollback discarded its durable recovery evidence");
+        }
+    } else if !completed_journal_cleared {
+        return fail(format!(
+            "provider {phase} failure left a completed recovery journal behind"
+        ));
+    }
+    if !attempts.contains("rollback\t") {
+        return fail(format!(
+            "provider {phase} failure did not invoke rollback:\n{attempts}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn provider_preflight_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "preflight", 0)
+}
+pub(crate) fn provider_prepare_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "prepare", 1)
+}
+pub(crate) fn provider_drain_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "drain", 2)
+}
+pub(crate) fn provider_stop_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "stop", 3)
+}
+pub(crate) fn provider_activate_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "activate", 4)
+}
+pub(crate) fn provider_start_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "start", 5)
+}
+pub(crate) fn provider_verify_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "verify", 6)
+}
+pub(crate) fn provider_finalize_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "finalize", 7)
+}
+pub(crate) fn provider_rollback_failure(ctx: &Ctx) -> R {
+    provider_failure_case(ctx, "rollback", 8)
+}
+
+pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
+    use std::time::Instant;
+
+    let srv = "127.0.0.1:21809";
+    let svc = "127.0.0.1:21909";
+    let dir = ctx.work.join("magnolia-shaped-upgrade");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let app = dir.join(format!("app{}", ctx.exe));
+    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
+    let _server = ctx.serve(&dir, srv)?;
+    let fixture = dir.join("lifecycle-fixture");
+    let live = fixture.join("magnolia-state/live");
+    std::fs::create_dir_all(&live).map_err(str_err)?;
+    std::fs::write(live.join("content.db"), b"baseline-content\n").map_err(str_err)?;
+    std::fs::write(live.join("app.war"), b"1.0.0\n").map_err(str_err)?;
+    let command = vec![
+        std::env::current_exe()
+            .map_err(str_err)?
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        fixture.display().to_string(),
+        "magnolia-shaped".into(),
+    ];
+    let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+        .health(svc)
+        .check_interval("1s")
+        .health_grace("2s")
+        .lifecycle(command)
+        .guardian()?;
+    let process = Proc::spawn("magnolia-shaped", &mut tower)?;
+    if !wait_for_version(svc, "1.0.0", TRANSACTION_START_TIMEOUT) {
+        return fail("Magnolia-shaped baseline did not become healthy");
+    }
+    if !process.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = process.captured_log();
+        drop(process);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "Magnolia-shaped upgrade never began its transaction; log:\n{log}"
+        ));
+    }
+    // Real Java CMS upgrades are deliberately slow: backup, quiesce, stop,
+    // deployment, startup, and migration each get their own seconds-scale
+    // budget in the fixture. Keep an assertion here so this scenario cannot
+    // accidentally regress into a fast mock that hides timeout/race bugs.
+    let upgrade_started = Instant::now();
+    let upgraded = wait_until(RECOVERY_TIMEOUT, || {
+        wait_for_version(svc, "2.0.0", 1)
+            && std::path::Path::new(&fixture)
+                .join("magnolia-state/migration-finalized")
+                .is_file()
+    });
+    let state = fixture.join("magnolia-state");
+    let expected = [
+        "preflight-checked",
+        "backup-created",
+        "authors-drained",
+        "tomcat-stopped",
+        "war-activated",
+        "tomcat-started",
+        "cms-health-verified",
+        "migration-finalized",
+    ];
+    let complete = expected.iter().all(|name| state.join(name).is_file());
+    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).map_err(str_err)?;
+    let parsed = attempts
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect::<Vec<_>>();
+    let ordered = parsed.len() == expected.len()
+        && parsed.iter().map(|(phase, _)| *phase).eq([
+            "preflight",
+            "prepare",
+            "drain",
+            "stop",
+            "activate",
+            "start",
+            "verify",
+            "finalize",
+        ]);
+    let one_attempt = parsed
+        .first()
+        .is_some_and(|(_, id)| parsed.iter().all(|(_, candidate)| candidate == id));
+    let state_is_migrated = std::fs::read_to_string(live.join("content.db")).map_err(str_err)?
+        == "migrated-2.0.0\n"
+        && std::fs::read_to_string(live.join("app.war")).map_err(str_err)? == "2.0.0\n"
+        && !live.join("draining").exists();
+    let backup_is_exact = parsed.first().is_some_and(|(_, id)| {
+        let backup = state.join("backups").join(id);
+        std::fs::read_to_string(backup.join("content.db"))
+            .is_ok_and(|content| content == "baseline-content\n")
+            && std::fs::read_to_string(backup.join("app.war")).is_ok_and(|war| war == "1.0.0\n")
+    });
+    let elapsed = upgrade_started.elapsed();
+    drop(process);
+    kill_stray(&dir.join("install"));
+    if !upgraded || !complete || !ordered || !one_attempt || !state_is_migrated || !backup_is_exact
+    {
+        return fail(format!(
+            "Magnolia-shaped wrapper violated its lifecycle/state contract in {state:?}:\n{attempts}"
+        ));
+    }
+    if elapsed < Duration::from_millis(1_500) {
+        return fail(format!(
+            "Magnolia-shaped lifecycle completed unrealistically quickly ({elapsed:?})"
+        ));
+    }
+    ok("Magnolia-shaped wrapper performed backup, drain, WAR activation, restart, health verification, and finalization");
+    Ok(())
+}
+
+pub(crate) fn magnolia_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
+    let srv = "127.0.0.1:21810";
+    let svc = "127.0.0.1:21910";
+    let dir = ctx.work.join("magnolia-shaped-rollback");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let app = dir.join(format!("app{}", ctx.exe));
+    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
+    let _server = ctx.serve(&dir, srv)?;
+    let fixture = dir.join("lifecycle-fixture");
+    let live = fixture.join("magnolia-state/live");
+    std::fs::create_dir_all(&live).map_err(str_err)?;
+    std::fs::write(live.join("content.db"), b"baseline-content\n").map_err(str_err)?;
+    std::fs::write(live.join("app.war"), b"1.0.0\n").map_err(str_err)?;
+    let command = vec![
+        std::env::current_exe()
+            .map_err(str_err)?
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        fixture.display().to_string(),
+        "magnolia-shaped-fail-finalize".into(),
+    ];
+    let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+        .health(svc)
+        .check_interval("1s")
+        .health_grace("10s")
+        .lifecycle(command)
+        .guardian()?;
+    let process = Proc::spawn("magnolia-rollback", &mut tower)?;
+    if !wait_for_version(svc, "1.0.0", TRANSACTION_START_TIMEOUT) {
+        return fail("Magnolia rollback baseline did not become healthy");
+    }
+    if !process.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = process.captured_log();
+        drop(process);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "Magnolia rollback update never began its transaction; log:\n{log}"
+        ));
+    }
+    let restored = wait_until(RECOVERY_TIMEOUT, || {
+        fixture.join("magnolia-state/rollback-completed").is_file()
+            && std::fs::read_to_string(live.join("content.db"))
+                .is_ok_and(|content| content == "baseline-content\n")
+            && std::fs::read_to_string(live.join("app.war")).is_ok_and(|war| war == "1.0.0\n")
+            && wait_for_version(svc, "1.0.0", 1)
+    });
+    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).map_err(str_err)?;
+    let ids = attempts
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(_, id)| id))
+        .collect::<std::collections::HashSet<_>>();
+    let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
+    let journal_cleared = wait_until(RECOVERY_TIMEOUT, || {
+        !dir.join("install/state/transaction.json").is_file()
+    });
+    drop(process);
+    kill_stray(&dir.join("install"));
+    if !restored || ids.len() != 1 || rejected.trim().is_empty() || !journal_cleared {
+        return fail(format!(
+            "failed Magnolia migration did not restore one transaction cleanly:\n{attempts}"
+        ));
+    }
+    ok("failed Magnolia migration restored the WAR and content backup, rejected the candidate, and cleared recovery state");
     Ok(())
 }

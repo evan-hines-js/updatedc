@@ -74,7 +74,7 @@ impl Chaos {
             }
             let _ = std::fs::write(sentinel, phase);
         }
-        eprintln!("[supervisor] CHAOS: exiting at boundary {phase:?}");
+        eprintln!("supervisor: CHAOS: exiting at boundary {phase:?}");
         std::process::exit(137);
     }
 
@@ -254,7 +254,7 @@ pub(crate) trait DeploymentProvider {
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()>;
     /// Stop the predecessor when the activation strategy requires a process stop.
-    fn stop(&mut self);
+    fn stop(&mut self) -> io::Result<()>;
     /// Apply the selected release to the surrounding service environment.
     fn activate(
         &mut self,
@@ -265,7 +265,7 @@ pub(crate) trait DeploymentProvider {
     /// Start the selected release when activation requires a fresh process.
     fn start(&mut self) -> io::Result<()>;
     /// Stop the app — used when a rollback itself fails its health check.
-    fn quiesce(&mut self);
+    fn quiesce(&mut self) -> io::Result<()>;
     /// A same-PID reload keeps the launch token, so readiness must additionally prove the
     /// running image's version; a fresh launch's per-launch token already identifies it.
     fn requires_version_proof(&self) -> bool;
@@ -369,11 +369,11 @@ impl DeploymentProvider for DefaultProvider<'_> {
             predecessor,
         })
     }
-    fn stop(&mut self) {
+    fn stop(&mut self) -> io::Result<()> {
         match &self.opts.application.activation {
             // StopStart quiesces the app before activation; a reload keeps serving.
             Activation::StopStart => stop(&mut self.app.guardian, &self.opts.paths.app_token),
-            Activation::Reexec => {}
+            Activation::Reexec => Ok(()),
         }
     }
     fn activate(
@@ -398,8 +398,8 @@ impl DeploymentProvider for DefaultProvider<'_> {
             Activation::Reexec => Ok(()),
         }
     }
-    fn quiesce(&mut self) {
-        stop(&mut self.app.guardian, &self.opts.paths.app_token);
+    fn quiesce(&mut self) -> io::Result<()> {
+        stop(&mut self.app.guardian, &self.opts.paths.app_token)
     }
     fn requires_version_proof(&self) -> bool {
         matches!(self.opts.application.activation, Activation::Reexec)
@@ -516,10 +516,14 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
             "candidate {} was deferred before stopping its predecessor ({error})",
             candidate.version
         ));
+        // Stop is the last pre-activation boundary. Treat a provider failure as a
+        // deterministic rejection, not a defer: otherwise the scheduler immediately
+        // retries the same candidate and replays the provider's side effects forever.
+        require_candidate_rejection(store, &mut tx)?;
         abort_before_activation(tower, store, &mut tx)?;
-        return Ok(Outcome::Deferred);
+        return Ok(Outcome::RejectedBeforeActivation);
     }
-    tower.stop();
+    tower.stop()?;
     chaos.crossing(boundary::STOP_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::Stopped)?;
 
@@ -590,8 +594,12 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
             "candidate {} failed lifecycle finalization ({error})",
             candidate.version
         ));
+        // Finalization is part of activation: a failed hook must not be treated as a
+        // transient defer, or the scheduler will immediately replay the same transaction
+        // and its side effects. Persist rejection before restoring the predecessor.
+        require_candidate_rejection(store, &mut tx)?;
         roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::Deferred);
+        return Ok(Outcome::RolledBack);
     }
     chaos.crossing(boundary::FINALIZE_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::Finalized)?;
@@ -677,7 +685,7 @@ async fn roll_back<T: DeploymentProvider + Health>(
         &tx.previous_release,
         &tx.candidate_release,
     )?;
-    tower.stop();
+    tower.stop()?;
     chaos.crossing(boundary::ROLLBACK_STOP_APPLIED);
     advance_transaction(store, tx, TransactionPhase::RollbackStopped)?;
     advance_transaction(store, tx, TransactionPhase::RollbackActivateStarted)?;
@@ -710,7 +718,7 @@ async fn roll_back<T: DeploymentProvider + Health>(
     };
     advance_transaction(store, tx, TransactionPhase::RollbackHealthStarted)?;
     if !tower.became_healthy(version_proof).await {
-        tower.quiesce();
+        tower.quiesce()?;
         return Err(io::Error::other(
             "restored application failed its rollback health check",
         ));
@@ -788,7 +796,10 @@ pub(crate) fn run_lifecycle_command(
     let candidate_dir = app_provider.location(candidate);
     let predecessor_dir = app_provider.location(predecessor);
     let mut cmd = Command::new(resolved.program);
-    cmd.args(&lifecycle.args);
+    cmd.args(&lifecycle.args)
+        .current_dir(&resolved.cwd)
+        .env_clear()
+        .stdin(std::process::Stdio::null());
     // A wrapper commonly waits on vendor CLIs, curl, or mount helpers. Give the whole
     // lifecycle tree its own group so a timeout cannot kill only the shell and orphan the
     // foreground operation. Windows wrappers must obey the no-background-child contract.
@@ -796,9 +807,6 @@ pub(crate) fn run_lifecycle_command(
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
-    }
-    for key in crate::app::CONTROL_PLANE_ENV {
-        cmd.env_remove(key);
     }
     let command = cmd
         .env(env::LIFECYCLE_PHASE, phase_name)
@@ -814,6 +822,8 @@ pub(crate) fn run_lifecycle_command(
         command.env_remove(env::CHILD_PID);
     }
     let mut child = command.spawn()?;
+    #[cfg(windows)]
+    let lifecycle_job = WindowsLifecycleJob::assign(&child)?;
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -832,14 +842,10 @@ pub(crate) fn run_lifecycle_command(
         }
         if Instant::now() >= deadline {
             #[cfg(unix)]
-            // SAFETY: the child was spawned as leader of a fresh process group whose ID
-            // is its PID. A negative PID targets only that group, never the managed app.
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
+            kill_lifecycle_group(&child)?;
             #[cfg(not(unix))]
-            let _ = child.kill();
-            let _ = child.wait();
+            lifecycle_job.terminate()?;
+            child.wait()?;
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -849,6 +855,73 @@ pub(crate) fn run_lifecycle_command(
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn kill_lifecycle_group(child: &std::process::Child) -> io::Result<()> {
+    let pid = i32::try_from(child.id())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "lifecycle PID exceeds pid_t"))?;
+    // SAFETY: the child was spawned as leader of a fresh process group whose ID is its
+    // PID. The checked negative PID targets only that group, never the managed app.
+    if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsLifecycleJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsLifecycleJob {
+    fn assign(child: &std::process::Child) -> io::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let job = Self(handle);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+                || AssignProcessToJobObject(handle, child.as_raw_handle() as _) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+    }
+
+    fn terminate(&self) -> io::Result<()> {
+        if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsLifecycleJob {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
     }
 }
 
@@ -967,6 +1040,7 @@ mod tests {
         fail_first_verify_phase: bool,
         verify_phase_calls: usize,
         fail_first_activation: bool,
+        fail_process_stop: bool,
         activations: usize,
     }
 
@@ -1000,7 +1074,13 @@ mod tests {
             }
             Ok(())
         }
-        fn stop(&mut self) {}
+        fn stop(&mut self) -> io::Result<()> {
+            if self.fail_process_stop {
+                Err(io::Error::other("injected process stop failure"))
+            } else {
+                Ok(())
+            }
+        }
         fn activate(
             &mut self,
             _: &str,
@@ -1016,7 +1096,9 @@ mod tests {
         fn start(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn quiesce(&mut self) {}
+        fn quiesce(&mut self) -> io::Result<()> {
+            Ok(())
+        }
         fn requires_version_proof(&self) -> bool {
             false
         }
@@ -1068,7 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_finalization_restores_the_predecessor_without_rejecting_the_candidate() {
+    async fn failed_finalization_restores_and_rejects_the_candidate() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = MemoryStore::new(previous.clone());
@@ -1081,7 +1163,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, Outcome::Deferred));
+        assert!(matches!(outcome, Outcome::RolledBack));
         assert_eq!(
             tower.phases,
             [
@@ -1103,10 +1185,7 @@ mod tests {
             "candidate start plus predecessor restore"
         );
         assert_eq!(store.active, previous);
-        assert!(
-            store.rejected.is_empty(),
-            "operator deferral remains retryable"
-        );
+        assert_eq!(store.rejected, vec!["archive-two"]);
         assert!(
             store.journal.is_none(),
             "completed rollback clears its evidence"
@@ -1114,7 +1193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_stop_phase_defers_before_the_guardian_or_active_pointer_is_touched() {
+    async fn failed_stop_phase_rejects_before_the_guardian_or_active_pointer_is_touched() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = MemoryStore::new(previous.clone());
@@ -1127,12 +1206,38 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(outcome, Outcome::Deferred));
+        assert!(matches!(outcome, Outcome::RejectedBeforeActivation));
         assert_eq!(store.active, previous);
+        assert_eq!(store.rejected, vec!["archive-two"]);
         assert_eq!(provider.activations, 0);
         assert_eq!(
             provider.phases,
             ["preflight", "prepare", "drain", "stop", "rollback"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_process_stop_preserves_recovery_evidence_and_never_activates() {
+        let previous = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = MemoryStore::new(previous.clone());
+        let mut provider = FakeTower {
+            fail_process_stop: true,
+            ..Default::default()
+        };
+
+        let error =
+            match apply_update(&mut provider, &mut store, &candidate, "archive-two", None).await {
+                Err(error) => error,
+                Ok(_) => panic!("an unconfirmed process stop must abort activation"),
+            };
+
+        assert!(error.to_string().contains("process stop failure"));
+        assert_eq!(store.active, previous);
+        assert_eq!(provider.activations, 0);
+        assert!(
+            store.journal.is_some(),
+            "boot recovery needs the stop intent"
         );
     }
 

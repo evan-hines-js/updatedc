@@ -31,6 +31,7 @@ Usage: scripts/macos-smoke.sh <command> [argument]
   start [restart|reexec]  Seed bundle 1.0.0 and run it under a user LaunchAgent
   publish [version]       Publish a bundle update (default: 2.0.0)
   assign [version]        Atomically select an already-published application target
+  provider-set [id]       Publish an equivalent provider set under a fresh signed identity
   prepare [version]       Prepare, but do not publish, a versioned bundle tree
   status                  Show launchd and application state
   logs                    Follow repository and tower logs
@@ -39,17 +40,145 @@ Usage: scripts/macos-smoke.sh <command> [argument]
 EOF
 }
 
-sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 target_path() { printf 'products/app/stable/%s/%s/app' "$1" "$PLATFORM"; }
+target_sha256() { "$BIN/server" target-sha256 --repo "$REPO" --name "$1"; }
 publish_assignment() {
-  local version="$1" app_path set_path="provider-sets/default.json"
+  local version="$1" app_path set_id="${UPDATED_SMOKE_PROVIDER_SET_ID:-default}" set_path
+  set_path="provider-sets/$set_id.json"
   app_path="$(target_path "$version")"
   "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
     --name assignments/nodes/node.json --deployment "app-$version" \
     --metadata-url http://127.0.0.1:18080/metadata/ \
     --targets-url http://127.0.0.1:18080/targets/ \
-    --application-path "$app_path" --application-sha256 "$(sha256_file "$REPO/targets/$app_path")" \
-    --provider-set-path "$set_path" --provider-set-sha256 "$(sha256_file "$REPO/targets/$set_path")"
+    --application-path "$app_path" --application-sha256 "$(target_sha256 "$app_path")" \
+    --provider-set-path "$set_path" --provider-set-sha256 "$(target_sha256 "$set_path")"
+}
+
+publish_provider_set() {
+  local id="${1:-default}" profile="${UPDATED_SMOKE_LIFECYCLE_PROFILE:-default}"
+  local provider_path provider_product source
+  provider_product="app-lifecycle-$id"
+  if [[ "$profile" == complex ]]; then
+    source="$BIN/lifecycle-$id"
+    {
+      printf '#!/bin/sh\nset -eu\nSTATE=%q\n' "$WORK/deploy-state"
+      cat <<'EOF'
+phase=${UPDATED_LIFECYCLE_PHASE:?missing lifecycle phase}
+attempt=${UPDATED_LIFECYCLE_ATTEMPT_ID:?missing lifecycle attempt ID}
+candidate=${UPDATED_CANDIDATE_VERSION:?missing candidate version}
+predecessor=${UPDATED_PREDECESSOR_VERSION:?missing predecessor version}
+live="$STATE/live"
+backup="$STATE/backups/$attempt"
+effects="$STATE/effects/$attempt"
+mkdir -p "$live" "$STATE/backups" "$effects"
+printf '%s\t%s\t%s\t%s\n' "$phase" "$attempt" "$candidate" "$predecessor" >>"$STATE/attempts.log"
+
+require_file() {
+  test -s "$1" || { echo "complex lifecycle: missing required state $1" >&2; exit 1; }
+}
+require_effect() {
+  test -e "$effects/$1" || { echo "complex lifecycle: phase $phase requires completed $1" >&2; exit 1; }
+}
+record_completion() {
+  : >"$effects/$phase"
+}
+atomic_copy() {
+  cp "$1" "$2.tmp"
+  mv "$2.tmp" "$2"
+}
+atomic_write() {
+  printf '%s\n' "$1" >"$2.tmp"
+  mv "$2.tmp" "$2"
+}
+
+case "$phase" in
+  preflight)
+    require_file "$live/app.version"
+    require_file "$live/content.db"
+    test "$(cat "$live/app.version")" = "$predecessor" || {
+      echo "complex lifecycle: live version does not match predecessor $predecessor" >&2
+      exit 1
+    }
+    record_completion
+    ;;
+  prepare)
+    require_effect preflight
+    mkdir -p "$backup"
+    if test ! -e "$backup/app.version"; then atomic_copy "$live/app.version" "$backup/app.version"; fi
+    if test ! -e "$backup/content.db"; then atomic_copy "$live/content.db" "$backup/content.db"; fi
+    require_file "$backup/app.version"
+    require_file "$backup/content.db"
+    record_completion
+    ;;
+  drain)
+    require_effect prepare
+    atomic_write "$attempt" "$live/draining"
+    record_completion
+    ;;
+  stop)
+    require_effect drain
+    test "$(cat "$live/draining")" = "$attempt"
+    record_completion
+    ;;
+  activate)
+    require_effect stop
+    test "$(cat "$live/draining")" = "$attempt"
+    atomic_write "$candidate" "$live/app.version"
+    if test -n "${UPDATED_CHILD_PID:-}"; then kill -HUP "$UPDATED_CHILD_PID"; fi
+    record_completion
+    ;;
+  start)
+    require_effect activate
+    test "$(cat "$live/app.version")" = "$candidate"
+    record_completion
+    ;;
+  verify)
+    require_effect start
+    test "$(cat "$live/app.version")" = "$candidate"
+    observed=$(curl --connect-timeout 1 --max-time 2 -fsS http://127.0.0.1:19090/version)
+    test "$observed" = "$candidate"
+    record_completion
+    ;;
+  finalize)
+    require_effect verify
+    atomic_write "schema=2 version=$candidate" "$live/content.db"
+    rm -f "$live/draining"
+    record_completion
+    ;;
+  rollback)
+    require_file "$backup/app.version"
+    require_file "$backup/content.db"
+    atomic_copy "$backup/app.version" "$live/app.version"
+    atomic_copy "$backup/content.db" "$live/content.db"
+    rm -f "$live/draining"
+    record_completion
+    ;;
+  *)
+    echo "complex lifecycle: unsupported phase $phase" >&2
+    exit 2
+    ;;
+esac
+EOF
+    } >"$source"
+    chmod 0755 "$source"
+  elif [[ "$profile" != default ]]; then
+    echo "UPDATED_SMOKE_LIFECYCLE_PROFILE must be default or complex" >&2
+    exit 2
+  elif grep -Eq '^mode[[:space:]]*=[[:space:]]*"reexec"' "$CONFIG" 2>/dev/null; then
+    source="$BIN/lifecycle"
+  else
+    source="$BIN/lifecycle-noop"
+    printf '#!/bin/sh\nexit 0\n' >"$source"
+    chmod 0755 "$source"
+  fi
+  "$BIN/server" publish-provider-artifact --repo "$REPO" --keys "$KEYS" \
+    --product "$provider_product" --version 1.0.0 \
+    --bundle "$PLATFORM=$source" --entrypoint bin/lifecycle
+  provider_path="products/$provider_product/stable/1.0.0/$PLATFORM/$provider_product"
+  "$BIN/server" publish-provider-set --repo "$REPO" --keys "$KEYS" --id "$id" \
+    --provider-path "$provider_path" \
+    --provider-sha256 "$(target_sha256 "$provider_path")" \
+    --provider-timeout-ms 10000
 }
 
 need_macos() { [[ "$(uname -s)" == Darwin ]] || { echo "This smoke test requires macOS/launchd." >&2; exit 1; }; }
@@ -143,7 +272,7 @@ EOF
     provider_path="products/app-lifecycle/stable/1.0.0/$PLATFORM/app-lifecycle"
     "$BIN/server" publish-provider-set --repo "$REPO" --keys "$KEYS" --id default \
       --provider-path "$provider_path" \
-      --provider-sha256 "$(sha256_file "$REPO/targets/$provider_path")" \
+      --provider-sha256 "$(target_sha256 "$provider_path")" \
       --provider-timeout-ms 10000
     reload="$(cat <<EOF
 
@@ -183,6 +312,7 @@ EOF
 <key>Label</key><string>$LABEL</string><key>ProgramArguments</key><array>
 <string>$BIN/bootstrap</string><string>--state-dir</string><string>$GUARDIAN_STATE</string>
 <string>--supervisor-config</string><string>$CONFIG</string><string>--supervisor</string><string>$BIN/supervisor</string>
+<string>--confirm-timeout</string><string>1</string>
 <string>--stop-grace</string><string>$stop_grace</string>
 </array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>ThrottleInterval</key><integer>$launchd_throttle</integer>
@@ -210,6 +340,7 @@ case "${1:-}" in
   start) start "${2:-restart}" ;;
   publish) publish "${2:-2.0.0}" ;;
   assign) publish_assignment "${2:-2.0.0}" ;;
+  provider-set) publish_provider_set "${2:-default}" ;;
   prepare) UPDATED_SMOKE_PREPARE_ONLY=1 publish "${2:-2.0.0}" ;;
   status) launchctl print "$SERVICE" 2>/dev/null | sed -n '1,35p' || true; curl -fsS http://127.0.0.1:19090/version || true; echo ;;
   logs) touch "$REPO_LOG" "$TOWER_LOG"; tail -n 100 -F "$REPO_LOG" "$TOWER_LOG" ;;

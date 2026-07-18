@@ -33,6 +33,9 @@ pub struct Config {
     /// Seed for `desired-supervisor` on first boot, if not already recorded.
     pub initial_supervisor: Option<PathBuf>,
     pub ready_timeout: Duration,
+    /// How long a replacement must remain alive after proving ready before its
+    /// pointer is committed. The predecessor remains authoritative throughout.
+    pub confirm_timeout: Duration,
     /// Grace before hard-killing an application or supervisor during shutdown.
     pub stop_grace: Duration,
 }
@@ -207,9 +210,13 @@ fn serve<L: Link>(
     candidate: Option<PathBuf>,
 ) -> Result<Cycle, String> {
     // When activating, we must see a matching readiness ack before the deadline.
-    let mut committed = candidate.is_none();
+    let mut activation = ActivationState {
+        committed: candidate.is_none(),
+        candidate,
+        ready_since: None,
+        pending_replace: None,
+    };
     let deadline = Instant::now() + cfg.ready_timeout;
-    let mut pending_replace: Option<PathBuf> = None;
 
     if sup.send_hello().is_err() {
         sup.stop();
@@ -221,8 +228,11 @@ fn serve<L: Link>(
             sup.stop();
             return Ok(Cycle::Stop);
         }
-        if !committed && Instant::now() >= deadline {
-            let path = candidate.as_ref().expect("activation has a candidate");
+        if !activation.committed && activation.ready_since.is_none() && Instant::now() >= deadline {
+            let path = activation
+                .candidate
+                .as_ref()
+                .expect("activation has a candidate");
             warn(&format!(
                 "candidate {} did not signal ready in time; rolling back and rejecting it",
                 path.display()
@@ -240,17 +250,7 @@ fn serve<L: Link>(
         if sup.poll_readable(SERVE_POLL_MS) {
             match sup.read_request() {
                 Ok(req) => {
-                    if dispatch(
-                        cfg,
-                        sup,
-                        app,
-                        req,
-                        candidate.as_deref(),
-                        &mut committed,
-                        &mut pending_replace,
-                    )
-                    .is_err()
-                    {
+                    if dispatch(cfg, sup, app, req, &mut activation).is_err() {
                         // A channel write failed: the supervisor is gone. Fall to the
                         // exit check below.
                     }
@@ -276,10 +276,13 @@ fn serve<L: Link>(
         }
 
         if sup.exited() {
-            if !committed {
-                let path = candidate.as_ref().expect("activation has a candidate");
+            if !activation.committed {
+                let path = activation
+                    .candidate
+                    .as_ref()
+                    .expect("activation has a candidate");
                 warn(&format!(
-                    "candidate {} exited before signalling ready; rejecting it",
+                    "candidate {} exited before confirmation; rejecting it",
                     path.display()
                 ));
                 record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
@@ -290,7 +293,7 @@ fn serve<L: Link>(
                 })?;
                 return Ok(Cycle::Continue);
             }
-            if let Some(path) = pending_replace.take() {
+            if let Some(path) = activation.pending_replace.take() {
                 info("supervisor staged a replacement and exited; activating it");
                 return Ok(Cycle::Activate(path));
             }
@@ -299,7 +302,40 @@ fn serve<L: Link>(
             warn("supervisor exited (the application keeps running)");
             return Ok(Cycle::Backoff);
         }
+
+        // Commit only after proving the candidate is still alive in this iteration.
+        // Otherwise an exit racing the timer boundary could leave a dead desired pointer.
+        if !activation.committed
+            && activation
+                .ready_since
+                .is_some_and(|ready| ready.elapsed() >= cfg.confirm_timeout)
+        {
+            let path = activation
+                .candidate
+                .as_ref()
+                .expect("activation has a candidate");
+            if let Err(e) = record::set_desired_supervisor(&cfg.state_dir, path) {
+                error(&format!(
+                    "committing stable supervisor {} failed: {e}; reverting to its predecessor",
+                    path.display()
+                ));
+                sup.stop();
+                return Ok(Cycle::Continue);
+            }
+            info(&format!(
+                "candidate {} survived its confirmation window; committed as the supervisor",
+                path.display()
+            ));
+            activation.committed = true;
+        }
     }
+}
+
+struct ActivationState {
+    candidate: Option<PathBuf>,
+    committed: bool,
+    ready_since: Option<Instant>,
+    pending_replace: Option<PathBuf>,
 }
 
 /// Handle one control request, replying on the channel.
@@ -308,9 +344,7 @@ fn dispatch<L: Link>(
     sup: &mut L,
     app: &mut App,
     req: Request,
-    candidate: Option<&Path>,
-    committed: &mut bool,
-    pending_replace: &mut Option<PathBuf>,
+    activation: &mut ActivationState,
 ) -> control::Result<()> {
     let response = match req {
         Request::Launch(spec) => match app.launch(&spec, cfg.stop_grace) {
@@ -334,25 +368,21 @@ fn dispatch<L: Link>(
             let path = PathBuf::from(path);
             match validate_supervisor_path(cfg, &path, true) {
                 Ok(()) => {
-                    *pending_replace = Some(path);
+                    activation.pending_replace = Some(path);
                     Response::Ok
                 }
                 Err(e) => Response::Error(e),
             }
         }
         Request::Ready(nonce) => {
-            if !*committed && nonce == sup.nonce() {
-                if let Some(path) = candidate {
-                    if let Err(e) = record::set_desired_supervisor(&cfg.state_dir, path) {
-                        // The candidate proved ready but we could not commit it; keep
-                        // serving it uncommitted rather than dropping the channel.
-                        error(&format!("committing the new supervisor failed: {e}"));
-                    } else {
+            if !activation.committed && nonce == sup.nonce() {
+                if let Some(path) = activation.candidate.as_deref() {
+                    if activation.ready_since.is_none() {
                         info(&format!(
-                            "candidate {} proved ready; committed as the supervisor",
+                            "candidate {} proved ready; beginning its confirmation window",
                             path.display()
                         ));
-                        *committed = true;
+                        activation.ready_since = Some(Instant::now());
                     }
                 }
             }
@@ -587,6 +617,7 @@ mod tests {
             supervisor_config: PathBuf::from("/etc/supervisor.toml"),
             initial_supervisor: initial,
             ready_timeout: Duration::from_secs(30),
+            confirm_timeout: Duration::from_secs(30),
             stop_grace: Duration::from_secs(10),
         }
     }
@@ -617,22 +648,22 @@ mod tests {
         path
     }
 
+    fn activation(candidate: Option<PathBuf>, committed: bool) -> ActivationState {
+        ActivationState {
+            candidate,
+            committed,
+            ready_since: None,
+            pending_replace: None,
+        }
+    }
+
     #[test]
     fn dispatch_launch_starts_the_app_and_replies_launched() {
         let c = cfg(temp_dir("launch"), None);
         let mut sup = FakeLink::new();
         let mut app = App::with_spawn(fake_spawn);
-        let (mut committed, mut pending) = (true, None);
-        dispatch(
-            &c,
-            &mut sup,
-            &mut app,
-            Request::Launch(spec()),
-            None,
-            &mut committed,
-            &mut pending,
-        )
-        .unwrap();
+        let mut state = activation(None, true);
+        dispatch(&c, &mut sup, &mut app, Request::Launch(spec()), &mut state).unwrap();
         assert_eq!(sup.responses, vec![Response::Launched { pid: 4242 }]);
     }
 
@@ -641,17 +672,8 @@ mod tests {
         let c = cfg(temp_dir("stop"), None);
         let mut sup = FakeLink::new();
         let mut app = App::with_spawn(fake_spawn);
-        let (mut committed, mut pending) = (true, None);
-        dispatch(
-            &c,
-            &mut sup,
-            &mut app,
-            Request::Stop,
-            None,
-            &mut committed,
-            &mut pending,
-        )
-        .unwrap();
+        let mut state = activation(None, true);
+        dispatch(&c, &mut sup, &mut app, Request::Stop, &mut state).unwrap();
         assert_eq!(sup.responses, vec![Response::Ok]);
     }
 
@@ -660,19 +682,17 @@ mod tests {
         let c = cfg(temp_dir("replace"), None);
         let mut sup = FakeLink::new();
         let mut app = App::none();
-        let (mut committed, mut pending) = (true, None);
+        let mut state = activation(None, true);
         let candidate = staged_candidate(&c, 0x11);
         dispatch(
             &c,
             &mut sup,
             &mut app,
             Request::ReplaceSupervisor(candidate.as_os_str().to_owned()),
-            None,
-            &mut committed,
-            &mut pending,
+            &mut state,
         )
         .unwrap();
-        assert_eq!(pending, Some(candidate));
+        assert_eq!(state.pending_replace, Some(candidate));
         assert_eq!(sup.responses, vec![Response::Ok]);
     }
 
@@ -683,45 +703,41 @@ mod tests {
         std::fs::write(&outside, b"candidate").unwrap();
         let mut sup = FakeLink::new();
         let mut app = App::none();
-        let (mut committed, mut pending) = (true, None);
+        let mut state = activation(None, true);
         dispatch(
             &c,
             &mut sup,
             &mut app,
             Request::ReplaceSupervisor(outside.into_os_string()),
-            None,
-            &mut committed,
-            &mut pending,
+            &mut state,
         )
         .unwrap();
-        assert!(pending.is_none());
+        assert!(state.pending_replace.is_none());
         assert!(matches!(sup.responses.as_slice(), [Response::Error(_)]));
     }
 
     #[test]
-    fn dispatch_ready_with_the_matching_nonce_commits_exactly_the_candidate() {
+    fn dispatch_ready_with_the_matching_nonce_begins_confirmation() {
         let c = cfg(temp_dir("ready-ok"), None);
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
         let mut app = App::none();
-        let (mut committed, mut pending) = (false, None);
+        let mut state = activation(Some(cand), false);
         dispatch(
             &c,
             &mut sup,
             &mut app,
             Request::Ready([7u8; 16]),
-            Some(&cand),
-            &mut committed,
-            &mut pending,
+            &mut state,
         )
         .unwrap();
-        assert!(committed, "the matching nonce commits the candidate");
-        assert_eq!(
-            record::desired_supervisor(&c.state_dir).unwrap(),
-            Some(cand),
-            "commits exactly the candidate path"
+        assert!(
+            !state.committed,
+            "readiness alone must not commit the candidate"
         );
+        assert!(state.ready_since.is_some(), "the stability window begins");
+        assert!(record::desired_supervisor(&c.state_dir).unwrap().is_none());
         assert_eq!(sup.responses, vec![Response::Ok]);
     }
 
@@ -732,18 +748,17 @@ mod tests {
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
         let mut app = App::none();
-        let (mut committed, mut pending) = (false, None);
+        let mut state = activation(Some(cand), false);
         dispatch(
             &c,
             &mut sup,
             &mut app,
             Request::Ready([9u8; 16]),
-            Some(&cand),
-            &mut committed,
-            &mut pending,
+            &mut state,
         )
         .unwrap();
-        assert!(!committed, "a wrong nonce must not commit");
+        assert!(!state.committed, "a wrong nonce must not commit");
+        assert!(state.ready_since.is_none());
         assert!(
             record::desired_supervisor(&c.state_dir).unwrap().is_none(),
             "the desired pointer is untouched"
@@ -762,15 +777,13 @@ mod tests {
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
         let mut app = App::none();
-        let (mut committed, mut pending) = (true, None);
+        let mut state = activation(Some(cand), true);
         dispatch(
             &c,
             &mut sup,
             &mut app,
             Request::Ready([7u8; 16]),
-            Some(&cand),
-            &mut committed,
-            &mut pending,
+            &mut state,
         )
         .unwrap();
         assert!(
@@ -812,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_does_not_reject_a_candidate_that_readied_then_exited() {
+    fn serve_rejects_a_candidate_that_exits_during_confirmation() {
         let cand = PathBuf::from("/state/supervisors/good/supervisor");
         let c = cfg(temp_dir("postready"), None);
         let mut sup = FakeLink::new();
@@ -824,18 +837,58 @@ mod tests {
         let mut app = App::none();
         let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(
-            matches!(cycle, Cycle::Backoff),
-            "a committed supervisor that exits just backs off"
+            matches!(cycle, Cycle::Continue),
+            "an unconfirmed supervisor rolls back immediately"
         );
         assert!(
-            rejected_marker(&c).is_none(),
-            "a committed candidate is never rejected"
+            rejected_marker(&c).as_deref() == cand.to_str(),
+            "an unstable candidate is rejected"
         );
         assert_eq!(
             record::desired_supervisor(&c.state_dir).unwrap(),
-            Some(cand),
-            "and it was committed"
+            None,
+            "an unstable candidate must never become desired"
         );
+    }
+
+    #[test]
+    fn serve_commits_only_after_the_confirmation_window() {
+        let cand = PathBuf::from("/state/supervisors/stable/supervisor");
+        let mut c = cfg(temp_dir("confirmed"), None);
+        c.confirm_timeout = Duration::ZERO;
+        let mut sup = FakeLink::new();
+        sup.nonce = [7u8; 16];
+        sup.readable.borrow_mut().push_back(true);
+        sup.requests.push_back(Request::Ready([7u8; 16]));
+        sup.exited.push_back(false);
+        sup.exited.push_back(true);
+        let mut app = App::none();
+        let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        assert!(matches!(cycle, Cycle::Backoff));
+        assert_eq!(
+            record::desired_supervisor(&c.state_dir).unwrap(),
+            Some(cand)
+        );
+        assert!(rejected_marker(&c).is_none());
+    }
+
+    #[test]
+    fn exit_at_confirmation_deadline_loses_to_liveness_check() {
+        let cand = PathBuf::from("/state/supervisors/racy/supervisor");
+        let mut c = cfg(temp_dir("confirmation-race"), None);
+        c.confirm_timeout = Duration::ZERO;
+        let mut sup = FakeLink::new();
+        sup.nonce = [7u8; 16];
+        sup.readable.borrow_mut().push_back(true);
+        sup.requests.push_back(Request::Ready([7u8; 16]));
+        sup.exited.push_back(true);
+        let mut app = App::none();
+        assert!(matches!(
+            serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap(),
+            Cycle::Continue
+        ));
+        assert_eq!(record::desired_supervisor(&c.state_dir).unwrap(), None);
+        assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
     }
 
     #[test]

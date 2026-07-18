@@ -89,8 +89,8 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     }
     // The committed pointer must name the exact published v2 bytes. Comparing content
     // makes this separator-independent and proves more than a path substring does.
-    let expected_v2_sha = sha256_hex(&supervisor_v(ctx, "2.0.0"));
-    if !desired.is_file() || sha256_hex(&desired) != expected_v2_sha {
+    let expected_v2_sha = sha256_hex(&supervisor_v(ctx, "2.0.0"))?;
+    if !desired.is_file() || sha256_hex(&desired)? != expected_v2_sha {
         return fail(format!(
             "desired-supervisor did not advance to the staged v2 binary: {desired:?}"
         ));
@@ -159,11 +159,62 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     }
     // The pointer must still resolve to the exact v1 bytes, irrespective of Windows
     // versus Unix path separators. A substring test could silently pass on Windows.
-    if !desired.is_file() || sha256_hex(&desired) != sha256_hex(&sup_v1) {
+    if !desired.is_file() || sha256_hex(&desired)? != sha256_hex(&sup_v1)? {
         return fail(format!(
             "desired-supervisor did not remain on the committed v1 binary: {desired:?}"
         ));
     }
     ok("unlaunchable supervisor candidate rolled back, rejected, and never retried; app untouched");
+    Ok(())
+}
+
+/// A candidate can pass its startup/readiness gate and still die immediately afterward.
+/// The guardian must keep the predecessor pointer until the independent stability window
+/// completes, reject this candidate, and leave its separately owned application untouched.
+pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
+    let (srv, svc) = ("127.0.0.1:21122", "127.0.0.1:21123");
+    let dir = ctx.work.join("selfupd-post-ready-crash");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let app = dir.join(format!("app{}", ctx.exe));
+    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
+    let sup_v1 = supervisor_v(ctx, "1.0.0");
+    let unstable = ctx.work.join(format!(
+        "build/supervisor-post-ready-crash-2.0.0{}",
+        ctx.exe
+    ));
+
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "supervisor", "1.0.0", &sup_v1)?;
+    let _server = ctx.serve(&dir, srv)?;
+    let boot = Proc::spawn("guardian", &mut tower(ctx, &dir, srv, svc, &app, &sup_v1)?)?;
+    if !wait_for_version(svc, "1.0.0", 25) || !boot.wait_for_log("started application pid", 10) {
+        kill_stray(&app);
+        return fail("tower did not establish its baseline");
+    }
+    let app_pid = pid_number_after(&boot.captured_log(), "started application pid")
+        .ok_or("could not read the guardian-reported application PID")?;
+
+    ctx.publish(&dir, "supervisor", "2.0.0", &unstable)?;
+    let began_confirmation = boot.wait_for_log("beginning its confirmation window", 40);
+    let rejected = boot.wait_for_log("exited before confirmation; rejecting it", 10);
+    let predecessor_returned = boot.wait_for_log("recorded rejected supervisor candidate", 10);
+    let still_serving = wait_for_version(svc, "1.0.0", 5);
+    let adopted_pid = pid_after(&boot.captured_log(), "adopted the running application");
+    let desired = desired_supervisor(&dir)?;
+    kill_stray(&app);
+
+    if !began_confirmation || !rejected || !predecessor_returned {
+        return fail("post-ready supervisor failure did not complete guarded rollback");
+    }
+    if !still_serving || adopted_pid != Some(app_pid) || !pid_alive(app_pid) {
+        return fail(format!(
+            "post-ready supervisor failure disturbed the app (pid {app_pid} -> {adopted_pid:?})"
+        ));
+    }
+    if !desired.is_file() || sha256_hex(&desired)? != sha256_hex(&sup_v1)? {
+        return fail("unstable ready supervisor was incorrectly committed");
+    }
+    ok("post-ready supervisor crash rolled back before commit; app ownership stayed with the guardian");
     Ok(())
 }

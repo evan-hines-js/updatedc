@@ -16,6 +16,8 @@ pub struct Config {
     pub repository: Repository,
     pub application: Application,
     #[serde(default)]
+    pub storage: Storage,
+    #[serde(default)]
     pub timeouts: Timeouts,
 }
 
@@ -33,6 +35,8 @@ pub struct Routing {
     pub datastore: Option<PathBuf>,
     #[serde(default = "meg")]
     pub metadata_limit: u64,
+    #[serde(default = "transport_timeout", deserialize_with = "de_dur")]
+    pub transport_timeout: Duration,
 }
 
 /// Locally pinned trust and resource limits for the repository selected by the
@@ -50,6 +54,8 @@ pub struct Repository {
     pub metadata_limit: u64,
     #[serde(default = "half_gib")]
     pub target_limit: u64,
+    #[serde(default = "transport_timeout", deserialize_with = "de_dur")]
+    pub transport_timeout: Duration,
 }
 
 /// Strict payload carried as a verified target in the routing repository.
@@ -176,6 +182,7 @@ pub struct RepositorySource {
     pub targets_url: String,
     pub metadata_limit: u64,
     pub target_limit: u64,
+    pub transport_timeout: Duration,
 }
 
 impl Repository {
@@ -203,6 +210,7 @@ impl Repository {
             targets_url: assignment.targets_url,
             metadata_limit: self.metadata_limit,
             target_limit: self.target_limit,
+            transport_timeout: self.transport_timeout,
         })
     }
 }
@@ -212,6 +220,34 @@ fn meg() -> u64 {
 }
 fn half_gib() -> u64 {
     512 << 20
+}
+fn transport_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+/// Bounds for inactive immutable material. Releases needed by installed state,
+/// rollback state, or an active transaction are always protected regardless of these
+/// limits; the limits apply only to disposable history.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Storage {
+    pub inactive_releases: usize,
+    pub inactive_providers: usize,
+    pub inactive_supervisors: usize,
+    pub inactive_bytes: u64,
+    pub inactive_repository_caches: usize,
+}
+
+impl Default for Storage {
+    fn default() -> Self {
+        Self {
+            inactive_releases: 2,
+            inactive_providers: 2,
+            inactive_supervisors: 1,
+            inactive_bytes: 1024 * 1024 * 1024,
+            inactive_repository_caches: 2,
+        }
+    }
 }
 
 /// The program being kept current.
@@ -387,6 +423,15 @@ impl Config {
         if self.repository.target_limit == 0 {
             return Err("repository.target_limit must be greater than zero".into());
         }
+        if self.storage.inactive_bytes == 0 {
+            return Err("storage.inactive_bytes must be greater than zero".into());
+        }
+        if self.routing.transport_timeout.is_zero() {
+            return Err("routing.transport_timeout must be greater than zero".into());
+        }
+        if self.repository.transport_timeout.is_zero() {
+            return Err("repository.transport_timeout must be greater than zero".into());
+        }
         Ok(())
     }
 }
@@ -544,6 +589,7 @@ mod tests {
             datastore: None,
             metadata_limit: meg(),
             target_limit: half_gib(),
+            transport_timeout: transport_timeout(),
         };
         let source = repository.resolve(assignment).unwrap();
         assert_eq!(source.root, PathBuf::from("/pinned-root.json"));
@@ -690,6 +736,11 @@ mod tests {
         make_install_root_native(&mut cfg);
         cfg.repository.target_limit = 0;
         assert!(cfg.validate().unwrap_err().contains("target_limit"));
+
+        let mut cfg: Config = toml::from_str(base).unwrap();
+        make_install_root_native(&mut cfg);
+        cfg.routing.transport_timeout = Duration::ZERO;
+        assert!(cfg.validate().unwrap_err().contains("transport_timeout"));
     }
 
     #[test]
@@ -719,6 +770,8 @@ mod tests {
         assert_eq!(cfg.timeouts.retry_after, Duration::from_secs(300));
         assert_eq!(cfg.repository.metadata_limit, 1 << 20);
         assert_eq!(cfg.repository.target_limit, 512 << 20);
+        assert_eq!(cfg.routing.transport_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.repository.transport_timeout, Duration::from_secs(30));
         assert_eq!(cfg.application.channel, "stable");
     }
 

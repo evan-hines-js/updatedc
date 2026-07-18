@@ -55,6 +55,8 @@
     <string>/etc/selfupdate/supervisor</string>
     <string>--ready-timeout</string>
     <string>60</string>
+    <string>--confirm-timeout</string>
+    <string>30</string>
   </array>
 
   <key>RunAtLoad</key>

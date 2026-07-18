@@ -38,7 +38,7 @@ Type=simple
 # The bootstrap is installer-owned and read-only; it never updates itself, so it
 # lives outside the writable state directory. The initial supervisor is installer-owned;
 # later verified candidates live content-addressed under the state directory.
-ExecStart=/usr/lib/selfupdate/bootstrap --state-dir /var/lib/selfupdate --supervisor-config /etc/selfupdate/config.toml --supervisor /usr/lib/selfupdate/supervisor --ready-timeout 60
+ExecStart=/usr/lib/selfupdate/bootstrap --state-dir /var/lib/selfupdate --supervisor-config /etc/selfupdate/config.toml --supervisor /usr/lib/selfupdate/supervisor --ready-timeout 60 --confirm-timeout 30
 
 # Relaunch the bootstrap if it ever crashes. The start-limit defaults stop a
 # crash-looping build after a few tries; each guardian relaunch restores the tower.

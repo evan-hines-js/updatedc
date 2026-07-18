@@ -27,10 +27,6 @@ pub mod select;
 
 pub use policy::{DefaultPolicy, PolicyError};
 
-/// Bound every wait on a repository origin. Target downloads may take longer than
-/// this in total, but must continue making progress.
-const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// A TUF client error, classified so callers can tell a *retryable* network
 /// problem from a *fail-closed* trust failure that must never be retried blindly
 /// or worked around.
@@ -106,7 +102,7 @@ mod error_tests {
 
     #[test]
     fn timeout_is_a_retryable_transport_failure() {
-        let error = transport_timeout("refreshing metadata");
+        let error = transport_timeout(std::time::Duration::from_secs(30), "refreshing metadata");
         assert!(error.is_retryable());
         assert!(error.to_string().contains("timed out after 30s"));
     }
@@ -202,6 +198,7 @@ impl TrustedRepository {
     pub async fn assigned(
         routing_config: &updated::config::Routing,
         repository_config: &updated::config::Repository,
+        storage: &updated::config::Storage,
         paths: &updated::config::Paths,
     ) -> Result<Self, Error> {
         if !routing_config.base_url.ends_with('/') {
@@ -234,6 +231,7 @@ impl TrustedRepository {
             targets_url: targets_url.to_string(),
             metadata_limit: routing_config.metadata_limit,
             target_limit: 64 * 1024,
+            transport_timeout: routing_config.transport_timeout,
         };
         let routing = Self::load(&routing, &paths.routing_datastore).await?;
         let target = routing
@@ -252,7 +250,8 @@ impl TrustedRepository {
             .map_err(|e| Error::Local(format!("reading verified routing assignment: {e}")))?;
         let assignment: updated::config::RepositoryAssignment = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Trust(format!("invalid repository assignment: {e}")))?;
-        let assignment_store = paths.datastore.join(assignment_identity(&assignment));
+        let assignment_key = assignment_identity(&assignment);
+        let assignment_store = paths.datastore.join(&assignment_key);
         let source = repository_config
             .resolve(assignment.clone())
             .map_err(Error::Trust)?;
@@ -260,6 +259,18 @@ impl TrustedRepository {
         validate_release_url("targets_url", &source.targets_url)?;
         let mut repository = Self::load(&source, &assignment_store).await?;
         repository.assignment = Some(assignment);
+        let protected = std::iter::once(assignment_key.into()).collect();
+        if let Err(error) = updated::gc::prune_directories(
+            &paths.datastore,
+            &protected,
+            storage.inactive_repository_caches,
+            storage.inactive_bytes,
+        ) {
+            foundation::log::warn(
+                "tuf",
+                &format!("could not prune inactive repository metadata caches: {error}"),
+            );
+        }
         Ok(repository)
     }
     /// Load the pinned root and refresh the full metadata chain.
@@ -303,9 +314,9 @@ impl TrustedRepository {
             })
             .expiration_enforcement(ExpirationEnforcement::Safe)
             .load();
-        timeout(TRANSPORT_TIMEOUT, load)
+        timeout(config.transport_timeout, load)
             .await
-            .map_err(|_| transport_timeout("refreshing metadata"))?
+            .map_err(|_| transport_timeout(config.transport_timeout, "refreshing metadata"))?
             .map_err(classify)
     }
 
@@ -361,9 +372,9 @@ impl TrustedRepository {
     ) -> Result<(), Error> {
         let name = TargetName::new(target.path.as_str())
             .map_err(|e| Error::Local(format!("bad target name {}: {e}", target.path)))?;
-        let stream = timeout(TRANSPORT_TIMEOUT, self.repo.read_target(&name))
+        let stream = timeout(self.config.transport_timeout, self.repo.read_target(&name))
             .await
-            .map_err(|_| transport_timeout("opening target stream"))?
+            .map_err(|_| transport_timeout(self.config.transport_timeout, "opening target stream"))?
             .map_err(classify)?
             .ok_or_else(|| {
                 Error::Trust(format!(
@@ -385,9 +396,11 @@ impl TrustedRepository {
         let mut written = 0u64;
         tokio::pin!(stream);
         let result = async {
-            while let Some(chunk) = timeout(TRANSPORT_TIMEOUT, stream.next())
+            while let Some(chunk) = timeout(self.config.transport_timeout, stream.next())
                 .await
-                .map_err(|_| transport_timeout("waiting for target data"))?
+                .map_err(|_| {
+                    transport_timeout(self.config.transport_timeout, "waiting for target data")
+                })?
             {
                 // A stream error means a size/hash check failed: do NOT use the data.
                 let chunk = chunk.map_err(classify)?;
@@ -464,11 +477,13 @@ fn validate_release_url(name: &str, raw: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn transport_timeout(operation: &str) -> Error {
-    Error::Transport(format!(
-        "timed out after {}s while {operation}",
-        TRANSPORT_TIMEOUT.as_secs()
-    ))
+fn transport_timeout(timeout: Duration, operation: &str) -> Error {
+    let timeout = if timeout.subsec_nanos() == 0 {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{:.3}s", timeout.as_secs_f64())
+    };
+    Error::Transport(format!("timed out after {timeout} while {operation}"))
 }
 
 fn to_verified(path: &str, target: &Target) -> VerifiedTarget {

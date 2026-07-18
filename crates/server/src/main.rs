@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use updated_tuf::repo::{self, PublishTarget};
@@ -36,11 +36,12 @@ async fn main() {
         "publish-supervisor" => publish(rest, false).await,
         "publish-provider-set" => publish_provider_set(rest).await,
         "publish-assignment" => publish_assignment(rest).await,
+        "target-sha256" => target_sha256(rest).await,
         "serve" => serve(rest).await,
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|install-app|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|serve> [flags]"
+                "usage: server <init|install-app|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|target-sha256|serve> [flags]"
             );
             exit(2);
         }
@@ -49,6 +50,13 @@ async fn main() {
         eprintln!("error: {e}");
         exit(1);
     }
+}
+
+async fn target_sha256(args: &[String]) -> R {
+    let repo = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
+    let name = flag(args, "--name").ok_or("--name <target-path> is required")?;
+    println!("{}", repo::target_sha256(&repo, &name).await?);
+    Ok(())
 }
 
 async fn publish_assignment(args: &[String]) -> R {
@@ -339,7 +347,10 @@ async fn serve(args: &[String]) -> R {
     }
 }
 
-async fn serve_conn(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
+async fn serve_conn<S>(mut stream: S, root: &Path) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Read request headers (bounded).
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -358,20 +369,59 @@ async fn serve_conn(mut stream: TcpStream, root: &Path) -> std::io::Result<()> {
     })
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "request header timeout"))??;
-    let head = String::from_utf8_lossy(&buf);
-    let path = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
+    if buf.len() > 16 * 1024 {
+        respond_status(&mut stream, 431, b"request headers too large").await;
+        return Ok(());
+    }
+    if !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        respond_status(&mut stream, 400, b"incomplete request headers").await;
+        return Ok(());
+    }
+    let Ok(head) = std::str::from_utf8(&buf) else {
+        respond_status(&mut stream, 400, b"invalid request headers").await;
+        return Ok(());
+    };
+    let Some(request_line) = head.lines().next() else {
+        respond_status(&mut stream, 400, b"missing request line").await;
+        return Ok(());
+    };
+    let mut request = request_line.split_whitespace();
+    let (Some(method), Some(path), Some(version), None) = (
+        request.next(),
+        request.next(),
+        request.next(),
+        request.next(),
+    ) else {
+        respond_status(&mut stream, 400, b"malformed request line").await;
+        return Ok(());
+    };
+    if method != "GET" {
+        respond_status(&mut stream, 405, b"method not allowed").await;
+        return Ok(());
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        respond_status(&mut stream, 400, b"unsupported HTTP version").await;
+        return Ok(());
+    }
     // A `Range: bytes=N-` header means tough is resuming a download.
-    let range_start = head.lines().find_map(|l| {
+    let range = head.lines().skip(1).find_map(|l| {
         let l = l.to_ascii_lowercase();
-        l.strip_prefix("range:")
-            .and_then(|v| v.trim().strip_prefix("bytes="))
-            .and_then(|v| v.split('-').next())
-            .and_then(|v| v.trim().parse::<usize>().ok())
+        l.strip_prefix("range:").map(|v| v.trim().to_owned())
     });
+    let range_start = match range.as_deref() {
+        None => None,
+        Some(value) => match value
+            .strip_prefix("bytes=")
+            .and_then(|value| value.strip_suffix('-'))
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            Some(start) => Some(start),
+            None => {
+                respond_status(&mut stream, 400, b"malformed range").await;
+                return Ok(());
+            }
+        },
+    };
 
     match resolve(root, path) {
         Some(file) => match tokio::fs::File::open(&file).await {
@@ -408,11 +458,10 @@ fn resolve(root: &Path, path: &str) -> Option<PathBuf> {
     canonical.starts_with(root).then_some(canonical)
 }
 
-async fn respond_file(
-    stream: &mut TcpStream,
-    mut file: tokio::fs::File,
-    range_start: Option<usize>,
-) {
+async fn respond_file<S>(stream: &mut S, mut file: tokio::fs::File, range_start: Option<u64>)
+where
+    S: AsyncWrite + Unpin,
+{
     // Only a regular file has a body. `File::open` on a directory succeeds on Unix and its
     // stat reports a non-zero size, so without this a directory URL answers 200 with a
     // Content-Length that no body can ever satisfy — the client sees a truncated response
@@ -426,7 +475,14 @@ async fn respond_file(
         return;
     }
     let length = metadata.len();
-    let start = range_start.map(|n| n as u64).filter(|&n| n <= length);
+    if range_start.is_some_and(|start| start >= length) {
+        let hdr = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{length}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = write_with_timeout(stream, hdr.as_bytes()).await;
+        return;
+    }
+    let start = range_start;
     let (header, offset, count) = match start {
         Some(start) => {
             let remaining = length - start;
@@ -477,14 +533,28 @@ async fn respond_file(
     let _ = stream.flush().await;
 }
 
-async fn write_with_timeout(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+async fn write_with_timeout<S>(stream: &mut S, bytes: &[u8]) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     timeout(Duration::from_secs(30), stream.write_all(bytes))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "response write timeout"))?
 }
 
-async fn respond_status(stream: &mut TcpStream, code: u16, body: &[u8]) {
-    let reason = if code == 200 { "OK" } else { "Not Found" };
+async fn respond_status<S>(stream: &mut S, code: u16, body: &[u8])
+where
+    S: AsyncWrite + Unpin,
+{
+    let reason = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        416 => "Range Not Satisfiable",
+        431 => "Request Header Fields Too Large",
+        _ => "Error",
+    };
     let hdr = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -596,17 +666,16 @@ mod tests {
         assert!(resolve(&root, "/keys/root.pk8").is_none());
     }
 
-    /// Serve one request against a real socket and return the raw response.
+    /// Serve one request through an in-memory transport so protocol unit tests do not
+    /// require permission to bind loopback sockets.
     async fn get(root: &Path, request: &str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (mut client, server) = tokio::io::duplex(32 * 1024);
         let root = root.to_path_buf();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = serve_conn(stream, &root).await;
+            let _ = serve_conn(server, &root).await;
         });
-        let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
         let mut out = Vec::new();
         client.read_to_end(&mut out).await.unwrap();
         String::from_utf8_lossy(&out).into_owned()
@@ -663,6 +732,50 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 206"), "got: {response:?}");
         assert!(response.contains("Content-Length: 6"), "got: {response:?}");
         assert!(response.ends_with("456789"), "got: {response:?}");
+    }
+
+    #[tokio::test]
+    async fn unsupported_methods_are_rejected() {
+        let root = serve_root("method");
+        let response = get(&root, "POST /targets/app HTTP/1.1\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 405"), "got: {response:?}");
+    }
+
+    #[tokio::test]
+    async fn malformed_ranges_are_rejected() {
+        let root = serve_root("bad-range");
+        let response = get(
+            &root,
+            "GET /targets/app HTTP/1.1\r\nRange: bytes=wat\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "got: {response:?}");
+    }
+
+    #[tokio::test]
+    async fn a_range_at_eof_is_unsatisfiable() {
+        let root = serve_root("eof-range");
+        let response = get(
+            &root,
+            "GET /targets/app HTTP/1.1\r\nRange: bytes=10-\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 416"), "got: {response:?}");
+        assert!(
+            response.contains("Content-Range: bytes */10"),
+            "got: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_headers_are_rejected() {
+        let root = serve_root("large-header");
+        let request = format!(
+            "GET /targets/app HTTP/1.1\r\nX-Fill: {}\r\n\r\n",
+            "x".repeat(16 * 1024)
+        );
+        let response = get(&root, &request).await;
+        assert!(response.starts_with("HTTP/1.1 431"), "got: {response:?}");
     }
 
     #[test]

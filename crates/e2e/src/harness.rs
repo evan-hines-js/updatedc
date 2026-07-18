@@ -43,25 +43,55 @@ pub fn wait_for_buf(buf: &LogBuf, needle: &str, secs: u64) -> bool {
 
 /// Tee a child stream to this process's stderr (prefixed with `label`) and append
 /// it to `buf`. Spawns a reader thread that ends when the stream closes.
-pub fn tee(label: &str, stream: Option<impl Read + Send + 'static>, buf: &LogBuf) {
-    let Some(stream) = stream else { return };
+pub struct LogReader {
+    done: std::sync::mpsc::Receiver<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl LogReader {
+    fn finish(self) {
+        // Descendants can accidentally retain an inherited output handle. Never let that
+        // turn diagnostic log draining into an unbounded E2E teardown hang.
+        if self.done.recv_timeout(Duration::from_secs(1)).is_ok() {
+            let _ = self.thread.join();
+        }
+    }
+}
+
+pub fn tee(
+    label: &str,
+    stream: Option<impl Read + Send + 'static>,
+    buf: &LogBuf,
+) -> Option<LogReader> {
+    let stream = stream?;
     let (buf, label) = (buf.clone(), label.to_string());
-    std::thread::spawn(move || {
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         loop {
             line.clear();
             match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
+                Ok(0) => break,
+                Err(error) => {
+                    if let Ok(mut b) = buf.lock() {
+                        b.push_str(&format!("log capture failed: {error}\n"));
+                    }
+                    break;
+                }
                 Ok(_) => {
-                    eprint!("[{label}] {line}");
+                    // Avoid square-bracket prefixes: Windows CI log relays have been
+                    // observed rendering their bytes as `Ä` and `Å`.
+                    eprint!("{label}: {line}");
                     if let Ok(mut b) = buf.lock() {
                         b.push_str(&line);
                     }
                 }
             }
         }
+        let _ = done_tx.send(());
     });
+    Some(LogReader { done, thread })
 }
 
 /// Shared paths and build outputs for one run.
@@ -119,7 +149,11 @@ impl Ctx {
         // they outlive their supervisor by design); reap them so they don't hold a
         // port this run needs.
         reap_workdir(&work);
-        let _ = std::fs::remove_dir_all(&work);
+        match std::fs::remove_dir_all(&work) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return fail(format!("removing stale E2E workdir: {error}")),
+        }
         std::fs::create_dir_all(work.join("build")).map_err(str_err)?;
         let exe = if cfg!(windows) { ".exe" } else { "" };
         let bin = |name: &str| root.join(format!("target/release/{name}{exe}"));
@@ -228,6 +262,33 @@ impl Ctx {
         Ok(dst)
     }
 
+    /// Build a chaos-only candidate that completes boot and signals ready, then exits
+    /// before the guardian's confirmation window can commit it.
+    pub fn build_post_ready_crashing_supervisor(&self, version: &str) -> R<PathBuf> {
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.current_dir(&self.root)
+            .env("SUPERVISOR_VERSION", version)
+            .env("SUPERVISOR_CHAOS_EXIT_AFTER_READY", "1")
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "supervisor",
+                "--features",
+                "chaos",
+            ]);
+        run(&mut cmd)?;
+        let src = self
+            .root
+            .join(format!("target/release/supervisor{}", self.exe));
+        let dst = self.work.join(format!(
+            "build/supervisor-post-ready-crash-{version}{}",
+            self.exe
+        ));
+        std::fs::copy(src, &dst).map_err(str_err)?;
+        Ok(dst)
+    }
+
     /// The update-transaction boundaries the supervisor can crash at, enumerated from the
     /// binary itself (`--list-chaos-boundaries`, a chaos-feature build). One source of
     /// truth: the chaos scenario drives exactly the supervisor's crossings, so a boundary
@@ -302,7 +363,7 @@ impl Ctx {
         run(&mut command)?;
         if application {
             let target = release_target(product, "stable", version, &self.platkey, product);
-            let sha = sha256_hex(&dir.join("repo/targets").join(&target));
+            let sha = self.target_sha256(dir, &target)?;
             std::fs::write(dir.join("desired-app"), format!("{target}\n{sha}\n"))
                 .map_err(str_err)?;
             if let Ok(addr) = std::fs::read_to_string(dir.join("assignment-addr")) {
@@ -323,14 +384,22 @@ impl Ctx {
             .args(["--id", "default"]))?;
         std::fs::write(dir.join("assignment-addr"), addr).map_err(str_err)?;
         self.publish_current_assignment(dir, addr, "initial")?;
-        Proc::spawn(
+        let mut server = Proc::spawn(
             "server",
             Command::new(&self.server)
                 .arg("serve")
                 .arg("--repo")
                 .arg(dir.join("repo"))
                 .args(["--addr", addr]),
-        )
+        )?;
+        if !server.wait_for_log("serving ", 10) {
+            let exited = server.has_exited();
+            let output = server.captured_log();
+            return fail(format!(
+                "repository server did not become ready at {addr} (exited={exited}):\n{output}"
+            ));
+        }
+        Ok(server)
     }
 
     fn publish_current_assignment(&self, dir: &Path, addr: &str, deployment: &str) -> R {
@@ -343,7 +412,7 @@ impl Ctx {
             .next()
             .ok_or("desired application hash is missing")?;
         let set_path = "provider-sets/default.json";
-        let set_sha = sha256_hex(&dir.join("repo/targets").join(set_path));
+        let set_sha = self.target_sha256(dir, set_path)?;
         run(Command::new(&self.server)
             .arg("publish-assignment")
             .arg("--repo")
@@ -363,6 +432,27 @@ impl Ctx {
     /// The installer-pinned root a client trusts for the repo under `dir`.
     pub fn root(&self, dir: &Path) -> PathBuf {
         dir.join("repo/metadata/root.json")
+    }
+
+    pub fn target_sha256(&self, dir: &Path, name: &str) -> R<String> {
+        let output = Command::new(&self.server)
+            .arg("target-sha256")
+            .arg("--repo")
+            .arg(dir.join("repo"))
+            .arg("--name")
+            .arg(name)
+            .output()
+            .map_err(str_err)?;
+        if !output.status.success() {
+            return fail(format!(
+                "reading target {name} digest failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8(output.stdout)
+            .map_err(|error| error.to_string())?
+            .trim()
+            .to_string())
     }
     pub fn meta_url(&self, srv: &str) -> String {
         format!("http://{srv}/metadata/")
@@ -392,9 +482,11 @@ pub fn release_target(
 
 /// Hex SHA-256 of a file — used to seed committed installed-target state. Delegates
 /// to the same streaming hasher the tower uses, so the harness and the production
-/// path can never disagree on a digest; an unreadable file yields an empty string.
-pub fn sha256_hex(path: &Path) -> String {
-    updated::hash::sha256_file(path).unwrap_or_default()
+/// path can never disagree on a digest. Fixture I/O failures are fatal rather than
+/// becoming an empty digest that could make two missing files appear equal.
+pub fn sha256_hex(path: &Path) -> R<String> {
+    updated::hash::sha256_file(path)
+        .map_err(|error| format!("hashing E2E fixture {}: {error}", path.display()))
 }
 
 /// GET `url`, returning the body on a 2xx response.
@@ -431,6 +523,7 @@ pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
 pub struct Proc {
     child: Child,
     log: LogBuf,
+    readers: Vec<LogReader>,
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
 }
@@ -486,13 +579,19 @@ impl Proc {
         }
         let mut child = cmd.spawn().map_err(|e| format!("spawn {label}: {e}"))?;
         let log = log_buf();
-        tee(label, child.stdout.take(), &log);
-        tee(label, child.stderr.take(), &log);
+        let readers = [
+            tee(label, child.stdout.take(), &log),
+            tee(label, child.stderr.take(), &log),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         #[cfg(windows)]
         let job = assign_job(&child)?;
         Ok(Proc {
             child,
             log,
+            readers,
             #[cfg(windows)]
             job,
         })
@@ -527,6 +626,9 @@ impl Drop for Proc {
             windows_sys::Win32::Foundation::CloseHandle(self.job);
         }
         let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            reader.finish();
+        }
     }
 }
 
@@ -545,13 +647,18 @@ fn assign_job(child: &Child) -> R<windows_sys::Win32::Foundation::HANDLE> {
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
+        if SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const _,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        );
-        AssignProcessToJobObject(job, child.as_raw_handle() as _);
+        ) == 0
+            || AssignProcessToJobObject(job, child.as_raw_handle() as _) == 0
+        {
+            let error = std::io::Error::last_os_error();
+            windows_sys::Win32::Foundation::CloseHandle(job);
+            return fail(format!("configuring E2E process Job Object: {error}"));
+        }
         Ok(job)
     }
 }
@@ -649,12 +756,17 @@ fn run_service(
                 return;
             }
         };
-        tee(label, grouped.child.stdout.take(), log);
-        tee(label, grouped.child.stderr.take(), log);
+        let readers = [
+            tee(label, grouped.child.stdout.take(), log),
+            tee(label, grouped.child.stderr.take(), log),
+        ];
         loop {
             if stop.load(Ordering::SeqCst) {
                 grouped.teardown();
                 let _ = grouped.child.wait();
+                for reader in readers.into_iter().flatten() {
+                    reader.finish();
+                }
                 return;
             }
             match grouped.child.try_wait() {
@@ -664,6 +776,9 @@ fn run_service(
         }
         grouped.close();
         let _ = grouped.child.wait();
+        for reader in readers.into_iter().flatten() {
+            reader.finish();
+        }
         std::thread::sleep(Duration::from_millis(200)); // RestartSec
     }
 }

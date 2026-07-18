@@ -76,11 +76,11 @@ impl BundleStore {
         )
     }
 
-    /// Resolve how to launch a materialized release: its entrypoint program, working
-    /// directory, and declared product. Trusts the already-verified committed tree,
-    /// confirming only that the bytes still resolve by identity.
+    /// Resolve how to launch a materialized release after re-verifying every file.
+    /// Providers are executable policy and may sit unused between deployments, so
+    /// ingest-time verification alone is not an execution-time trust boundary.
     pub fn resolve(&self, release: &ReleaseId) -> io::Result<Resolved> {
-        let (manifest, program) = bundle::read_manifest(&self.versions, release)?;
+        let (manifest, program) = bundle::read_release(&self.versions, release)?;
         Ok(Resolved {
             program,
             cwd: self.location(release),
@@ -161,5 +161,55 @@ mod tests {
             manifest_sha256: "a".repeat(64),
         };
         assert!(provider.resolve(&missing).is_err());
+    }
+
+    #[test]
+    fn resolving_a_provider_with_post_install_drift_fails_closed() {
+        let root = scratch("provider-drift");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/app"), b"trusted").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let archive = root.join("provider.tar.zst");
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        bundle::create_bundle(
+            &source,
+            &archive,
+            "lifecycle",
+            "1.0.0",
+            &platform,
+            "bin/app",
+        )
+        .unwrap();
+        let store = BundleStore::new(root.join("versions"), root.join("staging"));
+        let staged = store
+            .install(
+                &archive,
+                &bundle::ExpectedBundle {
+                    product: "lifecycle",
+                    version: "1.0.0",
+                    platform: &platform,
+                },
+            )
+            .unwrap();
+        let installed_entrypoint = store.location(&staged.id).join("bin/app");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&installed_entrypoint, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&installed_entrypoint).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&installed_entrypoint, permissions).unwrap();
+        }
+        fs::write(installed_entrypoint, b"tampered").unwrap();
+        assert!(store.resolve(&staged.id).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }

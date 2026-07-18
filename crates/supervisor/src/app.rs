@@ -48,16 +48,16 @@ impl App {
 
 /// Adopt the application the guardian is already running (no restart). The health token
 /// the previous supervisor persisted is reloaded so health checks still verify responses.
-pub(crate) fn adopt(guardian: Guardian, opts: &Options, pid: u32) -> App {
-    let health_token = read_app_token(&opts.paths.app_token).unwrap_or_default();
+pub(crate) fn adopt(guardian: Guardian, opts: &Options, pid: u32) -> io::Result<App> {
+    let health_token = read_app_token(&opts.paths.app_token)?;
     log(&format!(
         "adopted the running application (pid {pid}) the guardian already owns"
     ));
-    App {
+    Ok(App {
         guardian,
         pid,
         health_token,
-    }
+    })
 }
 
 /// Launch a fresh application from the active release entrypoint.
@@ -123,22 +123,27 @@ fn write_app_token(path: &Path, token: &str) -> io::Result<()> {
     apply::atomic_write(path, token.as_bytes())
 }
 
-fn read_app_token(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
+fn read_app_token(path: &Path) -> io::Result<String> {
+    let token = std::fs::read_to_string(path)?.trim().to_string();
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted application health token is invalid",
+        ));
+    }
+    Ok(token)
 }
 
-fn clear_app_token(path: &Path) {
-    let _ = std::fs::remove_file(path);
+fn clear_app_token(path: &Path) -> io::Result<()> {
+    updated::apply::remove_file_durable(path)
 }
 
 /// Ask the guardian to stop the application (it escalates to a hard kill), then clear the
 /// persisted health token. The single path for quiescing the running app — before
 /// activating a release, and when the boot planner stops an uncommitted candidate.
-pub(crate) fn stop(guardian: &mut Guardian, app_token: &Path) {
-    let _ = guardian.stop();
-    clear_app_token(app_token);
+pub(crate) fn stop(guardian: &mut Guardian, app_token: &Path) -> io::Result<()> {
+    guardian.stop().map_err(io::Error::other)?;
+    clear_app_token(app_token)
 }
 
 // ------------------------------- health probe -------------------------------
@@ -285,7 +290,7 @@ pub(crate) async fn wait_for_shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::Readiness;
+    use super::{read_app_token, Readiness};
 
     #[test]
     fn readiness_needs_consecutive_successes_and_a_failure_resets_the_run() {
@@ -311,5 +316,23 @@ mod tests {
         // no evidence.
         let mut r = Readiness::new(0);
         assert!(r.observe(true));
+    }
+
+    #[test]
+    fn persisted_health_tokens_fail_closed_when_missing_empty_or_malformed() {
+        let root = std::env::temp_dir().join(format!("updated-app-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("token");
+
+        assert!(read_app_token(&path).is_err());
+        std::fs::write(&path, b"\n").unwrap();
+        assert!(read_app_token(&path).is_err());
+        std::fs::write(&path, b"not-a-token\n").unwrap();
+        assert!(read_app_token(&path).is_err());
+        let valid = "0123456789abcdef".repeat(4);
+        std::fs::write(&path, format!("{valid}\n")).unwrap();
+        assert_eq!(read_app_token(&path).unwrap(), valid);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

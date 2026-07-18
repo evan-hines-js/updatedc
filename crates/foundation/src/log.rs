@@ -15,5 +15,8 @@ fn emit(component: &str, level: &str, msg: &str) {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    eprintln!("{h:02}:{m:02}:{s:02} {level:<5} [{component}] {msg}");
+    // Keep the wire-to-console format ASCII and punctuation-light. Some Windows CI
+    // log relays reinterpret square brackets through an OEM code page, rendering them
+    // as `Ä`/`Å`; `component:` remains unambiguous through every supported console.
+    eprintln!("{h:02}:{m:02}:{s:02} {level:<5} {component}: {msg}");
 }

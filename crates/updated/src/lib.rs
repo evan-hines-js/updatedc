@@ -14,6 +14,7 @@ pub mod apply;
 pub mod bundle;
 pub mod config;
 pub mod env;
+pub mod gc;
 pub mod hash;
 pub mod health;
 pub mod lock;

@@ -10,4 +10,9 @@ fn main() {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=SUPERVISOR_VERSION={v}");
     println!("cargo:rerun-if-env-changed=SUPERVISOR_VERSION");
+    if std::env::var_os("SUPERVISOR_CHAOS_EXIT_AFTER_READY").is_some() {
+        println!("cargo:rustc-cfg=supervisor_chaos_exit_after_ready");
+    }
+    println!("cargo:rustc-check-cfg=cfg(supervisor_chaos_exit_after_ready)");
+    println!("cargo:rerun-if-env-changed=SUPERVISOR_CHAOS_EXIT_AFTER_READY");
 }

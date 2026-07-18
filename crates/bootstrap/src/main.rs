@@ -58,6 +58,7 @@ fn parse_args() -> Result<guardian::Config, String> {
     let mut supervisor_config: Option<PathBuf> = None;
     let mut initial_supervisor: Option<PathBuf> = None;
     let mut ready_timeout = Duration::from_secs(45);
+    let mut confirm_timeout = Duration::from_secs(30);
     let mut stop_grace = Duration::from_secs(10);
 
     let mut args = std::env::args_os().skip(1);
@@ -68,6 +69,7 @@ fn parse_args() -> Result<guardian::Config, String> {
             "--supervisor-config" => supervisor_config = Some(next_path(&mut args, flag)?),
             "--supervisor" => initial_supervisor = Some(next_path(&mut args, flag)?),
             "--ready-timeout" => ready_timeout = next_seconds(&mut args, flag)?,
+            "--confirm-timeout" => confirm_timeout = next_seconds(&mut args, flag)?,
             "--stop-grace" => stop_grace = next_seconds(&mut args, flag)?,
             "-h" | "--help" => {
                 usage();
@@ -90,6 +92,7 @@ fn parse_args() -> Result<guardian::Config, String> {
         supervisor_config,
         initial_supervisor,
         ready_timeout,
+        confirm_timeout,
         stop_grace,
     })
 }
@@ -117,11 +120,13 @@ fn usage() {
     eprintln!(
         "bootstrap — the update tower's root and the application's permanent guardian\n\n\
          usage: bootstrap --state-dir <dir> --supervisor-config <path.toml> \\\n\
-         \x20                [--supervisor <path>] [--ready-timeout <secs>] [--stop-grace <secs>]\n\n\
+         \x20                [--supervisor <path>] [--ready-timeout <secs>]\n\
+         \x20                [--confirm-timeout <secs>] [--stop-grace <secs>]\n\n\
          --state-dir          where the guardian keeps ownership + supervisor pointers\n\
          --supervisor-config  operator config, passed verbatim to each supervisor\n\
          --supervisor         initial supervisor binary (first boot only; seeds the pointer)\n\
          --ready-timeout      how long a replacement supervisor has to prove ready (default 45s)\n\
+         --confirm-timeout    stability window before committing a replacement (default 30s)\n\
          --stop-grace         graceful process-stop deadline before a hard kill (default 10s)"
     );
 }
