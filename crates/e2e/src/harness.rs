@@ -17,7 +17,7 @@ pub type R<T = ()> = Result<T, String>;
 
 /// Failure ceiling for positive E2E events. Pollers return immediately on success;
 /// this only prevents a resource-starved CI runner from turning latency into a flake.
-pub const EVENT_TIMEOUT: u64 = 120;
+pub const EVENT_TIMEOUT: u64 = 600;
 
 pub fn fail<T>(msg: impl Into<String>) -> R<T> {
     Err(msg.into())

@@ -57,13 +57,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
       # Portable updater scenarios run identically on every OS.
       - run: cargo run -p e2e
-      # Windows additionally exercises the real Service Control Manager boundary:
-      # native service registration, durable bootstrap state, clean application
-      # shutdown, and a fresh application launch after service restart. GitHub's
-      # Windows runners permit service creation from the runner administrator account.
-      - if: runner.os == 'Windows'
-        shell: powershell
-        run: .\deploy\windows\test-scm-e2e.ps1
 
       # A main build produces the continuously-running update tower for each desktop
       # target. The optional updated-oneshot companion remains independently buildable
@@ -97,6 +90,22 @@ jobs:
           name: updated-${{ matrix.release }}
           path: dist/*
           if-no-files-found: error
+
+  windows-scm-e2e:
+    name: Windows Service Control Manager E2E
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # aws-lc-rs requires NASM when building for Windows MSVC.
+      - uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      # Exercise native service registration, durable bootstrap state, clean
+      # application shutdown, and relaunch after an SCM service restart.
+      - name: Exercise the native SCM lifecycle
+        shell: powershell
+        run: .\deploy\windows\test-scm-e2e.ps1
 
   macos-publish-fuzz:
     name: macOS concurrent publish fuzz (${{ matrix.mode }})
@@ -156,7 +165,7 @@ jobs:
   release:
     name: Publish rolling release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, trivy, macos-publish-fuzz, linux-haproxy-e2e]
+    needs: [test, trivy, windows-scm-e2e, macos-publish-fuzz, linux-haproxy-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

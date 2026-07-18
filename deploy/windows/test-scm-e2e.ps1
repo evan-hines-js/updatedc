@@ -105,8 +105,10 @@ try {
     if ($LASTEXITCODE) { throw 'publishing provider set failed' }
     $appTarget = 'products/app/stable/1.0.0/windows-x86_64/app'
     $setTarget = 'provider-sets/default.json'
-    $appSha = (Get-FileHash -Algorithm SHA256 (Join-Path $repo "targets/$appTarget")).Hash.ToLowerInvariant()
-    $setSha = (Get-FileHash -Algorithm SHA256 (Join-Path $repo "targets/$setTarget")).Hash.ToLowerInvariant()
+    $appSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $appTarget).Trim()
+    if ($LASTEXITCODE) { throw 'resolving the published application hash failed' }
+    $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $setTarget).Trim()
+    if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
     & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
         --name assignments/nodes/node.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
         --targets-url "http://127.0.0.1:$repoPort/targets/" --deployment initial `

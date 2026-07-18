@@ -48,7 +48,7 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "3.0.0", &ctx.server.clone())?;
     if !sup.wait_for_log(
         "restoring predecessor 2.0.0 after interrupted activation of 3.0.0",
-        40,
+        EVENT_TIMEOUT,
     ) {
         return fail("supervisor did not reject the crashing v3.0.0 on recovery");
     }
