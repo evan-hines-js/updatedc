@@ -1,0 +1,13 @@
+---
+# Bring up the kind demo cluster: the operator, the CDN (release-server + minio), the base
+# fleet, the ingress controller (published on this host's ports 80/443). This currently drives
+# the existing provisioning script; it is being dissolved into native ansible tasks, but
+# wrapping it here already makes the playbook the single entry point.
+- name: Provision the kind cluster, control plane, CDN, and base fleet
+  ansible.builtin.command:
+    cmd: ./scripts/kind-updatec-e2e.sh --fuzz-rounds 0
+    chdir: "{{ demo_root }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+    UPDATEC_KIND_CLUSTER: "{{ demo_cluster }}"
+    UPDATEC_KEEP_KIND_CLUSTER: "1"

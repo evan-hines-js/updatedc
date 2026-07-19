@@ -4,9 +4,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A temp file untouched for at least this long is an abandoned crash leftover, not one a
+/// writer is mid-way through — [`sweep_stale_temps`] leaves anything newer alone so it can
+/// be called at any time without racing an in-flight [`atomic_write`].
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 
 pub fn create_temp(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
     create_temp_with(dir, prefix, |path| {
@@ -105,6 +110,43 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
         return Err(error);
     }
     sync_dir(dir)
+}
+
+/// Best-effort removal of stale temp files left behind when a crash or power loss struck
+/// between an [`atomic_write`]/[`install_executable`]/[`create_temp`] and its rename —
+/// the `<prefix>…-….tmp` sibling is then an orphan no one will ever finish. Sweeps `dir`
+/// for files whose name starts with `prefix` and ends with `.tmp`, skipping any modified
+/// within [`STALE_TEMP_AGE`] so a temp an in-flight writer still owns is never yanked.
+///
+/// Purely hygiene: a directory-read or unlink failure is ignored (a stray temp is inert —
+/// the sequence/pid/nanos naming means it can never collide with a real committed file),
+/// so this returns the count removed rather than a `Result`.
+pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
+    let now = SystemTime::now();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let recently_written = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age < STALE_TEMP_AGE);
+        if recently_written {
+            continue;
+        }
+        if fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 pub fn remove_file(path: &Path) -> io::Result<()> {
@@ -223,6 +265,39 @@ mod tests {
         remove_file(Path::new("bare.state")).unwrap();
         drop(restore);
         assert!(!d.join("bare.state").exists());
+    }
+
+    #[test]
+    fn sweep_removes_stale_temps_but_spares_fresh_and_unrelated_files() {
+        let d = dir("sweep");
+        // A committed file and an unrelated `.tmp` (wrong prefix) must survive.
+        fs::write(d.join("state"), b"committed").unwrap();
+        fs::write(d.join("other-9-9-9.tmp"), b"not ours").unwrap();
+        // A fresh temp under our prefix is an in-flight write — spare it.
+        fs::write(d.join(".guardian-1-2-3.tmp"), b"in flight").unwrap();
+        // An aged temp under our prefix is a crash leftover — reap it.
+        let stale = d.join(".guardian-4-5-6.tmp");
+        fs::write(&stale, b"orphan").unwrap();
+        let aged = SystemTime::now() - (STALE_TEMP_AGE + Duration::from_secs(1));
+        filetime_set(&stale, aged);
+
+        assert_eq!(sweep_stale_temps(&d, ".guardian-"), 1);
+        assert!(d.join("state").exists());
+        assert!(d.join("other-9-9-9.tmp").exists());
+        assert!(d.join(".guardian-1-2-3.tmp").exists());
+        assert!(!stale.exists());
+    }
+
+    /// Backdate a file's mtime without pulling in a dependency: reopening and rewriting
+    /// would only refresh it, so set it directly through `File::set_times`.
+    fn filetime_set(path: &Path, when: SystemTime) {
+        let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
     }
 
     #[test]

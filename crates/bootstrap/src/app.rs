@@ -3,8 +3,9 @@
 //! The guardian owns the application only so it can control the app's lifecycle during
 //! an update (stop → the supervisor swaps the bytes → start) and so the app dies with
 //! the guardian — never an orphan, never a duplicate. It does *not* keep the app alive:
-//! that is the init system's job. When the app exits on its own the guardian rolls the
-//! exit code up and the whole tower goes down, and the init system restarts it fresh.
+//! that is the init system's job. When the app exits on its own the guardian rolls its
+//! exact exit code up and the whole tower goes down. Exit zero is still a spontaneous
+//! service exit; the outer lifecycle owner decides whether that warrants a restart.
 //!
 //! This is the platform-agnostic lifecycle over the [`Process`] port;
 //! the contained process itself (native launch, containment, stop, exit polling) lives in
@@ -53,8 +54,8 @@ impl App {
     }
 
     /// Stop the application (intentional — quiescing it to swap its binary). After this
-    /// there is no process, so a later [`poll_crash`](App::poll_crash) never mistakes
-    /// the stop for a crash.
+    /// there is no process, so a later [`poll_exit`](App::poll_exit) never mistakes
+    /// the stop for a spontaneous exit.
     pub fn stop(&mut self, grace: Duration) {
         if let Some(mut proc) = self.proc.take() {
             proc.stop(grace);
@@ -69,10 +70,11 @@ impl App {
         self.proc.as_ref().map(|p| p.pid())
     }
 
-    /// If the application has exited on its own, take its exit code. From the guardian's
-    /// view this is a crash: an intentional stop clears the process first, so an
-    /// intentional exit never surfaces here.
-    pub fn poll_crash(&mut self) -> Option<i32> {
+    /// If the service exited on its own, take its exact exit code. This process wrapper
+    /// deliberately attaches no success/failure policy to that code; the guardian's
+    /// service state machine rolls every spontaneous exit up. An intentional stop clears
+    /// the process first, so it never surfaces here.
+    pub fn poll_exit(&mut self) -> Option<i32> {
         let code = self.proc.as_mut()?.poll_exit()?;
         self.proc = None;
         Some(code)
@@ -133,26 +135,29 @@ mod tests {
     const GRACE: Duration = Duration::from_millis(10);
 
     #[test]
-    fn a_crash_surfaces_once_then_clears() {
+    fn a_spontaneous_exit_surfaces_once_then_clears() {
         let mut app = app();
         app.launch(&spec("exit:7"), GRACE).unwrap();
-        assert_eq!(
-            app.poll_crash(),
-            Some(7),
-            "the crash surfaces its exit code"
-        );
-        assert_eq!(app.poll_crash(), None, "and only once — it is then cleared");
+        assert_eq!(app.poll_exit(), Some(7), "the crash surfaces its exit code");
+        assert_eq!(app.poll_exit(), None, "and only once — it is then cleared");
         assert!(!app.is_running());
     }
 
     #[test]
-    fn an_intentional_stop_is_not_a_crash() {
+    fn an_intentional_stop_is_not_an_exit_event() {
         let mut app = app();
         app.launch(&spec("run-forever"), GRACE).unwrap();
         assert!(app.is_running());
         app.stop(GRACE);
         assert!(!app.is_running());
-        assert_eq!(app.poll_crash(), None, "a stopped app is not a crash");
+        assert_eq!(app.poll_exit(), None, "a stopped app has no exit event");
+    }
+
+    #[test]
+    fn exit_zero_is_preserved_as_a_spontaneous_service_exit() {
+        let mut app = app();
+        app.launch(&spec("exit:0"), GRACE).unwrap();
+        assert_eq!(app.poll_exit(), Some(0));
     }
 
     #[test]
@@ -190,7 +195,7 @@ mod unix_tests {
             .unwrap();
         let mut code = None;
         for _ in 0..200 {
-            if let Some(c) = app.poll_crash() {
+            if let Some(c) = app.poll_exit() {
                 code = Some(c);
                 break;
             }
@@ -212,7 +217,7 @@ mod unix_tests {
         assert!(app.is_running());
         app.stop(Duration::from_secs(2));
         assert!(!app.is_running());
-        assert_eq!(app.poll_crash(), None, "a stopped app is not a crash");
+        assert_eq!(app.poll_exit(), None, "a stopped app has no exit event");
     }
 
     #[test]

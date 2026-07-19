@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-endpoints
+  namespace: {{ demo_namespace }}
+spec:
+  ingressClassName: nginx
+  rules:
+    # The co-located out-of-cluster agent reaches the control plane by these in-cluster names,
+    # resolved to nginx on this host. The gateway virtual-hosts both.
+    - host: updatec-gateway
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: updatec-gateway, port: { number: 80 } } }
+    - host: release-default
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: updatec-gateway, port: { number: 80 } } }
+    # The browser (any other host) → the demo UI.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: updatec-demo, port: { number: 80 } } }

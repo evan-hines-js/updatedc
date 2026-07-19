@@ -4,7 +4,7 @@ use super::super::*;
 /// self-updates from the `supervisor` TUF product; the app is health-gated.
 fn tower(ctx: &Ctx, dir: &Path, srv: &str, svc: &str, app: &Path, sup_v1: &Path) -> R<Command> {
     Sup::new(ctx, dir, srv, "app", appcmd(app, &["--addr", svc]))
-        .health(svc)
+        .readiness_health(svc)
         .check_interval("60s")
         .health_grace("3s")
         .supervisor_check_interval("1s")

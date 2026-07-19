@@ -13,7 +13,7 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     let mut first_cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .check_interval("60s")
         .health_grace("2s")
-        .health(svc)
+        .readiness_health(svc)
         .guardian()?;
     let first = Proc::spawn("supervisor-1", &mut first_cmd)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {

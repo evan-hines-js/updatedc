@@ -13,7 +13,8 @@ $keys = Join-Path $work 'keys'
 $guardianState = Join-Path $work 'guardian-state'
 $install = Join-Path $work 'install'
 $bundle = Join-Path $work 'bundle-1.0.0'
-$config = Join-Path $work 'config.toml'
+$config = Join-Path $work 'bootstrap.toml'
+$runtime = Join-Path $work 'runtime.json'
 $repoPort = 21980
 $appPort = 21990
 $serverProcess = $null
@@ -110,35 +111,33 @@ try {
     if ($LASTEXITCODE) { throw 'resolving the published application hash failed' }
     $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $setTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
+    $runtimeJson = @{
+        product = 'app'; channel = 'stable'; install_root = $install
+        args = @('--addr', "127.0.0.1:$appPort")
+        health_checks = @(@{kind='readiness'; url="http://127.0.0.1:$appPort/healthz"}); activation = 'stop-start'
+        repository = @{metadata_limit=1048576; target_limit=536870912; transport_timeout_seconds=30}
+        storage = @{inactive_releases=2; inactive_providers=2; inactive_supervisors=1; inactive_bytes=1073741824; inactive_repository_caches=2}
+        timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; retry_after_seconds=300; refresh_retry_seconds=5; confirmation_window_seconds=120; supervisor_check_interval_seconds=3600}
+    } | ConvertTo-Json -Depth 5 -Compress
+    [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
         --name assignments/agents/agent.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
         --targets-url "http://127.0.0.1:$repoPort/targets/" --deployment initial `
         --application-path $appTarget --application-sha256 $appSha `
-        --provider-set-path $setTarget --provider-set-sha256 $setSha
+        --provider-set-path $setTarget --provider-set-sha256 $setSha --runtime $runtime
     if ($LASTEXITCODE) { throw 'publishing routing assignment failed' }
 
     $serverProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
         -ArgumentList @('serve', '--repo', $repo, '--addr', "127.0.0.1:$repoPort")
-    $rootJson = Join-Path $repo 'metadata\root.json'
+    & (Join-Path $bin 'server.exe') export-enrollment --repo $repo `
+        --assignment assignments/agents/agent.json --agent-id agent `
+        --routing-base-url "http://127.0.0.1:$repoPort/" `
+        --output (Join-Path $guardianState 'enrollment.json')
+    if ($LASTEXITCODE) { throw 'exporting enrollment bundle failed' }
     $configText = @"
-[routing]
-root = '$($rootJson.Replace("'", "''"))'
-base_url = 'http://127.0.0.1:$repoPort/'
-assignment = 'assignments/agents/agent.json'
-
-[repository]
-root = '$($rootJson.Replace("'", "''"))'
-
-[application]
-product = 'app'
-channel = 'stable'
-install_root = '$($install.Replace("'", "''"))'
-args = ['--addr', '127.0.0.1:$appPort']
-health_url = 'http://127.0.0.1:$appPort/healthz'
-
-[timeouts]
-check_interval = '60s'
-health_grace = '10s'
+[enrollment]
+url = 'http://127.0.0.1:$repoPort/enroll'
+key = 'unused-preplaced'
 "@
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
 

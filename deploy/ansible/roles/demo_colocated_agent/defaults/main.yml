@@ -1,0 +1,4 @@
+---
+# The hostname pins the enrollment identity; the `-manual-` segment is what the UI reads as the
+# Magnolia role, so this node shows up as `magnolia · manual`.
+demo_colocated_hostname: magnolia-manual-vm

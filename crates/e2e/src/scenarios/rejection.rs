@@ -16,7 +16,10 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
         Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
             .check_interval("1s")
             .health_grace("1s")
-            .health(svc)
+            // Deliberately much shorter than the observation below. This is the generic
+            // transient retry delay, not permission to retry proven-bad content.
+            .retry_after("1s")
+            .readiness_health(svc)
             .guardian()
     };
 
@@ -26,11 +29,21 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     {
         let cmd = make()?;
         let sup = Service::spawn("reject-1", &cmd);
+        // A candidate that fails its health gate during activation is rejected by the
+        // transaction, which leaves a durable rollback journal and terminates the
+        // disposable supervisor; the guardian relaunches it and boot recovery rejects the
+        // bad bytes and restores v1 — the single rollback path.
+        if !sup.wait_for_log(
+            "recovery: rejected 2.0.0 after failed activation",
+            EVENT_TIMEOUT,
+        ) {
+            return fail("boot recovery did not reject the crashing v2");
+        }
         if !sup.wait_for_log(
             "restoring predecessor 1.0.0 after interrupted activation of 2.0.0",
             EVENT_TIMEOUT,
         ) {
-            return fail("the crashing v2 was not rejected on recovery");
+            return fail("boot recovery did not roll back to v1.0.0");
         }
         if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
             return fail("the tower did not recover to v1.0.0 after rejecting v2");

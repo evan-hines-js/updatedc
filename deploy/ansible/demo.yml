@@ -1,0 +1,31 @@
+---
+# The entire operator-demo UX on ONE server. Run it ON the server:
+#
+#     cd updated && ansible-playbook deploy/ansible/demo.yml
+#
+# It installs the deps (docker/kind/kubectl/rust), brings up the kind demo (operator + CDN +
+# fleet + Magnolia), routes every endpoint through nginx, and provisions a co-located
+# out-of-cluster agent on this same host that doubles as the external Magnolia VM — it reaches
+# the in-cluster gateway locally (resolving updatec-gateway to nginx on 127.0.0.1; no socat, no
+# LAN-IP). When it finishes, browse to http://<this-server>/ .
+- name: updated operator demo (single server)
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    demo_root: "{{ (playbook_dir + '/../..') | realpath }}"
+    demo_namespace: updated-system
+    demo_cluster: updatec-demo
+    demo_kube_context: kind-updatec-demo
+  roles:
+    # Order matters: bring up the cluster + gateway ingress, enroll the co-located agent, THEN
+    # apply the demo layer (which labels that now-enrolled agent into the manual Magnolia group).
+    - demo_deps
+    - demo_cluster
+    - demo_ingress
+    - demo_colocated_agent
+    - demo_app
+  post_tasks:
+    - name: Where to reach the demo
+      ansible.builtin.debug:
+        msg: "Demo is up — browse to http://{{ ansible_default_ipv4.address | default('<this-server>') }}/"

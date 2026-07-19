@@ -9,10 +9,10 @@
 //! independent (unique dirs + ports) and run on a bounded thread pool; set
 //! `E2E_JOBS=1` to run them one at a time in order.
 
-mod harness;
 mod scenarios;
 
-use harness::*;
+pub use e2e::fixtures::*;
+pub use e2e::harness::*;
 use scenarios::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,7 +28,7 @@ fn main() {
         }
         return;
     }
-    if let Err(e) = run() {
+    if let Err(e) = run_suite() {
         eprintln!("\x1b[1;31mFAIL: {e}\x1b[0m");
         std::process::exit(1);
     }
@@ -50,6 +50,13 @@ fn run_lifecycle_fixture() -> R {
     let id = std::env::var("UPDATED_LIFECYCLE_ATTEMPT_ID").map_err(|error| error.to_string())?;
     let candidate_version =
         std::env::var("UPDATED_CANDIDATE_VERSION").map_err(|error| error.to_string())?;
+    // `pre-start` is a per-boot environment hook (attempt id "boot"), not a transaction lifecycle
+    // phase. Every attempts.log assertion reads the file as the transaction's phase sequence, so a
+    // faithfully-provisioned seed — whose installed record now carries its provider set and thus
+    // fires pre-start on each launch — must not pollute it. Succeed as a no-op without recording.
+    if phase == "pre-start" {
+        return Ok(());
+    }
     std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
     let mut attempts = std::fs::OpenOptions::new()
         .create(true)
@@ -90,6 +97,24 @@ fn run_lifecycle_fixture() -> R {
     let fail_forward_candidate = candidate_version == "2.0.0" && fail_phase == Some(phase.as_str());
     if fail_forward_candidate || fail_start_and_rollback {
         return fail(format!("injected {phase} failure"));
+    }
+    // A hook that *hangs* (rather than cleanly exiting non-zero) must be bounded by the
+    // supervisor's provider timeout and treated as a failure — not left to stall the update
+    // indefinitely. Hang only the forward candidate's target phase, well past the 5s provider
+    // timeout, so the supervisor kills us; the rollback (which reverses candidate/predecessor,
+    // so this guard no longer matches) then runs normally.
+    if mode.strip_prefix("hang-") == Some(phase.as_str()) && candidate_version == "2.0.0" {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+    // A post-drain grace: hold briefly on the post-drain phase (which runs after the
+    // guardian has already flipped readyz to unready) so a readiness-aware load balancer
+    // observes the failed probe and stops routing before the old release is stopped. Every
+    // other phase is a no-op — the point is how little a real drain integration needs.
+    if mode == "drain-grace" {
+        if phase == "drain" {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        return Ok(());
     }
     // The mixed-artifact scenario uses the Magnolia adapter only while the
     // Magnolia-shaped release is the candidate. Its following ordinary binary
@@ -134,8 +159,18 @@ fn run_lifecycle_fixture() -> R {
                 std::fs::copy(live.join("app.war"), backup.join("app.war")).map_err(str_err)?;
                 "backup-created"
             }
-            "drain" => {
+            "pre-drain" => {
                 require("backup-created")?;
+                // The pre-drain hook runs a script while the node is still IN rotation —
+                // before drain withdraws it from traffic. Prove that ordering: the drain
+                // flag must not be set yet.
+                if live.join("draining").exists() {
+                    return fail("Magnolia pre-drain ran after the node was out of rotation");
+                }
+                "pre-drain-script-ran"
+            }
+            "drain" => {
+                require("pre-drain-script-ran")?;
                 std::fs::write(live.join("draining"), b"true\n").map_err(str_err)?;
                 "authors-drained"
             }
@@ -201,20 +236,48 @@ fn scenarios() -> Vec<Scenario> {
             app_update_and_rollback,
         ),
         (
+            "a stop-start upgrade drains to zero downtime behind a readiness-aware load balancer",
+            zero_downtime_stop_start,
+        ),
+        (
             "bootstrap cold-installs the first application from only the update runtime",
             bootstrap_cold_installs_first_application,
+        ),
+        (
+            "the install machine hands off cleanly to the update machine (no journal overlap)",
+            cold_install_hands_off_to_update,
         ),
         (
             "a committed update that crashes after health is reverted + rejected (one strike)",
             app_post_health_crash_reverts,
         ),
         (
+            "signed chaotic applications fail closed across distinct health failure modes",
+            chaotic_application_health_failures,
+        ),
+        (
+            "a stateless cold node descends past a broken assigned head to the newest healthy release",
+            cold_install_descends_past_broken_head,
+        ),
+        (
+            "a crash at every install boundary then a stateless emptyDir wipe reconverges to a live cold install",
+            stateless_install_chaos,
+        ),
+        (
+            "a cold node rejects a malformed (unextractable) assigned bundle at ingest and descends to a healthy release",
+            cold_install_descends_past_corrupt_bundle,
+        ),
+        (
             "two nodes receive one group release; only the failing node rolls back",
             group_peer_failure_is_node_local,
         ),
         (
-            "a tampered pinned root blocks updates but not the verified offline baseline",
+            "a tampered enrollment trust root fails closed before application launch",
             tampered_root_fails_closed,
+        ),
+        (
+            "a signed local deployment repairs a modified bundle with no network",
+            signed_local_repair_without_network,
         ),
         (
             "a second supervisor on the same install is refused",
@@ -226,6 +289,7 @@ fn scenarios() -> Vec<Scenario> {
         ),
         ("custom provider preflight failure is contained", provider_preflight_failure),
         ("custom provider prepare failure is contained", provider_prepare_failure),
+        ("custom provider pre-drain failure is contained", provider_pre_drain_failure),
         ("custom provider drain failure is contained", provider_drain_failure),
         ("custom provider stop failure is contained", provider_stop_failure),
         ("custom provider activate failure rolls back", provider_activate_failure),
@@ -233,6 +297,7 @@ fn scenarios() -> Vec<Scenario> {
         ("custom provider verify failure rolls back", provider_verify_failure),
         ("custom provider finalize failure rolls back", provider_finalize_failure),
             ("custom provider rollback failure remains recoverable", provider_rollback_failure),
+            ("a wedged (hanging) provider hook is bounded by the timeout at every phase", provider_hook_hangs_are_bounded),
             ("a Magnolia-shaped Java upgrade wrapper completes every lifecycle step", magnolia_shaped_upgrade),
             ("an install switches sample app -> Magnolia-shaped -> sample app", sample_magnolia_sample_transition),
             ("a failed Magnolia migration restores its WAR and content backup", magnolia_shaped_failed_migration_rolls_back),
@@ -270,20 +335,32 @@ fn scenarios() -> Vec<Scenario> {
     {
         s.push(("the TUF role keys are owner-only (0600)", key_perms));
         s.push((
-            "zero-downtime reexec reload drops no requests under load",
+            "a health-check provider gates first install and upgrade, replacing the HTTP probe",
+            health_check_provider_gates_readiness,
+        ));
+        s.push((
+            "zero-downtime custom-provider reload drops no requests under load",
             zero_downtime_reexec,
         ));
         s.push((
-            "an unexecutable reexec candidate is rejected without downtime; the next release upgrades",
+            "an unexecutable custom-reload candidate is rejected without downtime; the next release upgrades",
             reexec_rejects_unexecutable_without_downtime,
         ));
         s.push((
-            "a failed reexec preflight touches no live or durable activation state",
+            "a failed custom-reload preflight touches no live or durable activation state",
             reexec_preflight_rejects_without_activation,
+        ));
+        s.push((
+            "a stateless cold node descends past wedged (alive-but-unhealthy) assigned heads to the newest healthy release",
+            cold_install_descends_past_wedged_head,
         ));
     }
     // Chaos recovery runs last: it replays every transaction boundary, so it is by
     // far the slowest scenario.
+    s.push((
+        "crash at every cold-install boundary; recovery completes the first install",
+        install_chaos_recovery,
+    ));
     s.push((
         "crash at every update boundary; a fresh supervisor recovers",
         chaos_recovery,
@@ -303,7 +380,7 @@ fn scenarios() -> Vec<Scenario> {
     s
 }
 
-fn run() -> R {
+fn run_suite() -> R {
     let ctx = Ctx::new()?;
     step("build workspace binaries");
     ctx.build()?;
@@ -359,7 +436,10 @@ fn run() -> R {
                 let secs = began.elapsed().as_secs_f64();
                 match &res {
                     Ok(()) => println!("\x1b[1;32mPASS\x1b[0m ({secs:>5.1}s) {name}"),
-                    Err(e) => println!("\x1b[1;31mFAIL\x1b[0m ({secs:>5.1}s) {name}: {e}"),
+                    Err(e) => println!(
+                        "\x1b[1;31mFAIL\x1b[0m ({secs:>5.1}s) {name}: {e}{}",
+                        dump_install_state(&ctx.work)
+                    ),
                 }
                 results.lock().unwrap().push((name, res));
             });
@@ -413,435 +493,15 @@ fn ok(msg: &str) {
     println!("\x1b[1;32m{msg}\x1b[0m");
 }
 
-fn app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
-    ctx.work.join(format!("build/app-{v}{}", ctx.exe))
-}
 
-#[cfg(unix)]
-fn reexec_app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
-    ctx.work.join(format!("build/reexec-app-{v}{}", ctx.exe))
-}
 
-fn supervisor_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
-    ctx.work.join(format!("build/supervisor-{v}{}", ctx.exe))
-}
 
-/// The managed-app command line (binary path + args) for a scenario config.
-fn appcmd(app: &Path, args: &[&str]) -> Vec<String> {
-    let mut v = vec![app.display().to_string()];
-    v.extend(args.iter().map(|s| s.to_string()));
-    v
-}
 
-/// A TOML literal string (single-quoted, no escaping) — safe for Windows paths.
-fn lit(s: &str) -> String {
-    format!("'{s}'")
-}
 
-/// Writes a scenario's config file and yields a guardian command — the whole tower.
-/// The guardian (`bootstrap`) launches the disposable supervisor, which owns the update
-/// policy and drives the guardian to run the application. Production launches nothing
-/// else; there is no way to run the supervisor standalone.
-pub struct Sup {
-    root: PathBuf,
-    repository_base_url: String,
-    supervisor_bin: PathBuf,
-    server_bin: PathBuf,
-    platform: String,
-    exe: &'static str,
-    guardian_bin: PathBuf,
-    oneshot_bin: PathBuf,
-    dir: PathBuf,
-    product: String,
-    install_root: PathBuf,
-    seed_binary: PathBuf,
-    args: Vec<String>,
-    health_url: Option<String>,
-    check_interval: Option<String>,
-    health_grace: Option<String>,
-    confirmation_window: Option<String>,
-    lifecycle_command: Option<Vec<String>>,
-    reexec: bool,
-    supervisor_check_interval: Option<String>,
-    ready_timeout: Option<String>,
-    seed_application: bool,
-    /// Override the supervisor binary the guardian runs (self-update tests supply a
-    /// specific version); defaults to the built one.
-    supervisor_override: Option<PathBuf>,
-}
 
-impl Sup {
-    /// The tower managing `command` (the app binary + args) against the repo under
-    /// `dir` served at `srv`, for `product`.
-    pub fn new(ctx: &Ctx, dir: &Path, srv: &str, product: &str, command: Vec<String>) -> Self {
-        let seed_binary = PathBuf::from(command.first().expect("app command requires binary"));
-        Sup {
-            root: ctx.root(dir),
-            repository_base_url: format!("http://{srv}/"),
-            supervisor_bin: ctx.supervisor.clone(),
-            server_bin: ctx.server.clone(),
-            platform: ctx.platkey.clone(),
-            exe: ctx.exe,
-            guardian_bin: ctx.bootstrap.clone(),
-            oneshot_bin: ctx.oneshot.clone(),
-            dir: dir.to_path_buf(),
-            product: product.into(),
-            install_root: dir.join("install"),
-            seed_binary,
-            args: command.into_iter().skip(1).collect(),
-            health_url: None,
-            check_interval: None,
-            health_grace: None,
-            confirmation_window: None,
-            lifecycle_command: None,
-            reexec: false,
-            supervisor_check_interval: None,
-            ready_timeout: None,
-            seed_application: true,
-            supervisor_override: None,
-        }
-    }
-    pub fn health(mut self, svc: &str) -> Self {
-        self.health_url = Some(format!("http://{svc}/healthz"));
-        self
-    }
-    pub fn check_interval(mut self, s: &str) -> Self {
-        self.check_interval = Some(s.into());
-        self
-    }
-    pub fn health_grace(mut self, s: &str) -> Self {
-        self.health_grace = Some(s.into());
-        self
-    }
-    pub fn confirmation_window(mut self, s: &str) -> Self {
-        self.confirmation_window = Some(s.into());
-        self
-    }
-    pub fn reexec(mut self, command: Vec<String>) -> Self {
-        self.reexec = true;
-        self.lifecycle_command = Some(command);
-        self
-    }
-    pub fn lifecycle(mut self, command: Vec<String>) -> Self {
-        self.lifecycle_command = Some(command);
-        self
-    }
-    pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
-        self.supervisor_check_interval = Some(check_interval.into());
-        self
-    }
-    /// How long a replacement supervisor has to prove ready before the guardian rolls back.
-    pub fn ready_timeout(mut self, secs: &str) -> Self {
-        self.ready_timeout = Some(secs.into());
-        self
-    }
-    /// Run this supervisor binary instead of the default (self-update tests).
-    pub fn supervisor_bin(mut self, path: &Path) -> Self {
-        self.supervisor_override = Some(path.to_path_buf());
-        self
-    }
 
-    /// Start with only bootstrap + supervisor; the supervisor must install the
-    /// first trusted application before the guardian launches anything.
-    pub fn cold_install(mut self) -> Self {
-        self.seed_application = false;
-        self
-    }
 
-    /// The guardian's state directory for this scenario.
-    pub fn state_dir(&self) -> PathBuf {
-        self.dir.join("guardian-state")
-    }
 
-    fn write_config(&self) -> R<PathBuf> {
-        if self.seed_application {
-            self.seed_install()?;
-        }
-        let mut t = format!(
-            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/agents/agent.json'\ntransport_timeout = '5s'\n\n[repository]\nroot = {}\ntransport_timeout = '5s'\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
-            lit(&self.root.display().to_string()),
-            lit(&self.repository_base_url),
-            lit(&self.root.display().to_string()),
-            lit(&self.product),
-            lit(&self.install_root.display().to_string()),
-            self.args.iter().map(|s| lit(s)).collect::<Vec<_>>().join(", "),
-        );
-        if let Some(u) = &self.health_url {
-            t += &format!("health_url = {}\n", lit(u));
-        }
-        if let Some(c) = &self.lifecycle_command {
-            let (program, provider_args) = c
-                .split_first()
-                .ok_or("lifecycle command requires an executable")?;
-            let program = resolve_executable(program)?;
-            #[cfg(unix)]
-            let (published_source, published_entrypoint, signed_args) =
-                if program.file_name().and_then(|name| name.to_str()) == Some("sh")
-                    && provider_args.first().map(String::as_str) == Some("-c")
-                    && provider_args.len() == 2
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let tree = self.dir.join("lifecycle-provider-source");
-                    let published_entrypoint = "bin/lifecycle".to_string();
-                    std::fs::create_dir_all(tree.join("bin")).map_err(str_err)?;
-                    let entrypoint = tree.join(&published_entrypoint);
-                    std::fs::write(&entrypoint, format!("#!/bin/sh\n{}\n", provider_args[1]))
-                        .map_err(str_err)?;
-                    let mut permissions = std::fs::metadata(&entrypoint)
-                        .map_err(str_err)?
-                        .permissions();
-                    permissions.set_mode(0o755);
-                    std::fs::set_permissions(&entrypoint, permissions).map_err(str_err)?;
-                    (tree, published_entrypoint, Vec::new())
-                } else {
-                    (
-                        program.clone(),
-                        format!("bin/lifecycle{}", self.exe),
-                        provider_args.to_vec(),
-                    )
-                };
-            #[cfg(not(unix))]
-            let (published_source, published_entrypoint, signed_args) = (
-                program.clone(),
-                format!("bin/lifecycle{}", self.exe),
-                provider_args.to_vec(),
-            );
-            let provider_product = format!("{}-lifecycle", self.product);
-            harness::run(
-                Command::new(&self.server_bin)
-                    .arg("publish-provider-artifact")
-                    .arg("--repo")
-                    .arg(self.dir.join("repo"))
-                    .arg("--keys")
-                    .arg(self.dir.join("keys"))
-                    .args(["--product", &provider_product, "--version", "1.0.0"])
-                    .arg("--bundle")
-                    .arg(format!("{}={}", self.platform, published_source.display()))
-                    .args(["--entrypoint", &published_entrypoint]),
-            )?;
-            let provider_path = harness::release_target(
-                &provider_product,
-                "stable",
-                "1.0.0",
-                &self.platform,
-                &provider_product,
-            );
-            let provider_sha = target_sha256(&self.server_bin, &self.dir, &provider_path)?;
-            let mut provider_set = Command::new(&self.server_bin);
-            provider_set
-                .arg("publish-provider-set")
-                .arg("--repo")
-                .arg(self.dir.join("repo"))
-                .arg("--keys")
-                .arg(self.dir.join("keys"))
-                .args(["--id", "default"])
-                .args(["--provider-path", &provider_path])
-                .args(["--provider-sha256", &provider_sha])
-                .args(["--provider-timeout-ms", "5000"]);
-            for arg in &signed_args {
-                provider_set.args(["--provider-arg", arg]);
-            }
-            harness::run(&mut provider_set)?;
-            republish_assignment(self, "provider-default")?;
-            if self.reexec {
-                t += "\n[application.activation]\nmode = \"reexec\"\n";
-            }
-        }
-        // Tests poll with generous failure deadlines, but the system under test must
-        // react quickly after a transient local-repository failure.
-        let mut to = "refresh_retry = '1s'\n".to_string();
-        for (k, v) in [
-            ("check_interval", &self.check_interval),
-            ("health_grace", &self.health_grace),
-            ("confirmation_window", &self.confirmation_window),
-            ("supervisor_check_interval", &self.supervisor_check_interval),
-        ] {
-            if let Some(v) = v {
-                to += &format!("{k} = {}\n", lit(v));
-            }
-        }
-        t += &format!("\n[timeouts]\n{to}");
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let path = self.dir.join(format!(
-            "config-{}.toml",
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&path, t).map_err(str_err)?;
-        Ok(path)
-    }
-
-    fn seed_install(&self) -> R {
-        let paths = updated::config::Paths {
-            install_root: self.install_root.clone(),
-            versions: self.install_root.join("versions"),
-            staging: self.install_root.join("staging"),
-            active_release: self.install_root.join("active-release"),
-            download: self.install_root.join("staging/bundle.download"),
-            state: self.install_root.join("state/installed.json"),
-            datastore: self.install_root.join("state/tuf"),
-            routing_datastore: self.install_root.join("state/routing-tuf"),
-            assignment: self.install_root.join("state/repository-assignment.json"),
-            journal: self.install_root.join("state/transaction.json"),
-            rejected: self.install_root.join("state/rejected"),
-            app_token: self.install_root.join("state/app-token"),
-            provider_versions: self.install_root.join("providers/versions"),
-            provider_staging: self.install_root.join("providers/staging"),
-            provider_download: self.install_root.join("providers/staging/bundle.download"),
-        };
-        if matches!(
-            updated::state::read_installed(&paths.state),
-            updated::state::Installed::Present(_)
-        ) {
-            return Ok(());
-        }
-        let prepared = self.install_root.join("seed-source");
-        std::fs::create_dir_all(prepared.join("bin")).map_err(str_err)?;
-        std::fs::create_dir_all(prepared.join("config")).map_err(str_err)?;
-        let entrypoint = format!("bin/app{}", if cfg!(windows) { ".exe" } else { "" });
-        std::fs::copy(&self.seed_binary, prepared.join(&entrypoint)).map_err(str_err)?;
-        std::fs::write(
-            prepared.join("config/release.toml"),
-            "version = \"1.0.0\"\n",
-        )
-        .map_err(str_err)?;
-        std::fs::create_dir_all(self.install_root.join("state")).map_err(str_err)?;
-        updated::bundle::create_bundle(
-            &prepared,
-            &paths.download,
-            &self.product,
-            "1.0.0",
-            &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            &entrypoint,
-        )
-        .map_err(str_err)?;
-        let staged = updated::provider::BundleStore::for_app(&paths)
-            .install(
-                &paths.download,
-                &updated::bundle::ExpectedBundle {
-                    product: &self.product,
-                    version: "1.0.0",
-                    platform: &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-                },
-            )
-            .map_err(str_err)?;
-        updated::bundle::write_active(&paths.active_release, &staged.id).map_err(str_err)?;
-        let lineage = updated::state::RepositoryLineage::from_metadata_url(&format!(
-            "{}metadata/",
-            self.repository_base_url
-        ));
-        updated::state::enroll(&paths.state, lineage.clone()).map_err(str_err)?;
-        updated::state::write_installed(
-            &paths.state,
-            &updated::state::InstalledState::confirmed(lineage, staged.id, staged.archive_sha256),
-        )
-        .map_err(str_err)
-    }
-
-    /// A guardian command: `bootstrap --state-dir <dir> --supervisor-config <cfg>
-    /// --supervisor <supervisor>`. This is the whole tower — the guardian owns the app,
-    /// launches the supervisor, and reflects the app's exit code.
-    pub fn guardian(self) -> R<Command> {
-        let state_dir = self.state_dir();
-        std::fs::create_dir_all(&state_dir).map_err(str_err)?;
-        let supervisor = self
-            .supervisor_override
-            .clone()
-            .unwrap_or_else(|| self.supervisor_bin.clone());
-        let ready_timeout = self.ready_timeout.clone().unwrap_or_else(|| "30".into());
-        let cfg = self.write_config()?;
-        let mut c = Command::new(&self.guardian_bin);
-        c.arg("--state-dir")
-            .arg(&state_dir)
-            .arg("--supervisor-config")
-            .arg(&cfg)
-            .arg("--supervisor")
-            .arg(&supervisor)
-            .arg("--ready-timeout")
-            .arg(&ready_timeout)
-            .arg("--confirm-timeout")
-            .arg("1");
-        Ok(c)
-    }
-
-    /// A one-shot updater command (`updated-oneshot --config <written file>`). Shares
-    /// the exact same config the supervisor reads.
-    pub fn oneshot(self) -> R<Command> {
-        let cfg = self.write_config()?;
-        let mut c = Command::new(&self.oneshot_bin);
-        c.arg("--config").arg(cfg);
-        Ok(c)
-    }
-}
-
-fn target_sha256(server: &Path, dir: &Path, name: &str) -> R<String> {
-    let output = Command::new(server)
-        .arg("target-sha256")
-        .arg("--repo")
-        .arg(dir.join("repo"))
-        .arg("--name")
-        .arg(name)
-        .output()
-        .map_err(str_err)?;
-    if !output.status.success() {
-        return fail(format!(
-            "reading target {name} digest failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(String::from_utf8(output.stdout)
-        .map_err(|error| error.to_string())?
-        .trim()
-        .to_string())
-}
-
-fn republish_assignment(sup: &Sup, deployment: &str) -> R {
-    let desired = std::fs::read_to_string(sup.dir.join("desired-app")).map_err(str_err)?;
-    let mut desired = desired.lines();
-    let app_path = desired
-        .next()
-        .ok_or("desired application path is missing")?;
-    let app_sha = desired
-        .next()
-        .ok_or("desired application hash is missing")?;
-    let set_path = "provider-sets/default.json";
-    let set_sha = target_sha256(&sup.server_bin, &sup.dir, set_path)?;
-    harness::run(
-        Command::new(&sup.server_bin)
-            .arg("publish-assignment")
-            .arg("--repo")
-            .arg(sup.dir.join("repo"))
-            .arg("--keys")
-            .arg(sup.dir.join("keys"))
-            .args(["--name", "assignments/agents/agent.json"])
-            .args([
-                "--metadata-url",
-                &format!("{}metadata/", sup.repository_base_url),
-            ])
-            .args([
-                "--targets-url",
-                &format!("{}targets/", sup.repository_base_url),
-            ])
-            .args(["--deployment", deployment])
-            .args(["--application-path", app_path])
-            .args(["--application-sha256", app_sha])
-            .args(["--provider-set-path", set_path])
-            .args(["--provider-set-sha256", &set_sha]),
-    )
-}
-
-fn resolve_executable(program: &str) -> R<PathBuf> {
-    let path = PathBuf::from(program);
-    if path.components().count() > 1 {
-        return Ok(path);
-    }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-        .ok_or_else(|| format!("lifecycle executable {program:?} was not found on PATH"))
-}
 
 #[cfg(test)]
 mod tests {

@@ -15,7 +15,7 @@ use tough::editor::RepositoryEditor;
 use tough::key_source::{KeySource, LocalKeySource};
 use tough::schema::decoded::{Decoded, Hex};
 use tough::schema::key::Key;
-use tough::schema::{KeyHolder, RoleKeys, RoleType, Root, Target};
+use tough::schema::{KeyHolder, RoleKeys, RoleType, Root, Signed, Target};
 use tough::sign::{parse_keypair, Sign};
 use tough::{FilesystemTransport, RepositoryLoader, TargetName};
 use url::Url;
@@ -37,27 +37,39 @@ fn err(context: &str, e: impl std::fmt::Display) -> RepoError {
     RepoError(format!("{context}: {e}"))
 }
 
-/// Paths to the four TUF role signing keys (ed25519 pkcs8).
+/// Paths to the TUF role signing keys (ed25519 pkcs8). The root role carries **two keys
+/// side-by-side** (an active key and a pre-provisioned successor) so the root can be
+/// rotated without a flag day: a new root version is co-signed by a retained key and a
+/// fresh one, and clients follow the version chain. The online roles have one key each.
 pub struct Keys {
-    pub root: PathBuf,
+    /// Root-role keys, `roots[0]` active and any remainder pre-provisioned successors.
+    pub roots: Vec<PathBuf>,
     pub targets: PathBuf,
     pub snapshot: PathBuf,
     pub timestamp: PathBuf,
 }
 
 impl Keys {
-    /// The standard key file layout under `dir`.
+    /// The standard key file layout under `dir`: `root.pk8` (active) and, when present,
+    /// `root.next.pk8` (the side-by-side successor). A repository minted single-key (e.g.
+    /// the operator's assignment repo) simply has no `root.next.pk8`.
     pub fn in_dir(dir: &Path) -> Self {
+        let mut roots = vec![dir.join("root.pk8")];
+        let successor = dir.join("root.next.pk8");
+        if successor.exists() {
+            roots.push(successor);
+        }
         Keys {
-            root: dir.join("root.pk8"),
+            roots,
             targets: dir.join("targets.pk8"),
             snapshot: dir.join("snapshot.pk8"),
             timestamp: dir.join("timestamp.pk8"),
         }
     }
-    fn all(&self) -> [(RoleType, &PathBuf); 4] {
+
+    /// The single-key online roles (targets, snapshot, timestamp).
+    fn online(&self) -> [(RoleType, &PathBuf); 3] {
         [
-            (RoleType::Root, &self.root),
             (RoleType::Targets, &self.targets),
             (RoleType::Snapshot, &self.snapshot),
             (RoleType::Timestamp, &self.timestamp),
@@ -100,6 +112,20 @@ impl PublishTarget {
             custom,
         }
     }
+
+    /// Bind the provider set this application version was published with into the target's
+    /// signed custom metadata. When an ordered-fallback descent selects this older app
+    /// version, it re-selects exactly these providers — so the app and its providers roll
+    /// back as one signed unit, never pairing an old app with the head's newer providers.
+    /// The assignment's own `provider_set` still governs the assigned *head*, so providers
+    /// remain independently revisable there without republishing the app.
+    pub fn with_provider_set(mut self, path: &str, sha256: &str) -> Self {
+        self.custom.insert(
+            "provider_set".into(),
+            serde_json::json!({ "path": path, "sha256": sha256 }),
+        );
+        self
+    }
 }
 
 /// Generate the four ed25519 role keys under `keys_dir` if they are not present.
@@ -107,18 +133,38 @@ pub async fn generate_keys(keys_dir: &Path) -> Result<Keys> {
     tokio::fs::create_dir_all(keys_dir)
         .await
         .map_err(|e| err("creating key dir", e))?;
-    let keys = Keys::in_dir(keys_dir);
     let rng = SystemRandom::new();
-    for (_role, path) in keys.all() {
+    // Two root keys side-by-side (active + successor) so the root is rotatable from day one.
+    for name in [
+        "root.pk8",
+        "root.next.pk8",
+        "targets.pk8",
+        "snapshot.pk8",
+        "timestamp.pk8",
+    ] {
+        let path = keys_dir.join(name);
         if path.exists() {
-            validate_key_file(path)?;
+            validate_key_file(&path)?;
             continue;
         }
         let pkcs8 =
             Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| err("generating ed25519 key", e))?;
-        create_key_file(path, pkcs8.as_ref())?;
+        create_key_file(&path, pkcs8.as_ref())?;
     }
-    Ok(keys)
+    Ok(Keys::in_dir(keys_dir))
+}
+
+/// Mint a single fresh ed25519 root key at `path` (mode 0600). Used to provision the new
+/// successor when rotating the root. Fails if `path` already exists.
+pub async fn generate_root_key(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| err("creating key dir", e))?;
+    }
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|e| err("generating ed25519 key", e))?;
+    create_key_file(path, pkcs8.as_ref())
 }
 
 fn create_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -159,6 +205,20 @@ fn validate_key_file(path: &Path) -> Result<()> {
             )));
         }
     }
+    // No portable file-mode enforcement exists off Unix, so the 0600 guarantee cannot be
+    // upheld there. The control plane runs on Linux; this path is only reached in non-Unix
+    // dev/test. Warn loudly and proceed rather than silently skipping the check.
+    #[cfg(not(unix))]
+    {
+        foundation::log::warn(
+            "updated-tuf",
+            &format!(
+                "cannot enforce 0600 permissions on signing key {} on this platform; \
+                 proceeding without file-mode protection",
+                path.display()
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -176,12 +236,27 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
 
     let expires = expiry(expiry_days)?;
 
-    // Build root.json: one ed25519 key per role, threshold 1.
+    // Build root.json. The root role lists every provided root key (threshold 1, so any one
+    // can sign a rotation); each online role has a single key.
     let mut root_keys: HashMap<Decoded<Hex>, Key> = HashMap::new();
     let mut roles: HashMap<RoleType, RoleKeys> = HashMap::new();
-    for (role, path) in keys.all() {
-        let signer = load_signer(path)?;
-        let key = signer.tuf_key();
+    let mut root_keyids = Vec::new();
+    for path in &keys.roots {
+        let key = load_signer(path)?.tuf_key();
+        let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
+        root_keys.insert(keyid.clone(), key);
+        root_keyids.push(keyid);
+    }
+    roles.insert(
+        RoleType::Root,
+        RoleKeys {
+            keyids: root_keyids,
+            threshold: nz(1),
+            _extra: HashMap::new(),
+        },
+    );
+    for (role, path) in keys.online() {
+        let key = load_signer(path)?.tuf_key();
         let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
         root_keys.insert(keyid.clone(), key);
         roles.insert(
@@ -206,14 +281,10 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
         _extra: HashMap::new(),
     };
     let rng = SystemRandom::new();
-    let signed_root = SignedRole::new(
-        root.clone(),
-        &KeyHolder::Root(root),
-        &[local(&keys.root)],
-        &rng,
-    )
-    .await
-    .map_err(|e| err("signing root", e))?;
+    let root_sources: Vec<Box<dyn KeySource>> = keys.roots.iter().map(|p| local(p)).collect();
+    let signed_root = SignedRole::new(root.clone(), &KeyHolder::Root(root), &root_sources, &rng)
+        .await
+        .map_err(|e| err("signing root", e))?;
     // The pinned root and the versioned root the client fetches for rotation.
     tokio::fs::write(metadata_dir.join("root.json"), signed_root.buffer())
         .await
@@ -244,6 +315,123 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
         .await
         .map_err(|e| err("signing initial metadata", e))?;
     publish_metadata(&signed, &metadata_dir).await?;
+    Ok(())
+}
+
+/// Rotate the root role: publish a new root version whose key set is the `retained` keys
+/// (which must already be in the current root, providing continuity) plus the freshly
+/// minted `new_root_key`. The new version is co-signed by the retained keys — which
+/// authorizes the change under the *current* root — and the new key, so clients that trust
+/// any prior version follow the chain (`tough` does this automatically on load).
+///
+/// This is a root-key-only ceremony: the online roles (targets/snapshot/timestamp) are
+/// carried forward from the current root untouched, so their keys are never needed here and
+/// their signed metadata stays valid. Only `metadata/root.json` and the new versioned
+/// `metadata/<n>.root.json` are written; nothing else changes.
+pub async fn rotate_root(
+    repo_dir: &Path,
+    retained: &[PathBuf],
+    new_root_key: &Path,
+    expiry_days: i64,
+) -> Result<()> {
+    if retained.is_empty() {
+        return Err(RepoError(
+            "root rotation needs at least one retained key for continuity".into(),
+        ));
+    }
+    let metadata_dir = repo_dir.join("metadata");
+    let root_path = metadata_dir.join("root.json");
+    let bytes = tokio::fs::read(&root_path)
+        .await
+        .map_err(|e| err("reading root.json", e))?;
+    let current: Signed<Root> = serde_json::from_slice(&bytes).map_err(|e| err("parsing root.json", e))?;
+    let old = &current.signed;
+    let old_root_role = old
+        .roles
+        .get(&RoleType::Root)
+        .ok_or_else(|| RepoError("current root omits the root role".into()))?;
+
+    // Carry the online roles forward from the current root, unchanged.
+    let mut keys: HashMap<Decoded<Hex>, Key> = HashMap::new();
+    let mut roles: HashMap<RoleType, RoleKeys> = HashMap::new();
+    for role in [RoleType::Targets, RoleType::Snapshot, RoleType::Timestamp] {
+        let role_keys = old
+            .roles
+            .get(&role)
+            .ok_or_else(|| RepoError(format!("current root omits the {role:?} role")))?
+            .clone();
+        for keyid in &role_keys.keyids {
+            let key = old
+                .keys
+                .get(keyid)
+                .ok_or_else(|| RepoError(format!("current root omits a {role:?} key")))?
+                .clone();
+            keys.insert(keyid.clone(), key);
+        }
+        roles.insert(role, role_keys);
+    }
+
+    // New root role = retained continuity keys + the fresh successor.
+    let mut root_keyids = Vec::new();
+    let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
+    for path in retained {
+        let key = load_signer(path)?.tuf_key();
+        let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
+        if !old_root_role.keyids.contains(&keyid) {
+            return Err(RepoError(format!(
+                "retained key {} is not in the current root, so it cannot authorize a rotation",
+                path.display()
+            )));
+        }
+        keys.insert(keyid.clone(), key);
+        root_keyids.push(keyid);
+        sources.push(local(path));
+    }
+    let new_key = load_signer(new_root_key)?.tuf_key();
+    let new_keyid = new_key.key_id().map_err(|e| err("computing key id", e))?;
+    if old_root_role.keyids.contains(&new_keyid) {
+        return Err(RepoError(
+            "the new root key already belongs to the current root; provide a fresh key".into(),
+        ));
+    }
+    keys.insert(new_keyid.clone(), new_key);
+    root_keyids.push(new_keyid);
+    sources.push(local(new_root_key));
+    roles.insert(
+        RoleType::Root,
+        RoleKeys {
+            keyids: root_keyids,
+            threshold: nz(1),
+            _extra: HashMap::new(),
+        },
+    );
+
+    let next_version = nz(old.version.get() + 1);
+    let new_root = Root {
+        spec_version: old.spec_version.clone(),
+        consistent_snapshot: old.consistent_snapshot,
+        version: next_version,
+        expires: expiry(expiry_days)?,
+        keys,
+        roles,
+        _extra: HashMap::new(),
+    };
+    let rng = SystemRandom::new();
+    let signed_root = SignedRole::new(new_root.clone(), &KeyHolder::Root(new_root), &sources, &rng)
+        .await
+        .map_err(|e| err("signing rotated root", e))?;
+    // The versioned root is what clients fetch to walk the rotation chain; the unversioned
+    // pointer is the anchor for new enrollments.
+    tokio::fs::write(
+        metadata_dir.join(format!("{next_version}.root.json")),
+        signed_root.buffer(),
+    )
+    .await
+    .map_err(|e| err("writing versioned root.json", e))?;
+    tokio::fs::write(&root_path, signed_root.buffer())
+        .await
+        .map_err(|e| err("writing root.json", e))?;
+    foundation::durable::sync_dir(&metadata_dir).map_err(|e| err("syncing metadata dir", e))?;
     Ok(())
 }
 

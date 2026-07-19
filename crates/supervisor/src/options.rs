@@ -1,18 +1,22 @@
 use super::*;
-use updated::config::{config_path, Config};
+use updated::enrollment::bootstrap_path;
 
 /// Build the supervisor's runtime options from its one argument, `--config <path>`.
 /// Everything else lives in the TOML config (see [`updated::config`]); the guardian
 /// launches the supervisor with the same file, and supplies the control channel and
 /// state directory in the environment (see [`control`]).
-pub(crate) fn parse_args() -> Result<Options, String> {
-    let cfg = Config::load(&config_path("supervisor")?)?;
+pub(crate) async fn parse_args() -> Result<Options, String> {
+    let bootstrap = bootstrap_path("supervisor")?;
+    let state_dir = supervisor_state_dir()?;
+    let cfg = updated_tuf::resolve_managed_config(&bootstrap, &state_dir)
+        .await
+        .map_err(|error| format!("resolving signed managed configuration: {error}"))?;
     // One shared resolver derives every on-disk path (binary, state, datastore, and the
     // staging/journal/rejected/app-token siblings) so the supervisor and the
     // one-shot updater never re-derive them by hand and drift apart.
     let paths = cfg.resolve_paths()?;
 
-    let supervisor_update = build_supervisor_update(&cfg)?;
+    let supervisor_update = build_supervisor_update(&cfg, state_dir);
     Ok(Options {
         routing: cfg.routing,
         repository: cfg.repository,
@@ -26,7 +30,7 @@ pub(crate) fn parse_args() -> Result<Options, String> {
 
 /// Supervisor replacement requires the guardian's state directory, where verified
 /// content-addressed candidates are staged.
-fn build_supervisor_update(cfg: &Config) -> Result<SupervisorUpdate, String> {
+fn supervisor_state_dir() -> Result<PathBuf, String> {
     let Ok(state_dir) = std::env::var(control::STATE_DIR_ENV) else {
         return Err(
             "the supervisor was not launched by the guardian (no state directory); \
@@ -34,10 +38,13 @@ fn build_supervisor_update(cfg: &Config) -> Result<SupervisorUpdate, String> {
                 .into(),
         );
     };
-    let state_dir = PathBuf::from(state_dir);
-    Ok(SupervisorUpdate {
+    Ok(PathBuf::from(state_dir))
+}
+
+fn build_supervisor_update(cfg: &updated::config::Config, state_dir: PathBuf) -> SupervisorUpdate {
+    SupervisorUpdate {
         channel: cfg.application.channel.clone(),
         state_dir,
         check_interval: cfg.timeouts.supervisor_check_interval,
-    })
+    }
 }

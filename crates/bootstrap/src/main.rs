@@ -24,8 +24,10 @@
 mod app;
 mod guardian;
 mod log;
+mod probe;
 mod rand;
 mod record;
+mod service;
 mod supervisor;
 mod sys;
 
@@ -59,6 +61,7 @@ fn parse_args() -> Result<guardian::Config, String> {
     let mut ready_timeout = Duration::from_secs(45);
     let mut confirm_timeout = Duration::from_secs(30);
     let mut stop_grace = Duration::from_secs(10);
+    let mut probe_address = None;
 
     let mut args = std::env::args_os().skip(1);
     while let Some(flag) = args.next() {
@@ -70,6 +73,16 @@ fn parse_args() -> Result<guardian::Config, String> {
             "--ready-timeout" => ready_timeout = next_seconds(&mut args, flag)?,
             "--confirm-timeout" => confirm_timeout = next_seconds(&mut args, flag)?,
             "--stop-grace" => stop_grace = next_seconds(&mut args, flag)?,
+            "--probe-address" => {
+                let value = args.next().ok_or("--probe-address needs an IP:port")?;
+                probe_address = Some(
+                    value
+                        .to_str()
+                        .ok_or("--probe-address must be valid UTF-8")?
+                        .parse()
+                        .map_err(|_| "--probe-address needs an IP:port")?,
+                );
+            }
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -93,6 +106,7 @@ fn parse_args() -> Result<guardian::Config, String> {
         ready_timeout,
         confirm_timeout,
         stop_grace,
+        probe_address,
     })
 }
 
@@ -120,13 +134,15 @@ fn usage() {
         "bootstrap — the update tower's root and the application's permanent guardian\n\n\
          usage: bootstrap --state-dir <dir> --supervisor-config <path.toml> \\\n\
          \x20                [--supervisor <path>] [--ready-timeout <secs>]\n\
-         \x20                [--confirm-timeout <secs>] [--stop-grace <secs>]\n\n\
+         \x20                [--confirm-timeout <secs>] [--stop-grace <secs>]\n\
+         \x20                [--probe-address <IP:port>]\n\n\
          --state-dir          where the guardian keeps ownership + supervisor pointers\n\
          --supervisor-config  operator config, passed verbatim to each supervisor\n\
          --supervisor         initial supervisor binary (first boot only; seeds the pointer)\n\
          --ready-timeout      how long a replacement supervisor has to prove ready (default 45s)\n\
          --confirm-timeout    stability window before committing a replacement (default 30s)\n\
-         --stop-grace         graceful process-stop deadline before a hard kill (default 10s)"
+         --stop-grace         graceful process-stop deadline before a hard kill (default 10s)\n\
+         --probe-address      guardian /livez, /readyz, /startupz listener (disabled by default)"
     );
 }
 

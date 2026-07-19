@@ -39,6 +39,17 @@ pub(crate) struct BundleManifest {
     pub version: String,
     pub platform: String,
     pub entrypoint: String,
+    /// The provider's activation script — the operator-owned process transition, run for the
+    /// `Activate` hook. Its presence is what makes a deployment **reload in place**: the guardian
+    /// does not stop-start the process, the script reloads it (a SIGHUP/exec/vendor reload) and is
+    /// handed the running PID, and readiness must prove the version. Absent → the guardian
+    /// **restarts** the process (stop-start) and the forward `entrypoint` runs at the activate hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activate: Option<String>,
+    /// The provider's rollback script — its local "undo", run for the rollback hook. Absent → the
+    /// rollback hook falls back to `entrypoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<String>,
     pub files: Vec<ManifestFile>,
 }
 
@@ -85,6 +96,26 @@ pub struct StagedRelease {
     pub archive_sha256: String,
 }
 
+/// The scripts a bundle declares. `entrypoint` (the forward action) is always required; `activate`
+/// (the operator-owned reload) and `rollback` (the local undo) are optional deployment-provider
+/// scripts — an application bundle sets neither.
+pub struct Entrypoints<'a> {
+    pub entrypoint: &'a str,
+    pub activate: Option<&'a str>,
+    pub rollback: Option<&'a str>,
+}
+
+impl<'a> Entrypoints<'a> {
+    /// An application (or legacy single-script provider) bundle: just the forward entrypoint.
+    pub fn new(entrypoint: &'a str) -> Self {
+        Self {
+            entrypoint,
+            activate: None,
+            rollback: None,
+        }
+    }
+}
+
 /// Build the canonical deterministic application archive from a prepared release tree.
 /// `source` must not itself contain `manifest.json`; the publisher generates it from the
 /// exact files that will be archived.
@@ -94,10 +125,13 @@ pub fn create_bundle(
     product: &str,
     version: &str,
     platform: &str,
-    entrypoint: &str,
+    entrypoints: &Entrypoints<'_>,
 ) -> io::Result<()> {
     semver::Version::parse(version).map_err(invalid)?;
-    validate_relative(entrypoint, 1024)?;
+    validate_relative(entrypoints.entrypoint, 1024)?;
+    for script in [entrypoints.activate, entrypoints.rollback].into_iter().flatten() {
+        validate_relative(script, 1024)?;
+    }
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(invalid("bundle source is not a regular directory"));
@@ -109,7 +143,12 @@ pub fn create_bundle(
     for relative in &paths {
         let path = source.join(relative);
         let metadata = fs::symlink_metadata(&path)?;
-        let executable = relative == entrypoint || is_executable(&metadata);
+        // Every declared script is always executable regardless of the source file mode.
+        let declared = |s: Option<&str>| s == Some(relative.as_str());
+        let executable = relative == entrypoints.entrypoint
+            || declared(entrypoints.activate)
+            || declared(entrypoints.rollback)
+            || is_executable(&metadata);
         files.push(ManifestFile {
             path: relative.clone(),
             sha256: sha256_file(&path)?,
@@ -122,7 +161,9 @@ pub fn create_bundle(
         product: product.to_string(),
         version: version.to_string(),
         platform: platform.to_string(),
-        entrypoint: entrypoint.to_string(),
+        entrypoint: entrypoints.entrypoint.to_string(),
+        activate: entrypoints.activate.map(str::to_string),
+        rollback: entrypoints.rollback.map(str::to_string),
         files,
     };
     let expected = ExpectedBundle {
@@ -182,13 +223,22 @@ impl BundleManifest {
                 return Err(invalid("duplicate or case-colliding manifest path"));
             }
         }
-        let entry = self
-            .files
-            .iter()
-            .find(|file| file.path == self.entrypoint)
-            .ok_or_else(|| invalid("bundle entrypoint is not declared"))?;
-        if !entry.executable {
-            return Err(invalid("bundle entrypoint is not executable"));
+        // Every declared script must be a real, executable file in the tree.
+        for (kind, script) in [
+            ("entrypoint", Some(&self.entrypoint)),
+            ("activate script", self.activate.as_ref()),
+            ("rollback script", self.rollback.as_ref()),
+        ] {
+            let Some(script) = script else { continue };
+            validate_relative(script, 1024)?;
+            let file = self
+                .files
+                .iter()
+                .find(|file| &file.path == script)
+                .ok_or_else(|| invalid(format!("bundle {kind} is not declared")))?;
+            if !file.executable {
+                return Err(invalid(format!("bundle {kind} is not executable")));
+            }
         }
         Ok(())
     }
@@ -235,6 +285,12 @@ pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleMan
     let (manifest, entrypoint) = read_manifest(root, id)?;
     verify_tree(&root.join(id.directory_name()), &manifest)?;
     Ok((manifest, entrypoint))
+}
+
+/// Re-hash a committed release without exposing its manifest internals. Supervisors use
+/// this before every network refresh so local tampering is detected while fully offline.
+pub fn verify_release(root: &Path, id: &ReleaseId) -> io::Result<()> {
+    read_release(root, id).map(|_| ())
 }
 
 pub fn read_active(path: &Path) -> io::Result<Option<ReleaseId>> {
@@ -610,7 +666,7 @@ mod tests {
             "app",
             "2.0.0",
             "test-platform",
-            "bin/app",
+            &Entrypoints::new("bin/app"),
         )
         .unwrap();
         let staged = stage_bundle(
@@ -660,5 +716,51 @@ mod tests {
         assert!(BundleManifest::parse(unknown, &expected).is_err());
         let escaping = br#"{"schema":1,"product":"app","version":"1.0.0","platform":"test","entrypoint":"../app","files":[]}"#;
         assert!(BundleManifest::parse(escaping, &expected).is_err());
+    }
+
+    #[test]
+    fn manifest_validates_the_rollback_script_like_the_forward_entrypoint() {
+        let expected = ExpectedBundle {
+            product: "app",
+            version: "1.0.0",
+            platform: "test",
+        };
+        let digest = "a".repeat(64);
+        let manifest = |files: &str, rollback: &str| {
+            format!(
+                r#"{{"schema":{MANIFEST_SCHEMA},"product":"app","version":"1.0.0","platform":"test","entrypoint":"bin/app"{rollback},"files":[{files}]}}"#
+            )
+            .into_bytes()
+        };
+        let entry = format!(r#"{{"path":"bin/app","sha256":"{digest}","size":1,"executable":true}}"#);
+        let rollback_ok =
+            format!(r#"{{"path":"bin/rollback","sha256":"{digest}","size":1,"executable":true}}"#);
+        let rollback_not_exec =
+            format!(r#"{{"path":"bin/rollback","sha256":"{digest}","size":1,"executable":false}}"#);
+
+        // A declared, executable rollback script is accepted.
+        BundleManifest::parse(
+            &manifest(&format!("{entry},{rollback_ok}"), r#","rollback":"bin/rollback""#),
+            &expected,
+        )
+        .unwrap();
+        // A rollback that names a file not in the bundle is rejected.
+        assert!(BundleManifest::parse(
+            &manifest(&entry, r#","rollback":"bin/rollback""#),
+            &expected
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rollback script is not declared"));
+        // A declared-but-not-executable rollback is rejected.
+        assert!(BundleManifest::parse(
+            &manifest(&format!("{entry},{rollback_not_exec}"), r#","rollback":"bin/rollback""#),
+            &expected
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rollback script is not executable"));
+        // No rollback field at all is fine (the legacy single-entrypoint provider / an app bundle).
+        BundleManifest::parse(&manifest(&entry, ""), &expected).unwrap();
     }
 }

@@ -9,7 +9,8 @@ use std::io;
 use std::path::Path;
 
 use crate::bundle::ReleaseId;
-use crate::state::{LifecycleProviderRelease, RepositoryLineage};
+use crate::state::{ProviderRelease, RepositoryLineage};
+
 
 /// Durable intent for an in-flight executable replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +32,12 @@ pub struct Transaction {
     pub candidate_rejection_required: bool,
     /// Recovery must replay the operator lifecycle provider before clearing this intent.
     #[serde(deserialize_with = "crate::required_option")]
-    pub lifecycle: Option<Box<LifecycleProviderRelease>>,
+    pub lifecycle: Option<Box<ProviderRelease>>,
+    /// The health-check provider that gates this attempt (forward and on rollback). Rides the
+    /// journal so a crash-recovered rollback health-gates with the same provider the in-process
+    /// path used.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub healthcheck: Option<Box<ProviderRelease>>,
     /// Last state-machine operation known to have completed durably. Recovery replays
     /// the next operation; adapters are idempotent across the action/journal-write gap.
     pub phase: Phase,
@@ -45,6 +51,7 @@ pub enum Phase {
     PreflightCompleted,
     PrepareStarted,
     Prepared,
+    PreDrainStarted,
     DrainStarted,
     Drained,
     StopStarted,
@@ -103,11 +110,14 @@ impl Transaction {
                 "on-launch transactions cannot require supervised candidate rejection",
             ));
         }
-        if let Some(lifecycle) = &self.lifecycle {
-            if lifecycle.product.is_empty() || lifecycle.timeout_millis == 0 {
+        for provider in [self.lifecycle.as_ref(), self.healthcheck.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if provider.product.is_empty() || provider.timeout_millis == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "transaction lifecycle identity is invalid",
+                    "transaction provider identity is invalid",
                 ));
             }
         }
@@ -178,7 +188,8 @@ impl Transaction {
                 (Phase::PreflightStarted, Phase::PreflightCompleted)
                     | (Phase::PreflightCompleted, Phase::PrepareStarted)
                     | (Phase::PrepareStarted, Phase::Prepared)
-                    | (Phase::Prepared, Phase::DrainStarted)
+                    | (Phase::Prepared, Phase::PreDrainStarted)
+                    | (Phase::PreDrainStarted, Phase::DrainStarted)
                     | (Phase::DrainStarted, Phase::Drained)
                     | (Phase::Drained, Phase::StopStarted)
                     | (Phase::StopStarted, Phase::Stopped)
@@ -259,6 +270,7 @@ pub fn classify_recovery(
         | Phase::PreflightCompleted
         | Phase::PrepareStarted
         | Phase::Prepared
+        | Phase::PreDrainStarted
         | Phase::DrainStarted
         | Phase::Drained
         | Phase::StopStarted
@@ -327,6 +339,7 @@ mod tests {
             ),
             candidate_rejection_required: false,
             lifecycle: None,
+            healthcheck: None,
             phase: Phase::PreflightStarted,
         }
     }
@@ -388,6 +401,7 @@ mod tests {
             Phase::PreflightCompleted,
             Phase::PrepareStarted,
             Phase::Prepared,
+            Phase::PreDrainStarted,
             Phase::DrainStarted,
             Phase::Drained,
             Phase::StopStarted,

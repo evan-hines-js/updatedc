@@ -25,4 +25,4 @@ socket2 = "0.5"
 # Unix signal / fork / exec / fd plumbing for the zero-downtime reload modes
 # (reexec, handoff). The plain `restart` mode uses none of it.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true

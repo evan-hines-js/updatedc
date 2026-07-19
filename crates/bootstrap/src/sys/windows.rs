@@ -32,11 +32,7 @@ impl Proc {
     fn launch(spec: &CommandSpec) -> io::Result<Proc> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         use windows_sys::Win32::System::Threading::{
             CreateProcessW, ResumeThread, TerminateProcess, CREATE_NEW_PROCESS_GROUP,
             CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
@@ -49,25 +45,12 @@ impl Proc {
             .as_ref()
             .map(|c| to_wide_nul(c.as_os_str().encode_wide()));
 
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) == 0
-            {
-                let e = io::Error::last_os_error();
-                CloseHandle(job);
-                return Err(e);
-            }
+        // Identical kill-on-close job setup as the portable containment; shared so the two
+        // can never drift. The assign route below (a `CREATE_SUSPENDED` process) is what
+        // differs, so only the setup is shared.
+        let job = foundation::process::create_kill_on_close_job()?;
 
+        unsafe {
             let mut si: STARTUPINFOW = std::mem::zeroed();
             si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
             let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
@@ -117,13 +100,18 @@ impl crate::sys::Process for Proc {
     }
 
     fn poll_exit(&mut self) -> Option<i32> {
-        use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-        const STILL_ACTIVE: u32 = 259;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
         if self.exited.is_none() {
-            let mut code = 0u32;
-            let ok = unsafe { GetExitCodeProcess(self.process, &mut code) };
-            if ok != 0 && code != STILL_ACTIVE {
-                self.exited = Some(code as i32);
+            // Decide exited-vs-running by waiting on the process handle (signaled only once
+            // the process has terminated), not by comparing the exit code against 259
+            // (`STILL_ACTIVE`) — an app that genuinely exits with 259 must still be seen as
+            // dead. Only after the handle signals is the exit code meaningful.
+            if unsafe { WaitForSingleObject(self.process, 0) } == WAIT_OBJECT_0 {
+                let mut code = 0u32;
+                if unsafe { GetExitCodeProcess(self.process, &mut code) } != 0 {
+                    self.exited = Some(code as i32);
+                }
             }
         }
         self.exited
@@ -296,40 +284,15 @@ impl Channel {
 
     pub fn poll_readable(&self, timeout_ms: i32) -> bool {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-        // Anonymous pipes are not waitable for readability, so peek for buffered bytes,
-        // sleeping between checks up to the timeout.
         let handle = self.read.as_raw_handle() as HANDLE;
         let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
-        loop {
-            let mut available: u32 = 0;
-            let ok = unsafe {
-                PeekNamedPipe(
-                    handle,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                // Broken pipe: the supervisor is gone. Report "not readable" and let the
-                // serve loop observe the death through the supervisor's exit status.
-                return false;
-            }
-            if available > 0 {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Only buffered bytes count as readable; a broken pipe or the deadline both read as
+        // "not readable" and let the serve loop observe a death through the exit status.
+        matches!(peek_until_readable(handle, deadline), Peek::Ready)
     }
 
     pub fn send_hello(&mut self) -> control::Result<()> {
-        control::Hello::current().write(&mut self.write)
+        control::Hello::current().write(&mut TimeoutWriter(&mut self.write))
     }
 
     pub fn read_request(&mut self) -> control::Result<control::Request> {
@@ -337,59 +300,168 @@ impl Channel {
     }
 
     pub fn send_response(&mut self, resp: &control::Response) -> control::Result<()> {
-        resp.write(&mut self.write)
+        resp.write(&mut TimeoutWriter(&mut self.write))
     }
 }
 
-/// How long a single control-channel read may stall the guardian's one thread before it
-/// gives up on the frame. Mirrors the Unix end's `SO_RCVTIMEO`, which is likewise per-read.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a single control-channel read or write may stall the guardian's one thread
+/// before it gives up on the frame. Mirrors the Unix end's per-operation `SO_RCVTIMEO`/
+/// `SO_SNDTIMEO`.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bounds a blocking pipe read. An anonymous pipe cannot carry a receive timeout, and
-/// `ReadFile` on one blocks until at least a byte arrives — so peek until something is
-/// buffered, and give up at the deadline. `ReadFile` never waits for more than the bytes
-/// already present, so once the peek sees any, the read cannot block.
-///
-/// Without this, a supervisor that writes one byte and stops would block the guardian's only
-/// thread inside `read_exact` forever, stranding its shutdown signal, its application-crash
-/// check, and its readiness deadline while it still owns the application.
+/// The outcome of waiting for a pipe to have buffered bytes.
+enum Peek {
+    /// Bytes are buffered — a read will not block.
+    Ready,
+    /// The peek failed: a broken pipe (peer gone) or a real error.
+    Broken,
+    /// The deadline passed with nothing buffered.
+    TimedOut,
+}
+
+/// Wait until `handle` has buffered bytes, its peer is gone, or `deadline` passes. An
+/// anonymous pipe is not waitable for readability, so peek for buffered bytes and sleep
+/// between checks — `ReadFile` never waits for more than the bytes already present, so once
+/// this returns [`Peek::Ready`] a read cannot block. Shared by [`Channel::poll_readable`]
+/// and [`TimeoutReader`].
+fn peek_until_readable(handle: HANDLE, deadline: std::time::Instant) -> Peek {
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    loop {
+        let mut available: u32 = 0;
+        let ok = unsafe {
+            PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Peek::Broken;
+        }
+        if available > 0 {
+            return Peek::Ready;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Peek::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Bounds a blocking pipe read. Without this a supervisor that writes one byte and stops
+/// would block the guardian's only thread inside `read_exact` forever, stranding its
+/// shutdown signal, its application-crash check, and its readiness deadline while it still
+/// owns the application.
 struct TimeoutReader<'a>(&'a mut std::fs::File);
 
 impl std::io::Read for TimeoutReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
         if buf.is_empty() {
             return Ok(0);
         }
         let handle = self.0.as_raw_handle() as HANDLE;
-        let deadline = std::time::Instant::now() + READ_TIMEOUT;
-        loop {
-            let mut available: u32 = 0;
-            let ok = unsafe {
-                PeekNamedPipe(
-                    handle,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                )
-            };
-            // A failed peek means a broken pipe (the supervisor is gone) or a real error:
-            // let the read itself surface it, so a closed peer still reads as a clean close
-            // at a frame boundary rather than as a timeout.
-            if ok == 0 || available > 0 {
-                return self.0.read(buf);
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "control channel read timed out",
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        let deadline = std::time::Instant::now() + IO_TIMEOUT;
+        match peek_until_readable(handle, deadline) {
+            // Let the read itself surface a broken pipe, so a closed peer still reads as a
+            // clean close at a frame boundary rather than as a timeout.
+            Peek::Ready | Peek::Broken => self.0.read(buf),
+            Peek::TimedOut => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control channel read timed out",
+            )),
         }
+    }
+}
+
+/// Bounds a blocking pipe write to the same [`IO_TIMEOUT`] as the read, matching the Unix
+/// channel's `SO_SNDTIMEO`. An anonymous pipe carries no write timeout, and `WriteFile`
+/// blocks once the pipe buffer fills — so a supervisor that stops draining could otherwise
+/// wedge the guardian's only thread inside `send_hello`/`send_response` forever, stranding
+/// the shutdown signal and readiness deadline while it still owns the application.
+///
+/// The bound is enforced by writing each frame chunk on a scratch thread (holding a
+/// duplicated handle) and waiting up to the deadline. On timeout the guardian abandons the
+/// thread — it unblocks and closes its handle copy if the pipe ever drains or closes — and
+/// reports the stall, which the serve loop treats as a lost supervisor.
+struct TimeoutWriter<'a>(&'a mut std::fs::File);
+
+impl std::io::Write for TimeoutWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        use std::os::windows::io::AsRawHandle;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let handle = self.0.as_raw_handle() as HANDLE;
+        bounded_pipe_write(handle, buf, IO_TIMEOUT)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// A duplicated write handle we deliberately move to a scratch thread. `RawHandle` is not
+/// `Send`; the thread is the sole user of this copy, so moving the raw value is sound.
+struct SendHandle(std::os::windows::io::RawHandle);
+unsafe impl Send for SendHandle {}
+
+/// Write all of `buf` to the pipe `handle`, giving up after `timeout`. Returns the bytes
+/// written (`buf.len()` on success) or a `TimedOut`/OS error.
+fn bounded_pipe_write(handle: HANDLE, buf: &[u8], timeout: Duration) -> io::Result<usize> {
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{
+        DuplicateHandle, DUPLICATE_SAME_ACCESS, FALSE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // Duplicate the write handle so the scratch thread owns a copy it can close on drop,
+    // leaving the caller's `File` untouched even if we abandon a wedged write.
+    let mut dup: HANDLE = INVALID_HANDLE_VALUE;
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            handle,
+            GetCurrentProcess(),
+            &mut dup,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let dup = SendHandle(dup as RawHandle);
+    let payload = buf.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        // Bind the whole `SendHandle` (not just `dup.0`) so the closure captures the `Send`
+        // wrapper rather than the bare `*mut c_void`, which is not `Send`.
+        let dup = dup;
+        // Adopt the duplicated handle as a File so the write goes through std and the handle
+        // is closed on drop — including when the guardian has already abandoned us.
+        let mut file = unsafe { std::fs::File::from_raw_handle(dup.0) };
+        let result = file.write_all(&payload).map(|()| payload.len());
+        // The receiver may already be gone (we timed out); ignore the send failure.
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control channel write timed out",
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "control channel write thread vanished",
+        )),
     }
 }
 

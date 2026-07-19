@@ -28,7 +28,7 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         ctx.publish(&dir, "app", "2.0.0", &v2)?;
         let server = ctx.serve(&dir, &srv)?;
         let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
-            .health(&svc)
+            .readiness_health(&svc)
             .check_interval("1s")
             .health_grace("2s")
             .guardian()?;
@@ -91,6 +91,74 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
     Ok(())
 }
 
+/// Crash the supervisor at every *first-install* journal boundary. There is no predecessor to
+/// fall back to, so recovery is not a rollback: the guardian relaunches, the on-disk install
+/// journal drives the interrupted install to a committed, live release, and no journal is left
+/// behind. This proves cold install has the same crash-safe journaled parity as an update.
+/// Each boundary runs in its own isolated dir + repo, cold-installed from only the runtime.
+pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
+    // Enumerated from the supervisor binary so the scenario crashes at exactly the crossings the
+    // install machine defines (see `Ctx::install_chaos_boundaries`).
+    let boundaries = ctx.install_chaos_boundaries()?;
+    for (index, point) in boundaries.iter().enumerate() {
+        let srv = format!("127.0.0.1:{}", 22800 + index);
+        let svc = format!("127.0.0.1:{}", 22850 + index);
+        let dir = ctx.work.join(format!("install-chaos-{point}"));
+        std::fs::create_dir_all(&dir).map_err(str_err)?;
+        ctx.init_repo(&dir)?;
+        ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+        let app = dir.join(format!("not-preinstalled{}", ctx.exe));
+        let server = ctx.serve(&dir, &srv)?;
+        let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+            .cold_install()
+            .readiness_health(&svc)
+            .check_interval("1s")
+            .health_grace("2s")
+            .guardian()?;
+        cmd.env("UPDATED_CHAOS_POINT", point);
+        let boot = Proc::spawn("install-chaos", &mut cmd)?;
+
+        // The first supervisor cold-installs and crashes once at `point`; the guardian must
+        // observe that crash and launch a fresh supervisor that resumes the install.
+        let crash_seen = boot.wait_for_log(
+            &format!("CHAOS: exiting at boundary \"{point}\""),
+            RECOVERY_TIMEOUT,
+        );
+        let relaunched = wait_until(RECOVERY_TIMEOUT, || {
+            boot.log_count("launched supervisor") >= 2
+        });
+
+        // Durable convergence: the installed record names the exact v1 bytes and the install
+        // journal is gone. Since the first supervisor died mid-install, only recovery could
+        // have reached this state.
+        let state_path = dir.join("install/state/installed.json");
+        let journal_path = dir.join("install/state/install.json");
+        let durable = wait_until(RECOVERY_TIMEOUT, || {
+            matches!(
+                updated::state::read_installed(&state_path),
+                updated::state::Installed::Present(ref state)
+                    if state.release.version == "1.0.0"
+            ) && !journal_path.exists()
+        });
+        let live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
+        let log = boot.captured_log();
+        drop(boot);
+        drop(server);
+        kill_stray(&dir.join("install"));
+        let stopped = wait_until(RECOVERY_TIMEOUT, || {
+            http_text(&format!("http://{svc}/version")).is_none()
+        });
+        if !crash_seen || !relaunched || !durable || !live || !stopped {
+            return fail(format!(
+                "install recovery at {point} was incomplete (crash_seen={crash_seen}, \
+                 relaunched={relaunched}, durable={durable}, live={live}, stopped={stopped}); log:\n{log}"
+            ));
+        }
+    }
+    ok("every cold-install crash boundary recovered to a committed, live first install");
+    Ok(())
+}
+
 /// Commit a candidate that deliberately crashes inside its confirmation window, then
 /// kill the recovering supervisor at every rollback action/journal boundary. Each case
 /// must converge to the predecessor with the candidate rejected and no journal left.
@@ -119,7 +187,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         ];
 
         let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
-            .health(&svc)
+            .readiness_health(&svc)
             .check_interval("1s")
             .health_grace("2s")
             .confirmation_window("120s")
@@ -185,6 +253,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let mut expected_sequence = vec![
             "preflight",
             "prepare",
+            "pre-drain",
             "drain",
             "stop",
             "activate",
@@ -197,7 +266,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         expected_sequence.extend(std::iter::repeat_n("start", expected_start_calls - 1));
         expected_sequence.extend(std::iter::repeat_n("verify", expected_verify_calls - 1));
         expected_sequence.extend(std::iter::repeat_n("rollback", expected_rollback_calls));
-        let calls_are_minimal = ["preflight", "prepare", "drain", "finalize"]
+        let calls_are_minimal = ["preflight", "prepare", "pre-drain", "drain", "finalize"]
             .iter()
             .all(|phase| count(phase) == 1)
             && count("stop") == expected_stop_calls
@@ -216,6 +285,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let effects_are_idempotent = [
             "preflight",
             "prepare",
+            "pre-drain",
             "drain",
             "stop",
             "activate",
@@ -228,7 +298,10 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         .all(|phase| {
             effect_names
                 .iter()
-                .filter(|name| name.ends_with(&format!("-{phase}")))
+                // Markers are `{id}-{phase}`; the id is dashless hex, so the phase is
+                // everything after the first `-`. Match it exactly — a plain `ends_with`
+                // would let `{id}-pre-drain` also count as a `drain` effect.
+                .filter(|name| name.split_once('-').map(|(_, tail)| tail) == Some(*phase))
                 .count()
                 == 1
         });
@@ -284,7 +357,7 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
         "fail-drain".into(),
     ];
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .health(svc)
+        .readiness_health(svc)
         .check_interval("5s")
         .health_grace("2s")
         .lifecycle(fixture_command)
@@ -318,7 +391,7 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
     drop(tower);
     drop(server);
     kill_stray(&dir.join("install"));
-    if !crash_seen || !durable || !live || phases != ["preflight", "prepare", "drain", "rollback"] {
+    if !crash_seen || !durable || !live || phases != ["preflight", "prepare", "pre-drain", "drain", "rollback"] {
         return fail(format!(
             "aborted recovery failed (crash_seen={crash_seen}, durable={durable}, live={live}, \
              phases={phases:?}); attempts:\n{attempts}\nlog:\n{log}"
@@ -353,7 +426,7 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
         "fail-first-drain".into(),
     ];
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .health(svc)
+        .readiness_health(svc)
         .check_interval("1s")
         .health_grace("2s")
         .lifecycle(fixture_command)
@@ -420,11 +493,12 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
     if !upgraded
         || distinct.len() != 2
         || rollback_id != first_id
-        || first_phases != ["preflight", "prepare", "drain", "rollback"]
+        || first_phases != ["preflight", "prepare", "pre-drain", "drain", "rollback"]
         || second_phases
             != [
                 "preflight",
                 "prepare",
+                "pre-drain",
                 "drain",
                 "stop",
                 "activate",
@@ -457,7 +531,7 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let server = ctx.serve(&dir, &srv)?;
     let fixture = dir.join("lifecycle-fixture");
-    let retryable = matches!(phase, "prepare" | "drain");
+    let retryable = matches!(phase, "prepare" | "pre-drain" | "drain");
     let mode = if phase == "rollback" {
         "fail-start-and-rollback".to_string()
     } else if retryable {
@@ -475,7 +549,7 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         mode,
     ];
     let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
-        .health(&svc)
+        .readiness_health(&svc)
         .check_interval("1s")
         .health_grace("2s")
         .lifecycle(fixture_command)
@@ -566,11 +640,99 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     Ok(())
 }
 
+/// Fuzz the timeout-bounded-*hang* failure mode across every forward lifecycle hook. The clean
+/// exit-nonzero failure at each phase is covered by [`provider_failure_case`]; this covers the
+/// other way a hook goes wrong — it wedges and never returns. Each hook must be killed by the
+/// supervisor's provider timeout and recovered from, leaving a *live* predecessor. A stall (no
+/// timeout) would freeze the update or strand the app stopped mid-switchover — either way 1.0.0
+/// never comes back within the bound, so "predecessor live" is the invariant that catches it.
+/// (Rollback is excluded: its hooks run with the candidate/predecessor reversed, so the forward
+/// hang guard cannot target them.)
+pub(crate) fn provider_hook_hangs_are_bounded(ctx: &Ctx) -> R {
+    const PHASES: &[&str] = &[
+        "preflight", "prepare", "pre-drain", "drain", "stop", "activate", "start", "verify",
+        "finalize",
+    ];
+    for (index, phase) in PHASES.iter().enumerate() {
+        provider_hang_case(ctx, phase, index as u16)?;
+    }
+    ok("every forward lifecycle hook hang was bounded by the provider timeout and recovered with the predecessor live");
+    Ok(())
+}
+
+fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
+    let srv = format!("127.0.0.1:{}", 22300 + index);
+    let svc = format!("127.0.0.1:{}", 22350 + index);
+    let dir = ctx.work.join(format!("provider-hang-{phase}"));
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let app = dir.join(format!("app{}", ctx.exe));
+    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
+    let server = ctx.serve(&dir, &srv)?;
+    let fixture = dir.join("lifecycle-fixture");
+    let fixture_command = vec![
+        std::env::current_exe()
+            .map_err(str_err)?
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        fixture.display().to_string(),
+        format!("hang-{phase}"),
+    ];
+    let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+        .readiness_health(&svc)
+        .check_interval("1s")
+        .health_grace("2s")
+        .lifecycle(fixture_command)
+        .guardian()?;
+    let tower = Proc::spawn("provider-hang", &mut command)?;
+    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = tower.captured_log();
+        drop(tower);
+        drop(server);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "provider hang {phase} case never began its update transaction; log:\n{log}"
+        ));
+    }
+    // The hook wedges at `phase`; the bounded provider timeout must fire and recovery must restore
+    // a live predecessor within the window.
+    let attempted = wait_until(RECOVERY_TIMEOUT, || {
+        std::fs::read_to_string(fixture.join("attempts.log"))
+            .is_ok_and(|a| a.lines().any(|l| l.starts_with(&format!("{phase}\t"))))
+    });
+    let predecessor_live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
+    let log = tower.captured_log();
+    drop(tower);
+    drop(server);
+    kill_stray(&dir.join("install"));
+    if !attempted {
+        return fail(format!(
+            "provider hang {phase}: the hook was never invoked at that phase:\n{log}"
+        ));
+    }
+    if !predecessor_live {
+        return fail(format!(
+            "provider hang {phase}: the wedged hook was not bounded by the provider timeout — the \
+             node never recovered a live predecessor within {RECOVERY_TIMEOUT}s:\n{log}"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn provider_preflight_failure(ctx: &Ctx) -> R {
     provider_failure_case(ctx, "preflight", 0)
 }
 pub(crate) fn provider_prepare_failure(ctx: &Ctx) -> R {
     provider_failure_case(ctx, "prepare", 1)
+}
+pub(crate) fn provider_pre_drain_failure(ctx: &Ctx) -> R {
+    // Pre-drain runs before the guardian withdraws the node from traffic. A failure here
+    // must be contained exactly like drain: the running release is never touched, the
+    // node never leaves readiness, and the deferred candidate retries under a fresh id.
+    provider_failure_case(ctx, "pre-drain", 12)
 }
 pub(crate) fn provider_drain_failure(ctx: &Ctx) -> R {
     provider_failure_case(ctx, "drain", 2)
@@ -622,9 +784,10 @@ pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
         "magnolia-shaped".into(),
     ];
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .health(svc)
+        .readiness_health(svc)
         .check_interval("1s")
         .health_grace("2s")
+        .confirmation_window("2s")
         .lifecycle(command)
         .guardian()?;
     let process = Proc::spawn("magnolia-shaped", &mut tower)?;
@@ -654,6 +817,7 @@ pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
     let expected = [
         "preflight-checked",
         "backup-created",
+        "pre-drain-script-ran",
         "authors-drained",
         "tomcat-stopped",
         "war-activated",
@@ -671,6 +835,7 @@ pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
         && parsed.iter().map(|(phase, _)| *phase).eq([
             "preflight",
             "prepare",
+            "pre-drain",
             "drain",
             "stop",
             "activate",
@@ -736,9 +901,10 @@ pub(crate) fn sample_magnolia_sample_transition(ctx: &Ctx) -> R {
         "magnolia-shaped-transition".into(),
     ];
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .health(svc)
+        .readiness_health(svc)
         .check_interval("1s")
         .health_grace("2s")
+        .confirmation_window("2s")
         .lifecycle(command)
         .guardian()?;
     let process = Proc::spawn("artifact-transition", &mut tower)?;
@@ -758,10 +924,25 @@ pub(crate) fn sample_magnolia_sample_transition(ctx: &Ctx) -> R {
     // Reuse the ordinary sample-app executable fixture. `publish-app` writes
     // the requested 3.0.0 release configuration into the immutable bundle.
     ctx.publish(&dir, "app", "3.0.0", &app_v(ctx, "1.0.0"))?;
+    let attempts_path = fixture.join("attempts.log");
     let returned = wait_until(RECOVERY_TIMEOUT, || {
-        wait_for_version(svc, "3.0.0", 1) && !dir.join("install/state/transaction.json").is_file()
+        if !wait_for_version(svc, "3.0.0", 1) {
+            return false;
+        }
+        let Ok(attempts) = std::fs::read_to_string(&attempts_path) else {
+            return false;
+        };
+        attempts
+            .lines()
+            .filter_map(|line| {
+                let (phase, id) = line.split_once('\t')?;
+                (phase == "finalize").then_some(id)
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == 2
     }) && process.wait_for_log("upgraded to 3.0.0", RECOVERY_TIMEOUT);
-    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).map_err(str_err)?;
+    let attempts = std::fs::read_to_string(&attempts_path).map_err(str_err)?;
     let transaction_ids = attempts
         .lines()
         .filter_map(|line| line.split_once('\t').map(|(_, id)| id))
@@ -804,7 +985,7 @@ pub(crate) fn magnolia_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
         "magnolia-shaped-fail-finalize".into(),
     ];
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .health(svc)
+        .readiness_health(svc)
         .check_interval("1s")
         .health_grace("10s")
         .lifecycle(command)

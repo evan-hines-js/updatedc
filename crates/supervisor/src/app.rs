@@ -32,6 +32,10 @@ impl App {
         self.guardian.signal_ready()
     }
 
+    pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), String> {
+        self.guardian.traffic_ready(ready)
+    }
+
     /// Ask the guardian to (re)launch the application, updating our PID/token. The token
     /// is persisted *before* the launch so a crash mid-launch never leaves a running app
     /// whose token we forgot.
@@ -148,54 +152,90 @@ pub(crate) fn stop(guardian: &mut Guardian, app_token: &Path) -> io::Result<()> 
 
 // ------------------------------- health probe -------------------------------
 
-/// Whether the application became (and stayed) healthy within `grace`.
+/// The one HTTP sampling path for every application-health policy.
 ///
-/// The supervisor does not watch the process — the guardian does, and would tear the
-/// tower down (killing this supervisor) if the app crashed. So this is purely the
-/// readiness check: without a health URL, simply surviving the window is healthy; with
-/// one, the URL must answer with the launch token (and, for a reload, the candidate
-/// version) `successes` times consecutively.
+/// A supervisor owns one of these and reuses its connection pool. More importantly,
+/// callers can sample a URL once and feed that observation to every tagged policy that
+/// references it; readiness and liveness must not disagree merely because a flapping
+/// endpoint was requested twice in the same tick.
+pub(crate) struct HealthProbe {
+    client: reqwest::Client,
+}
+
+impl HealthProbe {
+    pub(crate) fn new() -> io::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(io::Error::other)?;
+        Ok(Self { client })
+    }
+
+    pub(crate) async fn sample(
+        &self,
+        app: &App,
+        url: &str,
+        expected_version: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> bool {
+        let mut request = self.client.get(url);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let Ok(response) = request.send().await else {
+            return false;
+        };
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        };
+        response.status().is_success()
+            && health_headers_match(
+                app.health_token(),
+                expected_version,
+                header(health::TOKEN_HEADER),
+                header(health::VERSION_HEADER),
+            )
+    }
+}
+
+/// Whether the application became (and stayed) healthy within `grace`, via the HTTP readiness
+/// probe. Without a health URL, simply surviving the window is healthy; with one, the URL must
+/// answer with the launch token (and, for an in-place reload, `expected_version`) `successes`
+/// times consecutively. A release that ships a health-check provider is gated by
+/// [`crate::update::became_healthy_via_provider`] instead.
 pub(crate) async fn became_healthy(
     app: &App,
     grace: Duration,
-    health_url: Option<&str>,
+    health_check_url: Option<&str>,
     expected_version: Option<&str>,
     successes: u32,
     interval: Duration,
 ) -> io::Result<bool> {
     let deadline = Instant::now() + grace;
 
-    let Some(url) = health_url else {
+    let Some(url) = health_check_url else {
         tokio::time::sleep(grace).await;
         return Ok(true);
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(io::Error::other)?;
+    let probe = HealthProbe::new()?;
     let mut readiness = Readiness::new(successes);
     let mut next_probe = Instant::now();
     while Instant::now() < deadline {
         if Instant::now() >= next_probe {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let request = client
-                .get(url)
-                .timeout(remaining.min(Duration::from_secs(1)));
-            let ok = if let Ok(resp) = request.send().await {
-                let status_ok = resp.status().is_success();
-                let header = |h: &str| resp.headers().get(h).and_then(|v| v.to_str().ok());
-                status_ok
-                    && health_headers_match(
-                        app.health_token(),
-                        expected_version,
-                        header(health::TOKEN_HEADER),
-                        header(health::VERSION_HEADER),
-                    )
-            } else {
-                false
-            };
+            let ok = probe
+                .sample(
+                    app,
+                    url,
+                    expected_version,
+                    Some(remaining.min(Duration::from_secs(1))),
+                )
+                .await;
             if readiness.observe(ok) {
                 return Ok(true);
             }
@@ -212,14 +252,15 @@ pub(crate) async fn became_healthy(
 
 /// Progress toward readiness: a run of `need` consecutive healthy probes, any failure
 /// resetting the run. Pure — the async loop feeds it probe outcomes — so the
-/// consecutive-successes gate a same-PID reload relies on is provable without a server.
-struct Readiness {
+/// consecutive-successes gate is provable without a server. Shared by the HTTP probe here and
+/// the health-check-provider probe in [`crate::update`].
+pub(crate) struct Readiness {
     need: u32,
     consecutive: u32,
 }
 
 impl Readiness {
-    fn new(successes: u32) -> Self {
+    pub(crate) fn new(successes: u32) -> Self {
         Readiness {
             need: successes.max(1),
             consecutive: 0,
@@ -227,7 +268,7 @@ impl Readiness {
     }
 
     /// Fold in one probe outcome; `true` once enough consecutive successes are seen.
-    fn observe(&mut self, healthy: bool) -> bool {
+    pub(crate) fn observe(&mut self, healthy: bool) -> bool {
         if healthy {
             self.consecutive += 1;
             self.consecutive >= self.need
@@ -238,14 +279,23 @@ impl Readiness {
     }
 }
 
+/// Whether the app's *optional* identity headers are consistent with this launch.
+///
+/// Both signals are best-effort. An app that echoes the launch token — and, for a reload,
+/// its version — gets the stronger check: a forged or stale process answering on the port
+/// is caught. An off-the-shelf app (Magnolia, nginx, …) that returns neither is trusted on
+/// its 2xx alone. The supervisor observes the app; it never forces a protocol onto it.
+///
+/// A header that is *present but wrong* still fails — that is a forged or stale answer, not
+/// an absent one. Only genuine absence is skipped.
 pub(crate) fn health_headers_match(
     expected_token: &str,
     expected_version: Option<&str>,
     token: Option<&str>,
     version: Option<&str>,
 ) -> bool {
-    token == Some(expected_token)
-        && expected_version.is_none_or(|expected| version == Some(expected))
+    token.is_none_or(|actual| actual == expected_token)
+        && expected_version.is_none_or(|expected| version.is_none_or(|actual| actual == expected))
 }
 
 // ------------------------------- async waits --------------------------------
@@ -295,7 +345,7 @@ pub(crate) async fn wait_for_shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_app_token, Readiness};
+    use super::{health_headers_match, read_app_token, Readiness};
 
     #[test]
     fn readiness_needs_consecutive_successes_and_a_failure_resets_the_run() {
@@ -339,5 +389,21 @@ mod tests {
         std::fs::write(&path, format!("{valid}\n")).unwrap();
         assert_eq!(read_app_token(&path).unwrap(), valid);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identity_headers_are_optional_but_a_wrong_one_still_fails() {
+        // An off-the-shelf app (Magnolia, nginx) that returns no identity headers is healthy
+        // on its 2xx alone — absence is skipped, never a failure.
+        assert!(health_headers_match("tok", None, None, None));
+        assert!(health_headers_match("tok", Some("2.0.0"), None, None));
+        // A cooperating app that echoes the launch token keeps the stronger check.
+        assert!(health_headers_match("tok", None, Some("tok"), None));
+        assert!(health_headers_match("tok", Some("2.0.0"), Some("tok"), Some("2.0.0")));
+        // A header that is present but wrong is a forged or stale answer — still rejected.
+        assert!(!health_headers_match("tok", None, Some("forged"), None));
+        assert!(!health_headers_match("tok", Some("2.0.0"), Some("tok"), Some("1.0.0")));
+        // A missing version when one was expected is skipped (best-effort), not a failure.
+        assert!(health_headers_match("tok", Some("2.0.0"), Some("tok"), None));
     }
 }

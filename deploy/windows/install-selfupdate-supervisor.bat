@@ -1,13 +1,13 @@
 :: Native Windows SCM deployment for the self-update tower. Run from an elevated
 :: Administrator command prompt after installing the bootstrap, supervisor, pinned
-:: root, operator config, and initial manifested application bundle.
+:: signed enrollment bundle, bootstrap config, and optional offline application bundle.
 @echo off
 setlocal
 
 set "SERVICE=SelfUpdateSupervisor"
 set "WRAPPER=C:\Program Files\selfupdate\selfupdate-service.exe"
 set "BOOTSTRAP=C:\Program Files\selfupdate\bootstrap.exe"
-set "CONFIG=C:\Program Files\selfupdate\config.toml"
+set "CONFIG=C:\Program Files\selfupdate\bootstrap.toml"
 set "STATEDIR=C:\ProgramData\selfupdate"
 set "SUPERVISOR=C:\Program Files\selfupdate\supervisor.exe"
 
@@ -16,7 +16,7 @@ set "SUPERVISOR=C:\Program Files\selfupdate\supervisor.exe"
 :: The bootstrap launches the application in a separate process group so it does not
 :: receive that console event directly; the bootstrap then shuts it down cleanly.
 :: A later service start launches a fresh guardian and application process.
-set "BINPATH=\"%WRAPPER%\" --bootstrap \"%BOOTSTRAP%\" --state-dir \"%STATEDIR%\" --supervisor-config \"%CONFIG%\" --supervisor \"%SUPERVISOR%\""
+set "BINPATH=\"%WRAPPER%\" --bootstrap \"%BOOTSTRAP%\" --state-dir \"%STATEDIR%\" --supervisor-config \"%CONFIG%\" --supervisor \"%SUPERVISOR%\" --probe-address 127.0.0.1:9090"
 sc.exe create "%SERVICE%" binPath= "%BINPATH%" start= auto DisplayName= "Self-updating supervisor"
 if errorlevel 1 exit /b %errorlevel%
 sc.exe description "%SERVICE%" "Native SCM host for the installer-owned self-update bootstrap"

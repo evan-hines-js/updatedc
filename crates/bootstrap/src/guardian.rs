@@ -12,14 +12,16 @@
 //! also checks the application process and the shutdown flag; there is no background
 //! thread.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use control::{Request, Response};
 
-use crate::app::App;
 use crate::log::{error, info, warn};
+use crate::probe::Machine as ProbeMachine;
 use crate::record;
+use crate::service::Service;
 use crate::supervisor::{Link, Supervisor};
 
 /// How often the serve loop wakes to re-check the application, the supervisor, and shutdown.
@@ -38,6 +40,7 @@ pub struct Config {
     pub confirm_timeout: Duration,
     /// Grace before hard-killing an application or supervisor during shutdown.
     pub stop_grace: Duration,
+    pub probe_address: Option<SocketAddr>,
 }
 
 /// Exponential backoff for relaunching a failed supervisor.
@@ -49,6 +52,7 @@ pub struct Config {
 /// and NEVER takes the application down: the app keeps running the entire time.
 struct Backoff {
     consecutive: u32,
+    base: Duration,
 }
 
 impl Backoff {
@@ -58,7 +62,21 @@ impl Backoff {
     const SETTLED: Duration = Duration::from_secs(30);
 
     fn new() -> Self {
-        Backoff { consecutive: 0 }
+        Backoff {
+            consecutive: 0,
+            base: Self::base(),
+        }
+    }
+
+    /// The crash-loop base delay. Tunable via `UPDATED_GUARDIAN_BACKOFF_BASE_MS` so a test can
+    /// widen the backoff window enough that a shutdown deterministically lands inside the sleep
+    /// (never in the brief serve window) — no wall-clock margin to flake. Defaults to [`BASE`].
+    fn base() -> Duration {
+        std::env::var("UPDATED_GUARDIAN_BACKOFF_BASE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Self::BASE)
     }
 
     /// The delay before the next relaunch, given how long the last supervisor ran. A run
@@ -68,7 +86,7 @@ impl Backoff {
             self.consecutive = 0;
         }
         let delay =
-            foundation::time::exponential_backoff(Self::BASE, self.consecutive, 8, Self::CAP);
+            foundation::time::exponential_backoff(self.base, self.consecutive, 8, Self::CAP);
         self.consecutive = self.consecutive.saturating_add(1);
         delay
     }
@@ -84,25 +102,36 @@ enum Cycle {
     Stop,
     /// The supervisor staged a replacement and exited; activate it under a readiness gate.
     Activate(PathBuf),
-    /// The application exited on its own — roll its exit code up to the init system.
-    AppCrashed(i32),
+    /// The service exited on its own — roll its exact exit code up to the init system.
+    ServiceExited(i32),
 }
 
 /// Run the guardian. Returns the process exit code: `0` for a clean stop, or the
-/// application's exit code when it crashes (rolled up so the init system sees it).
+/// service's exact exit code when it exits spontaneously (including zero).
 pub fn run(cfg: &Config) -> Result<i32, String> {
     crate::sys::ignore_sigpipe();
     crate::sys::install_shutdown_handler();
     std::fs::create_dir_all(&cfg.state_dir)
         .map_err(|e| format!("creating state dir {}: {e}", cfg.state_dir.display()))?;
+    // Reap any half-written record temp orphaned by a prior crash between write and rename,
+    // before we start dropping fresh ones. Best-effort hygiene, never a correctness gate.
+    let swept = foundation::durable::sweep_stale_temps(&cfg.state_dir, ".guardian-");
+    if swept > 0 {
+        info(&format!("swept {swept} stale state temp file(s)"));
+    }
     seed_desired_supervisor(cfg)?;
+    let probes = ProbeMachine::new();
+    if let Some(address) = cfg.probe_address {
+        crate::probe::serve(address, probes.clone())?;
+        info(&format!("guardian probes listening on http://{address}"));
+    }
 
-    let mut app = App::none();
+    let mut service = Service::new(probes.clone());
     let mut next: Option<PathBuf> = None; // Some(path) means "activate this candidate"
     let mut backoff = Backoff::new();
     while !crate::sys::shutdown_requested() {
         let launched = Instant::now();
-        match run_supervisor(cfg, &mut app, next.take())? {
+        match run_supervisor(cfg, &mut service, next.take())? {
             Cycle::Stop => break,
             Cycle::Continue => {}
             Cycle::Backoff => {
@@ -112,32 +141,42 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
                     delay.as_secs()
                 ));
                 if sleep_interruptible(delay) {
+                    // Emitted ONLY when shutdown cut the backoff sleep short (never when the
+                    // sleep elapsed and we relaunch), so a test can prove interruption from
+                    // durable evidence instead of racing a wall clock.
+                    info("shutdown interrupted the relaunch backoff; exiting without relaunch");
                     break;
                 }
             }
             Cycle::Activate(path) => next = Some(path),
-            Cycle::AppCrashed(code) => {
-                record::mark_app_crashed(&cfg.state_dir)
-                    .map_err(|e| format!("recording application crash before restart: {e}"))?;
-                warn(&format!(
-                    "application exited (code {code}); rolling it up and letting the init system restart"
-                ));
-                return Ok(code);
-            }
+            Cycle::ServiceExited(code) => return roll_up_service_exit(&cfg.state_dir, code),
         }
     }
 
     // Transparent clean stop: forward it down to the application.
     info("stop requested; stopping the application and exiting");
-    app.stop(cfg.stop_grace);
+    service.stop(cfg.stop_grace);
     Ok(0)
 }
 
+/// Apply the perpetual-service exit policy to a neutral child-process outcome. Keeping
+/// this policy at the guardian boundary makes the process wrapper reusable without
+/// weakening the service contract: every spontaneous exit is durable and unhealthy,
+/// and its exact code—including zero—is returned to the outer lifecycle owner.
+fn roll_up_service_exit(state_dir: &Path, code: i32) -> Result<i32, String> {
+    record::mark_service_exited(state_dir)
+        .map_err(|error| format!("recording service exit before restart: {error}"))?;
+    warn(&format!(
+        "application exited (code {code}); rolling it up and letting the init system restart"
+    ));
+    Ok(code)
+}
+
 /// Launch one supervisor (the committed one, or `candidate` for a gated activation) and
-/// serve it until it exits, is replaced, the app crashes, or a stop arrives.
+/// serve it until it exits, is replaced, the service exits, or a stop arrives.
 fn run_supervisor(
     cfg: &Config,
-    app: &mut App,
+    service: &mut Service,
     candidate: Option<PathBuf>,
 ) -> Result<Cycle, String> {
     let binary = match &candidate {
@@ -150,19 +189,23 @@ fn run_supervisor(
     };
     validate_supervisor_path(cfg, &binary, candidate.is_some())?;
 
-    // An application crash that landed while the guardian was between supervisors (the
-    // backoff sleep, or a handoff) is only visible here — `poll_crash` runs solely inside
-    // `serve()`. Surface it before adopting/launching, or the crash would be silently
+    // A service exit that landed while the guardian was between supervisors (the backoff
+    // sleep, or a handoff) is only visible here — `poll_exit` runs solely inside serve.
+    // Surface it before adopting/launching, or the exit would be silently
     // discarded (the next `app.launch` reaps the dead proc) and the bad update relaunched
     // instead of rolled up and reverted.
-    if let Some(code) = app.poll_crash() {
-        return Ok(Cycle::AppCrashed(code));
+    if let Some(code) = service.poll_exit() {
+        return Ok(Cycle::ServiceExited(code));
     }
 
     // If an application is already running (a supervisor crash-relaunch, or a candidate
     // activation over the previous supervisor's app), hand its PID to the new supervisor
     // so it adopts rather than launching a duplicate.
-    let app_pid = if app.is_running() { app.pid() } else { None };
+    let app_pid = if service.is_running() {
+        service.pid()
+    } else {
+        None
+    };
 
     let mut sup = match Supervisor::launch(
         &binary,
@@ -200,13 +243,13 @@ fn run_supervisor(
             ""
         }
     ));
-    serve(cfg, &mut sup, app, candidate)
+    serve_service(cfg, &mut sup, service, candidate)
 }
 
-fn serve<L: Link>(
+fn serve_service<L: Link>(
     cfg: &Config,
     sup: &mut L,
-    app: &mut App,
+    service: &mut Service,
     candidate: Option<PathBuf>,
 ) -> Result<Cycle, String> {
     // When activating, we must see a matching readiness ack before the deadline.
@@ -220,6 +263,19 @@ fn serve<L: Link>(
 
     if sup.send_hello().is_err() {
         sup.stop();
+        // If this was a candidate (a staged replacement), reject its bytes. A hello that
+        // deterministically fails — e.g. an ABI/protocol mismatch surfacing at the handshake —
+        // would otherwise be re-selected, re-staged (idempotent slot), and re-handed-off forever
+        // (a livelock), because every other candidate-failure exit rejects the hash but this one
+        // did not. A committed supervisor is never rejected; it just backs off and retries.
+        if let Some(path) = activation.candidate.as_ref() {
+            record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
+                format!(
+                    "recording hello-failed supervisor {} rejection: {e}",
+                    path.display()
+                )
+            })?;
+        }
         return Ok(Cycle::Backoff);
     }
 
@@ -250,7 +306,7 @@ fn serve<L: Link>(
         if sup.poll_readable(SERVE_POLL_MS) {
             match sup.read_request() {
                 Ok(req) => {
-                    if dispatch(cfg, sup, app, req, &mut activation).is_err() {
+                    if dispatch(cfg, sup, service, req, &mut activation).is_err() {
                         // A channel write failed: the supervisor is gone. Fall to the
                         // exit check below.
                     }
@@ -269,10 +325,10 @@ fn serve<L: Link>(
             }
         }
 
-        // The application crashing takes priority: roll its code up and tear down.
-        if let Some(code) = app.poll_crash() {
+        // A spontaneous service exit takes priority: roll its exact code up and tear down.
+        if let Some(code) = service.poll_exit() {
             sup.stop();
-            return Ok(Cycle::AppCrashed(code));
+            return Ok(Cycle::ServiceExited(code));
         }
 
         if sup.exited() {
@@ -342,12 +398,12 @@ struct ActivationState {
 fn dispatch<L: Link>(
     cfg: &Config,
     sup: &mut L,
-    app: &mut App,
+    service: &mut Service,
     req: Request,
     activation: &mut ActivationState,
 ) -> control::Result<()> {
     let response = match req {
-        Request::Launch(spec) => match app.launch(&spec, cfg.stop_grace) {
+        Request::Launch(spec) => match service.launch(&spec, cfg.stop_grace) {
             Ok(pid) => {
                 info(&format!("launched application pid {pid}"));
                 Response::Launched { pid }
@@ -358,7 +414,7 @@ fn dispatch<L: Link>(
             }
         },
         Request::Stop => {
-            app.stop(cfg.stop_grace);
+            service.stop(cfg.stop_grace);
             Response::Ok
         }
         Request::ReplaceSupervisor(path) => {
@@ -388,8 +444,37 @@ fn dispatch<L: Link>(
             }
             Response::Ok
         }
+        Request::TrafficReady(ready) => {
+            // A durable record of each readiness edge. The probe endpoints only reflect
+            // the withdrawal transiently (readiness drops, then returns once the candidate
+            // is healthy), so this log — emitted once per edge, not once per poll — is the
+            // deterministic signal that the guardian drained traffic without ever taking
+            // the live tower down.
+            if service.traffic_ready(ready) {
+                if ready {
+                    info("returned the application to traffic; readiness restored");
+                } else {
+                    info("withdrew the application from traffic; the tower stays live");
+                }
+            }
+            Response::Ok
+        }
+        Request::ApplicationFailed => {
+            service.fail(cfg.stop_grace);
+            Response::Ok
+        }
     };
     sup.send_response(&response)
+}
+
+#[cfg(test)]
+fn serve<L: Link>(
+    cfg: &Config,
+    sup: &mut L,
+    service: &mut Service,
+    candidate: Option<PathBuf>,
+) -> Result<Cycle, String> {
+    serve_service(cfg, sup, service, candidate)
 }
 
 /// On first boot, record the supplied initial supervisor as the committed one.
@@ -403,6 +488,10 @@ fn seed_desired_supervisor(cfg: &Config) -> Result<(), String> {
         .initial_supervisor
         .as_ref()
         .ok_or("no committed supervisor and no --supervisor to seed one")?;
+    // Durably record the seeded path BEFORE the pointer, so a later boot trusts it flag-free (see
+    // `validate_supervisor_path`). A crash between the two just re-seeds identically next boot.
+    record::set_seeded_supervisor(&cfg.state_dir, initial)
+        .map_err(|e| format!("recording the seeded supervisor: {e}"))?;
     validate_supervisor_path(cfg, initial, false)?;
     record::set_desired_supervisor(&cfg.state_dir, initial)
         .map_err(|e| format!("recording the initial supervisor: {e}"))
@@ -418,14 +507,18 @@ fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Resul
         ));
     }
     if !candidate {
-        if let Some(initial) = &cfg.initial_supervisor {
-            // Both sides must resolve: comparing `.ok()` would make two *failures* compare
-            // equal (None == None) and wave the path through without ever reaching the
-            // staging-directory check below.
-            if let (Ok(resolved), Ok(initial)) =
-                (std::fs::canonicalize(path), std::fs::canonicalize(initial))
+        // Trust a non-staging committed path only if it matches the DURABLE seeded record (written
+        // at first boot while `--supervisor` was present) — not the live `--supervisor` flag. This
+        // means the flag can be dropped on any later restart without bricking a node that has never
+        // self-updated (its committed pointer is still the installer-placed raw path). A node that
+        // HAS self-updated has a staging-tree pointer and never reaches here.
+        if let Ok(Some(seeded)) = record::seeded_supervisor(&cfg.state_dir) {
+            // Both sides must resolve: comparing `.ok()` would make two *failures* compare equal
+            // (None == None) and wave the path through without reaching the staging check below.
+            if let (Ok(resolved), Ok(seeded)) =
+                (std::fs::canonicalize(path), std::fs::canonicalize(&seeded))
             {
-                if resolved == initial {
+                if resolved == seeded {
                     return Ok(());
                 }
             }
@@ -442,11 +535,7 @@ fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Resul
         )
     })?;
     let parts: Vec<_> = relative.components().collect();
-    let expected_name = if cfg!(windows) {
-        "supervisor.exe"
-    } else {
-        "supervisor"
-    };
+    let expected_name = foundation::platform::supervisor_binary_name();
     if parts.len() != 2
         || parts[0]
             .as_os_str()
@@ -469,7 +558,9 @@ fn sleep_interruptible(dur: Duration) -> bool {
         if crate::sys::shutdown_requested() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // Poll finely: a stop signal must interrupt a multi-second backoff promptly even
+        // when the machine is heavily loaded and this thread is slow to be scheduled.
+        std::thread::sleep(Duration::from_millis(25));
     }
     crate::sys::shutdown_requested()
 }
@@ -477,6 +568,8 @@ fn sleep_interruptible(dur: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::App;
+    use crate::probe::State as ProbeState;
 
     const INSTANT: Duration = Duration::from_millis(10); // a supervisor that died at once
 
@@ -619,6 +712,7 @@ mod tests {
             ready_timeout: Duration::from_secs(30),
             confirm_timeout: Duration::from_secs(30),
             stop_grace: Duration::from_secs(10),
+            probe_address: None,
         }
     }
 
@@ -639,11 +733,7 @@ mod tests {
         let digest = format!("{byte:02x}").repeat(32);
         let dir = c.state_dir.join("supervisors").join(digest);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(if cfg!(windows) {
-            "supervisor.exe"
-        } else {
-            "supervisor"
-        });
+        let path = dir.join(foundation::platform::supervisor_binary_name());
         std::fs::write(&path, b"candidate").unwrap();
         path
     }
@@ -658,10 +748,20 @@ mod tests {
     }
 
     #[test]
+    fn exit_zero_is_rolled_up_unchanged_by_service_policy() {
+        let state_dir = temp_dir("exit-zero");
+
+        assert_eq!(roll_up_service_exit(&state_dir, 0).unwrap(), 0);
+        assert!(state_dir
+            .join(control::SERVICE_EXITED_MARKER_FILE)
+            .is_file());
+    }
+
+    #[test]
     fn dispatch_launch_starts_the_app_and_replies_launched() {
         let c = cfg(temp_dir("launch"), None);
         let mut sup = FakeLink::new();
-        let mut app = App::with_spawn(fake_spawn);
+        let mut app = Service::with_process(App::with_spawn(fake_spawn));
         let mut state = activation(None, true);
         dispatch(&c, &mut sup, &mut app, Request::Launch(spec()), &mut state).unwrap();
         assert_eq!(sup.responses, vec![Response::Launched { pid: 4242 }]);
@@ -671,17 +771,44 @@ mod tests {
     fn dispatch_stop_replies_ok() {
         let c = cfg(temp_dir("stop"), None);
         let mut sup = FakeLink::new();
-        let mut app = App::with_spawn(fake_spawn);
+        let mut app = Service::with_process(App::with_spawn(fake_spawn));
         let mut state = activation(None, true);
         dispatch(&c, &mut sup, &mut app, Request::Stop, &mut state).unwrap();
         assert_eq!(sup.responses, vec![Response::Ok]);
     }
 
     #[test]
+    fn traffic_requests_drive_the_guardian_probe_state_machine() {
+        let c = cfg(temp_dir("traffic-state"), None);
+        let mut sup = FakeLink::new();
+        let probes = ProbeMachine::new();
+        let mut app = Service::new(probes.clone());
+        let mut state = activation(None, true);
+        dispatch(
+            &c,
+            &mut sup,
+            &mut app,
+            Request::TrafficReady(true),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(probes.state(), ProbeState::Serving);
+        dispatch(
+            &c,
+            &mut sup,
+            &mut app,
+            Request::TrafficReady(false),
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(probes.state(), ProbeState::Unready);
+    }
+
+    #[test]
     fn dispatch_replace_stages_the_candidate_and_replies_ok() {
         let c = cfg(temp_dir("replace"), None);
         let mut sup = FakeLink::new();
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let mut state = activation(None, true);
         let candidate = staged_candidate(&c, 0x11);
         dispatch(
@@ -702,7 +829,7 @@ mod tests {
         let outside = c.state_dir.join("arbitrary-supervisor");
         std::fs::write(&outside, b"candidate").unwrap();
         let mut sup = FakeLink::new();
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let mut state = activation(None, true);
         dispatch(
             &c,
@@ -722,7 +849,7 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let mut state = activation(Some(cand), false);
         dispatch(
             &c,
@@ -747,7 +874,7 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let mut state = activation(Some(cand), false);
         dispatch(
             &c,
@@ -776,7 +903,7 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let mut state = activation(Some(cand), true);
         dispatch(
             &c,
@@ -798,7 +925,7 @@ mod tests {
         c.ready_timeout = Duration::ZERO; // the deadline is already past on the first poll.
         let cand = PathBuf::from("/state/supervisors/slow/supervisor");
         let mut sup = FakeLink::new();
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(
             matches!(cycle, Cycle::Continue),
@@ -818,7 +945,7 @@ mod tests {
         let c = cfg(temp_dir("preexit"), None);
         let mut sup = FakeLink::new();
         sup.exited.push_back(true); // exits before any Ready
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Continue));
         assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
@@ -834,7 +961,7 @@ mod tests {
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(false); // still running right after readying...
         sup.exited.push_back(true); // ...then exits
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(
             matches!(cycle, Cycle::Continue),
@@ -862,7 +989,7 @@ mod tests {
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(false);
         sup.exited.push_back(true);
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Backoff));
         assert_eq!(
@@ -882,7 +1009,7 @@ mod tests {
         sup.readable.borrow_mut().push_back(true);
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(true);
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         assert!(matches!(
             serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap(),
             Cycle::Continue
@@ -897,7 +1024,7 @@ mod tests {
         c.ready_timeout = Duration::ZERO;
         let mut sup = FakeLink::new();
         sup.exited.push_back(true); // a plain committed supervisor that crashes
-        let mut app = App::none();
+        let mut app = Service::with_process(App::none());
         let cycle = serve(&c, &mut sup, &mut app, None).unwrap(); // candidate None ⇒ already committed
         assert!(
             matches!(cycle, Cycle::Backoff),
@@ -933,6 +1060,23 @@ mod tests {
             record::desired_supervisor(&c.state_dir).unwrap(),
             Some(initial)
         );
+    }
+
+    #[test]
+    fn a_seeded_supervisor_validates_after_the_flag_is_dropped() {
+        // Regression for the seeded-initial brick: a node that seeded via `--supervisor` and then
+        // had the flag removed on a later restart (before ever self-updating) must still validate
+        // its committed pointer — via the durable seeded record, not the live flag.
+        let dir = temp_dir("seed-flag-dropped");
+        let initial = dir.join("supervisor");
+        std::fs::write(&initial, b"binary").unwrap();
+        // First boot: flag present, seeds the pointer + the durable seeded record.
+        seed_desired_supervisor(&cfg(dir.clone(), Some(initial.clone()))).unwrap();
+        // Later boot: flag dropped. Seeding re-validates the existing committed pointer.
+        let no_flag = cfg(dir.clone(), None);
+        seed_desired_supervisor(&no_flag).expect("committed seed must validate without the flag");
+        validate_supervisor_path(&no_flag, &initial, false)
+            .expect("the seeded path must validate flag-free");
     }
 
     #[test]

@@ -1,0 +1,429 @@
+//! Arbitrary-`SIGKILL` fuzzer for the cold-install / broken-rollout / roll-forward crash-safety
+//! paths.
+//!
+//! The deterministic `install_chaos_recovery` / `stateless_install_chaos` scenarios crash at every
+//! *named* state-machine boundary — that's the exhaustive proof *under the atomicity invariant*
+//! (every durable write is atomic, so a crash between boundaries is equivalent to a crash at one).
+//! This fuzzer is the adversarial check that the invariant actually holds *everywhere*: it kills the
+//! whole tower at truly arbitrary instants, which is the one thing that catches a durable write we
+//! forgot to make atomic (or a boundary we forgot to place), and it models real pod-kill timing.
+//!
+//! It runs three sequential rounds, each a full burst of arbitrary kills, so the fuzz spans the
+//! whole fleet lifecycle — the story is: 1.0.0 installs, a broken 2.0.0 begins rolling out, and a
+//! healthy 3.0.0 supersedes the failing 2.0.0 mid-rollout; the node must end up on 3.0.0.
+//!
+//! - `install` — a cold node must reconverge to a live, committed 1.0.0. Only this round wipes the
+//!   disk (emptyDir restart churn); an upgrade never does.
+//! - `broken-rollout` — the head is re-signed to a 2.0.0 that stages and verifies but whose
+//!   entrypoint cannot exec (a signed bundle with a broken executable, exactly like the demo's
+//!   broken rollout versions — NOT an ingest-malformed archive). The node ACTIVATES it, the launch
+//!   fails, and it rolls back to the committed 1.0.0 and holds there. Persistent disk — no wipes.
+//! - `roll-forward` — a healthy 3.0.0 supersedes the failing 2.0.0 head; the node must abandon the
+//!   broken 2.0.0 and converge to a live, committed 3.0.0. Persistent disk — no wipes.
+//! - `interleave` — the true-race round: a broken head is superseded by a healthy one *while its
+//!   update transaction is still in-flight on disk*. Each trial waits for THIS trial's fresh broken
+//!   rollout to begin (the `-> {broken_v}` log, not a bare journal — a prior trial can leave a stale
+//!   committed journal behind), SIGKILLs the tree the instant its transaction journal lands,
+//!   publishes the healthy successor while the node is DOWN, then boots — forcing recovery to
+//!   reconcile an in-flight broken journal against a head that already moved on. It must reject the
+//!   broken release, restore the predecessor, and roll forward to the healthy successor (versions
+//!   climb 3→5→7→9). Persistent disk — no wipes.
+//!
+//! We do NOT publish 3.0.0 until the node has provably BEGUN the 2.0.0 rollout (a clean tower is
+//! run first and gated on the `applying update … -> 2.0.0` log). Otherwise 3.0.0 would pre-empt an
+//! un-attempted 2.0.0 and the node would jump straight to 3.0.0, never exercising the rollback. The
+//! `interleave` round is the stronger form of that same guarantee: it publishes the healthy
+//! successor only after the broken transaction is provably journaled and in-flight.
+//!
+//! Deleting the disk on an upgrade round would turn the upgrade into a fresh cold-install and never
+//! exercise the roll-forward-from-committed-state path, so only the install round is allowed to.
+//!
+//! It lives in its own binary — never inside the e2e concurrent scenario pool — so its aggressive
+//! whole-tree kills can never starve or collide with other scenarios. It reuses the e2e harness
+//! library for the (fragile, single-source-of-truth) TUF + guardian setup and adds only the kill
+//! loop. Run: `cargo run -p killfuzz` (tune with `KILLFUZZ_ROUNDS` / `KILLFUZZ_SEED`).
+
+use e2e::fixtures::*;
+use e2e::harness::*;
+use std::path::Path;
+use std::process::Command;
+
+fn main() {
+    match run() {
+        Ok(()) => println!("\n\x1b[1;32mkillfuzz: OK\x1b[0m"),
+        Err(e) => {
+            eprintln!("\n\x1b[1;31mkillfuzz FAIL: {e}\x1b[0m");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// A tiny deterministic PRNG so a failing run is reproducible from its seed.
+struct Lcg(u64);
+impl Lcg {
+    fn step(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+    fn range(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + (self.step() >> 33) % (hi - lo)
+    }
+    fn bit(&mut self) -> bool {
+        (self.step() >> 40) & 1 == 1
+    }
+}
+
+/// Reap the tower's stragglers after a kill WITHOUT touching the mock-CDN server. `Service::drop`
+/// already killed the guardian's process group; this mops up the two things that can escape it: the
+/// app orphan on macOS (its argv carries the *install* path) and a supervisor that raced the
+/// guardian's relaunch out of the group (its argv carries the *supervisor-binary* path, e.g.
+/// `.../killfuzz-work/build/supervisor-chaos`). The server's argv carries the *repo* path, so
+/// neither pattern matches it — it must stay up to serve the repo across every kill.
+fn reap(install: &Path, supervisor: &Path) {
+    kill_stray(install);
+    kill_stray(supervisor);
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim_start_matches("0x").parse().ok().or_else(|| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+        .unwrap_or(default)
+}
+
+/// One kill-fuzz round: `rounds` arbitrary SIGKILLs, then an untouched boot that must reconverge to
+/// a live, committed `expect`. The whole tower is respawned and killed each iteration. When
+/// `wipe_disk` is set (the cold-install round only), half the iterations wipe the install first
+/// (stateless emptyDir → fresh cold-install), half leave state to recover; an upgrade round never
+/// wipes — deleting the disk would turn it into a fresh install, not an upgrade.
+#[allow(clippy::too_many_arguments)]
+fn fuzz_phase(
+    label: &str,
+    expect: &str,
+    wipe_disk: bool,
+    rounds: usize,
+    seed: u64,
+    rng: &mut Lcg,
+    cmd: &Command,
+    install: &Path,
+    supervisor: &Path,
+    state_path: &Path,
+    svc: &str,
+    ver_url: &str,
+) -> R {
+    println!("killfuzz [{label}]: {rounds} rounds of arbitrary SIGKILL → expect a live, committed {expect}");
+    for round in 0..rounds {
+        // On the install round, half the iterations are stateless (emptyDir wipe → fresh
+        // cold-install), half stateful (state survives → journal recovery). Upgrade rounds keep
+        // the disk on every iteration so the roll-forward-from-committed-state path is exercised.
+        let stateless = wipe_disk && rng.bit();
+        if stateless {
+            let _ = std::fs::remove_dir_all(install);
+        }
+        let tower = Service::spawn("killfuzz", cmd);
+        // Kill at a random instant spanning the install/upgrade/reject/confirm/steady window.
+        let kill_ms = rng.range(150, 3500);
+        std::thread::sleep(std::time::Duration::from_millis(kill_ms));
+
+        // A brick is never acceptable at any kill timing: a healthy floor (1.0.0, later 2.0.0)
+        // always exists at or below the assigned head, so recovery can never run out of targets.
+        if tower.log_contains("no installable application") {
+            let log = tower.captured_log();
+            drop(tower);
+            reap(install, supervisor);
+            return fail(format!(
+                "phase {label} round {round} ({}, killed at {kill_ms}ms, seed {seed:#x}): stranded on \
+                 'no installable application' — a kill must never brick a node with a healthy floor:\n{log}",
+                if stateless { "stateless" } else { "stateful" }
+            ));
+        }
+
+        // SIGKILL the WHOLE tree, then reap synchronously: `Service::drop` kills the guardian's
+        // process group and joins its monitor; `reap` mops up any app/supervisor orphan (see its
+        // doc) while leaving the mock-CDN server up.
+        drop(tower);
+        reap(install, supervisor);
+        // Do not start the next round until the tree is actually gone (service port released).
+        if !wait_until(20, || http_text(ver_url).is_none()) {
+            return fail(format!(
+                "phase {label} round {round}: the tower tree was not fully reaped (service port still held) after the kill"
+            ));
+        }
+    }
+
+    // An untouched boot must reconverge to this phase's expected live, committed version — proving
+    // no round's kill left durable state that bricks recovery or strands the wrong release.
+    let tower = Service::spawn("killfuzz", cmd);
+    let live = wait_for_version(svc, expect, 120);
+    let want = expect.to_string();
+    let settled = wait_until(120, || {
+        matches!(
+            updated::state::read_installed(state_path),
+            updated::state::Installed::Present(ref s) if s.release.version == want
+        )
+    });
+    let log = tower.captured_log();
+    drop(tower);
+    reap(install, supervisor);
+    if !live || !settled {
+        return fail(format!(
+            "phase {label}: after {rounds} arbitrary SIGKILLs (seed {seed:#x}) the node never \
+             reconverged to a live, committed {expect} (live={live}, settled={settled}):\n{log}"
+        ));
+    }
+    // Release the port before the next phase respawns the tower.
+    if !wait_until(20, || http_text(ver_url).is_none()) {
+        return fail(format!(
+            "phase {label}: the settle boot's tree was not fully reaped (service port still held)"
+        ));
+    }
+    println!("killfuzz [{label}]: reconverged to a live, committed {expect}");
+    Ok(())
+}
+
+fn run() -> R {
+    // Its own lock (`target/killfuzz.lock`) + workdir (`target/killfuzz-work`), so it never blocks
+    // on or clobbers the e2e suite and the two can run concurrently.
+    let ctx = Ctx::named("killfuzz")?;
+    // Silent for a couple of minutes on a cold target — say so, so it doesn't look hung.
+    println!("killfuzz: building workspace binaries + sample app (first run is slow)…");
+    ctx.build()?;
+    // `ctx.build()` builds server/supervisor/bootstrap; the versioned sample app is a separate
+    // fixture the e2e runner builds explicitly, so build it here too or the publish has no source.
+    // One version-agnostic binary serves every release — the version is baked into each signed
+    // bundle's config, so the same bytes publish as 1.0.0, 2.0.0, and 3.0.0.
+    ctx.build_app("1.0.0")?;
+
+    let dir = ctx.work.join("killfuzz");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    // Round 1 starts with only a healthy 1.0.0 floor and ordered-install fallback signed in. The
+    // corrupt 2.0.0 and healthy 3.0.0 heads are published live BETWEEN rounds (below), which re-signs
+    // the assignment in place, so the running tower rolls forward exactly as a fleet push would.
+    ctx.publish(&dir, "app", "1.0.0", &app_v(&ctx, "1.0.0"))?;
+
+    let (srv, svc, probes) = ("127.0.0.1:21990", "127.0.0.1:21991", "127.0.0.1:21992");
+    let server = ctx.serve(&dir, srv)?;
+    let unplaced = dir.join(format!("not-preinstalled{}", ctx.exe));
+    let cmd = Sup::new(&ctx, &dir, srv, "app", appcmd(&unplaced, &["--addr", svc]))
+        .cold_install()
+        .ordered_install_fallback()
+        .readiness_health(svc)
+        .check_interval("1s")
+        .health_grace("2s")
+        // A short confirmation window (default is 120s) so a committed update confirms quickly
+        // instead of blocking the next one. The `interleave` round in particular can only begin a
+        // fresh broken rollout once the current version is confirmed — the supervisor refuses to
+        // start a new update while one is still unconfirmed in its window. The killfuzz exercises
+        // crash-safety of install/rollback/roll-forward/reconcile, not the window's duration.
+        .confirmation_window("3s")
+        .guardian_probes(probes)
+        .guardian()?;
+
+    let install = dir.join("install");
+    let state_path = install.join("state/installed.json");
+    let ver_url = format!("http://{svc}/version");
+    let rounds = env_u64("KILLFUZZ_ROUNDS", 12) as usize;
+    let seed = env_u64("KILLFUZZ_SEED", 0xC0FFEE_D00D);
+    let mut rng = Lcg(seed);
+
+    println!(
+        "killfuzz: 3 rounds (install→1.0.0, broken 2.0.0 rollout→rolls back to 1.0.0, healthy 3.0.0 \
+         supersedes→3.0.0), {rounds} kill rounds each (seed {seed:#x})"
+    );
+
+    // Round 1 — cold install. Assignment head is 1.0.0; a kill at any instant of
+    // cold-install/confirm/steady must reconverge to a live, committed 1.0.0. This is the only round
+    // that wipes the disk (emptyDir restart churn).
+    fuzz_phase(
+        "install", "1.0.0", true, rounds, seed, &mut rng, &cmd, &install, &ctx.supervisor,
+        &state_path, svc, &ver_url,
+    )?;
+
+    // Round 2 — a broken 2.0.0 begins rolling out. Its bundle stages and verifies (a valid, signed
+    // archive) but its entrypoint cannot exec — exactly like the demo's broken rollout versions — so
+    // the node ACTIVATES it, the launch fails, and it rolls back to the committed 1.0.0. Publishing
+    // it re-signs the live assignment head to 2.0.0. Persistent disk — no wipes; a kill at any
+    // instant of the rollout/rollback must still leave a live, committed 1.0.0.
+    let broken = dir.join("broken-app");
+    std::fs::write(&broken, b"not-a-runnable-application-entrypoint\n").map_err(str_err)?;
+    ctx.publish(&dir, "app", "2.0.0", &broken)?;
+
+    // Gate: prove the node actually BEGINS rolling out 2.0.0 before 3.0.0 is ever published. A clean
+    // tower is run and waited on for the durable `applying update 1.0.0 -> 2.0.0` log (a broken
+    // executable makes the rollback that follows inevitable). Without this, publishing 3.0.0 could
+    // pre-empt an un-attempted 2.0.0 and the node would jump straight to 3.0.0, never exercising the
+    // rollback — the whole point of the round.
+    {
+        let tower = Service::spawn("killfuzz", &cmd);
+        let started = wait_until(120, || tower.log_contains("applying update 1.0.0 -> 2.0.0"));
+        let log = tower.captured_log();
+        drop(tower);
+        reap(&install, &ctx.supervisor);
+        wait_until(20, || http_text(&ver_url).is_none());
+        if !started {
+            drop(server);
+            return fail(format!(
+                "round 2: the node never began rolling out the broken 2.0.0 head (no `applying \
+                 update 1.0.0 -> 2.0.0`); cannot test supersession because 3.0.0 would just pre-empt \
+                 an un-attempted 2.0.0:\n{log}"
+            ));
+        }
+    }
+    println!("killfuzz [broken-rollout]: node began the 2.0.0 rollout — 3.0.0 will not be published until now");
+
+    fuzz_phase(
+        "broken-rollout", "1.0.0", false, rounds, seed, &mut rng, &cmd, &install, &ctx.supervisor,
+        &state_path, svc, &ver_url,
+    )?;
+
+    // Round 3 — a healthy 3.0.0 supersedes the failing 2.0.0 head. Only now — after the node has
+    // provably engaged the 2.0.0 rollout above — is 3.0.0 published, moving the head above the
+    // broken 2.0.0; the node must abandon 2.0.0 and roll forward to a live, committed 3.0.0.
+    // Persistent disk — no wipes.
+    ctx.publish(&dir, "app", "3.0.0", &app_v(&ctx, "1.0.0"))?;
+    fuzz_phase(
+        "roll-forward", "3.0.0", false, rounds, seed, &mut rng, &cmd, &install, &ctx.supervisor,
+        &state_path, svc, &ver_url,
+    )?;
+
+    // Round 4 — TRUE INTERLEAVE: a broken head is superseded by a healthy one *while the broken
+    // update transaction is still in-flight on disk*. This is the one window rounds 2-3 never hit —
+    // there, the broken 2.0.0 was fully rejected before 3.0.0 was published, so recovery never had
+    // to reconcile an in-flight broken journal against a head that had already moved on. Here we
+    // force exactly that and prove `reconcile_transaction` finalizes the broken rollback (rejects it,
+    // restores the predecessor) before rolling forward, no matter where the SIGKILL lands.
+    //
+    // Each trial uses a fresh broken head with unique bytes and an ascending version, so no stale
+    // rejection or version floor carries between trials (the node climbs 3→5→7→9).
+    let journal_path = install.join("state/transaction.json");
+    const INTERLEAVE_TRIALS: usize = 3;
+    for trial in 0..INTERLEAVE_TRIALS {
+        let broken_v = format!("{}.0.0", 4 + 2 * trial);
+        let healthy_v = format!("{}.0.0", 5 + 2 * trial);
+        // Fresh broken bytes → a new archive hash → never a stale rejection from a prior trial. The
+        // bundle stages and verifies but its entrypoint cannot exec, so activating it fails.
+        let broken = dir.join(format!("interleave-broken-{trial}"));
+        std::fs::write(&broken, format!("not-a-runnable-application-entrypoint trial {trial}\n"))
+            .map_err(str_err)?;
+        ctx.publish(&dir, "app", &broken_v, &broken)?;
+
+        // Bring the broken update in-flight, then SIGKILL the tree with its transaction journal on
+        // disk. Gate on THIS trial's fresh rollout log (`-> {broken_v}`) first, NOT on bare
+        // `journal_path.exists()`: the previous trial's settle tower can be torn down in the window
+        // after it commits an update but before it clears the spent journal, leaving a stale
+        // committed journal on disk. Keying off bare journal existence would fire on that stale
+        // journal — before the broken rollout even starts (the just-committed version is still
+        // unconfirmed, so the supervisor won't begin a new update yet) — and recovery would then
+        // reconcile the stale version instead of {broken_v}. Waiting for `-> {broken_v}` means the
+        // gate tower has already cleared the stale journal and confirmed the predecessor, so the
+        // journal we then catch belongs to {broken_v}.
+        let tower = Service::spawn("killfuzz", &cmd);
+        let began = wait_until(120, || tower.log_contains(&format!("-> {broken_v}")));
+        // Tight-poll for the fresh journal (written at ActivateStarted, before the entrypoint even
+        // execs) and SIGKILL the instant it lands — before the failed activation can roll up and a
+        // Service restart's recovery can clear it, freezing a genuine in-flight transaction on disk.
+        let in_flight = began && {
+            let mut seen = false;
+            for _ in 0..1200 {
+                if journal_path.exists() {
+                    seen = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            seen
+        };
+        if !in_flight {
+            let log = tower.captured_log();
+            drop(tower);
+            reap(&install, &ctx.supervisor);
+            drop(server);
+            return fail(format!(
+                "round 4 trial {trial}: the broken {broken_v} update never went in-flight \
+                 (began={began}); cannot stage the reconcile-against-moved-head race:\n{log}"
+            ));
+        }
+
+        // SIGKILL the whole tree with the broken transaction still journaled.
+        drop(tower);
+        reap(&install, &ctx.supervisor);
+        if !wait_until(20, || http_text(&ver_url).is_none()) {
+            drop(server);
+            return fail(format!(
+                "round 4 trial {trial}: tower tree not reaped after the mid-flight kill"
+            ));
+        }
+        // The in-flight broken journal must have survived the kill — that durable record is what
+        // forces recovery to reconcile. Now move the head to the healthy successor while the node is
+        // DOWN, so the next boot reconciles an in-flight broken journal against an already-moved head.
+        if !journal_path.exists() {
+            drop(server);
+            return fail(format!(
+                "round 4 trial {trial}: the in-flight {broken_v} journal did not survive the kill; \
+                 the reconcile-against-moved-head window was not created"
+            ));
+        }
+        ctx.publish(&dir, "app", &healthy_v, &app_v(&ctx, "1.0.0"))?;
+
+        // Boot into recovery. Journal-driven, it must finalize the broken transaction (reject/restore
+        // the predecessor) and then roll forward to a live, committed healthy_v.
+        let tower = Service::spawn("killfuzz", &cmd);
+        let live = wait_for_version(svc, &healthy_v, 120);
+        let want = healthy_v.clone();
+        let settled = wait_until(120, || {
+            matches!(
+                updated::state::read_installed(&state_path),
+                updated::state::Installed::Present(ref s) if s.release.version == want
+            )
+        });
+        // Prove recovery actually reconciled the in-flight broken transaction (rather than the node
+        // simply never having engaged the broken head): a recovery line must name broken_v. Which
+        // classification fires depends on where the kill landed, so accept any of them.
+        let reconciled = tower
+            .log_contains(&format!("recovery: rejected {broken_v} after failed activation"))
+            || tower.log_contains(&format!("interrupted activation of {broken_v}"))
+            || tower.log_contains(&format!("activation of {broken_v} never landed"))
+            || tower.log_contains(&format!("completing rollback from {broken_v}"));
+        let log = tower.captured_log();
+        drop(tower);
+        reap(&install, &ctx.supervisor);
+        if !live || !settled {
+            drop(server);
+            return fail(format!(
+                "round 4 trial {trial}: after killing the in-flight {broken_v} update and moving the \
+                 head to {healthy_v}, the node never reconverged to a live, committed {healthy_v} \
+                 (live={live}, settled={settled}):\n{log}"
+            ));
+        }
+        if !reconciled {
+            drop(server);
+            return fail(format!(
+                "round 4 trial {trial}: the node reached {healthy_v} but its recovery log never \
+                 reconciled the in-flight {broken_v} transaction — the moved-head reconcile path was \
+                 not exercised (its coverage is the whole point of this round):\n{log}"
+            ));
+        }
+        if !wait_until(20, || http_text(&ver_url).is_none()) {
+            drop(server);
+            return fail(format!(
+                "round 4 trial {trial}: settle tower not reaped (service port still held)"
+            ));
+        }
+        println!(
+            "killfuzz [interleave]: trial {trial}: killed the in-flight {broken_v} update, moved the \
+             head to {healthy_v} while down, and recovery reconciled + rolled forward to {healthy_v}"
+        );
+    }
+
+    drop(server);
+    println!(
+        "killfuzz: survived cold-install (1.0.0), a broken 2.0.0 rollout that rolled back (held on \
+         1.0.0), a healthy 3.0.0 that superseded it (→3.0.0), and {INTERLEAVE_TRIALS} in-flight \
+         broken-transaction kills each reconciled against an already-moved head (climbed 3→5→7→9)"
+    );
+    Ok(())
+}

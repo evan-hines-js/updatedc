@@ -34,6 +34,9 @@ pub const PREDECESSOR_VERSION: &str = "UPDATED_PREDECESSOR_VERSION";
 pub const LIFECYCLE_ATTEMPT_ID: &str = "UPDATED_LIFECYCLE_ATTEMPT_ID";
 /// Lifecycle phase requested from the operator lifecycle provider.
 pub const LIFECYCLE_PHASE: &str = "UPDATED_LIFECYCLE_PHASE";
+/// Why the application is being launched — `install` | `restart` | `update`. Lets one
+/// provider script tell a first boot from a plain restart from an update.
+pub const LIFECYCLE_REASON: &str = "UPDATED_LIFECYCLE_REASON";
 
 // ── test-only fault injection ──────────────────────────────────────────────────
 

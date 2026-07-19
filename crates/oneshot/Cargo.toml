@@ -17,3 +17,6 @@ update-client = { path = "../update-client" }
 tokio = { workspace = true }
 # Install the workspace's single aws-lc-rs crypto provider for the TUF HTTP client.
 rustls = { workspace = true }
+
+[features]
+fips = ["updated/fips", "updated-tuf/fips"]

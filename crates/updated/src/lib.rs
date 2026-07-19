@@ -12,16 +12,21 @@
 
 pub mod bundle;
 pub mod config;
+pub mod csr;
+pub mod enrollment;
 pub mod env;
 pub mod gc;
 pub mod hash;
 pub mod health;
+pub mod install;
 pub mod lock;
 pub mod on_launch;
 pub mod provider;
 pub mod rand;
 pub mod reject;
 pub mod state;
+pub mod telemetry;
+pub mod tls;
 pub mod transaction;
 
 /// Deserialize an optional value while still requiring the field itself to exist.

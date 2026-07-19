@@ -21,6 +21,8 @@ use tokio::sync::Semaphore;
 use tokio::time::{timeout, Duration};
 use updated_tuf::repo::{self, PublishTarget};
 
+mod certs;
+
 type R = Result<(), Box<dyn std::error::Error>>;
 
 #[tokio::main]
@@ -36,12 +38,14 @@ async fn main() {
         "publish-supervisor" => publish(rest, false).await,
         "publish-provider-set" => publish_provider_set(rest).await,
         "publish-assignment" => publish_assignment(rest).await,
+        "export-enrollment" => export_enrollment(rest),
         "target-sha256" => target_sha256(rest).await,
+        "gen-certs" => gen_certs(rest).await,
         "serve" => serve(rest).await,
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|install-app|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|target-sha256|serve> [flags]"
+                "usage: server <init|install-app|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|export-enrollment|target-sha256|serve> [flags]"
             );
             exit(2);
         }
@@ -50,6 +54,83 @@ async fn main() {
         eprintln!("error: {e}");
         exit(1);
     }
+}
+
+fn export_enrollment(args: &[String]) -> R {
+    let repo = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
+    let assignment = flag(args, "--assignment").ok_or("--assignment <target-path> is required")?;
+    let agent_id = flag(args, "--agent-id").ok_or("--agent-id <id> is required")?;
+    let routing_base_url = flag(args, "--routing-base-url")
+        .ok_or("--routing-base-url <url-or-absolute-path> is required")?;
+    let output = PathBuf::from(flag(args, "--output").ok_or("--output <path> is required")?);
+    let metadata = repo.join("metadata");
+    let root = std::fs::read_to_string(metadata.join("root.json"))?;
+    let timestamp = std::fs::read_to_string(metadata.join("timestamp.json"))?;
+    let timestamp_value: serde_json::Value = serde_json::from_str(&timestamp)?;
+    let snapshot_version = timestamp_value
+        .pointer("/signed/meta/snapshot.json/version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("timestamp omits snapshot.json version")?;
+    let snapshot =
+        std::fs::read_to_string(metadata.join(format!("{snapshot_version}.snapshot.json")))?;
+    let snapshot_value: serde_json::Value = serde_json::from_str(&snapshot)?;
+    let targets_version = snapshot_value
+        .pointer("/signed/meta/targets.json/version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("snapshot omits targets.json version")?;
+    let targets =
+        std::fs::read_to_string(metadata.join(format!("{targets_version}.targets.json")))?;
+    let targets_value: serde_json::Value = serde_json::from_str(&targets)?;
+    let agent_document = repository_target_text(&repo, &targets_value, &assignment)?;
+    let agent: updated::config::AgentDocument = serde_json::from_str(&agent_document)?;
+    agent.validate()?;
+    let managed_configuration = repository_target_text(&repo, &targets_value, &agent.config.path)?;
+    let bundle = updated::enrollment::EnrollmentBundle {
+        schema: 1,
+        agent_id,
+        routing_base_url: ensure_base_location(routing_base_url),
+        assignment,
+        routing_root: root,
+        initial: updated::enrollment::InitialSignedConfiguration {
+            timestamp,
+            snapshot,
+            targets,
+            agent_document,
+            managed_configuration,
+        },
+    };
+    bundle.validate_shape()?;
+    foundation::durable::atomic_write(
+        &output,
+        ".enrollment-",
+        &serde_json::to_vec_pretty(&bundle)?,
+    )?;
+    println!("exported signed enrollment bundle to {}", output.display());
+    Ok(())
+}
+
+fn repository_target_text(
+    repo: &Path,
+    targets: &serde_json::Value,
+    logical: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let sha = targets
+        .pointer(&format!(
+            "/signed/targets/{}/hashes/sha256",
+            logical.replace('~', "~0").replace('/', "~1")
+        ))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("targets metadata omits {logical}"))?;
+    Ok(std::fs::read_to_string(
+        repo.join("targets").join(format!("{sha}.{logical}")),
+    )?)
+}
+
+fn ensure_base_location(mut value: String) -> String {
+    if !value.ends_with('/') {
+        value.push('/');
+    }
+    value
 }
 
 async fn target_sha256(args: &[String]) -> R {
@@ -67,7 +148,14 @@ async fn publish_assignment(args: &[String]) -> R {
     let targets_url = flag(args, "--targets-url").ok_or("--targets-url <url> is required")?;
     let deployment = flag(args, "--deployment").ok_or("--deployment <id> is required")?;
     let application = target_reference(args, "application")?;
+    let ordered_install_fallback = args.iter().any(|arg| arg == "--ordered-install-fallback");
     let provider_set = target_reference(args, "provider-set")?;
+    // The release trust anchor belongs to the repository being assigned. Keeping it
+    // adjacent to that repository eliminates a second caller-supplied root path.
+    let release_root_path = repo_dir.join("metadata/root.json");
+    let release_root = serde_json::from_slice(&std::fs::read(release_root_path)?)?;
+    let runtime_path = flag(args, "--runtime").ok_or("--runtime <runtime.json> is required")?;
+    let runtime = serde_json::from_slice(&std::fs::read(runtime_path)?)?;
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
     let config_source = repo_dir.join(".config-build.json");
     let node_source = repo_dir.join(".node-build.json");
@@ -76,8 +164,12 @@ async fn publish_assignment(args: &[String]) -> R {
         deployment,
         metadata_url,
         targets_url,
+        report_url: None,
         application,
+        ordered_install_fallback,
         provider_set,
+        release_root,
+        runtime,
     };
     assignment.validate()?;
     let config_bytes = serde_json::to_vec(&assignment)?;
@@ -93,6 +185,9 @@ async fn publish_assignment(args: &[String]) -> R {
             path: config_name.clone(),
             sha256: config_sha256,
         },
+        // The dev/e2e publisher does not model an external intermediary; nodes it seeds
+        // self-manage with their own probes.
+        status: None,
     };
     node.validate()?;
     foundation::durable::atomic_write(&config_source, ".config-", &config_bytes)?;
@@ -127,18 +222,42 @@ async fn publish_provider_set(args: &[String]) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
     let id = flag(args, "--id").ok_or("--id <provider-set-id> is required")?;
-    let overrides = if flag(args, "--provider-path").is_some() {
-        vec![updated::config::ProviderOverride {
-            capability: updated::config::ProviderCapability::Lifecycle,
-            artifact: target_reference(args, "provider")?,
-            args: flags_all(args, "--provider-arg"),
-            timeout_millis: flag(args, "--provider-timeout-ms")
+    // Each capability is published from its own flag prefix; a set may carry a lifecycle
+    // override, a health-check override, both, or (for a provider-less set) neither.
+    let override_for = |prefix: &str,
+                        arg_flag: &str,
+                        timeout_flag: &str,
+                        capability: updated::config::ProviderCapability|
+     -> Result<Option<updated::config::ProviderOverride>, Box<dyn std::error::Error>> {
+        if flag(args, &format!("--{prefix}-path")).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(updated::config::ProviderOverride {
+            capability,
+            artifact: target_reference(args, prefix)?,
+            args: flags_all(args, arg_flag),
+            timeout_millis: flag(args, timeout_flag)
                 .unwrap_or_else(|| "300000".into())
                 .parse()?,
-        }]
-    } else {
-        Vec::new()
+        }))
     };
+    let overrides = [
+        override_for(
+            "provider",
+            "--provider-arg",
+            "--provider-timeout-ms",
+            updated::config::ProviderCapability::Lifecycle,
+        )?,
+        override_for(
+            "health-provider",
+            "--health-provider-arg",
+            "--health-provider-timeout-ms",
+            updated::config::ProviderCapability::HealthCheck,
+        )?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let set = updated::config::ProviderSet {
         schema: 2,
         id: id.clone(),
@@ -205,7 +324,7 @@ fn install_app(args: &[String]) -> R {
         &product,
         &version,
         &platform,
-        &entrypoint,
+        &updated::bundle::Entrypoints::new(&entrypoint),
     )?;
     // Seed the baseline through the same default provider the tower installs with, so
     // the installer and the running system agree on exactly one ingest path.
@@ -315,14 +434,30 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
             } else {
                 input
             };
+            let entrypoint =
+                flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
+            let activate = flag(args, "--activate");
+            let rollback = flag(args, "--rollback");
             updated::bundle::create_bundle(
                 input,
                 &archive,
                 &product,
                 &version,
                 platform,
-                &flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?,
+                &updated::bundle::Entrypoints {
+                    entrypoint: &entrypoint,
+                    activate: activate.as_deref(),
+                    rollback: rollback.as_deref(),
+                },
             )?;
+            // Test-only: deliberately damage the just-built archive. It is corrupted *before*
+            // `add_release` hashes it, so the published target is signed for its own broken bytes —
+            // it passes the client's download sha check and fails only at extract/validate. This is
+            // the malformed-but-signed bundle an honest publisher can never emit, used to exercise
+            // the client's ingest-rejection + ordered-fallback descent. Never used by real releases.
+            if let Some(kind) = flag(args, "--corrupt") {
+                corrupt_archive(&archive, &kind, &version)?;
+            }
             archive
         } else {
             PathBuf::from(source)
@@ -345,6 +480,24 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
     Ok(())
 }
 
+/// Test-only: damage a built bundle archive in a chosen way, keeping it signed for its (now
+/// corrupt) bytes so it passes the download sha check and fails only at extract/validate — the
+/// client's defense against a malformed-but-signed bundle. Distinct per version, so a descent
+/// rejects independent hashes.
+fn corrupt_archive(archive: &Path, kind: &str, version: &str) -> R {
+    match kind {
+        // Not a valid zstd stream at all: decompression fails outright.
+        "garbage" => std::fs::write(archive, format!("corrupt-archive-{version}\n").repeat(64))?,
+        // A truncated tar.zst: decompression / untar hits an unexpected EOF partway through.
+        "truncate" => {
+            let bytes = std::fs::read(archive)?;
+            std::fs::write(archive, &bytes[..bytes.len() / 2])?;
+        }
+        other => return Err(format!("unknown --corrupt kind {other:?}").into()),
+    }
+    Ok(())
+}
+
 fn lock_publisher(repo_dir: &Path) -> std::io::Result<File> {
     let lock = OpenOptions::new()
         .create(true)
@@ -358,21 +511,55 @@ fn lock_publisher(repo_dir: &Path) -> std::io::Result<File> {
 
 // --- serve ------------------------------------------------------------------
 
+/// Mint the fleet CA + gateway server cert + agent client cert into `--dir`. Each `--san`
+/// is a name the gateway is reached by (repeatable). The local counterpart of cert-manager.
+async fn gen_certs(args: &[String]) -> R {
+    let dir = PathBuf::from(flag(args, "--dir").ok_or("--dir <dir> is required")?);
+    let sans: Vec<String> = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--san")
+        .map(|pair| pair[1].clone())
+        .collect();
+    if sans.is_empty() {
+        return Err("at least one --san <name> is required for the server certificate".into());
+    }
+    certs::generate(&dir, &sans).await?;
+    println!(
+        "minted fleet CA + server + client certificates in {}",
+        dir.display()
+    );
+    Ok(())
+}
+
 async fn serve(args: &[String]) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let addr = flag(args, "--addr").unwrap_or_else(|| "127.0.0.1:8080".into());
     let root = tokio::fs::canonicalize(&repo_dir).await?;
 
+    // mTLS is mandatory, exactly like the gateway: the mock CDN admits a connection only if the
+    // client presents a certificate the fleet CA signed. It terminates TLS here and hands the
+    // decrypted stream to the same stream-generic handler.
+    let cert = PathBuf::from(flag(args, "--cert").ok_or("--cert <server.crt> is required")?);
+    let key = PathBuf::from(flag(args, "--key").ok_or("--key <server.key> is required")?);
+    let ca = PathBuf::from(flag(args, "--ca").ok_or("--ca <ca.crt> is required")?);
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(updated::tls::server_config(
+        &cert, &key, &ca,
+    )?));
+
     let listener = TcpListener::bind(&addr).await?;
     let connections = Arc::new(Semaphore::new(128));
-    println!("serving {} on http://{addr}", root.display());
+    println!("serving {} on https://{addr} (mTLS)", root.display());
     loop {
         let (stream, _) = listener.accept().await?;
         let permit = connections.clone().acquire_owned().await?;
         let root = root.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = serve_conn(stream, &root).await;
+            // A client that fails the mTLS handshake is dropped without ever reaching the repo.
+            if let Ok(stream) = acceptor.accept(stream).await {
+                let _ = serve_conn(stream, &root).await;
+            }
         });
     }
 }
@@ -425,12 +612,18 @@ where
         respond_status(&mut stream, 400, b"malformed request line").await;
         return Ok(());
     };
-    if method != "GET" {
-        respond_status(&mut stream, 405, b"method not allowed").await;
-        return Ok(());
-    }
     if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
         respond_status(&mut stream, 400, b"unsupported HTTP version").await;
+        return Ok(());
+    }
+    // As a "bring your own control plane" data plane, the server also accepts node
+    // rollout telemetry — the same generic contract the k8s gateway implements — writing
+    // each report beside the repository it serves.
+    if method == "PUT" {
+        return serve_telemetry_put(&mut stream, root, path, head, &buf).await;
+    }
+    if method != "GET" {
+        respond_status(&mut stream, 405, b"method not allowed").await;
         return Ok(());
     }
     // A `Range: bytes=N-` header means tough is resuming a download.
@@ -456,6 +649,81 @@ where
     match open_repository_file(root, path) {
         Some(file) => respond_file(&mut stream, tokio::fs::File::from_std(file), range_start).await,
         None => respond_status(&mut stream, 404, b"not found").await,
+    }
+    Ok(())
+}
+
+/// Accept a node rollout report and persist it beside the repository at
+/// `<root>/telemetry/<node>.json`. Mirrors the k8s gateway's telemetry contract: the
+/// body must be a well-formed [`updated::telemetry::NodeReport`] naming the same node as
+/// the path, so a malformed or misattributed report is rejected rather than stored.
+async fn serve_telemetry_put<S>(
+    stream: &mut S,
+    root: &Path,
+    path: &str,
+    head: &str,
+    buf: &[u8],
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(node) = updated::telemetry::node_from_path(path) else {
+        respond_status(stream, 404, b"not found").await;
+        return Ok(());
+    };
+    let content_length = head.lines().skip(1).find_map(|line| {
+        let line = line.to_ascii_lowercase();
+        line.strip_prefix("content-length:")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    });
+    let Some(content_length) = content_length else {
+        respond_status(stream, 411, b"length required").await;
+        return Ok(());
+    };
+    if content_length > 64 * 1024 {
+        respond_status(stream, 413, b"payload too large").await;
+        return Ok(());
+    }
+    let start = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .unwrap_or(buf.len());
+    let mut body = buf.get(start..).unwrap_or_default().to_vec();
+    body.truncate(content_length);
+    let mut chunk = [0u8; 1024];
+    while body.len() < content_length {
+        let read = timeout(Duration::from_secs(10), stream.read(&mut chunk))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "body timeout"))??;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    if body.len() < content_length {
+        respond_status(stream, 400, b"short body").await;
+        return Ok(());
+    }
+    body.truncate(content_length);
+    let Ok(report) = serde_json::from_slice::<updated::telemetry::NodeReport>(&body) else {
+        respond_status(stream, 400, b"malformed report").await;
+        return Ok(());
+    };
+    if report.node != node {
+        respond_status(stream, 400, b"report node mismatch").await;
+        return Ok(());
+    }
+    let dest = root.join(updated::telemetry::report_object_key(node));
+    if let Some(parent) = dest.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            respond_status(stream, 500, error.to_string().as_bytes()).await;
+            return Ok(());
+        }
+    }
+    match foundation::durable::atomic_write(&dest, ".telemetry-", &body) {
+        Ok(()) => respond_status(stream, 200, b"ok").await,
+        Err(error) => respond_status(stream, 500, error.to_string().as_bytes()).await,
     }
     Ok(())
 }

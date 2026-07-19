@@ -4,21 +4,53 @@ pub(crate) enum AppOutcome {
     Upgraded { version: String },
     Unchanged,
     Fatal(String),
+    /// A post-activation update failure: the candidate is rejected and its rollback journal is
+    /// durable. This disposable supervisor must terminate cleanly so the guardian relaunches it and
+    /// boot recovery performs the (single) rollback. Distinct from `Fatal`, which *holds* the
+    /// process alive for an unrecoverable/non-idempotent condition.
+    RestartForRecovery,
 }
 
-async fn stage_lifecycle_provider(
+/// The operator providers staged for a release from its signed provider set. Every capability
+/// is optional; a release may ship none, a lifecycle provider, a health-check provider, or both.
+#[derive(Default, Clone)]
+pub(crate) struct StagedProviders {
+    pub(crate) lifecycle: Option<updated::state::ProviderRelease>,
+    pub(crate) healthcheck: Option<updated::state::ProviderRelease>,
+}
+
+pub(crate) async fn stage_providers(
     opts: &Options,
     repo: &TrustedRepository,
     store: &mut dyn Store,
-) -> Result<Option<updated::state::LifecycleProviderRelease>, String> {
+    ordered_current: Option<&str>,
+) -> Result<StagedProviders, String> {
     let assignment = repo
         .assignment()
         .ok_or_else(|| "release repository has no desired deployment".to_string())?;
     let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
     std::fs::create_dir_all(&opts.paths.provider_staging)
         .map_err(|e| format!("creating lifecycle provider staging directory failed: {e}"))?;
+    // Resolve the provider set against the app version that will actually be selected. When
+    // ordered fallback descends below the assigned head (the head bytes are unusable), the
+    // descended app version's own signed provider set governs — app and providers roll back as
+    // one signed unit rather than pairing an old app with the head's newer providers. At the
+    // assigned head, `provider_set` is `None` and the assignment's own pointer governs, keeping
+    // providers independently revisable there. Selection is deterministic and side-effect free.
+    let policy =
+        updated_tuf::DefaultPolicy::current(&opts.application.product, &opts.application.channel);
+    let provider_ref = repo
+        .assigned_application(
+            &policy,
+            ordered_current,
+            |_message| {},
+            |target, _version| store.is_rejected(&lineage, &target_sha(target)),
+        )
+        .map_err(|e| format!("selecting application to resolve its provider set failed: {e}"))?
+        .and_then(|selected| selected.provider_set)
+        .unwrap_or_else(|| assignment.provider_set.clone());
     let set_target = repo
-        .exact_target(&assignment.provider_set)
+        .exact_target(&provider_ref)
         .map_err(|e| format!("resolving desired provider set failed: {e}"))?;
     repo.download_target(&set_target, &opts.paths.provider_download)
         .await
@@ -29,7 +61,7 @@ async fn stage_lifecycle_provider(
         .map_err(|e| format!("desired provider set is invalid: {e}"))?;
     set.validate()
         .map_err(|error| format!("desired provider set is invalid: {error}"))?;
-    let mut lifecycle = None;
+    let mut staged = StagedProviders::default();
     for provider in set.overrides {
         let target = repo.exact_target(&provider.artifact).map_err(|e| {
             format!(
@@ -54,10 +86,10 @@ async fn stage_lifecycle_provider(
             .get("version")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("provider {:?} metadata has no version", provider.capability))?;
-        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let platform = foundation::platform::platform_key();
         let provider_store = updated::provider::BundleStore::for_lifecycle(&opts.paths)
             .with_target_limit(opts.repository.target_limit);
-        let staged = update_client::acquire_verified_bundle(
+        let staged_bundle = update_client::acquire_verified_bundle(
             repo,
             &target,
             &opts.paths.provider_download,
@@ -80,19 +112,19 @@ async fn stage_lifecycle_provider(
                 provider.capability
             )
         })?;
+        let release = updated::state::ProviderRelease {
+            product: product.to_string(),
+            release: staged_bundle.id,
+            archive_sha256: sha,
+            args: provider.args,
+            timeout_millis: provider.timeout_millis,
+        };
         match provider.capability {
-            updated::config::ProviderCapability::Lifecycle => {
-                lifecycle = Some(updated::state::LifecycleProviderRelease {
-                    product: product.to_string(),
-                    release: staged.id,
-                    archive_sha256: sha,
-                    args: provider.args,
-                    timeout_millis: provider.timeout_millis,
-                });
-            }
+            updated::config::ProviderCapability::Lifecycle => staged.lifecycle = Some(release),
+            updated::config::ProviderCapability::HealthCheck => staged.healthcheck = Some(release),
         }
     }
-    Ok(lifecycle)
+    Ok(staged)
 }
 
 /// Select, authorize, download, and apply the newest application target, if any.
@@ -118,21 +150,13 @@ pub(crate) async fn check_application(
     // Provider-only deployment revisions reconcile here as well. Staging is
     // content-addressed and side-effect free; no lifecycle phase runs until an app
     // transaction consumes this exact resolved provider.
-    let lifecycle = match stage_lifecycle_provider(opts, repo, store).await {
-        Ok(lifecycle) => lifecycle,
+    let providers = match stage_providers(opts, repo, store, ordered_current).await {
+        Ok(providers) => providers,
         Err(error) => {
             warn(&error);
             return AppOutcome::Unchanged;
         }
     };
-    if matches!(
-        opts.application.activation,
-        updated::config::Activation::Reexec
-    ) && lifecycle.is_none()
-    {
-        warn("desired reexec deployment has no lifecycle provider; the running release remains active");
-        return AppOutcome::Unchanged;
-    }
     // A provider-set revision may be published independently of an application
     // release. Stage and validate it above, but never manufacture an application
     // transaction when the assigned application version is already running. In
@@ -199,14 +223,20 @@ pub(crate) async fn check_application(
     // Drive the transaction over the live-application port; scope the tower so its borrow of
     // `app` is released before the arms below read `app.pid()`.
     let outcome = {
-        let mut tower = DefaultProvider::new(app, opts, lifecycle.as_ref());
+        let mut tower = DefaultProvider::new(
+            app,
+            opts,
+            providers.lifecycle.as_ref(),
+            providers.healthcheck.as_ref(),
+        );
         apply_update(
             &mut tower,
             store,
             &prepared.release,
             &prepared.archive_sha256,
             lineage.clone(),
-            lifecycle.clone(),
+            providers.lifecycle.clone(),
+            providers.healthcheck.clone(),
         )
         .await
     };
@@ -227,22 +257,24 @@ pub(crate) async fn check_application(
                 version: prepared.version,
             }
         }
-        Ok(failure @ (Outcome::RolledBack | Outcome::RejectedBeforeActivation)) => {
-            // The transaction persisted rejection before beginning any rollback. This
-            // layer reports the already-durable result; it never owns transaction state.
-            match failure {
-                Outcome::RolledBack => warn(&format!(
-                    "rolling back to {from}: update to {} failed activation or health",
-                    prepared.version
-                )),
-                Outcome::RejectedBeforeActivation => warn(&format!(
-                    "rejected {} before activation; {from} remains running",
-                    prepared.version
-                )),
-                Outcome::Committed => unreachable!(),
-                Outcome::Deferred => unreachable!(),
-            }
+        Ok(Outcome::RejectedBeforeActivation) => {
+            // Rejected before the candidate ever activated: the predecessor never stopped, so this
+            // is a no-op for the running application. The rejection is already durable.
+            warn(&format!(
+                "rejected {} before activation; {from} remains running",
+                prepared.version
+            ));
             AppOutcome::Unchanged
+        }
+        Ok(Outcome::RollbackPending) => {
+            // The candidate activated and then failed: it is rejected and its rollback journal is
+            // durable. Terminate so the guardian relaunches us and boot recovery rolls back to the
+            // predecessor — the one rollback path.
+            warn(&format!(
+                "update to {} failed after activation; restarting to roll back to {from}",
+                prepared.version
+            ));
+            AppOutcome::RestartForRecovery
         }
         Ok(Outcome::Deferred) => {
             warn(&format!(

@@ -133,7 +133,21 @@ For the routing repository CRD, use one S3 destination:
 
 ```yaml
 spec:
-  assignment_prefix: assignments
+  defaultDeployment:
+    name: web-default
+    releaseRepository:
+      metadataUrl: https://updates.acme.example/releases/web-stable/metadata/
+      targetsUrl: https://updates.acme.example/releases/web-stable/targets/
+    application:
+      path: products/web/stable/42.0.0/linux-x86_64/web
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    providerSet:
+      path: provider-sets/web-7.json
+      sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  signingSecretRef: {name: tuf-signing-keys}
+  enrollment:
+    sharedSecretRef: {name: enrollment-secret}
+  assignmentPrefix: assignments
   s3:
     bucket: acme-updates-prod
     prefix: prod/routing

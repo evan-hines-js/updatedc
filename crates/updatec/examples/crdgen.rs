@@ -1,12 +1,13 @@
 use kube::CustomResourceExt;
-use updatec::{UpdatedGroup, UpdatedNode, UpdatedRepository};
+use updatec::{UpdateAgent, UpdateGroup, UpdateGroupSet, UpdateRepository};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     print!(
-        "{}---\n{}---\n{}",
-        serde_yaml::to_string(&UpdatedGroup::crd())?,
-        serde_yaml::to_string(&UpdatedNode::crd())?,
-        serde_yaml::to_string(&UpdatedRepository::crd())?
+        "{}---\n{}---\n{}---\n{}",
+        serde_yaml::to_string(&UpdateGroup::crd())?,
+        serde_yaml::to_string(&UpdateGroupSet::crd())?,
+        serde_yaml::to_string(&UpdateAgent::crd())?,
+        serde_yaml::to_string(&UpdateRepository::crd())?
     );
     Ok(())
 }

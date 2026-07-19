@@ -55,8 +55,30 @@ jobs:
       # dependency artifacts and analyzes only this workspace's code.
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
-      # Portable updater scenarios run identically on every OS.
-      - run: cargo run -p e2e
+      # Portable updater scenarios run identically on every OS. The arbitrary-kill fuzzer
+      # (killfuzz) runs concurrently with the suite on Unix: it SIGKILLs whole process trees at
+      # random instants (its reaper shells out to `pkill`, so it is Unix-only). The two coexist by
+      # construction — separate lock files (`target/{e2e,killfuzz}.lock`) and separate
+      # `CARGO_TARGET_DIR`s (`target/{e2e,killfuzz}-cargo`) — so neither clobbers the other's build
+      # output or workdir. The step fails if either the suite or the fuzzer fails.
+      - name: Updater E2E suite (kill fuzzer in parallel on Unix)
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            cargo run -p killfuzz &
+            killfuzz_pid=$!
+          fi
+          cargo run -p e2e
+          e2e_rc=$?
+          if [[ -n "${killfuzz_pid:-}" ]]; then
+            wait "$killfuzz_pid"
+            killfuzz_rc=$?
+          else
+            killfuzz_rc=0
+          fi
+          echo "e2e exit=$e2e_rc, killfuzz exit=$killfuzz_rc"
+          [[ $e2e_rc -eq 0 && $killfuzz_rc -eq 0 ]]
 
       # A main build produces the continuously-running update tower for each desktop
       # target. The optional updated-oneshot companion remains independently buildable
@@ -107,41 +129,6 @@ jobs:
         shell: powershell
         run: .\deploy\windows\test-scm-e2e.ps1
 
-  macos-publish-fuzz:
-    name: macOS concurrent publish fuzz (${{ matrix.mode }})
-    runs-on: macos-14
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [restart, reexec]
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Start production-shaped update tower
-        env:
-          UPDATED_SMOKE_CHECK_INTERVAL: 1s
-          UPDATED_SMOKE_HEALTH_GRACE: 2s
-          UPDATED_SMOKE_CONFIRMATION_WINDOW: 2s
-          UPDATED_SMOKE_STOP_GRACE_SECONDS: 1
-          UPDATED_SMOKE_LAUNCHD_THROTTLE_SECONDS: 1
-        run: ./scripts/macos-smoke.sh start "${{ matrix.mode }}"
-      - name: Fuzz concurrent version publication and convergence
-        run: ./scripts/macos-publish-fuzz.sh
-      - name: Preserve failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: macos-publish-fuzz-${{ matrix.mode }}-logs
-          path: |
-            target/macos-smoke/*.log
-            target/macos-smoke/publish-fuzz-results/
-          if-no-files-found: warn
-      - name: Stop update tower and remove smoke state
-        if: always()
-        run: ./scripts/macos-smoke.sh reset
-
   linux-haproxy-e2e:
     name: Linux real HAProxy binary reload
     runs-on: ubuntu-latest
@@ -176,10 +163,33 @@ jobs:
       - if: failure()
         run: kubectl -n updated-system logs deployment/updatec || true
 
+  updatec-demo-e2e:
+    name: one-click operator fleet demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+        with: {install_only: true}
+      # The single pass/fail demo e2e: stands up the kind cluster (operator + CDN + fleet +
+      # Magnolia) and asserts fleet convergence, set isolation, external-endpoint reconciliation,
+      # ordered lifecycle hooks, and group rollback. `--exit` returns 0 on "E2E PASS", non-zero on
+      # any failed assertion. (`scripts/demo.sh` is the human, ansible/VM bring-up path, not this.)
+      - name: Exercise UI publication, lifecycle hooks, per-node failure, rollback, and upgrade
+        run: cargo run -p updatec-demo -- e2e --exit
+      - name: Preserve demo diagnostics
+        if: failure()
+        run: |
+          kubectl -n updated-system get pods,updateagents,updategroups -o wide || true
+          kubectl -n updated-system logs deployment/updatec-controller --tail=200 || true
+          kubectl -n updated-system logs deployment/updatec-demo --tail=200 || true
+
   release:
     name: Publish immutable release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, trivy, windows-scm-e2e, macos-publish-fuzz, linux-haproxy-e2e, updatec-e2e]
+    needs: [test, trivy, windows-scm-e2e, linux-haproxy-e2e, updatec-e2e, updatec-demo-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,7 +1,7 @@
 # Kubernetes operator (`updatec`)
 
 `updatec` is one possible control plane for `updated`. Kubernetes stores its desired
-state, but an `UpdatedNode` may represent an agent in this cluster, another cluster, a
+state, but an `UpdateAgent` may represent an agent in this cluster, another cluster, a
 VM, bare metal, or an embedded device. The operator signs the complete routing view as
 one TUF generation and publishes it to S3-compatible object storage. Agents consume the
 standard static TUF layout either directly through S3/CDN/static hosting or through the
@@ -13,10 +13,11 @@ This is the authoritative operator deployment guide. The example manifest is
 
 ## Operating model
 
-- One `UpdatedRepository` named by `UPDATED_REPOSITORY` is reconciled in
-  `UPDATED_NAMESPACE`.
-- Every `UpdatedNode` and `UpdatedGroup` in that namespace belongs to that repository.
-- Exactly one group is the explicit default. Every other group has a label selector.
+- The `UpdateRepository` named by `UPDATED_REPOSITORY` is reconciled in
+  `UPDATED_NAMESPACE`. `UpdateGroup` and `UpdateAgent` objects opt into it with an
+  explicit `repositoryRef`, so multiple independent repositories can share a namespace.
+- The repository contains the default deployment. Named groups contain their deployment
+  inline and have a non-empty label selector.
 - A node record must match zero or one non-default group. Overlapping matches reject the whole
   reconciliation and leave the last signed publication active.
 - For each of N node records, `updatec` publishes a minimal agent document containing only
@@ -120,107 +121,116 @@ are identical. Keep the bucket private when using the gateway.
 
 ## Declare desired state
 
-Each group references a ConfigMap containing one `deployment.json`. The document uses the
-same strict assignment type consumed by nodes:
-
-```json
-{
-  "schema": 2,
-  "deployment": "web-2026-07-18",
-  "metadata_url": "https://updates.example/releases/metadata/",
-  "targets_url": "https://updates.example/releases/targets/",
-  "application": {
-    "path": "products/web/stable/1.0.0/linux-x86_64/app",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  },
-  "provider_set": {
-    "path": "provider-sets/web-1.json",
-    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  }
-}
-```
-
-Create the ConfigMap and groups:
+Declare a repository with the fallback deployment. `releaseRepository` is one TUF
+lineage: `metadataUrl` is the authenticated metadata endpoint and `targetsUrl` is the
+transport base for every target authenticated by that metadata. Target paths and hashes
+are per artifact; duplicating `targetsUrl` on each artifact would permit inconsistent
+origins inside one signed lineage.
 
 ```sh
-kubectl -n updated-system create configmap deployment-default \
-  --from-file=deployment.json=./default-deployment.json
-kubectl -n updated-system create configmap deployment-edge \
-  --from-file=deployment.json=./edge-deployment.json
-
 kubectl apply -f - <<'YAML'
 apiVersion: updated.dev/v1alpha1
-kind: UpdatedGroup
+kind: UpdateRepository
 metadata: {name: default, namespace: updated-system}
 spec:
-  match_labels: {updated.dev/default: "true"}
-  deployment_config_map: deployment-default
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedGroup
-metadata: {name: edge, namespace: updated-system}
-spec:
-  match_labels: {updated.dev/role: edge}
-  deployment_config_map: deployment-edge
-YAML
-```
-
-The default group's selector is intentionally not evaluated; its non-empty value makes
-accidental catch-all definitions fail consistently. Declare logical agents explicitly;
-these records do not imply that the agents run in Kubernetes:
-
-```sh
-kubectl apply -f - <<'YAML'
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedNode
-metadata: {name: worker-1, namespace: updated-system}
-spec:
-  labels: {updated.dev/role: edge}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedNode
-metadata: {name: vm-42, namespace: updated-system}
-spec:
-  labels: {}
-YAML
-```
-
-Create the repository:
-
-```sh
-kubectl apply -f - <<'YAML'
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedRepository
-metadata: {name: default, namespace: updated-system}
-spec:
-  default_group: default
-  signing_secret: tuf-signing-keys
-  assignment_prefix: assignments
+  defaultDeployment:
+    name: web-default
+    releaseRepository:
+      metadataUrl: https://updates.example/releases/metadata/
+      targetsUrl: https://updates.example/releases/targets/
+    application:
+      path: products/web/stable/1.0.0/linux-x86_64/app
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    providerSet:
+      path: provider-sets/web-1.json
+      sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  signingSecretRef: {name: tuf-signing-keys}
+  assignmentPrefix: assignments
   s3:
     bucket: production-updates
     prefix: routing
     region: us-east-1
-    credentials_secret: s3-credentials
-    # endpoint: https://s3-compatible.example  # omit for AWS S3
+    credentialsSecretRef: {name: s3-credentials}
+    # endpoint: https://s3-compatible.example
+---
+apiVersion: updated.dev/v1alpha1
+kind: UpdateGroup
+metadata: {name: edge, namespace: updated-system}
+spec:
+  repositoryRef: {name: default}
+  selector:
+    matchLabels: {updated.dev/role: edge}
+  deployment:
+    name: web-edge
+    releaseRepository:
+      metadataUrl: https://updates.example/releases/metadata/
+      targetsUrl: https://updates.example/releases/targets/
+    application:
+      path: products/web/stable/2.0.0/linux-x86_64/app
+      sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+    providerSet:
+      path: provider-sets/web-1.json
+      sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 YAML
 ```
 
-Provision each agent with only the routing trust root, routing URL, and its stable agent
-document path. For the supplied gateway, expose its Service through your ordinary ingress
-or load balancer and use that external base URL:
+Declare logical agents explicitly; these records do not imply that the agents run in
+Kubernetes. An agent matching no named group receives `defaultDeployment`:
 
-```toml
-[routing]
-root = "/etc/example-app/routing-root.json"
-base_url = "https://updates.example/routing/"
-assignment = "assignments/agents/worker-1.json"
+```sh
+kubectl apply -f - <<'YAML'
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata: {name: worker-1, namespace: updated-system}
+spec:
+  repositoryRef: {name: default}
+  identity: {kind: manual}
+  labels: {updated.dev/role: edge}
+---
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata: {name: vm-42, namespace: updated-system}
+spec:
+  repositoryRef: {name: default}
+  identity: {kind: manual}
+  labels: {}
+YAML
 ```
 
-On every update check, the agent first refreshes routing TUF, verifies its agent document,
-follows the agent document's exact `config` target reference, and verifies that config bundle.
-Only then does it contact the release metadata URL inside the config. Moving `worker-1`
-between groups changes its agent document pointer; no group concept or configuration exists
-on the agent.
+After the routing generation is published, the controller records the exportable Secret
+in agent status. Export the portable enrollment bundle without giving the machine any
+Kubernetes credentials:
+
+```sh
+secret="$(kubectl -n updated-system get updateagent worker-1 \
+  -o jsonpath='{.status.enrollmentSecretRef.name}')"
+kubectl -n updated-system get secret "$secret" \
+  -o jsonpath='{.data.enrollment\.json}' | base64 --decode > worker-1.enrollment.json
+```
+
+The immutable Secret is owned by the `UpdateAgent`. Its file contains the pinned public
+routing root, exact assignment identity, the initial agent/config targets, and the TUF
+timestamp/snapshot/targets proof needed to verify that initial configuration offline.
+The agent never reads Kubernetes or edits CRDs.
+
+Dynamic agents receive only the enrollment URL and shared secret. For the supplied gateway,
+expose its Service through an HTTPS ingress or load balancer:
+
+```toml
+[enrollment]
+url = "https://updates.example/"
+client_cert = "/etc/updated/agent-tls/tls.crt"
+client_key = "/etc/updated/agent-tls/tls.key"
+ca = "/etc/updated/agent-tls/ca.crt"
+```
+
+Enrollment is authenticated by mutual TLS: the agent presents a client certificate the fleet
+CA signed, and trusts that CA for the gateway. cert-manager (or any issuer) mints the material;
+the config holds only paths, so it stays secretless.
+
+The gateway registers a stable generated `UpdateAgent`; operators then select it through
+CRDs. Manual provisioning instead creates a manual `UpdateAgent` and exports the immutable
+enrollment Secret shown above. Agents never receive Kubernetes credentials or edit CRDs.
 
 ## Verify operation
 
@@ -232,7 +242,7 @@ kubectl -n updated-system get lease updatec-publisher -o yaml
 ```
 
 A successful cycle logs `desired state reconciled` with the deterministic plan digest.
-Changing a group ConfigMap, selector, `UpdatedNode` labels, or repository destination causes
+Changing an inline deployment, selector, `UpdateAgent` labels, or repository destination causes
 a new signed generation. Deleting a node or group removes its logical route from new TUF
 metadata; immutable historical target objects remain available to clients holding older
 metadata.
@@ -241,6 +251,8 @@ Run the production-shaped local integration test with:
 
 ```sh
 ./scripts/kind-updatec-e2e.sh
+# Fast functional pass without the fleet-fuzz/fault-recovery phase:
+./scripts/kind-updatec-e2e.sh --fuzz-rounds 0
 ```
 
 The test keeps MinIO private, reaches routing only through the in-cluster gateway, and
@@ -248,13 +260,22 @@ runs five real bootstrap/supervisor/sampleapp towers as a StatefulSet. Two agent
 the `edge` deployment, two select `batch`, and one uses the default. An in-cluster
 Kubernetes Job curls each application's `/version` endpoint and prints the five observed
 versions before the test passes; no host port-forwarding participates. The test also
-then runs a seeded fleet fuzzer (five generations by default): every generation publishes
+then runs a seeded fleet fuzzer (one generation by default): every generation publishes
 new monotonic group versions, randomly reassigns the agents, and disrupts the controller,
 gateway, or release origin while five indexed observer pods log health/version transitions.
 A verifier Job proves exact fleet convergence after every generation. Finally, the test
 introduces an overlapping group and proves the rejected reconciliation did not change the
-published routing timestamp. Set `UPDATEC_FUZZ_ROUNDS` and `UPDATEC_FUZZ_SEED` to control
-the soak length and reproduce a placement sequence.
+published routing timestamp. Pass `--fuzz-rounds N` to control the soak length; zero
+skips the entire fleet-fuzz/observer/fault-recovery phase. `UPDATEC_FUZZ_ROUNDS` remains
+an environment fallback for CI, and `UPDATEC_FUZZ_SEED` reproduces a placement sequence.
+A separate scheduled CI soak uses
+additional rounds so the normal release gate stays deterministic and short.
+
+Each agent container exposes the guardian—not the application—on port 9090. Kubernetes
+uses `/startupz`, `/readyz`, and `/livez` directly. The E2E suite proves a planned update
+becomes unready while remaining live. It separately crashes a managed application,
+observes the guardian roll up the container, waits for Kubernetes to restart it, and
+verifies the committed bundle becomes ready again.
 
 ## Failure and recovery
 

@@ -5,5 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+foundation = { path = "../foundation" }
 updated = { path = "../updated" }
 updated-tuf = { path = "../updated-tuf" }

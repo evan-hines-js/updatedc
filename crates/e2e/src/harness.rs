@@ -103,6 +103,11 @@ pub struct Ctx {
     _run_lock: std::fs::File,
     pub root: PathBuf,
     pub work: PathBuf,
+    /// Cargo's build-output dir for this driver. `e2e` uses the shared `target/`; a differently
+    /// named driver (the kill fuzzer) gets its own `target/<name>-cargo` so its `cargo build`
+    /// never unlinks a shared `target/release/*` artifact out from under a concurrent e2e run
+    /// (which surfaced as the guardian's transient `inspecting supervisor: No such file`).
+    pub target: PathBuf,
     pub server: PathBuf,
     pub supervisor: PathBuf,
     pub bootstrap: PathBuf,
@@ -115,20 +120,36 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// The e2e scenario runner's harness. Uses the `e2e`-named lock + workdir.
     pub fn new() -> R<Ctx> {
+        Self::named("e2e")
+    }
+
+    /// A harness with its own `target/<name>.lock` and `target/<name>-work` build/run directory, so
+    /// independent drivers (the e2e suite vs. the standalone kill fuzzer) never share a lock or
+    /// clobber each other's workdir and can run concurrently.
+    pub fn named(name: &str) -> R<Ctx> {
         // crates/e2e/ -> workspace root.
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .ok_or("cannot locate workspace root")?
             .to_path_buf();
-        let work = root.join("target/e2e-work");
+        let work = root.join(format!("target/{name}-work"));
+        let lock_path = root.join(format!("target/{name}.lock"));
+        // Every driver builds into its own `target/<name>-cargo`, so concurrent `cargo build`s
+        // (and the dev tree's own `target/`) never unlink a shared `target/release/*` artifact out
+        // from under each other — the collision that surfaced as the guardian's transient
+        // `inspecting supervisor: No such file`. Point cargo (via `CARGO_TARGET_DIR`) and every
+        // built-artifact path below at the same dir so builds and copies agree.
+        let target = root.join(format!("target/{name}-cargo"));
+        std::env::set_var("CARGO_TARGET_DIR", &target);
         let run_lock = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(root.join("target/e2e.lock"))
+            .open(&lock_path)
             .map_err(str_err)?;
         let lock_deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -138,13 +159,15 @@ impl Ctx {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    return fail(
-                        "another E2E run still owns target/e2e.lock after 10s; stop that run before retrying",
-                    );
+                    return fail(format!(
+                        "another run still owns {} after 10s; stop that run before retrying",
+                        lock_path.display()
+                    ));
                 }
                 Err(std::fs::TryLockError::Error(error)) => {
                     return fail(format!(
-                        "acquiring the E2E shared ports/workdir lock: {error}"
+                        "acquiring the shared ports/workdir lock {}: {error}",
+                        lock_path.display()
                     ));
                 }
             }
@@ -160,7 +183,7 @@ impl Ctx {
         }
         std::fs::create_dir_all(work.join("build")).map_err(str_err)?;
         let exe = if cfg!(windows) { ".exe" } else { "" };
-        let bin = |name: &str| root.join(format!("target/release/{name}{exe}"));
+        let bin = |name: &str| target.join(format!("release/{name}{exe}"));
         Ok(Ctx {
             _run_lock: run_lock,
             server: bin("server"),
@@ -173,6 +196,7 @@ impl Ctx {
             platkey: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             exe,
             work,
+            target,
             root,
         })
     }
@@ -181,116 +205,94 @@ impl Ctx {
     /// `chaos` feature — the crash-injection points the chaos-recovery scenarios need,
     /// which are compiled out of every ordinary build.
     pub fn build(&self) -> R {
+        // `E2E_FIPS=1` runs the suite on FIPS-validated crypto: the binaries that do crypto (the
+        // mock CDN, the one-shot updater, and the supervisor — mTLS, the TUF transport, hashing,
+        // signing) are built `--features fips`, which links the validated aws-lc-rs. The guardian
+        // and sample apps do no crypto, so they build unchanged. A FIPS build that cannot validate
+        // its provider fails closed at startup.
+        let fips = std::env::var_os("E2E_FIPS").is_some();
+        let fips_feature: &[&str] = if fips { &["--features", "fips"] } else { &[] };
+        let crypto_cdn =
+            [["build", "--release", "-p", "server", "-p", "updated-oneshot"].as_slice(), fips_feature]
+                .concat();
+        cargo(&self.root, None, &crypto_cdn)?;
+        cargo(&self.root, None, &["build", "--release", "-p", "bootstrap"])?;
+        let supervisor_features = if fips { "chaos,fips" } else { "chaos" };
         cargo(
             &self.root,
             None,
-            &[
-                "build",
-                "--release",
-                "-p",
-                "server",
-                "-p",
-                "bootstrap",
-                "-p",
-                "updated-oneshot",
-            ],
-        )?;
-        cargo(
-            &self.root,
-            None,
-            &[
-                "build",
-                "--release",
-                "-p",
-                "supervisor",
-                "--features",
-                "chaos",
-            ],
+            &["build", "--release", "-p", "supervisor", "--features", supervisor_features],
         )?;
         let built = self
-            .root
-            .join(format!("target/release/supervisor{}", self.exe));
+            .target
+            .join(format!("release/supervisor{}", self.exe));
         std::fs::copy(built, &self.supervisor).map_err(str_err)?;
         Ok(())
     }
 
-    /// Build one version-agnostic sample binary. Release identity lives in its bundle config.
-    pub fn build_app(&self, version: &str) -> R<PathBuf> {
-        cargo(&self.root, None, &["build", "--release", "-p", "sampleapp"])?;
-        let src = self
-            .root
-            .join(format!("target/release/sampleapp{}", self.exe));
-        let dst = self.work.join(format!("build/app-{version}{}", self.exe));
+    /// Build one release package (with optional extra env and cargo `--features`) and stage the
+    /// resulting binary at `build/<dst_stem><exe>`. The single build-then-copy path behind
+    /// `build_app`, `build_reexec_app`, `build_supervisor`, and the post-ready-crash variant.
+    fn build_and_stage(
+        &self,
+        pkg: &str,
+        env: &[(&str, &str)],
+        features: &[&str],
+        dst_stem: &str,
+    ) -> R<PathBuf> {
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.current_dir(&self.root);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.args(["build", "--release", "-p", pkg]);
+        if !features.is_empty() {
+            cmd.arg("--features").arg(features.join(","));
+        }
+        run(&mut cmd)?;
+        let src = self.target.join(format!("release/{pkg}{}", self.exe));
+        let dst = self.work.join(format!("build/{dst_stem}{}", self.exe));
         std::fs::copy(&src, &dst).map_err(str_err)?;
         Ok(dst)
     }
 
+    /// Build one version-agnostic sample binary. Release identity lives in its bundle config.
+    pub fn build_app(&self, version: &str) -> R<PathBuf> {
+        self.build_and_stage("sampleapp", &[], &[], &format!("app-{version}"))
+    }
+
     pub fn build_reexec_app(&self, version: &str) -> R<PathBuf> {
-        cargo(
-            &self.root,
-            None,
-            &["build", "--release", "-p", "sampleapp-reexec"],
-        )?;
-        let src = self
-            .root
-            .join(format!("target/release/sampleapp-reexec{}", self.exe));
-        let dst = self
-            .work
-            .join(format!("build/reexec-app-{version}{}", self.exe));
-        std::fs::copy(&src, &dst).map_err(str_err)?;
-        Ok(dst)
+        self.build_and_stage(
+            "sampleapp-reexec",
+            &[],
+            &[],
+            &format!("reexec-app-{version}"),
+        )
     }
 
     /// Build `supervisor` with a baked version (so the bytes differ per version) and
     /// copy it to `build/supervisor-<v><exe>`, for the self-update scenarios.
     pub fn build_supervisor(&self, version: &str) -> R<PathBuf> {
-        cargo(
-            &self.root,
-            Some(("SUPERVISOR_VERSION", version)),
-            &[
-                "build",
-                "--release",
-                "-p",
-                "supervisor",
-                "--features",
-                "chaos",
-            ],
-        )?;
-        let src = self
-            .root
-            .join(format!("target/release/supervisor{}", self.exe));
-        let dst = self
-            .work
-            .join(format!("build/supervisor-{version}{}", self.exe));
-        std::fs::copy(&src, &dst).map_err(str_err)?;
-        Ok(dst)
+        self.build_and_stage(
+            "supervisor",
+            &[("SUPERVISOR_VERSION", version)],
+            &["chaos"],
+            &format!("supervisor-{version}"),
+        )
     }
 
     /// Build a chaos-only candidate that completes boot and signals ready, then exits
     /// before the guardian's confirmation window can commit it.
     pub fn build_post_ready_crashing_supervisor(&self, version: &str) -> R<PathBuf> {
-        let mut cmd = Command::new(env!("CARGO"));
-        cmd.current_dir(&self.root)
-            .env("SUPERVISOR_VERSION", version)
-            .env("SUPERVISOR_CHAOS_EXIT_AFTER_READY", "1")
-            .args([
-                "build",
-                "--release",
-                "-p",
-                "supervisor",
-                "--features",
-                "chaos",
-            ]);
-        run(&mut cmd)?;
-        let src = self
-            .root
-            .join(format!("target/release/supervisor{}", self.exe));
-        let dst = self.work.join(format!(
-            "build/supervisor-post-ready-crash-{version}{}",
-            self.exe
-        ));
-        std::fs::copy(src, &dst).map_err(str_err)?;
-        Ok(dst)
+        self.build_and_stage(
+            "supervisor",
+            &[
+                ("SUPERVISOR_VERSION", version),
+                ("SUPERVISOR_CHAOS_EXIT_AFTER_READY", "1"),
+            ],
+            &["chaos"],
+            &format!("supervisor-post-ready-crash-{version}"),
+        )
     }
 
     /// The update-transaction boundaries the supervisor can crash at, enumerated from the
@@ -307,6 +309,10 @@ impl Ctx {
 
     pub fn abort_chaos_boundaries(&self) -> R<Vec<String>> {
         self.list_chaos_boundaries("--list-abort-chaos-boundaries")
+    }
+
+    pub fn install_chaos_boundaries(&self) -> R<Vec<String>> {
+        self.list_chaos_boundaries("--list-install-chaos-boundaries")
     }
 
     fn list_chaos_boundaries(&self, flag: &str) -> R<Vec<String>> {
@@ -339,11 +345,42 @@ impl Ctx {
             .arg("--repo")
             .arg(dir.join("repo"))
             .arg("--keys")
-            .arg(dir.join("keys")))
+            .arg(dir.join("keys")))?;
+        // Mint the fleet mTLS material alongside the TUF keys, so the mock CDN can require client
+        // certs and each supervisor can present one. Loopback SANs cover `https://127.0.0.1:port`.
+        run(Command::new(&self.server)
+            .arg("gen-certs")
+            .arg("--dir")
+            .arg(dir.join("certs"))
+            .args(["--san", "127.0.0.1", "--san", "localhost"]))
     }
 
     /// Publish a per-platform release of `source` for `product` at `version`.
     pub fn publish(&self, dir: &Path, product: &str, version: &str, source: &Path) -> R {
+        self.publish_with(dir, product, version, source, None)
+    }
+
+    /// Publish a release whose signed bundle archive is deliberately `kind`-corrupt (`garbage` /
+    /// `truncate`) — a malformed-but-signed bundle for exercising the client's ingest rejection.
+    pub fn publish_corrupt(
+        &self,
+        dir: &Path,
+        product: &str,
+        version: &str,
+        source: &Path,
+        kind: &str,
+    ) -> R {
+        self.publish_with(dir, product, version, source, Some(kind))
+    }
+
+    fn publish_with(
+        &self,
+        dir: &Path,
+        product: &str,
+        version: &str,
+        source: &Path,
+        corrupt: Option<&str>,
+    ) -> R {
         let application = product != "supervisor";
         let mut command = Command::new(&self.server);
         command
@@ -363,6 +400,9 @@ impl Ctx {
             command
                 .arg("--entrypoint")
                 .arg(format!("bin/app{}", self.exe));
+        }
+        if let Some(kind) = corrupt {
+            command.args(["--corrupt", kind]);
         }
         run(&mut command)?;
         if application {
@@ -387,14 +427,21 @@ impl Ctx {
             .arg(dir.join("keys"))
             .args(["--id", "default"]))?;
         std::fs::write(dir.join("assignment-addr"), addr).map_err(str_err)?;
-        self.publish_current_assignment(dir, addr, "initial")?;
+        let certs = dir.join("certs");
         let mut server = Proc::spawn(
             "server",
             Command::new(&self.server)
                 .arg("serve")
                 .arg("--repo")
                 .arg(dir.join("repo"))
-                .args(["--addr", addr]),
+                .args(["--addr", addr])
+                // Terminate mTLS: present the fleet server cert, require a client cert.
+                .arg("--cert")
+                .arg(certs.join("server.crt"))
+                .arg("--key")
+                .arg(certs.join("server.key"))
+                .arg("--ca")
+                .arg(certs.join("ca.crt")),
         )?;
         if !server.wait_for_log("serving ", EVENT_TIMEOUT) {
             let exited = server.has_exited();
@@ -407,6 +454,10 @@ impl Ctx {
     }
 
     fn publish_current_assignment(&self, dir: &Path, addr: &str, deployment: &str) -> R {
+        let runtime = dir.join("assignment-runtime.json");
+        if !runtime.exists() {
+            return Ok(());
+        }
         let desired = std::fs::read_to_string(dir.join("desired-app")).map_err(str_err)?;
         let mut desired = desired.lines();
         let app_path = desired
@@ -417,7 +468,8 @@ impl Ctx {
             .ok_or("desired application hash is missing")?;
         let set_path = "provider-sets/default.json";
         let set_sha = self.target_sha256(dir, set_path)?;
-        run(Command::new(&self.server)
+        let mut command = Command::new(&self.server);
+        command
             .arg("publish-assignment")
             .arg("--repo")
             .arg(dir.join("repo"))
@@ -430,7 +482,14 @@ impl Ctx {
             .args(["--application-path", app_path])
             .args(["--application-sha256", app_sha])
             .args(["--provider-set-path", set_path])
-            .args(["--provider-set-sha256", &set_sha]))
+            .args(["--provider-set-sha256", &set_sha])
+            .arg("--runtime")
+            .arg(runtime);
+        // The Sup builder drops this marker when ordered-install fallback is opted into.
+        if dir.join("ordered-install-fallback").exists() {
+            command.arg("--ordered-install-fallback");
+        }
+        run(&mut command)
     }
 
     /// The installer-pinned root a client trusts for the repo under `dir`.
@@ -459,10 +518,10 @@ impl Ctx {
             .to_string())
     }
     pub fn meta_url(&self, srv: &str) -> String {
-        format!("http://{srv}/metadata/")
+        format!("https://{srv}/metadata/")
     }
     pub fn targets_url(&self, srv: &str) -> String {
-        format!("http://{srv}/targets/")
+        format!("https://{srv}/targets/")
     }
     /// A key file path under `dir/keys` (e.g. `root.pk8`). Only the Unix-only
     /// key-permissions scenario needs it.
@@ -525,11 +584,9 @@ pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
 /// A spawned process whose entire descendant tree is stopped on drop. Its output
 /// is teed to the console and captured in `log`.
 pub struct Proc {
-    child: Child,
+    grouped: Grouped,
     log: LogBuf,
     readers: Vec<LogReader>,
-    #[cfg(windows)]
-    job: windows_sys::Win32::Foundation::HANDLE,
 }
 
 /// One log-query API for directly spawned processes and init-model services.
@@ -563,41 +620,29 @@ impl Proc {
     /// can be torn down as a unit, teeing its stdout+stderr to the console and an
     /// in-memory buffer.
     pub fn spawn(label: &str, cmd: &mut Command) -> R<Proc> {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
+        // The tree teardown (process group on Unix, Job Object on Windows) is `spawn_grouped`'s
+        // job. On Windows one extra flag beyond it: make the child its own process-group leader so
+        // `term_pid` can deliver a `CTRL_BREAK_EVENT` to just this tree — the graceful-stop signal
+        // a directly-spawned process (unlike an init-model `Service`) must be able to receive.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
             cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         }
-        let mut child = cmd.spawn().map_err(|e| format!("spawn {label}: {e}"))?;
+        let mut grouped = spawn_grouped(cmd).map_err(|e| format!("spawn {label}: {e}"))?;
         let log = log_buf();
         let readers = [
-            tee(label, child.stdout.take(), &log),
-            tee(label, child.stderr.take(), &log),
+            tee(label, grouped.child.stdout.take(), &log),
+            tee(label, grouped.child.stderr.take(), &log),
         ]
         .into_iter()
         .flatten()
         .collect();
-        #[cfg(windows)]
-        let job = assign_job(&child)?;
         Ok(Proc {
-            child,
+            grouped,
             log,
             readers,
-            #[cfg(windows)]
-            job,
         })
     }
 
@@ -606,30 +651,19 @@ impl Proc {
     }
 
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        matches!(self.grouped.child.try_wait(), Ok(Some(_)))
     }
 
     /// This process's own PID (e.g. the guardian's), so a test can signal it directly.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.grouped.child.id()
     }
 }
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            let pgid = self.child.id() as libc::pid_t;
-            libc::kill(-pgid, libc::SIGTERM);
-            std::thread::sleep(Duration::from_millis(400));
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
-            windows_sys::Win32::Foundation::CloseHandle(self.job);
-        }
-        let _ = self.child.wait();
+        self.grouped.teardown();
+        let _ = self.grouped.child.wait();
         for reader in self.readers.drain(..) {
             reader.finish();
         }
@@ -856,16 +890,110 @@ fn cargo(root: &Path, env: Option<(&str, &str)>, args: &[&str]) -> R {
 
 /// Run a command to completion, failing on a non-zero exit.
 pub fn run(cmd: &mut Command) -> R {
-    let status = cmd
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    // Capture both streams so a failing child (a cargo build, a server invocation)
+    // reports *why* it failed, not just its exit code. On success we stay quiet.
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|e| format!("running {cmd:?}: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        fail(format!("{cmd:?} exited with {status}"))
+    if output.status.success() {
+        return Ok(());
     }
+    let mut detail = String::new();
+    for (label, stream) in [("stderr", &output.stderr), ("stdout", &output.stdout)] {
+        let text = String::from_utf8_lossy(stream);
+        if !text.trim().is_empty() {
+            detail.push_str(&format!("\n--- {label} ---\n{}", text.trim_end()));
+        }
+    }
+    fail(format!("{cmd:?} exited with {}{detail}", output.status))
+}
+
+/// Durable-state diagnostics for a failed scenario: every `install/state` directory
+/// under `work`, with the installed version, any recorded rejections, and whether an
+/// update transaction is mid-flight. Printed automatically when a scenario fails, so a
+/// failure never has to be diagnosed by guessing from streamed logs alone.
+pub fn dump_install_state(work: &Path) -> String {
+    let mut states = Vec::new();
+    let mut stack = vec![work.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let is_state = path.file_name() == Some(std::ffi::OsStr::new("state"))
+                && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("install"));
+            if is_state {
+                states.push(path);
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    states.sort();
+    if states.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n--- install-state diagnostics ---");
+    for state in states {
+        let label = state
+            .strip_prefix(work)
+            .unwrap_or(&state)
+            .parent()
+            .and_then(Path::parent)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let installed_doc = std::fs::read_to_string(state.join("installed.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        let installed = installed_doc
+            .as_ref()
+            .and_then(|doc| doc.get("release")?.get("version")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "none".into());
+        // `confirmed=false` marks a provisional cold-install head still awaiting its first passing
+        // health gate — the state that drives the ordered-fallback descent.
+        let confirmed = installed_doc
+            .as_ref()
+            .and_then(|doc| doc.get("confirmed")?.as_bool())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "n/a".into());
+        let rejected = std::fs::read_to_string(state.join("rejected"))
+            .map(|text| {
+                let hashes: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                if hashes.is_empty() {
+                    "none".into()
+                } else {
+                    hashes.join(",")
+                }
+            })
+            .unwrap_or_else(|_| "none".into());
+        let transaction = if state.join("transaction.json").exists() {
+            "IN-FLIGHT"
+        } else {
+            "none"
+        };
+        // Provider/pending presence: a rollback replays the *predecessor's own* providers held in
+        // `pending`, so `lifecycle=none`/`pending=none` on a record that should have run rollback
+        // hooks is the smoking gun for a rollback that skipped them (rather than product logic).
+        let present = |key: &str| {
+            installed_doc
+                .as_ref()
+                .map(|doc| if doc.get(key).is_some_and(|v| !v.is_null()) { "yes" } else { "none" })
+                .unwrap_or("n/a")
+        };
+        let (lifecycle, healthcheck, pending) =
+            (present("lifecycle"), present("healthcheck"), present("pending"));
+        out.push_str(&format!(
+            "\n  {label}: installed={installed} confirmed={confirmed} rejected=[{rejected}] \
+             transaction={transaction} lifecycle={lifecycle} healthcheck={healthcheck} pending={pending}"
+        ));
+    }
+    out
 }
 
 /// Best-effort teardown of any process still running the binary at `path`. The
@@ -985,4 +1113,23 @@ pub fn reap_workdir(work: &Path) {
 /// converter, not one per module.
 pub fn str_err(e: std::io::Error) -> String {
     e.to_string()
+}
+
+/// Make a fixture writable by the current operator without broadening permissions for
+/// group/other users. Bundle installation intentionally removes write access, and several
+/// corruption/repair scenarios need to model a deliberate local edit afterward.
+pub fn make_owner_writable(path: &Path) -> R {
+    let mut permissions = std::fs::metadata(path).map_err(str_err)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::PermissionsExt;
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+        permissions.set_attributes(permissions.attributes() & !FILE_ATTRIBUTE_READONLY);
+    }
+    std::fs::set_permissions(path, permissions).map_err(str_err)
 }

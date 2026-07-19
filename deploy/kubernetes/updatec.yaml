@@ -7,11 +7,14 @@ kind: Role
 metadata: {name: updatec, namespace: updated-system}
 rules:
   - apiGroups: [""]
-    resources: ["configmaps", "secrets"]
-    verbs: ["get", "list", "watch"]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["updated.dev"]
-    resources: ["updatedgroups", "updatednodes", "updatedrepositories"]
-    verbs: ["get", "list", "watch"]
+    resources: ["updategroups", "updategroupsets", "updateagents", "updaterepositories"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["updated.dev"]
+    resources: ["updategroups/status", "updategroupsets/status", "updateagents/status", "updaterepositories/status"]
+    verbs: ["get", "patch", "update"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
@@ -53,6 +56,7 @@ spec:
           env:
             - {name: UPDATED_NAMESPACE, value: updated-system}
             - {name: UPDATED_REPOSITORY, value: default}
+            - {name: UPDATED_PUBLIC_URL, value: "https://updates.example/routing"}
             - {name: RUST_LOG, value: info}
           volumeMounts:
             - {name: state, mountPath: /var/lib/updatec}
@@ -82,8 +86,13 @@ spec:
           args: [serve]
           ports:
             - {name: http, containerPort: 8080}
-          readinessProbe: {httpGet: {path: /healthz, port: http}}
-          livenessProbe: {httpGet: {path: /healthz, port: http}}
+            # Plaintext health port for the kubelet probes, which cannot present a client cert.
+            - {name: health, containerPort: 8081}
+            # Server-TLS-only join port: a join-mode node has no client cert yet, so it proves
+            # itself with the group join token in the request body. Serves only POST /join.
+            - {name: join, containerPort: 8443}
+          readinessProbe: {httpGet: {path: /healthz, port: health}}
+          livenessProbe: {httpGet: {path: /healthz, port: health}}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
@@ -97,20 +106,40 @@ spec:
             - {name: UPDATED_NAMESPACE, value: updated-system}
             - {name: UPDATED_REPOSITORY, value: default}
             - {name: UPDATED_LISTEN, value: "0.0.0.0:8080"}
+            - {name: UPDATED_JOIN_LISTEN, value: "0.0.0.0:8443"}
+            - {name: UPDATED_ISSUING_CA_DIR, value: /etc/issuing-ca}
+            - {name: UPDATED_PUBLIC_URL, value: "https://updates.example/routing"}
+            - {name: UPDATED_GATEWAY_TLS_DIR, value: /etc/gateway-tls}
             - {name: RUST_LOG, value: info}
           volumeMounts:
             - {name: tmp, mountPath: /tmp}
+            # The gateway is externally exposed, so it terminates mTLS. cert-manager issues its
+            # server cert + the fleet CA into this secret (tls.crt/tls.key/ca.crt).
+            - {name: gateway-tls, mountPath: /etc/gateway-tls, readOnly: true}
+            # The fleet CA *with its private key*, so the join handler can sign join-mode node
+            # CSRs into client certs the mTLS listener accepts. Holding the CA key here widens the
+            # gateway's blast radius; see docs/group-enrollment-design.md.
+            - {name: issuing-ca, mountPath: /etc/issuing-ca, readOnly: true}
       volumes:
         - name: tmp
           emptyDir: {medium: Memory, sizeLimit: 64Mi}
+        - name: gateway-tls
+          secret: {secretName: gateway-tls}
+        - name: issuing-ca
+          secret: {secretName: fleet-ca}
 ---
 apiVersion: v1
 kind: Service
 metadata: {name: updatec-gateway, namespace: updated-system}
 spec:
   selector: {app: updatec-gateway}
+  # Agents reach the gateway at `https://updatec-gateway` (port 443) under mTLS; map that to the
+  # container's mTLS data port. The plaintext health port is probe-only and not exposed here.
   ports:
-    - {name: http, port: 80, targetPort: http}
+    - {name: https, port: 443, targetPort: http}
+    # Join-mode nodes reach the server-TLS-only join listener here (no client cert). Mount-mode
+    # nodes never use this port; repository content and /enroll stay behind the mTLS port above.
+    - {name: join, port: 8443, targetPort: join}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

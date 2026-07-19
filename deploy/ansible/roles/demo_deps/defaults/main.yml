@@ -1,0 +1,5 @@
+---
+demo_kind_version: v0.24.0
+demo_kubectl_version: v1.31.0
+# Map ansible_architecture to the Go arch the kind/kubectl release assets use.
+demo_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"

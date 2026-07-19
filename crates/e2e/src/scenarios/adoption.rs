@@ -19,7 +19,7 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
             .check_interval("60s")
             // The default health policy requires multiple polls; be generous on CI.
             .health_grace("5s")
-            .health(svc)
+            .readiness_health(svc)
             .guardian()?,
     )?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
@@ -96,7 +96,7 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
         &mut Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
             .check_interval("60s")
             .health_grace("5s")
-            .health(svc)
+            .readiness_health(svc)
             .guardian()?,
     )?;
 

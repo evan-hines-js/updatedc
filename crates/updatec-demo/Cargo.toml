@@ -1,0 +1,22 @@
+[package]
+name = "updatec-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+updated = { path = "../updated" }
+updatec = { path = "../updatec" }
+
+[features]
+fips = ["updatec/fips", "updated/fips"]
