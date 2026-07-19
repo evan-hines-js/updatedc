@@ -14,6 +14,7 @@ use std::time::Duration;
 use socket2::{Domain, Socket, Type};
 
 static VERSION: OnceLock<String> = OnceLock::new();
+static ARTIFACT: OnceLock<&'static str> = OnceLock::new();
 
 fn version() -> &'static str {
     VERSION.get().expect("version initialized")
@@ -50,11 +51,19 @@ static RELOAD: AtomicBool = AtomicBool::new(false);
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn run(reexec_capable: bool) {
+    run_artifact(reexec_capable, "sampleapp");
+}
+
+/// Run the fixture under a distinct application identity.  The Kind and macOS
+/// fuzzers use this to prove that an update replaced the artifact, rather than
+/// merely rewriting the version file beside the same executable.
+pub fn run_artifact(reexec_capable: bool, artifact: &'static str) {
     let loaded = load_version().unwrap_or_else(|error| {
         eprintln!("sampleapp: {error}");
         std::process::exit(2);
     });
     VERSION.set(loaded).expect("version set once");
+    ARTIFACT.set(artifact).expect("artifact set once");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let addr = flag(&args, "--addr").unwrap_or_else(|| "127.0.0.1:9090".into());
     let addr: SocketAddr = match addr.parse() {
@@ -84,7 +93,8 @@ pub fn run(reexec_capable: bool) {
     install_reload_handler(reload_signal(&reload_sig));
 
     eprintln!(
-        "sampleapp {} listening on http://{addr} (pid {}, mode {mode})",
+        "{} {} listening on http://{addr} (pid {}, mode {mode})",
+        ARTIFACT.get().expect("artifact initialized"),
         version(),
         std::process::id()
     );
@@ -155,6 +165,7 @@ fn handle(mut stream: TcpStream) {
     let crash = path == "/crash";
     let (code, body) = match path {
         "/version" => (200, version()),
+        "/artifact" => (200, *ARTIFACT.get().expect("artifact initialized")),
         "/healthz" => (200, "ok"),
         "/pid" => (200, pid.as_str()),
         "/crash" => (200, "crashing"),

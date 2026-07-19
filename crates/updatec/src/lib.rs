@@ -1,7 +1,7 @@
 //! Environment-neutral desired-state compiler for `updated`, hosted on Kubernetes.
 //!
 //! Custom `UpdatedNode` resources represent agents anywhere. Group selectors determine
-//! which exact group bundle each minimal node bundle references.
+//! which exact config bundle each minimal agent document references.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,6 +14,7 @@ pub use updated::config::{
     RepositoryAssignment as DesiredDeployment, TargetReference as ExactTarget,
 };
 
+pub mod gateway;
 pub mod publisher;
 pub mod runtime;
 
@@ -96,7 +97,7 @@ pub struct PublicationTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationPlan {
-    /// Group documents contain desired deployments; node documents contain exact group
+    /// Config documents contain desired deployments; agent documents contain exact config
     /// target references.
     pub targets: Vec<PublicationTarget>,
     pub node_groups: BTreeMap<String, String>,
@@ -224,13 +225,13 @@ pub fn build_publication_plan(
         targets.push(group);
     }
     for (node, group) in &node_groups {
-        let assignment = updated::config::NodeAssignment {
+        let assignment = updated::config::AgentDocument {
             schema: 1,
             config: group_references[group].clone(),
         };
         let bytes = serde_json::to_vec(&assignment)
             .map_err(|error| PlanError::Serialize(error.to_string()))?;
-        targets.push(target(format!("{prefix}/nodes/{node}.json"), bytes));
+        targets.push(target(format!("{prefix}/agents/{node}.json"), bytes));
     }
     targets.sort_by(|a, b| a.path.cmp(&b.path));
     let digest = publication_digest(&targets);
@@ -342,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn node_bundles_point_to_the_exact_selected_config_bundle() {
+    fn agent_documents_point_to_the_exact_selected_config_bundle() {
         let plan = build_publication_plan(
             &repository(),
             [
@@ -362,9 +363,9 @@ mod tests {
         let node = plan
             .targets
             .iter()
-            .find(|t| t.path == "assignments/nodes/a.json")
+            .find(|t| t.path == "assignments/agents/a.json")
             .unwrap();
-        let assignment: updated::config::NodeAssignment =
+        let assignment: updated::config::AgentDocument =
             serde_json::from_slice(&node.bytes).unwrap();
         assert_eq!(assignment.config.path, config.path);
         assert_eq!(assignment.config.sha256, config.sha256);

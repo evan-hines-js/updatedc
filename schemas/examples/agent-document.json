@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "config": {
+    "path": "assignments/configs/production-web.json",
+    "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+  }
+}

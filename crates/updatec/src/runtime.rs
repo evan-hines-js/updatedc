@@ -102,6 +102,12 @@ pub fn s3_store(
     access_key: Option<&str>,
     secret_key: Option<&str>,
 ) -> Result<Arc<dyn ObjectStore>, StorageError> {
+    validate_object_prefix(&destination.prefix)?;
+    if destination.bucket.trim().is_empty() || destination.region.trim().is_empty() {
+        return Err(StorageError(
+            "S3 bucket and region must not be empty".into(),
+        ));
+    }
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(&destination.bucket)
         .with_region(&destination.region);
@@ -120,6 +126,45 @@ pub fn s3_store(
         .build()
         .map(|store| Arc::new(store) as Arc<dyn ObjectStore>)
         .map_err(|e| StorageError(format!("configuring S3 store: {e}")))
+}
+
+fn validate_object_prefix(prefix: &str) -> Result<(), StorageError> {
+    let trimmed = prefix.trim_matches('/');
+    if prefix != trimmed
+        || (!trimmed.is_empty()
+            && trimmed.split('/').any(|part| {
+                part.is_empty()
+                    || part == "."
+                    || part == ".."
+                    || part.contains(['\\', ':'])
+                    || part.chars().any(char::is_control)
+            }))
+    {
+        return Err(StorageError(
+            "S3 prefix must be a relative, normalized object-key prefix".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the repository's private object store using the same configuration for both
+/// publication and the read-only HTTP gateway.
+pub async fn repository_store(
+    client: Client,
+    namespace: &str,
+    repository_name: &str,
+) -> Result<(S3Destination, Arc<dyn ObjectStore>), Box<dyn std::error::Error>> {
+    let repositories: Api<UpdatedRepository> = Api::namespaced(client.clone(), namespace);
+    let secrets: Api<Secret> = Api::namespaced(client, namespace);
+    let destination = repositories.get(repository_name).await?.spec.s3;
+    let credentials = match &destination.credentials_secret {
+        Some(name) => Some(secrets.get(name).await?),
+        None => None,
+    };
+    let access = secret_string(credentials.as_ref(), "AWS_ACCESS_KEY_ID")?;
+    let secret = secret_string(credentials.as_ref(), "AWS_SECRET_ACCESS_KEY")?;
+    let store = s3_store(&destination, access.as_deref(), secret.as_deref())?;
+    Ok((destination, store))
 }
 
 /// Mirror a fully signed repository. `timestamp.json` is uploaded last, making it the
@@ -313,5 +358,15 @@ mod lease_tests {
         let first = desired_publication_digest(&repository("first"), "plan").unwrap();
         let second = desired_publication_digest(&repository("second"), "plan").unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn object_prefix_is_normalized_and_confined() {
+        for valid in ["", "routing", "tenant/routing"] {
+            assert!(validate_object_prefix(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["/routing", "routing/", "a//b", "a/../b", "a\\b", "a:b"] {
+            assert!(validate_object_prefix(invalid).is_err(), "{invalid}");
+        }
     }
 }

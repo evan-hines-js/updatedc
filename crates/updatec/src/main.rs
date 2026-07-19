@@ -9,9 +9,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    let mode = std::env::args()
+        .nth(1)
+        .ok_or("usage: updatec <controller|serve>")?;
+    if !matches!(mode.as_str(), "controller" | "serve") || std::env::args().nth(2).is_some() {
+        return Err("usage: updatec <controller|serve>".into());
+    }
     let client = kube::Client::try_default().await?;
     let namespace = std::env::var("UPDATED_NAMESPACE").unwrap_or_else(|_| "updated-system".into());
     let repository = std::env::var("UPDATED_REPOSITORY").unwrap_or_else(|_| "default".into());
+    if mode == "serve" {
+        let addr = std::env::var("UPDATED_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
+        let (destination, store) = loop {
+            match updatec::runtime::repository_store(client.clone(), &namespace, &repository).await
+            {
+                Ok(configured) => break configured,
+                Err(error) => {
+                    tracing::warn!(%error, "gateway storage is not configured yet; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        };
+        return updatec::gateway::serve(&addr, store, destination.prefix)
+            .await
+            .map_err(Into::into);
+    }
     let state = std::env::var("UPDATED_STATE_DIR").unwrap_or_else(|_| "/var/lib/updatec".into());
     let identity =
         std::env::var("HOSTNAME").unwrap_or_else(|_| format!("updatec-{}", std::process::id()));

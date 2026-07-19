@@ -91,7 +91,13 @@ fn run_lifecycle_fixture() -> R {
     if fail_forward_candidate || fail_start_and_rollback {
         return fail(format!("injected {phase} failure"));
     }
-    if mode.starts_with("magnolia-shaped") {
+    // The mixed-artifact scenario uses the Magnolia adapter only while the
+    // Magnolia-shaped release is the candidate. Its following ordinary binary
+    // deliberately returns to the provider's generic lifecycle path.
+    let magnolia_candidate = mode == "magnolia-shaped-transition" && candidate_version == "2.0.0";
+    if (mode.starts_with("magnolia-shaped") && mode != "magnolia-shaped-transition")
+        || magnolia_candidate
+    {
         // A stateful stand-in for a Java/WAR CMS adapter. Each phase verifies the durable
         // prerequisite produced by the preceding phase, so running phases out of order is
         // a hard failure rather than another marker in a directory.
@@ -195,6 +201,10 @@ fn scenarios() -> Vec<Scenario> {
             app_update_and_rollback,
         ),
         (
+            "bootstrap cold-installs the first application from only the update runtime",
+            bootstrap_cold_installs_first_application,
+        ),
+        (
             "a committed update that crashes after health is reverted + rejected (one strike)",
             app_post_health_crash_reverts,
         ),
@@ -224,6 +234,7 @@ fn scenarios() -> Vec<Scenario> {
         ("custom provider finalize failure rolls back", provider_finalize_failure),
             ("custom provider rollback failure remains recoverable", provider_rollback_failure),
             ("a Magnolia-shaped Java upgrade wrapper completes every lifecycle step", magnolia_shaped_upgrade),
+            ("an install switches sample app -> Magnolia-shaped -> sample app", sample_magnolia_sample_transition),
             ("a failed Magnolia migration restores its WAR and content backup", magnolia_shaped_failed_migration_rolls_back),
         (
             "a supervisor crash does not disturb the app; the guardian relaunches it",
@@ -453,6 +464,7 @@ pub struct Sup {
     reexec: bool,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
+    seed_application: bool,
     /// Override the supervisor binary the guardian runs (self-update tests supply a
     /// specific version); defaults to the built one.
     supervisor_override: Option<PathBuf>,
@@ -485,6 +497,7 @@ impl Sup {
             reexec: false,
             supervisor_check_interval: None,
             ready_timeout: None,
+            seed_application: true,
             supervisor_override: None,
         }
     }
@@ -528,15 +541,24 @@ impl Sup {
         self
     }
 
+    /// Start with only bootstrap + supervisor; the supervisor must install the
+    /// first trusted application before the guardian launches anything.
+    pub fn cold_install(mut self) -> Self {
+        self.seed_application = false;
+        self
+    }
+
     /// The guardian's state directory for this scenario.
     pub fn state_dir(&self) -> PathBuf {
         self.dir.join("guardian-state")
     }
 
     fn write_config(&self) -> R<PathBuf> {
-        self.seed_install()?;
+        if self.seed_application {
+            self.seed_install()?;
+        }
         let mut t = format!(
-            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/nodes/node.json'\ntransport_timeout = '5s'\n\n[repository]\nroot = {}\ntransport_timeout = '5s'\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
+            "[routing]\nroot = {}\nbase_url = {}\nassignment = 'assignments/agents/agent.json'\ntransport_timeout = '5s'\n\n[repository]\nroot = {}\ntransport_timeout = '5s'\n\n[application]\nproduct = {}\ninstall_root = {}\nargs = [{}]\n",
             lit(&self.root.display().to_string()),
             lit(&self.repository_base_url),
             lit(&self.root.display().to_string()),
@@ -704,9 +726,14 @@ impl Sup {
             )
             .map_err(str_err)?;
         updated::bundle::write_active(&paths.active_release, &staged.id).map_err(str_err)?;
+        let lineage = updated::state::RepositoryLineage::from_metadata_url(&format!(
+            "{}metadata/",
+            self.repository_base_url
+        ));
+        updated::state::enroll(&paths.state, lineage.clone()).map_err(str_err)?;
         updated::state::write_installed(
             &paths.state,
-            &updated::state::InstalledState::confirmed(staged.id, staged.archive_sha256),
+            &updated::state::InstalledState::confirmed(lineage, staged.id, staged.archive_sha256),
         )
         .map_err(str_err)
     }
@@ -786,7 +813,7 @@ fn republish_assignment(sup: &Sup, deployment: &str) -> R {
             .arg(sup.dir.join("repo"))
             .arg("--keys")
             .arg(sup.dir.join("keys"))
-            .args(["--name", "assignments/nodes/node.json"])
+            .args(["--name", "assignments/agents/agent.json"])
             .args([
                 "--metadata-url",
                 &format!("{}metadata/", sup.repository_base_url),

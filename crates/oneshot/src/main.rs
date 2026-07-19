@@ -37,6 +37,12 @@ fn run() -> Result<(), String> {
         }
         Installed::Invalid => return Err("installed bundle state is corrupt".into()),
     };
+    if !matches!(
+        updated::state::read_enrollment(&paths.state),
+        updated::state::EnrollmentState::Present
+    ) {
+        return Err("installed bundle has no valid enrollment record".into());
+    }
     verify_active(&paths, &installed)
         .map_err(|error| format!("verifying active bundle: {error}"))?;
 
@@ -57,15 +63,19 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
         TrustedRepository::assigned(&config.routing, &config.repository, &config.storage, paths)
             .await
             .map_err(|error| format!("loading repository: {error}"))?;
+    let assignment = repository
+        .assignment()
+        .ok_or_else(|| "release repository has no desired deployment".to_string())?;
+    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
     let prepared = match update_client::prepare_assigned_application(
         update_client::ApplicationRequest {
             repository: &repository,
             application: &config.application,
             repository_config: &config.repository,
             paths,
-            current_version: Some(&installed.release.version),
+            current_version: installed.version_floor_for(&lineage),
         },
-        |sha256| rejected.is_rejected(sha256),
+        |sha256| rejected.is_rejected(&lineage.rejection_key(sha256)),
     )
     .await
     {
@@ -73,7 +83,7 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
         Ok(None) => return Ok(()),
         Err(error) => {
             if let Some((version, archive_sha256)) = error.rejected_archive() {
-                rejected.reject(archive_sha256).map_err(|reject_error| {
+                rejected.reject(&lineage.rejection_key(archive_sha256)).map_err(|reject_error| {
                     format!(
                         "{error}; rejecting malformed application bundle {version} also failed: {reject_error}"
                     )
@@ -82,14 +92,31 @@ async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> R
             return Err(error.to_string());
         }
     };
+    if let Some(rebound) = installed.rebind_if_same_artifact(
+        lineage.clone(),
+        &prepared.release,
+        &prepared.archive_sha256,
+    ) {
+        updated::state::write_installed(&paths.state, &rebound)
+            .map_err(|error| format!("committing repository lineage: {error}"))?;
+        info(
+            "oneshot",
+            &format!(
+                "adopted repository lineage for already-installed {}",
+                installed.release.version
+            ),
+        );
+        return Ok(());
+    }
     updated::on_launch::activate(
         paths,
         installed,
         prepared.release,
         prepared.archive_sha256.clone(),
+        lineage.clone(),
     )
     .map_err(|error| error.to_string())?;
-    if let Err(error) = rejected.clear(&prepared.archive_sha256) {
+    if let Err(error) = rejected.clear(&lineage.rejection_key(&prepared.archive_sha256)) {
         warn(
             "oneshot",
             &format!("could not clear stale rejection: {error}"),

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://updated.dev/schemas/agent-document.schema.json",
+  "title": "Updated Agent Document",
+  "description": "The minimal routing document for one agent. Control-plane grouping is deliberately absent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "config"],
+  "properties": {
+    "schema": { "const": 1 },
+    "config": {
+      "$ref": "https://updated.dev/schemas/target-reference.schema.json"
+    }
+  }
+}

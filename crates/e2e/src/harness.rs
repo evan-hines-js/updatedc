@@ -423,7 +423,7 @@ impl Ctx {
             .arg(dir.join("repo"))
             .arg("--keys")
             .arg(dir.join("keys"))
-            .args(["--name", "assignments/nodes/node.json"])
+            .args(["--name", "assignments/agents/agent.json"])
             .args(["--metadata-url", &self.meta_url(addr)])
             .args(["--targets-url", &self.targets_url(addr)])
             .args(["--deployment", deployment])

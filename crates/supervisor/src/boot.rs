@@ -34,6 +34,7 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
         let pending = state.pending.as_ref().expect("checked above");
         plan.release = ReleaseFix::Activate(pending.previous_release.clone());
         plan.commit = Some(InstalledState::confirmed(
+            pending.previous_repository_lineage.clone(),
             pending.previous_release.clone(),
             pending.previous_archive_sha256.clone(),
         ));
@@ -75,7 +76,10 @@ fn reconcile_transaction(
     let recovery =
         transaction::classify_recovery(tx, situation.active.as_ref(), Some(&installed.release));
     if tx.candidate_rejection_required {
-        plan.reject_app.push(tx.candidate_archive_sha256.clone());
+        plan.reject_app.push((
+            tx.candidate_repository_lineage.clone(),
+            tx.candidate_archive_sha256.clone(),
+        ));
         plan.warn(format!(
             "recovery: rejected {} after failed activation",
             tx.candidate_release.version
@@ -94,7 +98,10 @@ fn reconcile_transaction(
             plan.quiesce = situation.app_running.is_some();
             plan.release = ReleaseFix::Activate(tx.previous_release.clone());
             if situation.app_crashed && !tx.candidate_rejection_required {
-                plan.reject_app.push(tx.candidate_archive_sha256.clone());
+                plan.reject_app.push((
+                    tx.candidate_repository_lineage.clone(),
+                    tx.candidate_archive_sha256.clone(),
+                ));
                 plan.warn(format!(
                     "recovery: rejected {} after failed activation",
                     tx.candidate_release.version
@@ -108,6 +115,7 @@ fn reconcile_transaction(
     }
     if tx.is_rollback() {
         plan.commit = Some(InstalledState::confirmed(
+            tx.previous_repository_lineage.clone(),
             tx.previous_release.clone(),
             tx.previous_archive_sha256.clone(),
         ));
@@ -140,8 +148,12 @@ fn confirm_or_revert(
     if situation.app_crashed {
         plan.quiesce = situation.app_running.is_some();
         plan.release = ReleaseFix::Activate(pending.previous_release.clone());
-        plan.reject_app.push(installed.archive_sha256.clone());
+        plan.reject_app.push((
+            installed.repository_lineage.clone(),
+            installed.archive_sha256.clone(),
+        ));
         plan.commit = Some(InstalledState::confirmed(
+            pending.previous_repository_lineage.clone(),
             pending.previous_release.clone(),
             pending.previous_archive_sha256.clone(),
         ));
@@ -152,6 +164,7 @@ fn confirm_or_revert(
         ));
     } else if window_passed(pending, situation.confirm_window, situation.now) {
         plan.commit = Some(InstalledState::confirmed(
+            installed.repository_lineage.clone(),
             installed.release.clone(),
             installed.archive_sha256.clone(),
         ));
@@ -172,10 +185,15 @@ mod tests {
         }
     }
 
+    fn lineage() -> updated::state::RepositoryLineage {
+        updated::state::RepositoryLineage::from_metadata_url("https://repo/metadata/")
+    }
+
     fn steady() -> Situation {
         let current = release("1.0.0", "one");
         Situation {
             installed: Installed::Present(InstalledState::confirmed(
+                lineage(),
                 current.clone(),
                 "archive-one".into(),
             )),
@@ -207,15 +225,17 @@ mod tests {
             kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
             previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: None,
             phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
         assert_eq!(plan.release, ReleaseFix::Activate(release("1.0.0", "one")));
-        assert_eq!(plan.reject_app, vec!["archive-two"]);
+        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
         assert!(plan
             .notes
             .iter()
@@ -232,8 +252,10 @@ mod tests {
             kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
             previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: None,
             phase: TransactionPhase::CandidateActivated,
@@ -249,6 +271,7 @@ mod tests {
         let mut situation = steady();
         situation.active = Some(predecessor.clone());
         situation.installed = Installed::Present(InstalledState {
+            repository_lineage: lineage(),
             release: candidate.clone(),
             archive_sha256: "archive-two".into(),
             pending: None,
@@ -259,8 +282,10 @@ mod tests {
             kind: updated::transaction::Kind::Supervised,
             previous_release: predecessor,
             previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: None,
             phase: TransactionPhase::RollbackStarted,
@@ -268,7 +293,7 @@ mod tests {
 
         let plan = plan_boot(&situation);
 
-        assert_eq!(plan.reject_app, vec!["archive-two"]);
+        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
     }
 
     #[test]
@@ -281,8 +306,10 @@ mod tests {
             kind: updated::transaction::Kind::Supervised,
             previous_release: predecessor,
             previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: None,
             phase: TransactionPhase::PreflightStarted,
@@ -291,7 +318,7 @@ mod tests {
         let plan = plan_boot(&situation);
 
         assert_eq!(plan.release, ReleaseFix::None);
-        assert_eq!(plan.reject_app, vec!["archive-two"]);
+        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
         assert!(plan.clear_journal);
     }
 
@@ -302,12 +329,14 @@ mod tests {
         let mut situation = steady();
         situation.active = Some(predecessor.clone());
         situation.installed = Installed::Present(InstalledState {
+            repository_lineage: lineage(),
             release: candidate,
             archive_sha256: "archive-two".into(),
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
                 previous_release: predecessor.clone(),
                 previous_archive_sha256: "archive-one".into(),
+                previous_repository_lineage: lineage(),
                 committed_at: 100,
                 lifecycle: None,
             }),
@@ -319,7 +348,11 @@ mod tests {
         assert_eq!(plan.current.as_deref(), Some("1.0.0"));
         assert_eq!(
             plan.commit,
-            Some(InstalledState::confirmed(predecessor, "archive-one".into()))
+            Some(InstalledState::confirmed(
+                lineage(),
+                predecessor,
+                "archive-one".into()
+            ))
         );
     }
 }

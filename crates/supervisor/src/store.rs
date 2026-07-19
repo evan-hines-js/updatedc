@@ -4,19 +4,21 @@ use std::time::Duration;
 use updated::bundle::{read_active, write_active, ReleaseId};
 use updated::config::Paths;
 use updated::reject::Rejections;
-use updated::state::{read_installed, write_installed, Installed, InstalledState};
+use updated::state::{
+    read_installed, write_installed, Installed, InstalledState, RepositoryLineage,
+};
 use updated::transaction::{self, Transaction};
 
 pub(crate) trait Store {
     fn installed(&self) -> Installed;
     fn journal(&self) -> io::Result<Option<Transaction>>;
     fn active_release(&self) -> io::Result<Option<ReleaseId>>;
-    fn is_rejected(&self, digest: &str) -> bool;
+    fn is_rejected(&self, lineage: &RepositoryLineage, digest: &str) -> bool;
     fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()>;
     fn write_journal(&mut self, tx: &Transaction) -> io::Result<()>;
     fn clear_journal(&mut self) -> io::Result<()>;
-    fn reject(&mut self, digest: &str) -> io::Result<()>;
-    fn clear_rejection(&mut self, digest: &str) -> io::Result<()>;
+    fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()>;
+    fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()>;
     fn activate(&mut self, release: &ReleaseId) -> io::Result<()>;
 }
 
@@ -47,8 +49,8 @@ impl Store for FileStore {
     fn active_release(&self) -> io::Result<Option<ReleaseId>> {
         read_active(&self.paths.active_release)
     }
-    fn is_rejected(&self, digest: &str) -> bool {
-        self.rejected.is_rejected(digest)
+    fn is_rejected(&self, lineage: &RepositoryLineage, digest: &str) -> bool {
+        self.rejected.is_rejected(&lineage.rejection_key(digest))
     }
     fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
         write_installed(&self.paths.state, state)
@@ -59,11 +61,11 @@ impl Store for FileStore {
     fn clear_journal(&mut self) -> io::Result<()> {
         transaction::clear(&self.paths.journal)
     }
-    fn reject(&mut self, digest: &str) -> io::Result<()> {
-        self.rejected.reject(digest)
+    fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+        self.rejected.reject(&lineage.rejection_key(digest))
     }
-    fn clear_rejection(&mut self, digest: &str) -> io::Result<()> {
-        self.rejected.clear(digest)
+    fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+        self.rejected.clear(&lineage.rejection_key(digest))
     }
     fn activate(&mut self, release: &ReleaseId) -> io::Result<()> {
         // Verification is an ingest-time gate (see `stage_bundle`); the committed store is

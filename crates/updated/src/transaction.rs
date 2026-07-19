@@ -9,7 +9,7 @@ use std::io;
 use std::path::Path;
 
 use crate::bundle::ReleaseId;
-use crate::state::LifecycleProviderRelease;
+use crate::state::{LifecycleProviderRelease, RepositoryLineage};
 
 /// Durable intent for an in-flight executable replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,8 +21,10 @@ pub struct Transaction {
     pub kind: Kind,
     pub previous_release: ReleaseId,
     pub previous_archive_sha256: String,
+    pub previous_repository_lineage: RepositoryLineage,
     pub candidate_release: ReleaseId,
     pub candidate_archive_sha256: String,
+    pub candidate_repository_lineage: RepositoryLineage,
     /// Recovery must durably reject the candidate before this transaction may be
     /// cleared. This records policy intent that cannot safely be reconstructed from
     /// one-shot process-exit markers on a later recovery boot.
@@ -85,6 +87,14 @@ impl Transaction {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transaction id must not be empty",
+            ));
+        }
+        if !crate::hash::is_sha256_hex(self.previous_repository_lineage.as_str())
+            || !crate::hash::is_sha256_hex(self.candidate_repository_lineage.as_str())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction repository lineage is invalid",
             ));
         }
         if self.kind == Kind::OnLaunch && self.candidate_rejection_required {
@@ -307,8 +317,14 @@ mod tests {
             kind: Kind::Supervised,
             previous_release: release("1.0.0", "old"),
             previous_archive_sha256: "previous-archive".into(),
+            previous_repository_lineage: crate::state::RepositoryLineage::from_metadata_url(
+                "https://old/metadata/",
+            ),
             candidate_release: release("2.0.0", "new"),
             candidate_archive_sha256: "archive".into(),
+            candidate_repository_lineage: crate::state::RepositoryLineage::from_metadata_url(
+                "https://new/metadata/",
+            ),
             candidate_rejection_required: false,
             lifecycle: None,
             phase: Phase::PreflightStarted,

@@ -5,6 +5,7 @@ set -euo pipefail
 # launchd -> bootstrap guardian -> supervisor -> manifested application bundle.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/scripts/lib/publish-fuzz-plan.sh"
 WORK="${UPDATED_SMOKE_DIR:-$ROOT/target/macos-smoke}"
 LABEL="com.updated.local-smoke"
 DOMAIN="gui/$(id -u)"
@@ -47,7 +48,7 @@ publish_assignment() {
   set_path="provider-sets/$set_id.json"
   app_path="$(target_path "$version")"
   "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
-    --name assignments/nodes/node.json --deployment "app-$version" \
+    --name assignments/agents/agent.json --deployment "app-$version" \
     --metadata-url http://127.0.0.1:18080/metadata/ \
     --targets-url http://127.0.0.1:18080/targets/ \
     --application-path "$app_path" --application-sha256 "$(target_sha256 "$app_path")" \
@@ -198,12 +199,18 @@ stop_all() {
 }
 
 prepare_bundle() {
-  local version="$1" tree="$BIN/bundle-$1"
+  local version="$1" tree="$BIN/bundle-$1" artifact binary
   rm -rf "$tree"
   mkdir -p "$tree/bin" "$tree/config"
-  cp "$BIN/sampleapp" "$tree/bin/app"
+  artifact="$(publish_fuzz_artifact "$version")"
+  binary="$BIN/$artifact"
+  # reexec deliberately stays within its socket-compatible fixture. Restart
+  # mode swaps actual sampleapp and Magnolia-shaped executables.
+  if [[ ! -x "$binary" ]]; then binary="$BIN/sampleapp"; artifact=sampleapp; fi
+  cp "$binary" "$tree/bin/app"
   chmod +x "$tree/bin/app"
   printf 'version = "%s"\n' "$version" >"$tree/config/release.toml"
+  printf '%s\n' "$artifact" >"$tree/config/artifact"
   echo "$tree"
 }
 
@@ -253,11 +260,13 @@ start() {
     cp "$ROOT/target/release/sampleapp-reexec" "$BIN/sampleapp"
   else
     cp "$ROOT/target/release/sampleapp" "$BIN/sampleapp"
+    cp "$ROOT/target/release/magnolia-like" "$BIN/magnolia"
   fi
   "$BIN/server" init --repo "$REPO" --keys "$KEYS"
   baseline="$(prepare_bundle 1.0.0)"
   "$BIN/server" install-app --install-root "$INSTALL" --product app --version 1.0.0 \
-    --platform "$PLATFORM" --bundle "$baseline" --entrypoint bin/app
+    --platform "$PLATFORM" --bundle "$baseline" --entrypoint bin/app \
+    --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/"
   "$BIN/server" publish-app --repo "$REPO" --keys "$KEYS" --product app \
     --version 1.0.0 --bundle "$PLATFORM=$baseline" --entrypoint bin/app
   "$BIN/server" publish-provider-set --repo "$REPO" --keys "$KEYS" --id default
@@ -291,7 +300,7 @@ EOF
 [routing]
 root = "$REPO/metadata/root.json"
 base_url = "http://127.0.0.1:18080/"
-assignment = "assignments/nodes/node.json"
+assignment = "assignments/agents/agent.json"
 [repository]
 root = "$REPO/metadata/root.json"
 [application]

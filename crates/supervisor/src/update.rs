@@ -432,6 +432,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     store: &mut dyn Store,
     candidate: &updated::bundle::ReleaseId,
     candidate_archive_sha256: &str,
+    candidate_repository_lineage: updated::state::RepositoryLineage,
     lifecycle: Option<updated::state::LifecycleProviderRelease>,
 ) -> io::Result<Outcome> {
     // Recovery belongs to the boot state machine. A live supervisor must never mutate
@@ -454,8 +455,10 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
         kind: updated::transaction::Kind::Supervised,
         previous_release: installed.release.clone(),
         previous_archive_sha256: installed.archive_sha256.clone(),
+        previous_repository_lineage: installed.repository_lineage.clone(),
         candidate_release: candidate.clone(),
         candidate_archive_sha256: candidate_archive_sha256.to_string(),
+        candidate_repository_lineage: candidate_repository_lineage.clone(),
         candidate_rejection_required: false,
         lifecycle: lifecycle.map(Box::new),
         phase: TransactionPhase::PreflightStarted,
@@ -612,11 +615,13 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
         lifecycle_attempt_id: tx.id.clone(),
         previous_release: installed.release,
         previous_archive_sha256: installed.archive_sha256,
+        previous_repository_lineage: installed.repository_lineage,
         committed_at: now_unix(),
         lifecycle: tx.lifecycle.clone(),
     });
     advance_transaction(store, &mut tx, TransactionPhase::CommitStarted)?;
     store.commit_installed(&InstalledState {
+        repository_lineage: candidate_repository_lineage,
         release: candidate.clone(),
         archive_sha256: candidate_archive_sha256.to_string(),
         pending,
@@ -664,7 +669,10 @@ fn require_candidate_rejection(store: &mut dyn Store, tx: &mut Transaction) -> i
         tx.candidate_rejection_required = true;
         store.write_journal(tx)?;
     }
-    store.reject(&tx.candidate_archive_sha256)
+    store.reject(
+        &tx.candidate_repository_lineage,
+        &tx.candidate_archive_sha256,
+    )
 }
 
 /// Reactivate the previous release and get it running again through the same strategy (so a
@@ -976,6 +984,7 @@ mod tests {
         fn new(previous: updated::bundle::ReleaseId) -> Self {
             Self {
                 installed: Installed::Present(InstalledState::confirmed(
+                    test_lineage(),
                     previous.clone(),
                     "previous-archive".into(),
                 )),
@@ -1000,7 +1009,7 @@ mod tests {
         fn active_release(&self) -> io::Result<Option<updated::bundle::ReleaseId>> {
             Ok(Some(self.active.clone()))
         }
-        fn is_rejected(&self, _: &str) -> bool {
+        fn is_rejected(&self, _: &updated::state::RepositoryLineage, _: &str) -> bool {
             false
         }
         fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
@@ -1015,17 +1024,29 @@ mod tests {
             self.journal = None;
             Ok(())
         }
-        fn reject(&mut self, digest: &str) -> io::Result<()> {
+        fn reject(
+            &mut self,
+            _: &updated::state::RepositoryLineage,
+            digest: &str,
+        ) -> io::Result<()> {
             self.rejected.push(digest.into());
             Ok(())
         }
-        fn clear_rejection(&mut self, _: &str) -> io::Result<()> {
+        fn clear_rejection(
+            &mut self,
+            _: &updated::state::RepositoryLineage,
+            _: &str,
+        ) -> io::Result<()> {
             Ok(())
         }
         fn activate(&mut self, release: &updated::bundle::ReleaseId) -> io::Result<()> {
             self.active = release.clone();
             Ok(())
         }
+    }
+
+    fn test_lineage() -> updated::state::RepositoryLineage {
+        updated::state::RepositoryLineage::from_metadata_url("https://repo/metadata/")
     }
 
     #[derive(Default)]
@@ -1120,9 +1141,16 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
-            .await
-            .unwrap();
+        let outcome = apply_update(
+            &mut tower,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(outcome, Outcome::Deferred));
         assert_eq!(tower.phases, ["preflight", "prepare", "drain", "rollback"]);
@@ -1141,11 +1169,16 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
-                .await
-                .is_err()
-        );
+        assert!(apply_update(
+            &mut tower,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            None
+        )
+        .await
+        .is_err());
         assert!(store.journal.is_some());
     }
 
@@ -1159,9 +1192,16 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
-            .await
-            .unwrap();
+        let outcome = apply_update(
+            &mut tower,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(outcome, Outcome::RolledBack));
         assert_eq!(
@@ -1202,9 +1242,16 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = apply_update(&mut provider, &mut store, &candidate, "archive-two", None)
-            .await
-            .unwrap();
+        let outcome = apply_update(
+            &mut provider,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(outcome, Outcome::RejectedBeforeActivation));
         assert_eq!(store.active, previous);
@@ -1226,11 +1273,19 @@ mod tests {
             ..Default::default()
         };
 
-        let error =
-            match apply_update(&mut provider, &mut store, &candidate, "archive-two", None).await {
-                Err(error) => error,
-                Ok(_) => panic!("an unconfirmed process stop must abort activation"),
-            };
+        let error = match apply_update(
+            &mut provider,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            None,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an unconfirmed process stop must abort activation"),
+        };
 
         assert!(error.to_string().contains("process stop failure"));
         assert_eq!(store.active, previous);
@@ -1253,9 +1308,16 @@ mod tests {
                 ..Default::default()
             };
 
-            let outcome = apply_update(&mut provider, &mut store, &candidate, "archive-two", None)
-                .await
-                .unwrap();
+            let outcome = apply_update(
+                &mut provider,
+                &mut store,
+                &candidate,
+                "archive-two",
+                test_lineage(),
+                None,
+            )
+            .await
+            .unwrap();
 
             assert!(matches!(outcome, Outcome::RolledBack));
             assert_eq!(store.active, previous);
@@ -1277,11 +1339,16 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(
-            apply_update(&mut tower, &mut store, &candidate, "archive-two", None)
-                .await
-                .is_err()
-        );
+        assert!(apply_update(
+            &mut tower,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            None
+        )
+        .await
+        .is_err());
         assert_eq!(store.rejected, ["archive-two"]);
         assert!(
             store

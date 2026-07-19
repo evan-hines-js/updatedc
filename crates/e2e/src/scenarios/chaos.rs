@@ -709,6 +709,75 @@ pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
     Ok(())
 }
 
+pub(crate) fn sample_magnolia_sample_transition(ctx: &Ctx) -> R {
+    let srv = "127.0.0.1:21811";
+    let svc = "127.0.0.1:21911";
+    let dir = ctx.work.join("sample-magnolia-sample");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let app = dir.join(format!("app{}", ctx.exe));
+    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
+    let _server = ctx.serve(&dir, srv)?;
+
+    let fixture = dir.join("lifecycle-fixture");
+    let live = fixture.join("magnolia-state/live");
+    std::fs::create_dir_all(&live).map_err(str_err)?;
+    std::fs::write(live.join("content.db"), b"baseline-content\n").map_err(str_err)?;
+    std::fs::write(live.join("app.war"), b"1.0.0\n").map_err(str_err)?;
+    let command = vec![
+        std::env::current_exe()
+            .map_err(str_err)?
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        fixture.display().to_string(),
+        "magnolia-shaped-transition".into(),
+    ];
+    let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+        .health(svc)
+        .check_interval("1s")
+        .health_grace("2s")
+        .lifecycle(command)
+        .guardian()?;
+    let process = Proc::spawn("artifact-transition", &mut tower)?;
+    let magnolia_committed = wait_until(RECOVERY_TIMEOUT, || {
+        wait_for_version(svc, "2.0.0", 1)
+            && fixture.join("magnolia-state/migration-finalized").is_file()
+    }) && process.wait_for_log("upgraded to 2.0.0", RECOVERY_TIMEOUT);
+    if !magnolia_committed {
+        let log = process.captured_log();
+        drop(process);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "sample -> Magnolia-shaped transition failed:\n{log}"
+        ));
+    }
+
+    // Reuse the ordinary sample-app executable fixture. `publish-app` writes
+    // the requested 3.0.0 release configuration into the immutable bundle.
+    ctx.publish(&dir, "app", "3.0.0", &app_v(ctx, "1.0.0"))?;
+    let returned = wait_until(RECOVERY_TIMEOUT, || {
+        wait_for_version(svc, "3.0.0", 1) && !dir.join("install/state/transaction.json").is_file()
+    }) && process.wait_for_log("upgraded to 3.0.0", RECOVERY_TIMEOUT);
+    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).map_err(str_err)?;
+    let transaction_ids = attempts
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(_, id)| id))
+        .collect::<std::collections::HashSet<_>>();
+    let log = process.captured_log();
+    drop(process);
+    kill_stray(&dir.join("install"));
+    if !returned || transaction_ids.len() != 2 {
+        return fail(format!(
+            "Magnolia-shaped -> sample transition was not a distinct complete transaction:\n{attempts}\ntower log:\n{log}"
+        ));
+    }
+    ok("one install switched sample app -> Magnolia-shaped lifecycle -> sample app");
+    Ok(())
+}
+
 pub(crate) fn magnolia_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
     let srv = "127.0.0.1:21810";
     let svc = "127.0.0.1:21910";

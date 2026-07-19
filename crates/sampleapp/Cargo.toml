@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "sampleapp"
 path = "src/bin/sampleapp.rs"
 
+[[bin]]
+name = "magnolia-like"
+path = "src/bin/magnolia-like.rs"
+
 [dependencies]
 updated = { path = "../updated" }
 serde.workspace = true
