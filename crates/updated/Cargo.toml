@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Build against the FIPS-validated aws-lc-rs (and rustls in FIPS mode). Cargo unifies these onto
+# the single shared aws-lc-rs/rustls build, so every crate's TLS, hashing, signing, and RNG use
+# the validated module. `updated::tls::crypto_provider` asserts the provider really is FIPS.
+fips = ["aws-lc-rs/fips", "rustls/fips"]
+
 [dependencies]
 foundation = { path = "../foundation" }
 # The shared operator-config loader for the supervisor and one-shot updater.
@@ -18,3 +24,13 @@ hex = { workspace = true }
 tar = { workspace = true }
 zstd = { workspace = true }
 url = { workspace = true }
+reqwest = { workspace = true }
+# The agent's mTLS enrollment/repository identity — an aws-lc-rs rustls client config built
+# from cert/key/CA file paths (the bootstrap config holds paths, never secrets).
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+# Join-mode enrollment: the agent generates its keypair and a CSR locally (aws-lc-rs backend,
+# one crypto library) so no per-node certificate is ever provisioned out of band.
+rcgen = { workspace = true }
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,29 @@
+[package]
+name = "updated-healthproxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "updated_healthproxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "updated-healthproxy"
+path = "src/main.rs"
+
+[dependencies]
+# The one telemetry contract every part of the system already speaks; membership readiness
+# is derived from the exact `NodeReport` a managed node publishes to the CDN.
+updated = { path = "../updated" }
+tokio = { workspace = true }
+# Poll every node's health concurrently so one slow fetch cannot serialize the reconcile.
+futures = { workspace = true }
+# Health documents are fetched over HTTP(S) from the CDN/object store nodes write to.
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+# The first load-balancer backend programs Kubernetes EndpointSlices; kube-proxy forwards.
+kube = { workspace = true }
+k8s-openapi = { workspace = true }

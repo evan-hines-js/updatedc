@@ -3,8 +3,8 @@
 //! The guardian keeps almost nothing, and interprets none of it. It moves one pointer —
 //! which supervisor binary is committed (`desired-supervisor`) — forward on a successful
 //! handoff and leaves it put on a failed one (that is the rollback). And it drops
-//! two dumb markers for the supervisor to interpret on recovery: `app-crashed` (the last
-//! application exit was a crash) and `rejected-supervisor` (a candidate supervisor failed
+//! two dumb markers for the supervisor to interpret on recovery: `service-exited` (the
+//! managed service exited spontaneously) and `rejected-supervisor` (a candidate failed
 //! its readiness gate). It keeps no rejection set and no application-ownership record —
 //! the guardian owns the app in memory, and the app never outlives the guardian.
 //!
@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 const DESIRED_FILE: &str = "desired-supervisor";
+const SEEDED_FILE: &str = "seeded-supervisor";
 
 /// The committed supervisor binary path. `None` on first boot (the installer or the
 /// `--supervisor` flag seeds it).
@@ -23,6 +24,19 @@ pub fn desired_supervisor(state_dir: &Path) -> std::io::Result<Option<PathBuf>> 
 
 pub fn set_desired_supervisor(state_dir: &Path, path: &Path) -> std::io::Result<()> {
     write_pointer(&state_dir.join(DESIRED_FILE), path)
+}
+
+/// The initial supervisor path recorded at first-boot seed. It lives *outside* the
+/// content-addressed staging tree (the installer placed it), so validation of the committed
+/// pointer trusts a non-staging path only when it matches this durable record — proving a prior
+/// boot legitimately seeded it while `--supervisor` was present, rather than requiring the flag to
+/// be re-passed on every restart (which would brick a node that never self-updated).
+pub fn seeded_supervisor(state_dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    read_pointer(&state_dir.join(SEEDED_FILE))
+}
+
+pub fn set_seeded_supervisor(state_dir: &Path, path: &Path) -> std::io::Result<()> {
+    write_pointer(&state_dir.join(SEEDED_FILE), path)
 }
 
 fn read_pointer(path: &Path) -> std::io::Result<Option<PathBuf>> {
@@ -61,15 +75,15 @@ fn write_pointer(path: &Path, target: &Path) -> std::io::Result<()> {
     foundation::durable::atomic_write(path, ".guardian-", body.as_bytes())
 }
 
-/// Note that the last application exit was a crash (the guardian rolled its code up).
+/// Note that the managed service exited spontaneously (the guardian rolled its code up).
 /// The supervisor reads and clears this on recovery to revert an unconfirmed update.
-/// A clean stop leaves it untouched, so it distinguishes a crash-restart from an
-/// ordinary service restart.
-pub fn mark_app_crashed(state_dir: &Path) -> std::io::Result<()> {
-    // Durable (atomic write + fsync), like the desired pointer: a crash marker lost to
-    // power loss would let a crash-looping update come back up unreverted on reboot.
+/// A requested stop leaves it untouched, distinguishing spontaneous exit from a clean
+/// service restart.
+pub fn mark_service_exited(state_dir: &Path) -> std::io::Result<()> {
+    // Durable (atomic write + fsync), like the desired pointer: a lost exit marker could
+    // let an unconfirmed, immediately-exiting service return unreverted after reboot.
     foundation::durable::atomic_write(
-        &state_dir.join(control::CRASH_MARKER_FILE),
+        &state_dir.join(control::SERVICE_EXITED_MARKER_FILE),
         ".guardian-",
         b"",
     )
@@ -127,8 +141,8 @@ mod tests {
     #[test]
     fn markers_are_written_for_the_supervisor_to_interpret() {
         let d = dir("markers");
-        mark_app_crashed(&d).unwrap();
-        assert!(d.join(control::CRASH_MARKER_FILE).exists());
+        mark_service_exited(&d).unwrap();
+        assert!(d.join(control::SERVICE_EXITED_MARKER_FILE).exists());
         let bad = d.join("supervisors/badc0de/supervisor");
         mark_rejected_supervisor(&d, &bad).unwrap();
         assert_eq!(
@@ -140,8 +154,8 @@ mod tests {
     #[test]
     fn marker_write_failures_are_reported() {
         let d = dir("marker-errors");
-        std::fs::create_dir(d.join(control::CRASH_MARKER_FILE)).unwrap();
-        assert!(mark_app_crashed(&d).is_err());
+        std::fs::create_dir(d.join(control::SERVICE_EXITED_MARKER_FILE)).unwrap();
+        assert!(mark_service_exited(&d).is_err());
         std::fs::create_dir(d.join(control::REJECTED_SUPERVISOR_FILE)).unwrap();
         assert!(mark_rejected_supervisor(&d, Path::new("candidate")).is_err());
     }

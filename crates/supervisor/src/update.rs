@@ -2,17 +2,34 @@ use super::*;
 
 pub(crate) enum Outcome {
     Committed,
-    RolledBack,
     RejectedBeforeActivation,
     Deferred,
+    /// A candidate failed *after* activation: it is rejected and the durable rollback journal is
+    /// left in place, but the actual rollback is performed by the one rollback implementation — the
+    /// boot state machine — after this disposable supervisor terminates and the guardian relaunches
+    /// it. There is no in-process rollback path.
+    RollbackPending,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum LifecyclePhase {
     Preflight,
+    PreDrain,
     Drain,
     Prepare,
     Stop,
+    /// Runs immediately before the application process is launched, on *every* launch —
+    /// first install, plain restart, and update. The place for per-boot environment prep
+    /// (seed a JBoss home, clear a wedged NFS mount). Fail-closed: if it fails, the app is
+    /// not launched. `UPDATED_LIFECYCLE_REASON` tells the provider which kind of launch.
+    PreStart,
+    /// The provider's activation hand-off, run for every mode right after the built-in pointer
+    /// swap (`store.activate`) and before the process is (re)launched. `stop-start` treats it as a
+    /// no-op hook (the fresh process is launched in the later `Start` phase); `custom` does its
+    /// program-specific work here — reload the running process in place (a SIGHUP, an exec),
+    /// reuse the same directory, move files in, migrate — on top of, not instead of, the pointer
+    /// swap that already made the candidate current, and is handed the live PID. Fail-closed: a
+    /// failure rolls the update back.
     Activate,
     Start,
     Verify,
@@ -20,13 +37,35 @@ pub(crate) enum LifecyclePhase {
     Rollback,
 }
 
+/// Why the application is being launched — passed to the provider as
+/// `UPDATED_LIFECYCLE_REASON` so one script can branch (first-boot seeding vs. per-restart
+/// cleanup vs. an update) instead of needing a hook per situation.
+#[derive(Clone, Copy)]
+pub(crate) enum LifecycleReason {
+    Install,
+    Restart,
+    Update,
+}
+
+impl LifecycleReason {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Restart => "restart",
+            Self::Update => "update",
+        }
+    }
+}
+
 impl LifecyclePhase {
     fn name(self) -> &'static str {
         match self {
             Self::Preflight => "preflight",
+            Self::PreDrain => "pre-drain",
             Self::Drain => "drain",
             Self::Prepare => "prepare",
             Self::Stop => "stop",
+            Self::PreStart => "pre-start",
             Self::Activate => "activate",
             Self::Start => "start",
             Self::Verify => "verify",
@@ -95,6 +134,8 @@ pub(crate) mod boundary {
     pub const PREPARE_STARTED: &str = "prepare-started";
     pub const PREPARED: &str = "prepared";
     pub const PREPARE_APPLIED: &str = "prepare-applied";
+    pub const PRE_DRAIN_STARTED: &str = "pre-drain-started";
+    pub const PRE_DRAIN_APPLIED: &str = "pre-drain-applied";
     pub const DRAIN_STARTED: &str = "drain-started";
     pub const DRAINED: &str = "drained";
     pub const DRAIN_APPLIED: &str = "drain-applied";
@@ -142,6 +183,7 @@ pub(crate) mod boundary {
             TransactionPhase::PreflightCompleted => PREFLIGHT_COMPLETED,
             TransactionPhase::PrepareStarted => PREPARE_STARTED,
             TransactionPhase::Prepared => PREPARED,
+            TransactionPhase::PreDrainStarted => PRE_DRAIN_STARTED,
             TransactionPhase::DrainStarted => DRAIN_STARTED,
             TransactionPhase::Drained => DRAINED,
             TransactionPhase::StopStarted => STOP_STARTED,
@@ -185,6 +227,8 @@ pub(crate) const BOUNDARIES: &[&str] = &[
     boundary::PREPARE_STARTED,
     boundary::PREPARE_APPLIED,
     boundary::PREPARED,
+    boundary::PRE_DRAIN_STARTED,
+    boundary::PRE_DRAIN_APPLIED,
     boundary::DRAIN_STARTED,
     boundary::DRAIN_APPLIED,
     boundary::DRAINED,
@@ -241,10 +285,29 @@ pub(crate) const ABORT_BOUNDARIES: &[&str] = &[boundary::ABORTED];
 // test fake scripts control outcomes and health, so every fault path of [`apply_update`] is
 // provable without a guardian, an HTTP server, or a real process.
 
-/// Bring a staged release into (or back out of) service — the two hand-off moments plus the
-/// quiesce a failed rollback needs. The port the transaction drives; the sole restart
-/// abstraction (the `Restart` mode is data the [`DefaultProvider`] lifecycle acts on).
+/// Bring a staged release into service — the activation hand-off moments. The port the transaction
+/// drives; the sole restart abstraction (the `Restart` mode is data the [`DefaultProvider`]
+/// lifecycle acts on). A post-activation failure does not roll back in-process: the transaction
+/// rejects the candidate, leaves a durable rollback journal, and the supervisor terminates so boot
+/// recovery performs the one rollback path.
+/// How the built-in drain waits, after readiness is withdrawn and before the running release is
+/// stopped, so the load balancer has removed this node from rotation first (no in-flight request
+/// lands on a stopping process).
+pub(crate) enum DrainHold {
+    /// Stop immediately — a `custom` deployment (its provider owns the drain), or a managed one
+    /// that set the hold to zero.
+    None,
+    /// Hold up to this long — a bounded ceiling on how long we wait after withdrawing readiness
+    /// before stopping the running release. Today it is a fixed sleep; a future increment can let
+    /// the intermediary's signed drain acknowledgement (`ManagedStatus.ready`) end the wait early.
+    Bounded(Duration),
+}
+
 pub(crate) trait DeploymentProvider {
+    /// Change whether external traffic may reach the managed application.
+    fn traffic_ready(&mut self, ready: bool) -> io::Result<()>;
+    /// The drain hold policy: how long to wait, after readiness is withdrawn, before stopping.
+    fn drain_hold(&self) -> DrainHold;
     /// Invoke the optional operator-owned lifecycle provider.
     fn lifecycle(
         &mut self,
@@ -264,16 +327,16 @@ pub(crate) trait DeploymentProvider {
     ) -> io::Result<()>;
     /// Start the selected release when activation requires a fresh process.
     fn start(&mut self) -> io::Result<()>;
-    /// Stop the app — used when a rollback itself fails its health check.
-    fn quiesce(&mut self) -> io::Result<()>;
-    /// A same-PID reload keeps the launch token, so readiness must additionally prove the
-    /// running image's version; a fresh launch's per-launch token already identifies it.
+    /// Whether readiness must additionally prove the running version (an in-place reload keeps
+    /// the launch token, so the token alone cannot identify the reloaded image).
     fn requires_version_proof(&self) -> bool;
 }
 
-/// Probe the application to readiness. `expected_version` is required only for a reload.
-/// The future is not `Send`-bound: the update loop is driven by `block_on` on one thread,
-/// never spawned, so the transaction never crosses threads (as before this port existed).
+/// Probe the release to readiness — the health-check provider if the release ships one, else
+/// the HTTP readiness URL, else simply surviving the grace window. `expected_version` is set
+/// only for an in-place reload, where the launch token cannot distinguish the running image.
+/// The future is not `Send`-bound: the update loop is driven by `block_on` on one thread, never
+/// spawned, so the transaction never crosses threads (as before this port existed).
 pub(crate) trait Health {
     fn became_healthy(
         &self,
@@ -281,11 +344,22 @@ pub(crate) trait Health {
     ) -> impl std::future::Future<Output = bool>;
 }
 
-/// The production lifecycle: `DeploymentProvider` performs the configured `Restart` mode over the
-/// guardian-owned [`App`]; `Health` is the real HTTP readiness probe.
+/// The production tower: `reloads_in_place` selects the process seam over the
+/// guardian-owned [`App`], the lifecycle `phases` provider runs the operator hooks, and
+/// `Health` is the readiness signal (health-check provider if present, else the HTTP probe).
 pub(crate) struct DefaultProvider<'a> {
     app: &'a mut App,
     opts: &'a Options,
+    /// Whether activation reloads a still-running process *in place* (a SIGHUP/exec/vendor reload)
+    /// rather than the guardian stop-starting it. When true the guardian's stop/start/traffic
+    /// operations are no-ops (the operator's `activate` script owns the transition and drain), the
+    /// `activate` hook gets the live PID to signal, and readiness must prove the version (the
+    /// reloaded process keeps its launch token). When false the guardian stop-starts a fresh
+    /// process. The guardian holds the process either way.
+    reloads_in_place: bool,
+    /// The release's health-check provider, if it ships one — the readiness signal that
+    /// replaces the HTTP probe. Resolved from the provider set alongside `phases`.
+    healthcheck: Option<&'a updated::state::ProviderRelease>,
     phases: LoadedPhaseProvider<'a>,
 }
 
@@ -295,7 +369,7 @@ pub(crate) struct DefaultProvider<'a> {
 enum LoadedPhaseProvider<'a> {
     BuiltIn(BuiltInPhases),
     External {
-        release: &'a updated::state::LifecycleProviderRelease,
+        release: &'a updated::state::ProviderRelease,
         opts: &'a Options,
     },
 }
@@ -311,7 +385,7 @@ impl BuiltInPhases {
 impl<'a> LoadedPhaseProvider<'a> {
     fn load(
         opts: &'a Options,
-        external: Option<&'a updated::state::LifecycleProviderRelease>,
+        external: Option<&'a updated::state::ProviderRelease>,
     ) -> Self {
         match external {
             Some(release) => Self::External { release, opts },
@@ -328,11 +402,55 @@ impl<'a> LoadedPhaseProvider<'a> {
 }
 
 pub(crate) fn invoke_deployment_provider(
-    external: Option<&updated::state::LifecycleProviderRelease>,
+    external: Option<&updated::state::ProviderRelease>,
     opts: &Options,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<()> {
     LoadedPhaseProvider::load(opts, external).invoke(invocation)
+}
+
+/// Launch a fresh application, running the operator's `pre-start` hook first — the one
+/// launch path for a first install or a plain restart. The hook gets
+/// `UPDATED_LIFECYCLE_REASON` (`install`/`restart`) so one script can do per-boot prep
+/// (seed a JBoss home, clear a wedged NFS mount) and tell a first boot from a restart.
+///
+/// `reason` is `None` when the boot is resuming an interrupted transaction: recovery replays
+/// only that transaction's own minimal, idempotent steps, so the per-boot hook is skipped and
+/// the application is launched directly.
+///
+/// Fail-closed: if the hook fails the application is *not* launched — the error propagates
+/// and the guardian retries the whole tower with backoff. The built-in provider is a no-op,
+/// so a node with no operator hook launches exactly as before.
+pub(crate) fn launch_with_pre_start(
+    guardian: Guardian,
+    opts: &Options,
+    store: &dyn Store,
+    reason: Option<LifecycleReason>,
+) -> io::Result<App> {
+    if let Some(reason) = reason {
+        if let updated::state::Installed::Present(installed) = store.installed() {
+            let installed = *installed;
+            let release = installed.release;
+            let lifecycle = installed.lifecycle;
+            // Pre-start is a per-boot environment hook, run on every launch. Release placement
+            // (including Custom's provider hook) already happened durably — in the install
+            // machine on a first boot, in the update transaction on an upgrade — so this path
+            // never places; it only prepares the environment before the launch.
+            invoke_deployment_provider(
+                lifecycle.as_deref(),
+                opts,
+                LifecycleInvocation {
+                    phase: LifecyclePhase::PreStart,
+                    reason,
+                    id: "boot",
+                    pid: None,
+                    candidate: &release,
+                    predecessor: &release,
+                },
+            )?;
+        }
+    }
+    crate::app::start(guardian, opts)
 }
 
 impl<'a> DefaultProvider<'a> {
@@ -343,17 +461,67 @@ impl<'a> DefaultProvider<'a> {
     pub(crate) fn new(
         app: &'a mut App,
         opts: &'a Options,
-        lifecycle: Option<&'a updated::state::LifecycleProviderRelease>,
+        lifecycle: Option<&'a updated::state::ProviderRelease>,
+        healthcheck: Option<&'a updated::state::ProviderRelease>,
     ) -> Self {
         DefaultProvider {
             app,
             opts,
+            reloads_in_place: reloads_in_place(opts, lifecycle),
+            healthcheck,
             phases: LoadedPhaseProvider::load(opts, lifecycle),
         }
     }
+
+    /// The PID handed to the hooks / used for health: the guardian's launched PID (the guardian
+    /// always holds the process).
+    fn hook_pid(&self) -> Option<u32> {
+        Some(self.app.pid())
+    }
+}
+
+/// Whether this release **reloads in place** at activation — i.e. its lifecycle provider ships an
+/// `activate` script. When it does, the guardian does not restart the process; the operator's
+/// `activate` script reloads it in place and readiness proves the version. Absent (or no lifecycle
+/// provider at all) → the guardian **restarts** the process (stop-start). A resolve failure defaults
+/// to restart; the corrupt bundle then fails closed when its first phase runs.
+pub(crate) fn reloads_in_place(
+    opts: &Options,
+    lifecycle: Option<&updated::state::ProviderRelease>,
+) -> bool {
+    lifecycle
+        .and_then(|release| {
+            updated::provider::BundleStore::for_lifecycle(&opts.paths)
+                .resolve(&release.release)
+                .ok()
+        })
+        .is_some_and(|resolved| resolved.activate.is_some())
 }
 
 impl DeploymentProvider for DefaultProvider<'_> {
+    fn traffic_ready(&mut self, ready: bool) -> io::Result<()> {
+        if self.reloads_in_place {
+            // A reload keeps serving; the operator's script owns readiness rotation.
+            return Ok(());
+        }
+        self.app
+            .guardian
+            .traffic_ready(ready)
+            .map_err(io::Error::other)
+    }
+    fn drain_hold(&self) -> DrainHold {
+        if self.reloads_in_place {
+            // The operator's `activate`/drain scripts own the drain end to end.
+            return DrainHold::None;
+        }
+        match self.opts.timeouts.drain_hold {
+            Some(hold) if hold.is_zero() => DrainHold::None,
+            Some(hold) => DrainHold::Bounded(hold),
+            // An unset drain hold is *no* hold — deterministic and never a stall. (An indefinite
+            // "wait for the intermediary's drain-ack" mode is future work; see config docs.)
+            None => DrainHold::None,
+        }
+    }
     fn lifecycle(
         &mut self,
         phase: LifecyclePhase,
@@ -361,20 +529,24 @@ impl DeploymentProvider for DefaultProvider<'_> {
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()> {
+        // The hook is told the current process PID (UPDATED_CHILD_PID) — the process provider's
+        // for a custom release, the guardian's otherwise. It is informational, never a branch.
+        let pid = self.hook_pid();
         self.phases.invoke(LifecycleInvocation {
             phase,
+            reason: LifecycleReason::Update,
             id: lifecycle_attempt_id,
-            pid: Some(self.app.pid()),
+            pid,
             candidate,
             predecessor,
         })
     }
     fn stop(&mut self) -> io::Result<()> {
-        match &self.opts.application.activation {
-            // StopStart quiesces the app before activation; a reload keeps serving.
-            Activation::StopStart => stop(&mut self.app.guardian, &self.opts.paths.app_token),
-            Activation::Reexec => Ok(()),
+        if self.reloads_in_place {
+            // Nothing to stop: the process keeps running and is reloaded in place at activation.
+            return Ok(());
         }
+        stop(&mut self.app.guardian, &self.opts.paths.app_token)
     }
     fn activate(
         &mut self,
@@ -382,10 +554,17 @@ impl DeploymentProvider for DefaultProvider<'_> {
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()> {
-        let pid =
-            matches!(self.opts.application.activation, Activation::Reexec).then(|| self.app.pid());
+        // The managed default stopped the process before activation, so its hook gets no PID; a
+        // provider-driven reload kept the process running and reloads it in place, so its hook
+        // gets the live PID to signal.
+        let pid = if self.reloads_in_place {
+            self.hook_pid()
+        } else {
+            None
+        };
         self.phases.invoke(LifecycleInvocation {
             phase: LifecyclePhase::Activate,
+            reason: LifecycleReason::Update,
             id: lifecycle_attempt_id,
             pid,
             candidate,
@@ -393,27 +572,43 @@ impl DeploymentProvider for DefaultProvider<'_> {
         })
     }
     fn start(&mut self) -> io::Result<()> {
-        match &self.opts.application.activation {
-            Activation::StopStart => self.app.launch(self.opts),
-            Activation::Reexec => Ok(()),
+        if self.reloads_in_place {
+            // The process was never stopped; the reload at activation brought the new version up.
+            return Ok(());
         }
-    }
-    fn quiesce(&mut self) -> io::Result<()> {
-        stop(&mut self.app.guardian, &self.opts.paths.app_token)
+        self.app.launch(self.opts)
     }
     fn requires_version_proof(&self) -> bool {
-        matches!(self.opts.application.activation, Activation::Reexec)
+        self.reloads_in_place
     }
 }
 
 impl Health for DefaultProvider<'_> {
     async fn became_healthy(&self, expected_version: Option<&str>) -> bool {
-        // A probe-infrastructure error (a client that will not even build) is a health
-        // failure like any other: fail closed to a rollback rather than propagate.
+        // The health-check provider, when the release ships one, is the readiness signal and
+        // replaces the HTTP probe; otherwise the HTTP readiness URL, otherwise surviving the
+        // grace window. A probe-infrastructure error (a client that will not even build, a
+        // provider that cannot be resolved) is a health failure like any other: fail closed to
+        // a rollback rather than propagate.
+        if let Some(healthcheck) = self.healthcheck {
+            // The provider actively probes the running service, so it identifies the image
+            // directly and needs no version header from it.
+            return became_healthy_via_provider(
+                healthcheck,
+                self.opts,
+                self.hook_pid(),
+                self.opts.timeouts.health_grace,
+                self.opts.timeouts.health_successes,
+                self.opts.timeouts.health_interval,
+            )
+            .await;
+        }
         became_healthy(
             self.app,
             self.opts.timeouts.health_grace,
-            self.opts.application.health_url.as_deref(),
+            self.opts
+                .application
+                .health_check_url(updated::config::HealthCheckKind::Readiness),
             expected_version,
             self.opts.timeouts.health_successes,
             self.opts.timeouts.health_interval,
@@ -433,7 +628,8 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     candidate: &updated::bundle::ReleaseId,
     candidate_archive_sha256: &str,
     candidate_repository_lineage: updated::state::RepositoryLineage,
-    lifecycle: Option<updated::state::LifecycleProviderRelease>,
+    lifecycle: Option<updated::state::ProviderRelease>,
+    healthcheck: Option<updated::state::ProviderRelease>,
 ) -> io::Result<Outcome> {
     // Recovery belongs to the boot state machine. A live supervisor must never mutate
     // recovery evidence or restore an executable underneath a guardian-owned process.
@@ -460,7 +656,15 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
         candidate_archive_sha256: candidate_archive_sha256.to_string(),
         candidate_repository_lineage: candidate_repository_lineage.clone(),
         candidate_rejection_required: false,
-        lifecycle: lifecycle.map(Box::new),
+        // These fields drive ROLLBACK recovery (restoring the predecessor), so they carry the
+        // PREDECESSOR's own signed providers — app and providers are one signed unit, and a revert
+        // must gate/watch the old release with the old hooks, not the candidate's. The forward path
+        // runs the candidate through the `tower`, never these fields; the candidate's providers
+        // become the new head's providers at commit below. This keeps the journal-driven recovery
+        // (an in-process rollback that crashed) consistent with the pending-driven one, which
+        // already carries the predecessor's providers.
+        lifecycle: installed.lifecycle.clone(),
+        healthcheck: installed.healthcheck.clone(),
         phase: TransactionPhase::PreflightStarted,
     };
     persist_transaction(store, &tx)?;
@@ -498,7 +702,43 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     chaos.crossing(boundary::PREPARE_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::Prepared)?;
 
+    // Pre-drain: custom logic *before* we withdraw from traffic — e.g. tell the app to
+    // begin shedding work — while the predecessor is still serving. Nothing has changed
+    // yet, so a failure here defers cleanly. No-op when the provider defines no pre-drain
+    // phase.
+    advance_transaction(store, &mut tx, TransactionPhase::PreDrainStarted)?;
+    if let Err(error) =
+        tower.lifecycle(LifecyclePhase::PreDrain, &tx.id, candidate, &installed.release)
+    {
+        warn(&format!(
+            "candidate {} was deferred during pre-drain ({error}); the running release remains active",
+            candidate.version
+        ));
+        abort_before_activation(tower, store, &mut tx)?;
+        return Ok(Outcome::Deferred);
+    }
+    chaos.crossing(boundary::PRE_DRAIN_APPLIED);
+
+    // Built-in drain: the guardian flips its readiness probe to unready and only
+    // acknowledges once its probe machine is in the drained state — that acknowledgement
+    // is the go-ahead. We never stop the running binary until it returns, so the node is
+    // out of readiness before switchover.
+    tower.traffic_ready(false)?;
     advance_transaction(store, &mut tx, TransactionPhase::DrainStarted)?;
+
+    // Built-in drain hold: having withdrawn readiness, wait for the load balancer to actually
+    // remove this node before we stop the running release — otherwise an in-flight request lands
+    // on a stopping process (the downtime a bare readiness flip leaves when endpoint removal lags
+    // the switchover). Bounded is a ceiling; a `custom` deployment and an unset hold wait nothing
+    // here (the custom Drain hook owns it, or the operator opted out).
+    match tower.drain_hold() {
+        DrainHold::None => {}
+        DrainHold::Bounded(hold) => tokio::time::sleep(hold).await,
+    }
+
+    // Post-drain: custom logic *after* we are unready but *before* switchover — e.g. wait
+    // for the orchestrator to observe the failed probe and stop routing, or for in-flight
+    // connections to finish. Must run to completion before the predecessor is stopped.
     if let Err(error) =
         tower.lifecycle(LifecyclePhase::Drain, &tx.id, candidate, &installed.release)
     {
@@ -533,44 +773,36 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     advance_transaction(store, &mut tx, TransactionPhase::ActivateStarted)?;
     if let Err(e) = store.activate(candidate) {
         warn(&format!("release activation failed before commit ({e})"));
-        require_candidate_rejection(store, &mut tx)?;
-        roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::RolledBack);
+        return reject_then_recover(store, &mut tx);
     }
     chaos.crossing(boundary::CANDIDATE_POINTER_APPLIED);
 
     if let Err(e) = tower.activate(&tx.id, candidate, &tx.previous_release) {
         warn(&format!("activating the new version failed ({e})"));
-        require_candidate_rejection(store, &mut tx)?;
-        roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::RolledBack);
+        return reject_then_recover(store, &mut tx);
     }
     chaos.crossing(boundary::CANDIDATE_LIFECYCLE_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::CandidateActivated)?;
     advance_transaction(store, &mut tx, TransactionPhase::StartStarted)?;
     if let Err(e) = tower.start() {
         warn(&format!("starting the new version failed ({e})"));
-        require_candidate_rejection(store, &mut tx)?;
-        roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::RolledBack);
+        return reject_then_recover(store, &mut tx);
     }
     if let Err(e) = tower.lifecycle(LifecyclePhase::Start, &tx.id, candidate, &installed.release) {
         warn(&format!("candidate start provider phase failed ({e})"));
-        require_candidate_rejection(store, &mut tx)?;
-        roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::RolledBack);
+        return reject_then_recover(store, &mut tx);
     }
     chaos.crossing(boundary::CANDIDATE_START_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::CandidateStarted)?;
 
     advance_transaction(store, &mut tx, TransactionPhase::HealthStarted)?;
+    // An in-place reload keeps the launch token, so readiness must also prove the candidate's
+    // version; a fresh launch's token already identifies it.
     let version_proof = tower
         .requires_version_proof()
         .then_some(candidate.version.as_str());
     if !tower.became_healthy(version_proof).await {
-        require_candidate_rejection(store, &mut tx)?;
-        roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::RolledBack);
+        return reject_then_recover(store, &mut tx);
     }
     if let Err(e) = tower.lifecycle(
         LifecyclePhase::Verify,
@@ -579,9 +811,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
         &installed.release,
     ) {
         warn(&format!("candidate verify provider phase failed ({e})"));
-        require_candidate_rejection(store, &mut tx)?;
-        roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::RolledBack);
+        return reject_then_recover(store, &mut tx);
     }
     chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::CandidateHealthy)?;
@@ -600,9 +830,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
         // Finalization is part of activation: a failed hook must not be treated as a
         // transient defer, or the scheduler will immediately replay the same transaction
         // and its side effects. Persist rejection before restoring the predecessor.
-        require_candidate_rejection(store, &mut tx)?;
-        roll_back(tower, store, &mut tx).await?;
-        return Ok(Outcome::RolledBack);
+        return reject_then_recover(store, &mut tx);
     }
     chaos.crossing(boundary::FINALIZE_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::Finalized)?;
@@ -617,14 +845,28 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
         previous_archive_sha256: installed.archive_sha256,
         previous_repository_lineage: installed.repository_lineage,
         committed_at: now_unix(),
-        lifecycle: tx.lifecycle.clone(),
+        // The rollback restores the *predecessor*, so it must carry the *predecessor's own* signed
+        // providers (app + providers are one signed unit), not the candidate's. At the assigned head
+        // these are the same set; across a provider-set revision in this update they differ, and
+        // reverting the old release with the new providers would gate/watch it with the wrong hooks.
+        lifecycle: installed.lifecycle,
+        healthcheck: installed.healthcheck,
     });
     advance_transaction(store, &mut tx, TransactionPhase::CommitStarted)?;
     store.commit_installed(&InstalledState {
         repository_lineage: candidate_repository_lineage,
         release: candidate.clone(),
         archive_sha256: candidate_archive_sha256.to_string(),
+        // The candidate's own providers are now the installed release's providers; persist them so
+        // pre-start, health gating, and PID watching can run them on the next boot. (These are the
+        // candidate providers passed in — `tx.lifecycle/healthcheck/process` hold the *predecessor's*
+        // now, for rollback.)
+        lifecycle: lifecycle.map(Box::new),
+        healthcheck: healthcheck.map(Box::new),
         pending,
+        // An update always has a proven predecessor: its failure recovery is this state machine's
+        // rollback, never an ordered-fallback descent, so the new head commits already confirmed.
+        confirmed: true,
     })?;
     chaos.crossing(boundary::COMMIT_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::Committed)?;
@@ -639,6 +881,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
             "update committed but clearing its journal failed ({e}); recovery will remove it"
         ));
     }
+    tower.traffic_ready(true)?;
     Ok(Outcome::Committed)
 }
 
@@ -658,7 +901,8 @@ fn abort_before_activation<T: DeploymentProvider>(
         &tx.candidate_release,
     )?;
     advance_transaction(store, tx, TransactionPhase::Aborted)?;
-    store.clear_journal()
+    store.clear_journal()?;
+    tower.traffic_ready(true)
 }
 
 /// Persist the rejection decision before applying it. If the process dies in the gap,
@@ -675,81 +919,19 @@ fn require_candidate_rejection(store: &mut dyn Store, tx: &mut Transaction) -> i
     )
 }
 
-/// Reactivate the previous release and get it running again through the same strategy (so a
-/// reload strategy rolls back with zero downtime too). This is the only in-process
-/// rollback — for an update whose new version stayed *alive* but never became healthy; a
-/// crash instead tears the tower down and recovery rolls back on the next boot.
-async fn roll_back<T: DeploymentProvider + Health>(
-    tower: &mut T,
-    store: &mut dyn Store,
-    tx: &mut Transaction,
-) -> io::Result<()> {
-    let chaos = Chaos::from_env();
-    advance_transaction(store, tx, TransactionPhase::RollbackStarted)?;
-    advance_transaction(store, tx, TransactionPhase::RollbackStopStarted)?;
-    tower.lifecycle(
-        LifecyclePhase::Stop,
-        &tx.id,
-        &tx.previous_release,
-        &tx.candidate_release,
-    )?;
-    tower.stop()?;
-    chaos.crossing(boundary::ROLLBACK_STOP_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::RollbackStopped)?;
-    advance_transaction(store, tx, TransactionPhase::RollbackActivateStarted)?;
-    store.activate(&tx.previous_release)?;
-    chaos.crossing(boundary::PREDECESSOR_POINTER_APPLIED);
-    tower.activate(&tx.id, &tx.previous_release, &tx.candidate_release)?;
-    chaos.crossing(boundary::PREDECESSOR_LIFECYCLE_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::PredecessorActivated)?;
-    advance_transaction(store, tx, TransactionPhase::RollbackStartStarted)?;
-    tower.start()?;
-    tower.lifecycle(
-        LifecyclePhase::Start,
-        &tx.id,
-        &tx.previous_release,
-        &tx.candidate_release,
-    )?;
-    chaos.crossing(boundary::PREDECESSOR_START_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::PredecessorStarted)?;
-    // Prove the rollback landed with the same evidence the forward path demands. A reload
-    // keeps the PID and the launch token, so under that strategy the token proves nothing
-    // about *which* image is answering: without the predecessor's version, an app that
-    // never re-execed would have the just-rejected new version answer this probe and pass
-    // it — leaving the release recorded as rolled back and rejected while it is still the
-    // one running. A stop/start relaunch mints a fresh token, which already identifies it.
-    let rollback_version = tx.previous_release.version.clone();
-    let version_proof = if tower.requires_version_proof() {
-        Some(rollback_version.as_str())
-    } else {
-        None
-    };
-    advance_transaction(store, tx, TransactionPhase::RollbackHealthStarted)?;
-    if !tower.became_healthy(version_proof).await {
-        tower.quiesce()?;
-        return Err(io::Error::other(
-            "restored application failed its rollback health check",
-        ));
-    }
-    tower.lifecycle(
-        LifecyclePhase::Verify,
-        &tx.id,
-        &tx.previous_release,
-        &tx.candidate_release,
-    )?;
-    chaos.crossing(boundary::PREDECESSOR_HEALTH_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::PredecessorHealthy)?;
-    advance_transaction(store, tx, TransactionPhase::RollbackFinalizeStarted)?;
-    tower.lifecycle(
-        LifecyclePhase::Rollback,
-        &tx.id,
-        &tx.previous_release,
-        &tx.candidate_release,
-    )?;
-    chaos.crossing(boundary::ROLLBACK_ADAPTER_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::RolledBack)?;
-    store.clear_journal()?;
-    Ok(())
+/// Reject the failed candidate and hand the rollback to the boot state machine — the single
+/// rollback implementation. Every post-activation failure ends here: the candidate is activated
+/// (and possibly still running) but failed, so this records the rejection and leaves the durable
+/// journal for boot recovery to complete on the next supervisor start. A supervisor restart is
+/// cheap; the guardian keeps the (failed) application alive across it, and the freshly-booted
+/// supervisor stops the candidate and restores the predecessor with the predecessor's *own*
+/// providers (carried in the transaction). Rolling back here in-process would be a second rollback
+/// path to keep in lockstep with boot recovery — and, because a live supervisor runs the candidate's
+/// tower, it would gate the restored predecessor with the *candidate's* health provider. One path,
+/// one set of providers, no divergence.
+fn reject_then_recover(store: &mut dyn Store, tx: &mut Transaction) -> io::Result<Outcome> {
+    require_candidate_rejection(store, tx)?;
+    Ok(Outcome::RollbackPending)
 }
 
 pub(crate) fn advance_transaction(
@@ -772,6 +954,7 @@ pub(crate) fn persist_transaction(store: &mut dyn Store, tx: &Transaction) -> io
 /// wedged enterprise integration from wedging the updater forever.
 pub(crate) struct LifecycleInvocation<'a> {
     pub(crate) phase: LifecyclePhase,
+    pub(crate) reason: LifecycleReason,
     pub(crate) id: &'a str,
     pub(crate) pid: Option<u32>,
     pub(crate) candidate: &'a updated::bundle::ReleaseId,
@@ -779,12 +962,13 @@ pub(crate) struct LifecycleInvocation<'a> {
 }
 
 pub(crate) fn run_lifecycle_command(
-    lifecycle: &updated::state::LifecycleProviderRelease,
+    lifecycle: &updated::state::ProviderRelease,
     opts: &Options,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<()> {
     let LifecycleInvocation {
         phase,
+        reason,
         id: lifecycle_attempt_id,
         pid,
         candidate,
@@ -803,21 +987,22 @@ pub(crate) fn run_lifecycle_command(
     let app_provider = updated::provider::BundleStore::for_app(&opts.paths);
     let candidate_dir = app_provider.location(candidate);
     let predecessor_dir = app_provider.location(predecessor);
-    let mut cmd = Command::new(resolved.program);
+    // The activate hook runs the provider's `activate` (reload) script and the rollback hook its
+    // `rollback` script when the bundle declares them; every other hook — and a provider that ships
+    // neither — runs the forward `program`. The phase still rides in `UPDATED_LIFECYCLE_PHASE`, so a
+    // dedicated script can branch too.
+    let program = match phase {
+        LifecyclePhase::Activate if resolved.activate.is_some() => resolved.activate.unwrap(),
+        LifecyclePhase::Rollback if resolved.rollback.is_some() => resolved.rollback.unwrap(),
+        _ => resolved.program,
+    };
+    let mut cmd = Command::new(program);
     cmd.args(&lifecycle.args)
         .current_dir(&resolved.cwd)
         .env_clear()
-        .stdin(std::process::Stdio::null());
-    // A wrapper commonly waits on vendor CLIs, curl, or mount helpers. Give the whole
-    // lifecycle tree its own group so a timeout cannot kill only the shell and orphan the
-    // foreground operation. Windows wrappers must obey the no-background-child contract.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let command = cmd
+        .stdin(std::process::Stdio::null())
         .env(env::LIFECYCLE_PHASE, phase_name)
+        .env(env::LIFECYCLE_REASON, reason.name())
         .env(env::LIFECYCLE_ATTEMPT_ID, lifecycle_attempt_id)
         .env(env::INSTALL_ROOT, &opts.paths.install_root)
         .env(env::CANDIDATE, &candidate_dir)
@@ -825,13 +1010,15 @@ pub(crate) fn run_lifecycle_command(
         .env(env::CANDIDATE_VERSION, &candidate.version)
         .env(env::PREDECESSOR_VERSION, &predecessor.version);
     if let Some(pid) = pid {
-        command.env(env::CHILD_PID, pid.to_string());
+        cmd.env(env::CHILD_PID, pid.to_string());
     } else {
-        command.env_remove(env::CHILD_PID);
+        cmd.env_remove(env::CHILD_PID);
     }
-    let mut child = command.spawn()?;
-    #[cfg(windows)]
-    let lifecycle_job = WindowsLifecycleJob::assign(&child)?;
+    // A wrapper commonly waits on vendor CLIs, curl, or mount helpers. Run it as a
+    // contained tree (Unix process group / Windows job object) so a timeout takes the
+    // whole tree down, not just the shell — leaving the foreground operation orphaned.
+    // The platform mechanism lives in `foundation::process`, not inlined here.
+    let mut child = foundation::process::ContainedChild::spawn(cmd)?;
     let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -849,10 +1036,7 @@ pub(crate) fn run_lifecycle_command(
             };
         }
         if Instant::now() >= deadline {
-            #[cfg(unix)]
-            kill_lifecycle_group(&child)?;
-            #[cfg(not(unix))]
-            lifecycle_job.terminate()?;
+            child.kill_tree()?;
             child.wait()?;
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -866,71 +1050,124 @@ pub(crate) fn run_lifecycle_command(
     }
 }
 
-#[cfg(unix)]
-fn kill_lifecycle_group(child: &std::process::Child) -> io::Result<()> {
-    let pid = i32::try_from(child.id())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "lifecycle PID exceeds pid_t"))?;
-    // SAFETY: the child was spawned as leader of a fresh process group whose ID is its
-    // PID. The checked negative PID targets only that group, never the managed app.
-    if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
+/// Run the health-check provider once. Exit 0 = healthy; a non-zero exit, a timeout, or any
+/// resolve/spawn error = unhealthy. Unlike a lifecycle phase, an unhealthy result is a normal
+/// outcome, not an error — the caller folds it into the readiness decision (fail closed). The
+/// provider is handed `UPDATED_INSTALL_ROOT` and, when the supervisor tracks one,
+/// `UPDATED_CHILD_PID`, so a script can probe the exact running process. This single probe is
+/// the steady-state readiness/liveness signal; startup gating layers grace/successes on top of it.
+pub(crate) fn run_healthcheck_command(
+    healthcheck: &updated::state::ProviderRelease,
+    opts: &Options,
+    pid: Option<u32>,
+) -> bool {
+    run_provider_probe(healthcheck, opts, false, |cmd| {
+        if let Some(pid) = pid {
+            cmd.env(env::CHILD_PID, pid.to_string());
         }
-    }
-    Ok(())
+    })
+    .0
 }
 
-#[cfg(windows)]
-struct WindowsLifecycleJob(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl WindowsLifecycleJob {
-    fn assign(child: &std::process::Child) -> io::Result<Self> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-        unsafe {
-            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            let job = Self(handle);
-            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            if SetInformationJobObject(
-                handle,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ) == 0
-                || AssignProcessToJobObject(handle, child.as_raw_handle() as _) == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(job)
-        }
+/// Run a signed provider CLI once with a bounded wait, returning whether it exited 0 and — when
+/// `capture_stdout` — its stdout (capped, so a provider cannot flood memory). A resolve, product,
+/// or spawn failure and a timeout all read as a non-success with no output; the timed-out tree is
+/// killed. The CLI gets a clean environment with `UPDATED_INSTALL_ROOT` plus whatever `configure`
+/// adds. Shared by the health-check and process providers, which differ only in how they read
+/// the result.
+fn run_provider_probe(
+    provider: &updated::state::ProviderRelease,
+    opts: &Options,
+    capture_stdout: bool,
+    configure: impl FnOnce(&mut Command),
+) -> (bool, Option<String>) {
+    let resolved = match updated::provider::BundleStore::for_lifecycle(&opts.paths)
+        .resolve(&provider.release)
+    {
+        Ok(resolved) if resolved.product == provider.product => resolved,
+        _ => return (false, None),
+    };
+    let Some(deadline) = Instant::now().checked_add(Duration::from_millis(provider.timeout_millis))
+    else {
+        return (false, None);
+    };
+    let mut cmd = Command::new(resolved.program);
+    cmd.args(&provider.args)
+        .current_dir(&resolved.cwd)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .env(env::INSTALL_ROOT, &opts.paths.install_root);
+    if capture_stdout {
+        cmd.stdout(std::process::Stdio::piped());
     }
-
-    fn terminate(&self) -> io::Result<()> {
-        if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) } == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+    configure(&mut cmd);
+    let Ok(mut child) = foundation::process::ContainedChild::spawn(cmd) else {
+        return (false, None);
+    };
+    let stdout = if capture_stdout { child.take_stdout() } else { None };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return (false, None);
+                }
+                return (true, stdout.and_then(read_first_line));
+            }
+            Ok(None) => {}
+            Err(_) => return (false, None),
         }
+        if Instant::now() >= deadline {
+            let _ = child.kill_tree();
+            let _ = child.wait();
+            return (false, None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-#[cfg(windows)]
-impl Drop for WindowsLifecycleJob {
-    fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
+/// Read the first newline-terminated line of a child's stdout, capped at 64 KiB. Only the first
+/// line is read (not to EOF) so a provider that forks a daemon inheriting the pipe cannot wedge
+/// the read waiting for a close that never comes; the cap bounds a provider that never emits a
+/// newline. The provider contract is therefore: print the PID followed by a newline, promptly.
+fn read_first_line(stdout: std::process::ChildStdout) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    std::io::BufReader::new(stdout.take(64 * 1024))
+        .read_line(&mut line)
+        .ok()?;
+    Some(line)
+}
+
+/// Readiness via the health-check provider: the provider stands in for the HTTP probe, and the
+/// same grace/successes/interval machinery gates it — a run of consecutive healthy exits within
+/// the grace window. Mirrors [`crate::app::became_healthy`]'s loop so a provider-gated release
+/// and a URL-gated one share identical readiness semantics.
+pub(crate) async fn became_healthy_via_provider(
+    healthcheck: &updated::state::ProviderRelease,
+    opts: &Options,
+    pid: Option<u32>,
+    grace: Duration,
+    successes: u32,
+    interval: Duration,
+) -> bool {
+    let deadline = Instant::now() + grace;
+    let mut readiness = crate::app::Readiness::new(successes);
+    let mut next_probe = Instant::now();
+    while Instant::now() < deadline {
+        if Instant::now() >= next_probe {
+            let ok = run_healthcheck_command(healthcheck, opts, pid);
+            if readiness.observe(ok) {
+                return true;
+            }
+            // Space confirmation probes only after a success; keep probing promptly until the
+            // release first answers healthy.
+            if ok {
+                next_probe = Instant::now() + interval;
+            }
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    false
 }
 
 #[cfg(test)]
@@ -964,6 +1201,7 @@ mod tests {
             provider
                 .invoke(LifecycleInvocation {
                     phase,
+                    reason: LifecycleReason::Update,
                     id: "attempt",
                     pid: Some(42),
                     candidate: &candidate,
@@ -983,11 +1221,11 @@ mod tests {
     impl MemoryStore {
         fn new(previous: updated::bundle::ReleaseId) -> Self {
             Self {
-                installed: Installed::Present(InstalledState::confirmed(
+                installed: Installed::Present(Box::new(InstalledState::confirmed(
                     test_lineage(),
                     previous.clone(),
                     "previous-archive".into(),
-                )),
+                ))),
                 journal: None,
                 active: previous,
                 rejected: Vec::new(),
@@ -1006,6 +1244,11 @@ mod tests {
         fn journal(&self) -> io::Result<Option<Transaction>> {
             Ok(self.journal.clone())
         }
+        fn install_journal(
+            &self,
+        ) -> io::Result<Option<updated::install::InstallTransaction>> {
+            Ok(None)
+        }
         fn active_release(&self) -> io::Result<Option<updated::bundle::ReleaseId>> {
             Ok(Some(self.active.clone()))
         }
@@ -1013,7 +1256,7 @@ mod tests {
             false
         }
         fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
-            self.installed = Installed::Present(state.clone());
+            self.installed = Installed::Present(Box::new(state.clone()));
             Ok(())
         }
         fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
@@ -1022,6 +1265,15 @@ mod tests {
         }
         fn clear_journal(&mut self) -> io::Result<()> {
             self.journal = None;
+            Ok(())
+        }
+        fn write_install_journal(
+            &mut self,
+            _: &updated::install::InstallTransaction,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+        fn clear_install_journal(&mut self) -> io::Result<()> {
             Ok(())
         }
         fn reject(
@@ -1066,6 +1318,13 @@ mod tests {
     }
 
     impl DeploymentProvider for FakeTower {
+        fn drain_hold(&self) -> DrainHold {
+            DrainHold::None
+        }
+        fn traffic_ready(&mut self, _ready: bool) -> io::Result<()> {
+            Ok(())
+        }
+
         fn lifecycle(
             &mut self,
             phase: LifecyclePhase,
@@ -1117,9 +1376,6 @@ mod tests {
         fn start(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn quiesce(&mut self) -> io::Result<()> {
-            Ok(())
-        }
         fn requires_version_proof(&self) -> bool {
             false
         }
@@ -1148,12 +1404,16 @@ mod tests {
             "archive-two",
             test_lineage(),
             None,
+            None,
         )
         .await
         .unwrap();
 
         assert!(matches!(outcome, Outcome::Deferred));
-        assert_eq!(tower.phases, ["preflight", "prepare", "drain", "rollback"]);
+        assert_eq!(
+            tower.phases,
+            ["preflight", "prepare", "pre-drain", "drain", "rollback"]
+        );
         assert_eq!(tower.activations, 0);
         assert!(store.journal.is_none());
     }
@@ -1175,7 +1435,8 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None
+            None,
+            None,
         )
         .await
         .is_err());
@@ -1183,7 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_finalization_restores_and_rejects_the_candidate() {
+    async fn failed_finalization_rejects_and_defers_rollback_to_boot_recovery() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = MemoryStore::new(previous.clone());
@@ -1199,36 +1460,31 @@ mod tests {
             "archive-two",
             test_lineage(),
             None,
+            None,
         )
         .await
         .unwrap();
 
-        assert!(matches!(outcome, Outcome::RolledBack));
+        // A post-activation failure rejects the candidate and leaves a durable rollback journal.
+        // The restore itself is performed by the one rollback path — boot recovery — after this
+        // disposable supervisor terminates and the guardian relaunches it. No in-process rollback
+        // phases run here, and the candidate stays activated until recovery reverts it.
+        assert!(matches!(outcome, Outcome::RollbackPending));
         assert_eq!(
             tower.phases,
             [
-                "preflight",
-                "prepare",
-                "drain",
-                "stop",
-                "start",
-                "verify",
-                "finalize",
-                "stop",
-                "start",
-                "verify",
-                "rollback",
+                "preflight", "prepare", "pre-drain", "drain", "stop", "start", "verify", "finalize",
             ]
         );
-        assert_eq!(
-            tower.activations, 2,
-            "candidate start plus predecessor restore"
-        );
-        assert_eq!(store.active, previous);
+        assert_eq!(tower.activations, 1, "candidate started; no restore in-process");
+        assert_eq!(store.active, candidate);
         assert_eq!(store.rejected, vec!["archive-two"]);
         assert!(
-            store.journal.is_none(),
-            "completed rollback clears its evidence"
+            store
+                .journal
+                .as_ref()
+                .is_some_and(|tx| tx.candidate_rejection_required),
+            "the rollback journal is left for boot recovery, carrying the rejection decision"
         );
     }
 
@@ -1249,6 +1505,7 @@ mod tests {
             "archive-two",
             test_lineage(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1259,7 +1516,7 @@ mod tests {
         assert_eq!(provider.activations, 0);
         assert_eq!(
             provider.phases,
-            ["preflight", "prepare", "drain", "stop", "rollback"]
+            ["preflight", "prepare", "pre-drain", "drain", "stop", "rollback"]
         );
     }
 
@@ -1280,6 +1537,7 @@ mod tests {
             "archive-two",
             test_lineage(),
             None,
+            None,
         )
         .await
         {
@@ -1297,7 +1555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_start_or_verify_phase_rolls_back_through_the_same_provider() {
+    async fn failed_start_or_verify_phase_rejects_and_defers_rollback_to_boot_recovery() {
         for failure in [LifecyclePhase::Start, LifecyclePhase::Verify] {
             let previous = release("1.0.0", "one");
             let candidate = release("2.0.0", "two");
@@ -1315,40 +1573,47 @@ mod tests {
                 "archive-two",
                 test_lineage(),
                 None,
+                None,
             )
             .await
             .unwrap();
 
-            assert!(matches!(outcome, Outcome::RolledBack));
-            assert_eq!(store.active, previous);
+            // Post-activation failure: reject the candidate and leave the rollback journal for boot
+            // recovery. The candidate stays activated (recovery restores the predecessor), and no
+            // in-process rollback phase runs.
+            assert!(matches!(outcome, Outcome::RollbackPending));
+            assert_eq!(store.active, candidate);
             assert_eq!(store.rejected, ["archive-two"]);
-            assert!(provider
-                .phases
-                .ends_with(&["stop", "start", "verify", "rollback"]));
+            assert!(!provider.phases.contains(&"rollback"));
+            assert!(store.journal.is_some(), "boot recovery needs the rollback journal");
         }
     }
 
     #[tokio::test]
-    async fn candidate_failure_is_rejected_before_rollback_can_fail() {
+    async fn a_failed_activation_records_the_rejection_before_deferring_to_recovery() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut store = MemoryStore::new(previous);
         let mut tower = FakeTower {
             fail_first_activation: true,
-            fail_rollback: true,
             ..Default::default()
         };
 
-        assert!(apply_update(
+        let outcome = apply_update(
             &mut tower,
             &mut store,
             &candidate,
             "archive-two",
             test_lineage(),
-            None
+            None,
+            None,
         )
         .await
-        .is_err());
+        .unwrap();
+
+        // The candidate activated then failed: it is rejected and the rollback journal is durable
+        // before we hand off to boot recovery. There is no in-process rollback to fail.
+        assert!(matches!(outcome, Outcome::RollbackPending));
         assert_eq!(store.rejected, ["archive-two"]);
         assert!(
             store

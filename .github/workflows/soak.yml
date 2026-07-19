@@ -1,0 +1,32 @@
+name: Scheduled soak
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Fleet fuzz generations
+        required: false
+        default: "5"
+
+jobs:
+  updatec-fleet:
+    name: updatec fleet fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
+        with: {install_only: true}
+      - name: Run the extended deterministic fleet soak
+        env: {UPDATEC_FUZZ_SEED: "20260718"}
+        run: ./scripts/kind-updatec-e2e.sh --fuzz-rounds "${{ inputs.rounds || '5' }}"
+      - name: Preserve diagnostics
+        if: failure()
+        run: |
+          kubectl -n updated-system get pods,jobs,updateagents,updategroups,updaterepositories -o wide || true
+          kubectl -n updated-system logs deployment/updatec-controller || true
+          kubectl -n updated-system logs deployment/updatec-gateway || true

@@ -44,6 +44,7 @@ mod windows {
         state_dir: OsString,
         supervisor_config: OsString,
         supervisor: OsString,
+        probe_address: Option<OsString>,
     }
 
     pub fn main() {
@@ -81,6 +82,7 @@ mod windows {
         let mut state_dir = None;
         let mut supervisor_config = None;
         let mut supervisor = None;
+        let mut probe_address = None;
         let mut it = std::env::args_os().skip(1);
         while let Some(arg) = it.next() {
             match arg.to_string_lossy().as_ref() {
@@ -88,6 +90,7 @@ mod windows {
                 "--state-dir" => state_dir = it.next(),
                 "--supervisor-config" => supervisor_config = it.next(),
                 "--supervisor" => supervisor = it.next(),
+                "--probe-address" => probe_address = it.next(),
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -96,6 +99,7 @@ mod windows {
             state_dir: state_dir.ok_or("--state-dir <path> is required")?,
             supervisor_config: supervisor_config.ok_or("--supervisor-config <path> is required")?,
             supervisor: supervisor.ok_or("--supervisor <path> is required")?,
+            probe_address,
         })
     }
 
@@ -209,8 +213,11 @@ mod windows {
             .arg("--supervisor-config")
             .arg(&args.supervisor_config)
             .arg("--supervisor")
-            .arg(&args.supervisor)
-            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);
+            .arg(&args.supervisor);
+        if let Some(address) = &args.probe_address {
+            command.arg("--probe-address").arg(address);
+        }
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);
         command
             .spawn()
             .map_err(|e| format!("launching bootstrap {:?}: {e}", args.bootstrap))

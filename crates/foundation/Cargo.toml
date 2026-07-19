@@ -6,6 +6,14 @@ license.workspace = true
 
 # Shared mechanisms only. Keep this crate usable by the permanent guardian: no
 # serialization, async runtime, crypto policy, configuration, or application crates.
-# It currently needs no dependencies; platform bindings are the only permitted future
-# exception. Routine tower changes must remain deployable against an older statically
-# linked guardian. A rare guardian/OS release may coordinate a new tower baseline.
+# Platform binding crates are the sole permitted dependencies (they are ABI-correct
+# type/constant/function declarations, not behaviour) — the `process` module's
+# process-group/job-object containment needs them. Routine tower changes must remain
+# deployable against an older statically linked guardian. A rare guardian/OS release may
+# coordinate a new tower baseline.
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

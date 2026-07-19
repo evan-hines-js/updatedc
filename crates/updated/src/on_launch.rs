@@ -28,6 +28,7 @@ pub fn activate(
         candidate_repository_lineage: candidate_repository_lineage.clone(),
         candidate_rejection_required: false,
         lifecycle: None,
+        healthcheck: None,
         phase: Phase::Started,
     };
     transaction::write(&paths.journal, &transaction)?;

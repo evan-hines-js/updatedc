@@ -36,10 +36,12 @@ impl RepositoryLineage {
     }
 }
 
-/// Exact independently signed lifecycle provider pinned to an update attempt.
+/// Exact independently signed provider (lifecycle or health-check) pinned to a release.
+/// The supervisor stages it content-addressed on disk and invokes its manifest entrypoint
+/// as an external CLI; this record holds only the signed reference plus its invocation args.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LifecycleProviderRelease {
+pub struct ProviderRelease {
     pub product: String,
     pub release: ReleaseId,
     pub archive_sha256: String,
@@ -55,6 +57,20 @@ pub struct InstalledState {
     pub repository_lineage: RepositoryLineage,
     pub release: ReleaseId,
     pub archive_sha256: String,
+    /// The lifecycle provider of the currently-installed release, if the operator ships one.
+    /// Persisted with the install so `pre-start` can run on every boot — install, plain
+    /// restart, and update — without first re-resolving the assignment over the network. The
+    /// provider bytes are already content-addressed on disk from when the release was staged;
+    /// this holds only the signed reference. `None` for a node with no operator provider.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub lifecycle: Option<Box<ProviderRelease>>,
+    /// The health-check provider of the currently-installed release, if the operator ships one.
+    /// When present it *replaces* the HTTP readiness probe as the health signal (exit 0 =
+    /// healthy); `null` means health falls back to the HTTP URL / process-lifetime. Like every
+    /// other field the key is always written and required on read — this is a single, strict
+    /// schema, not a migrated one.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub healthcheck: Option<Box<ProviderRelease>>,
     /// Set at the instant an update commits and cleared once it is confirmed. While it is
     /// set, the update is unconfirmed: a crash reactivates `previous_release`, and
     /// surviving the window confirms it. Absent for a
@@ -63,6 +79,16 @@ pub struct InstalledState {
     /// separate "arm" step to be interrupted.
     #[serde(deserialize_with = "crate::required_option")]
     pub pending: Option<Pending>,
+    /// Whether this head has proven itself healthy at least once. `false` marks a *provisional*
+    /// cold install: a head placed from the first trusted assignment that has never passed a
+    /// health gate and has no predecessor to revert to. If a provisional head fails — crashes or
+    /// wedges before its first passing gate — the boot rejects its bytes so the next cold install
+    /// descends via ordered fallback past it; passing the gate flips this to `true` and it is then
+    /// a normal steady-state head. Every non-cold-install commit (update, rollback, rebind) writes
+    /// `true`: their failure recovery is the update state machine's rollback to a proven
+    /// predecessor, not an ordered-fallback descent. This is the whole "first boot / clean
+    /// environment" signal, kept atomic with the install record rather than in a side file.
+    pub confirmed: bool,
 }
 
 /// The rollback intent of an unconfirmed update: the version to revert to and when the
@@ -76,7 +102,10 @@ pub struct Pending {
     pub previous_repository_lineage: RepositoryLineage,
     /// A crash rollback requires the operator lifecycle provider.
     #[serde(deserialize_with = "crate::required_option")]
-    pub lifecycle: Option<Box<LifecycleProviderRelease>>,
+    pub lifecycle: Option<Box<ProviderRelease>>,
+    /// The health-check provider to gate the restored predecessor with during a crash rollback.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub healthcheck: Option<Box<ProviderRelease>>,
     /// Unix seconds when the update committed.
     pub committed_at: u64,
 }
@@ -87,6 +116,15 @@ impl InstalledState {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid repository lineage",
+            ));
+        }
+        if !self.confirmed && self.pending.is_some() {
+            // A provisional cold install has no proven predecessor to revert to; a rollback intent
+            // on an unconfirmed head is a contradiction. Every confirmed-write path clears or sets
+            // pending deliberately, so this can only appear in a corrupt/hand-edited record.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a provisional (unconfirmed) install must not carry a pending rollback",
             ));
         }
         if let Some(pending) = &self.pending {
@@ -108,19 +146,23 @@ impl InstalledState {
                     "pending predecessor must differ from the installed release",
                 ));
             }
-            if pending.lifecycle.as_ref().is_some_and(|lifecycle| {
-                lifecycle.product.is_empty() || lifecycle.timeout_millis == 0
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "pending lifecycle identity is invalid",
-                ));
+            for provider in [pending.lifecycle.as_ref(), pending.healthcheck.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if provider.product.is_empty() || provider.timeout_millis == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "pending provider identity is invalid",
+                    ));
+                }
             }
         }
         Ok(())
     }
 
-    /// A confirmed install (no pending rollback).
+    /// A confirmed install (no pending rollback): a head with a proven predecessor or one that
+    /// has already passed a health gate. Its recovery on failure is the update state machine.
     pub fn confirmed(
         repository_lineage: RepositoryLineage,
         release: ReleaseId,
@@ -130,8 +172,46 @@ impl InstalledState {
             repository_lineage,
             release,
             archive_sha256,
+            lifecycle: None,
+            healthcheck: None,
             pending: None,
+            confirmed: true,
         }
+    }
+
+    /// A *provisional* cold install: the head placed from the first trusted assignment, not yet
+    /// health-proven and with no predecessor. See the [`confirmed`](Self::confirmed) field — if it
+    /// fails its first health gate the boot rejects it and the next cold install descends past it.
+    pub fn provisional(
+        repository_lineage: RepositoryLineage,
+        release: ReleaseId,
+        archive_sha256: String,
+    ) -> Self {
+        Self {
+            confirmed: false,
+            ..Self::confirmed(repository_lineage, release, archive_sha256)
+        }
+    }
+
+    /// Promote a provisional cold install to confirmed after it passes its first health gate.
+    /// Idempotent; returns whether the flag changed, so the caller only rewrites on transition.
+    pub fn confirm(&mut self) -> bool {
+        !std::mem::replace(&mut self.confirmed, true)
+    }
+
+    /// Record the lifecycle provider that ships with this installed release, so `pre-start`
+    /// can resolve it on every subsequent boot. `None` leaves the install provider-less.
+    pub fn with_lifecycle(mut self, lifecycle: Option<Box<ProviderRelease>>) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    /// Record the health-check provider that ships with this installed release, so every
+    /// boot and steady-state probe resolves it without re-fetching the assignment. `None`
+    /// leaves health on the HTTP URL / process-lifetime fallback.
+    pub fn with_healthcheck(mut self, healthcheck: Option<Box<ProviderRelease>>) -> Self {
+        self.healthcheck = healthcheck;
+        self
     }
 
     /// Version ordering is meaningful only inside one metadata lineage.
@@ -158,7 +238,7 @@ impl InstalledState {
 /// missing record is a legitimate first install, a corrupt one is not and the
 /// caller must fail closed rather than treat it as a fresh start.
 pub enum Installed {
-    Present(InstalledState),
+    Present(Box<InstalledState>),
     Missing,
     Invalid,
 }
@@ -215,7 +295,7 @@ pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
 pub fn read_installed(path: &Path) -> Installed {
     match std::fs::read(path) {
         Ok(raw) => match serde_json::from_slice::<InstalledState>(&raw) {
-            Ok(s) if s.validate().is_ok() => Installed::Present(s),
+            Ok(s) if s.validate().is_ok() => Installed::Present(Box::new(s)),
             Ok(_) | Err(_) => Installed::Invalid,
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Installed::Missing,
@@ -256,6 +336,8 @@ mod tests {
                     manifest_sha256: "manifest".into(),
                 },
                 archive_sha256: "abcd".into(),
+                lifecycle: None,
+                healthcheck: None,
                 pending: Some(Pending {
                     lifecycle_attempt_id: "lifecycle".into(),
                     previous_release: ReleaseId {
@@ -267,8 +349,10 @@ mod tests {
                         "https://old/metadata/",
                     ),
                     lifecycle: None,
+                    healthcheck: None,
                     committed_at: 1_700_000_000,
                 }),
+                confirmed: true,
             },
         )
         .unwrap();

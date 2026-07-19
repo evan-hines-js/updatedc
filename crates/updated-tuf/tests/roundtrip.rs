@@ -36,6 +36,11 @@ fn client_config(repo_dir: &std::path::Path) -> RepositorySource {
         metadata_limit: 1024 * 1024,
         target_limit: 100 * 1024 * 1024,
         transport_timeout: std::time::Duration::from_secs(5),
+        mtls: updated::tls::Identity::new(
+            repo_dir.join("client.crt"),
+            repo_dir.join("client.key"),
+            repo_dir.join("ca.crt"),
+        ),
     }
 }
 
@@ -46,6 +51,173 @@ fn policy() -> DefaultPolicy {
         os: "linux".into(),
         arch: "x86_64".into(),
     }
+}
+
+#[tokio::test]
+async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
+    let tmp = std::env::temp_dir().join(format!(
+        "updated-tuf-offline-{}-{}",
+        std::process::id(),
+        updated::rand::token().unwrap()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let repo_dir = tmp.join("routing");
+    let keys = repo::generate_keys(&tmp.join("routing-keys"))
+        .await
+        .unwrap();
+    repo::init(&repo_dir, &keys, 365).await.unwrap();
+
+    let root_text = std::fs::read_to_string(repo_dir.join("metadata/root.json")).unwrap();
+    let root: serde_json::Value = serde_json::from_str(&root_text).unwrap();
+    let runtime = updated::config::ManagedRuntime {
+        product: "offline-app".into(),
+        channel: "stable".into(),
+        install_root: tmp.join("install"),
+        args: vec!["serve".into()],
+        health_checks: vec![],
+        repository: updated::config::ManagedRepositoryLimits {
+            metadata_limit: 1024 * 1024,
+            target_limit: 1024 * 1024,
+            transport_timeout_seconds: 5,
+        },
+        storage: updated::config::ManagedStorage {
+            inactive_releases: 2,
+            inactive_providers: 2,
+            inactive_supervisors: 2,
+            inactive_bytes: 1024 * 1024,
+            inactive_repository_caches: 2,
+        },
+        timeouts: updated::config::ManagedTimeouts {
+            check_interval_seconds: 5,
+            health_grace_seconds: 5,
+            health_successes: 1,
+            health_interval_seconds: 1,
+            retry_after_seconds: 5,
+            refresh_retry_seconds: 5,
+            confirmation_window_seconds: 5,
+            supervisor_check_interval_seconds: 5,
+            drain_hold_seconds: Some(0),
+        },
+    };
+    let assignment = updated::config::RepositoryAssignment {
+        schema: 2,
+        deployment: "offline".into(),
+        metadata_url: "http://127.0.0.1:9/release/metadata/".into(),
+        targets_url: "http://127.0.0.1:9/release/targets/".into(),
+        report_url: None,
+        application: updated::config::TargetReference {
+            path: "products/offline-app/stable/1/linux-x86_64/app".into(),
+            sha256: "a".repeat(64),
+        },
+        ordered_install_fallback: false,
+        provider_set: updated::config::TargetReference {
+            path: "provider-sets/default.json".into(),
+            sha256: "b".repeat(64),
+        },
+        release_root: root.clone(),
+        runtime,
+    };
+    let config_bytes = serde_json::to_vec(&assignment).unwrap();
+    let config_sha = updated::hash::sha256_bytes(&config_bytes);
+    let config_path = format!("assignments/configs/{config_sha}.json");
+    let agent = updated::config::AgentDocument {
+        schema: 1,
+        config: updated::config::TargetReference {
+            path: config_path.clone(),
+            sha256: config_sha,
+        },
+        status: None,
+    };
+    let agent_bytes = serde_json::to_vec(&agent).unwrap();
+    let config_source = tmp.join("managed.json");
+    let agent_source = tmp.join("agent.json");
+    std::fs::write(&config_source, &config_bytes).unwrap();
+    std::fs::write(&agent_source, &agent_bytes).unwrap();
+    let agent_path = "assignments/agents/offline.json";
+    repo::add_release(
+        &repo_dir,
+        &keys,
+        vec![
+            repo::PublishTarget {
+                name: config_path,
+                source: config_source,
+                custom: Default::default(),
+            },
+            repo::PublishTarget {
+                name: agent_path.into(),
+                source: agent_source,
+                custom: Default::default(),
+            },
+        ],
+        365,
+    )
+    .await
+    .unwrap();
+    let timestamp = std::fs::read_to_string(repo_dir.join("metadata/timestamp.json")).unwrap();
+    let timestamp_value: serde_json::Value = serde_json::from_str(&timestamp).unwrap();
+    let snapshot_version = timestamp_value["signed"]["meta"]["snapshot.json"]["version"]
+        .as_u64()
+        .unwrap();
+    let snapshot = std::fs::read_to_string(
+        repo_dir.join(format!("metadata/{snapshot_version}.snapshot.json")),
+    )
+    .unwrap();
+    let snapshot_value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    let targets_version = snapshot_value["signed"]["meta"]["targets.json"]["version"]
+        .as_u64()
+        .unwrap();
+    let targets =
+        std::fs::read_to_string(repo_dir.join(format!("metadata/{targets_version}.targets.json")))
+            .unwrap();
+    let bundle = updated::enrollment::EnrollmentBundle {
+        schema: 1,
+        agent_id: "offline".into(),
+        routing_base_url: "http://127.0.0.1:9/routing/".into(),
+        assignment: agent_path.into(),
+        routing_root: root_text,
+        initial: updated::enrollment::InitialSignedConfiguration {
+            timestamp,
+            snapshot,
+            targets,
+            agent_document: String::from_utf8(agent_bytes).unwrap(),
+            managed_configuration: String::from_utf8(config_bytes).unwrap(),
+        },
+    };
+    let bootstrap = tmp.join("bootstrap.toml");
+    std::fs::write(
+        &bootstrap,
+        "[enrollment]\nurl='https://127.0.0.1:9'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
+    )
+    .unwrap();
+    let enrollment_state = tmp.join("enrollment-state");
+    std::fs::create_dir_all(&enrollment_state).unwrap();
+    std::fs::write(
+        enrollment_state.join("enrollment.json"),
+        serde_json::to_vec(&bundle).unwrap(),
+    )
+    .unwrap();
+    let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
+        .await
+        .unwrap();
+    assert_eq!(config.application.product, "offline-app");
+
+    let mut tampered = bundle;
+    let mut tampered_config: serde_json::Value =
+        serde_json::from_str(&tampered.initial.managed_configuration).unwrap();
+    tampered_config["deployment"] = serde_json::json!("attacker");
+    tampered.initial.managed_configuration = serde_json::to_string(&tampered_config).unwrap();
+    let tampered_state = tmp.join("tampered-state");
+    std::fs::create_dir_all(&tampered_state).unwrap();
+    std::fs::write(
+        tampered_state.join("enrollment.json"),
+        serde_json::to_vec(&tampered).unwrap(),
+    )
+    .unwrap();
+    let error = updated_tuf::resolve_managed_config(&bootstrap, &tampered_state)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("digest mismatch"), "{error}");
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[tokio::test]
@@ -70,6 +242,25 @@ async fn publish_then_verify_and_download() {
     let repo = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds"))
         .await
         .unwrap();
+
+    // A manually placed repository uses the identical TUF path. Absolute directories
+    // are merely shorthand for file: base URLs; there is no separate offline verifier.
+    let mut local = client_config(&repo_dir);
+    local.metadata_url = std::fs::canonicalize(repo_dir.join("metadata"))
+        .unwrap()
+        .display()
+        .to_string();
+    local.targets_url = std::fs::canonicalize(repo_dir.join("targets"))
+        .unwrap()
+        .display()
+        .to_string();
+    let local_repo = TrustedRepository::load(&local, &tmp.join("ds-local-paths"))
+        .await
+        .unwrap();
+    assert!(local_repo
+        .all_targets()
+        .iter()
+        .any(|target| target.path == target_path));
 
     let found = repo
         .all_targets()

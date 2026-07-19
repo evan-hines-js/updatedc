@@ -18,7 +18,7 @@ impl SelfUpdateState {
         prune_supervisor_cache(opts);
         Ok(SelfUpdateState {
             next_check: Instant::now(),
-            rejected: Rejections::load(&path, updated::reject::REJECT_TTL)?,
+            rejected: Rejections::load(&path)?,
         })
     }
 
@@ -158,11 +158,9 @@ fn running_supervisor_is(sha: &str) -> bool {
         .is_some_and(|h| h.eq_ignore_ascii_case(sha))
 }
 
-/// The supervisor binary's file name inside a content-addressed staging directory.
+/// The supervisor binary's file name inside a content-addressed staging directory. The
+/// guardian validates against the same name via [`foundation::platform`], so the two
+/// cannot drift.
 fn supervisor_filename() -> &'static str {
-    if cfg!(windows) {
-        "supervisor.exe"
-    } else {
-        "supervisor"
-    }
+    foundation::platform::supervisor_binary_name()
 }

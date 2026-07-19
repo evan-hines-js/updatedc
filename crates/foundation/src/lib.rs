@@ -15,6 +15,8 @@
 
 pub mod durable;
 pub mod log;
+pub mod platform;
+pub mod process;
 pub mod time;
 
 #[cfg(test)]

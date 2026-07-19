@@ -12,7 +12,8 @@ REPO="$WORK/repo"
 KEYS="$WORK/keys"
 INSTALL="$WORK/install"
 BIN="$WORK/bin"
-CONFIG="$WORK/config.toml"
+BOOTSTRAP="$WORK/bootstrap.toml"
+RUNTIME="$WORK/runtime.json"
 TOWER_LOG="$WORK/tower.log"
 REPO_LOG="$WORK/repository.log"
 TRAFFIC_LOG="$WORK/traffic.log"
@@ -120,7 +121,8 @@ assign() {
     --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/" \
     --targets-url "http://127.0.0.1:$REPO_PORT/targets/" \
     --application-path "$app_path" --application-sha256 "$(target_sha256 "$app_path")" \
-    --provider-set-path "$set_path" --provider-set-sha256 "$(target_sha256 "$set_path")"
+    --provider-set-path "$set_path" --provider-set-sha256 "$(target_sha256 "$set_path")" \
+    --runtime "$RUNTIME"
 }
 
 rm -rf "$WORK"
@@ -181,36 +183,23 @@ done
 "$BIN/server" install-app --install-root "$INSTALL" --product app --version 1.0.0 \
   --platform linux-x86_64 --bundle "$WORK/bundle-1.0.0" --entrypoint bin/launch \
   --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/"
+cat >"$RUNTIME" <<EOF
+{"product":"app","channel":"stable","install_root":"$INSTALL","args":[],"health_checks":[{"kind":"readiness","url":"http://127.0.0.1:$HTTP_PORT/"}],"activation":"custom","repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_supervisors":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"retry_after_seconds":60,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"supervisor_check_interval_seconds":3600}}
+EOF
 publish 1.0.0 "$WORK/bundle-1.0.0"
-
-cat >"$CONFIG" <<EOF
-[routing]
-root = "$REPO/metadata/root.json"
-base_url = "http://127.0.0.1:$REPO_PORT/"
-assignment = "assignments/agents/agent.json"
-transport_timeout = "5s"
-[repository]
-root = "$REPO/metadata/root.json"
-transport_timeout = "5s"
-[application]
-product = "app"
-channel = "stable"
-install_root = "$INSTALL"
-health_url = "http://127.0.0.1:$HTTP_PORT/"
-[application.activation]
-mode = "reexec"
-[timeouts]
-check_interval = "1s"
-health_grace = "4s"
-retry_after = "60s"
-refresh_retry = "1s"
-confirmation_window = "2s"
+"$BIN/server" export-enrollment --repo "$REPO" --assignment assignments/agents/agent.json \
+  --agent-id agent --routing-base-url "http://127.0.0.1:$REPO_PORT/" \
+  --output "$WORK/guardian-state/enrollment.json"
+cat >"$BOOTSTRAP" <<EOF
+[enrollment]
+url = "http://127.0.0.1:$REPO_PORT/"
+key = "unused-preplaced"
 EOF
 
 : >"$TOWER_LOG"; : >"$REPO_LOG"; : >"$TRAFFIC_LOG"
 "$BIN/server" serve --repo "$REPO" --addr "127.0.0.1:$REPO_PORT" >>"$REPO_LOG" 2>&1 &
 REPO_PID="$!"
-"$BIN/bootstrap" --state-dir "$WORK/guardian-state" --supervisor-config "$CONFIG" \
+"$BIN/bootstrap" --state-dir "$WORK/guardian-state" --supervisor-config "$BOOTSTRAP" \
   --supervisor "$BIN/supervisor" --stop-grace 2 >>"$TOWER_LOG" 2>&1 &
 TOWER_PID="$!"
 wait_version 1.0.0

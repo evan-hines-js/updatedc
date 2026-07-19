@@ -79,24 +79,27 @@ that activation.
 | Path | Contents |
 | --- | --- |
 | `/usr/lib/selfupdate/bootstrap` (Linux), `/etc/selfupdate/bootstrap` (macOS) | Installer-owned `bootstrap` — the root we ship; never self-updates, read-only |
-| `/etc/selfupdate/root.json` | Installer-pinned TUF root — the anchor of trust, read-only |
-| `/var/lib/selfupdate/` (Linux), `/usr/local/var/selfupdate/` (macOS) | Writable guardian state: `desired-supervisor`, crash/rejection markers, and content-addressed `supervisors/` candidates; application state and the TUF cache live beside paths selected in `config.toml` |
+| `/etc/selfupdate/bootstrap.toml` | Read-only enrollment URL and shared key |
+| `/var/lib/selfupdate/` (Linux), `/usr/local/var/selfupdate/` (macOS) | Writable guardian state, the consumed signed enrollment bundle, supervisor candidates, application state, and TUF caches |
 
 Because supervisor candidates and immutable application bundles are updated, they live
 in writable state directories. The two things that must never be forged — the
-bootstrap and the pinned TUF root — stay read-only. A leaked or misused role key
-still cannot make a client run anything the pinned root's roles did not sign.
+bootstrap and bootstrap config — stay read-only. Enrollment supplies the pinned TUF root;
+a leaked or misused role key still cannot make a client run unsigned content.
 
-The installer places the initial supervisor, pins the TUF root, and stages a verified
-initial application bundle into `application.install_root`, including `active-release`
-and `state/installed.json`. It passes the initial supervisor with
-`bootstrap --supervisor`; the bootstrap seeds its durable supervisor pointer on first
-launch. After that the system is self-sustaining.
+The installer always places the bootstrap and initial supervisor and passes the latter
+with `bootstrap --supervisor`; the bootstrap seeds its durable supervisor pointer on
+first launch. For offline-first installation it also preplaces the exported signed
+`enrollment.json` and verified initial application bundle. For online-first installation
+it places the enrollment URL/key bootstrap file and the supervisor cold-installs the
+first trusted assignment. Both paths converge on the same durable layout and transaction.
 
-**Offline-capable, fail-closed first start.** The supervisor requires the installer-seeded
-release, strict installed record, and active pointer. It verifies every manifested file
-before launch and refuses missing, corrupt, or drifted state; it never synthesizes trust
-from loose executable bytes. No network is required to launch the verified active bundle.
+**Offline-capable, fail-closed first start.** If signed installer material is present,
+the supervisor verifies every manifested file before launch and refuses missing,
+corrupt, or drifted state; it never synthesizes trust from loose executable bytes. No
+network is required to launch that verified active bundle. Without installer material,
+network enrollment and cold installation are allowed but must complete before any
+application launches.
 
 ## Linux (systemd)
 
@@ -107,8 +110,14 @@ systemctl enable --now selfupdate-supervisor
 journalctl -u selfupdate-supervisor -f      # watch bootstrap + supervisor + app
 ```
 
-Install `config.toml` read-only alongside the pinned root:
-`install -m0644 config.toml /etc/selfupdate/config.toml`.
+Install `bootstrap.toml` read-only:
+`install -m0644 bootstrap.toml /etc/selfupdate/bootstrap.toml`.
+
+The templates enable the guardian probe listener on loopback port 9090. `/readyz`
+withdraws before a planned stop while `/livez` remains successful; an application crash
+or sustained signed liveness-check failure makes `/livez` fail until the outer lifecycle
+owner replaces the tower. `/startupz` latches after the first accepted application. Bind
+to `0.0.0.0` only inside a container network namespace where the runtime must reach it.
 
 **Updating the supervisor:** publish a signed supervisor release on its channel;
 the running supervisor stages it under `supervisors/<content-id>/` and exits, and the

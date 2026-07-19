@@ -3,7 +3,36 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/publish-fuzz-plan.sh"
+FUZZ_ROUNDS=${UPDATEC_FUZZ_ROUNDS:-1}
+while (( $# > 0 )); do
+  case "$1" in
+    --fuzz-rounds)
+      [[ $# -ge 2 ]] || { echo "FAIL: --fuzz-rounds needs a value" >&2; exit 2; }
+      FUZZ_ROUNDS=$2
+      shift 2
+      ;;
+    --help|-h)
+      echo "usage: $0 [--fuzz-rounds N]"
+      echo "  N=0 skips fleet fuzz; default: ${UPDATEC_FUZZ_ROUNDS:-1}"
+      exit 0
+      ;;
+    *)
+      echo "FAIL: unknown argument $1" >&2
+      exit 2
+      ;;
+  esac
+done
+[[ "$FUZZ_ROUNDS" =~ ^[0-9]+$ ]] || {
+  echo "FAIL: fuzz rounds must be a non-negative integer, got '$FUZZ_ROUNDS'" >&2
+  exit 2
+}
+echo "Kind E2E fleet-fuzz rounds: $FUZZ_ROUNDS"
 NAME="${UPDATEC_KIND_CLUSTER:-updatec-e2e}"
+KUBE_CONTEXT="kind-$NAME"
+# Never depend on kubectl's process-global current context. The demo, CI, and a
+# developer's separate Kind run may execute concurrently; pinning every operation is
+# the only way namespace creation and all later resources remain in the same cluster.
+kubectl() { command kubectl --context "$KUBE_CONTEXT" "$@"; }
 WORK="$ROOT/target/kind-$NAME"
 cleanup() { kind delete cluster --name "$NAME" >/dev/null 2>&1 || true; }
 finish() {
@@ -23,6 +52,16 @@ finish() {
   echo "remove with:  kind delete cluster --name $NAME" >&2
   kubectl -n updated-system get pods,jobs >&2 || true
 }
+kubectl_log_contains() {
+  local resource=$1
+  local needle=$2
+  local log
+  shift 2
+  # Capture before matching: `grep -q` closes a live pipe after the first match,
+  # which can SIGPIPE kubectl and falsely fail under `set -o pipefail`.
+  log="$(kubectl -n updated-system logs "$resource" "$@" 2>/dev/null || true)"
+  [[ "$log" == *"$needle"* ]]
+}
 trap finish EXIT
 cleanup
 mkdir -p "$WORK"
@@ -32,6 +71,21 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
+    # Lets an ingress-nginx controller schedule (its nodeSelector is ingress-ready=true),
+    # so the demo can front each set's pods with a real per-set Ingress.
+    labels:
+      ingress-ready: "true"
+    # Publish the ingress controller on the host's ports 80/443, so both the browser AND the
+    # co-located out-of-cluster agent reach every endpoint through nginx — the agent resolves
+    # updatec-gateway/release-default to 127.0.0.1 (nginx), no socat or LAN-IP needed.
+    extraPortMappings:
+      - { containerPort: 80, hostPort: 80, protocol: TCP }
+      - { containerPort: 443, hostPort: 443, protocol: TCP }
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        apiVersion: kubelet.config.k8s.io/v1beta1
+        maxPods: 250
 YAML
 kind create cluster --name "$NAME" --config "$WORK/kind.yaml"
 cargo run -q -p updatec --example crdgen >"$WORK/crds.yaml"
@@ -44,9 +98,80 @@ kubectl -n updated-system set env deployment/minio MINIO_ROOT_USER=minio MINIO_R
 kubectl -n updated-system expose deployment minio --port=9000
 kubectl -n updated-system rollout status deployment/minio --timeout=120s
 kubectl -n updated-system run minio-init --restart=Never --image=minio/mc:RELEASE.2025-04-16T18-13-26Z --command -- sh -c \
-  'until mc alias set local http://minio:9000 minio minio123; do sleep 1; done; mc mb --ignore-existing local/updates'
+  'until mc alias set local http://minio:9000 minio minio123; do sleep 1; done; mc mb --ignore-existing local/updates; mc anonymous set download local/updates'
 kubectl -n updated-system wait pod/minio-init --for=condition=Ready=false --timeout=1s >/dev/null 2>&1 || true
 kubectl -n updated-system wait pod/minio-init --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s
+
+# Ingress controller: cluster infrastructure, provisioned here alongside minio so every
+# environment built from this script is ingress-capable. The demo fronts each set's
+# load-balancer Service with a per-set Ingress on this controller, so Kubernetes — not the
+# demo's own routing — guarantees a set is only ever answered by its own pods. Scheduled
+# onto the ingress-ready control-plane node (see the kind config above).
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
+kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=180s
+
+# cert-manager issues the fleet mTLS material: a self-signed root CA, then the gateway's server
+# certificate and the agents' client certificate, all from that one CA. The gateway (the only
+# externally exposed listener) requires a client cert the CA signed — that mutual TLS is the
+# enrollment identity, so there is no shared secret anywhere.
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.3/cert-manager.yaml
+kubectl -n cert-manager rollout status deployment/cert-manager-webhook --timeout=180s
+kubectl -n cert-manager rollout status deployment/cert-manager --timeout=180s
+kubectl -n cert-manager rollout status deployment/cert-manager-cainjector --timeout=180s
+cat <<'YAML' | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: fleet-selfsigned, namespace: updated-system}
+spec: {selfSigned: {}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: fleet-ca, namespace: updated-system}
+spec:
+  isCA: true
+  commonName: updated-fleet-ca
+  secretName: fleet-ca
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: fleet-selfsigned, kind: Issuer}
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: fleet-ca-issuer, namespace: updated-system}
+spec: {ca: {secretName: fleet-ca}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: gateway-tls, namespace: updated-system}
+spec:
+  secretName: gateway-tls
+  commonName: updatec-gateway
+  dnsNames: [updatec-gateway, release-default, release-edge, release-batch, release-join, localhost]
+  usages: [server auth]
+  issuerRef: {name: fleet-ca-issuer, kind: Issuer}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: agent-tls, namespace: updated-system}
+spec:
+  secretName: agent-tls
+  commonName: updated-agent
+  usages: [client auth]
+  issuerRef: {name: fleet-ca-issuer, kind: Issuer}
+---
+# An intruder identity issued by the self-signed issuer directly (NOT the fleet CA), so the
+# gateway rejects it — proving the mTLS gate fails closed for a non-fleet client.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: intruder-tls, namespace: updated-system}
+spec:
+  secretName: intruder-tls
+  commonName: intruder
+  usages: [client auth]
+  issuerRef: {name: fleet-selfsigned, kind: Issuer}
+YAML
+kubectl -n updated-system wait --for=condition=Ready certificate/gateway-tls --timeout=120s
+kubectl -n updated-system wait --for=condition=Ready certificate/agent-tls --timeout=120s
+kubectl -n updated-system wait --for=condition=Ready certificate/intruder-tls --timeout=120s
 
 docker build -f crates/updatec/Dockerfile.e2e -t updatec-e2e:kind .
 kind load docker-image --name "$NAME" updatec-e2e:kind
@@ -72,39 +197,54 @@ spec:
         - name: release-server
           image: updatec-e2e:kind
           command: [/usr/local/bin/release-server]
-          ports: [{name: http, containerPort: 8080}]
-          volumeMounts: [{name: repository, mountPath: /data}]
+          ports: [{name: https, containerPort: 8080}]
+          volumeMounts:
+            - {name: repository, mountPath: /data}
+            # The fleet server cert + CA: release-server terminates mTLS, so it needs the same
+            # gateway-tls material the gateway uses.
+            - {name: gateway-tls, mountPath: /etc/gateway-tls, readOnly: true}
       volumes:
         - name: repository
           persistentVolumeClaim: {claimName: release-repository}
+        - name: gateway-tls
+          secret: {secretName: gateway-tls}
 ---
 apiVersion: v1
 kind: Service
 metadata: {name: release-server, namespace: updated-system}
 spec:
   selector: {app: release-server}
-  ports: [{name: http, port: 80, targetPort: http}]
+  ports: [{name: https, port: 443, targetPort: https}]
 ---
 apiVersion: v1
 kind: Service
 metadata: {name: release-edge, namespace: updated-system}
 spec:
   selector: {app: release-server}
-  ports: [{name: http, port: 80, targetPort: http}]
+  ports: [{name: https, port: 443, targetPort: https}]
 ---
 apiVersion: v1
 kind: Service
 metadata: {name: release-batch, namespace: updated-system}
 spec:
   selector: {app: release-server}
-  ports: [{name: http, port: 80, targetPort: http}]
+  ports: [{name: https, port: 443, targetPort: https}]
 ---
 apiVersion: v1
 kind: Service
 metadata: {name: release-default, namespace: updated-system}
 spec:
   selector: {app: release-server}
-  ports: [{name: http, port: 80, targetPort: http}]
+  ports: [{name: https, port: 443, targetPort: https}]
+---
+# The join-mode cohort's bundle routes through https://release-join/ (deployment("join", …) in the
+# kind_resources example), so it needs the same release-server alias + TLS SAN that edge/batch have.
+apiVersion: v1
+kind: Service
+metadata: {name: release-join, namespace: updated-system}
+spec:
+  selector: {app: release-server}
+  ports: [{name: https, port: 443, targetPort: https}]
 YAML
 kubectl -n updated-system rollout status deployment/release-server --timeout=180s
 echo "waiting for the in-cluster release repository"
@@ -144,88 +284,31 @@ cargo run -q -p server -- init --repo "$WORK/seed-repo" --keys "$WORK/keys"
 kubectl -n updated-system create secret generic tuf-signing-keys --from-file="$WORK/keys/root.pk8" --from-file="$WORK/keys/targets.pk8" --from-file="$WORK/keys/snapshot.pk8" --from-file="$WORK/keys/timestamp.pk8"
 kubectl -n updated-system create secret generic s3-credentials --from-literal=AWS_ACCESS_KEY_ID=minio --from-literal=AWS_SECRET_ACCESS_KEY=minio123
 
-deployment() {
-  printf '{"schema":2,"deployment":"%s","metadata_url":"http://release-%s/metadata/","targets_url":"http://release-%s/targets/","application":{"path":"products/app/stable/%s/%s/app","sha256":"%s"},"provider_set":{"path":"provider-sets/default.json","sha256":"%s"}}' \
-    "$1" "$2" "$2" "$3" "$PLATFORM" "$4" "$PROVIDER_SHA"
-}
-kubectl -n updated-system create configmap deployment-default --save-config \
-  --from-literal=deployment.json="$(deployment default default 1.0.0 "$APP_V1_SHA")"
-kubectl -n updated-system create configmap deployment-edge --save-config \
-  --from-literal=deployment.json="$(deployment edge edge 2.0.0 "$APP_V2_SHA")"
-kubectl -n updated-system create configmap deployment-batch --save-config \
-  --from-literal=deployment.json="$(deployment batch batch 3.0.0 "$APP_V3_SHA")"
-cat >"$WORK/resources.yaml" <<'YAML'
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedGroup
-metadata: {name: default, namespace: updated-system}
-spec: {match_labels: {updated.dev/default: "true"}, deployment_config_map: deployment-default}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedGroup
-metadata: {name: edge, namespace: updated-system}
-spec: {match_labels: {updated.dev/role: edge}, deployment_config_map: deployment-edge}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedGroup
-metadata: {name: batch, namespace: updated-system}
-spec: {match_labels: {updated.dev/role: batch}, deployment_config_map: deployment-batch}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedNode
-metadata: {name: agent-0, namespace: updated-system}
-spec: {labels: {updated.dev/role: edge}}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedNode
-metadata: {name: agent-1, namespace: updated-system}
-spec: {labels: {updated.dev/role: edge}}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedNode
-metadata: {name: agent-2, namespace: updated-system}
-spec: {labels: {updated.dev/role: batch}}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedNode
-metadata: {name: agent-3, namespace: updated-system}
-spec: {labels: {updated.dev/role: batch}}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedNode
-metadata: {name: agent-4, namespace: updated-system}
-spec: {labels: {}}
----
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedRepository
-metadata: {name: default, namespace: updated-system}
-spec:
-  default_group: default
-  signing_secret: tuf-signing-keys
-  assignment_prefix: assignments
-  s3:
-    bucket: updates
-    region: us-east-1
-    endpoint: http://minio:9000
-    credentials_secret: s3-credentials
-YAML
+cargo run -q -p updatec --example kind_resources -- \
+  "$PLATFORM" "$APP_V1_SHA" "$APP_V2_SHA" "$APP_V3_SHA" "$PROVIDER_SHA" \
+  "$WORK/release-root.json" >"$WORK/resources.yaml"
 kubectl apply -f "$WORK/resources.yaml"
 
 docker build -f crates/updatec/Dockerfile -t updatec:kind .
 kind load docker-image --name "$NAME" updatec:kind
 kubectl apply -f deploy/kubernetes/updatec.yaml
+kubectl -n updated-system set env deployment/updatec-controller \
+  UPDATED_PUBLIC_URL=https://updatec-gateway
+kubectl -n updated-system set env deployment/updatec-gateway \
+  UPDATED_PUBLIC_URL=https://updatec-gateway
 kubectl -n updated-system rollout status deployment/updatec-controller --timeout=180s
 kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=180s
 
 echo "waiting for updatec to publish the first complete routing generation"
 for attempt in {1..60}; do
-  if kubectl -n updated-system logs deployment/updatec-controller | grep -q 'desired state reconciled'; then break; fi
+  if kubectl_log_contains deployment/updatec-controller 'desired state reconciled'; then break; fi
   if (( attempt % 5 == 0 )); then
     echo "still waiting for publication (${attempt}/60); latest controller log:"
     kubectl -n updated-system logs deployment/updatec-controller --tail=3 || true
   fi
   sleep 2
 done
-if ! kubectl -n updated-system logs deployment/updatec-controller | grep -q 'desired state reconciled'; then
+if ! kubectl_log_contains deployment/updatec-controller 'desired state reconciled'; then
   echo "FAIL: updatec did not publish within 120s" >&2
   kubectl -n updated-system get pods >&2 || true
   kubectl -n updated-system logs deployment/updatec-controller --tail=100 >&2 || true
@@ -233,10 +316,243 @@ if ! kubectl -n updated-system logs deployment/updatec-controller | grep -q 'des
   exit 1
 fi
 echo "initial routing generation published"
-kubectl -n updated-system create configmap agent-roots \
-  --from-file=routing-root.json="$WORK/seed-repo/metadata/root.json" \
-  --from-file=release-root.json="$WORK/release-root.json"
+
+# Exercise the operator-driven installer route end to end. The controller must turn a
+# manual UpdateAgent into an immutable signed enrollment Secret. An init container models
+# the external installer: it places the baseline bundle and enrollment artifact before the
+# runtime starts. The runtime receives an unreachable bootstrap URL, so its first launch
+# can succeed only from those fully local, verified inputs.
 cat <<'YAML' | kubectl apply -f -
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata: {name: manual-offline, namespace: updated-system}
+spec:
+  repositoryRef: {name: default}
+  identity: {kind: manual}
+  labels: {}
+YAML
+echo "waiting for the manual agent's signed installer artifact"
+for attempt in {1..60}; do
+  MANUAL_ENROLLMENT_SECRET="$(kubectl -n updated-system get updateagent manual-offline \
+    -o jsonpath='{.status.enrollmentSecretRef.name}' 2>/dev/null || true)"
+  if [[ -n "$MANUAL_ENROLLMENT_SECRET" ]] && \
+    kubectl -n updated-system get secret "$MANUAL_ENROLLMENT_SECRET" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+if [[ -z "${MANUAL_ENROLLMENT_SECRET:-}" ]]; then
+  echo "FAIL: manual agent never received an enrollment Secret" >&2
+  kubectl -n updated-system get updateagent manual-offline -o yaml >&2 || true
+  exit 1
+fi
+cat >"$WORK/manual-offline.yaml" <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: manual-offline-bootstrap, namespace: updated-system}
+data:
+  bootstrap.toml: |
+    [enrollment]
+    url = "https://127.0.0.1:1"
+    client_cert = "/etc/agent-tls/tls.crt"
+    client_key = "/etc/agent-tls/tls.key"
+    ca = "/etc/agent-tls/ca.crt"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: manual-offline
+  namespace: updated-system
+  labels: {test: manual-offline}
+spec:
+  restartPolicy: Never
+  hostAliases:
+    - ip: 127.0.0.1
+      hostnames: [updatec-gateway, release-default]
+  securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+  initContainers:
+    - name: external-installer
+      image: updatec-e2e:kind
+      imagePullPolicy: IfNotPresent
+      command: [/bin/sh, -ec]
+      args:
+        - |
+          mkdir -p /tmp/installer/bin /tmp/installer/config /var/lib/updated/guardian
+          cp /usr/local/bin/sampleapp /tmp/installer/bin/app
+          printf 'version = "1.0.0"\n' >/tmp/installer/config/release.toml
+          printf 'sampleapp\n' >/tmp/installer/config/artifact
+          server install-app --install-root /var/lib/updated --bundle /tmp/installer \
+            --product app --version 1.0.0 --platform $PLATFORM --entrypoint bin/app \
+            --metadata-url https://release-default/metadata/
+          cp /signed/enrollment.json /var/lib/updated/guardian/enrollment.json
+      volumeMounts:
+        - {name: state, mountPath: /var/lib/updated}
+        - {name: enrollment, mountPath: /signed, readOnly: true}
+  containers:
+    - name: agent
+      image: updatec-e2e:kind
+      imagePullPolicy: IfNotPresent
+      command: [/usr/local/bin/bootstrap]
+      args: [--state-dir, /var/lib/updated/guardian, --supervisor-config, /bootstrap/bootstrap.toml, --supervisor, /usr/local/bin/supervisor, --ready-timeout, "30", --confirm-timeout, "2", --probe-address, 0.0.0.0:9090]
+      ports: [{name: http, containerPort: 8080}, {name: guardian, containerPort: 9090}]
+      startupProbe: {httpGet: {path: /startupz, port: guardian}, periodSeconds: 1, failureThreshold: 60}
+      readinessProbe: {httpGet: {path: /readyz, port: guardian}, periodSeconds: 1}
+      livenessProbe: {httpGet: {path: /livez, port: guardian}, periodSeconds: 2}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: [ALL]}
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 65532
+      volumeMounts:
+        - {name: state, mountPath: /var/lib/updated}
+        - {name: bootstrap, mountPath: /bootstrap, readOnly: true}
+  volumes:
+    - {name: state, emptyDir: {}}
+    - name: enrollment
+      secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
+    - name: bootstrap
+      configMap: {name: manual-offline-bootstrap}
+YAML
+kubectl apply -f "$WORK/manual-offline.yaml"
+kubectl -n updated-system wait pod/manual-offline --for=condition=Ready --timeout=120s
+MANUAL_VERSION="$(kubectl -n updated-system exec manual-offline -c agent -- \
+  curl -fsS http://127.0.0.1:8080/version)"
+[[ "$MANUAL_VERSION" == 1.0.0 ]] || {
+  echo "FAIL: offline manual installer launched version '$MANUAL_VERSION', expected 1.0.0" >&2
+  exit 1
+}
+kubectl_log_contains manual-offline 'started application pid' -c agent
+echo "manual CRD export installed and launched 1.0.0 with enrollment networking unavailable"
+
+# A malformed installer artifact is terminal: it must never fall back to the URL/key or
+# launch the preinstalled baseline. `timeout` bounds bootstrap's intentional supervision
+# retries so Kubernetes records an observable failed container for this negative test.
+cat >"$WORK/manual-bad-enrollment.yaml" <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: manual-bad-enrollment, namespace: updated-system}
+spec:
+  restartPolicy: Never
+  hostAliases:
+    - ip: 127.0.0.1
+      hostnames: [updatec-gateway, release-default]
+  initContainers:
+    - name: corrupt-external-installer
+      image: updatec-e2e:kind
+      command: [/bin/sh, -ec]
+      args:
+        - |
+          mkdir -p /tmp/installer/bin /tmp/installer/config /var/lib/updated/guardian
+          cp /usr/local/bin/sampleapp /tmp/installer/bin/app
+          printf 'version = "1.0.0"\n' >/tmp/installer/config/release.toml
+          printf 'sampleapp\n' >/tmp/installer/config/artifact
+          server install-app --install-root /var/lib/updated --bundle /tmp/installer \
+            --product app --version 1.0.0 --platform $PLATFORM --entrypoint bin/app \
+            --metadata-url https://release-default/metadata/
+          cp /signed/enrollment.json /var/lib/updated/guardian/enrollment.json
+          printf tampered >>/var/lib/updated/guardian/enrollment.json
+      volumeMounts:
+        - {name: state, mountPath: /var/lib/updated}
+        - {name: enrollment, mountPath: /signed, readOnly: true}
+  containers:
+    - name: agent
+      image: updatec-e2e:kind
+      command: [/bin/sh, -ec]
+      args: ["timeout 15 bootstrap --state-dir /var/lib/updated/guardian --supervisor-config /bootstrap/bootstrap.toml --supervisor /usr/local/bin/supervisor --ready-timeout 5 --confirm-timeout 2"]
+      volumeMounts:
+        - {name: state, mountPath: /var/lib/updated}
+        - {name: bootstrap, mountPath: /bootstrap, readOnly: true}
+  volumes:
+    - {name: state, emptyDir: {}}
+    - name: enrollment
+      secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
+    - name: bootstrap
+      configMap: {name: manual-offline-bootstrap}
+YAML
+kubectl apply -f "$WORK/manual-bad-enrollment.yaml"
+for attempt in {1..30}; do
+  BAD_PHASE="$(kubectl -n updated-system get pod manual-bad-enrollment -o jsonpath='{.status.phase}')"
+  [[ "$BAD_PHASE" == Failed ]] && break
+  sleep 1
+done
+[[ "${BAD_PHASE:-}" == Failed ]] || {
+  echo "FAIL: corrupted enrollment container did not fail" >&2
+  kubectl -n updated-system logs manual-bad-enrollment -c agent >&2 || true
+  exit 1
+}
+BAD_LOG="$(kubectl -n updated-system logs manual-bad-enrollment -c agent)"
+[[ "$BAD_LOG" == *"resolving signed managed configuration"* ]]
+[[ "$BAD_LOG" != *"started application pid"* ]]
+echo "corrupted installer enrollment failed closed before application launch"
+
+# Invalid online credentials are also fail-closed and may not leave registration state.
+BAD_REGISTRATION="$(printf bad-online-agent | shasum -a 256 | awk '{print $1}')"
+BAD_AGENT_HASH="$(printf %s "$BAD_REGISTRATION" | shasum -a 256 | awk '{print $1}')"
+BAD_AGENT_NAME="agent-${BAD_AGENT_HASH:0:24}"
+cat <<'YAML' | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: bad-online-enrollment, namespace: updated-system}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: agent
+      image: updatec-e2e:kind
+      command: [/bin/sh, -ec]
+      args:
+        - |
+          mkdir -p /var/lib/updated/guardian
+          nonce=$(printf bad-online-agent | sha256sum | cut -d' ' -f1)
+          printf %s "$nonce" >/var/lib/updated/guardian/registration-nonce
+          # Present an intruder client cert NOT signed by the fleet CA: the gateway must reject
+          # it at the mTLS handshake so enrollment fails closed. It still trusts the real fleet
+          # CA for the gateway's server cert.
+          cat >/tmp/bootstrap.toml <<EOF
+          [enrollment]
+          url = "https://updatec-gateway"
+          client_cert = "/etc/intruder-tls/tls.crt"
+          client_key = "/etc/intruder-tls/tls.key"
+          ca = "/etc/agent-tls/ca.crt"
+          EOF
+          timeout 15 bootstrap --state-dir /var/lib/updated/guardian \
+            --supervisor-config /tmp/bootstrap.toml --supervisor /usr/local/bin/supervisor \
+            --ready-timeout 5 --confirm-timeout 2
+      volumeMounts:
+        - {name: state, mountPath: /var/lib/updated}
+        - {name: intruder-tls, mountPath: /etc/intruder-tls, readOnly: true}
+        - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
+  volumes:
+    - {name: state, emptyDir: {}}
+    - {name: intruder-tls, secret: {secretName: intruder-tls}}
+    - {name: agent-tls, secret: {secretName: agent-tls}}
+YAML
+for attempt in {1..30}; do
+  BAD_ONLINE_PHASE="$(kubectl -n updated-system get pod bad-online-enrollment -o jsonpath='{.status.phase}')"
+  [[ "$BAD_ONLINE_PHASE" == Failed ]] && break
+  sleep 1
+done
+[[ "${BAD_ONLINE_PHASE:-}" == Failed ]]
+if kubectl -n updated-system get updateagent "$BAD_AGENT_NAME" >/dev/null 2>&1; then
+  echo "FAIL: invalid enrollment credentials created $BAD_AGENT_NAME" >&2
+  exit 1
+fi
+echo "invalid online enrollment credentials failed closed without registering an agent"
+
+cat <<'YAML' | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: poison-preinstalled-apps, namespace: updated-system}
+data:
+  sampleapp: |
+    #!/bin/sh
+    echo "FAIL: agent used the image-baked sampleapp instead of a verified bundle" >&2
+    exit 97
+  magnolia-like: |
+    #!/bin/sh
+    echo "FAIL: agent used the image-baked magnolia-like app instead of a verified bundle" >&2
+    exit 98
+---
 apiVersion: v1
 kind: Service
 metadata: {name: agents, namespace: updated-system}
@@ -244,7 +560,7 @@ spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector: {app: updated-agent}
-  ports: [{name: http, port: 8080, targetPort: http}]
+  ports: [{name: http, port: 8080, targetPort: http}, {name: guardian, port: 9090, targetPort: guardian}]
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -263,8 +579,10 @@ spec:
           image: updatec-e2e:kind
           imagePullPolicy: IfNotPresent
           command: [/usr/local/bin/run-agent]
-          ports: [{name: http, containerPort: 8080}]
-          readinessProbe: {httpGet: {path: /version, port: http}, periodSeconds: 1}
+          ports: [{name: http, containerPort: 8080}, {name: guardian, containerPort: 9090}]
+          startupProbe: {httpGet: {path: /startupz, port: guardian}, periodSeconds: 1, failureThreshold: 120}
+          readinessProbe: {httpGet: {path: /readyz, port: guardian}, periodSeconds: 1}
+          livenessProbe: {httpGet: {path: /livez, port: guardian}, periodSeconds: 2}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
@@ -276,15 +594,185 @@ spec:
             limits: {cpu: "1", memory: 256Mi}
           volumeMounts:
             - {name: state, mountPath: /var/lib/updated}
-            - {name: roots, mountPath: /etc/updated, readOnly: true}
             - {name: tmp, mountPath: /tmp}
+            - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
+            - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/sampleapp, subPath: sampleapp, readOnly: true}
+            - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/magnolia-like, subPath: magnolia-like, readOnly: true}
       volumes:
         - {name: state, emptyDir: {}}
-        - {name: roots, configMap: {name: agent-roots}}
         - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 64Mi}}
+        # cert-manager issues the agents' shared client identity (fleet membership) here.
+        - {name: agent-tls, secret: {secretName: agent-tls}}
+        - name: poison-preinstalled-apps
+          configMap: {name: poison-preinstalled-apps, defaultMode: 365}
 YAML
 echo "waiting for all five real agent towers to reach their assigned versions"
 kubectl -n updated-system rollout status statefulset/agent --timeout=240s
+agent_resource_name() {
+  nonce=$(printf 'agent-%s' "$1" | shasum -a 256 | awk '{print $1}')
+  registration=$(printf %s "$nonce" | shasum -a 256 | awk '{print $1}')
+  printf 'agent-%s\n' "${registration%${registration#????????????????????????}}"
+}
+for ordinal in 0 1 2 3 4; do
+  resource="$(agent_resource_name "$ordinal")"
+  identity="$(kubectl -n updated-system get updateagent "$resource" -o jsonpath='{.spec.identity.kind}')"
+  [[ "$identity" == enrolled ]] || {
+    echo "FAIL: agent-$ordinal registered with identity '$identity', expected enrolled" >&2
+    exit 1
+  }
+  kubectl -n updated-system exec "agent-$ordinal" -c agent -- \
+    grep -q '"routingBaseUrl":"https://updatec-gateway/"' \
+      /var/lib/updated/guardian/enrollment.json || {
+    echo "FAIL: agent-$ordinal did not persist the reachable in-cluster routing URL" >&2
+    exit 1
+  }
+  log="$(kubectl -n updated-system logs "agent-$ordinal" -c agent)"
+  [[ "$log" == *"cold-installed application 1.0.0 from the first trusted assignment"* ]] || {
+    echo "FAIL: agent-$ordinal did not cold-install through online enrollment" >&2
+    echo "$log" >&2
+    exit 1
+  }
+  [[ "$log" != *"FAIL: agent used the image-baked"* ]] || {
+    echo "FAIL: agent-$ordinal executed a masked image-baked application" >&2
+    exit 1
+  }
+done
+echo "all five empty agents enrolled online and cold-installed the network assignment"
+
+# --- Join-mode fleet (second StatefulSet) -----------------------------------------------------
+# A second StatefulSet whose nodes hold NO client certificate. They authenticate their join with
+# the controller-minted group token at the gateway's server-TLS-only /join port, generate a keypair
+# locally, and get a CSR signed into a client cert. That identity and the install state live on a
+# small PVC, because unlike mount mode the key exists nowhere else — an emptyDir would lose it on a
+# restart and force a fresh identity + cold reinstall. See docs/group-enrollment-design.md.
+echo "waiting for the controller to mint the join group's token"
+JOIN_GROUP_ID=""
+for attempt in {1..60}; do
+  JOIN_GROUP_ID="$(kubectl -n updated-system get updategroup join -o jsonpath='{.status.groupId}' 2>/dev/null || true)"
+  # The token Secret is named after the group id (join-<group_id>), so the gateway resolves it with
+  # a single keyed GET rather than listing every UpdateGroup on each /join.
+  if [[ -n "$JOIN_GROUP_ID" ]] && kubectl -n updated-system get secret "join-$JOIN_GROUP_ID" >/dev/null 2>&1; then break; fi
+  sleep 2
+done
+[[ -n "$JOIN_GROUP_ID" ]] || { echo "FAIL: join group id/token was never minted" >&2; kubectl -n updated-system get updategroup join -o yaml >&2 || true; exit 1; }
+# Verify the token key is present without decoding it into a shell var — the pod reads it straight
+# from the Secret via secretKeyRef (below), so the plaintext nonce never lands in the pod spec/etcd.
+kubectl -n updated-system get secret "join-$JOIN_GROUP_ID" -o jsonpath='{.data.nonce}' | grep -q . || { echo "FAIL: join token secret join-$JOIN_GROUP_ID carries no nonce" >&2; exit 1; }
+cat <<YAML | kubectl apply -f -
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: agent-join, namespace: updated-system}
+spec:
+  serviceName: agents
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector: {matchLabels: {app: updated-agent, demo.updated.dev/enroll: join}}
+  template:
+    metadata: {labels: {app: updated-agent, demo.updated.dev/enroll: join}}
+    spec:
+      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: agent
+          image: updatec-e2e:kind
+          imagePullPolicy: IfNotPresent
+          command: [/usr/local/bin/run-agent-join]
+          env:
+            # group_id is a non-secret UID; the nonce is the shared secret, so it is read from the
+            # Secret at runtime (secretKeyRef) rather than embedded as a plaintext env value.
+            - {name: JOIN_GROUP_ID, value: "$JOIN_GROUP_ID"}
+            - name: JOIN_NONCE
+              valueFrom: {secretKeyRef: {name: join-$JOIN_GROUP_ID, key: nonce}}
+          ports: [{name: http, containerPort: 8080}, {name: guardian, containerPort: 9090}]
+          startupProbe: {httpGet: {path: /startupz, port: guardian}, periodSeconds: 1, failureThreshold: 120}
+          readinessProbe: {httpGet: {path: /readyz, port: guardian}, periodSeconds: 1}
+          livenessProbe: {httpGet: {path: /livez, port: guardian}, periodSeconds: 2}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/updated}
+            - {name: tmp, mountPath: /tmp}
+            # A join node needs ONLY the fleet CA (to trust the join server + gateway) — never the
+            # shared client cert/key. Projecting just ca.crt withholds the mount-mode identity that
+            # join mode is designed not to have.
+            - {name: fleet-ca, mountPath: /etc/agent-tls, readOnly: true}
+            - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/sampleapp, subPath: sampleapp, readOnly: true}
+      volumes:
+        - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 64Mi}}
+        # Project ONLY ca.crt from the agent-tls Secret — tls.crt/tls.key (the shared client
+        # identity) are deliberately not mounted into join pods.
+        - {name: fleet-ca, secret: {secretName: agent-tls, items: [{key: ca.crt, path: ca.crt}]}}
+        - name: poison-preinstalled-apps
+          configMap: {name: poison-preinstalled-apps, defaultMode: 365}
+  # Join mode REQUIRES persistent storage: the minted key/cert and the install state live only here.
+  # Sized to hold the installed app plus retained inactive releases (the runtime keeps 2), so it must
+  # match the fleet's install footprint, not just the tiny config/state-machine — 16Mi would ENOSPC
+  # on the first upgrade on a real CSI backend (kind's local-path ignores the request, masking it).
+  volumeClaimTemplates:
+    - metadata: {name: state}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
+YAML
+kubectl -n updated-system rollout status statefulset/agent-join --timeout=300s
+# The join enrolled name mirrors agent.sh's derivation: instance = sha256(hostname), agent name =
+# agent-<first 24 hex of sha256(instance)>.
+join_resource_name() {
+  instance=$(printf %s "$1" | shasum -a 256 | awk '{print $1}')
+  registration=$(printf %s "$instance" | shasum -a 256 | awk '{print $1}')
+  printf 'agent-%s\n' "${registration%${registration#????????????????????????}}"
+}
+for pod in agent-join-0 agent-join-1; do
+  resource="$(join_resource_name "$pod")"
+  group=""
+  for attempt in {1..60}; do
+    group="$(kubectl -n updated-system get updateagent "$resource" -o jsonpath='{.status.selectedGroup}' 2>/dev/null || true)"
+    [[ "$group" == join ]] && break
+    sleep 2
+  done
+  [[ "$group" == join ]] || { echo "FAIL: $pod ($resource) did not join group 'join' (selectedGroup='$group')" >&2; kubectl -n updated-system get updateagent "$resource" -o yaml >&2 || true; exit 1; }
+  # The gateway signed its CSR (identity Enrolled) and it cold-installed the app over the same path.
+  identity="$(kubectl -n updated-system get updateagent "$resource" -o jsonpath='{.spec.identity.kind}')"
+  [[ "$identity" == enrolled ]] || { echo "FAIL: $pod registered with identity '$identity', expected enrolled" >&2; exit 1; }
+  log="$(kubectl -n updated-system logs "$pod" -c agent)"
+  [[ "$log" == *"cold-installed application"* ]] || { echo "FAIL: $pod did not install the app after joining" >&2; echo "$log" >&2; exit 1; }
+  [[ "$log" != *"FAIL: agent used the image-baked"* ]] || { echo "FAIL: $pod executed a masked image-baked application" >&2; exit 1; }
+done
+echo "join-mode nodes authenticated with the group token, minted client certificates, and cold-installed the app"
+
+# Restart = upgrade, not reinstall. The identity name alone proves nothing here: instance =
+# sha256(hostname) is deterministic, so a node that LOST its PVC would re-derive the identical
+# UpdateAgent name, re-join, and cold-install from scratch — and a name-exists check would still
+# pass. The real proof the PVC persisted install state is that the restarted container reuses the
+# committed release instead of cold-installing again, i.e. its fresh log has NO "cold-installed".
+restart_resource="$(join_resource_name agent-join-0)"
+kubectl -n updated-system delete pod agent-join-0 --wait=true
+kubectl -n updated-system rollout status statefulset/agent-join --timeout=300s
+kubectl -n updated-system get updateagent "$restart_resource" >/dev/null 2>&1 || {
+  echo "FAIL: join node lost its identity across a restart (resource $restart_resource gone)" >&2
+  exit 1
+}
+restart_log="$(kubectl -n updated-system logs agent-join-0 -c agent)"
+[[ "$restart_log" != *"cold-installed application"* ]] || {
+  echo "FAIL: join node re-cold-installed after restart — install state did not persist (PVC not reused)" >&2
+  echo "$restart_log" >&2
+  exit 1
+}
+echo "join node reused its persisted identity AND install state across a restart (upgrade, not reinstall)"
+for ordinal in 0 1; do
+  kubectl -n updated-system patch updateagent "$(agent_resource_name "$ordinal")" --type merge \
+    -p '{"spec":{"labels":{"updated.dev/role":"edge"}}}'
+done
+for ordinal in 2 3; do
+  kubectl -n updated-system patch updateagent "$(agent_resource_name "$ordinal")" --type merge \
+    -p '{"spec":{"labels":{"updated.dev/role":"batch"}}}'
+done
+echo "dynamic enrollments registered; waiting for group assignments"
+sleep 5
 cat <<'YAML' | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
@@ -326,6 +814,36 @@ YAML
 kubectl -n updated-system wait --for=condition=complete job/verify-agent-versions --timeout=150s
 kubectl -n updated-system logs job/verify-agent-versions
 
+# A real application crash is not a planned drain. The guardian marks the tower
+# failed, exits with the application, and lets Kubernetes restart the container.
+# The pod and its emptyDir survive that container restart, so the new guardian must
+# verify and relaunch the same committed bundle before readiness returns.
+restart_before="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+kubectl -n updated-system exec agent-4 -c agent -- \
+  sh -c 'curl -fsS http://127.0.0.1:8080/crash >/dev/null || true' || true
+restarted=false
+for attempt in $(seq 1 60); do
+  restart_after="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+  if [ "$restart_after" -gt "$restart_before" ]; then
+    restarted=true
+    break
+  fi
+  sleep 1
+done
+[[ "$restarted" == true ]] || {
+  echo "FAIL: Kubernetes did not restart agent-4 after its managed application crashed" >&2
+  kubectl -n updated-system logs agent-4 -c agent --previous >&2 || true
+  exit 1
+}
+kubectl -n updated-system wait --for=condition=ready pod/agent-4 --timeout=120s
+recovered_version="$(kubectl -n updated-system exec agent-4 -c agent -- curl -fsS http://127.0.0.1:8080/version)"
+[[ "$recovered_version" == 1.0.0 ]] || {
+  echo "FAIL: agent-4 recovered as '$recovered_version', expected committed 1.0.0" >&2
+  exit 1
+}
+echo "managed application crash failed the guardian tower; Kubernetes restarted it and readiness recovered"
+
+if (( FUZZ_ROUNDS > 0 )); then
 cat <<'YAML' | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -376,7 +894,6 @@ data:
     echo "fleet converged exactly"
 YAML
 
-FUZZ_ROUNDS=${UPDATEC_FUZZ_ROUNDS:-5}
 OBSERVER_ITERATIONS=$((FUZZ_ROUNDS * 45))
 cat <<YAML | kubectl apply -f -
 apiVersion: batch/v1
@@ -432,9 +949,15 @@ replace_group_deployment() {
   local name="$1"
   local version="$2"
   local sha="$3"
-  kubectl -n updated-system create configmap "deployment-$name" --dry-run=client -o yaml \
-    --from-literal=deployment.json="$(deployment "$name-fuzz-$version" "$name" "$version" "$sha")" | \
-    kubectl apply -f - >/dev/null
+  local deployment
+  deployment="{\"name\":\"$name-fuzz-$version\",\"releaseRepository\":{\"metadataUrl\":\"https://release-$name/metadata/\",\"targetsUrl\":\"https://release-$name/targets/\"},\"application\":{\"path\":\"products/app/stable/$version/$PLATFORM/app\",\"sha256\":\"$sha\"},\"providerSet\":{\"path\":\"provider-sets/default.json\",\"sha256\":\"$PROVIDER_SHA\"}}"
+  if [ "$name" = default ]; then
+    kubectl -n updated-system patch updaterepository default --type=merge \
+      -p "{\"spec\":{\"defaultDeployment\":$deployment}}" >/dev/null
+  else
+    kubectl -n updated-system patch updategroup "$name" --type=merge \
+      -p "{\"spec\":{\"deployment\":$deployment}}" >/dev/null
+  fi
 }
 
 fuzz_state=${UPDATEC_FUZZ_SEED:-20260718}
@@ -473,7 +996,8 @@ for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
     else
       patch="[{\"op\":\"replace\",\"path\":\"/spec/labels\",\"value\":{\"updated.dev/role\":\"$selected_role\"}}]"
     fi
-    kubectl -n updated-system patch updatednode "agent-$index" --type=json -p "$patch" >/dev/null
+    resource="$(agent_resource_name "$index")"
+    kubectl -n updated-system patch updateagent "$resource" --type=json -p "$patch" >/dev/null
     echo "fuzz generation $round plan: agent-$index -> $selected_role -> $selected_version"
   done
 
@@ -482,7 +1006,8 @@ for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
   # instead of misreporting a correctly converged agent as broken.
   expected=""
   for index in 0 1 2 3 4; do
-    applied_role="$(kubectl -n updated-system get updatednode "agent-$index" \
+    resource="$(agent_resource_name "$index")"
+    applied_role="$(kubectl -n updated-system get updateagent "$resource" \
       -o jsonpath='{.spec.labels.updated\.dev/role}')"
     case "$applied_role" in
       edge) applied_version="$edge_version" ;;
@@ -498,7 +1023,7 @@ for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
       exit 1
     fi
     echo "fuzz generation $round applied: agent-$index -> $applied_role -> $applied_version"
-    expected="$expected agent-$index=$applied_version,$(publish_fuzz_artifact "$applied_version")"
+    expected="$expected agent-$index=$(publish_fuzz_expectation "$applied_version")"
   done
 
   fuzz_state=$(((fuzz_state * 1103515245 + 12345) & 2147483647))
@@ -543,10 +1068,17 @@ done
 sleep 8
 verify_fleet verify-fuzz-rollback "$expected"
 for index in 0 1 2 3 4; do
-  kubectl -n updated-system logs "agent-$index" | grep -q 'rejected 18.0.0' || {
+  # Do not pipe `kubectl logs` into `grep -q` under pipefail. Once grep finds
+  # the line it closes the pipe; a sufficiently large log then gives kubectl
+  # SIGPIPE and turns a successful assertion into a false failure. Capture both
+  # restart generations because rejection recovery may itself roll the tower.
+  if ! kubectl_log_contains "agent-$index" \
+      'recovery: rejected 18.0.0 after failed activation' -c agent \
+    && ! kubectl_log_contains "agent-$index" \
+      'recovery: rejected 18.0.0 after failed activation' -c agent --previous; then
     echo "FAIL: agent-$index did not record rejection of corrupt 18.0.0" >&2
     exit 1
-  }
+  fi
 done
 echo "all agents rejected 18.0.0 and retained their exact predecessors"
 
@@ -566,6 +1098,9 @@ echo "fleet recovered through sampleapp 19.0.0 -> Magnolia-shaped 20.0.0"
 echo "fleet observer transitions during chaos:"
 kubectl -n updated-system logs -l job-name=observe-fleet-chaos --prefix --all-containers=true
 kubectl -n updated-system delete job observe-fleet-chaos --wait=true >/dev/null
+else
+  echo "fleet fuzz skipped (--fuzz-rounds 0)"
+fi
 cat <<'YAML' | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
@@ -579,16 +1114,15 @@ spec:
         - name: digest
           image: updatec-e2e:kind
           command: [/bin/sh, -ec]
-          args: ['curl -fsS http://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
+          args: ['curl -fsS --cert /etc/agent-tls/tls.crt --key /etc/agent-tls/tls.key --cacert /etc/agent-tls/ca.crt https://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
+          volumeMounts: [{name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}]
+      volumes: [{name: agent-tls, secret: {secretName: agent-tls}}]
 YAML
 kubectl -n updated-system wait --for=condition=complete job/routing-digest-before-overlap --timeout=60s
 before="$(kubectl -n updated-system logs job/routing-digest-before-overlap)"
-cat <<'YAML' | kubectl apply -f -
-apiVersion: updated.dev/v1alpha1
-kind: UpdatedGroup
-metadata: {name: overlapping-edge, namespace: updated-system}
-spec: {match_labels: {updated.dev/role: edge}, deployment_config_map: deployment-default}
-YAML
+cargo run -q -p updatec --example kind_resources -- \
+  "$PLATFORM" "$APP_V1_SHA" "$APP_V2_SHA" "$APP_V3_SHA" "$PROVIDER_SHA" \
+  "$WORK/release-root.json" overlap | kubectl apply -f -
 sleep 8
 cat <<'YAML' | kubectl apply -f -
 apiVersion: batch/v1
@@ -603,7 +1137,9 @@ spec:
         - name: digest
           image: updatec-e2e:kind
           command: [/bin/sh, -ec]
-          args: ['curl -fsS http://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
+          args: ['curl -fsS --cert /etc/agent-tls/tls.crt --key /etc/agent-tls/tls.key --cacert /etc/agent-tls/ca.crt https://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
+          volumeMounts: [{name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}]
+      volumes: [{name: agent-tls, secret: {secretName: agent-tls}}]
 YAML
 kubectl -n updated-system wait --for=condition=complete job/routing-digest-after-overlap --timeout=60s
 after="$(kubectl -n updated-system logs job/routing-digest-after-overlap)"

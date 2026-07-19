@@ -1,0 +1,15 @@
+[Unit]
+# DEMO ONLY. Forwards the in-cluster gateway (exposed on the laptop's LAN by
+# `kubectl port-forward --address 0.0.0.0`) to local port 80, so the agent — pointed at the
+# in-cluster hostnames via /etc/hosts — reaches it with the identical config the pods use.
+Description=updated demo gateway shim
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:80,fork,reuseaddr TCP:{{ updated_demo_shim_host }}:{{ updated_demo_shim_port }}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

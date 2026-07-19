@@ -86,6 +86,18 @@ impl Guardian {
         self.expect_ok(&Request::Stop, "STOP")
     }
 
+    /// Publish the application traffic state exposed by the guardian's stable probe
+    /// endpoint. False is sent before drain; true only after health verification.
+    pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), String> {
+        self.require(control::CAP_TRAFFIC_STATE, "TRAFFIC_STATE")?;
+        self.expect_ok(&Request::TrafficReady(ready), "TRAFFIC_STATE")
+    }
+
+    pub(crate) fn application_failed(&mut self) -> Result<(), String> {
+        self.require(control::CAP_FAIL_APPLICATION, "FAIL_APPLICATION")?;
+        self.expect_ok(&Request::ApplicationFailed, "FAIL_APPLICATION")
+    }
+
     /// Hand off to a staged replacement supervisor at `path`; the guardian relaunches
     /// from it under a readiness gate after this supervisor exits.
     pub(crate) fn replace_supervisor(&mut self, path: &Path) -> Result<(), String> {
@@ -127,10 +139,10 @@ pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// Read and clear the guardian's crash marker: `true` if the last application exit was a
-/// crash (so an unconfirmed update should revert to its predecessor).
-pub(crate) fn take_crash_marker(state_dir: &Path) -> std::io::Result<bool> {
-    let path = state_dir.join(control::CRASH_MARKER_FILE);
+/// Read and clear the guardian's service-exit marker. Any spontaneous exit, including
+/// zero, invalidates an unconfirmed service release and requires boot reconciliation.
+pub(crate) fn take_service_exit_marker(state_dir: &Path) -> std::io::Result<bool> {
+    let path = state_dir.join(control::SERVICE_EXITED_MARKER_FILE);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             foundation::durable::remove_file(&path)?;
@@ -138,7 +150,10 @@ pub(crate) fn take_crash_marker(state_dir: &Path) -> std::io::Result<bool> {
         }
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("crash marker {} is not a regular file", path.display()),
+            format!(
+                "service-exit marker {} is not a regular file",
+                path.display()
+            ),
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
@@ -287,18 +302,18 @@ mod marker_tests {
     }
 
     #[test]
-    fn crash_marker_is_consumed_once() {
-        let state = dir("crash");
-        std::fs::write(state.join(control::CRASH_MARKER_FILE), b"crashed\n").unwrap();
-        assert!(take_crash_marker(&state).unwrap());
-        assert!(!take_crash_marker(&state).unwrap());
+    fn service_exit_marker_is_consumed_once() {
+        let state = dir("service-exit");
+        std::fs::write(state.join(control::SERVICE_EXITED_MARKER_FILE), b"exited\n").unwrap();
+        assert!(take_service_exit_marker(&state).unwrap());
+        assert!(!take_service_exit_marker(&state).unwrap());
     }
 
     #[test]
     fn malformed_markers_fail_closed() {
         let state = dir("malformed");
-        std::fs::create_dir(state.join(control::CRASH_MARKER_FILE)).unwrap();
-        assert!(take_crash_marker(&state).is_err());
+        std::fs::create_dir(state.join(control::SERVICE_EXITED_MARKER_FILE)).unwrap();
+        assert!(take_service_exit_marker(&state).is_err());
         std::fs::write(state.join(control::REJECTED_SUPERVISOR_FILE), b"one\ntwo\n").unwrap();
         assert!(take_rejected_supervisor(&state).is_err());
     }

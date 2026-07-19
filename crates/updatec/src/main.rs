@@ -3,9 +3,7 @@
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .map_err(|_| "installing rustls crypto provider failed")?;
+    updated::tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -18,8 +16,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = kube::Client::try_default().await?;
     let namespace = std::env::var("UPDATED_NAMESPACE").unwrap_or_else(|_| "updated-system".into());
     let repository = std::env::var("UPDATED_REPOSITORY").unwrap_or_else(|_| "default".into());
+    let public_url =
+        std::env::var("UPDATED_PUBLIC_URL").map_err(|_| "UPDATED_PUBLIC_URL is required")?;
     if mode == "serve" {
         let addr = std::env::var("UPDATED_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
+        let health_addr =
+            std::env::var("UPDATED_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:8081".into());
+        let join_addr =
+            std::env::var("UPDATED_JOIN_LISTEN").unwrap_or_else(|_| "0.0.0.0:8443".into());
         let (destination, store) = loop {
             match updatec::runtime::repository_store(client.clone(), &namespace, &repository).await
             {
@@ -30,9 +34,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         };
-        return updatec::gateway::serve(&addr, store, destination.prefix)
-            .await
-            .map_err(Into::into);
+        let enrollment = updatec::gateway::EnrollmentContext {
+            client: client.clone(),
+            namespace: namespace.clone(),
+            repository: repository.clone(),
+            public_url,
+        };
+        // The gateway's mTLS material is a cert-manager-issued secret mounted as files. The
+        // standard cert-manager keys are tls.crt / tls.key / ca.crt.
+        let tls_dir =
+            std::env::var("UPDATED_GATEWAY_TLS_DIR").unwrap_or_else(|_| "/etc/gateway-tls".into());
+        let tls = updatec::gateway::GatewayTls {
+            cert: std::path::Path::new(&tls_dir).join("tls.crt"),
+            key: std::path::Path::new(&tls_dir).join("tls.key"),
+            client_ca: std::path::Path::new(&tls_dir).join("ca.crt"),
+        };
+        // The join endpoint signs node CSRs with the fleet CA — the same cert-manager CA the gateway
+        // trusts as its client CA, mounted here with its private key so leaves it mints are accepted
+        // on the mTLS listener. Standard cert-manager keys are tls.crt / tls.key.
+        let ca_dir =
+            std::env::var("UPDATED_ISSUING_CA_DIR").unwrap_or_else(|_| "/etc/issuing-ca".into());
+        let ca_cert = std::fs::read_to_string(std::path::Path::new(&ca_dir).join("tls.crt"))
+            .map_err(|error| format!("reading issuing CA certificate: {error}"))?;
+        let ca_key = std::fs::read_to_string(std::path::Path::new(&ca_dir).join("tls.key"))
+            .map_err(|error| format!("reading issuing CA key: {error}"))?;
+        let join = updatec::gateway::JoinContext {
+            enrollment: enrollment.clone(),
+            ca: std::sync::Arc::new(updatec::join::IssuingCa::load(&ca_cert, &ca_key)?),
+        };
+        return updatec::gateway::serve(
+            updatec::gateway::GatewayAddresses {
+                data: addr,
+                health: health_addr,
+                join: join_addr,
+            },
+            store,
+            destination.prefix,
+            enrollment,
+            join,
+            tls,
+        )
+        .await
+        .map_err(Into::into);
     }
     let state = std::env::var("UPDATED_STATE_DIR").unwrap_or_else(|_| "/var/lib/updatec".into());
     let identity =
@@ -62,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &namespace,
             &repository,
             std::path::Path::new(&state),
+            &public_url,
         );
         tokio::pin!(reconciliation);
         loop {
@@ -69,7 +113,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 result = &mut reconciliation => {
                     match result {
                         Ok(digest) => tracing::info!(%digest, "desired state reconciled"),
-                        Err(error) => tracing::error!(%error, "reconciliation failed; last publication remains active"),
+                        Err(error) => {
+                            tracing::error!(%error, "reconciliation failed; last publication remains active");
+                            if let Err(status_error) = updatec::runtime::record_repository_failure(
+                                client.clone(), &namespace, &repository, &error.to_string(),
+                            ).await {
+                                tracing::error!(%status_error, "recording repository failure status failed");
+                            }
+                        }
                     }
                     break;
                 }
@@ -90,6 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // Poll for desired-state changes once per second so a freshly patched
+        // rollout is republished promptly and the fleet starts converging fast.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }

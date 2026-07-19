@@ -50,13 +50,15 @@
     <string>--state-dir</string>
     <string>/usr/local/var/selfupdate</string>
     <string>--supervisor-config</string>
-    <string>/etc/selfupdate/config.toml</string>
+    <string>/etc/selfupdate/bootstrap.toml</string>
     <string>--supervisor</string>
     <string>/etc/selfupdate/supervisor</string>
     <string>--ready-timeout</string>
     <string>60</string>
     <string>--confirm-timeout</string>
     <string>30</string>
+    <string>--probe-address</string>
+    <string>127.0.0.1:9090</string>
   </array>
 
   <key>RunAtLoad</key>

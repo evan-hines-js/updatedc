@@ -33,11 +33,18 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
         // "repair" the pointer back to the failed candidate.
         let pending = state.pending.as_ref().expect("checked above");
         plan.release = ReleaseFix::Activate(pending.previous_release.clone());
-        plan.commit = Some(InstalledState::confirmed(
-            pending.previous_repository_lineage.clone(),
-            pending.previous_release.clone(),
-            pending.previous_archive_sha256.clone(),
-        ));
+        // Carry the predecessor's providers (the operator set `pending` holds for exactly this
+        // rollback) onto the restored record — otherwise the reverted release runs with no
+        // process crash-watch, no provider health, and no pre-start hook until the next update.
+        plan.commit = Some(
+            InstalledState::confirmed(
+                pending.previous_repository_lineage.clone(),
+                pending.previous_release.clone(),
+                pending.previous_archive_sha256.clone(),
+            )
+            .with_lifecycle(pending.lifecycle.clone())
+            .with_healthcheck(pending.healthcheck.clone())
+        );
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
             "recovery: completing rollback from {} to {}",
@@ -58,6 +65,15 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
         }
     }
 
+    // A boot that (re)installed this cycle changed the active bytes. Any process the guardian kept
+    // alive is the *previous* release — e.g. a wedged head the cold-install descent just stepped
+    // past — so it must be stopped and the freshly-installed bytes launched. Adopting it would
+    // health-gate the stale process and then reject the release we just installed as if it were the
+    // one that failed, stranding a node on an exhausted descent even though a healthy release was
+    // available. (A crashed head leaves no running process, so this only bites the wedge path.)
+    if s.first_install && s.app_running.is_some() {
+        plan.quiesce = true;
+    }
     plan.acquire = match s.app_running {
         Some(pid) if !plan.quiesce => Acquire::Adopt(pid),
         _ => Acquire::Launch,
@@ -95,9 +111,12 @@ fn reconcile_transaction(
             tx.candidate_release.version
         )),
         Recovery::RestorePredecessor => {
-            plan.quiesce = situation.app_running.is_some();
+            // A reload deployment keeps its process across a failed candidate reload, so adopt the
+            // running predecessor rather than stop-starting it (no downtime). A restart deployment
+            // stops the uncommitted candidate and relaunches the predecessor.
+            plan.quiesce = !situation.reloads_in_place && situation.app_running.is_some();
             plan.release = ReleaseFix::Activate(tx.previous_release.clone());
-            if situation.app_crashed && !tx.candidate_rejection_required {
+            if situation.service_exited && !tx.candidate_rejection_required {
                 plan.reject_app.push((
                     tx.candidate_repository_lineage.clone(),
                     tx.candidate_archive_sha256.clone(),
@@ -114,11 +133,18 @@ fn reconcile_transaction(
         }
     }
     if tx.is_rollback() {
-        plan.commit = Some(InstalledState::confirmed(
-            tx.previous_repository_lineage.clone(),
-            tx.previous_release.clone(),
-            tx.previous_archive_sha256.clone(),
-        ));
+        // Restore the predecessor *with* the operator providers the transaction staged, so a
+        // crash-recovered rollback health-gates and crash-watches the predecessor identically to
+        // an in-process one rather than committing a provider-less record.
+        plan.commit = Some(
+            InstalledState::confirmed(
+                tx.previous_repository_lineage.clone(),
+                tx.previous_release.clone(),
+                tx.previous_archive_sha256.clone(),
+            )
+            .with_lifecycle(tx.lifecycle.clone())
+            .with_healthcheck(tx.healthcheck.clone())
+        );
         plan.current = Some(tx.previous_release.version.clone());
     }
     recovery
@@ -145,29 +171,42 @@ fn confirm_or_revert(
     installed: &InstalledState,
     pending: &Pending,
 ) {
-    if situation.app_crashed {
-        plan.quiesce = situation.app_running.is_some();
+    if situation.service_exited {
+        // Reload deployments adopt the still-running predecessor; restart deployments stop-start it.
+        plan.quiesce = !situation.reloads_in_place && situation.app_running.is_some();
         plan.release = ReleaseFix::Activate(pending.previous_release.clone());
         plan.reject_app.push((
             installed.repository_lineage.clone(),
             installed.archive_sha256.clone(),
         ));
-        plan.commit = Some(InstalledState::confirmed(
-            pending.previous_repository_lineage.clone(),
-            pending.previous_release.clone(),
-            pending.previous_archive_sha256.clone(),
-        ));
+        // Revert to the predecessor carrying its providers (held in `pending`) so the restored
+        // release keeps its crash-watch, provider health, and pre-start hook — see the confirm
+        // branch below, which carries the same three for the forward case.
+        plan.commit = Some(
+            InstalledState::confirmed(
+                pending.previous_repository_lineage.clone(),
+                pending.previous_release.clone(),
+                pending.previous_archive_sha256.clone(),
+            )
+            .with_lifecycle(pending.lifecycle.clone())
+            .with_healthcheck(pending.healthcheck.clone())
+        );
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
-            "release {} crashed within its confirmation window; reverting to {}",
+            "release {} exited within its confirmation window; reverting to {}",
             installed.release.version, pending.previous_release.version
         ));
     } else if window_passed(pending, situation.confirm_window, situation.now) {
-        plan.commit = Some(InstalledState::confirmed(
-            installed.repository_lineage.clone(),
-            installed.release.clone(),
-            installed.archive_sha256.clone(),
-        ));
+        // Confirming the current install: carry its providers forward unchanged.
+        plan.commit = Some(
+            InstalledState::confirmed(
+                installed.repository_lineage.clone(),
+                installed.release.clone(),
+                installed.archive_sha256.clone(),
+            )
+            .with_lifecycle(installed.lifecycle.clone())
+            .with_healthcheck(installed.healthcheck.clone())
+        );
         plan.info(format!("release {} confirmed", installed.release.version));
     }
 }
@@ -192,19 +231,54 @@ mod tests {
     fn steady() -> Situation {
         let current = release("1.0.0", "one");
         Situation {
-            installed: Installed::Present(InstalledState::confirmed(
+            installed: Installed::Present(Box::new(InstalledState::confirmed(
                 lineage(),
                 current.clone(),
                 "archive-one".into(),
-            )),
+            ))),
             active: Some(current),
             journal: None,
-            app_crashed: false,
+            service_exited: false,
             app_running: None,
+            reloads_in_place: false,
+            first_install: false,
             bad_supervisor: None,
             confirm_window: Duration::from_secs(60),
             now: 100,
         }
+    }
+
+    #[test]
+    fn a_reinstall_launches_fresh_and_stops_a_kept_alive_stale_process() {
+        // The cold-install descent re-installs a lower release while the guardian is still holding
+        // the wedged head it stepped past. The planner must stop that stale process and launch the
+        // freshly-installed bytes — never adopt it (which would health-gate the wrong version and
+        // reject the release just installed).
+        let mut situation = steady();
+        situation.first_install = true;
+        situation.app_running = Some(4321);
+
+        let plan = plan_boot(&situation);
+
+        assert!(plan.quiesce, "a re-install with a kept-alive process must stop it");
+        assert_eq!(
+            plan.acquire,
+            Acquire::Launch,
+            "a re-install must launch the freshly-installed bytes, not adopt the stale process"
+        );
+    }
+
+    #[test]
+    fn a_plain_restart_still_adopts_the_running_process() {
+        // Guard the fix's scope: an ordinary supervisor restart (no re-install this boot) must
+        // still adopt the app the guardian legitimately keeps running.
+        let mut situation = steady();
+        situation.app_running = Some(4321);
+
+        let plan = plan_boot(&situation);
+
+        assert!(!plan.quiesce);
+        assert_eq!(plan.acquire, Acquire::Adopt(4321));
     }
 
     #[test]
@@ -219,7 +293,7 @@ mod tests {
         let mut situation = steady();
         let candidate = release("2.0.0", "two");
         situation.active = Some(candidate.clone());
-        situation.app_crashed = true;
+        situation.service_exited = true;
         situation.journal = Some(Transaction {
             id: "attempt".into(),
             kind: updated::transaction::Kind::Supervised,
@@ -231,6 +305,7 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: None,
+            healthcheck: None,
             phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
@@ -258,6 +333,7 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: None,
+            healthcheck: None,
             phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
@@ -270,13 +346,16 @@ mod tests {
         let candidate = release("2.0.0", "two");
         let mut situation = steady();
         situation.active = Some(predecessor.clone());
-        situation.installed = Installed::Present(InstalledState {
+        situation.installed = Installed::Present(Box::new(InstalledState {
             repository_lineage: lineage(),
             release: candidate.clone(),
             archive_sha256: "archive-two".into(),
+            lifecycle: None,
+            healthcheck: None,
             pending: None,
-        });
-        situation.app_crashed = false;
+            confirmed: true,
+        }));
+        situation.service_exited = false;
         situation.journal = Some(Transaction {
             id: "attempt".into(),
             kind: updated::transaction::Kind::Supervised,
@@ -288,6 +367,7 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: None,
+            healthcheck: None,
             phase: TransactionPhase::RollbackStarted,
         });
 
@@ -312,6 +392,7 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: None,
+            healthcheck: None,
             phase: TransactionPhase::PreflightStarted,
         });
 
@@ -328,10 +409,12 @@ mod tests {
         let candidate = release("2.0.0", "two");
         let mut situation = steady();
         situation.active = Some(predecessor.clone());
-        situation.installed = Installed::Present(InstalledState {
+        situation.installed = Installed::Present(Box::new(InstalledState {
             repository_lineage: lineage(),
             release: candidate,
             archive_sha256: "archive-two".into(),
+            lifecycle: None,
+            healthcheck: None,
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
                 previous_release: predecessor.clone(),
@@ -339,8 +422,10 @@ mod tests {
                 previous_repository_lineage: lineage(),
                 committed_at: 100,
                 lifecycle: None,
+                healthcheck: None,
             }),
-        });
+            confirmed: true,
+        }));
 
         let plan = plan_boot(&situation);
 

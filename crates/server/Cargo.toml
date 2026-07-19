@@ -16,3 +16,10 @@ tokio = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true }
 same-file = { workspace = true }
+# Mint the mTLS material (fleet CA, gateway server cert, agent client cert) like TUF keys,
+# and terminate mTLS on the mock CDN listener so it mirrors the gateway's client-cert gate.
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+
+[features]
+fips = ["updated/fips"]

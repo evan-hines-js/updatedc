@@ -17,12 +17,13 @@ use aws_lc_rs::digest::{digest, SHA256};
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Duration};
-use tough::schema::Target;
+use tough::schema::{Role, Root, Signed, Snapshot, Target, Targets, Timestamp};
 use tough::{ExpirationEnforcement, Limits, Repository, RepositoryLoader, TargetName};
 use url::Url;
 
 pub mod policy;
 pub mod repo;
+mod transport;
 pub mod select;
 
 pub use policy::{DefaultPolicy, PolicyError};
@@ -109,19 +110,53 @@ mod error_tests {
 
     #[test]
     fn assigned_repositories_have_independent_stable_datastores() {
+        let runtime = || updated::config::ManagedRuntime {
+            product: "app".into(),
+            channel: "stable".into(),
+            install_root: "/app".into(),
+            args: vec![],
+            health_checks: vec![],
+            repository: updated::config::ManagedRepositoryLimits {
+                metadata_limit: 1,
+                target_limit: 1,
+                transport_timeout_seconds: 1,
+            },
+            storage: updated::config::ManagedStorage {
+                inactive_releases: 1,
+                inactive_providers: 1,
+                inactive_supervisors: 1,
+                inactive_bytes: 1,
+                inactive_repository_caches: 1,
+            },
+            timeouts: updated::config::ManagedTimeouts {
+                check_interval_seconds: 1,
+                health_grace_seconds: 1,
+                health_successes: 1,
+                health_interval_seconds: 1,
+                retry_after_seconds: 1,
+                refresh_retry_seconds: 1,
+                confirmation_window_seconds: 1,
+                supervisor_check_interval_seconds: 1,
+                drain_hold_seconds: Some(0),
+            },
+        };
         let assignment = |metadata: &str, targets: &str| RepositoryAssignment {
             schema: 2,
             deployment: "deployment".into(),
             metadata_url: metadata.into(),
             targets_url: targets.into(),
+            report_url: None,
             application: updated::config::TargetReference {
                 path: "app".into(),
                 sha256: "aa".into(),
             },
+            ordered_install_fallback: false,
             provider_set: updated::config::TargetReference {
                 path: "providers".into(),
                 sha256: "bb".into(),
             },
+            release_root: serde_json::json!({}),
+            runtime: runtime(),
         };
         let a = assignment("https://cdn/a/metadata/", "https://cdn/a/targets/");
         let b = assignment("https://cdn/b/metadata/", "https://cdn/b/targets/");
@@ -137,13 +172,46 @@ mod error_tests {
             deployment: "deploy-1".into(),
             metadata_url: "https://cdn/group/metadata/".into(),
             targets_url: "https://cdn/group/targets/".into(),
+            report_url: None,
             application: updated::config::TargetReference {
                 path: "products/app/stable/1/linux-x86_64/app".into(),
                 sha256: "a".repeat(64),
             },
+            ordered_install_fallback: false,
             provider_set: updated::config::TargetReference {
                 path: "provider-sets/1.json".into(),
                 sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({}),
+            runtime: updated::config::ManagedRuntime {
+                product: "app".into(),
+                channel: "stable".into(),
+                install_root: "/app".into(),
+                args: vec![],
+                health_checks: vec![],
+                repository: updated::config::ManagedRepositoryLimits {
+                    metadata_limit: 1,
+                    target_limit: 1,
+                    transport_timeout_seconds: 1,
+                },
+                storage: updated::config::ManagedStorage {
+                    inactive_releases: 1,
+                    inactive_providers: 1,
+                    inactive_supervisors: 1,
+                    inactive_bytes: 1,
+                    inactive_repository_caches: 1,
+                },
+                timeouts: updated::config::ManagedTimeouts {
+                    check_interval_seconds: 1,
+                    health_grace_seconds: 1,
+                    health_successes: 1,
+                    health_interval_seconds: 1,
+                    retry_after_seconds: 1,
+                    refresh_retry_seconds: 1,
+                    confirmation_window_seconds: 1,
+                    supervisor_check_interval_seconds: 1,
+                    drain_hold_seconds: Some(0),
+                },
             },
         };
         let datastore = assignment_identity(&first);
@@ -156,9 +224,13 @@ mod error_tests {
     #[test]
     fn assigned_endpoints_are_bounded_http_base_urls() {
         assert!(validate_release_url("metadata_url", "https://cdn.example/metadata/").is_ok());
+        assert!(validate_release_url("metadata_url", "file:///opt/update/metadata/").is_ok());
+        assert!(validate_release_url("metadata_url", "/opt/update/metadata/").is_ok());
         for invalid in [
-            "file:///tmp/metadata/",
+            "relative/metadata/",
+            "ftp://cdn.example/metadata/",
             "https://user:pass@cdn.example/metadata/",
+            "https://cdn.example/metadata/?generation=1",
             "https://cdn.example/metadata/#fragment",
             "https://cdn.example/metadata",
         ] {
@@ -191,49 +263,213 @@ pub struct TrustedRepository {
     assignment: Option<updated::config::RepositoryAssignment>,
 }
 
+/// Enroll (or load the one-way preplaced enrollment bundle), verify the current
+/// routing assignment, and materialize the complete managed configuration it signs.
+/// The caller supplies a durable enrollment state directory; no managed install path
+/// is consulted until after the assignment has passed TUF verification.
+pub async fn resolve_managed_config(
+    bootstrap_path: &Path,
+    enrollment_state: &Path,
+) -> Result<updated::config::Config, Error> {
+    let bootstrap = updated::enrollment::BootstrapConfig::load(bootstrap_path)
+        .map_err(|error| Error::Local(format!("loading bootstrap config: {error}")))?;
+    let bundle = updated::enrollment::load_or_enroll_http(&bootstrap, enrollment_state)
+        .await
+        .map_err(|error| Error::Local(format!("loading enrollment bundle: {error}")))?;
+    let routing_root = enrollment_state.join("routing-root.json");
+    foundation::durable::atomic_write(
+        &routing_root,
+        ".routing-root-",
+        bundle.routing_root.as_bytes(),
+    )
+    .map_err(|error| Error::Local(format!("materializing routing root: {error}")))?;
+    // The gateway that serves routing and release metadata is the same externally-exposed listener
+    // the agent enrolled through, so ongoing fetches present the same mTLS identity: the mounted
+    // cert (mount mode) or the certificate the node minted at `/join` (join mode).
+    let mtls = bootstrap
+        .enrollment
+        .steady_identity(enrollment_state)
+        .map_err(|error| Error::Local(format!("resolving steady-state mTLS identity: {error}")))?;
+    let routing = updated::config::Routing {
+        root: routing_root,
+        base_url: bundle.routing_base_url.clone(),
+        assignment: bundle.assignment.clone(),
+        datastore: None,
+        metadata_limit: 1024 * 1024,
+        transport_timeout: std::time::Duration::from_secs(30),
+        mtls,
+    };
+    let assignment = verify_embedded_assignment(&bundle)?;
+    assignment
+        .runtime
+        .materialize(routing, &assignment.release_root, enrollment_state)
+        .map_err(Error::Trust)
+}
+
+/// Verify the complete initial TUF chain carried by an enrollment bundle and return
+/// the exact managed assignment it authenticates. This is the offline installer path:
+/// no network operation is permitted or required.
+fn verify_embedded_assignment(
+    bundle: &updated::enrollment::EnrollmentBundle,
+) -> Result<updated::config::RepositoryAssignment, Error> {
+    let root_bytes = bundle.routing_root.as_bytes();
+    let timestamp_bytes = bundle.initial.timestamp.as_bytes();
+    let snapshot_bytes = bundle.initial.snapshot.as_bytes();
+    let targets_bytes = bundle.initial.targets.as_bytes();
+    let agent_bytes = bundle.initial.agent_document.as_bytes();
+    let config_bytes = bundle.initial.managed_configuration.as_bytes();
+
+    let root: Signed<Root> = parse_embedded(root_bytes, "root")?;
+    let timestamp: Signed<Timestamp> = parse_embedded(timestamp_bytes, "timestamp")?;
+    let snapshot: Signed<Snapshot> = parse_embedded(snapshot_bytes, "snapshot")?;
+    let targets: Signed<Targets> = parse_embedded(targets_bytes, "targets")?;
+    root.signed
+        .verify_role(&root)
+        .map_err(|error| Error::Trust(format!("embedded root signature: {error}")))?;
+    root.signed
+        .verify_role(&timestamp)
+        .map_err(|error| Error::Trust(format!("embedded timestamp signature: {error}")))?;
+    root.signed
+        .verify_role(&snapshot)
+        .map_err(|error| Error::Trust(format!("embedded snapshot signature: {error}")))?;
+    root.signed
+        .verify_role(&targets)
+        .map_err(|error| Error::Trust(format!("embedded targets signature: {error}")))?;
+    let now = jiff::Timestamp::now();
+    for (name, expires) in [
+        ("root", root.signed.expires()),
+        ("timestamp", timestamp.signed.expires()),
+        ("snapshot", snapshot.signed.expires()),
+        ("targets", targets.signed.expires()),
+    ] {
+        if expires <= now {
+            return Err(Error::Trust(format!("embedded {name} metadata is expired")));
+        }
+    }
+    if timestamp.signed.meta.len() != 1 {
+        return Err(Error::Trust(
+            "embedded timestamp must describe exactly snapshot.json".into(),
+        ));
+    }
+    let snapshot_meta = timestamp
+        .signed
+        .meta
+        .get("snapshot.json")
+        .ok_or_else(|| Error::Trust("embedded timestamp omits snapshot.json".into()))?;
+    verify_metafile("snapshot", snapshot_meta, snapshot_bytes)?;
+    if snapshot.signed.version != snapshot_meta.version {
+        return Err(Error::Trust(
+            "embedded snapshot version does not match timestamp".into(),
+        ));
+    }
+    let targets_meta = snapshot
+        .signed
+        .meta
+        .get("targets.json")
+        .ok_or_else(|| Error::Trust("embedded snapshot omits targets.json".into()))?;
+    verify_metafile("targets", targets_meta, targets_bytes)?;
+    if targets.signed.version != targets_meta.version {
+        return Err(Error::Trust(
+            "embedded targets version does not match snapshot".into(),
+        ));
+    }
+    verify_embedded_target(&targets, &bundle.assignment, agent_bytes, "agent document")?;
+    let agent: updated::config::AgentDocument = parse_embedded(agent_bytes, "agent document")?;
+    agent.validate().map_err(Error::Trust)?;
+    verify_embedded_target(
+        &targets,
+        &agent.config.path,
+        config_bytes,
+        "managed configuration",
+    )?;
+    let actual_config = updated::hash::sha256_bytes(config_bytes);
+    if actual_config != agent.config.sha256 {
+        return Err(Error::Trust(
+            "embedded managed configuration digest does not match agent document".into(),
+        ));
+    }
+    let assignment: updated::config::RepositoryAssignment =
+        parse_embedded(config_bytes, "managed configuration")?;
+    assignment.validate().map_err(Error::Trust)?;
+    Ok(assignment)
+}
+
+fn parse_embedded<T: serde::de::DeserializeOwned>(bytes: &[u8], name: &str) -> Result<T, Error> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| Error::Trust(format!("invalid embedded {name}: {error}")))
+}
+
+fn verify_metafile(name: &str, meta: &tough::schema::Metafile, bytes: &[u8]) -> Result<(), Error> {
+    if meta
+        .length
+        .is_some_and(|length| length != bytes.len() as u64)
+    {
+        return Err(Error::Trust(format!("embedded {name} length mismatch")));
+    }
+    if let Some(hashes) = &meta.hashes {
+        let actual = digest(&SHA256, bytes);
+        if hashes.sha256.as_ref() != actual.as_ref() {
+            return Err(Error::Trust(format!("embedded {name} digest mismatch")));
+        }
+    }
+    Ok(())
+}
+
+fn verify_embedded_target(
+    targets: &Signed<Targets>,
+    path: &str,
+    bytes: &[u8],
+    name: &str,
+) -> Result<(), Error> {
+    let target_name = TargetName::new(path)
+        .map_err(|error| Error::Trust(format!("invalid embedded {name} path: {error}")))?;
+    let target = targets
+        .signed
+        .targets
+        .get(&target_name)
+        .ok_or_else(|| Error::Trust(format!("embedded targets omit {name} {path}")))?;
+    if target.length != bytes.len() as u64
+        || target.hashes.sha256.as_ref() != digest(&SHA256, bytes).as_ref()
+    {
+        return Err(Error::Trust(format!(
+            "embedded {name} length or digest mismatch"
+        )));
+    }
+    Ok(())
+}
+
 impl TrustedRepository {
-    /// Resolve the agent's exact, TUF-verified document and then load the
-    /// selected release repository. Repeating this operation is how a running node
-    /// observes control-plane group changes without restart.
-    pub async fn assigned(
+    /// Resolve only the signed routing document. This deliberately does not touch the
+    /// selected release repository: callers can use the verified managed runtime to
+    /// derive its install paths and resource limits first.
+    pub async fn resolve_assignment(
         routing_config: &updated::config::Routing,
-        repository_config: &updated::config::Repository,
-        storage: &updated::config::Storage,
-        paths: &updated::config::Paths,
-    ) -> Result<Self, Error> {
+        routing_datastore: &Path,
+        assignment_staging: &Path,
+    ) -> Result<updated::config::RepositoryAssignment, Error> {
         if !routing_config.base_url.ends_with('/') {
             return Err(Error::Local(
                 "routing.base_url must end with '/' so metadata/ and targets/ are children".into(),
             ));
         }
-        let base = Url::parse(&routing_config.base_url)
-            .map_err(|e| Error::Local(format!("routing.base_url: {e}")))?;
-        if !matches!(base.scheme(), "http" | "https")
-            || base.cannot_be_a_base()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.fragment().is_some()
-        {
-            return Err(Error::Local(
-                "routing.base_url must be an HTTP(S) base URL without credentials or a fragment"
-                    .into(),
-            ));
-        }
+        let base = repository_base("routing.base_url", &routing_config.base_url)
+            .map_err(|error| Error::Local(error.to_string()))?;
         let metadata_url = base
             .join("metadata/")
             .map_err(|e| Error::Local(format!("routing metadata URL: {e}")))?;
         let targets_url = base
             .join("targets/")
             .map_err(|e| Error::Local(format!("routing targets URL: {e}")))?;
-        let routing = updated::config::RepositorySource {
+        let source = updated::config::RepositorySource {
             root: routing_config.root.clone(),
             metadata_url: metadata_url.to_string(),
             targets_url: targets_url.to_string(),
             metadata_limit: routing_config.metadata_limit,
             target_limit: 64 * 1024,
             transport_timeout: routing_config.transport_timeout,
+            mtls: routing_config.mtls.clone(),
         };
-        let routing = Self::load(&routing, &paths.routing_datastore).await?;
+        let routing = Self::load(&source, routing_datastore).await?;
         let target = routing
             .all_targets()
             .into_iter()
@@ -244,25 +480,59 @@ impl TrustedRepository {
                     routing_config.assignment
                 ))
             })?;
-        routing.download_target(&target, &paths.assignment).await?;
-        let bytes = tokio::fs::read(&paths.assignment)
+        routing.download_target(&target, assignment_staging).await?;
+        let bytes = tokio::fs::read(assignment_staging)
             .await
             .map_err(|e| Error::Local(format!("reading verified agent document: {e}")))?;
         let agent: updated::config::AgentDocument = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Trust(format!("invalid agent document: {e}")))?;
         agent.validate().map_err(Error::Trust)?;
         let config = routing.exact_target(&agent.config)?;
-        routing.download_target(&config, &paths.assignment).await?;
-        let bytes = tokio::fs::read(&paths.assignment)
+        routing.download_target(&config, assignment_staging).await?;
+        let bytes = tokio::fs::read(assignment_staging)
             .await
             .map_err(|e| Error::Local(format!("reading verified config bundle: {e}")))?;
         let assignment: updated::config::RepositoryAssignment = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
+        assignment.validate().map_err(Error::Trust)?;
+        Ok(assignment)
+    }
+
+    /// Resolve the agent's exact, TUF-verified document and then load the
+    /// selected release repository. Repeating this operation is how a running node
+    /// observes control-plane group changes without restart.
+    pub async fn assigned(
+        routing_config: &updated::config::Routing,
+        repository_config: &updated::config::Repository,
+        storage: &updated::config::Storage,
+        paths: &updated::config::Paths,
+    ) -> Result<Self, Error> {
+        let assignment =
+            Self::resolve_assignment(routing_config, &paths.routing_datastore, &paths.assignment)
+                .await?;
         let assignment_key = assignment_identity(&assignment);
         let assignment_store = paths.datastore.join(&assignment_key);
-        let source = repository_config
-            .resolve(assignment.clone())
-            .map_err(Error::Trust)?;
+        std::fs::create_dir_all(&assignment_store).map_err(|error| {
+            Error::Local(format!("creating assigned repository state: {error}"))
+        })?;
+        let release_root = assignment_store.join("release-root.json");
+        foundation::durable::atomic_write(
+            &release_root,
+            ".release-root-",
+            &serde_json::to_vec(&assignment.release_root)
+                .map_err(|error| Error::Trust(format!("encoding signed release root: {error}")))?,
+        )
+        .map_err(|error| Error::Local(format!("materializing signed release root: {error}")))?;
+        let source = updated::config::RepositorySource {
+            root: release_root,
+            metadata_url: assignment.metadata_url.clone(),
+            targets_url: assignment.targets_url.clone(),
+            metadata_limit: repository_config.metadata_limit,
+            target_limit: repository_config.target_limit,
+            transport_timeout: repository_config.transport_timeout,
+            // The release repository is the same externally-exposed gateway as routing.
+            mtls: routing_config.mtls.clone(),
+        };
         validate_release_url("metadata_url", &source.metadata_url)?;
         validate_release_url("targets_url", &source.targets_url)?;
         let mut repository = Self::load(&source, &assignment_store).await?;
@@ -304,14 +574,13 @@ impl TrustedRepository {
                 config.root.display()
             ))
         })?;
-        let metadata_url = Url::parse(&config.metadata_url)
-            .map_err(|e| Error::Local(format!("metadata base url: {e}")))?;
-        let targets_url = Url::parse(&config.targets_url)
-            .map_err(|e| Error::Local(format!("targets base url: {e}")))?;
+        let metadata_url = repository_base("metadata base", &config.metadata_url)?;
+        let targets_url = repository_base("targets base", &config.targets_url)?;
         tokio::fs::create_dir_all(datastore)
             .await
             .map_err(|e| Error::Local(format!("creating datastore: {e}")))?;
         let load = RepositoryLoader::new(&root, metadata_url, targets_url)
+            .transport(transport::transport(&config.mtls))
             .datastore(datastore.to_owned())
             .limits(Limits {
                 max_root_size: config.metadata_limit,
@@ -471,18 +740,43 @@ fn assignment_identity(assignment: &updated::config::RepositoryAssignment) -> St
 }
 
 fn validate_release_url(name: &str, raw: &str) -> Result<(), Error> {
-    let url = Url::parse(raw).map_err(|e| Error::Trust(format!("assignment {name}: {e}")))?;
-    if !raw.ends_with('/') || !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+    repository_base(&format!("assignment {name}"), raw).map(|_| ())
+}
+
+/// One location grammar for automatic and manual deployments. HTTP(S) and file URLs
+/// are accepted directly; an absolute directory path is the shorthand used by a
+/// manually placed assignment. All forms resolve to the same TUF transport.
+fn repository_base(name: &str, raw: &str) -> Result<Url, Error> {
+    let parsed = Url::parse(raw).ok();
+    let url = match parsed {
+        Some(url) if matches!(url.scheme(), "http" | "https" | "file") => url,
+        Some(url) if !url.scheme().is_empty() => {
+            return Err(Error::Trust(format!(
+                "{name} uses unsupported {} scheme",
+                url.scheme()
+            )))
+        }
+        _ => Url::from_directory_path(Path::new(raw)).map_err(|_| {
+            Error::Trust(format!(
+                "{name} must be an HTTP(S)/file base URL or an absolute directory path"
+            ))
+        })?,
+    };
+    if url.cannot_be_a_base() || !url.path().ends_with('/') {
         return Err(Error::Trust(format!(
-            "assignment {name} must be an HTTP(S) base URL ending with '/'"
+            "{name} must identify a base directory ending with '/'"
         )));
     }
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(Error::Trust(format!(
-            "assignment {name} must not contain credentials or a fragment"
+            "{name} must not contain credentials, a query, or a fragment"
         )));
     }
-    Ok(())
+    Ok(url)
 }
 
 fn transport_timeout(timeout: Duration, operation: &str) -> Error {

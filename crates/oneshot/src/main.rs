@@ -2,10 +2,10 @@
 
 use foundation::log::{error, info, warn};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use updated::bundle::{read_active, write_active};
-use updated::config::{config_path, Config, Paths};
+use updated::config::{Config, Paths};
 use updated::lock::InstanceLock;
 use updated::provider::BundleStore;
 use updated::reject::Rejections;
@@ -13,7 +13,7 @@ use updated::state::{read_installed, Installed, InstalledState};
 use updated_tuf::TrustedRepository;
 
 fn main() -> ExitCode {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    updated::tls::install_crypto_provider();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -24,7 +24,17 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let config = Config::load(&config_path("updated-oneshot")?)?;
+    let (bootstrap, enrollment_state) = parse_args()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("creating runtime: {error}"))?;
+    let config = runtime
+        .block_on(updated_tuf::resolve_managed_config(
+            &bootstrap,
+            &enrollment_state,
+        ))
+        .map_err(|error| format!("resolving signed managed configuration: {error}"))?;
     let paths = config.resolve_paths()?;
     let _lock = InstanceLock::acquire(&paths.install_root.join("state/instance.lock"))
         .map_err(|error| format!("another updater owns this install: {error}"))?;
@@ -46,18 +56,42 @@ fn run() -> Result<(), String> {
     verify_active(&paths, &installed)
         .map_err(|error| format!("verifying active bundle: {error}"))?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("creating runtime: {error}"))?;
     if let Err(message) = runtime.block_on(update(&config, &paths, &installed)) {
         warn("oneshot", &format!("update skipped: {message}"));
     }
     execute_active(&config, &paths)
 }
 
+fn parse_args() -> Result<(PathBuf, PathBuf), String> {
+    let usage = "usage: updated-oneshot --config <bootstrap.toml> --state-dir <dir>";
+    let mut args = std::env::args_os().skip(1);
+    let mut config = None;
+    let mut state = None;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--config") if config.is_none() => {
+                config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?));
+            }
+            Some("--state-dir") if state.is_none() => {
+                state = Some(PathBuf::from(
+                    args.next().ok_or("--state-dir needs a path")?,
+                ));
+            }
+            Some("-h" | "--help") => {
+                println!("{usage}");
+                std::process::exit(0);
+            }
+            _ => return Err(usage.into()),
+        }
+    }
+    Ok((
+        config.ok_or_else(|| usage.to_string())?,
+        state.ok_or_else(|| usage.to_string())?,
+    ))
+}
+
 async fn update(config: &Config, paths: &Paths, installed: &InstalledState) -> Result<(), String> {
-    let mut rejected = Rejections::load(&paths.rejected, config.timeouts.retry_after)
+    let mut rejected = Rejections::load(&paths.rejected)
         .map_err(|error| format!("loading rejections: {error}"))?;
     let repository =
         TrustedRepository::assigned(&config.routing, &config.repository, &config.storage, paths)

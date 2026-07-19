@@ -1,0 +1,13 @@
+---
+# Route every endpoint through nginx (published on this host's port 80 by the kind config):
+#   - the browser hits http://<server>/ → the demo UI,
+#   - the co-located agent hits http://updatec-gateway / http://release-default → the control
+#     plane, resolving those names to 127.0.0.1 (nginx) via /etc/hosts.
+# Both the per-set load-balancer paths (/set-N) and this catch-all coexist: nginx matches the
+# more specific prefix first.
+- name: Route the UI and the control-plane hostnames through nginx
+  ansible.builtin.command:
+    cmd: kubectl --context {{ demo_kube_context }} -n {{ demo_namespace }} apply -f -
+    stdin: "{{ lookup('template', 'demo-endpoints-ingress.yaml.j2') }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"

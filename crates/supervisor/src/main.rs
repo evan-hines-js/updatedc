@@ -9,24 +9,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use updated::config::{
-    with_suffix, Activation, Application, Paths, Repository, Routing, Storage, Timeouts,
+    with_suffix, Application, Paths, Repository, Routing, Storage, Timeouts,
 };
 use updated::{env, health};
 mod app;
 mod boot;
 mod domain;
 mod guardian;
+mod install;
 mod options;
 mod schedule;
 mod selection;
 mod self_update;
 mod store;
+mod telemetry;
 mod update;
 
 use app::*;
 use boot::plan_boot;
 use domain::*;
 use guardian::Guardian;
+use install::ensure_installed;
 use options::*;
 use schedule::*;
 use selection::*;
@@ -88,10 +91,12 @@ fn main() {
         a == "--list-chaos-boundaries"
             || a == "--list-rollback-chaos-boundaries"
             || a == "--list-abort-chaos-boundaries"
+            || a == "--list-install-chaos-boundaries"
     }) {
         let boundaries = match kind.as_str() {
             "--list-chaos-boundaries" => update::BOUNDARIES,
             "--list-rollback-chaos-boundaries" => update::ROLLBACK_BOUNDARIES,
+            "--list-install-chaos-boundaries" => install::INSTALL_BOUNDARIES,
             _ => update::ABORT_BOUNDARIES,
         };
         for b in boundaries {
@@ -102,8 +107,12 @@ fn main() {
 
     // reqwest is built without a default TLS provider so the TUF client and
     // health probe share the workspace's single aws-lc-rs implementation.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let opts = match parse_args() {
+    updated::tls::install_crypto_provider();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let opts = match runtime.block_on(parse_args()) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("supervisor: {e}\n");
@@ -111,10 +120,6 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
     if let Err(e) = runtime.block_on(run(opts)) {
         eprintln!("supervisor: fatal: {e}");
         std::process::exit(1);
@@ -122,8 +127,8 @@ fn main() {
 }
 
 fn usage() {
-    eprintln!("usage: supervisor --config <path.toml>");
-    eprintln!("all configuration lives in the TOML file; see updated::config.");
+    eprintln!("usage: supervisor --config <bootstrap.toml>");
+    eprintln!("the bootstrap file contains only the enrollment URL and shared key");
 }
 
 async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
@@ -143,36 +148,63 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let guardian = Guardian::connect().map_err(|e| format!("connecting to the guardian: {e}"))?;
+    let mut guardian =
+        Guardian::connect().map_err(|e| format!("connecting to the guardian: {e}"))?;
     let guardian_state = guardian::state_dir();
 
-    let mut store = FileStore::open(opts.paths.clone(), opts.timeouts.retry_after)?;
+    let mut store = FileStore::open(opts.paths.clone())?;
 
-    match (
-        store.installed(),
-        updated::state::read_enrollment(&opts.paths.state),
-    ) {
-        (updated::state::Installed::Missing, updated::state::EnrollmentState::Missing) => {
-            cold_install(&opts, &mut store).await?;
-        }
-        (updated::state::Installed::Missing, _) => {
-            return Err("installed state is missing after bootstrap eligibility was consumed; refusing to cold-install".into());
-        }
-        (updated::state::Installed::Present(_), updated::state::EnrollmentState::Present) => {}
-        (updated::state::Installed::Present(_), _) => {
-            return Err("installed state exists without a valid enrollment record".into());
-        }
-        (updated::state::Installed::Invalid, _) => {
-            return Err("installed state is invalid; refusing to cold-install".into());
+    // Reconcile any in-flight install journal and cold-install a fresh node, returning whether
+    // this boot performed the install. That selects the pre-start hook's reason (install vs.
+    // restart) so an operator script can seed on first boot and merely clean up on later
+    // restarts. All first-install placement — including Custom's provider hook — happens inside
+    // this durable, crash-recoverable install; there is no first-install branch after it.
+    let first_install = ensure_installed(&opts, &mut store).await?;
+
+    // The disk is not trusted merely because it was verified during installation. This
+    // check is local and deliberately precedes every repository access. A modified
+    // committed bundle is never launched, even when the network is unavailable.
+    if let updated::state::Installed::Present(installed) = store.installed() {
+        if let Err(error) =
+            updated::bundle::verify_release(&opts.paths.versions, &installed.release)
+        {
+            let _ = guardian.stop();
+            repair_from_local_assignment(&opts, &mut store)
+                .await
+                .map_err(|repair| {
+                    format!(
+                        "committed application bundle failed local verification ({error}); no valid signed local repair was applicable: {repair}"
+                    )
+                })?;
         }
     }
 
     // Gather the whole world into a Situation and let the pure boot planner decide
     // everything: recovery, drift enforcement, crash rejection, pending confirm/revert,
     // and whether to adopt the running application or launch a fresh one.
-    let mut guardian = guardian;
-    let situation = gather_situation(&opts, &store, guardian_state.as_deref())?;
+    let situation = gather_situation(&opts, &store, guardian_state.as_deref(), first_install)?;
     let mut recovery_transaction = recovery_transaction(&situation);
+    // A *provisional* committed head (`confirmed == false`, never health-proven) that crashed (the
+    // guardian recorded a service exit) with no pending update to revert is a broken assigned head
+    // that a stateless pod-kill cold-installed. Reject its bytes and restart *before* relaunching
+    // it: the next boot's cold install descends via ordered fallback to the newest healthy release.
+    // A confirmed head that crashes transiently is a no-op here, so it falls through to the normal
+    // relaunch-and-recover path — the single-crash recovery the base e2e relies on.
+    //
+    // The `!first_install` guard is load-bearing: when *this* boot descended and (re)installed a
+    // new head, that head has not launched yet, so a `service_exited` marker on disk is the stale
+    // exit of the *previous* head (which is exactly what drove this descent). Acting on it here
+    // would reject the freshly-installed release before it ever runs — stranding a cold node on an
+    // exhausted descent even though a healthy release was available (the fleet baseline-rejection
+    // bug). A genuine crash of *this* head is caught on the next boot (no longer first_install) or,
+    // if it fails its gate this boot, by the boot health gate below.
+    if situation.service_exited && recovery_transaction.is_none() && !situation.first_install {
+        if let Installed::Present(state) = &situation.installed {
+            if reject_provisional_head(&mut store, state, "crashed with no pending update")? {
+                return Err("provisional head crashed; descending on the next boot".into());
+            }
+        }
+    }
     let defer_recovery_commit = recovery_transaction
         .as_ref()
         .is_some_and(Transaction::is_rollback);
@@ -229,20 +261,21 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             .await;
         }
     };
-    if matches!(opts.application.activation, Activation::StopStart) {
-        if let Err(error) =
-            complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut(), None)
-        {
-            return hold_recovery_after_provider_failure(
-                &shutdown,
-                format!("predecessor activation recovery hook failed: {error}"),
-            )
-            .await;
-        }
-        if let Some(tx) = recovery_transaction.as_mut() {
-            if tx.rollback_rank().is_some_and(|rank| rank < 5) {
-                advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
-            }
+    // Restore the predecessor's activation before relaunching it (rollback recovery). A restart
+    // deployment has no live process here (it was stopped); a reload deployment kept it and reloads
+    // it in place — `complete_recovery_activation` resolves that itself.
+    if let Err(error) =
+        complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut())
+    {
+        return hold_recovery_after_provider_failure(
+            &shutdown,
+            format!("predecessor activation recovery hook failed: {error}"),
+        )
+        .await;
+    }
+    if let Some(tx) = recovery_transaction.as_mut() {
+        if tx.rollback_rank().is_some_and(|rank| rank < 5) {
+            advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
         }
     }
     if pending.is_some() {
@@ -254,40 +287,36 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log(&format!(
-        "supervisor {SELF_VERSION} (default provider {}) supervising {:?} (product {} channel {}, installed {}, updates {}, restart {}, check every {}s)",
+        "supervisor {SELF_VERSION} (default provider {}) supervising {:?} (product {} channel {}, installed {}, updates {}, check every {}s)",
         DefaultProvider::VERSION,
         opts.paths.install_root,
         opts.application.product,
         opts.application.channel,
         current.as_deref().unwrap_or("none"),
         if updates_enabled { "enabled" } else { "DISABLED" },
-        opts.application.activation.name(),
         opts.timeouts.check_interval.as_secs()
     ));
 
     let mut app = match plan.acquire {
         Acquire::Adopt(pid) => adopt(guardian, &opts, pid)?,
-        Acquire::Launch => start(guardian, &opts)?,
-    };
-    if matches!(opts.application.activation, Activation::Reexec) {
-        if let Err(error) = complete_recovery_activation(
+        // Pre-start is a clean-boot environment hook. A boot that is resuming an interrupted
+        // update or rollback (recovery_transaction is Some) must replay only that
+        // transaction's minimal, idempotent steps — injecting a fresh per-boot hook there
+        // would run the operator provider outside the transaction. So pre-start fires only on
+        // an ordinary launch, never on a recovery relaunch.
+        Acquire::Launch => launch_with_pre_start(
+            guardian,
             &opts,
-            &mut store,
-            recovery_transaction.as_mut(),
-            Some(app.pid()),
-        ) {
-            return hold_recovery_after_provider_failure(
-                &shutdown,
-                format!("predecessor activation recovery hook failed: {error}"),
-            )
-            .await;
-        }
-        if let Some(tx) = recovery_transaction.as_mut() {
-            if tx.rollback_rank().is_some_and(|rank| rank < 5) {
-                advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
-            }
-        }
-    }
+            &store,
+            if recovery_transaction.is_some() {
+                None
+            } else if first_install {
+                Some(LifecycleReason::Install)
+            } else {
+                Some(LifecycleReason::Restart)
+            },
+        )?,
+    };
     if recovery_transaction
         .as_ref()
         .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 6))
@@ -298,6 +327,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             &opts,
             LifecycleInvocation {
                 phase: LifecyclePhase::Start,
+                reason: LifecycleReason::Update,
                 id: &tx.id,
                 pid: Some(app.pid()),
                 candidate: &tx.previous_release,
@@ -320,21 +350,94 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             advance_transaction(&mut store, tx, TransactionPhase::RollbackHealthStarted)?;
         }
     }
+    // Signal *supervisor* readiness to the guardian now that this process is up and owns a running
+    // application — BEFORE the app health gate below. For a committed supervisor this is a no-op;
+    // for a candidate it begins the guardian's confirmation window. Signalling here (not after the
+    // app health gate) decouples "the supervisor process started successfully" from "the app is
+    // healthy": a slow-to-start app during a swap can no longer blow the guardian's ready_timeout
+    // and get a perfectly good supervisor permanently rejected. If the app then fails its gate the
+    // supervisor exits, which the guardian sees as a candidate dying in its window and rejects —
+    // so a supervisor whose app cannot get healthy is still not committed.
+    if let Err(e) = app.signal_ready() {
+        warn(&format!("could not signal readiness to the guardian: {e}"));
+    }
+    #[cfg(all(feature = "chaos", supervisor_chaos_exit_after_ready))]
+    {
+        eprintln!("supervisor: CHAOS: exiting after readiness, before guardian confirmation");
+        std::process::exit(137);
+    }
     // Gate readiness: the application must be healthy before we trust this boot. A crash
     // would have torn the tower down instead, so an unhealthy result here means the
     // process is alive but wedged — fail closed. For a candidate supervisor, failing this
-    // exits before signalling ready, so the guardian rolls the candidate back.
-    if !became_healthy(
-        &app,
-        opts.timeouts.health_grace,
-        opts.application.health_url.as_deref(),
-        None,
-        opts.timeouts.health_successes,
-        opts.timeouts.health_interval,
-    )
-    .await?
-    {
+    // exits before signalling ready, so the guardian rolls the candidate back. The health-check
+    // provider, if the installed release ships one, is the signal and replaces the HTTP probe.
+    // During a crash-recovered rollback the predecessor commit is deferred until *after* this gate,
+    // so `store.installed()` still holds the CANDIDATE record. Gate the restored predecessor with
+    // ITS OWN health/process providers — carried in the recovery transaction from `pending` (the
+    // operator set staged for exactly this rollback) — not the candidate's. Otherwise an update that
+    // revised the health-check provider, then failed, would gate the healthy predecessor with a
+    // probe only the candidate serves, reject it, and crash-loop a good release.
+    let installed_healthcheck = match recovery_transaction.as_ref() {
+        Some(tx) if tx.is_rollback() => tx.healthcheck.clone(),
+        _ => installed_health_provider(&store),
+    };
+    let boot_healthy = if let Some(healthcheck) = installed_healthcheck.as_deref() {
+        let pid = Some(app.pid());
+        became_healthy_via_provider(
+            healthcheck,
+            &opts,
+            pid,
+            opts.timeouts.health_grace,
+            opts.timeouts.health_successes,
+            opts.timeouts.health_interval,
+        )
+        .await
+    } else {
+        became_healthy(
+            &app,
+            opts.timeouts.health_grace,
+            opts.application
+                .health_check_url(updated::config::HealthCheckKind::Startup)
+                .or_else(|| {
+                    opts.application
+                        .health_check_url(updated::config::HealthCheckKind::Readiness)
+                }),
+            // Boot always launches fresh through the guardian, so its token identifies the
+            // image; no version proof is needed here even for a reload deployment.
+            None,
+            opts.timeouts.health_successes,
+            opts.timeouts.health_interval,
+        )
+        .await?
+    };
+    if !boot_healthy {
+        // A still-provisional head that never becomes healthy is a broken assigned head wedged
+        // alive (a crash instead tears the tower down before here — see the service-exit path at
+        // boot gather). Reject its bytes so the next boot's cold install descends via ordered
+        // fallback to the newest healthy release rather than relaunching a head that can't serve.
+        // A confirmed head that fails is a no-op here and left alone for the normal path.
+        if let updated::state::Installed::Present(state) = store.installed() {
+            if let Err(error) =
+                reject_provisional_head(&mut store, &state, "wedged alive without a passing gate")
+            {
+                warn(&format!(
+                    "recording rejection of the failed provisional head failed: {error}"
+                ));
+            }
+        }
+        app.guardian
+            .application_failed()
+            .map_err(|error| format!("reporting initial application health failure: {error}"))?;
         return Err("the managed application failed its initial health check".into());
+    }
+    // The head has now proven healthy this boot: confirm it so a later transient crash of this
+    // (proven) head is relaunched and recovered, not rejected as a broken head.
+    if let updated::state::Installed::Present(mut state) = store.installed() {
+        if state.confirm() {
+            if let Err(error) = store.commit_installed(&state) {
+                warn(&format!("confirming the proven head failed: {error}"));
+            }
+        }
     }
     if recovery_transaction
         .as_ref()
@@ -346,6 +449,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             &opts,
             LifecycleInvocation {
                 phase: LifecyclePhase::Verify,
+                reason: LifecycleReason::Update,
                 id: &tx.id,
                 pid: Some(app.pid()),
                 candidate: &tx.previous_release,
@@ -386,6 +490,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 &opts,
                 LifecycleInvocation {
                     phase: LifecyclePhase::Rollback,
+                    reason: LifecycleReason::Update,
                     id: &tx.id,
                     pid: Some(app.pid()),
                     candidate: &tx.previous_release,
@@ -419,19 +524,47 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     garbage_collect(&opts, &store);
 
-    // Prove readiness to the guardian. For an ordinary launch this is a no-op; for a
-    // candidate it begins the guardian-owned stability window. Only surviving that
-    // independent window commits the handoff.
-    if let Err(e) = app.signal_ready() {
-        warn(&format!("could not signal readiness to the guardian: {e}"));
-    }
-    #[cfg(all(feature = "chaos", supervisor_chaos_exit_after_ready))]
-    {
-        eprintln!("supervisor: CHAOS: exiting after readiness, before guardian confirmation");
-        std::process::exit(137);
-    }
+    // Publish application readiness (traffic rotation) only now that the app has passed its health
+    // gate — never route traffic to an app that has not proven healthy. This is distinct from the
+    // guardian *supervisor*-readiness signalled earlier: this one is about the app, that one about
+    // this process being a working supervisor.
+    app.traffic_ready(true)
+        .map_err(|error| format!("publishing initial application readiness: {error}"))?;
 
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
+    let readiness_url = opts
+        .application
+        .health_check_url(updated::config::HealthCheckKind::Readiness);
+    let liveness_url = opts
+        .application
+        .health_check_url(updated::config::HealthCheckKind::Liveness);
+    let health_probe = (readiness_url.is_some() || liveness_url.is_some())
+        .then(HealthProbe::new)
+        .transpose()?;
+    // The installed release's health-check provider, if it ships one, is the single steady-state
+    // signal — it drives both readiness and liveness, replacing the HTTP probes. Refreshed when
+    // an update commits, since the provider travels with the release.
+    let mut steady_healthcheck = installed_health_provider(&store);
+    let mut next_health_probe = Instant::now() + opts.timeouts.health_interval;
+    let mut liveness_failures = 0u32;
+    // Rollout telemetry: this node's identity and a client for best-effort reports. Both
+    // are inert unless the current assignment carries a report URL; a node without a
+    // derivable identity or a failing client simply never reports and updates as usual.
+    //
+    // The report endpoint is the fleet gateway, which admits only fleet-CA client certs — the
+    // same mTLS the node already uses to fetch its repository — so the telemetry client presents
+    // the node's identity. If that identity can't build (an offline/non-mTLS deployment with no
+    // CA on disk), fall back to a plain client: telemetry is best-effort, and a plain-HTTP report
+    // target is served as usual.
+    let telemetry_node = telemetry::node_identity(&opts.routing);
+    let telemetry_client = opts
+        .routing
+        .mtls
+        .reqwest_client()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    // Latest readiness observation, so a report reflects whether the running deployment is
+    // actually serving. `None` until first sampled (or when no readiness check exists).
+    let mut last_ready: Option<bool> = None;
     loop {
         // An unconfirmed update that ran its whole window without crashing is confirmed.
         let confirm_due = pending
@@ -468,7 +601,10 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             opts.timeouts.check_interval
         };
-        let wait = app_wait.min(self_update.due_in(now));
+        let mut wait = app_wait.min(self_update.due_in(now));
+        if health_probe.is_some() || steady_healthcheck.is_some() {
+            wait = wait.min(next_health_probe.saturating_duration_since(now));
+        }
         let wait = wait.max(Duration::from_millis(100));
 
         if sleep_interruptible(wait, &shutdown).await {
@@ -477,6 +613,63 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let now = Instant::now();
+        if let Some(healthcheck) = steady_healthcheck
+            .as_deref()
+            .filter(|_| now >= next_health_probe)
+        {
+            // The health-check provider is the single steady-state signal: one probe per tick
+            // drives readiness (rotation) and liveness (teardown after repeated failure), just
+            // as it gated startup. It replaces the HTTP probes entirely for such a release.
+            next_health_probe = now + opts.timeouts.health_interval;
+            let pid = Some(app.pid());
+            let healthy = run_healthcheck_command(healthcheck, &opts, pid);
+            last_ready = Some(healthy);
+            app.traffic_ready(healthy)
+                .map_err(|error| format!("publishing application readiness: {error}"))?;
+            if healthy {
+                liveness_failures = 0;
+            } else {
+                liveness_failures = liveness_failures.saturating_add(1);
+                if liveness_failures >= 3 {
+                    app.guardian.application_failed().map_err(|error| {
+                        format!("reporting application liveness failure: {error}")
+                    })?;
+                    return Err("the managed application failed its liveness check".into());
+                }
+            }
+        } else if let Some(probe) = health_probe.as_ref().filter(|_| now >= next_health_probe) {
+            next_health_probe = now + opts.timeouts.health_interval;
+            // A tagged URL is sampled at most once per tick. When readiness and
+            // liveness intentionally share an application endpoint, both policies see
+            // the same observation rather than racing a flapping handler.
+            let readiness = match readiness_url {
+                Some(url) => Some(probe.sample(&app, url, None, None).await),
+                None => None,
+            };
+            if let Some(ready) = readiness {
+                last_ready = Some(ready);
+                app.traffic_ready(ready)
+                    .map_err(|error| format!("publishing application readiness: {error}"))?;
+            }
+            if let Some(url) = liveness_url {
+                let live = if readiness_url == Some(url) {
+                    readiness.expect("the shared readiness URL was sampled")
+                } else {
+                    probe.sample(&app, url, None, None).await
+                };
+                if live {
+                    liveness_failures = 0;
+                } else {
+                    liveness_failures = liveness_failures.saturating_add(1);
+                    if liveness_failures >= 3 {
+                        app.guardian.application_failed().map_err(|error| {
+                            format!("reporting application liveness failure: {error}")
+                        })?;
+                        return Err("the managed application failed its liveness check".into());
+                    }
+                }
+            }
+        }
         let self_due = self_update.due(now);
         let app_due = application_check_due(
             updates_enabled,
@@ -486,6 +679,27 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         );
         if !self_due && !app_due {
             continue;
+        }
+
+        if let updated::state::Installed::Present(installed) = store.installed() {
+            if let Err(error) =
+                updated::bundle::verify_release(&opts.paths.versions, &installed.release)
+            {
+                let _ = app::stop(&mut app.guardian, &opts.paths.app_token);
+                repair_from_local_assignment(&opts, &mut store)
+                    .await
+                    .map_err(|repair| {
+                        format!(
+                            "committed application bundle changed on disk ({error}); stopped it before repository access and no valid signed local repair was applicable: {repair}"
+                        )
+                    })?;
+                current = match store.installed() {
+                    updated::state::Installed::Present(state) => Some(state.release.version),
+                    _ => None,
+                };
+                pending = None;
+                app.launch(&opts)?;
+            }
         }
 
         // Resolve the agent document afresh, then load its release repository.
@@ -544,9 +758,20 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // The commit recorded the update as unconfirmed; pick it up so its
                     // window is watched and a crash is caught on the next boot.
                     pending = installed_pending(&store);
+                    // The new release's health provider travels with it, so steady-state gating
+                    // switches to it from now on.
+                    steady_healthcheck = installed_health_provider(&store);
                     garbage_collect(&opts, &store);
                 }
                 AppOutcome::Unchanged => {}
+                AppOutcome::RestartForRecovery => {
+                    // A post-activation failure left a durable rollback journal. Terminate this
+                    // disposable supervisor cleanly; the guardian relaunches it and boot recovery
+                    // performs the rollback (the single rollback path). The guardian keeps the
+                    // application alive across the restart.
+                    log("update failed after activation; restarting so boot recovery rolls back");
+                    return Ok(());
+                }
                 AppOutcome::Fatal(message) => {
                     return hold_recovery_after_provider_failure(
                         &shutdown,
@@ -556,20 +781,56 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        // Best-effort rollout heartbeat, emitted after acting on the current assignment.
+        // `healthy` is true only when the running app is ready AND no update is still
+        // unconfirmed (`pending`) — so a node that has merely *fetched* a new assignment,
+        // or is mid-rollout, is never reported as settled on it. That is exactly what lets
+        // the control plane hold a pair's second member until the first has genuinely
+        // completed (installed and confirmed, or attempted and rolled back). Keyed off the
+        // current assignment's report URL, so adding or removing telemetry just starts or
+        // stops the heartbeat.
+        if let Some(assignment) = repo.assignment() {
+            // If a readiness signal is configured but has not been sampled yet (first tick after
+            // boot), do NOT report settled on the strength of the boot gate alone — wait for a
+            // steady-state observation. When no readiness signal exists there is nothing to sample,
+            // so the boot gate (already passed) is the answer.
+            let has_readiness = steady_healthcheck.is_some()
+                || (health_probe.is_some() && readiness_url.is_some());
+            let settled = pending.is_none() && last_ready.unwrap_or(!has_readiness);
+            telemetry::report_running_state(
+                &telemetry_client,
+                assignment.report_url.as_deref(),
+                telemetry_node.as_deref(),
+                &assignment.deployment,
+                current.as_deref().unwrap_or_default(),
+                settled,
+            )
+            .await;
+        }
     }
 }
 
-async fn cold_install(
+
+/// Repair a damaged committed release from the same signed deployment contract used by
+/// normal updates, but only when its routing repository is explicitly local. This path
+/// performs no network request and is therefore safe to try before online reconciliation.
+async fn repair_from_local_assignment(
     opts: &Options,
     store: &mut FileStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let local = opts.routing.base_url.starts_with("file:")
+        || Path::new(&opts.routing.base_url).is_absolute();
+    if !local {
+        return Err("the signed routing repository is not local".into());
+    }
     let repo =
         TrustedRepository::assigned(&opts.routing, &opts.repository, &opts.storage, &opts.paths)
             .await
-            .map_err(|error| format!("loading the first trusted assignment: {error}"))?;
+            .map_err(|error| format!("loading signed local repair assignment: {error}"))?;
     let assignment = repo
         .assignment()
-        .ok_or("the first trusted repository has no desired deployment")?;
+        .ok_or("the signed local repository has no desired deployment")?;
     let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
     let prepared = update_client::prepare_assigned_application(
         update_client::ApplicationRequest {
@@ -582,22 +843,23 @@ async fn cold_install(
         |sha256| store.is_rejected(&lineage, sha256),
     )
     .await
-    .map_err(|error| format!("preparing the first application: {error}"))?
-    .ok_or("the first trusted assignment contains no installable application")?;
-
-    // Consume bootstrap first. If any later write is interrupted, subsequent starts fail
-    // closed and cannot reinterpret the damaged install as a never-enrolled node.
-    updated::state::enroll(&opts.paths.state, lineage.clone())?;
-    // Commit first. If activation is interrupted, the ordinary boot planner repairs
-    // the pointer from this authoritative installed record on the next guardian retry.
-    store.commit_installed(&updated::state::InstalledState::confirmed(
-        lineage,
-        prepared.release.clone(),
-        prepared.archive_sha256,
-    ))?;
+    .map_err(|error| format!("preparing signed local repair: {error}"))?
+    .ok_or("the signed local assignment contains no installable application")?;
+    let providers = selection::stage_providers(opts, &repo, store, None)
+        .await
+        .map_err(|error| format!("staging the providers for local repair: {error}"))?;
+    store.commit_installed(
+        &updated::state::InstalledState::confirmed(
+            lineage,
+            prepared.release.clone(),
+            prepared.archive_sha256,
+        )
+        .with_lifecycle(providers.lifecycle.map(Box::new))
+        .with_healthcheck(providers.healthcheck.map(Box::new))
+    )?;
     store.activate(&prepared.release)?;
     log(&format!(
-        "cold-installed application {} from the first trusted assignment",
+        "repaired the committed application from signed local deployment {}",
         prepared.version
     ));
     Ok(())
@@ -626,11 +888,14 @@ fn garbage_collect(opts: &Options, store: &dyn Store) {
     };
     let mut releases = vec![installed.release.clone()];
     let mut providers = Vec::new();
+    // Protect the installed release's own providers — they run on every boot (pre-start,
+    // health gating) — and the pending predecessor's, which a rollback would replay.
+    providers.extend(installed.lifecycle.map(|provider| provider.release));
+    providers.extend(installed.healthcheck.map(|provider| provider.release));
     if let Some(pending) = installed.pending {
         releases.push(pending.previous_release);
-        if let Some(lifecycle) = pending.lifecycle {
-            providers.push(lifecycle.release);
-        }
+        providers.extend(pending.lifecycle.map(|provider| provider.release));
+        providers.extend(pending.healthcheck.map(|provider| provider.release));
     }
     match updated::gc::prune_releases(
         &opts.paths.versions,
@@ -662,22 +927,52 @@ fn garbage_collect(opts: &Options, store: &dyn Store) {
     }
 }
 
+/// Reject the bytes of a *provisional* (never-health-proven) cold-installed head so the next
+/// boot's cold install descends via ordered fallback past it. A confirmed head is left untouched.
+/// Returns whether a rejection was actually recorded (i.e. the head was provisional). This is the
+/// single reject rule shared by the two ways a provisional head can prove bad: it crashed last
+/// boot (service exit) or it wedged alive through the boot health gate.
+fn reject_provisional_head(
+    store: &mut FileStore,
+    state: &updated::state::InstalledState,
+    why: &str,
+) -> std::io::Result<bool> {
+    if state.confirmed {
+        return Ok(false);
+    }
+    store.reject(&state.repository_lineage, &state.archive_sha256)?;
+    warn(&format!(
+        "provisional head {} {why}; rejected its bytes so the next cold install descends via \
+         ordered fallback",
+        state.release.version
+    ));
+    Ok(true)
+}
+
 fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
     if let Some(tx) = &situation.journal {
         let committed = match &situation.installed {
             Installed::Present(state) => Some(&state.release),
             Installed::Missing | Installed::Invalid => None,
         };
-        if updated::transaction::classify_recovery(tx, situation.active.as_ref(), committed)
-            != updated::transaction::Recovery::Committed
-        {
-            return Some(tx.clone());
-        }
+        // A journal is authoritative and decides recovery on its own — it must NEVER fall through
+        // to the `Pending` branch below. Drive the rollback hook replay only when the predecessor
+        // must actually be restored (`RestorePredecessor`). `Committed` (nothing to undo) and
+        // `NeverSwapped` (a pre-activation crash that never displaced the predecessor, or an
+        // already-finished rollback/abort) are fully handled by the boot plan alone —
+        // `reconcile_transaction` clears the journal and, for a finished rollback, commits the
+        // predecessor via its `is_rollback` branch with zero lifecycle calls. Falling through here
+        // would let the confirm-window `Pending` branch synthesize a *fresh* `RollbackStarted` and
+        // re-run the entire (already-completed) rollback machine — a non-minimal double-invoke of
+        // every lifecycle hook.
+        return (updated::transaction::classify_recovery(tx, situation.active.as_ref(), committed)
+            == updated::transaction::Recovery::RestorePredecessor)
+            .then(|| tx.clone());
     }
     if let Installed::Present(installed) = &situation.installed {
         if let Some(pending) = &installed.pending {
             let rollback_started = situation.active.as_ref() == Some(&pending.previous_release);
-            if situation.app_crashed || rollback_started {
+            if situation.service_exited || rollback_started {
                 return Some(Transaction {
                     id: pending.lifecycle_attempt_id.clone(),
                     kind: updated::transaction::Kind::Supervised,
@@ -687,8 +982,9 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
                     candidate_release: installed.release.clone(),
                     candidate_archive_sha256: installed.archive_sha256.clone(),
                     candidate_repository_lineage: installed.repository_lineage.clone(),
-                    candidate_rejection_required: situation.app_crashed,
+                    candidate_rejection_required: situation.service_exited,
                     lifecycle: pending.lifecycle.clone(),
+                    healthcheck: pending.healthcheck.clone(),
                     phase: TransactionPhase::RollbackStarted,
                 });
             }
@@ -701,7 +997,6 @@ fn complete_recovery_activation(
     opts: &Options,
     store: &mut dyn Store,
     recovery: Option<&mut Transaction>,
-    pid: Option<u32>,
 ) -> io::Result<()> {
     let Some(tx) = recovery else {
         return Ok(());
@@ -709,18 +1004,24 @@ fn complete_recovery_activation(
     if tx.rollback_rank().is_none_or(|rank| rank >= 4) {
         return Ok(());
     }
-    if tx.lifecycle.is_none() && matches!(opts.application.activation, Activation::Reexec) {
-        return Err(io::Error::other(
-            "reexec rollback requires its pinned lifecycle provider",
-        ));
+    // Restore the predecessor's activation. A **reload** deployment reloads the still-running
+    // process in place, so its `activate` script needs the live PID; if the process is gone (the
+    // failed candidate reload took it down), there is nothing to reload — skip the hook and let the
+    // boot plan relaunch the predecessor fresh. A **restart** deployment ran its stop-start already,
+    // so its activate hook is a plain forward hook with no PID.
+    let reloads = update::reloads_in_place(opts, tx.lifecycle.as_deref());
+    let pid = guardian::adopted_app_pid();
+    if reloads && pid.is_none() {
+        return advance_transaction(store, tx, TransactionPhase::PredecessorActivated);
     }
     invoke_deployment_provider(
         tx.lifecycle.as_deref(),
         opts,
         LifecycleInvocation {
             phase: LifecyclePhase::Activate,
+            reason: LifecycleReason::Update,
             id: &tx.id,
-            pid,
+            pid: reloads.then_some(pid).flatten(),
             candidate: &tx.previous_release,
             predecessor: &tx.candidate_release,
         },
@@ -738,17 +1039,33 @@ fn gather_situation(
     opts: &Options,
     store: &dyn Store,
     guardian_state: Option<&Path>,
+    first_install: bool,
 ) -> io::Result<Situation> {
     let active = store.active_release()?;
+    let installed = store.installed();
+    let journal = store.journal()?;
+    // The release a recovery would restore reloads in place iff its lifecycle ships an `activate`
+    // script. That lifecycle rides the rollback journal, or the confirm-window `Pending` record.
+    let recovery_lifecycle = journal
+        .as_ref()
+        .and_then(|tx| tx.lifecycle.as_deref())
+        .or_else(|| match &installed {
+            Installed::Present(state) => state.pending.as_ref().and_then(|p| p.lifecycle.as_deref()),
+            _ => None,
+        });
+    let reloads_in_place =
+        recovery_lifecycle.is_some_and(|lc| update::reloads_in_place(opts, Some(lc)));
     Ok(Situation {
-        installed: store.installed(),
+        installed,
         active,
-        journal: store.journal()?,
-        app_crashed: match guardian_state {
-            Some(state) => guardian::take_crash_marker(state)?,
+        journal,
+        service_exited: match guardian_state {
+            Some(state) => guardian::take_service_exit_marker(state)?,
             None => false,
         },
         app_running: guardian::adopted_app_pid(),
+        reloads_in_place,
+        first_install,
         bad_supervisor: match guardian_state {
             Some(state) => guardian::take_rejected_supervisor(state)?,
             None => None,
@@ -774,9 +1091,17 @@ fn execute_boot_plan(
             advance_transaction(store, tx, TransactionPhase::RollbackStopStarted)?;
         }
     }
-    let needs_quiesce = recovery
+    // A reload deployment never stops the process during recovery: the failed candidate reload left
+    // the predecessor running in place (or took it down, in which case the boot plan relaunches it),
+    // so there is nothing to stop and the operator owns any drain. Only a restart deployment
+    // stop-starts the process, so only it quiesces here.
+    let reloads = recovery
         .as_ref()
-        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
+        .is_some_and(|tx| update::reloads_in_place(opts, tx.lifecycle.as_deref()));
+    let needs_quiesce = !reloads
+        && recovery
+            .as_ref()
+            .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
     if needs_quiesce {
         if let Some(tx) = recovery.as_ref() {
             invoke_deployment_provider(
@@ -784,6 +1109,7 @@ fn execute_boot_plan(
                 opts,
                 LifecycleInvocation {
                     phase: LifecyclePhase::Stop,
+                    reason: LifecycleReason::Update,
                     id: &tx.id,
                     pid: guardian::adopted_app_pid(),
                     candidate: &tx.previous_release,
@@ -850,6 +1176,16 @@ fn apply_store_plan(
 fn installed_pending(store: &dyn Store) -> Option<Pending> {
     match store.installed() {
         Installed::Present(s) => s.pending,
+        _ => None,
+    }
+}
+
+/// The committed release's own health-check provider (`None` when nothing is installed or the
+/// release ships no health provider). It travels with the release, so callers re-read it whenever an
+/// update commits.
+fn installed_health_provider(store: &dyn Store) -> Option<Box<updated::state::ProviderRelease>> {
+    match store.installed() {
+        Installed::Present(state) => state.healthcheck,
         _ => None,
     }
 }

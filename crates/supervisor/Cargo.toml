@@ -13,6 +13,8 @@ path = "src/main.rs"
 # crash-recovery scenarios. OFF by default so production binaries contain no injection
 # points at all — a stray `UPDATED_CHAOS_POINT` can never crash a real supervisor.
 chaos = []
+# Build the whole agent against FIPS-validated crypto. Propagates to the shared aws-lc-rs/rustls.
+fips = ["updated/fips", "updated-tuf/fips"]
 
 [dependencies]
 foundation = { path = "../foundation" }

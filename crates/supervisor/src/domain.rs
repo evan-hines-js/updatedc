@@ -42,10 +42,22 @@ pub(crate) struct Situation {
     pub active: Option<ReleaseId>,
     /// The in-flight update transaction, if a journal is present.
     pub journal: Option<Transaction>,
-    /// The guardian's crash marker: the last application exit was a crash.
-    pub app_crashed: bool,
+    /// The guardian's marker that the managed service exited spontaneously.
+    /// The managed service exited spontaneously. Exit zero is included: service policy
+    /// requires a continuously running process, so the exact code affects outer restart
+    /// behavior but not whether an unconfirmed release must be reconsidered.
+    pub service_exited: bool,
     /// The PID of an application the guardian is already running (adopt, do not relaunch).
     pub app_running: Option<u32>,
+    /// Whether the release a recovery would restore reloads in place (its lifecycle ships an
+    /// `activate` script). A reload leaves the predecessor process running through a failed
+    /// candidate reload, so recovery adopts it rather than stop-starting it — no downtime.
+    pub reloads_in_place: bool,
+    /// This boot performed a (re)install — [`ensure_installed`](crate::install::ensure_installed)
+    /// changed the active bytes. Any process the guardian kept alive is therefore the *previous*
+    /// release (e.g. a wedged head we just descended past), so the planner must stop it and launch
+    /// the freshly-installed bytes rather than adopt a stale process and health-gate the wrong one.
+    pub first_install: bool,
     /// A candidate supervisor the guardian rolled back (reject its content hash).
     pub bad_supervisor: Option<PathBuf>,
     /// How long a committed update stays unconfirmed.
@@ -141,6 +153,7 @@ mod tests {
                 "https://repo/metadata/",
             ),
             lifecycle: None,
+            healthcheck: None,
             committed_at: 1000,
         }
     }

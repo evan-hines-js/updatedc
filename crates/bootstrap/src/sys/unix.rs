@@ -168,11 +168,30 @@ fn close_fd(fd: libc::c_int) {
     }
 }
 
+/// Install `handler` for `signum` via `sigaction`, checking the result. `sigaction` is
+/// preferred over `signal`: it has deterministic cross-platform semantics (no BSD/System-V
+/// disagreement, no one-shot handler reset) and reports failure, where `signal` returns an
+/// opaque sentinel. `SA_RESTART` is set to match the glibc `signal` behaviour these calls
+/// replaced. SAFETY: `action` is fully initialised before use and `handler` is a valid
+/// disposition (a handler function pointer, `SIG_IGN`, or `SIG_DFL`).
+fn set_signal_action(signum: libc::c_int, handler: libc::sighandler_t) -> io::Result<()> {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        if libc::sigaction(signum, &action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Ignore `SIGPIPE` process-wide so a write to a control channel whose peer has died
 /// returns `EPIPE` instead of killing the guardian.
 pub fn ignore_sigpipe() {
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    if let Err(e) = set_signal_action(libc::SIGPIPE, libc::SIG_IGN) {
+        crate::log::warn(&format!("ignoring SIGPIPE: {e}"));
     }
 }
 
@@ -180,9 +199,10 @@ pub fn ignore_sigpipe() {
 /// guardian exits cleanly (forwarding the stop down to the application).
 pub fn install_shutdown_handler() {
     let handler = handle_signal as *const () as libc::sighandler_t;
-    unsafe {
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
+    for signum in [libc::SIGTERM, libc::SIGINT] {
+        if let Err(e) = set_signal_action(signum, handler) {
+            crate::log::warn(&format!("installing stop handler for signal {signum}: {e}"));
+        }
     }
 }
 

@@ -23,6 +23,14 @@ pub struct BundleStore {
 /// provider bundles).
 pub struct Resolved {
     pub program: PathBuf,
+    /// The provider's activation (reload) script, when the bundle declares one — run for the
+    /// activate hook. Its presence makes the deployment reload in place instead of the guardian
+    /// restarting the process.
+    pub activate: Option<PathBuf>,
+    /// The provider's rollback script, when the bundle declares one — run for the rollback hook in
+    /// place of `program`. `None` for an application bundle or a provider that keeps its rollback in
+    /// its single forward entrypoint.
+    pub rollback: Option<PathBuf>,
     pub cwd: PathBuf,
     pub product: String,
 }
@@ -81,9 +89,14 @@ impl BundleStore {
     /// ingest-time verification alone is not an execution-time trust boundary.
     pub fn resolve(&self, release: &ReleaseId) -> io::Result<Resolved> {
         let (manifest, program) = bundle::read_release(&self.versions, release)?;
+        let cwd = self.location(release);
+        let activate = manifest.activate.as_ref().map(|relative| cwd.join(relative));
+        let rollback = manifest.rollback.as_ref().map(|relative| cwd.join(relative));
         Ok(Resolved {
             program,
-            cwd: self.location(release),
+            activate,
+            rollback,
+            cwd,
             product: manifest.product,
         })
     }
@@ -126,7 +139,7 @@ mod tests {
             "demo",
             "1.2.3",
             "test-platform",
-            "bin/app",
+            &bundle::Entrypoints::new("bin/app"),
         )
         .unwrap();
 
@@ -175,14 +188,14 @@ mod tests {
             fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let archive = root.join("provider.tar.zst");
-        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let platform = foundation::platform::platform_key();
         bundle::create_bundle(
             &source,
             &archive,
             "lifecycle",
             "1.0.0",
             &platform,
-            "bin/app",
+            &bundle::Entrypoints::new("bin/app"),
         )
         .unwrap();
         let store = BundleStore::new(root.join("versions"), root.join("staging"));
@@ -204,6 +217,134 @@ mod tests {
         .unwrap();
         fs::write(installed_entrypoint, b"tampered").unwrap();
         assert!(store.resolve(&staged.id).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_provider_with_an_activate_script_resolves_it() {
+        let root = scratch("provider-activate");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/deploy.sh"), b"#!/bin/sh\ntrue\n").unwrap();
+        fs::write(source.join("bin/reload.sh"), b"#!/bin/sh\ntrue\n").unwrap();
+        let archive = root.join("provider.tar.zst");
+        let platform = foundation::platform::platform_key();
+        bundle::create_bundle(
+            &source,
+            &archive,
+            "lifecycle",
+            "1.0.0",
+            &platform,
+            &bundle::Entrypoints {
+                entrypoint: "bin/deploy.sh",
+                activate: Some("bin/reload.sh"),
+                rollback: None,
+            },
+        )
+        .unwrap();
+        let store = BundleStore::new(root.join("versions"), root.join("staging"));
+        let staged = store
+            .install(
+                &archive,
+                &bundle::ExpectedBundle {
+                    product: "lifecycle",
+                    version: "1.0.0",
+                    platform: &platform,
+                },
+            )
+            .unwrap();
+        let resolved = store.resolve(&staged.id).unwrap();
+        // The activate script's presence is what the supervisor reads to reload in place.
+        assert_eq!(
+            resolved.activate,
+            Some(store.location(&staged.id).join("bin/reload.sh"))
+        );
+        assert_eq!(resolved.rollback, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_provider_with_a_rollback_resolves_both_scripts() {
+        let root = scratch("provider-rollback");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/deploy.sh"), b"#!/bin/sh\ntrue\n").unwrap();
+        fs::write(source.join("bin/rollback.sh"), b"#!/bin/sh\ntrue\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["bin/deploy.sh", "bin/rollback.sh"] {
+                fs::set_permissions(source.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let archive = root.join("provider.tar.zst");
+        let platform = foundation::platform::platform_key();
+        // The source files are *not* +x; the bundle marks both declared scripts executable.
+        bundle::create_bundle(
+            &source,
+            &archive,
+            "lifecycle",
+            "1.0.0",
+            &platform,
+            &bundle::Entrypoints {
+                entrypoint: "bin/deploy.sh",
+                activate: None,
+                rollback: Some("bin/rollback.sh"),
+            },
+        )
+        .unwrap();
+        let store = BundleStore::new(root.join("versions"), root.join("staging"));
+        let staged = store
+            .install(
+                &archive,
+                &bundle::ExpectedBundle {
+                    product: "lifecycle",
+                    version: "1.0.0",
+                    platform: &platform,
+                },
+            )
+            .unwrap();
+        let resolved = store.resolve(&staged.id).unwrap();
+        let dir = store.location(&staged.id);
+        assert_eq!(resolved.program, dir.join("bin/deploy.sh"));
+        assert_eq!(resolved.rollback, Some(dir.join("bin/rollback.sh")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_provider_without_a_rollback_resolves_none() {
+        let root = scratch("provider-no-rollback");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/app"), b"trusted").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let archive = root.join("provider.tar.zst");
+        let platform = foundation::platform::platform_key();
+        bundle::create_bundle(
+            &source,
+            &archive,
+            "lifecycle",
+            "1.0.0",
+            &platform,
+            &bundle::Entrypoints::new("bin/app"),
+        )
+        .unwrap();
+        let store = BundleStore::new(root.join("versions"), root.join("staging"));
+        let staged = store
+            .install(
+                &archive,
+                &bundle::ExpectedBundle {
+                    product: "lifecycle",
+                    version: "1.0.0",
+                    platform: &platform,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.resolve(&staged.id).unwrap().rollback, None);
         let _ = fs::remove_dir_all(root);
     }
 }

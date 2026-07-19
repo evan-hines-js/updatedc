@@ -15,6 +15,41 @@ use socket2::{Domain, Socket, Type};
 
 static VERSION: OnceLock<String> = OnceLock::new();
 static ARTIFACT: OnceLock<&'static str> = OnceLock::new();
+static FAULT: OnceLock<Fault> = OnceLock::new();
+static HEALTH_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Deterministic bad-application behaviors used by the updater E2E suite. Keeping
+/// these in the managed process (rather than mocking the supervisor's HTTP client)
+/// exercises the real signed bundle, guardian, network timeout, health identity,
+/// rollback, confirmation, and outer-restart paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Fault {
+    #[default]
+    None,
+    ExitBeforeBind,
+    Unhealthy,
+    HangHealth,
+    WrongIdentity,
+    Flapping,
+    CrashOnHealth,
+    DegradeAfterReady,
+}
+
+impl Fault {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "exit-before-bind" => Ok(Self::ExitBeforeBind),
+            "unhealthy" => Ok(Self::Unhealthy),
+            "hang-health" => Ok(Self::HangHealth),
+            "wrong-identity" => Ok(Self::WrongIdentity),
+            "flapping" => Ok(Self::Flapping),
+            "crash-on-health" => Ok(Self::CrashOnHealth),
+            "degrade-after-ready" => Ok(Self::DegradeAfterReady),
+            other => Err(format!("unknown --fault mode {other:?}")),
+        }
+    }
+}
 
 fn version() -> &'static str {
     VERSION.get().expect("version initialized")
@@ -65,6 +100,19 @@ pub fn run_artifact(reexec_capable: bool, artifact: &'static str) {
     VERSION.set(loaded).expect("version set once");
     ARTIFACT.set(artifact).expect("artifact set once");
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let fault = flag(&args, "--fault")
+        .map(|value| Fault::parse(&value))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("sampleapp: {error}");
+            std::process::exit(2);
+        })
+        .unwrap_or_default();
+    FAULT.set(fault).expect("fault set once");
+    if fault == Fault::ExitBeforeBind {
+        eprintln!("sampleapp {}: injected exit before bind", version());
+        std::process::exit(17);
+    }
     let addr = flag(&args, "--addr").unwrap_or_else(|| "127.0.0.1:9090".into());
     let addr: SocketAddr = match addr.parse() {
         Ok(a) => a,
@@ -162,24 +210,52 @@ fn handle(mut stream: TcpStream) {
     // guardian ownership and adoption use the OS-derived child PID over `control` and
     // never depend on this endpoint.
     let pid = std::process::id().to_string();
-    let crash = path == "/crash";
+    let fault = *FAULT.get().expect("fault initialized");
+    let health_request = path == "/healthz";
+    let health_attempt = health_request.then(|| HEALTH_REQUESTS.fetch_add(1, Ordering::SeqCst));
+    if health_request && fault == Fault::HangHealth {
+        // Deliberately much longer than every supervisor-side probe deadline. This
+        // models a wedged handler that accepts the connection and never completes;
+        // recovery must not depend on the managed application releasing it.
+        thread::sleep(Duration::from_secs(300));
+    }
+    let injected_unhealthy = health_request && matches!(fault, Fault::Unhealthy)
+        || health_attempt.is_some_and(|attempt| {
+            (fault == Fault::Flapping && attempt % 2 == 1)
+                || (fault == Fault::DegradeAfterReady && attempt > 0)
+        });
+    let crash = path == "/crash" || (health_request && fault == Fault::CrashOnHealth);
     let (code, body) = match path {
         "/version" => (200, version()),
         "/artifact" => (200, *ARTIFACT.get().expect("artifact initialized")),
+        "/healthz" if injected_unhealthy => (503, "unhealthy"),
         "/healthz" => (200, "ok"),
         "/pid" => (200, pid.as_str()),
         "/crash" => (200, "crashing"),
+        "/" => (200, if version() == "2.0.0" { "green" } else { "red" }),
         _ => (404, "not found"),
     };
-    let reason = if code == 200 { "OK" } else { "Not Found" };
-    let health_headers = if path == "/healthz" {
+    let reason = match code {
+        200 => "OK",
+        503 => "Service Unavailable",
+        _ => "Not Found",
+    };
+    let health_headers = if health_request {
         let token = std::env::var(updated::env::HEALTH_TOKEN)
             .map(|v| format!("{}: {v}\r\n", updated::health::TOKEN_HEADER))
             .unwrap_or_default();
+        let (token, reported_version) = if fault == Fault::WrongIdentity {
+            (
+                format!("{}: forged\r\n", updated::health::TOKEN_HEADER),
+                "forged-version",
+            )
+        } else {
+            (token, version())
+        };
         format!(
             "{token}{}: {}\r\n",
             updated::health::VERSION_HEADER,
-            version()
+            reported_version
         )
     } else {
         String::new()

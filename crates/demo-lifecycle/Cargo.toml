@@ -1,0 +1,10 @@
+[package]
+name = "demo-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foundation = { path = "../foundation" }
+updated = { path = "../updated" }
+ureq.workspace = true

@@ -1,0 +1,57 @@
+---
+# Install everything the demo needs on a fresh Ubuntu server: Docker (kind's runtime), the
+# Rust build toolchain (+ aws-lc-rs C deps), and the kind/kubectl binaries.
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - cmake            # aws-lc-rs builds C via cmake
+      - clang
+      - pkg-config
+      - curl
+      - ca-certificates
+      - git
+      - rsync
+      - jq
+    state: present
+    update_cache: true
+
+# Docker is Docker — kind doesn't care whether it's Debian's docker.io or Docker's own
+# docker-ce. Only install docker.io on a box that has neither; forcing it on top of an
+# existing docker-ce install makes dpkg fail on the shared docker-buildx cli-plugin file.
+- name: Check for an existing Docker install
+  ansible.builtin.command: docker --version
+  register: demo_docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Install Docker (docker.io) when none is present
+  ansible.builtin.apt:
+    name: docker.io
+    state: present
+    update_cache: true
+  when: demo_docker_check.rc != 0
+
+- name: Enable and start Docker
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Install kind
+  ansible.builtin.get_url:
+    url: "https://kind.sigs.k8s.io/dl/{{ demo_kind_version }}/kind-linux-{{ demo_arch }}"
+    dest: /usr/local/bin/kind
+    mode: "0755"
+
+- name: Install kubectl
+  ansible.builtin.get_url:
+    url: "https://dl.k8s.io/release/{{ demo_kubectl_version }}/bin/linux/{{ demo_arch }}/kubectl"
+    dest: /usr/local/bin/kubectl
+    mode: "0755"
+
+- name: Install the Rust toolchain (rustup)
+  ansible.builtin.shell: >
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  args:
+    creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"

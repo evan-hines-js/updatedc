@@ -6,13 +6,24 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# The gateway HTTP data plane is Axum over hyper; hyper-util drives the per-connection serve loop
+# behind our own tokio-rustls accept loops (so TLS/mTLS and the aws-lc-rs provider stay ours).
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "matched-path", "original-uri"] }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+# Request timeout middleware for the gateway routers (bounds slow-loris body reads); returns 408
+# rather than dropping the connection.
+tower-http = { version = "0.6", features = ["timeout"] }
 chrono.workspace = true
 futures.workspace = true
 foundation = { path = "../foundation" }
+hex.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 object_store.workspace = true
 rustls.workspace = true
+# The gateway is externally exposed, so it terminates mTLS: aws-lc-rs rustls, required client cert.
+tokio-rustls = { workspace = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,4 +34,17 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 updated = { path = "../updated" }
 updated-tuf = { path = "../updated-tuf" }
+# The join endpoint parses and signs agent CSRs with the fleet CA (aws-lc-rs backend, one crypto
+# library); x509-parser lets it read the CSR's public key for proof-of-possession.
+rcgen = { workspace = true, features = ["x509-parser"] }
 tempfile = "3"
+
+[dev-dependencies]
+# Introspect minted leaf certificates in join tests: subject, SAN, and public key, to prove the
+# control plane certifies the CSR's key while setting the identity itself.
+x509-parser = "0.16"
+# Drive Axum routers directly in gateway tests via `ServiceExt::oneshot`, no socket needed.
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+fips = ["updated/fips"]

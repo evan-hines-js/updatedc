@@ -1,0 +1,81 @@
+---
+# A real `updated` agent on THIS host, outside kind — the co-located "external VM". It enrolls
+# with the in-cluster control plane and becomes the manual Magnolia node the UI's "Upgrade
+# Magnolia" button rolls. It reaches the gateway by resolving the in-cluster names to nginx on
+# 127.0.0.1 (published on this host's port 80 by the kind config) — no socat, no LAN-IP.
+- name: Resolve the control-plane names to nginx on this host
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} updated co-located agent"
+    block: |
+      127.0.0.1 updatec-gateway release-default
+
+- name: Build the agent binaries from the local source
+  become: false
+  ansible.builtin.command:
+    cmd: cargo build --release -p bootstrap -p supervisor
+    chdir: "{{ demo_root }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+
+- name: Install the agent binaries
+  ansible.builtin.copy:
+    remote_src: true
+    src: "{{ demo_root }}/target/release/{{ item }}"
+    dest: "/usr/local/bin/{{ item }}"
+    mode: "0755"
+  loop:
+    - bootstrap
+    - supervisor
+
+- name: Pin the enrollment identity so it registers as the manual Magnolia node
+  ansible.builtin.shell: |
+    mkdir -p /var/lib/updated/guardian
+    printf %s "{{ demo_colocated_hostname }}" | sha256sum | cut -d' ' -f1 \
+      > /var/lib/updated/guardian/registration-nonce
+  args:
+    creates: /var/lib/updated/guardian/registration-nonce
+
+- name: Read the fleet client identity issued by cert-manager in the cluster
+  ansible.builtin.command:
+    cmd: >-
+      kubectl --context {{ demo_kube_context }} -n {{ demo_namespace }}
+      get secret agent-tls -o jsonpath={.data['{{ item }}']}
+  register: demo_agent_tls
+  changed_when: false
+  loop: [tls.crt, tls.key, ca.crt]
+
+- name: Ensure the agent mTLS directory exists
+  ansible.builtin.file:
+    path: /etc/updated/agent-tls
+    state: directory
+    mode: "0700"
+
+- name: Write the agent mTLS identity (client cert, key, fleet CA)
+  ansible.builtin.copy:
+    dest: "/etc/updated/agent-tls/{{ item.item }}"
+    content: "{{ item.stdout | b64decode }}"
+    mode: "0600"
+  loop: "{{ demo_agent_tls.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  no_log: true
+
+- name: Write the bootstrap enrollment config
+  ansible.builtin.template:
+    src: bootstrap.toml.j2
+    dest: /etc/updated/bootstrap.toml
+    mode: "0600"
+
+- name: Install the agent service
+  ansible.builtin.template:
+    src: updated-agent.service.j2
+    dest: /etc/systemd/system/updated-agent.service
+    mode: "0644"
+
+- name: Start the agent
+  ansible.builtin.systemd:
+    name: updated-agent
+    state: restarted
+    enabled: true
+    daemon_reload: true

@@ -23,3 +23,24 @@ publish_fuzz_corrupt_version() {
   batch_size=$2
   printf '999.%s.%s\n' "$round" "$((batch_size + 1))"
 }
+
+# Canonical expected observation emitted by every harness and verifier.
+publish_fuzz_expectation() {
+  version=$1
+  printf '%s,%s\n' "$version" "$(publish_fuzz_artifact "$version")"
+}
+
+# The application transaction contract is platform-independent. Lifecycle fixtures
+# and observers compare against this exact sequence rather than carrying local copies.
+publish_fuzz_lifecycle_phases() {
+  printf '%s\n' 'preflight,prepare,pre-drain,drain,stop,activate,start,verify,finalize'
+}
+
+publish_fuzz_require_lifecycle_phases() {
+  actual=$1
+  expected=$(publish_fuzz_lifecycle_phases)
+  [ "$actual" = "$expected" ] || {
+    printf 'expected lifecycle phases %s, got %s\n' "$expected" "$actual" >&2
+    return 1
+  }
+}

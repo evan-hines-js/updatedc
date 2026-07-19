@@ -1,0 +1,20 @@
+[Unit]
+Description=updated agent (bootstrap guardian)
+After=network-online.target updated-gateway-shim.service
+Wants=network-online.target
+
+[Service]
+# The guardian derives its enrollment identity from the hostname; pin it so the control plane
+# addresses this node deterministically regardless of the machine's own hostname.
+Environment=HOSTNAME={{ updated_hostname }}
+ExecStart=/usr/local/bin/bootstrap \
+  --state-dir /var/lib/updated/guardian \
+  --supervisor-config /etc/updated/bootstrap.toml \
+  --supervisor /usr/local/bin/supervisor \
+  --ready-timeout 900 --confirm-timeout 5 \
+  --probe-address 0.0.0.0:9090
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

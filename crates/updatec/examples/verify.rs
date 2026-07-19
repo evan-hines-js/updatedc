@@ -16,6 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metadata_limit: 1024 * 1024,
             target_limit: 1024 * 1024,
             transport_timeout: std::time::Duration::from_secs(30),
+            mtls: updated::tls::Identity::new("client.crt", "client.key", "ca.crt"),
         },
         &state.path().join("datastore"),
     )

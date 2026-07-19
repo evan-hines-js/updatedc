@@ -1,0 +1,29 @@
+---
+# Install the `updated` agent on a fleet of hosts and register each with the control plane.
+# This is the VM-fleet counterpart to the Kubernetes operator: the *same* agent (bootstrap +
+# supervisor), installed by ansible instead of a pod spec, phoning the same control plane home.
+#
+# Required vars (see roles/updated_agent/defaults):
+#   updated_source          path to the updated workspace to build from (on the control node)
+#   updated_enrollment_url  the control plane's enrollment endpoint (HTTPS/mTLS)
+#   updated_enrollment_client_cert / _client_key / _ca
+#                           base64 PEM of the fleet client cert, its key, and the fleet CA (the
+#                           mTLS identity — cert-manager issues it; no shared secret)
+#   updated_hostname        stable identity the control plane addresses this node by
+# Optional demo-only vars (kind gateway exposed on the laptop's LAN):
+#   updated_demo_shim_host / updated_demo_shim_port
+- name: Install the updated agent
+  hosts: updated_agents
+  become: true
+  gather_facts: false
+  pre_tasks:
+    # A freshly-imaged VM may lack python/rsync that ansible's modules need; install them raw.
+    - name: Bootstrap python and rsync for ansible
+      ansible.builtin.raw: >
+        (test -e /usr/bin/python3 && command -v rsync >/dev/null 2>&1) ||
+        (apt-get update && apt-get install -y python3 rsync)
+      changed_when: false
+    - name: Gather facts
+      ansible.builtin.setup:
+  roles:
+    - updated_agent

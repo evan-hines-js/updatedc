@@ -26,6 +26,10 @@ pub struct PreparedApplication {
     pub release: ReleaseId,
     pub version: String,
     pub archive_sha256: String,
+    /// The provider set signed with this app version, present only when ordered fallback
+    /// descended below the assigned head. The caller stages *these* providers instead of the
+    /// assignment's `provider_set`, so a rolled-back app runs its own signed providers.
+    pub provider_set: Option<updated::config::TargetReference>,
 }
 
 #[derive(Debug)]
@@ -107,17 +111,23 @@ pub async fn prepare_assigned_application(
     mut is_rejected: impl FnMut(&str) -> bool,
 ) -> Result<Option<PreparedApplication>, PrepareError> {
     let policy = DefaultPolicy::current(&request.application.product, &request.application.channel);
+    // Rejection filtering now happens inside selection: exact-pin returns None when
+    // the assigned bytes are rejected (hold predecessor), and ordered fallback skips
+    // rejected targets as it descends. Diagnostics are dropped here; the supervisor's
+    // own selection path logs skips.
     let Some(selected) = request
         .repository
-        .assigned_application(&policy, request.current_version)
+        .assigned_application(
+            &policy,
+            request.current_version,
+            |_message| {},
+            |target, _version| is_rejected(&target_sha(target)),
+        )
         .map_err(PrepareError::Repository)?
     else {
         return Ok(None);
     };
-    if is_rejected(&selected.sha256) {
-        return Ok(None);
-    }
-    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let platform = foundation::platform::platform_key();
     let store = BundleStore::for_app(request.paths)
         .with_target_limit(request.repository_config.target_limit);
     let StagedRelease { id, .. } = acquire_verified_bundle(
@@ -147,6 +157,7 @@ pub async fn prepare_assigned_application(
         release: id,
         version: selected.version,
         archive_sha256: selected.sha256,
+        provider_set: selected.provider_set,
     }))
 }
 

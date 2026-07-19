@@ -41,10 +41,10 @@ pub const APP_PID_ENV: &str = "UPDATED_APP_PID";
 /// replacement supervisor binary (`<state>/supervisors/<id>/`).
 pub const STATE_DIR_ENV: &str = "UPDATED_STATE_DIR";
 
-/// Filename, under the state directory, the guardian touches when it rolls up a crashed
-/// application; the supervisor reads and clears it on recovery to revert an unconfirmed update. A
-/// shared filename (not a wire message) since both sides agree on the layout.
-pub const CRASH_MARKER_FILE: &str = "app-crashed";
+/// Filename, under the state directory, the guardian touches when it rolls up any
+/// spontaneous managed-service exit. The supervisor consumes it during recovery. This
+/// is shared durable layout, not a wire message.
+pub const SERVICE_EXITED_MARKER_FILE: &str = "service-exited";
 /// Filename, under the state directory, into which the guardian writes the path of a
 /// replacement supervisor that failed its readiness gate (so the guardian rolled the
 /// `desired-supervisor` pointer back). The supervisor reads it on recovery and records
@@ -67,6 +67,8 @@ pub const CAP_LAUNCH_APP_V1: u16 = 1;
 pub const CAP_STOP_APP: u16 = 2;
 pub const CAP_REPLACE_SUPERVISOR_V1: u16 = 3;
 pub const CAP_READY: u16 = 4;
+pub const CAP_TRAFFIC_STATE: u16 = 5;
+pub const CAP_FAIL_APPLICATION: u16 = 6;
 
 /// Everything the current guardian build advertises.
 const CURRENT_CAPS: &[u16] = &[
@@ -74,6 +76,8 @@ const CURRENT_CAPS: &[u16] = &[
     CAP_STOP_APP,
     CAP_REPLACE_SUPERVISOR_V1,
     CAP_READY,
+    CAP_TRAFFIC_STATE,
+    CAP_FAIL_APPLICATION,
 ];
 
 /// A supervisor readiness nonce: 16 random bytes minted per supervisor launch and
@@ -84,6 +88,8 @@ const TAG_LAUNCH: u8 = 0x01;
 const TAG_STOP: u8 = 0x02;
 const TAG_REPLACE: u8 = 0x03;
 const TAG_READY: u8 = 0x04;
+const TAG_TRAFFIC_STATE: u8 = 0x05;
+const TAG_FAIL_APPLICATION: u8 = 0x06;
 
 const TAG_OK: u8 = 0x81;
 const TAG_ERROR: u8 = 0x82;
@@ -189,6 +195,10 @@ pub enum Request {
     ReplaceSupervisor(OsString),
     /// This supervisor has initialized; the nonce proves it is *this* launch.
     Ready(Nonce),
+    /// Publish whether the verified application should receive external traffic.
+    TrafficReady(bool),
+    /// A sustained application liveness failure; stop it and roll failure to the owner.
+    ApplicationFailed,
 }
 
 /// The guardian's reply to a [`Request`].
@@ -487,6 +497,11 @@ impl Request {
                 out.push(TAG_READY);
                 out.extend_from_slice(nonce);
             }
+            Request::TrafficReady(ready) => {
+                out.push(TAG_TRAFFIC_STATE);
+                out.push(u8::from(*ready));
+            }
+            Request::ApplicationFailed => out.push(TAG_FAIL_APPLICATION),
         }
         out
     }
@@ -499,6 +514,12 @@ impl Request {
             TAG_STOP => Request::Stop,
             TAG_REPLACE => Request::ReplaceSupervisor(get_os(body, &mut at)?),
             TAG_READY => Request::Ready(get_nonce(body, &mut at)?),
+            TAG_TRAFFIC_STATE => match body.first() {
+                Some(0) => Request::TrafficReady(false),
+                Some(1) => Request::TrafficReady(true),
+                _ => return Err(Error::Malformed("bad traffic-ready discriminant")),
+            },
+            TAG_FAIL_APPLICATION => Request::ApplicationFailed,
             other => return Err(Error::UnknownTag(other)),
         };
         Ok(req)
@@ -657,6 +678,9 @@ mod tests {
             "/var/lib/app/supervisors/deadbeef/supervisor",
         )));
         round_trip_request(Request::Ready([0xABu8; 16]));
+        round_trip_request(Request::TrafficReady(false));
+        round_trip_request(Request::TrafficReady(true));
+        round_trip_request(Request::ApplicationFailed);
     }
 
     #[test]

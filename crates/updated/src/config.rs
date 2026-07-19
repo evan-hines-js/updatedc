@@ -1,61 +1,50 @@
-//! The update tower's operator configuration: one TOML file describing the managed
-//! application, the signed repository, and the timeouts. The guardian
-//! (`bootstrap`) parses none of it — it is passed through verbatim to the supervisor,
-//! which reads it. Every timeout has a default, so `[timeouts]` — and any field within
-//! it — may be omitted.
+//! Runtime types materialized exclusively from a TUF-verified managed configuration.
+//! The only node-local configuration is the URL-and-key enrollment bootstrap.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::{Host, Url};
 
-/// The whole configuration, deserialized from the TOML file.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Fully verified, materialized runtime configuration.
+#[derive(Debug)]
 pub struct Config {
     pub routing: Routing,
     pub repository: Repository,
     pub application: Application,
-    #[serde(default)]
     pub storage: Storage,
-    #[serde(default)]
     pub timeouts: Timeouts,
 }
 
 /// Bootstrap trust for the small routing repository. `base_url` is the only
 /// repository URL configured on a node; its `metadata/` and `targets/` children
 /// contain a TUF repository whose verified assignment selects the release CDN.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Routing {
     pub root: PathBuf,
     pub base_url: String,
     /// Exact TUF target to resolve (for example `assignments/agents/agent-123.json`).
     pub assignment: String,
-    #[serde(default)]
     pub datastore: Option<PathBuf>,
-    #[serde(default = "meg")]
     pub metadata_limit: u64,
-    #[serde(default = "transport_timeout", deserialize_with = "de_dur")]
     pub transport_timeout: Duration,
+    /// The agent's mTLS identity for reaching the gateway — mandatory, never plaintext. The
+    /// routing and release repositories are the same externally-exposed gateway, so both fetch
+    /// under this identity.
+    pub mtls: crate::tls::Identity,
 }
 
 /// Locally pinned trust and resource limits for the repository selected by the
 /// routing assignment. Its URLs deliberately do not live in local config.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Repository {
     /// Installer-pinned trust anchor (read-only).
     pub root: PathBuf,
     /// Parent of per-assigned-repository TUF metadata caches; defaults to
     /// `<install_root>/state/tuf`.
-    #[serde(default)]
     pub datastore: Option<PathBuf>,
-    #[serde(default = "meg")]
     pub metadata_limit: u64,
-    #[serde(default = "half_gib")]
     pub target_limit: u64,
-    #[serde(default = "transport_timeout", deserialize_with = "de_dur")]
     pub transport_timeout: Duration,
 }
 
@@ -70,10 +59,105 @@ pub struct RepositoryAssignment {
     pub deployment: String,
     pub metadata_url: String,
     pub targets_url: String,
+    /// Optional location the node writes its running-state document to, so the control
+    /// plane can read rollout progress without ever reaching the node. Decoupled from
+    /// `metadata_url`/`targets_url` on purpose: it happens to be the same gateway in the
+    /// demo, but a deployment may point telemetry somewhere else. Absent means the node
+    /// reports nothing and the control plane rolls without completion gating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_url: Option<String>,
     /// Exact application bytes selected by the control plane.
     pub application: TargetReference,
+    /// Signed opt-in to ordered fallback on *first install only*. When true, a node
+    /// with no installed state (and thus no anti-rollback floor) may, if the exact
+    /// assigned bytes prove unusable, descend from the assigned version to the newest
+    /// healthy, non-rejected, policy-authorized target at or below it. Gated to first
+    /// install so an established node keeps exact-pin reject-and-hold and its version
+    /// floor still bounds any descent; authenticated here so only the publisher — not
+    /// an attacker replaying old metadata — can authorize a stateless downgrade.
+    pub ordered_install_fallback: bool,
     /// Exact immutable provider-set document selected independently of the app.
     pub provider_set: TargetReference,
+    /// Pinned public TUF root for the selected release lineage. It is authenticated as
+    /// part of this routing target and materialized locally before the release is opened.
+    pub release_root: serde_json::Value,
+    /// Complete operator-managed runtime configuration. No operational policy remains
+    /// in the two-field bootstrap file.
+    pub runtime: ManagedRuntime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRuntime {
+    pub product: String,
+    pub channel: String,
+    pub install_root: PathBuf,
+    pub args: Vec<String>,
+    pub health_checks: Vec<ManagedHealthCheck>,
+    pub repository: ManagedRepositoryLimits,
+    pub storage: ManagedStorage,
+    pub timeouts: ManagedTimeouts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HealthCheckKind {
+    Startup,
+    Readiness,
+    Liveness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedHealthCheck {
+    pub kind: HealthCheckKind,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRepositoryLimits {
+    pub metadata_limit: u64,
+    pub target_limit: u64,
+    pub transport_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStorage {
+    pub inactive_releases: usize,
+    pub inactive_providers: usize,
+    pub inactive_supervisors: usize,
+    pub inactive_bytes: u64,
+    pub inactive_repository_caches: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTimeouts {
+    pub check_interval_seconds: u64,
+    pub health_grace_seconds: u64,
+    pub health_successes: u32,
+    pub health_interval_seconds: u64,
+    pub retry_after_seconds: u64,
+    pub refresh_retry_seconds: u64,
+    pub confirmation_window_seconds: u64,
+    pub supervisor_check_interval_seconds: u64,
+    /// The *drain hold*, in seconds: how long a managed (stop-start) node waits after withdrawing
+    /// readiness before it stops the running release, so the load balancer has removed it from
+    /// rotation first (no in-flight request lands on a stopping process).
+    ///
+    /// `Some(0)` or absent = **no hold**; `Some(n)` = hold up to `n` seconds (a bounded ceiling, a
+    /// fixed sleep today). A `custom` deployment ignores this — its own Drain hook owns the wait.
+    /// Absent deserializes to no-hold, matching the struct default, so an assignment that omits the
+    /// field never accidentally stalls.
+    ///
+    /// FUTURE (not yet built — tracked in `docs/crash-safety-review.md`): let the intermediary's
+    /// signed [`ManagedStatus::ready`] end the wait early (turning `Some(n)` into a true ceiling),
+    /// and add an explicit externally-managed "wait for the drain-ack" mode. That needs the status
+    /// signal ([`AgentDocument::status`], a separate document) correlated at drain time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_hold_seconds: Option<u64>,
 }
 
 /// Minimal per-node routing document. A node begins with only the routing trust root,
@@ -85,6 +169,41 @@ pub struct RepositoryAssignment {
 pub struct AgentDocument {
     pub schema: u32,
     pub config: TargetReference,
+    /// Externally-managed health status, signed in by the control plane. Its **presence is
+    /// the switch**: when set, this node is managed by an intermediary (here, the Kubernetes
+    /// operator through the healthproxy) and trusts this verdict instead of probing locally;
+    /// when absent, the node runs its own probes (e.g. an ansible-deployed host with no
+    /// orchestrator). It only ever *withdraws* traffic — a node is taken out of rotation via
+    /// readiness, never killed for an unhealthy backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ManagedStatus>,
+}
+
+/// The control plane's signed verdict on a node's current rotation state — see
+/// [`AgentDocument::status`]. Written each cycle by the intermediary from what it observes
+/// (in Kubernetes, whether the node's healthproxy is a live Service endpoint).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStatus {
+    /// The deployment this verdict is about, so the node ignores a status left over from a
+    /// previous deployment generation rather than acting on stale rotation state.
+    pub deployment: String,
+    /// Whether the intermediary currently routes traffic to this node. During a drain it is
+    /// intended to go false once the node has actually left the load balancer, so the built-in
+    /// drain can proceed the instant it sees that instead of waiting out a timer. NOTE: this
+    /// field is **not yet consumed** — the drain hold does not read it today (see
+    /// `drain_hold_seconds` and `docs/crash-safety-review.md`); it is signed-in scaffolding for
+    /// that not-yet-wired early-proceed path.
+    pub ready: bool,
+}
+
+impl ManagedStatus {
+    fn validate(&self) -> Result<(), String> {
+        if self.deployment.is_empty() {
+            return Err("managed status deployment must not be empty".into());
+        }
+        Ok(())
+    }
 }
 
 /// A content-addressed reference to a target authenticated by release-repository TUF
@@ -124,6 +243,9 @@ pub struct ProviderOverride {
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderCapability {
     Lifecycle,
+    /// An external CLI that answers the release's health/readiness (exit 0 = healthy). When
+    /// present it replaces the built-in HTTP readiness probe as the supervisor's health signal.
+    HealthCheck,
 }
 
 impl ProviderSet {
@@ -195,20 +317,8 @@ pub struct RepositorySource {
     pub metadata_limit: u64,
     pub target_limit: u64,
     pub transport_timeout: Duration,
-}
-
-impl Repository {
-    pub fn resolve(&self, assignment: RepositoryAssignment) -> Result<RepositorySource, String> {
-        assignment.validate()?;
-        Ok(RepositorySource {
-            root: self.root.clone(),
-            metadata_url: assignment.metadata_url,
-            targets_url: assignment.targets_url,
-            metadata_limit: self.metadata_limit,
-            target_limit: self.target_limit,
-            transport_timeout: self.transport_timeout,
-        })
-    }
+    /// The agent's mTLS identity for this gateway fetch — mandatory, never plaintext.
+    pub mtls: crate::tls::Identity,
 }
 
 impl RepositoryAssignment {
@@ -232,7 +342,127 @@ impl RepositoryAssignment {
                 return Err(format!("repository assignment {name} reference is invalid"));
             }
         }
+        if !self.release_root.is_object() {
+            return Err("repository assignment release_root must be a JSON object".into());
+        }
+        self.runtime.validate()?;
         Ok(())
+    }
+}
+
+impl ManagedRuntime {
+    fn validate(&self) -> Result<(), String> {
+        if self.product.is_empty() || self.channel.is_empty() || !self.install_root.is_absolute() {
+            return Err("managed runtime product/channel/install_root is invalid".into());
+        }
+        if self.repository.metadata_limit == 0
+            || self.repository.target_limit == 0
+            || self.repository.transport_timeout_seconds == 0
+            || self.storage.inactive_bytes == 0
+            || self.timeouts.check_interval_seconds == 0
+            || self.timeouts.health_grace_seconds == 0
+            || self.timeouts.health_successes == 0
+            || self.timeouts.health_interval_seconds == 0
+            || self.timeouts.retry_after_seconds == 0
+            || self.timeouts.refresh_retry_seconds == 0
+            || self.timeouts.confirmation_window_seconds == 0
+            || self.timeouts.supervisor_check_interval_seconds == 0
+        {
+            return Err("managed runtime limits and timeouts must be non-zero".into());
+        }
+        // A health streak of N successes spaced by `interval` needs at least (N-1)*interval of
+        // grace to ever complete; otherwise a perfectly healthy app is failed on every gate and
+        // its provisional head is needlessly rejected. (interval is ignored when successes == 1.)
+        let min_grace = u64::from(self.timeouts.health_successes.saturating_sub(1))
+            .saturating_mul(self.timeouts.health_interval_seconds);
+        if self.timeouts.health_grace_seconds < min_grace {
+            return Err(format!(
+                "health_grace_seconds ({}) must be >= (health_successes-1)*health_interval_seconds \
+                 ({min_grace}); otherwise the health streak can never complete within the grace window",
+                self.timeouts.health_grace_seconds
+            ));
+        }
+        for check in &self.health_checks {
+            validate_health_check_url(&check.url)?;
+        }
+        for kind in [
+            HealthCheckKind::Startup,
+            HealthCheckKind::Readiness,
+            HealthCheckKind::Liveness,
+        ] {
+            if self
+                .health_checks
+                .iter()
+                .filter(|check| check.kind == kind)
+                .count()
+                > 1
+            {
+                return Err(format!(
+                    "managed runtime has more than one {kind:?} health check"
+                ));
+            }
+        }
+        // Every activation health-gates each release the same way — a readiness URL, a
+        // health-check provider, or simply surviving the grace window — so no activation
+        // needs a config-level readiness requirement. A delegated node with neither a
+        // readiness URL nor a health-check provider is caught at staging, where the provider
+        // set is known (a config that predates the provider fetch cannot see it here).
+        Ok(())
+    }
+
+    pub fn materialize(
+        &self,
+        routing: Routing,
+        release_root: &serde_json::Value,
+        state_dir: &Path,
+    ) -> Result<Config, String> {
+        self.validate()?;
+        let root = state_dir.join("release-root.json");
+        foundation::durable::atomic_write(
+            &root,
+            ".release-root-",
+            &serde_json::to_vec(release_root).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("materializing release root: {error}"))?;
+        Ok(Config {
+            routing,
+            repository: Repository {
+                root,
+                datastore: None,
+                metadata_limit: self.repository.metadata_limit,
+                target_limit: self.repository.target_limit,
+                transport_timeout: Duration::from_secs(self.repository.transport_timeout_seconds),
+            },
+            application: Application {
+                product: self.product.clone(),
+                channel: self.channel.clone(),
+                install_root: self.install_root.clone(),
+                args: self.args.clone(),
+                health_checks: self.health_checks.clone(),
+            },
+            storage: Storage {
+                inactive_releases: self.storage.inactive_releases,
+                inactive_providers: self.storage.inactive_providers,
+                inactive_supervisors: self.storage.inactive_supervisors,
+                inactive_bytes: self.storage.inactive_bytes,
+                inactive_repository_caches: self.storage.inactive_repository_caches,
+            },
+            timeouts: Timeouts {
+                check_interval: Duration::from_secs(self.timeouts.check_interval_seconds),
+                health_grace: Duration::from_secs(self.timeouts.health_grace_seconds),
+                health_successes: self.timeouts.health_successes,
+                health_interval: Duration::from_secs(self.timeouts.health_interval_seconds),
+                retry_after: Duration::from_secs(self.timeouts.retry_after_seconds),
+                refresh_retry: Duration::from_secs(self.timeouts.refresh_retry_seconds),
+                confirmation_window: Duration::from_secs(self.timeouts.confirmation_window_seconds),
+                supervisor_check_interval: Duration::from_secs(
+                    self.timeouts.supervisor_check_interval_seconds,
+                ),
+                // `None` (indefinite) is preserved; a finite value (including 0 = no hold) becomes
+                // a bounded ceiling.
+                drain_hold: self.timeouts.drain_hold_seconds.map(Duration::from_secs),
+            },
+        })
     }
 }
 
@@ -244,25 +474,19 @@ impl AgentDocument {
         if !valid_target_reference(&self.config) {
             return Err("agent document config reference is invalid".into());
         }
+        // A present status is load-bearing (it flips the node to externally-managed), so a
+        // malformed one must fail closed rather than be ignored.
+        if let Some(status) = &self.status {
+            status.validate()?;
+        }
         Ok(())
     }
-}
-
-fn meg() -> u64 {
-    1 << 20
-}
-fn half_gib() -> u64 {
-    512 << 20
-}
-fn transport_timeout() -> Duration {
-    Duration::from_secs(30)
 }
 
 /// Bounds for inactive immutable material. Releases needed by installed state,
 /// rollback state, or an active transaction are always protected regardless of these
 /// limits; the limits apply only to disposable history.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Storage {
     pub inactive_releases: usize,
     pub inactive_providers: usize,
@@ -284,66 +508,39 @@ impl Default for Storage {
 }
 
 /// The program being kept current.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct Application {
     pub product: String,
-    #[serde(default = "stable")]
     pub channel: String,
     /// Root containing active-release, immutable versions, staging, and durable state.
     pub install_root: PathBuf,
     /// Arguments appended to the manifest-owned entrypoint.
-    #[serde(default)]
     pub args: Vec<String>,
-    /// Readiness probe; omit for liveness-only (survive the health grace = healthy).
-    #[serde(default)]
-    pub health_url: Option<String>,
-    /// How a staged release enters service. The default is a portable stop/start;
-    /// reexec keeps the existing master alive and delegates its program-specific
-    /// handoff to the lifecycle provider.
-    #[serde(default)]
-    pub activation: Activation,
+    /// Tagged application probes. Each of startup, readiness, and liveness may appear
+    /// at most once; omitting a kind selects the documented process-lifetime fallback.
+    pub health_checks: Vec<ManagedHealthCheck>,
 }
 
-/// The one application activation model. The signed lifecycle entrypoint is direct argv;
-/// its inputs are supplied exclusively through the documented `UPDATED_*` environment.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum Activation {
-    /// Stop the managed process and launch the candidate entrypoint.
-    #[default]
-    StopStart,
-    /// Keep the master PID alive. The lifecycle provider's `activate` and `rollback`
-    /// phases perform the program-specific handoff.
-    Reexec,
-}
-
-impl Activation {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Activation::StopStart => "stop-start",
-            Activation::Reexec => "reexec",
-        }
+impl Application {
+    pub fn health_check_url(&self, kind: HealthCheckKind) -> Option<&str> {
+        self.health_checks
+            .iter()
+            .find(|check| check.kind == kind)
+            .map(|check| check.url.as_str())
     }
-}
-
-fn stable() -> String {
-    "stable".into()
 }
 
 /// Every tunable duration in the system, in one place. Omit any (or the whole
 /// `[timeouts]` table) to take the default.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Timeouts {
     /// How often to check for an application update.
-    #[serde(deserialize_with = "de_dur")]
     pub check_interval: Duration,
-    /// Window for the child to become healthy after a (re)start. With `health_url`
+    /// Window for the child to become healthy after a (re)start. With a startup or
+    /// readiness health check
     /// this is how long a slow-starting app has to answer — set it to minutes if
     /// needed; a *crash* is still detected instantly (the process exits), so a long
     /// grace never slows crash detection.
-    #[serde(deserialize_with = "de_dur")]
     pub health_grace: Duration,
     /// Consecutive good health responses required to declare the app ready (a
     /// readiness `successThreshold`). Default 1 — the first good answer commits;
@@ -352,21 +549,21 @@ pub struct Timeouts {
     /// Spacing between those confirmation probes (a readiness `periodSeconds`), so
     /// `health_successes > 1` proves health over time, not a 100 ms burst. Ignored
     /// when `health_successes` is 1.
-    #[serde(deserialize_with = "de_dur")]
     pub health_interval: Duration,
     /// How often a health-check-failed release is retried (not permanently blocked).
-    #[serde(deserialize_with = "de_dur")]
     pub retry_after: Duration,
     /// Backoff base for retrying a transient metadata transport failure.
-    #[serde(deserialize_with = "de_dur")]
     pub refresh_retry: Duration,
     /// How long a just-committed update stays unconfirmed. A crash within it reverts the
     /// update (one strike); surviving it confirms the update and drops the rollback image.
-    #[serde(deserialize_with = "de_dur")]
     pub confirmation_window: Duration,
     /// How often to check for a supervisor release.
-    #[serde(deserialize_with = "de_dur")]
     pub supervisor_check_interval: Duration,
+    /// Ceiling on the managed drain hold — how long to wait, after readiness is withdrawn, for the
+    /// load balancer to drop this node before stopping the running release. `None` = wait
+    /// indefinitely for the intermediary's drain acknowledgement (externally managed only);
+    /// `Some(Duration::ZERO)` = no hold. See [`ManagedTimeouts::drain_hold_seconds`].
+    pub drain_hold: Option<Duration>,
 }
 
 impl Default for Timeouts {
@@ -384,91 +581,9 @@ impl Default for Timeouts {
             refresh_retry: Duration::from_secs(5),
             confirmation_window: Duration::from_secs(120),
             supervisor_check_interval: Duration::from_secs(3600),
+            // No hold by default: a deployment opts into the drain hold explicitly.
+            drain_hold: Some(Duration::ZERO),
         }
-    }
-}
-
-impl Config {
-    /// Read and validate the TOML config at `path`.
-    pub fn load(path: &Path) -> Result<Config, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("reading config {}: {e}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&text).map_err(|e| format!("parsing config {}: {e}", path.display()))?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        if !self.application.install_root.is_absolute() {
-            return Err("application.install_root must be absolute".into());
-        }
-        if let Some(raw) = &self.application.health_url {
-            validate_health_url(raw)?;
-        }
-        if let Activation::Reexec = &self.application.activation {
-            if !cfg!(unix) {
-                return Err("application.activation reexec mode is supported only on Unix".into());
-            }
-            if self.application.health_url.is_none() {
-                return Err(
-                    "application.activation reexec mode requires application.health_url".into(),
-                );
-            }
-        }
-        for (name, value) in [
-            ("timeouts.check_interval", self.timeouts.check_interval),
-            ("timeouts.health_grace", self.timeouts.health_grace),
-            ("timeouts.health_interval", self.timeouts.health_interval),
-            ("timeouts.retry_after", self.timeouts.retry_after),
-            ("timeouts.refresh_retry", self.timeouts.refresh_retry),
-            (
-                "timeouts.confirmation_window",
-                self.timeouts.confirmation_window,
-            ),
-            (
-                "timeouts.supervisor_check_interval",
-                self.timeouts.supervisor_check_interval,
-            ),
-        ] {
-            if value.is_zero() {
-                return Err(format!("{name} must be greater than zero"));
-            }
-        }
-        if self.timeouts.health_successes == 0 {
-            return Err("timeouts.health_successes must be greater than zero".into());
-        }
-        if self.repository.metadata_limit == 0 {
-            return Err("repository.metadata_limit must be greater than zero".into());
-        }
-        if self.routing.metadata_limit == 0 {
-            return Err("routing.metadata_limit must be greater than zero".into());
-        }
-        if self.routing.assignment.is_empty()
-            || self.routing.assignment.starts_with('/')
-            || self.routing.assignment.contains(['\\', ':'])
-            || self.routing.assignment.chars().any(char::is_control)
-            || self
-                .routing
-                .assignment
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
-        {
-            return Err("routing.assignment must be a non-empty safe relative target path".into());
-        }
-        if self.repository.target_limit == 0 {
-            return Err("repository.target_limit must be greater than zero".into());
-        }
-        if self.storage.inactive_bytes == 0 {
-            return Err("storage.inactive_bytes must be greater than zero".into());
-        }
-        if self.routing.transport_timeout.is_zero() {
-            return Err("routing.transport_timeout must be greater than zero".into());
-        }
-        if self.repository.transport_timeout.is_zero() {
-            return Err("repository.transport_timeout must be greater than zero".into());
-        }
-        Ok(())
     }
 }
 
@@ -485,6 +600,7 @@ pub struct Paths {
     pub routing_datastore: PathBuf,
     pub assignment: PathBuf,
     pub journal: PathBuf,
+    pub install_journal: PathBuf,
     pub rejected: PathBuf,
     pub app_token: PathBuf,
     pub provider_versions: PathBuf,
@@ -515,6 +631,7 @@ impl Config {
             active_release: install_root.join("active-release"),
             download: install_root.join("staging/bundle.download"),
             journal: state_dir.join("transaction.json"),
+            install_journal: state_dir.join("install.json"),
             rejected: state_dir.join("rejected"),
             app_token: state_dir.join("app-token"),
             provider_versions: install_root.join("providers/versions"),
@@ -537,41 +654,9 @@ pub fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-/// Parse the sole CLI contract shared by every entrypoint that loads this config
-/// (the supervisor and the one-shot updater): `--config <path.toml>`. `-h`/`--help`
-/// prints usage and exits; `prog` names the binary in that message. Returns the
-/// config path, or an `Err` usage string the caller reports before exiting.
-pub fn config_path(prog: &str) -> Result<PathBuf, String> {
-    config_path_from(prog, std::env::args_os().skip(1))
-}
-
-fn config_path_from(
-    prog: &str,
-    args: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<PathBuf, String> {
-    let usage = || format!("usage: {prog} --config <path.toml>");
-    let mut args = args.into_iter();
-    match args.next().as_deref() {
-        Some(value) if value == "--config" => {
-            let path = args
-                .next()
-                .map(PathBuf::from)
-                .ok_or_else(|| "--config needs a path".to_string())?;
-            if args.next().is_some() {
-                return Err(format!("unexpected trailing argument; {}", usage()));
-            }
-            Ok(path)
-        }
-        Some(value) if value == "-h" || value == "--help" => {
-            println!("{}", usage());
-            std::process::exit(0);
-        }
-        _ => Err(usage()),
-    }
-}
-
-fn validate_health_url(raw: &str) -> Result<(), String> {
-    let url = Url::parse(raw).map_err(|error| format!("application.health_url: {error}"))?;
+fn validate_health_check_url(raw: &str) -> Result<(), String> {
+    let url =
+        Url::parse(raw).map_err(|error| format!("application.health_checks[].url: {error}"))?;
     if !matches!(url.scheme(), "http" | "https")
         || url.cannot_be_a_base()
         || !url.username().is_empty()
@@ -579,7 +664,7 @@ fn validate_health_url(raw: &str) -> Result<(), String> {
         || url.fragment().is_some()
     {
         return Err(
-            "application.health_url must be an HTTP(S) URL without credentials or a fragment"
+            "application.health_checks[].url must be an HTTP(S) URL without credentials or a fragment"
                 .into(),
         );
     }
@@ -590,103 +675,134 @@ fn validate_health_url(raw: &str) -> Result<(), String> {
         None => false,
     };
     if !loopback {
-        return Err("application.health_url must use a numeric loopback address".into());
+        return Err("application.health_checks[].url must use a numeric loopback address".into());
     }
     Ok(())
-}
-
-/// Human-friendly durations: `"15s"`, `"5m"`, `"2h"`, `"500ms"`, or a bare integer
-/// (seconds). Keeps the config readable without a `humantime` dependency.
-fn de_dur<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-    use serde::de::{Error, Visitor};
-    struct V;
-    impl Visitor<'_> for V {
-        type Value = Duration;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str(r#"a duration like "15s", "5m", "2h", or an integer of seconds"#)
-        }
-        fn visit_str<E: Error>(self, s: &str) -> Result<Duration, E> {
-            parse_duration(s).ok_or_else(|| E::custom(format!("invalid duration {s:?}")))
-        }
-        fn visit_i64<E: Error>(self, n: i64) -> Result<Duration, E> {
-            let seconds =
-                u64::try_from(n).map_err(|_| E::custom("duration must not be negative"))?;
-            Ok(Duration::from_secs(seconds))
-        }
-    }
-    d.deserialize_any(V)
-}
-
-fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    let n: u64 = s[..split].parse().ok()?;
-    match s[split..].trim() {
-        "" | "s" | "sec" | "secs" | "second" | "seconds" => Some(Duration::from_secs(n)),
-        "ms" => Some(Duration::from_millis(n)),
-        "m" | "min" | "mins" | "minute" | "minutes" => n.checked_mul(60).map(Duration::from_secs),
-        "h" | "hr" | "hrs" | "hour" | "hours" => n.checked_mul(3600).map(Duration::from_secs),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
-    fn make_install_root_native(cfg: &mut Config) {
-        cfg.application.install_root = if cfg!(windows) {
-            PathBuf::from(r"C:\app")
-        } else {
-            PathBuf::from("/app")
-        };
+    fn managed_runtime() -> ManagedRuntime {
+        ManagedRuntime {
+            product: "app".into(),
+            channel: "stable".into(),
+            install_root: "/app".into(),
+            args: vec![],
+            health_checks: vec![ManagedHealthCheck {
+                kind: HealthCheckKind::Readiness,
+                url: "http://127.0.0.1:8080/health".into(),
+            }],
+            repository: ManagedRepositoryLimits {
+                metadata_limit: 1 << 20,
+                target_limit: 512 << 20,
+                transport_timeout_seconds: 30,
+            },
+            storage: ManagedStorage {
+                inactive_releases: 2,
+                inactive_providers: 2,
+                inactive_supervisors: 2,
+                inactive_bytes: 1_073_741_824,
+                inactive_repository_caches: 2,
+            },
+            timeouts: ManagedTimeouts {
+                check_interval_seconds: 60,
+                health_grace_seconds: 30,
+                health_successes: 2,
+                health_interval_seconds: 1,
+                retry_after_seconds: 60,
+                refresh_retry_seconds: 5,
+                confirmation_window_seconds: 120,
+                supervisor_check_interval_seconds: 3600,
+                drain_hold_seconds: Some(0),
+            },
+        }
     }
 
     #[test]
-    fn durations_parse_human_and_bare() {
-        assert_eq!(parse_duration("15s"), Some(Duration::from_secs(15)));
-        assert_eq!(parse_duration("5m"), Some(Duration::from_secs(300)));
-        assert_eq!(parse_duration("2h"), Some(Duration::from_secs(7200)));
-        assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
-        assert_eq!(parse_duration("120"), Some(Duration::from_secs(120)));
-        assert_eq!(parse_duration("nonsense"), None);
-        assert_eq!(parse_duration("18446744073709551615m"), None);
+    fn agent_document_status_is_optional_and_switches_management() {
+        let reference = TargetReference {
+            path: "assignments/configs/abc.json".into(),
+            sha256: "a".repeat(64),
+        };
+        // Absent status: self-managed, and it does not appear in the serialized form.
+        let self_managed = AgentDocument {
+            schema: 1,
+            config: reference.clone(),
+            status: None,
+        };
+        self_managed.validate().unwrap();
+        let json = serde_json::to_string(&self_managed).unwrap();
+        assert!(!json.contains("status"));
+        assert_eq!(
+            serde_json::from_str::<AgentDocument>(&json).unwrap(),
+            self_managed
+        );
+
+        // Present status: externally managed, round-trips, and rejects an empty deployment.
+        let managed = AgentDocument {
+            schema: 1,
+            config: reference,
+            status: Some(ManagedStatus {
+                deployment: "d7".into(),
+                ready: false,
+            }),
+        };
+        managed.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentDocument>(&serde_json::to_string(&managed).unwrap())
+                .unwrap(),
+            managed
+        );
+        let mut invalid = managed;
+        invalid.status.as_mut().unwrap().deployment.clear();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
-    fn assignment_is_strict_and_cannot_replace_the_pinned_root() {
-        let assignment: RepositoryAssignment = serde_json::from_str(
-            r#"{"schema":2,"deployment":"d1","metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/","application":{"path":"app","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"provider_set":{"path":"providers","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
-        )
-        .unwrap();
-        let repository = Repository {
-            root: PathBuf::from("/pinned-root.json"),
-            datastore: None,
-            metadata_limit: meg(),
-            target_limit: half_gib(),
-            transport_timeout: transport_timeout(),
+    fn assignment_is_strict_and_carries_the_release_trust_and_runtime() {
+        let assignment = RepositoryAssignment {
+            schema: 2,
+            deployment: "d1".into(),
+            metadata_url: "https://cdn/m/".into(),
+            targets_url: "https://cdn/t/".into(),
+            report_url: None,
+            application: TargetReference {
+                path: "app".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: TargetReference {
+                path: "providers".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({"signed": {}, "signatures": []}),
+            runtime: managed_runtime(),
         };
-        let source = repository.resolve(assignment).unwrap();
-        assert_eq!(source.root, PathBuf::from("/pinned-root.json"));
+        assignment.validate().unwrap();
 
-        let unknown = r#"{"schema":2,"deployment":"d1","metadata_url":"https://cdn/m/","targets_url":"https://cdn/t/","application":{"path":"app","sha256":"aa"},"provider_set":{"path":"providers","sha256":"bb"},"root":"evil"}"#;
+        let unknown = r#"{"schema":2,"deployment":"d1","unexpected":true}"#;
         assert!(serde_json::from_str::<RepositoryAssignment>(unknown).is_err());
         let future = RepositoryAssignment {
             schema: 3,
             deployment: "future".into(),
             metadata_url: "https://cdn/m/".into(),
             targets_url: "https://cdn/t/".into(),
+            report_url: None,
             application: TargetReference {
                 path: "app".into(),
                 sha256: "a".repeat(64),
             },
+            ordered_install_fallback: false,
             provider_set: TargetReference {
                 path: "providers".into(),
                 sha256: "b".repeat(64),
             },
+            release_root: serde_json::json!({}),
+            runtime: managed_runtime(),
         };
-        assert!(repository.resolve(future).is_err());
+        assert!(future.validate().is_err());
     }
 
     fn provider_override(capability: ProviderCapability) -> ProviderOverride {
@@ -743,128 +859,9 @@ mod tests {
     }
 
     #[test]
-    fn negative_duration_is_rejected() {
-        #[derive(Debug, Deserialize)]
-        #[allow(dead_code)]
-        struct Wrapper {
-            #[serde(deserialize_with = "de_dur")]
-            duration: Duration,
-        }
-
-        let err = toml::from_str::<Wrapper>("duration = -1").unwrap_err();
-        assert!(err.to_string().contains("must not be negative"));
-
-        // A bare integer deserializes through visit_i64 as whole seconds.
-        let ok = toml::from_str::<Wrapper>("duration = 42").unwrap();
-        assert_eq!(ok.duration, Duration::from_secs(42));
-
-        // A wrong type surfaces the human-readable "expecting" description, not an
-        // empty one.
-        let type_err = toml::from_str::<Wrapper>("duration = true").unwrap_err();
-        assert!(type_err.to_string().contains("duration like"), "{type_err}");
-    }
-
-    #[test]
-    fn unsafe_zero_timeouts_are_rejected() {
-        let mut cfg: Config = toml::from_str(
-            r#"
-            [routing]
-            root = "/r"
-            base_url = "http://x/"
-            assignment = "assignments/agents/agent.json"
-            [repository]
-            root = "/r"
-            [application]
-            product = "app"
-            install_root = "/app"
-            [timeouts]
-            check_interval = 0
-            "#,
-        )
-        .unwrap();
-        make_install_root_native(&mut cfg);
-
-        assert_eq!(
-            cfg.validate().unwrap_err(),
-            "timeouts.check_interval must be greater than zero"
-        );
-    }
-
-    #[test]
-    fn zero_health_threshold_and_limits_are_rejected() {
-        let base = r#"
-            [routing]
-            root = "/r"
-            base_url = "http://x/"
-            assignment = "assignments/agents/agent.json"
-            [repository]
-            root = "/r"
-            [application]
-            product = "app"
-            install_root = "/app"
-        "#;
-        let mut cfg: Config = toml::from_str(base).unwrap();
-        make_install_root_native(&mut cfg);
-        cfg.timeouts.health_successes = 0;
-        assert!(cfg.validate().unwrap_err().contains("health_successes"));
-
-        let mut cfg: Config = toml::from_str(base).unwrap();
-        make_install_root_native(&mut cfg);
-        cfg.repository.target_limit = 0;
-        assert!(cfg.validate().unwrap_err().contains("target_limit"));
-
-        let mut cfg: Config = toml::from_str(base).unwrap();
-        make_install_root_native(&mut cfg);
-        cfg.routing.transport_timeout = Duration::ZERO;
-        assert!(cfg.validate().unwrap_err().contains("transport_timeout"));
-    }
-
-    #[test]
-    fn omitted_timeouts_take_defaults_partial_override() {
-        let mut cfg: Config = toml::from_str(
-            r#"
-            [routing]
-            root = "/etc/selfupdate/root.json"
-            base_url = "http://x/"
-            assignment = "assignments/agents/agent.json"
-            [repository]
-            root = "/etc/selfupdate/root.json"
-            [application]
-            product = "app"
-            install_root = "/app"
-            args = ["--addr", "127.0.0.1:9090"]
-            [timeouts]
-            health_grace = "2m"
-            "#,
-        )
-        .unwrap();
-        make_install_root_native(&mut cfg);
-        cfg.validate().unwrap();
-        // Overridden field takes the file value; the rest fall back to defaults.
-        assert_eq!(cfg.timeouts.health_grace, Duration::from_secs(120));
-        assert_eq!(cfg.timeouts.check_interval, Duration::from_secs(15));
-        assert_eq!(cfg.timeouts.retry_after, Duration::from_secs(300));
-        assert_eq!(cfg.repository.metadata_limit, 1 << 20);
-        assert_eq!(cfg.repository.target_limit, 512 << 20);
-        assert_eq!(cfg.routing.transport_timeout, Duration::from_secs(30));
-        assert_eq!(cfg.repository.transport_timeout, Duration::from_secs(30));
-        assert_eq!(cfg.application.channel, "stable");
-    }
-
-    #[test]
-    fn config_path_rejects_every_trailing_argument() {
-        let args = ["--config", "config.toml", "--typo"]
-            .into_iter()
-            .map(OsString::from);
-        assert!(config_path_from("supervisor", args)
-            .unwrap_err()
-            .contains("unexpected trailing argument"));
-    }
-
-    #[test]
-    fn health_url_is_loopback_and_redirect_safe_by_construction() {
+    fn health_check_urls_are_loopback_and_redirect_safe_by_construction() {
         for valid in ["http://127.0.0.1:9090/healthz", "http://[::1]:9090/healthz"] {
-            validate_health_url(valid).unwrap();
+            validate_health_check_url(valid).unwrap();
         }
         for invalid in [
             "http://example.com/healthz",
@@ -874,95 +871,10 @@ mod tests {
             "http://localhost/healthz#fragment",
             "not a url",
         ] {
-            assert!(validate_health_url(invalid).is_err(), "accepted {invalid}");
+            assert!(
+                validate_health_check_url(invalid).is_err(),
+                "accepted {invalid}"
+            );
         }
-    }
-
-    #[test]
-    fn reexec_without_health_url_is_rejected() {
-        let cfg: Result<Config, _> = toml::from_str(
-            r#"
-            [routing]
-            root = "/r"
-            base_url = "http://x/"
-            assignment = "assignments/agents/agent.json"
-            [repository]
-            root = "/r"
-            [application]
-            product = "app"
-            install_root = "/app"
-            [application.activation]
-            mode = "reexec"
-            [application.lifecycle]
-            product = "app-lifecycle"
-            "#,
-        );
-        // Parses, but validation rejects it (Unix) or the platform guard does.
-        if let Ok(cfg) = cfg {
-            assert!(cfg.validate().is_err());
-        }
-
-        // With health_url present, reexec is valid on Unix — the case that
-        // distinguishes the Unix-only platform guard from an unconditional reject.
-        #[cfg(unix)]
-        {
-            let cfg: Config = toml::from_str(
-                r#"
-                [routing]
-                root = "/r"
-                base_url = "http://x/"
-                assignment = "assignments/agents/agent.json"
-                [repository]
-                root = "/r"
-                [application]
-                product = "app"
-                install_root = "/app"
-                health_url = "http://127.0.0.1:9/healthz"
-                [application.activation]
-                mode = "reexec"
-                "#,
-            )
-            .unwrap();
-            cfg.validate().unwrap();
-        }
-    }
-
-    #[test]
-    fn resolve_paths_derives_the_canonical_install_layout() {
-        let dir = std::env::temp_dir().join(format!("cfg-paths-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg: Config = toml::from_str(
-            r#"
-            [routing]
-            root = "/r"
-            base_url = "http://x/"
-            assignment = "assignments/agents/agent.json"
-            [repository]
-            root = "/r"
-            [application]
-            product = "app"
-            install_root = "/placeholder"
-            "#,
-        )
-        .unwrap();
-        let mut cfg = cfg;
-        cfg.application.install_root = dir.clone();
-
-        let paths = cfg.resolve_paths().unwrap();
-        assert_eq!(paths.install_root, dir);
-        assert_eq!(paths.versions, paths.install_root.join("versions"));
-        assert_eq!(
-            paths.active_release,
-            paths.install_root.join("active-release")
-        );
-        assert_eq!(paths.state, paths.install_root.join("state/installed.json"));
-        assert_eq!(paths.datastore, paths.install_root.join("state/tuf"));
-        assert_eq!(
-            paths.download,
-            paths.install_root.join("staging/bundle.download")
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
