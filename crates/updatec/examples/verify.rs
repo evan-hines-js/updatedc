@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     repository
         .download_target(&verified, &state.path().join("assignment.json"))
         .await?;
-    let node: updated::config::NodeAssignment =
+    let node: updated::config::AgentDocument =
         serde_json::from_slice(&std::fs::read(state.path().join("assignment.json"))?)?;
     node.validate()?;
     let config = repository.exact_target(&node.config)?;

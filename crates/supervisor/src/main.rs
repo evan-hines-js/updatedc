@@ -148,6 +148,25 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut store = FileStore::open(opts.paths.clone(), opts.timeouts.retry_after)?;
 
+    match (
+        store.installed(),
+        updated::state::read_enrollment(&opts.paths.state),
+    ) {
+        (updated::state::Installed::Missing, updated::state::EnrollmentState::Missing) => {
+            cold_install(&opts, &mut store).await?;
+        }
+        (updated::state::Installed::Missing, _) => {
+            return Err("installed state is missing after bootstrap eligibility was consumed; refusing to cold-install".into());
+        }
+        (updated::state::Installed::Present(_), updated::state::EnrollmentState::Present) => {}
+        (updated::state::Installed::Present(_), _) => {
+            return Err("installed state exists without a valid enrollment record".into());
+        }
+        (updated::state::Installed::Invalid, _) => {
+            return Err("installed state is invalid; refusing to cold-install".into());
+        }
+    }
+
     // Gather the whole world into a Situation and let the pure boot planner decide
     // everything: recovery, drift enforcement, crash rejection, pending confirm/revert,
     // and whether to adopt the running application or launch a fresh one.
@@ -469,7 +488,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        // Resolve the routing assignment afresh, then load its release repository.
+        // Resolve the agent document afresh, then load its release repository.
         // One verified result serves application and self checks this cycle, and a
         // control-plane reassignment therefore takes effect without process restart.
         let repo = match TrustedRepository::assigned(
@@ -519,7 +538,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
         if app_due {
             loop_state.next_app_check = Instant::now() + jitter(opts.timeouts.check_interval, 20);
-            match check_application(&opts, &repo, &mut store, &mut app, &current).await {
+            match check_application(&opts, &repo, &mut store, &mut app).await {
                 AppOutcome::Upgraded { version } => {
                     current = Some(version);
                     // The commit recorded the update as unconfirmed; pick it up so its
@@ -538,6 +557,50 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+}
+
+async fn cold_install(
+    opts: &Options,
+    store: &mut FileStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo =
+        TrustedRepository::assigned(&opts.routing, &opts.repository, &opts.storage, &opts.paths)
+            .await
+            .map_err(|error| format!("loading the first trusted assignment: {error}"))?;
+    let assignment = repo
+        .assignment()
+        .ok_or("the first trusted repository has no desired deployment")?;
+    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+    let prepared = update_client::prepare_assigned_application(
+        update_client::ApplicationRequest {
+            repository: &repo,
+            application: &opts.application,
+            repository_config: &opts.repository,
+            paths: &opts.paths,
+            current_version: None,
+        },
+        |sha256| store.is_rejected(&lineage, sha256),
+    )
+    .await
+    .map_err(|error| format!("preparing the first application: {error}"))?
+    .ok_or("the first trusted assignment contains no installable application")?;
+
+    // Consume bootstrap first. If any later write is interrupted, subsequent starts fail
+    // closed and cannot reinterpret the damaged install as a never-enrolled node.
+    updated::state::enroll(&opts.paths.state, lineage.clone())?;
+    // Commit first. If activation is interrupted, the ordinary boot planner repairs
+    // the pointer from this authoritative installed record on the next guardian retry.
+    store.commit_installed(&updated::state::InstalledState::confirmed(
+        lineage,
+        prepared.release.clone(),
+        prepared.archive_sha256,
+    ))?;
+    store.activate(&prepared.release)?;
+    log(&format!(
+        "cold-installed application {} from the first trusted assignment",
+        prepared.version
+    ));
+    Ok(())
 }
 
 /// A recovery hook is operator code. If it fails, keep the existing application and
@@ -620,8 +683,10 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
                     kind: updated::transaction::Kind::Supervised,
                     previous_release: pending.previous_release.clone(),
                     previous_archive_sha256: pending.previous_archive_sha256.clone(),
+                    previous_repository_lineage: pending.previous_repository_lineage.clone(),
                     candidate_release: installed.release.clone(),
                     candidate_archive_sha256: installed.archive_sha256.clone(),
+                    candidate_repository_lineage: installed.repository_lineage.clone(),
                     candidate_rejection_required: situation.app_crashed,
                     lifecycle: pending.lifecycle.clone(),
                     phase: TransactionPhase::RollbackStarted,
@@ -775,8 +840,8 @@ fn apply_store_plan(
             ReleaseFix::Activate(release) => store.activate(release)?,
         }
     }
-    for hash in &plan.reject_app {
-        store.reject(hash)?;
+    for (lineage, hash) in &plan.reject_app {
+        store.reject(lineage, hash)?;
     }
     Ok(())
 }

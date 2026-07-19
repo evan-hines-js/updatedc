@@ -14,6 +14,7 @@ async fn stage_lifecycle_provider(
     let assignment = repo
         .assignment()
         .ok_or_else(|| "release repository has no desired deployment".to_string())?;
+    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
     std::fs::create_dir_all(&opts.paths.provider_staging)
         .map_err(|e| format!("creating lifecycle provider staging directory failed: {e}"))?;
     let set_target = repo
@@ -37,7 +38,7 @@ async fn stage_lifecycle_provider(
             )
         })?;
         let sha = target_sha(&target);
-        if store.is_rejected(&sha) {
+        if store.is_rejected(&lineage, &sha) {
             return Err(format!(
                 "desired {:?} provider override was previously rejected",
                 provider.capability
@@ -70,7 +71,7 @@ async fn stage_lifecycle_provider(
         .await
         .map_err(|error| {
             if matches!(&error, update_client::AcquireBundleError::Invalid { .. }) {
-                if let Err(reject_error) = store.reject(&sha) {
+                if let Err(reject_error) = store.reject(&lineage, &sha) {
                     return format!("staging {:?} provider override failed: {error}; recording its rejection also failed: {reject_error}", provider.capability);
                 }
             }
@@ -100,8 +101,17 @@ pub(crate) async fn check_application(
     repo: &TrustedRepository,
     store: &mut dyn Store,
     app: &mut App,
-    current: &Option<String>,
 ) -> AppOutcome {
+    let assignment = match repo.assignment() {
+        Some(assignment) => assignment,
+        None => return AppOutcome::Fatal("release repository has no desired deployment".into()),
+    };
+    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+    let installed = store.installed();
+    let ordered_current = match &installed {
+        updated::state::Installed::Present(state) => state.version_floor_for(&lineage),
+        updated::state::Installed::Missing | updated::state::Installed::Invalid => None,
+    };
     // A persisted rejection applies to the failed bytes only (keyed by hash), so it
     // pins the installation neither below a healthy intermediate release nor against
     // a corrected republish of the same version.
@@ -136,9 +146,9 @@ pub(crate) async fn check_application(
             application: &opts.application,
             repository_config: &opts.repository,
             paths: &opts.paths,
-            current_version: current.as_deref(),
+            current_version: ordered_current,
         },
-        |sha256| store.is_rejected(sha256),
+        |sha256| store.is_rejected(&lineage, sha256),
     )
     .await
     {
@@ -146,7 +156,7 @@ pub(crate) async fn check_application(
         Ok(None) => return AppOutcome::Unchanged,
         Err(error) => {
             if let Some((version, archive_sha256)) = error.rejected_archive() {
-                if let Err(reject_error) = store.reject(archive_sha256) {
+                if let Err(reject_error) = store.reject(&lineage, archive_sha256) {
                     return AppOutcome::Fatal(format!(
                         "rejecting malformed application bundle {version}: {reject_error}"
                     ));
@@ -157,7 +167,34 @@ pub(crate) async fn check_application(
         }
     };
 
-    let from = current.as_deref().unwrap_or("none");
+    // Crossing repository lineages may legitimately select the exact bytes already
+    // running (notably when a freshly enrolled node joins its first group). That is a
+    // state rebind, not an executable replacement: a full transaction would manufacture
+    // a release as its own rollback predecessor. Commit the authenticated lineage while
+    // leaving the active pointer and process untouched.
+    if let updated::state::Installed::Present(installed) = &installed {
+        if let Some(rebound) = installed.rebind_if_same_artifact(
+            lineage.clone(),
+            &prepared.release,
+            &prepared.archive_sha256,
+        ) {
+            if let Err(error) = store.commit_installed(&rebound) {
+                return AppOutcome::Fatal(format!(
+                    "committing repository lineage for the running release: {error}"
+                ));
+            }
+            log(&format!(
+                "adopted repository lineage for already-running {}",
+                installed.release.version
+            ));
+            return AppOutcome::Unchanged;
+        }
+    }
+
+    let from = match &installed {
+        updated::state::Installed::Present(state) => state.release.version.as_str(),
+        updated::state::Installed::Missing | updated::state::Installed::Invalid => "none",
+    };
     log(&format!("applying update {from} -> {}", prepared.version));
     // Drive the transaction over the live-application port; scope the tower so its borrow of
     // `app` is released before the arms below read `app.pid()`.
@@ -168,13 +205,14 @@ pub(crate) async fn check_application(
             store,
             &prepared.release,
             &prepared.archive_sha256,
+            lineage.clone(),
             lifecycle.clone(),
         )
         .await
     };
     match outcome {
         Ok(Outcome::Committed) => {
-            if let Err(e) = store.clear_rejection(&prepared.archive_sha256) {
+            if let Err(e) = store.clear_rejection(&lineage, &prepared.archive_sha256) {
                 warn(&format!(
                     "upgraded to {}, but clearing its stale rejection failed: {e}",
                     prepared.version

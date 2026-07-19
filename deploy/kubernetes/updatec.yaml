@@ -25,12 +25,12 @@ subjects:
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: updatec, namespace: updated-system}
+metadata: {name: updatec-controller, namespace: updated-system}
 spec:
   replicas: 1
-  selector: {matchLabels: {app: updatec}}
+  selector: {matchLabels: {app: updatec-controller}}
   template:
-    metadata: {labels: {app: updatec}}
+    metadata: {labels: {app: updatec-controller}}
     spec:
       serviceAccountName: updatec
       securityContext:
@@ -40,6 +40,7 @@ spec:
         - name: updatec
           image: updatec:kind
           imagePullPolicy: IfNotPresent
+          args: [controller]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
@@ -55,9 +56,61 @@ spec:
             - {name: RUST_LOG, value: info}
           volumeMounts:
             - {name: state, mountPath: /var/lib/updatec}
+            - {name: tmp, mountPath: /tmp}
       volumes:
         - name: state
           persistentVolumeClaim: {claimName: updatec-state}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 256Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: updatec-gateway, namespace: updated-system}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: updatec-gateway}}
+  template:
+    metadata: {labels: {app: updatec-gateway}}
+    spec:
+      serviceAccountName: updatec
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: updatec
+          image: updatec:kind
+          imagePullPolicy: IfNotPresent
+          args: [serve]
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe: {httpGet: {path: /healthz, port: http}}
+          livenessProbe: {httpGet: {path: /healthz, port: http}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          env:
+            - {name: UPDATED_NAMESPACE, value: updated-system}
+            - {name: UPDATED_REPOSITORY, value: default}
+            - {name: UPDATED_LISTEN, value: "0.0.0.0:8080"}
+            - {name: RUST_LOG, value: info}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: updatec-gateway, namespace: updated-system}
+spec:
+  selector: {app: updatec-gateway}
+  ports:
+    - {name: http, port: 80, targetPort: http}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

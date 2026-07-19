@@ -192,7 +192,7 @@ pub struct TrustedRepository {
 }
 
 impl TrustedRepository {
-    /// Resolve the node's exact, TUF-verified routing assignment and then load the
+    /// Resolve the agent's exact, TUF-verified document and then load the
     /// selected release repository. Repeating this operation is how a running node
     /// observes control-plane group changes without restart.
     pub async fn assigned(
@@ -247,11 +247,11 @@ impl TrustedRepository {
         routing.download_target(&target, &paths.assignment).await?;
         let bytes = tokio::fs::read(&paths.assignment)
             .await
-            .map_err(|e| Error::Local(format!("reading verified node assignment: {e}")))?;
-        let node: updated::config::NodeAssignment = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Trust(format!("invalid node assignment: {e}")))?;
-        node.validate().map_err(Error::Trust)?;
-        let config = routing.exact_target(&node.config)?;
+            .map_err(|e| Error::Local(format!("reading verified agent document: {e}")))?;
+        let agent: updated::config::AgentDocument = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Trust(format!("invalid agent document: {e}")))?;
+        agent.validate().map_err(Error::Trust)?;
+        let config = routing.exact_target(&agent.config)?;
         routing.download_target(&config, &paths.assignment).await?;
         let bytes = tokio::fs::read(&paths.assignment)
             .await

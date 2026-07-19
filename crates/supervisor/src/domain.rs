@@ -69,7 +69,7 @@ pub(crate) struct Plan {
     /// resolved). Never set for a plain drift/steady-state boot, which has no journal.
     pub clear_journal: bool,
     /// Application release hashes to add to the rejected set.
-    pub reject_app: Vec<String>,
+    pub reject_app: Vec<(updated::state::RepositoryLineage, String)>,
     /// A rolled-back candidate supervisor to reject, by its content-addressed path.
     pub reject_supervisor: Option<PathBuf>,
     /// Installed-state to (re)write — set to confirm an update (clear pending) or to
@@ -137,6 +137,9 @@ mod tests {
                 manifest_sha256: "aa".into(),
             },
             previous_archive_sha256: "archive-aa".into(),
+            previous_repository_lineage: updated::state::RepositoryLineage::from_metadata_url(
+                "https://repo/metadata/",
+            ),
             lifecycle: None,
             committed_at: 1000,
         }

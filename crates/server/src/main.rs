@@ -83,11 +83,11 @@ async fn publish_assignment(args: &[String]) -> R {
     let config_bytes = serde_json::to_vec(&assignment)?;
     let config_sha256 = updated::hash::sha256_bytes(&config_bytes);
     let (prefix, node_id) = name
-        .rsplit_once("/nodes/")
+        .rsplit_once("/agents/")
         .filter(|(prefix, node)| !prefix.is_empty() && !node.is_empty())
-        .ok_or("--name must use <prefix>/nodes/<node>.json")?;
+        .ok_or("--name must use <prefix>/agents/<agent>.json")?;
     let config_name = format!("{prefix}/configs/{config_sha256}.json");
-    let node = updated::config::NodeAssignment {
+    let node = updated::config::AgentDocument {
         schema: 1,
         config: updated::config::TargetReference {
             path: config_name.clone(),
@@ -119,7 +119,7 @@ async fn publish_assignment(args: &[String]) -> R {
     .await?;
     let _ = std::fs::remove_file(config_source);
     let _ = std::fs::remove_file(node_source);
-    println!("published routing node bundle {name} for {node_id}");
+    println!("published routing agent document {name} for {node_id}");
     Ok(())
 }
 
@@ -192,6 +192,8 @@ fn install_app(args: &[String]) -> R {
     let platform = flag(args, "--platform").ok_or("--platform <os>-<arch> is required")?;
     let entrypoint =
         flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
+    let metadata_url = flag(args, "--metadata-url")
+        .ok_or("--metadata-url <trusted repository metadata base URL> is required")?;
     let state_dir = install_root.join("state");
     let staging = install_root.join("staging");
     let versions = install_root.join("versions");
@@ -216,9 +218,11 @@ fn install_app(args: &[String]) -> R {
         },
     )?;
     updated::bundle::write_active(&install_root.join("active-release"), &staged.id)?;
+    let lineage = updated::state::RepositoryLineage::from_metadata_url(&metadata_url);
+    updated::state::enroll(&state_dir.join("installed.json"), lineage.clone())?;
     updated::state::write_installed(
         &state_dir.join("installed.json"),
-        &updated::state::InstalledState::confirmed(staged.id, staged.archive_sha256),
+        &updated::state::InstalledState::confirmed(lineage, staged.id, staged.archive_sha256),
     )?;
     println!(
         "installed {product} {version} into {}",
@@ -657,6 +661,8 @@ mod tests {
             "macos-aarch64".into(),
             "--entrypoint".into(),
             "bin/app".into(),
+            "--metadata-url".into(),
+            "https://repo/metadata/".into(),
         ];
         install_app(&args).unwrap();
         let state = match updated::state::read_installed(&install.join("state/installed.json")) {

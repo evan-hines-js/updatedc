@@ -496,7 +496,7 @@ fn validate_target_name(name: &str) -> Result<()> {
         || (parts.len() == 2 && parts[0] == "provider-sets" && parts[1].ends_with(".json"))
         || (parts.len() == 3
             && parts[0] == "assignments"
-            && matches!(parts[1], "configs" | "nodes")
+            && matches!(parts[1], "agents" | "configs")
             && parts[2].ends_with(".json"));
     if !known_layout || !parts.iter().all(|p| safe(p)) {
         return Err(RepoError(format!("unsafe target path {name:?}")));
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn target_names_are_confined_to_known_layouts() {
         assert!(validate_target_name("products/app/stable/1.0.0/linux-x86_64/app").is_ok());
-        assert!(validate_target_name("assignments/nodes/node-123.json").is_ok());
+        assert!(validate_target_name("assignments/agents/agent-123.json").is_ok());
         assert!(validate_target_name("assignments/node-123.json").is_err());
         assert!(validate_target_name("provider-sets/web.json").is_ok());
         assert!(validate_target_name("assignments/group/node.json").is_err());

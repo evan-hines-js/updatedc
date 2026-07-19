@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Publish concurrent bundles and require convergence to the greatest valid version.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/scripts/lib/publish-fuzz-plan.sh"
 SMOKE="$ROOT/scripts/macos-smoke.sh"
 WORK="${UPDATED_SMOKE_DIR:-$ROOT/target/macos-smoke}"
 RESULTS="$WORK/publish-fuzz-results"
@@ -12,6 +13,9 @@ INTERVAL="${UPDATED_SMOKE_FUZZ_INTERVAL_SECONDS:-60}"
 BATCH="${UPDATED_SMOKE_FUZZ_BATCH_SIZE:-4}"
 probe_version() {
   curl --connect-timeout 1 --max-time 1 -fsS http://127.0.0.1:19090/version 2>/dev/null || true
+}
+probe_artifact() {
+  curl --connect-timeout 1 --max-time 1 -fsS http://127.0.0.1:19090/artifact 2>/dev/null || true
 }
 if grep -Eq '^mode[[:space:]]*=[[:space:]]*"reexec"' "$WORK/config.toml"; then
   MODE=reexec
@@ -88,6 +92,7 @@ while (( round == 0 || SECONDS - started < DURATION )); do
     UPDATED_SMOKE_PREPARE_ONLY=1 "$SMOKE" publish "$version" >/dev/null
   done
   expected="999.$round.$BATCH"
+  expected_artifact="$(publish_fuzz_artifact "$expected")"
   provider_set="fuzz-$round"
   previous_content="$(<"$DEPLOY_STATE/live/content.db")"
   if [[ -e "$DEPLOY_STATE/attempts.log" ]]; then
@@ -118,7 +123,7 @@ while (( round == 0 || SECONDS - started < DURATION )); do
   fi
   corrupt=""
   if [[ "$CORRUPT" == 1 ]]; then
-    corrupt="999.$round.$((BATCH + 1))"
+    corrupt="$(publish_fuzz_corrupt_version "$round" "$BATCH")"
     UPDATED_SMOKE_PREPARE_ONLY=1 "$SMOKE" publish "$corrupt" >/dev/null
     printf 'intentionally corrupt bundle entrypoint\n' >"$WORK/bin/bundle-$corrupt/bin/app"
     chmod +x "$WORK/bin/bundle-$corrupt/bin/app"
@@ -187,7 +192,7 @@ while (( round == 0 || SECONDS - started < DURATION )); do
   while (( SECONDS < deadline )); do
     probes=$((probes + 1))
     current="$(probe_version)"
-    [[ "$current" == "$expected" ]] && break
+    [[ "$current" == "$expected" && "$(probe_artifact)" == "$expected_artifact" ]] && break
     if (( SECONDS >= next_progress )); then
       echo "  recovery $((SECONDS - recovery_started))s/${INTERVAL}s: ${current:-unavailable}"
       next_progress=$((SECONDS + 2))
@@ -201,6 +206,11 @@ while (( round == 0 || SECONDS - started < DURATION )); do
     tail -n 80 "$WORK/tower.log" >&2
     exit 1
   fi
+  if [[ "$(probe_artifact)" != "$expected_artifact" ]]; then
+    echo "FAIL: batch $round reached $expected with the wrong application artifact" >&2
+    exit 1
+  fi
+  echo "Converged to $expected as $expected_artifact"
   lifecycle_deadline=$((SECONDS + 15))
   attempt_id=""
   while (( SECONDS < lifecycle_deadline )); do

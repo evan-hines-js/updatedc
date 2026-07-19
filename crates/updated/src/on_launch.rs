@@ -5,6 +5,7 @@ use std::io;
 use crate::bundle::{read_active, write_active, ReleaseId};
 use crate::config::Paths;
 use crate::provider::BundleStore;
+use crate::state::RepositoryLineage;
 use crate::state::{read_installed, write_installed, Installed, InstalledState};
 use crate::transaction::{self, Kind, Phase, Recovery, Transaction};
 
@@ -14,14 +15,17 @@ pub fn activate(
     installed: &InstalledState,
     candidate: ReleaseId,
     candidate_archive_sha256: String,
+    candidate_repository_lineage: RepositoryLineage,
 ) -> io::Result<()> {
     let mut transaction = Transaction {
         id: crate::rand::token()?,
         kind: Kind::OnLaunch,
         previous_release: installed.release.clone(),
         previous_archive_sha256: installed.archive_sha256.clone(),
+        previous_repository_lineage: installed.repository_lineage.clone(),
         candidate_release: candidate.clone(),
         candidate_archive_sha256: candidate_archive_sha256.clone(),
+        candidate_repository_lineage: candidate_repository_lineage.clone(),
         candidate_rejection_required: false,
         lifecycle: None,
         phase: Phase::Started,
@@ -34,7 +38,11 @@ pub fn activate(
     advance(paths, &mut transaction, Phase::CandidateVerified)?;
     write_installed(
         &paths.state,
-        &InstalledState::confirmed(candidate, candidate_archive_sha256),
+        &InstalledState::confirmed(
+            candidate_repository_lineage,
+            candidate,
+            candidate_archive_sha256,
+        ),
     )?;
     advance(paths, &mut transaction, Phase::Committed)?;
     transaction::clear(&paths.journal)

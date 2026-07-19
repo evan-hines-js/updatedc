@@ -30,7 +30,7 @@ pub struct Config {
 pub struct Routing {
     pub root: PathBuf,
     pub base_url: String,
-    /// Exact TUF target to resolve (for example `assignments/nodes/node-123.json`).
+    /// Exact TUF target to resolve (for example `assignments/agents/agent-123.json`).
     pub assignment: String,
     #[serde(default)]
     pub datastore: Option<PathBuf>,
@@ -82,7 +82,7 @@ pub struct RepositoryAssignment {
 /// control-plane concern.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeAssignment {
+pub struct AgentDocument {
     pub schema: u32,
     pub config: TargetReference,
 }
@@ -236,16 +236,13 @@ impl RepositoryAssignment {
     }
 }
 
-impl NodeAssignment {
+impl AgentDocument {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != 1 {
-            return Err(format!(
-                "unsupported node assignment schema {}",
-                self.schema
-            ));
+            return Err(format!("unsupported agent document schema {}", self.schema));
         }
         if !valid_target_reference(&self.config) {
-            return Err("node assignment config reference is invalid".into());
+            return Err("agent document config reference is invalid".into());
         }
         Ok(())
     }
@@ -774,7 +771,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/nodes/node.json"
+            assignment = "assignments/agents/agent.json"
             [repository]
             root = "/r"
             [application]
@@ -799,7 +796,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/nodes/node.json"
+            assignment = "assignments/agents/agent.json"
             [repository]
             root = "/r"
             [application]
@@ -829,7 +826,7 @@ mod tests {
             [routing]
             root = "/etc/selfupdate/root.json"
             base_url = "http://x/"
-            assignment = "assignments/nodes/node.json"
+            assignment = "assignments/agents/agent.json"
             [repository]
             root = "/etc/selfupdate/root.json"
             [application]
@@ -888,7 +885,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/nodes/node.json"
+            assignment = "assignments/agents/agent.json"
             [repository]
             root = "/r"
             [application]
@@ -914,7 +911,7 @@ mod tests {
                 [routing]
                 root = "/r"
                 base_url = "http://x/"
-                assignment = "assignments/nodes/node.json"
+                assignment = "assignments/agents/agent.json"
                 [repository]
                 root = "/r"
                 [application]
@@ -940,7 +937,7 @@ mod tests {
             [routing]
             root = "/r"
             base_url = "http://x/"
-            assignment = "assignments/nodes/node.json"
+            assignment = "assignments/agents/agent.json"
             [repository]
             root = "/r"
             [application]

@@ -6,7 +6,7 @@
 [routing]
 root       = "/etc/selfupdate/routing-root.json" # installer-pinned routing trust anchor
 base_url   = "https://updates.example.com/routing/" # the node's only configured repository URL
-assignment = "assignments/nodes/node-123.json"
+assignment = "assignments/agents/agent-123.json"
 transport_timeout = "30s" # overall metadata refresh and per-target progress deadline
 
 [repository]

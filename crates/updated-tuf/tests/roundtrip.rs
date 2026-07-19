@@ -199,7 +199,7 @@ async fn publish_then_verify_and_download() {
     // Republishing one logical name must not invalidate a reader that already trusted
     // the previous metadata generation. Each generation resolves to its own immutable,
     // digest-prefixed target object.
-    let assignment_name = "assignments/nodes/node.json";
+    let assignment_name = "assignments/agents/agent.json";
     let assignment_v1 = tmp.join("assignment-v1");
     std::fs::write(&assignment_v1, b"assignment generation one").unwrap();
     repo::add_release(
@@ -268,7 +268,7 @@ async fn publish_then_verify_and_download() {
         &repo_dir,
         &keys,
         vec![repo::PublishTarget {
-            name: "assignments/nodes/current.json".into(),
+            name: "assignments/agents/current.json".into(),
             source: exact,
             custom: Default::default(),
         }],
@@ -281,7 +281,7 @@ async fn publish_then_verify_and_download() {
         .unwrap();
     let current = replaced.all_targets();
     assert_eq!(current.len(), 1);
-    assert_eq!(current[0].path, "assignments/nodes/current.json");
+    assert_eq!(current[0].path, "assignments/agents/current.json");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

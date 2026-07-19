@@ -96,7 +96,8 @@ try {
     & (Join-Path $bin 'server.exe') init --repo $repo --keys $keys
     if ($LASTEXITCODE) { throw 'repository initialization failed' }
     & (Join-Path $bin 'server.exe') install-app --install-root $install --bundle $bundle `
-        --product app --version 1.0.0 --platform windows-x86_64 --entrypoint bin/app.exe
+        --product app --version 1.0.0 --platform windows-x86_64 --entrypoint bin/app.exe `
+        --metadata-url "http://127.0.0.1:$repoPort/metadata/"
     if ($LASTEXITCODE) { throw 'installer bundle seeding failed' }
     & (Join-Path $bin 'server.exe') publish-app --repo $repo --keys $keys --product app `
         --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
@@ -110,7 +111,7 @@ try {
     $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $setTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
     & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
-        --name assignments/nodes/node.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
+        --name assignments/agents/agent.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
         --targets-url "http://127.0.0.1:$repoPort/targets/" --deployment initial `
         --application-path $appTarget --application-sha256 $appSha `
         --provider-set-path $setTarget --provider-set-sha256 $setSha
@@ -123,7 +124,7 @@ try {
 [routing]
 root = '$($rootJson.Replace("'", "''"))'
 base_url = 'http://127.0.0.1:$repoPort/'
-assignment = 'assignments/nodes/node.json'
+assignment = 'assignments/agents/agent.json'
 
 [repository]
 root = '$($rootJson.Replace("'", "''"))'

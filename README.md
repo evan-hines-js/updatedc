@@ -181,7 +181,7 @@ and SHA-256, so CDN lag can delay a deployment but cannot mix generations:
 
 ```sh
 target/release/server publish-assignment --repo ./routing-repo --keys ./routing-keys \
-  --name assignments/nodes/node-123.json \
+  --name assignments/agents/agent-123.json \
   --deployment deploy-42 \
   --metadata-url https://cdn.example.com/groups/canary/metadata/ \
   --targets-url https://cdn.example.com/groups/canary/targets/ \
@@ -198,7 +198,8 @@ target/release/server install-app \
   --install-root /var/lib/example-app \
   --bundle ./release-linux-x86_64 \
   --product app --version 1.0.0 --platform linux-x86_64 \
-  --entrypoint bin/app
+  --entrypoint bin/app \
+  --metadata-url http://127.0.0.1:8080/metadata/
 ```
 
 ## Configuration
@@ -207,7 +208,7 @@ target/release/server install-app \
 [routing]
 root = "/etc/example-app/routing-root.json"
 base_url = "https://updates.example.com/routing/"
-assignment = "assignments/nodes/node-123.json"
+assignment = "assignments/agents/agent-123.json"
 transport_timeout = "30s"
 
 [repository]
@@ -237,12 +238,13 @@ confirmation_window = "2m"
 All application-owned release paths resolve beneath `install_root`; mutable operator
 configuration and application data belong outside immutable `versions/` directories.
 
-`routing.base_url` is the node's only configured repository URL. The updater derives
-its `metadata/` and `targets/` endpoints, verifies the exact assignment target through
-TUF, then uses the two release-repository URLs in that strict document. It resolves the
-assignment on every update check, so a control-plane group change takes effect without
-restarting the node. The release root remains pinned locally: routing selects a repository,
-not a new trust authority.
+`routing.base_url` is the agent's only configured repository URL. The updater derives
+its standard static `metadata/` and `targets/` endpoints, verifies the exact agent document
+through TUF, then follows its exact config reference and uses that config's two release
+repository URLs. It repeats this routing resolution on every update check, so placement
+changes take effect without restarting the agent. The release root remains pinned locally:
+routing selects a repository, not a new trust authority. S3, CDNs, static HTTP servers,
+and the optional updatec gateway all expose this same byte-for-byte layout.
 See [deploy/config.toml](deploy/config.toml) for every option.
 
 Run the bootstrap—not the supervisor—under the chosen lifecycle owner:

@@ -1,0 +1,25 @@
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p bootstrap -p supervisor -p server -p sampleapp && \
+    cp /src/target/release/bootstrap /out-bootstrap && \
+    cp /src/target/release/supervisor /out-supervisor && \
+    cp /src/target/release/server /out-server && \
+    cp /src/target/release/sampleapp /out-sampleapp && \
+    cp /src/target/release/magnolia-like /out-magnolia-like
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/* && useradd --uid 65532 --create-home updated
+COPY --from=build /out-bootstrap /usr/local/bin/bootstrap
+COPY --from=build /out-supervisor /usr/local/bin/supervisor
+COPY --from=build /out-server /usr/local/bin/server
+COPY --from=build /out-sampleapp /usr/local/bin/sampleapp
+COPY --from=build /out-magnolia-like /usr/local/bin/magnolia-like
+COPY crates/updatec/e2e/release-server.sh /usr/local/bin/release-server
+COPY crates/updatec/e2e/agent.sh /usr/local/bin/run-agent
+COPY scripts/lib/publish-fuzz-plan.sh /usr/local/lib/publish-fuzz-plan.sh
+RUN chmod 0755 /usr/local/bin/release-server /usr/local/bin/run-agent
+USER 65532

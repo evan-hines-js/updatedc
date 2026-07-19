@@ -1,4 +1,43 @@
 use super::super::*;
+
+pub(crate) fn bootstrap_cold_installs_first_application(ctx: &Ctx) -> R {
+    let srv = "127.0.0.1:21079";
+    let svc = "127.0.0.1:21074";
+    let dir = ctx.work.join("cold-install");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    let _server = ctx.serve(&dir, srv)?;
+    let app = dir.join(format!("not-preinstalled{}", ctx.exe));
+    let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+        .cold_install()
+        .health(svc)
+        .check_interval("1s")
+        .guardian()?;
+    if dir.join("install/state/installed.json").exists()
+        || dir.join("install/active-release").exists()
+        || app.exists()
+    {
+        return fail("cold-install fixture accidentally contained a preinstalled application");
+    }
+    let process = Proc::spawn("cold-install", &mut tower)?;
+    let installed = process.wait_for_log(
+        "cold-installed application 1.0.0 from the first trusted assignment",
+        120,
+    ) && wait_for_version(svc, "1.0.0", 120)
+        && dir.join("install/state/installed.json").is_file()
+        && dir.join("install/active-release").is_file();
+    let log = process.captured_log();
+    drop(process);
+    kill_stray(&dir.join("install"));
+    if !installed {
+        return fail(format!(
+            "bootstrap did not cold-install and launch the first application:\n{log}"
+        ));
+    }
+    ok("bootstrap started with only the update runtime, installed the trusted bundle, and launched it");
+    Ok(())
+}
 pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21080", "127.0.0.1:21090");
     let dir = ctx.work.join("app");

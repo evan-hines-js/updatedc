@@ -116,7 +116,7 @@ target_sha256() { "$BIN/server" target-sha256 --repo "$REPO" --name "$1"; }
 assign() {
   local version="$1" app_path="products/app/stable/$1/linux-x86_64/app" set_path="provider-sets/default.json"
   "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
-    --name assignments/nodes/node.json --deployment "app-$version" \
+    --name assignments/agents/agent.json --deployment "app-$version" \
     --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/" \
     --targets-url "http://127.0.0.1:$REPO_PORT/targets/" \
     --application-path "$app_path" --application-sha256 "$(target_sha256 "$app_path")" \
@@ -179,14 +179,15 @@ EOF
 done
 
 "$BIN/server" install-app --install-root "$INSTALL" --product app --version 1.0.0 \
-  --platform linux-x86_64 --bundle "$WORK/bundle-1.0.0" --entrypoint bin/launch
+  --platform linux-x86_64 --bundle "$WORK/bundle-1.0.0" --entrypoint bin/launch \
+  --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/"
 publish 1.0.0 "$WORK/bundle-1.0.0"
 
 cat >"$CONFIG" <<EOF
 [routing]
 root = "$REPO/metadata/root.json"
 base_url = "http://127.0.0.1:$REPO_PORT/"
-assignment = "assignments/nodes/node.json"
+assignment = "assignments/agents/agent.json"
 transport_timeout = "5s"
 [repository]
 root = "$REPO/metadata/root.json"

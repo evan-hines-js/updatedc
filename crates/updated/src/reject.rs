@@ -102,13 +102,17 @@ impl Rejections {
     }
 }
 
-/// The canonical map key for a SHA-256 digest: exactly 64 hex characters, lowercased so
-/// the same digest never occupies two entries. The single definition of what this record
-/// may hold, applied identically on read and write.
+/// Canonical rejection key. Supervisor candidates use their plain digest; application
+/// candidates use `repository-lineage:digest`, preventing a rejection in one metadata
+/// lineage from poisoning a different lineage that happens to reuse the same bytes.
 fn digest_key(hash: &str) -> Result<String, String> {
-    if !crate::hash::is_sha256_hex(hash) {
+    let valid = crate::hash::is_sha256_hex(hash)
+        || hash.split_once(':').is_some_and(|(lineage, digest)| {
+            crate::hash::is_sha256_hex(lineage) && crate::hash::is_sha256_hex(digest)
+        });
+    if !valid {
         return Err(format!(
-            "invalid rejection hash (expected a 64-character hexadecimal SHA-256 digest, got {} characters)",
+            "invalid rejection key (expected a SHA-256 digest or lineage:digest, got {} characters)",
             hash.len()
         ));
     }
@@ -148,6 +152,18 @@ mod tests {
         let r2 = Rejections::load(&path, Duration::from_secs(3600)).unwrap();
         assert!(r2.is_rejected(&digest), "rejection survives a restart");
         assert!(!r2.is_rejected(&hash('3')));
+    }
+
+    #[test]
+    fn application_rejections_are_scoped_to_repository_lineage() {
+        let path = tmp("lineage");
+        let digest = hash('2');
+        let x = format!("{}:{digest}", hash('a'));
+        let y = format!("{}:{digest}", hash('b'));
+        let mut rejections = Rejections::load(&path, Duration::from_secs(3600)).unwrap();
+        rejections.reject(&x).unwrap();
+        assert!(rejections.is_rejected(&x));
+        assert!(!rejections.is_rejected(&y));
     }
 
     #[test]

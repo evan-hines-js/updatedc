@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://updated.dev/schemas/desired-deployment.schema.json",
   "title": "Updated Desired Deployment",
-  "description": "The signed routing document assigning an exact application and provider set to a node.",
+  "description": "A signed config document selecting release endpoints and exact application/provider targets.",
   "type": "object",
   "additionalProperties": false,
   "required": [
