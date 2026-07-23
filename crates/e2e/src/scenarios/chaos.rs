@@ -5,6 +5,7 @@ use super::super::*;
 // itself uses one-second checks and bounded transport retries.
 const TRANSACTION_START_TIMEOUT: u64 = 120;
 const RECOVERY_TIMEOUT: u64 = 120;
+const HEALTH_GRACE: &str = "10s";
 
 /// Crash the supervisor at every application-update transaction boundary; the guardian
 /// relaunches it and recovery (driven by the on-disk journal) drives the update to a
@@ -30,7 +31,7 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
             .readiness_health(&svc)
             .check_interval("1s")
-            .health_grace("2s")
+            .health_grace(HEALTH_GRACE)
             .guardian()?;
         cmd.env("UPDATED_CHAOS_POINT", point);
         let boot = Proc::spawn("chaos", &mut cmd)?;
@@ -113,7 +114,7 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
             .cold_install()
             .readiness_health(&svc)
             .check_interval("1s")
-            .health_grace("2s")
+            .health_grace(HEALTH_GRACE)
             .guardian()?;
         cmd.env("UPDATED_CHAOS_POINT", point);
         let boot = Proc::spawn("install-chaos", &mut cmd)?;
@@ -189,7 +190,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
             .readiness_health(&svc)
             .check_interval("1s")
-            .health_grace("2s")
+            .health_grace(HEALTH_GRACE)
             .confirmation_window("120s")
             .lifecycle(fixture_command)
             .guardian()?;
@@ -359,7 +360,7 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .readiness_health(svc)
         .check_interval("5s")
-        .health_grace("2s")
+        .health_grace(HEALTH_GRACE)
         .lifecycle(fixture_command)
         .guardian()?;
     cmd.env("UPDATED_CHAOS_POINT", "aborted");
@@ -432,7 +433,7 @@ pub(crate) fn transition_attempt_ids_are_scoped(ctx: &Ctx) -> R {
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .readiness_health(svc)
         .check_interval("1s")
-        .health_grace("2s")
+        .health_grace(HEALTH_GRACE)
         .lifecycle(fixture_command)
         .guardian()?;
     let tower = Proc::spawn("attempt-ids", &mut cmd)?;
@@ -555,7 +556,7 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
         .readiness_health(&svc)
         .check_interval("1s")
-        .health_grace("2s")
+        .health_grace(HEALTH_GRACE)
         .lifecycle(fixture_command)
         .guardian()?;
     let tower = Proc::spawn("provider-failure", &mut command)?;
@@ -695,7 +696,7 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
         .readiness_health(&svc)
         .check_interval("1s")
-        .health_grace("2s")
+        .health_grace(HEALTH_GRACE)
         .lifecycle(fixture_command)
         .guardian()?;
     let tower = Proc::spawn("provider-hang", &mut command)?;
@@ -797,7 +798,7 @@ pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .readiness_health(svc)
         .check_interval("1s")
-        .health_grace("2s")
+        .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
         .lifecycle(command)
         .guardian()?;
@@ -914,7 +915,7 @@ pub(crate) fn sample_magnolia_sample_transition(ctx: &Ctx) -> R {
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .readiness_health(svc)
         .check_interval("1s")
-        .health_grace("2s")
+        .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
         .lifecycle(command)
         .guardian()?;
@@ -998,7 +999,7 @@ pub(crate) fn magnolia_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .readiness_health(svc)
         .check_interval("1s")
-        .health_grace("10s")
+        .health_grace(HEALTH_GRACE)
         .lifecycle(command)
         .guardian()?;
     let process = Proc::spawn("magnolia-rollback", &mut tower)?;

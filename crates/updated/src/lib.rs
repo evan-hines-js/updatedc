@@ -20,7 +20,6 @@ pub mod hash;
 pub mod health;
 pub mod install;
 pub mod lock;
-pub mod on_launch;
 pub mod provider;
 pub mod rand;
 pub mod reject;

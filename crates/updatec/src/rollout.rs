@@ -412,11 +412,12 @@ mod tests {
 
     fn runtime() -> updated::config::ManagedRuntime {
         updated::config::ManagedRuntime {
+            mode: updated::config::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
             args: vec![],
-            health_checks: vec![],
+            secrets: vec![],
             repository: updated::config::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,

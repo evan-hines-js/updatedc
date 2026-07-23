@@ -70,11 +70,12 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let root_text = std::fs::read_to_string(repo_dir.join("metadata/root.json")).unwrap();
     let root: serde_json::Value = serde_json::from_str(&root_text).unwrap();
     let runtime = updated::config::ManagedRuntime {
+        mode: updated::config::RuntimeMode::Managed,
         product: "offline-app".into(),
         channel: "stable".into(),
         install_root: tmp.join("install"),
         args: vec!["serve".into()],
-        health_checks: vec![],
+        secrets: vec![],
         repository: updated::config::ManagedRepositoryLimits {
             metadata_limit: 1024 * 1024,
             target_limit: 1024 * 1024,

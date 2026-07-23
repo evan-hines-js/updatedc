@@ -30,12 +30,7 @@ pub struct InstallTransaction {
     pub repository_lineage: RepositoryLineage,
     /// The operator lifecycle provider staged with the install, persisted so the committed
     /// record can reference it and so recovery replays placement with the same provider.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub lifecycle: Option<Box<ProviderRelease>>,
-    /// The health-check provider staged with the install, persisted so the committed record
-    /// references it and recovery gates the first launch with it.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub healthcheck: Option<Box<ProviderRelease>>,
+    pub lifecycle: Box<ProviderRelease>,
     /// Last install step known to have completed durably. Recovery replays the next step;
     /// every step is idempotent across the action/journal-write gap.
     pub phase: InstallPhase,
@@ -70,16 +65,11 @@ impl InstallTransaction {
                 "install transaction repository lineage is invalid",
             ));
         }
-        for provider in [self.lifecycle.as_ref(), self.healthcheck.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if provider.product.is_empty() || provider.timeout_millis == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "install transaction provider identity is invalid",
-                ));
-            }
+        if self.lifecycle.product.is_empty() || self.lifecycle.timeout_millis == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "install transaction provider identity is invalid",
+            ));
         }
         Ok(())
     }
@@ -152,6 +142,16 @@ pub fn clear(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn provider() -> Box<ProviderRelease> {
+        Box::new(ProviderRelease {
+            product: "reconciler".into(),
+            release: release("1.0.0", "reconciler-manifest"),
+            archive_sha256: "reconciler-archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        })
+    }
+
     fn release(version: &str, digest: &str) -> ReleaseId {
         ReleaseId {
             version: version.into(),
@@ -167,8 +167,7 @@ mod tests {
             repository_lineage: crate::state::RepositoryLineage::from_metadata_url(
                 "https://repo/metadata/",
             ),
-            lifecycle: None,
-            healthcheck: None,
+            lifecycle: provider(),
             phase: InstallPhase::Started,
         }
     }

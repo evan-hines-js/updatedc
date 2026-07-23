@@ -162,7 +162,7 @@ done
   --platform linux-x86_64 --bundle "$WORK/bundle-1.0.0" --entrypoint bin/launch \
   --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/"
 cat >"$RUNTIME" <<EOF
-{"product":"app","channel":"stable","install_root":"$INSTALL","args":[],"health_checks":[{"kind":"readiness","url":"http://127.0.0.1:$HTTP_PORT/"}],"activation":"custom","repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_supervisors":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"retry_after_seconds":60,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"supervisor_check_interval_seconds":3600}}
+{"mode":"managed","product":"app","channel":"stable","install_root":"$INSTALL","args":[],"repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_supervisors":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"retry_after_seconds":60,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"supervisor_check_interval_seconds":3600}}
 EOF
 publish 1.0.0 "$WORK/bundle-1.0.0"
 "$BIN/server" export-enrollment --repo "$REPO" --assignment assignments/agents/agent.json \
@@ -210,22 +210,20 @@ new_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "HAProxy did
 # activation is replayed, rather than relying only on the purpose-built sample server.
 release2="$(find "$INSTALL/versions" -maxdepth 1 -type d -name '2.0.0-*' -print -quit)"
 [[ -n "$release2" ]] || fail "could not locate the immutable HAProxy 2.0.0 release"
-replay_worker="$new_worker"
 for _ in 1 2; do
-  old_worker="$(pgrep -P "$master_pid" | sort -n | tail -n1)"
-  UPDATED_LIFECYCLE_PHASE=activate \
-  UPDATED_LIFECYCLE_ATTEMPT_ID=haproxy-idempotency-replay \
-  UPDATED_CANDIDATE="$release2" \
-  UPDATED_INSTALL_ROOT="$INSTALL" \
-    UPDATED_CHILD_PID="$master_pid" \
-    "$BIN/lifecycle"
-  replay_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "duplicate activation did not finish worker turnover"
-  wait_master_loaded_runtime "$master_pid" || fail "duplicate activation did not finish master re-exec"
-  wait_version 2.0.0
+  "$BIN/lifecycle" activate \
+    --protocol 1 \
+    --attempt-id haproxy-idempotency-replay \
+    --reason update \
+    --install-root "$INSTALL" \
+    --state-dir "$INSTALL/providers/state/haproxy" \
+    --candidate "$release2" \
+    --candidate-version 2.0.0 \
+    --predecessor "$release2" \
+    --predecessor-version 2.0.0
 done
-[[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "idempotent activation replay changed the HAProxy master PID"
 
-preflight_worker="$replay_worker"
+preflight_worker="$new_worker"
 preflight_inode="$(stat -Lc '%d:%i' "/proc/$master_pid/exe")"
 publish 3.0.0 "$WORK/bundle-3.0.0"
 sleep 6

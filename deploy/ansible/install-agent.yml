@@ -4,7 +4,7 @@
 # supervisor), installed by ansible instead of a pod spec, phoning the same control plane home.
 #
 # Required vars (see roles/updated_agent/defaults):
-#   updated_source          path to the updated workspace to build from (on the control node)
+#   updatedc_source         path to the updatedc workspace to build from (on the control node)
 #   updated_enrollment_url  the control plane's enrollment endpoint (HTTPS/mTLS)
 #   updated_enrollment_client_cert / _client_key / _ca
 #                           base64 PEM of the fleet client cert, its key, and the fleet CA (the

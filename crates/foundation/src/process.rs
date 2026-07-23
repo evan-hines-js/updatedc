@@ -58,6 +58,11 @@ impl ContainedChild {
         self.child.stdout.take()
     }
 
+    /// Take the root child's captured stderr.
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
     /// Non-blocking exit check of the root child.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()

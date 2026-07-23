@@ -1,14 +1,14 @@
-# updated + updatec — reliable upgrades across fleets of applications
+# updatedc — reliable upgrades across fleets of applications
 
-[![CI](https://github.com/evan-hines-js/updated/actions/workflows/ci.yml/badge.svg)](https://github.com/evan-hines-js/updated/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml/badge.svg)](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml)
+[![License: PolyForm Small Business 1.0.0](https://img.shields.io/badge/License-PolyForm%20Small%20Business%201.0.0-blue.svg)](LICENSE)
 
 <p align="center">
   <img src="assets/fleet-cube.svg" width="700"
-       alt="An isometric lattice of green fleet nodes as a series of cubes and towers, each updating at its own pace — the taller the tower, the slower it changes colour. Most pulse amber and settle back to green; some fail (holding red), turn purple as they roll back, and settle on a different green: the previous version." />
+       alt="updatedc: the updatec control plane distributes signed releases to a fleet of updated node agents." />
 </p>
 
-This project is two cooperating halves that together roll signed application updates
+**updatedc** is two cooperating halves that together roll signed application updates
 across a whole fleet:
 
 - **`updated`** — the per-node agent. It securely installs and activates signed
@@ -207,50 +207,31 @@ Trust is anchored by [TUF](https://theupdateframework.io/) through the `tough` c
 pinned-root rotation, threshold roles, expiry/freeze resistance, metadata rollback
 protection, and target hash/length verification are not reimplemented here.
 
-## Activation modes
+## Runtime modes
 
-### Portable restart (default)
+The signed runtime has two ownership modes:
 
-`mode = "stop-start"` is the default: stop → activate → start. It works on Linux, macOS,
-and Windows and needs no update-specific application behavior. Health gates and the
-confirmation window bound the rollback decision.
+- `managed` (the default): the guardian launches one contained application child, observes
+  exit, adopts it across supervisor replacement, and owns stop and process-tree cleanup.
+- `provider-managed`: the agent launches and manages no application process. The signed node
+  reconciler performs every external effect, including calls to systemd, launchd, Windows SCM,
+  a container runtime, firmware tooling, or a remote control plane.
 
-### Custom provider lifecycle
+There is no partially managed mode and no PID-discovery contract. Either the guardian owns
+the process, or the reconciler owns the external runtime.
 
-For deployments the updater should not stop and start itself — a systemd unit, a
-launcher, a master/worker service that reloads in place — a signed lifecycle provider
-drives activation instead:
+Every deployment carries an immutable, signed node-reconciler bundle. The agent supplies
+delivery, verification of bytes, durable ordering, retries, deadlines, containment,
+cancellation, rollback journaling, scheduling, and telemetry. The bundle supplies all
+application-specific behavior through one executable accepting `preflight`, `prepare`, `pre-drain`, `drain`, `stop`,
+`pre-start`, `activate`, `start`, `verify`, `periodic`, `finalize`, and `rollback`.
 
-```toml
-[application.activation]
-mode = "custom"
-```
+`verify` performs one observation and exits zero only when the candidate is acceptable. The
+agent retries it to the signed success threshold within the signed grace window. `periodic`
+performs one steady-state observation on the signed cadence. Managed child exit remains an
+immediate reliability event independent of either reconciler observation.
 
-The supervisor contains the built-in `default` provider (its version *is* the supervisor
-version). A desired deployment may reference an immutable, separately-signed provider-set
-document that pins a capability override, argv, and timeout. Built-in and external
-providers receive the same phases; external loading is an override, not a second update
-path. The manifested entrypoint receives one of `preflight`, `prepare`, `drain`, `stop`,
-`activate`, `start`, `verify`, `finalize`, or `rollback` in `UPDATED_LIFECYCLE_PHASE`,
-plus a stable `UPDATED_LIFECYCLE_ATTEMPT_ID` and candidate/predecessor paths. It must be
-idempotent. In custom mode an external process provider owns the real process and reports
-its PID back for health and crash watching; the supervisor commits only once authenticated
-health confirms the expected version.
-
-See [LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md) for copy/paste AI prompts that map an
-existing deployment runbook or script set onto this protocol. Operators configure only the
-generated dispatcher; it can delegate internally to existing site scripts.
-
-### Update on launch
-
-`updated-oneshot` uses the same bundle store, verification, journal, recovery, and
-activation code before `exec`ing the active entrypoint. This fits CLIs, batch jobs, and
-Discord-style desktop launchers that update before the GUI starts. Network failure falls
-back to the verified committed bundle.
-
-Always-running desktop or tray applications can instead place the bootstrap under a login
-item or small startup host. The updater requires an outer start/relaunch/stop contract,
-not specifically a server init system.
+See [LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md) for copyable Bash and PowerShell templates.
 
 ## Bootstrap and enrollment
 
@@ -303,7 +284,7 @@ and local diagnostics one stable lifecycle surface:
 | Starting | 503 | 503 | 200 | Tower is alive; no application has been accepted yet |
 | Serving | 200 | 200 | 200 | The committed application is healthy and may receive traffic |
 | Draining | 200 | 503 | 200 | Planned update or rollback; remove traffic without restarting |
-| Failed | latched value | 503 | 503 | Application/process health failed; replace the tower |
+| Failed | latched value | 503 | 503 | Provider verification or managed-process liveness failed |
 
 ```text
 Starting --first healthy application--> Serving
@@ -314,25 +295,10 @@ any live state --application failure--> Failed
 
 Readiness is withdrawn before stop begins and restored only after the candidate commits or
 the predecessor is restored. Liveness remains successful throughout an intentional drain.
-Startup is a one-way latch, matching Kubernetes startup-probe semantics. A process crash is
-observed directly by the guardian and rolls up the tower immediately; three consecutive
-failures from a tagged application liveness check produce the same `Failed` transition.
-
-Signed managed configuration preserves distinct application health semantics:
-
-```json
-{
-  "healthChecks": [
-    {"kind": "startup", "url": "http://127.0.0.1:8080/startup"},
-    {"kind": "readiness", "url": "http://127.0.0.1:8080/ready"},
-    {"kind": "liveness", "url": "http://127.0.0.1:8080/live"}
-  ]
-}
-```
-
-Each kind may occur at most once and uses a numeric-loopback HTTP(S) URL. An update-unaware
-application may omit all three: surviving the configured startup grace supplies readiness,
-while a real process exit is still detected immediately.
+Startup is a one-way latch, matching Kubernetes startup-probe semantics. In managed mode a
+child crash is observed directly by the guardian and rolls up the tower immediately. All
+application-specific acceptance and steady-state evidence comes from the signed provider's
+`verify` and `periodic` hooks; the node configuration contains no HTTP health language.
 
 Platform templates and permission guidance are in [deploy/README.md](deploy/README.md).
 
@@ -474,4 +440,4 @@ is for development and for control planes built on other orchestrators.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+PolyForm Small Business License 1.0.0. See [LICENSE](LICENSE).

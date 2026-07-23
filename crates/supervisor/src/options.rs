@@ -17,7 +17,11 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
     let paths = cfg.resolve_paths()?;
 
     let supervisor_update = build_supervisor_update(&cfg, state_dir);
+    let secrets =
+        secrets::SecretManager::initialize(&cfg.routing, &cfg.deployment, &cfg.application.secrets)
+            .await?;
     Ok(Options {
+        deployment: cfg.deployment,
         routing: cfg.routing,
         repository: cfg.repository,
         application: cfg.application,
@@ -25,6 +29,7 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
         storage: cfg.storage,
         paths,
         supervisor_update,
+        secrets,
     })
 }
 

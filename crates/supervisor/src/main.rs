@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use updated::config::{with_suffix, Application, Paths, Repository, Routing, Storage, Timeouts};
-use updated::{env, health};
+use updated::env;
 mod app;
 mod boot;
 mod domain;
@@ -17,6 +17,7 @@ mod guardian;
 mod install;
 mod options;
 mod schedule;
+mod secrets;
 mod selection;
 mod self_update;
 mod store;
@@ -44,6 +45,7 @@ use updated_tuf::{DefaultPolicy, TrustedRepository};
 const SELF_VERSION: &str = env!("SUPERVISOR_VERSION");
 
 struct Options {
+    deployment: String,
     routing: Routing,
     repository: Repository,
     application: Application,
@@ -52,6 +54,7 @@ struct Options {
     /// Canonical bundle installation layout.
     paths: Paths,
     supervisor_update: SupervisorUpdate,
+    secrets: secrets::SecretManager,
 }
 
 impl Options {
@@ -67,7 +70,9 @@ impl Options {
     /// cohort keeps running with its old launch until relaunched, so the reload signal the
     /// activate hook later sends would hit a process that never learned to honour it.
     fn apply_runtime(&mut self, runtime: &updated::config::ManagedRuntime) -> bool {
-        let relaunch = self.application.args != runtime.args;
+        let relaunch = self.application.args != runtime.args
+            || self.application.mode != runtime.mode
+            || self.application.secrets != runtime.secrets;
         self.application = runtime.application();
         self.timeouts = runtime.timeouts();
         self.storage = runtime.storage();
@@ -348,7 +353,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 phase: LifecyclePhase::Start,
                 reason: LifecycleReason::Update,
                 id: &tx.id,
-                pid: Some(app.pid()),
+                pid: app.pid(),
                 candidate: &tx.previous_release,
                 predecessor: &tx.candidate_release,
             },
@@ -388,47 +393,24 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // Gate readiness: the application must be healthy before we trust this boot. A crash
     // would have torn the tower down instead, so an unhealthy result here means the
     // process is alive but wedged — fail closed. For a candidate supervisor, failing this
-    // exits before signalling ready, so the guardian rolls the candidate back. The health-check
-    // provider, if the installed release ships one, is the signal and replaces the HTTP probe.
+    // exits before signalling ready, so the guardian rolls the candidate back. The lifecycle
+    // provider's verify phase is the application-specific signal.
     // During a crash-recovered rollback the predecessor commit is deferred until *after* this gate,
     // so `store.installed()` still holds the CANDIDATE record. Gate the restored predecessor with
-    // ITS OWN health/process providers — carried in the recovery transaction from `pending` (the
+    // ITS OWN lifecycle provider — carried in the recovery transaction from `pending` (the
     // operator set staged for exactly this rollback) — not the candidate's. Otherwise an update that
-    // revised the health-check provider, then failed, would gate the healthy predecessor with a
-    // probe only the candidate serves, reject it, and crash-loop a good release.
-    let installed_healthcheck = match recovery_transaction.as_ref() {
-        Some(tx) if tx.is_rollback() => tx.healthcheck.clone(),
-        _ => installed_health_provider(&store),
+    // revised the lifecycle provider, then failed, would gate the healthy predecessor with the
+    // candidate's policy, reject it, and crash-loop a good release.
+    let installed_lifecycle = match recovery_transaction.as_ref() {
+        Some(tx) if tx.is_rollback() => tx.lifecycle.clone(),
+        _ => installed_lifecycle_provider(&store),
     };
-    let boot_healthy = if let Some(healthcheck) = installed_healthcheck.as_deref() {
-        let pid = Some(app.pid());
-        became_healthy_via_provider(
-            healthcheck,
-            &opts,
-            pid,
-            opts.timeouts.health_grace,
-            opts.timeouts.health_successes,
-            opts.timeouts.health_interval,
-        )
-        .await
-    } else {
-        became_healthy(
-            &app,
-            opts.timeouts.health_grace,
-            opts.application
-                .health_check_url(updated::config::HealthCheckKind::Startup)
-                .or_else(|| {
-                    opts.application
-                        .health_check_url(updated::config::HealthCheckKind::Readiness)
-                }),
-            // Boot always launches fresh through the guardian, so its token identifies the
-            // image; no version proof is needed here even for a reload deployment.
-            None,
-            opts.timeouts.health_successes,
-            opts.timeouts.health_interval,
-        )
-        .await?
+    let installed = match store.installed() {
+        Installed::Present(installed) => installed.release,
+        _ => return Err("cannot verify a boot without an installed release".into()),
     };
+    let mut tower = DefaultProvider::new(&mut app, &opts, installed_lifecycle.as_deref());
+    let boot_healthy = update::became_verified(&mut tower, "boot", &installed, &installed).await;
     if !boot_healthy {
         // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
         // dangerous case: `reject_provisional_head` below would no-op (the still-deferred
@@ -498,7 +480,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 phase: LifecyclePhase::Verify,
                 reason: LifecycleReason::Update,
                 id: &tx.id,
-                pid: Some(app.pid()),
+                pid: app.pid(),
                 candidate: &tx.previous_release,
                 predecessor: &tx.candidate_release,
             },
@@ -539,7 +521,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     phase: LifecyclePhase::Rollback,
                     reason: LifecycleReason::Update,
                     id: &tx.id,
-                    pid: Some(app.pid()),
+                    pid: app.pid(),
                     candidate: &tx.previous_release,
                     predecessor: &tx.candidate_release,
                 },
@@ -579,24 +561,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("publishing initial application readiness: {error}"))?;
 
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
-    // Owned so the loop can re-derive them after a control-plane reassignment updates
-    // `opts.application` (see `Options::apply_runtime`); a borrowed `&str` into `opts` would
-    // pin it immutable for the whole loop.
-    let mut readiness_url: Option<String> = opts
-        .application
-        .health_check_url(updated::config::HealthCheckKind::Readiness)
-        .map(str::to_owned);
-    let mut liveness_url: Option<String> = opts
-        .application
-        .health_check_url(updated::config::HealthCheckKind::Liveness)
-        .map(str::to_owned);
-    // Built once and reused: the probe is just a pooled HTTP client, so a reassignment that
-    // adds or changes a health URL is picked up by re-deriving the URLs above, not the client.
-    let health_probe = Some(HealthProbe::new()?);
-    // The installed release's health-check provider, if it ships one, is the single steady-state
-    // signal — it drives both readiness and liveness, replacing the HTTP probes. Refreshed when
-    // an update commits, since the provider travels with the release.
-    let mut steady_healthcheck = installed_health_provider(&store);
+    // The installed lifecycle provider's periodic phase is the steady-state signal. It drives
+    // readiness and liveness and is refreshed when an update commits.
+    let mut steady_lifecycle = installed_lifecycle_provider(&store);
     let mut next_health_probe = Instant::now() + opts.timeouts.health_interval;
     let mut liveness_failures = 0u32;
     // Rollout telemetry: this node's identity and a client for best-effort reports. Both
@@ -661,7 +628,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             opts.timeouts.check_interval
         };
         let mut wait = app_wait.min(self_update.due_in(now));
-        if health_probe.is_some() || steady_healthcheck.is_some() {
+        if steady_lifecycle.is_some() {
             wait = wait.min(next_health_probe.saturating_duration_since(now));
         }
         let wait = wait.max(Duration::from_millis(100));
@@ -672,16 +639,26 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let now = Instant::now();
-        if let Some(healthcheck) = steady_healthcheck
-            .as_deref()
-            .filter(|_| now >= next_health_probe)
-        {
-            // The health-check provider is the single steady-state signal: one probe per tick
-            // drives readiness (rotation) and liveness (teardown after repeated failure), just
-            // as it gated startup. It replaces the HTTP probes entirely for such a release.
+        if steady_lifecycle.is_some() && now >= next_health_probe {
+            // One periodic hook invocation per tick drives readiness and liveness.
             next_health_probe = now + opts.timeouts.health_interval;
-            let pid = Some(app.pid());
-            let healthy = run_healthcheck_command(healthcheck, &opts, pid);
+            let installed = match store.installed() {
+                Installed::Present(installed) => installed.release,
+                _ => return Err("periodic verification has no installed release".into()),
+            };
+            let healthy = invoke_deployment_provider(
+                steady_lifecycle.as_deref(),
+                &opts,
+                LifecycleInvocation {
+                    phase: LifecyclePhase::Periodic,
+                    reason: LifecycleReason::Restart,
+                    id: "periodic",
+                    pid: app.pid(),
+                    candidate: &installed,
+                    predecessor: &installed,
+                },
+            )
+            .is_ok();
             last_ready = Some(healthy);
             app.traffic_ready(healthy)
                 .map_err(|error| format!("publishing application readiness: {error}"))?;
@@ -689,43 +666,13 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 liveness_failures = 0;
             } else {
                 liveness_failures = liveness_failures.saturating_add(1);
-                if liveness_failures >= 3 {
+                if liveness_failures >= 3
+                    && opts.application.mode == updated::config::RuntimeMode::Managed
+                {
                     app.guardian.application_failed().map_err(|error| {
                         format!("reporting application liveness failure: {error}")
                     })?;
                     return Err("the managed application failed its liveness check".into());
-                }
-            }
-        } else if let Some(probe) = health_probe.as_ref().filter(|_| now >= next_health_probe) {
-            next_health_probe = now + opts.timeouts.health_interval;
-            // A tagged URL is sampled at most once per tick. When readiness and
-            // liveness intentionally share an application endpoint, both policies see
-            // the same observation rather than racing a flapping handler.
-            let readiness = match readiness_url.as_deref() {
-                Some(url) => Some(probe.sample(&app, url, None, None).await),
-                None => None,
-            };
-            if let Some(ready) = readiness {
-                last_ready = Some(ready);
-                app.traffic_ready(ready)
-                    .map_err(|error| format!("publishing application readiness: {error}"))?;
-            }
-            if let Some(url) = liveness_url.as_deref() {
-                let live = if readiness_url.as_deref() == Some(url) {
-                    readiness.expect("the shared readiness URL was sampled")
-                } else {
-                    probe.sample(&app, url, None, None).await
-                };
-                if live {
-                    liveness_failures = 0;
-                } else {
-                    liveness_failures = liveness_failures.saturating_add(1);
-                    if liveness_failures >= 3 {
-                        app.guardian.application_failed().map_err(|error| {
-                            format!("reporting application liveness failure: {error}")
-                        })?;
-                        return Err("the managed application failed its liveness check".into());
-                    }
                 }
             }
         }
@@ -744,7 +691,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) =
                 updated::bundle::verify_release(&opts.paths.versions, &installed.release)
             {
-                let _ = app::stop(&mut app.guardian, &opts.paths.app_token);
+                let _ = app::stop_runtime(&mut app, &opts.paths.app_token);
                 repair_from_local_assignment(&opts, &mut store)
                     .await
                     .map_err(|repair| {
@@ -808,17 +755,23 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // the same assignment and can change on a control-plane reassignment with no version
         // bump. Applying it here keeps every launch on the current launch spec.
         if let Some(assignment) = repo.assignment() {
-            let relaunch = opts.apply_runtime(&assignment.runtime);
-            // The health URLs live in the runtime we just applied; re-derive them (owned) so a
-            // reassignment that retargets a probe takes effect on the next tick.
-            readiness_url = opts
-                .application
-                .health_check_url(updated::config::HealthCheckKind::Readiness)
-                .map(str::to_owned);
-            liveness_url = opts
-                .application
-                .health_check_url(updated::config::HealthCheckKind::Liveness)
-                .map(str::to_owned);
+            let secrets_changed = match opts
+                .secrets
+                .reconcile(&assignment.deployment, &assignment.runtime.secrets)
+                .await
+            {
+                Ok(changed) => changed,
+                Err(error) => {
+                    warn(&format!(
+                        "assigned secrets could not be reconciled; keeping the running application and retrying: {error}"
+                    ));
+                    loop_state.next_app_check =
+                        Instant::now() + jitter(opts.timeouts.refresh_retry, 20);
+                    continue;
+                }
+            };
+            opts.deployment = assignment.deployment.clone();
+            let relaunch = opts.apply_runtime(&assignment.runtime) || secrets_changed;
             if relaunch {
                 // The launch spec changed. A live process cannot have its argv rewritten, so
                 // stop it and relaunch on the new args. This is the ONLY way a node reassigned
@@ -826,7 +779,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 // activate hook will later send — without it the process keeps its old launch
                 // and the reload upgrade silently no-ops, then rolls back on the version proof.
                 log("assignment runtime changed the launch spec; relaunching the application to apply it");
-                app::stop(&mut app.guardian, &opts.paths.app_token).map_err(|error| {
+                app::stop_runtime(&mut app, &opts.paths.app_token).map_err(|error| {
                     format!("stopping the application to apply a new launch spec: {error}")
                 })?;
                 app.launch(&opts).map_err(|error| {
@@ -856,9 +809,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // The commit recorded the update as unconfirmed; pick it up so its
                     // window is watched and a crash is caught on the next boot.
                     pending = installed_pending(&store);
-                    // The new release's health provider travels with it, so steady-state gating
-                    // switches to it from now on.
-                    steady_healthcheck = installed_health_provider(&store);
+                    // The new release's lifecycle provider travels with it.
+                    steady_lifecycle = installed_lifecycle_provider(&store);
                     garbage_collect(&opts, &store);
                 }
                 AppOutcome::Unchanged => {}
@@ -893,8 +845,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // boot), do NOT report settled on the strength of the boot gate alone — wait for a
             // steady-state observation. When no readiness signal exists there is nothing to sample,
             // so the boot gate (already passed) is the answer.
-            let has_readiness =
-                steady_healthcheck.is_some() || (health_probe.is_some() && readiness_url.is_some());
+            let has_readiness = steady_lifecycle.is_some();
             let settled = pending.is_none() && last_ready.unwrap_or(!has_readiness);
             telemetry::report_running_state(
                 &telemetry_client,
@@ -952,8 +903,7 @@ async fn repair_from_local_assignment(
             prepared.release.clone(),
             prepared.archive_sha256,
         )
-        .with_lifecycle(providers.lifecycle.map(Box::new))
-        .with_healthcheck(providers.healthcheck.map(Box::new)),
+        .with_lifecycle(Some(Box::new(providers))),
     )?;
     store.activate(&prepared.release)?;
     log(&format!(
@@ -987,13 +937,11 @@ fn garbage_collect(opts: &Options, store: &dyn Store) {
     let mut releases = vec![installed.release.clone()];
     let mut providers = Vec::new();
     // Protect the installed release's own providers — they run on every boot (pre-start,
-    // health gating) — and the pending predecessor's, which a rollback would replay.
+    // verification) — and the pending predecessor's, which a rollback would replay.
     providers.extend(installed.lifecycle.map(|provider| provider.release));
-    providers.extend(installed.healthcheck.map(|provider| provider.release));
     if let Some(pending) = installed.pending {
         releases.push(pending.previous_release);
         providers.extend(pending.lifecycle.map(|provider| provider.release));
-        providers.extend(pending.healthcheck.map(|provider| provider.release));
     }
     match updated::gc::prune_releases(
         &opts.paths.versions,
@@ -1118,7 +1066,6 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
             if situation.service_exited || rollback_started {
                 return Some(Transaction {
                     id: pending.lifecycle_attempt_id.clone(),
-                    kind: updated::transaction::Kind::Supervised,
                     previous_release: pending.previous_release.clone(),
                     previous_archive_sha256: pending.previous_archive_sha256.clone(),
                     previous_repository_lineage: pending.previous_repository_lineage.clone(),
@@ -1127,7 +1074,6 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
                     candidate_repository_lineage: installed.repository_lineage.clone(),
                     candidate_rejection_required: situation.service_exited,
                     lifecycle: pending.lifecycle.clone(),
-                    healthcheck: pending.healthcheck.clone(),
                     rollback_health_failures: 0,
                     phase: TransactionPhase::RollbackStarted,
                 });
@@ -1148,16 +1094,9 @@ fn complete_recovery_activation(
     if tx.rollback_rank().is_none_or(|rank| rank >= 4) {
         return Ok(());
     }
-    // Restore the predecessor's activation. A **reload** deployment reloads the still-running
-    // process in place, so its `activate` script needs the live PID; if the process is gone (the
-    // failed candidate reload took it down), there is nothing to reload — skip the hook and let the
-    // boot plan relaunch the predecessor fresh. A **restart** deployment ran its stop-start already,
-    // so its activate hook is a plain forward hook with no PID.
-    let reloads = update::reloads_in_place(opts, tx.lifecycle.as_deref());
-    let pid = guardian::adopted_app_pid();
-    if reloads && pid.is_none() {
-        return advance_transaction(store, tx, TransactionPhase::PredecessorActivated);
-    }
+    // Restore the predecessor's machine state through the same reconciler operation used for the
+    // candidate. Managed mode has already stopped the candidate; provider-managed mode never
+    // exposes or manipulates an application PID.
     invoke_deployment_provider(
         tx.lifecycle.as_deref(),
         opts,
@@ -1165,7 +1104,7 @@ fn complete_recovery_activation(
             phase: LifecyclePhase::Activate,
             reason: LifecycleReason::Update,
             id: &tx.id,
-            pid: reloads.then_some(pid).flatten(),
+            pid: None,
             candidate: &tx.previous_release,
             predecessor: &tx.candidate_release,
         },
@@ -1188,19 +1127,6 @@ fn gather_situation(
     let active = store.active_release()?;
     let installed = store.installed();
     let journal = store.journal()?;
-    // The release a recovery would restore reloads in place iff its lifecycle ships an `activate`
-    // script. That lifecycle rides the rollback journal, or the confirm-window `Pending` record.
-    let recovery_lifecycle = journal
-        .as_ref()
-        .and_then(|tx| tx.lifecycle.as_deref())
-        .or_else(|| match &installed {
-            Installed::Present(state) => {
-                state.pending.as_ref().and_then(|p| p.lifecycle.as_deref())
-            }
-            _ => None,
-        });
-    let reloads_in_place =
-        recovery_lifecycle.is_some_and(|lc| update::reloads_in_place(opts, Some(lc)));
     Ok(Situation {
         installed,
         active,
@@ -1210,7 +1136,6 @@ fn gather_situation(
             None => false,
         },
         app_running: guardian::adopted_app_pid(),
-        reloads_in_place,
         first_install,
         bad_supervisor: match guardian_state {
             Some(state) => guardian::take_rejected_supervisor(state)?,
@@ -1237,17 +1162,9 @@ fn execute_boot_plan(
             advance_transaction(store, tx, TransactionPhase::RollbackStopStarted)?;
         }
     }
-    // A reload deployment never stops the process during recovery: the failed candidate reload left
-    // the predecessor running in place (or took it down, in which case the boot plan relaunches it),
-    // so there is nothing to stop and the operator owns any drain. Only a restart deployment
-    // stop-starts the process, so only it quiesces here.
-    let reloads = recovery
+    let needs_quiesce = recovery
         .as_ref()
-        .is_some_and(|tx| update::reloads_in_place(opts, tx.lifecycle.as_deref()));
-    let needs_quiesce = !reloads
-        && recovery
-            .as_ref()
-            .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
+        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
     if needs_quiesce {
         if let Some(tx) = recovery.as_ref() {
             invoke_deployment_provider(
@@ -1326,12 +1243,10 @@ fn installed_pending(store: &dyn Store) -> Option<Pending> {
     }
 }
 
-/// The committed release's own health-check provider (`None` when nothing is installed or the
-/// release ships no health provider). It travels with the release, so callers re-read it whenever an
-/// update commits.
-fn installed_health_provider(store: &dyn Store) -> Option<Box<updated::state::ProviderRelease>> {
+/// The committed release's lifecycle provider.
+fn installed_lifecycle_provider(store: &dyn Store) -> Option<Box<updated::state::ProviderRelease>> {
     match store.installed() {
-        Installed::Present(state) => state.healthcheck,
+        Installed::Present(state) => state.lifecycle,
         _ => None,
     }
 }
@@ -1381,7 +1296,7 @@ mod tests {
     use updated::bundle::ReleaseId;
     use updated::install::InstallTransaction;
     use updated::state::{Installed, InstalledState, RepositoryLineage};
-    use updated::transaction::{Kind, Phase, Transaction};
+    use updated::transaction::{Phase, Transaction};
 
     /// A durable-store double that keeps everything in memory, so the counter-persistence loop can
     /// be driven across simulated boots without touching the filesystem.
@@ -1464,7 +1379,6 @@ mod tests {
         let candidate = release("2.0.0", "two");
         let tx = Transaction {
             id: "attempt".into(),
-            kind: Kind::Supervised,
             previous_release: predecessor.clone(),
             previous_archive_sha256: "archive-one".into(),
             previous_repository_lineage: lineage.clone(),
@@ -1473,7 +1387,6 @@ mod tests {
             candidate_repository_lineage: lineage.clone(),
             candidate_rejection_required: true,
             lifecycle: None,
-            healthcheck: None,
             rollback_health_failures: 0,
             phase: Phase::RollbackHealthStarted,
         };

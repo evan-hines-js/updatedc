@@ -2955,6 +2955,7 @@ dependencies = [
  "libc",
  "reqwest 0.13.4",
  "rustls",
+ "serde",
  "serde_json",
  "tokio",
  "update-client",
@@ -3531,18 +3532,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "updated",
-]
-
-[[package]]
-name = "updated-oneshot"
-version = "0.1.0"
-dependencies = [
- "foundation",
- "rustls",
- "tokio",
- "update-client",
- "updated",
- "updated-tuf",
 ]
 
 [[package]]

@@ -1,8 +1,6 @@
 //! Shared durable update transaction and binary-state decisions.
 //!
-//! Both the continuously supervised updater and the one-shot launcher use this exact
-//! journal format and recovery classifier. Process control and health policy remain in
-//! their shells; deciding what durable state means lives here once.
+//! The continuously supervised updater uses this journal format and recovery classifier.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -18,7 +16,6 @@ pub struct Transaction {
     /// Fresh identity for this attempt. Stable across crash recovery, different for a
     /// later retry of the same candidate/predecessor pair.
     pub id: String,
-    pub kind: Kind,
     pub previous_release: ReleaseId,
     pub previous_archive_sha256: String,
     pub previous_repository_lineage: RepositoryLineage,
@@ -30,13 +27,7 @@ pub struct Transaction {
     /// one-shot process-exit markers on a later recovery boot.
     pub candidate_rejection_required: bool,
     /// Recovery must replay the operator lifecycle provider before clearing this intent.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub lifecycle: Option<Box<ProviderRelease>>,
-    /// The health-check provider that gates this attempt (forward and on rollback). Rides the
-    /// journal so a crash-recovered rollback health-gates with the same provider the in-process
-    /// path used.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub healthcheck: Option<Box<ProviderRelease>>,
+    pub lifecycle: Box<ProviderRelease>,
     /// How many consecutive boots have failed to health-gate the restored predecessor during a
     /// crash-recovered rollback. The supervisor's boot health gate bounds this: once it reaches its
     /// limit, a predecessor whose bytes can no longer pass the gate stops crash-looping the node and
@@ -52,7 +43,6 @@ pub struct Transaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
-    Started,
     PreflightStarted,
     PreflightCompleted,
     PrepareStarted,
@@ -64,7 +54,6 @@ pub enum Phase {
     Stopped,
     ActivateStarted,
     CandidateActivated,
-    CandidateVerified,
     StartStarted,
     CandidateStarted,
     HealthStarted,
@@ -87,13 +76,6 @@ pub enum Phase {
     Aborted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Kind {
-    Supervised,
-    OnLaunch,
-}
-
 impl Transaction {
     pub fn validate(&self) -> io::Result<()> {
         if self.id.is_empty() {
@@ -110,44 +92,13 @@ impl Transaction {
                 "transaction repository lineage is invalid",
             ));
         }
-        if self.kind == Kind::OnLaunch && self.candidate_rejection_required {
+        if self.lifecycle.product.is_empty() || self.lifecycle.timeout_millis == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "on-launch transactions cannot require supervised candidate rejection",
+                "transaction provider identity is invalid",
             ));
         }
-        for provider in [self.lifecycle.as_ref(), self.healthcheck.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if provider.product.is_empty() || provider.timeout_millis == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "transaction provider identity is invalid",
-                ));
-            }
-        }
-        let valid = match self.kind {
-            Kind::Supervised => self.phase != Phase::Started,
-            Kind::OnLaunch => matches!(
-                self.phase,
-                Phase::Started
-                    | Phase::CandidateActivated
-                    | Phase::CandidateVerified
-                    | Phase::Committed
-            ),
-        };
-        if valid {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "transaction kind {:?} cannot have phase {:?}",
-                    self.kind, self.phase
-                ),
-            ))
-        }
+        Ok(())
     }
 
     pub fn is_rollback(&self) -> bool {
@@ -188,35 +139,27 @@ impl Transaction {
     }
 
     pub fn advance(&mut self, next: Phase) -> io::Result<()> {
-        let supervised_forward = self.kind == Kind::Supervised
-            && matches!(
-                (self.phase, next),
-                (Phase::PreflightStarted, Phase::PreflightCompleted)
-                    | (Phase::PreflightCompleted, Phase::PrepareStarted)
-                    | (Phase::PrepareStarted, Phase::Prepared)
-                    | (Phase::Prepared, Phase::PreDrainStarted)
-                    | (Phase::PreDrainStarted, Phase::DrainStarted)
-                    | (Phase::DrainStarted, Phase::Drained)
-                    | (Phase::Drained, Phase::StopStarted)
-                    | (Phase::StopStarted, Phase::Stopped)
-                    | (Phase::Stopped, Phase::ActivateStarted)
-                    | (Phase::ActivateStarted, Phase::CandidateActivated)
-                    | (Phase::CandidateActivated, Phase::StartStarted)
-                    | (Phase::StartStarted, Phase::CandidateStarted)
-                    | (Phase::CandidateStarted, Phase::HealthStarted)
-                    | (Phase::HealthStarted, Phase::CandidateHealthy)
-                    | (Phase::CandidateHealthy, Phase::FinalizeStarted)
-                    | (Phase::FinalizeStarted, Phase::Finalized)
-                    | (Phase::Finalized, Phase::CommitStarted)
-                    | (Phase::CommitStarted, Phase::Committed)
-            );
-        let on_launch_forward = self.kind == Kind::OnLaunch
-            && matches!(
-                (self.phase, next),
-                (Phase::Started, Phase::CandidateActivated)
-                    | (Phase::CandidateActivated, Phase::CandidateVerified)
-                    | (Phase::CandidateVerified, Phase::Committed)
-            );
+        let forward = matches!(
+            (self.phase, next),
+            (Phase::PreflightStarted, Phase::PreflightCompleted)
+                | (Phase::PreflightCompleted, Phase::PrepareStarted)
+                | (Phase::PrepareStarted, Phase::Prepared)
+                | (Phase::Prepared, Phase::PreDrainStarted)
+                | (Phase::PreDrainStarted, Phase::DrainStarted)
+                | (Phase::DrainStarted, Phase::Drained)
+                | (Phase::Drained, Phase::StopStarted)
+                | (Phase::StopStarted, Phase::Stopped)
+                | (Phase::Stopped, Phase::ActivateStarted)
+                | (Phase::ActivateStarted, Phase::CandidateActivated)
+                | (Phase::CandidateActivated, Phase::StartStarted)
+                | (Phase::StartStarted, Phase::CandidateStarted)
+                | (Phase::CandidateStarted, Phase::HealthStarted)
+                | (Phase::HealthStarted, Phase::CandidateHealthy)
+                | (Phase::CandidateHealthy, Phase::FinalizeStarted)
+                | (Phase::FinalizeStarted, Phase::Finalized)
+                | (Phase::Finalized, Phase::CommitStarted)
+                | (Phase::CommitStarted, Phase::Committed)
+        );
         let begin_rollback = next == Phase::RollbackStarted
             && !matches!(self.phase, Phase::Committed | Phase::RolledBack);
         let rollback = matches!(
@@ -233,7 +176,7 @@ impl Transaction {
                 | (Phase::RollbackFinalizeStarted, Phase::RolledBack)
                 | (Phase::RollbackStarted, Phase::Aborted)
         );
-        if !(supervised_forward || on_launch_forward || begin_rollback || rollback) {
+        if !(forward || begin_rollback || rollback) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid transaction phase {:?} -> {next:?}", self.phase),
@@ -260,10 +203,7 @@ pub fn classify_recovery(
     active: Option<&ReleaseId>,
     committed: Option<&ReleaseId>,
 ) -> Recovery {
-    let commit_may_have_landed = match tx.kind {
-        Kind::Supervised => matches!(tx.phase, Phase::CommitStarted | Phase::Committed),
-        Kind::OnLaunch => matches!(tx.phase, Phase::CandidateVerified | Phase::Committed),
-    };
+    let commit_may_have_landed = matches!(tx.phase, Phase::CommitStarted | Phase::Committed);
     match tx.phase {
         _ if commit_may_have_landed
             && active == Some(&tx.candidate_release)
@@ -271,8 +211,7 @@ pub fn classify_recovery(
         {
             Recovery::Committed
         }
-        Phase::Started
-        | Phase::PreflightStarted
+        Phase::PreflightStarted
         | Phase::PreflightCompleted
         | Phase::PrepareStarted
         | Phase::Prepared
@@ -329,10 +268,19 @@ mod tests {
         }
     }
 
+    fn provider() -> Box<ProviderRelease> {
+        Box::new(ProviderRelease {
+            product: "reconciler".into(),
+            release: release("1.0.0", "reconciler-manifest"),
+            archive_sha256: "reconciler-archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        })
+    }
+
     fn tx() -> Transaction {
         Transaction {
             id: "transaction-id".into(),
-            kind: Kind::Supervised,
             previous_release: release("1.0.0", "old"),
             previous_archive_sha256: "previous-archive".into(),
             previous_repository_lineage: crate::state::RepositoryLineage::from_metadata_url(
@@ -344,8 +292,7 @@ mod tests {
                 "https://new/metadata/",
             ),
             candidate_rejection_required: false,
-            lifecycle: None,
-            healthcheck: None,
+            lifecycle: provider(),
             rollback_health_failures: 0,
             phase: Phase::PreflightStarted,
         }
@@ -388,21 +335,10 @@ mod tests {
             Recovery::Committed,
             "a crash after installed-state commit but before its phase write is committed"
         );
-
-        tx.kind = Kind::OnLaunch;
-        tx.phase = Phase::CandidateVerified;
-        assert_eq!(
-            classify_recovery(
-                &tx,
-                Some(&tx.candidate_release),
-                Some(&tx.candidate_release)
-            ),
-            Recovery::Committed
-        );
     }
 
     #[test]
-    fn each_transaction_kind_accepts_only_its_explicit_path() {
+    fn transaction_accepts_only_its_explicit_path() {
         let mut supervised = tx();
         for phase in [
             Phase::PreflightCompleted,
@@ -427,14 +363,6 @@ mod tests {
             supervised.advance(phase).unwrap();
         }
         assert!(supervised.advance(Phase::RollbackStarted).is_err());
-
-        let mut on_launch = tx();
-        on_launch.kind = Kind::OnLaunch;
-        on_launch.phase = Phase::Started;
-        assert!(on_launch.advance(Phase::CandidateActivated).is_ok());
-        assert!(on_launch.advance(Phase::CandidateVerified).is_ok());
-        assert!(on_launch.advance(Phase::Committed).is_ok());
-        assert!(on_launch.advance(Phase::Finalized).is_err());
     }
 
     #[test]
@@ -494,31 +422,6 @@ mod tests {
         assert!(
             read(&path).is_err(),
             "unknown fields are not a second schema"
-        );
-    }
-
-    #[test]
-    fn phase_must_belong_to_the_declared_transaction_kind() {
-        let path = tmp("kind-phase");
-        let mut invalid = tx();
-        invalid.phase = Phase::Started;
-        assert!(write(&path, &invalid).is_err());
-
-        invalid.kind = Kind::OnLaunch;
-        invalid.phase = Phase::Drained;
-        assert!(write(&path, &invalid).is_err());
-    }
-
-    #[test]
-    fn on_launch_cannot_carry_supervised_rejection_policy() {
-        let mut invalid = tx();
-        invalid.kind = Kind::OnLaunch;
-        invalid.phase = Phase::Started;
-        invalid.candidate_rejection_required = true;
-
-        assert_eq!(
-            invalid.validate().unwrap_err().to_string(),
-            "on-launch transactions cannot require supervised candidate rejection"
         );
     }
 

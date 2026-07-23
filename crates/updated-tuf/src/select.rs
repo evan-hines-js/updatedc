@@ -190,8 +190,6 @@ impl TrustedRepository {
             target,
             version,
             sha256,
-            // At the assigned head: the assignment's `provider_set` governs, keeping
-            // providers independently revisable without republishing the app.
             provider_set: None,
         }))
     }
@@ -464,11 +462,12 @@ mod provider_binding {
 
     fn runtime() -> updated::config::ManagedRuntime {
         updated::config::ManagedRuntime {
+            mode: updated::config::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
             args: vec![],
-            health_checks: vec![],
+            secrets: vec![],
             repository: updated::config::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,

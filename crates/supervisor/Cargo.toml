@@ -27,6 +27,7 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 
 # Re-arming FD_CLOEXEC on the inherited control-channel endpoint, so it stops at this
 # process instead of leaking into the operator's lifecycle provider.

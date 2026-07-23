@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--lifecycle-fixture") {
+    if std::env::args().any(|arg| arg == "--lifecycle-fixture") {
         if let Err(error) = run_lifecycle_fixture() {
             eprintln!("lifecycle fixture: {error}");
             std::process::exit(1);
@@ -41,15 +41,36 @@ fn main() {
 fn run_lifecycle_fixture() -> R {
     use std::io::Write;
 
-    let root = std::env::args()
-        .nth(2)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let phase = args.first().ok_or("missing reconciler operation")?.clone();
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or("missing reconciler/provider argument separator")?;
+    let value = |name: &str| -> Result<String, String> {
+        let index = args[..separator]
+            .iter()
+            .position(|arg| arg == name)
+            .ok_or_else(|| format!("missing {name}"))?;
+        args.get(index + 1)
+            .cloned()
+            .ok_or_else(|| format!("missing value for {name}"))
+    };
+    if value("--protocol")? != "1" {
+        return fail("unsupported reconciler protocol");
+    }
+    let id = value("--attempt-id")?;
+    let candidate_version = value("--candidate-version")?;
+    let provider_args = &args[separator + 1..];
+    let fixture = provider_args
+        .iter()
+        .position(|arg| arg == "--lifecycle-fixture")
+        .ok_or("missing --lifecycle-fixture")?;
+    let root = provider_args
+        .get(fixture + 1)
         .map(PathBuf::from)
         .ok_or("missing fixture state directory")?;
-    let mode = std::env::args().nth(3).unwrap_or_default();
-    let phase = std::env::var("UPDATED_LIFECYCLE_PHASE").map_err(|error| error.to_string())?;
-    let id = std::env::var("UPDATED_LIFECYCLE_ATTEMPT_ID").map_err(|error| error.to_string())?;
-    let candidate_version =
-        std::env::var("UPDATED_CANDIDATE_VERSION").map_err(|error| error.to_string())?;
+    let mode = provider_args.get(fixture + 2).cloned().unwrap_or_default();
     // `pre-start` is a per-boot environment hook (attempt id "boot"), not a transaction lifecycle
     // phase. Every attempts.log assertion reads the file as the transaction's phase sequence, so a
     // faithfully-provisioned seed — whose installed record now carries its provider set and thus
@@ -105,6 +126,17 @@ fn run_lifecycle_fixture() -> R {
     // so this guard no longer matches) then runs normally.
     if mode.strip_prefix("hang-") == Some(phase.as_str()) && candidate_version == "2.0.0" {
         std::thread::sleep(Duration::from_secs(30));
+    }
+    if let Some(url) = mode.strip_prefix("http-health=") {
+        if matches!(phase.as_str(), "verify" | "periodic") && http_text(url).is_none() {
+            return fail(format!("{phase} could not verify {url}"));
+        }
+        return Ok(());
+    }
+    if mode == "accept-managed" {
+        // The guardian guarantees the child is alive whenever this provider is invoked. This
+        // fixture deliberately has no additional application policy.
+        return Ok(());
     }
     // A post-drain grace: hold briefly on the post-drain phase (which runs after the
     // guardian has already flipped readyz to unready) so a readiness-aware load balancer
@@ -268,6 +300,14 @@ fn scenarios() -> Vec<Scenario> {
             group_peer_failure_is_node_local,
         ),
         (
+            "assigned secrets are injected, rotated by restart, removed, and never persisted",
+            assigned_secret_lifecycle,
+        ),
+        (
+            "an incomplete secret bundle fails closed before application launch",
+            missing_assigned_secret_blocks_launch,
+        ),
+        (
             "a tampered enrollment trust root fails closed before application launch",
             tampered_root_fails_closed,
         ),
@@ -317,34 +357,14 @@ fn scenarios() -> Vec<Scenario> {
             "a ready supervisor that crashes during confirmation is rolled back without disturbing the app",
             supervisor_post_ready_crash_rolls_back,
         ),
-        (
-            "updated-oneshot updates a non-daemon program to the newest release on launch",
-            oneshot_updates_on_launch,
-        ),
-        (
-            "updated-oneshot launches the current version when the repository is unreachable",
-            oneshot_launches_without_repository,
-        ),
     ];
     // Unix-only mechanisms (file modes; fork/exec/signals for zero-downtime).
     #[cfg(unix)]
     {
         s.push(("the TUF role keys are owner-only (0600)", key_perms));
         s.push((
-            "a health-check provider gates first install and upgrade, replacing the HTTP probe",
-            health_check_provider_gates_readiness,
-        ));
-        s.push((
-            "zero-downtime custom-provider reload drops no requests under load",
-            zero_downtime_reexec,
-        ));
-        s.push((
-            "an unexecutable custom-reload candidate is rejected without downtime; the next release upgrades",
-            reexec_rejects_unexecutable_without_downtime,
-        ));
-        s.push((
-            "a failed custom-reload preflight touches no live or durable activation state",
-            reexec_preflight_rejects_without_activation,
+            "lifecycle verify gates first install and upgrade",
+            lifecycle_verify_gates_readiness,
         ));
         s.push((
             "a stateless cold node descends past wedged (alive-but-unhealthy) assigned heads to the newest healthy release",
@@ -387,11 +407,6 @@ fn run_suite() -> R {
         return fail(
             "sample app binaries differ; release identity must come only from bundle config",
         );
-    }
-    let reexec_v1 = ctx.build_reexec_app("1.0.0")?;
-    let reexec_v2 = ctx.build_reexec_app("2.0.0")?;
-    if sha256_hex(&reexec_v1)? != sha256_hex(&reexec_v2)? {
-        return fail("reexec sample binaries differ; release identity must come only from config");
     }
     // Two distinguishable supervisor builds for the self-update scenarios.
     ctx.build_supervisor("1.0.0")?;

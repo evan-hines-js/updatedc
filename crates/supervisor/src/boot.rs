@@ -42,8 +42,7 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
                 pending.previous_release.clone(),
                 pending.previous_archive_sha256.clone(),
             )
-            .with_lifecycle(pending.lifecycle.clone())
-            .with_healthcheck(pending.healthcheck.clone()),
+            .with_lifecycle(pending.lifecycle.clone()),
         );
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
@@ -114,7 +113,7 @@ fn reconcile_transaction(
             // A reload deployment keeps its process across a failed candidate reload, so adopt the
             // running predecessor rather than stop-starting it (no downtime). A restart deployment
             // stops the uncommitted candidate and relaunches the predecessor.
-            plan.quiesce = !situation.reloads_in_place && situation.app_running.is_some();
+            plan.quiesce = situation.app_running.is_some();
             plan.release = ReleaseFix::Activate(tx.previous_release.clone());
             if situation.service_exited && !tx.candidate_rejection_required {
                 plan.reject_app.push((
@@ -142,8 +141,7 @@ fn reconcile_transaction(
                 tx.previous_release.clone(),
                 tx.previous_archive_sha256.clone(),
             )
-            .with_lifecycle(tx.lifecycle.clone())
-            .with_healthcheck(tx.healthcheck.clone()),
+            .with_lifecycle(tx.lifecycle.clone()),
         );
         plan.current = Some(tx.previous_release.version.clone());
     }
@@ -173,7 +171,7 @@ fn confirm_or_revert(
 ) {
     if situation.service_exited {
         // Reload deployments adopt the still-running predecessor; restart deployments stop-start it.
-        plan.quiesce = !situation.reloads_in_place && situation.app_running.is_some();
+        plan.quiesce = situation.app_running.is_some();
         plan.release = ReleaseFix::Activate(pending.previous_release.clone());
         plan.reject_app.push((
             installed.repository_lineage.clone(),
@@ -188,8 +186,7 @@ fn confirm_or_revert(
                 pending.previous_release.clone(),
                 pending.previous_archive_sha256.clone(),
             )
-            .with_lifecycle(pending.lifecycle.clone())
-            .with_healthcheck(pending.healthcheck.clone()),
+            .with_lifecycle(pending.lifecycle.clone()),
         );
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
@@ -204,8 +201,7 @@ fn confirm_or_revert(
                 installed.release.clone(),
                 installed.archive_sha256.clone(),
             )
-            .with_lifecycle(installed.lifecycle.clone())
-            .with_healthcheck(installed.healthcheck.clone()),
+            .with_lifecycle(installed.lifecycle.clone()),
         );
         plan.info(format!("release {} confirmed", installed.release.version));
     }
@@ -240,7 +236,6 @@ mod tests {
             journal: None,
             service_exited: false,
             app_running: None,
-            reloads_in_place: false,
             first_install: false,
             bad_supervisor: None,
             confirm_window: Duration::from_secs(60),
@@ -299,7 +294,6 @@ mod tests {
         situation.service_exited = true;
         situation.journal = Some(Transaction {
             id: "attempt".into(),
-            kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
             previous_archive_sha256: "archive-one".into(),
             previous_repository_lineage: lineage(),
@@ -308,7 +302,6 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: None,
-            healthcheck: None,
             rollback_health_failures: 0,
             phase: TransactionPhase::CandidateActivated,
         });
@@ -328,7 +321,6 @@ mod tests {
         situation.active = Some(candidate.clone());
         situation.journal = Some(Transaction {
             id: "attempt".into(),
-            kind: updated::transaction::Kind::Supervised,
             previous_release: release("1.0.0", "one"),
             previous_archive_sha256: "archive-one".into(),
             previous_repository_lineage: lineage(),
@@ -337,7 +329,6 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: None,
-            healthcheck: None,
             rollback_health_failures: 0,
             phase: TransactionPhase::CandidateActivated,
         });
@@ -356,14 +347,12 @@ mod tests {
             release: candidate.clone(),
             archive_sha256: "archive-two".into(),
             lifecycle: None,
-            healthcheck: None,
             pending: None,
             confirmed: true,
         }));
         situation.service_exited = false;
         situation.journal = Some(Transaction {
             id: "attempt".into(),
-            kind: updated::transaction::Kind::Supervised,
             previous_release: predecessor,
             previous_archive_sha256: "archive-one".into(),
             previous_repository_lineage: lineage(),
@@ -372,7 +361,6 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: None,
-            healthcheck: None,
             rollback_health_failures: 0,
             phase: TransactionPhase::RollbackStarted,
         });
@@ -389,7 +377,6 @@ mod tests {
         let mut situation = steady();
         situation.journal = Some(Transaction {
             id: "attempt".into(),
-            kind: updated::transaction::Kind::Supervised,
             previous_release: predecessor,
             previous_archive_sha256: "archive-one".into(),
             previous_repository_lineage: lineage(),
@@ -398,7 +385,6 @@ mod tests {
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: None,
-            healthcheck: None,
             rollback_health_failures: 0,
             phase: TransactionPhase::PreflightStarted,
         });
@@ -421,7 +407,6 @@ mod tests {
             release: candidate,
             archive_sha256: "archive-two".into(),
             lifecycle: None,
-            healthcheck: None,
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
                 previous_release: predecessor.clone(),
@@ -429,7 +414,6 @@ mod tests {
                 previous_repository_lineage: lineage(),
                 committed_at: 100,
                 lifecycle: None,
-                healthcheck: None,
             }),
             confirmed: true,
         }));

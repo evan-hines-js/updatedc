@@ -10,20 +10,6 @@ pub fn app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
     ctx.work.join(format!("build/app-{v}{}", ctx.exe))
 }
 
-/// The `--activate <entrypoint>` publish args for a `custom` (reload-in-place) lifecycle provider:
-/// it ships the same script as its `activate` entrypoint, so the supervisor derives reload mode
-/// from the artifact. Empty for stop-start deployments and non-lifecycle providers.
-fn reload_activate_args(kind: &str, custom: bool, entrypoint: &str) -> Vec<String> {
-    if custom && kind == "lifecycle" {
-        vec!["--activate".into(), entrypoint.into()]
-    } else {
-        Vec::new()
-    }
-}
-#[cfg(unix)]
-pub fn reexec_app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
-    ctx.work.join(format!("build/reexec-app-{v}{}", ctx.exe))
-}
 pub fn supervisor_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
     ctx.work.join(format!("build/supervisor-{v}{}", ctx.exe))
 }
@@ -49,21 +35,17 @@ pub struct Sup {
     platform: String,
     exe: &'static str,
     guardian_bin: PathBuf,
-    oneshot_bin: PathBuf,
     dir: PathBuf,
     product: String,
     pub install_root: PathBuf,
     seed_binary: PathBuf,
     args: Vec<String>,
-    health_checks: Vec<updated::config::ManagedHealthCheck>,
     check_interval: Option<String>,
     health_grace: Option<String>,
     health_successes: u32,
     confirmation_window: Option<String>,
     retry_after: Option<String>,
     lifecycle_command: Option<Vec<String>>,
-    health_command: Option<Vec<String>>,
-    custom: bool,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
     probe_address: Option<String>,
@@ -74,12 +56,22 @@ pub struct Sup {
     /// Sign `ordered_install_fallback` into the assignment: a cold node whose exact assigned
     /// bytes prove unusable may descend to the newest healthy target at or below it.
     ordered_install_fallback: bool,
+    secrets: Vec<updated::config::SecretReference>,
 }
 impl Sup {
     /// The tower managing `command` (the app binary + args) against the repo under
     /// `dir` served at `srv`, for `product`.
     pub fn new(ctx: &Ctx, dir: &Path, srv: &str, product: &str, command: Vec<String>) -> Self {
         let seed_binary = PathBuf::from(command.first().expect("app command requires binary"));
+        let lifecycle_command = vec![
+            std::env::current_exe()
+                .expect("the e2e lifecycle fixture must have a current executable")
+                .display()
+                .to_string(),
+            "--lifecycle-fixture".into(),
+            dir.join("default-lifecycle-state").display().to_string(),
+            "accept-managed".into(),
+        ];
         Sup {
             repository_base_url: format!("https://{srv}/"),
             supervisor_bin: ctx.supervisor.clone(),
@@ -87,47 +79,51 @@ impl Sup {
             platform: ctx.platkey.clone(),
             exe: ctx.exe,
             guardian_bin: ctx.bootstrap.clone(),
-            oneshot_bin: ctx.oneshot.clone(),
             dir: dir.to_path_buf(),
             product: product.into(),
             install_root: dir.join("install"),
             seed_binary,
             args: command.into_iter().skip(1).collect(),
-            health_checks: Vec::new(),
             check_interval: None,
             health_grace: None,
             health_successes: 1,
             confirmation_window: None,
             retry_after: None,
-            lifecycle_command: None,
-            health_command: None,
-            custom: false,
+            lifecycle_command: Some(lifecycle_command),
             supervisor_check_interval: None,
             ready_timeout: None,
             probe_address: None,
             seed_application: true,
             supervisor_override: None,
             ordered_install_fallback: false,
+            secrets: vec![],
         }
+    }
+    pub fn secret(mut self, environment: &str, secret: &str, key: &str) -> Self {
+        self.secrets.push(updated::config::SecretReference {
+            environment: environment.into(),
+            secret: secret.into(),
+            key: key.into(),
+        });
+        self
     }
     /// Sign ordered-install fallback into the assignment (see the struct field).
     pub fn ordered_install_fallback(mut self) -> Self {
         self.ordered_install_fallback = true;
         self
     }
+    /// Install the cross-platform Rust lifecycle fixture. It implements the whole lifecycle
+    /// protocol and performs one HTTP observation for `verify` and `periodic`.
     pub fn readiness_health(self, svc: &str) -> Self {
-        self.health_check(
-            updated::config::HealthCheckKind::Readiness,
-            &format!("http://{svc}/healthz"),
-        )
-    }
-    pub fn health_check(mut self, kind: updated::config::HealthCheckKind, url: &str) -> Self {
-        self.health_checks
-            .push(updated::config::ManagedHealthCheck {
-                kind,
-                url: url.into(),
-            });
-        self
+        let executable = std::env::current_exe()
+            .expect("the e2e lifecycle fixture must have a current executable");
+        let state_dir = self.dir.join("http-lifecycle-state").display().to_string();
+        self.lifecycle(vec![
+            executable.display().to_string(),
+            "--lifecycle-fixture".into(),
+            state_dir,
+            format!("http-health=http://{svc}/healthz"),
+        ])
     }
     pub fn guardian_probes(mut self, address: &str) -> Self {
         self.probe_address = Some(address.into());
@@ -157,22 +153,8 @@ impl Sup {
         self.retry_after = Some(s.into());
         self
     }
-    /// Custom activation: the supervisor stops/starts nothing; the lifecycle provider owns
-    /// bringing each release into service (placement at first install, an in-place reload — e.g.
-    /// SIGHUP — on update). The command is that lifecycle provider.
-    pub fn custom(mut self, command: Vec<String>) -> Self {
-        self.custom = true;
-        self.lifecycle_command = Some(command);
-        self
-    }
     pub fn lifecycle(mut self, command: Vec<String>) -> Self {
         self.lifecycle_command = Some(command);
-        self
-    }
-    /// Ship a health-check provider: `command` is run as the readiness signal (exit 0 = healthy),
-    /// replacing the HTTP probe for this deployment.
-    pub fn health_provider(mut self, command: Vec<String>) -> Self {
-        self.health_command = Some(command);
         self
     }
     pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
@@ -296,10 +278,6 @@ impl Sup {
             &self.platform,
             &updated::bundle::Entrypoints {
                 entrypoint: &entrypoint,
-                // A `custom` lifecycle provider reloads in place: the same script is its `activate`
-                // entrypoint, so the supervisor derives reload mode from the artifact.
-                activate: (self.custom && kind == "lifecycle").then_some(entrypoint.as_str()),
-                rollback: None,
             },
         )
         .map_err(str_err)?;
@@ -322,7 +300,7 @@ impl Sup {
         })
     }
 
-    /// Publish a signed provider artifact of `kind` (`lifecycle` / `healthcheck`) built from
+    /// Publish a signed lifecycle provider artifact built from
     /// `command`, returning its release target path, sha256, and the args to sign into the set.
     fn publish_provider(&self, kind: &str, command: &[String]) -> R<(String, String, Vec<String>)> {
         let (published_source, published_entrypoint, signed_args) =
@@ -338,14 +316,7 @@ impl Sup {
                 .args(["--product", &provider_product, "--version", "1.0.0"])
                 .arg("--bundle")
                 .arg(format!("{}={}", self.platform, published_source.display()))
-                .args(["--entrypoint", &published_entrypoint])
-                // A `custom` lifecycle deployment reloads in place: ship the same script as the
-                // `activate` entrypoint so the supervisor derives reload mode from the artifact.
-                .args(reload_activate_args(
-                    kind,
-                    self.custom,
-                    &published_entrypoint,
-                )),
+                .args(["--entrypoint", &published_entrypoint]),
         )?;
         let provider_path = crate::harness::release_target(
             &provider_product,
@@ -362,7 +333,7 @@ impl Sup {
         if self.seed_application {
             self.seed_install()?;
         }
-        if self.lifecycle_command.is_some() || self.health_command.is_some() {
+        if self.lifecycle_command.is_some() {
             let mut provider_set = Command::new(&self.server_bin);
             provider_set
                 .arg("publish-provider-set")
@@ -381,16 +352,6 @@ impl Sup {
                     provider_set.args(["--provider-arg", arg]);
                 }
             }
-            if let Some(c) = self.health_command.clone() {
-                let (path, sha, signed_args) = self.publish_provider("healthcheck", &c)?;
-                provider_set
-                    .args(["--health-provider-path", &path])
-                    .args(["--health-provider-sha256", &sha])
-                    .args(["--health-provider-timeout-ms", "5000"]);
-                for arg in &signed_args {
-                    provider_set.args(["--health-provider-arg", arg]);
-                }
-            }
             crate::harness::run(&mut provider_set)?;
         }
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -405,11 +366,12 @@ impl Sup {
                 .map_err(|error| error.to_string())
         };
         let runtime = updated::config::ManagedRuntime {
+            mode: updated::config::RuntimeMode::Managed,
             product: self.product.clone(),
             channel: "stable".into(),
             install_root: self.install_root.clone(),
             args: self.args.clone(),
-            health_checks: self.health_checks.clone(),
+            secrets: self.secrets.clone(),
             repository: updated::config::ManagedRepositoryLimits {
                 metadata_limit: 1 << 20,
                 target_limit: 512 << 20,
@@ -451,7 +413,7 @@ impl Sup {
         // production installer. Ensure a (possibly empty) `default` provider set exists even
         // when the repository is intentionally never served (the offline one-shot scenario).
         // Only when no provider was published above — otherwise this would overwrite that set.
-        if self.lifecycle_command.is_none() && self.health_command.is_none() {
+        if self.lifecycle_command.is_none() {
             crate::harness::run(
                 Command::new(&self.server_bin)
                     .arg("publish-provider-set")
@@ -572,22 +534,16 @@ impl Sup {
         // Carry the same signed provider set the published assignment references, so the seeded
         // predecessor is faithful to a cold-installed node (install stages its providers). Without
         // this the first update's rollback restores a predecessor with no providers to replay.
-        let mut installed =
-            updated::state::InstalledState::confirmed(lineage, staged.id, staged.archive_sha256);
-        if let Some(command) = self.lifecycle_command.clone() {
-            installed = installed.with_lifecycle(Some(Box::new(self.stage_seed_provider(
-                &paths,
-                "lifecycle",
-                &command,
-            )?)));
-        }
-        if let Some(command) = self.health_command.clone() {
-            installed = installed.with_healthcheck(Some(Box::new(self.stage_seed_provider(
-                &paths,
-                "healthcheck",
-                &command,
-            )?)));
-        }
+        let command = self
+            .lifecycle_command
+            .clone()
+            .ok_or_else(|| "a lifecycle reconciler is required".to_string())?;
+        let installed = updated::state::InstalledState::confirmed(
+            lineage,
+            staged.id,
+            staged.archive_sha256,
+            Box::new(self.stage_seed_provider(&paths, "lifecycle", &command)?),
+        );
         updated::state::write_installed(&paths.state, &installed).map_err(str_err)
     }
 
@@ -617,16 +573,6 @@ impl Sup {
         if let Some(address) = &self.probe_address {
             c.arg("--probe-address").arg(address);
         }
-        Ok(c)
-    }
-
-    /// A one-shot updater command (`updated-oneshot --config <written file>`). Shares
-    /// the exact same config the supervisor reads.
-    pub fn oneshot(self) -> R<Command> {
-        let state_dir = self.state_dir();
-        let cfg = self.write_config()?;
-        let mut c = Command::new(&self.oneshot_bin);
-        c.arg("--config").arg(cfg).arg("--state-dir").arg(state_dir);
         Ok(c)
     }
 }

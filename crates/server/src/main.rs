@@ -222,47 +222,17 @@ async fn publish_provider_set(args: &[String]) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
     let id = flag(args, "--id").ok_or("--id <provider-set-id> is required")?;
-    // Each capability is published from its own flag prefix; a set may carry a lifecycle
-    // override, a health-check override, both, or (for a provider-less set) neither.
-    let override_for =
-        |prefix: &str,
-         arg_flag: &str,
-         timeout_flag: &str,
-         capability: updated::config::ProviderCapability|
-         -> Result<Option<updated::config::ProviderOverride>, Box<dyn std::error::Error>> {
-            if flag(args, &format!("--{prefix}-path")).is_none() {
-                return Ok(None);
-            }
-            Ok(Some(updated::config::ProviderOverride {
-                capability,
-                artifact: target_reference(args, prefix)?,
-                args: flags_all(args, arg_flag),
-                timeout_millis: flag(args, timeout_flag)
-                    .unwrap_or_else(|| "300000".into())
-                    .parse()?,
-            }))
-        };
-    let overrides = [
-        override_for(
-            "provider",
-            "--provider-arg",
-            "--provider-timeout-ms",
-            updated::config::ProviderCapability::Lifecycle,
-        )?,
-        override_for(
-            "health-provider",
-            "--health-provider-arg",
-            "--health-provider-timeout-ms",
-            updated::config::ProviderCapability::HealthCheck,
-        )?,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let reconciler = updated::config::Reconciler {
+        artifact: target_reference(args, "provider")?,
+        args: flags_all(args, "--provider-arg"),
+        timeout_millis: flag(args, "--provider-timeout-ms")
+            .unwrap_or_else(|| "300000".into())
+            .parse()?,
+    };
     let set = updated::config::ProviderSet {
-        schema: 2,
+        schema: 1,
         id: id.clone(),
-        overrides,
+        reconciler,
     };
     let source = repo_dir.join(".provider-set-build.json");
     foundation::durable::atomic_write(&source, ".provider-set-", &serde_json::to_vec(&set)?)?;
@@ -437,8 +407,6 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
             };
             let entrypoint =
                 flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
-            let activate = flag(args, "--activate");
-            let rollback = flag(args, "--rollback");
             updated::bundle::create_bundle(
                 input,
                 &archive,
@@ -447,8 +415,6 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
                 platform,
                 &updated::bundle::Entrypoints {
                     entrypoint: &entrypoint,
-                    activate: activate.as_deref(),
-                    rollback: rollback.as_deref(),
                 },
             )?;
             // Test-only: deliberately damage the just-built archive. It is corrupted *before*
@@ -626,6 +592,16 @@ where
         respond_status(&mut stream, 405, b"method not allowed").await;
         return Ok(());
     }
+    if path == "/v1/node/secrets" {
+        let bundle = root
+            .parent()
+            .map(|parent| parent.join("secret-bundle.json"));
+        match bundle.and_then(|path| std::fs::read(path).ok()) {
+            Some(body) => respond_secret_bundle(&mut stream, &body).await,
+            None => respond_status(&mut stream, 503, b"secret bundle unavailable").await,
+        }
+        return Ok(());
+    }
     // A `Range: bytes=N-` header means tough is resuming a download.
     let range = head.lines().skip(1).find_map(|l| {
         let l = l.to_ascii_lowercase();
@@ -651,6 +627,19 @@ where
         None => respond_status(&mut stream, 404, b"not found").await,
     }
     Ok(())
+}
+
+async fn respond_secret_bundle<S>(stream: &mut S, body: &[u8])
+where
+    S: AsyncWrite + Unpin,
+{
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nPragma: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+    let _ = stream.shutdown().await;
 }
 
 /// Accept a node rollout report and persist it beside the repository at

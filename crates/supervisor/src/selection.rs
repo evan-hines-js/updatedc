@@ -13,20 +13,12 @@ pub(crate) enum AppOutcome {
     RestartForRecovery,
 }
 
-/// The operator providers staged for a release from its signed provider set. Every capability
-/// is optional; a release may ship none, a lifecycle provider, a health-check provider, or both.
-#[derive(Default, Clone)]
-pub(crate) struct StagedProviders {
-    pub(crate) lifecycle: Option<updated::state::ProviderRelease>,
-    pub(crate) healthcheck: Option<updated::state::ProviderRelease>,
-}
-
 pub(crate) async fn stage_providers(
     opts: &Options,
     repo: &TrustedRepository,
     store: &mut dyn Store,
     ordered_current: Option<&str>,
-) -> Result<StagedProviders, String> {
+) -> Result<updated::state::ProviderRelease, String> {
     let assignment = repo
         .assignment()
         .ok_or_else(|| "release repository has no desired deployment".to_string())?;
@@ -41,7 +33,7 @@ pub(crate) async fn stage_providers(
     // providers independently revisable there. Selection is deterministic and side-effect free.
     let policy =
         updated_tuf::DefaultPolicy::current(&opts.application.product, &opts.application.channel);
-    let provider_ref = repo
+    let selected_provider_ref = repo
         .assigned_application(
             &policy,
             ordered_current,
@@ -49,8 +41,8 @@ pub(crate) async fn stage_providers(
             |target, _version| store.is_rejected(&lineage, &target_sha(target)),
         )
         .map_err(|e| format!("selecting application to resolve its provider set failed: {e}"))?
-        .and_then(|selected| selected.provider_set)
-        .unwrap_or_else(|| assignment.provider_set.clone());
+        .and_then(|selected| selected.provider_set);
+    let provider_ref = selected_provider_ref.unwrap_or_else(|| assignment.provider_set.clone());
     let set_target = repo
         .exact_target(&provider_ref)
         .map_err(|e| format!("resolving desired provider set failed: {e}"))?;
@@ -63,35 +55,28 @@ pub(crate) async fn stage_providers(
         .map_err(|e| format!("desired provider set is invalid: {e}"))?;
     set.validate()
         .map_err(|error| format!("desired provider set is invalid: {error}"))?;
-    let mut staged = StagedProviders::default();
-    for provider in set.overrides {
-        let target = repo.exact_target(&provider.artifact).map_err(|e| {
-            format!(
-                "resolving {:?} provider override failed: {e}",
-                provider.capability
-            )
-        })?;
-        let sha = target_sha(&target);
-        if store.is_rejected(&lineage, &sha) {
-            return Err(format!(
-                "desired {:?} provider override was previously rejected",
-                provider.capability
-            ));
-        }
-        let product = target
-            .custom
-            .get("product")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("provider {:?} metadata has no product", provider.capability))?;
-        let version = target
-            .custom
-            .get("version")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("provider {:?} metadata has no version", provider.capability))?;
-        let platform = foundation::platform::platform_key();
-        let provider_store = updated::provider::BundleStore::for_lifecycle(&opts.paths)
-            .with_target_limit(opts.repository.target_limit);
-        let staged_bundle = update_client::acquire_verified_bundle(
+    let provider = set.reconciler;
+    let target = repo
+        .exact_target(&provider.artifact)
+        .map_err(|e| format!("resolving node reconciler failed: {e}"))?;
+    let sha = target_sha(&target);
+    if store.is_rejected(&lineage, &sha) {
+        return Err("desired node reconciler was previously rejected".into());
+    }
+    let product = target
+        .custom
+        .get("product")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "node reconciler metadata has no product".to_string())?;
+    let version = target
+        .custom
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "node reconciler metadata has no version".to_string())?;
+    let platform = foundation::platform::platform_key();
+    let provider_store = updated::provider::BundleStore::for_lifecycle(&opts.paths)
+        .with_target_limit(opts.repository.target_limit);
+    let staged_bundle = update_client::acquire_verified_bundle(
             repo,
             &target,
             &opts.paths.provider_download,
@@ -106,27 +91,19 @@ pub(crate) async fn stage_providers(
         .map_err(|error| {
             if matches!(&error, update_client::AcquireBundleError::Invalid { .. }) {
                 if let Err(reject_error) = store.reject(&lineage, &sha) {
-                    return format!("staging {:?} provider override failed: {error}; recording its rejection also failed: {reject_error}", provider.capability);
+                    return format!("staging node reconciler failed: {error}; recording its rejection also failed: {reject_error}");
                 }
             }
-            format!(
-                "acquiring {:?} provider override failed: {error}",
-                provider.capability
-            )
+            format!("acquiring node reconciler failed: {error}")
         })?;
-        let release = updated::state::ProviderRelease {
-            product: product.to_string(),
-            release: staged_bundle.id,
-            archive_sha256: sha,
-            args: provider.args,
-            timeout_millis: provider.timeout_millis,
-        };
-        match provider.capability {
-            updated::config::ProviderCapability::Lifecycle => staged.lifecycle = Some(release),
-            updated::config::ProviderCapability::HealthCheck => staged.healthcheck = Some(release),
-        }
-    }
-    Ok(staged)
+    let release = updated::state::ProviderRelease {
+        product: product.to_string(),
+        release: staged_bundle.id,
+        archive_sha256: sha,
+        args: provider.args,
+        timeout_millis: provider.timeout_millis,
+    };
+    Ok(release)
 }
 
 /// Select, authorize, download, and apply the newest application target, if any.
@@ -152,8 +129,8 @@ pub(crate) async fn check_application(
     // Provider-only deployment revisions reconcile here as well. Staging is
     // content-addressed and side-effect free; no lifecycle phase runs until an app
     // transaction consumes this exact resolved provider.
-    let providers = match stage_providers(opts, repo, store, ordered_current).await {
-        Ok(providers) => providers,
+    let reconciler = match stage_providers(opts, repo, store, ordered_current).await {
+        Ok(reconciler) => reconciler,
         Err(error) => {
             warn(&error);
             return AppOutcome::Unchanged;
@@ -179,7 +156,19 @@ pub(crate) async fn check_application(
     .await
     {
         Ok(Some(prepared)) => prepared,
-        Ok(None) => return AppOutcome::Unchanged,
+        Ok(None) => match &installed {
+            updated::state::Installed::Present(state)
+                if state.lifecycle.as_deref() != Some(&reconciler) =>
+            {
+                update_client::PreparedApplication {
+                    release: state.release.clone(),
+                    version: state.release.version.clone(),
+                    archive_sha256: state.archive_sha256.clone(),
+                    provider_set: None,
+                }
+            }
+            _ => return AppOutcome::Unchanged,
+        },
         Err(error) => {
             if let Some((version, archive_sha256)) = error.rejected_archive() {
                 if let Err(reject_error) = store.reject(&lineage, archive_sha256) {
@@ -203,6 +192,7 @@ pub(crate) async fn check_application(
             lineage.clone(),
             &prepared.release,
             &prepared.archive_sha256,
+            &reconciler,
         ) {
             if let Err(error) = store.commit_installed(&rebound) {
                 return AppOutcome::Fatal(format!(
@@ -225,20 +215,14 @@ pub(crate) async fn check_application(
     // Drive the transaction over the live-application port; scope the tower so its borrow of
     // `app` is released before the arms below read `app.pid()`.
     let outcome = {
-        let mut tower = DefaultProvider::new(
-            app,
-            opts,
-            providers.lifecycle.as_ref(),
-            providers.healthcheck.as_ref(),
-        );
+        let mut tower = DefaultProvider::new(app, opts, Some(&reconciler));
         apply_update(
             &mut tower,
             store,
             &prepared.release,
             &prepared.archive_sha256,
             lineage.clone(),
-            providers.lifecycle.clone(),
-            providers.healthcheck.clone(),
+            Some(reconciler.clone()),
         )
         .await
     };
@@ -251,7 +235,7 @@ pub(crate) async fn check_application(
                 ));
             }
             log(&format!(
-                "upgraded to {} (pid {})",
+                "upgraded to {} (pid {:?})",
                 prepared.version,
                 app.pid()
             ));

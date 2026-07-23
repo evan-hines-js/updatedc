@@ -923,7 +923,7 @@ pub(crate) fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     if current.join("Cargo.toml").is_file() {
         return Ok(current);
     }
-    Err("run the demo from the updated workspace".into())
+    Err("run the demo from the updatedc workspace".into())
 }
 
 /// The base64 value of one key in a Secret, as the API stores it — used to hand the fleet
@@ -1121,7 +1121,7 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
         .arg("-i")
         .arg(&inventory)
         .arg(root.join("deploy/ansible/install-agent.yml"))
-        .args(["-e", &format!("updated_source={}", root.display())])
+        .args(["-e", &format!("updatedc_source={}", root.display())])
         .args(["-e", "updated_enrollment_url=https://updatec-gateway"])
         // The external VM presents the same fleet client certificate as the in-cluster agents,
         // read from the cert-manager-issued secret (base64; Ansible b64decodes it onto the VM).
@@ -1308,7 +1308,7 @@ pub(crate) fn bootstrap_minio_release_repo(
              artr=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
                --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
                --product demo-enterprise-lifecycle-reload --version 1.0.0 --entrypoint bin/lifecycle \
-               --activate bin/lifecycle --source /tmp/rube --platform {platform}); \
+               --source /tmp/rube --platform {platform}); \
              set -- $artr; \
              reload=$(updatectl publish-provider-set --keys-dir /data/release-keys \
                --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
@@ -1516,7 +1516,6 @@ pub(crate) fn apply_demo_resources(
     // activation, and uses the boot-sized health grace and relaxed cadence Magnolia's
     // multi-minute install needs.
     let magnolia_group = |name: &str,
-                          context: &str,
                           selector: serde_json::Value,
                           magnolia_path: &str,
                           magnolia_sha: &str,
@@ -1532,15 +1531,10 @@ pub(crate) fn apply_demo_resources(
         deployment["reportUrl"] = DEMO_REPORT_URL.into();
         deployment["orderedInstallFallback"] = serde_json::json!(false);
         deployment["runtime"]["product"] = "magnolia".into();
+        deployment["runtime"]["mode"] = "managed".into();
         deployment["runtime"]["args"] = serde_json::json!([]);
-        // Reload in place: the Magnolia lifecycle provider ships an `activate` script (see its
-        // publish below), so the supervisor hands the whole install to the provider — a real
-        // online, in-place Magnolia upgrade that backs the JCR up to another disk and reuses the
-        // repository, instead of the built-in restart. Rollback restores the backup.
-        deployment["runtime"]["healthChecks"] = serde_json::json!([{
-            "kind": "readiness",
-            "url": format!("http://127.0.0.1:8080/{context}/.rest/status")
-        }]);
+        // The Magnolia reconciler backs the JCR up before activation and reuses the repository.
+        // Managed mode supplies the process stop/start; rollback restores the backup.
         // Magnolia's first install runs for minutes; give it a boot-sized health grace and a
         // relaxed cadence rather than the fleet's sub-second timings.
         deployment["runtime"]["timeouts"] = serde_json::json!({
@@ -1564,12 +1558,11 @@ pub(crate) fn apply_demo_resources(
             }
         })
     };
-    for (role, _instance, context, _replicas) in
+    for (role, _instance, _context, _replicas) in
         MAGNOLIA_COHORTS.into_iter().filter(|_| magnolia_enabled)
     {
         items.push(magnolia_group(
             &format!("magnolia-{role}"),
-            context,
             serde_json::json!({"matchLabels":{"demo.updated.dev/kind":"magnolia", "demo.updated.dev/role": role}}),
             magnolia_path,
             magnolia_sha,
@@ -1584,7 +1577,6 @@ pub(crate) fn apply_demo_resources(
     if magnolia_enabled {
         items.push(magnolia_group(
             MAGNOLIA_MANUAL_GROUP,
-            "magnoliaPublic",
             serde_json::json!({"matchLabels":{"demo.updated.dev/cohort": DEMO_EXTERNAL_VM_COHORT}}),
             magnolia_path,
             magnolia_sha,

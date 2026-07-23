@@ -21,8 +21,8 @@ flowchart TB
         direction LR
         ENR["Enrollment<br/>(one-way)"] --> INST["Cold install<br/>(provisional→confirmed)"]
         INST --> UPD["Update transaction<br/>(upgrade + rollback)"]
-        UPD --> HG["Health gates"]
-        HG --> TEL["Telemetry<br/>(NodeReport)"]
+        UPD --> HOOKS["Signed lifecycle hooks<br/>verify + periodic"]
+        HOOKS --> TEL["Telemetry<br/>(NodeReport)"]
     end
     subgraph GUARD["Process supervision — bootstrap guardian"]
         direction LR
@@ -38,9 +38,10 @@ flowchart TB
 
 - **Control plane** decides *what* each group of nodes should run and *how fast* to roll it out.
   It never reaches into a node; it publishes signed TUF content and reads back node telemetry.
-- **Node agent** pulls its assignment, installs/upgrades to it, proves health, and reports back.
-- **Guardian** owns the OS process: it keeps the agent running, and swaps the agent binary itself
-  under a readiness gate. It is transparent to the init system (systemd/launchd/Windows service).
+- **Node agent** pulls its assignment, installs/upgrades to it, executes the signed node reconciler in a
+  contained environment, persists their ordering, and reports back.
+- **Guardian** always owns the agent process. In `managed` runtime mode it additionally owns the
+  application child; in `provider-managed` it owns no application process.
 
 The feedback loop is the whole point: control plane publishes → node converges → node reports
 health → throttle admits the next group. Nothing polls the app directly; telemetry is the only
@@ -277,29 +278,27 @@ stateDiagram-v2
 - The `Pending` image (predecessor release + *its* providers) is folded into the single atomic
   commit write — there is no separate "arm rollback" step that a crash could interrupt.
 
-## 8. Health gates
+## 8. Provider verification
 
-`became_healthy` gates every (re)start and every candidate. Three check kinds exist
-(`Startup`, `Readiness`, `Liveness`); the update/boot path uses the readiness-style gate.
+The lifecycle provider's `verify` phase gates every boot and candidate. Each invocation performs
+one application-specific observation; the agent owns the reliability policy around it.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Grace: (re)start; wait within health_grace window
-    Grace --> Probing: probe health URL
-    Probing --> Counting: 2xx (+ optional token/version match)
-    Probing --> Grace: non-2xx → reset streak
-    Counting --> Healthy: consecutive successes ≥ health_successes
-    Counting --> Probing: space by health_interval, probe again
-    Grace --> Failed: deadline exceeded → gate fails (reject / rollback)
-    Healthy --> [*]
+    [*] --> Verifying: invoke verify
+    Verifying --> Counting: hook exits successfully
+    Verifying --> Verifying: failure resets streak; retry within deadline
+    Counting --> Verified: required consecutive successes reached
+    Counting --> Verifying: wait configured interval
+    Verifying --> Failed: deadline exceeded
+    Verified --> [*]
 ```
 
-- Fields: `health_grace` (time to come up), `health_successes` (consecutive good probes, default 1),
-  `health_interval` (spacing between confirmations). No URL ⇒ sleep the grace and pass.
-- A passing gate is what flips a **provisional** cold-install head to **confirmed** (§5) and what
-  a candidate upgrade must clear before `Health → Finalize` (§6).
-- Optional identity check: the app may echo its launch token + version; present-but-wrong fails,
-  absent-but-2xx is trusted.
+- A passing gate flips a **provisional** cold-install head to **confirmed** (§5) and is required
+  before an update can finalize (§6).
+- `periodic` is the same signed provider contract for steady-state readiness/liveness sampling.
+- URL checks, vendor CLIs, PID inspection, and service-manager queries belong inside the provider;
+  the agent has no application-specific probe implementation.
 
 ## 9. Telemetry (the feedback signal)
 

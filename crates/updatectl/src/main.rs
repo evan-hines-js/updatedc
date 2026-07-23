@@ -67,12 +67,12 @@ enum Command {
     RotateRoot(RotateRootArgs),
     /// Build, sign, and publish an application bundle, then roll a named UpdateGroup onto it.
     Deploy(DeployArgs),
-    /// Build, sign, and publish a provider artifact bundle (a lifecycle/health/process CLI) as
+    /// Build, sign, and publish a lifecycle-provider artifact bundle as
     /// a signed target. Like `deploy` but publishes only the target — no group is rolled. A
     /// provider set then references the resulting `path`+`sha256`.
     PublishProviderArtifact(ProviderArtifactArgs),
     /// Sign and publish an immutable provider set (`provider-sets/<id>.json`) as a target,
-    /// binding a lifecycle and/or health-check provider artifact by path+sha256. This is the
+    /// binding the required lifecycle provider artifact by path+sha256. This is the
     /// S3-native counterpart of `server publish-provider-set`.
     PublishProviderSet(ProviderSetArgs),
 }
@@ -239,15 +239,6 @@ struct ProviderArtifactArgs {
     #[arg(long, env = "UPDATECTL_ENTRYPOINT")]
     entrypoint: String,
 
-    /// Bundle-relative path of the optional `activate` (reload) script. Its presence makes the
-    /// deployment reload in place instead of the guardian restarting the process.
-    #[arg(long, env = "UPDATECTL_ACTIVATE")]
-    activate: Option<String>,
-
-    /// Bundle-relative path of the optional `rollback` script (the local undo).
-    #[arg(long, env = "UPDATECTL_ROLLBACK")]
-    rollback: Option<String>,
-
     /// Source to publish: a prepared directory tree, or a single executable file that is
     /// wrapped into a one-file bundle at `--entrypoint`.
     #[arg(long, env = "UPDATECTL_SOURCE")]
@@ -272,12 +263,12 @@ struct ProviderSetArgs {
     id: String,
 
     /// Lifecycle provider artifact target path (from `publish-provider-artifact`).
-    #[arg(long, requires = "provider_sha256")]
-    provider_path: Option<String>,
+    #[arg(long)]
+    provider_path: String,
 
     /// sha256 of the lifecycle provider artifact.
-    #[arg(long, requires = "provider_path")]
-    provider_sha256: Option<String>,
+    #[arg(long)]
+    provider_sha256: String,
 
     /// Extra argument passed to the lifecycle provider (repeatable).
     #[arg(long)]
@@ -286,22 +277,6 @@ struct ProviderSetArgs {
     /// Lifecycle provider timeout, milliseconds.
     #[arg(long, default_value_t = 300_000)]
     provider_timeout_ms: u64,
-
-    /// Health-check provider artifact target path (from `publish-provider-artifact`).
-    #[arg(long, requires = "health_provider_sha256")]
-    health_provider_path: Option<String>,
-
-    /// sha256 of the health-check provider artifact.
-    #[arg(long, requires = "health_provider_path")]
-    health_provider_sha256: Option<String>,
-
-    /// Extra argument passed to the health-check provider (repeatable).
-    #[arg(long)]
-    health_provider_arg: Vec<String>,
-
-    /// Health-check provider timeout, milliseconds.
-    #[arg(long, default_value_t = 300_000)]
-    health_provider_timeout_ms: u64,
 
     /// Days until the re-signed TUF metadata expires.
     #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
@@ -534,9 +509,6 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
         &args.version,
         &platform,
         &args.entrypoint,
-        // An application deploy has no reload/undo scripts — those are provider-artifact concerns.
-        None,
-        None,
     )?;
 
     let mut target = PublishTarget::application(
@@ -634,8 +606,6 @@ async fn publish_provider_artifact(args: ProviderArtifactArgs) -> Result<(), Err
         &args.version,
         &platform,
         &args.entrypoint,
-        args.activate.as_deref(),
-        args.rollback.as_deref(),
     )?;
 
     let target = PublishTarget::application(
@@ -661,29 +631,16 @@ async fn publish_provider_artifact(args: ProviderArtifactArgs) -> Result<(), Err
 /// Publish an immutable provider set (`provider-sets/<id>.json`) as a signed target.
 async fn publish_provider_set(args: ProviderSetArgs) -> Result<(), Error> {
     let backend = &args.backend;
-    let mut overrides = Vec::new();
-    if let (Some(path), Some(sha256)) = (&args.provider_path, &args.provider_sha256) {
-        overrides.push(provider_override(
-            updated::config::ProviderCapability::Lifecycle,
-            path,
-            sha256,
-            &args.provider_arg,
-            args.provider_timeout_ms,
-        )?);
-    }
-    if let (Some(path), Some(sha256)) = (&args.health_provider_path, &args.health_provider_sha256) {
-        overrides.push(provider_override(
-            updated::config::ProviderCapability::HealthCheck,
-            path,
-            sha256,
-            &args.health_provider_arg,
-            args.health_provider_timeout_ms,
-        )?);
-    }
+    let reconciler = reconciler(
+        &args.provider_path,
+        &args.provider_sha256,
+        &args.provider_arg,
+        args.provider_timeout_ms,
+    )?;
     let set = updated::config::ProviderSet {
-        schema: 2,
+        schema: 1,
         id: args.id.clone(),
-        overrides,
+        reconciler,
     };
 
     let (destination, store, keys, repo_dir) = checkout_repository(backend).await?;
@@ -705,19 +662,17 @@ async fn publish_provider_set(args: ProviderSetArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Build a signed provider override from a validated artifact reference.
-fn provider_override(
-    capability: updated::config::ProviderCapability,
+/// Build a signed node reconciler from a validated artifact reference.
+fn reconciler(
     path: &str,
     sha256: &str,
     args: &[String],
     timeout_millis: u64,
-) -> Result<updated::config::ProviderOverride, Error> {
+) -> Result<updated::config::Reconciler, Error> {
     if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("provider sha256 {sha256:?} must be 64 hexadecimal characters").into());
     }
-    Ok(updated::config::ProviderOverride {
-        capability,
+    Ok(updated::config::Reconciler {
         artifact: updated::config::TargetReference {
             path: path.to_owned(),
             sha256: sha256.to_ascii_lowercase(),
@@ -847,8 +802,6 @@ fn build_bundle(
     version: &str,
     platform: &str,
     entrypoint: &str,
-    activate: Option<&str>,
-    rollback: Option<&str>,
 ) -> Result<(), Error> {
     let metadata = std::fs::symlink_metadata(source)
         .map_err(|error| format!("reading --source {}: {error}", source.display()))?;
@@ -871,11 +824,7 @@ fn build_bundle(
     } else {
         source
     };
-    let entrypoints = updated::bundle::Entrypoints {
-        entrypoint,
-        activate,
-        rollback,
-    };
+    let entrypoints = updated::bundle::Entrypoints { entrypoint };
     updated::bundle::create_bundle(tree, archive, product, version, platform, &entrypoints)
         .map_err(|error| format!("building bundle: {error}"))?;
     Ok(())

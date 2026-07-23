@@ -9,6 +9,7 @@ use url::{Host, Url};
 /// Fully verified, materialized runtime configuration.
 #[derive(Debug)]
 pub struct Config {
+    pub deployment: String,
     pub routing: Routing,
     pub repository: Repository,
     pub application: Application,
@@ -76,7 +77,8 @@ pub struct RepositoryAssignment {
     /// floor still bounds any descent; authenticated here so only the publisher — not
     /// an attacker replaying old metadata — can authorize a stateless downgrade.
     pub ordered_install_fallback: bool,
-    /// Exact immutable provider-set document selected independently of the app.
+    /// Exact reconciler manifest for the assigned application head. Historical application
+    /// targets carry their own reference for ordered fallback.
     pub provider_set: TargetReference,
     /// Pinned public TUF root for the selected release lineage. It is authenticated as
     /// part of this routing target and materialized locally before the release is opened.
@@ -89,29 +91,41 @@ pub struct RepositoryAssignment {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedRuntime {
+    /// Who owns the application process. The default is the hardened guardian-owned runtime.
+    /// `provider-managed` never launches, signals, probes, or stops an application process; the
+    /// signed node reconciler owns every application-specific effect.
+    #[serde(default)]
+    pub mode: RuntimeMode,
     pub product: String,
     pub channel: String,
     pub install_root: PathBuf,
     pub args: Vec<String>,
-    pub health_checks: Vec<ManagedHealthCheck>,
+    /// Environment variables whose values are resolved by the authenticated control plane.
+    /// Only references are signed into the assignment; secret bytes never enter TUF.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretReference>,
     pub repository: ManagedRepositoryLimits,
     pub storage: ManagedStorage,
     pub timeouts: ManagedTimeouts,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HealthCheckKind {
-    Startup,
-    Readiness,
-    Liveness,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ManagedHealthCheck {
-    pub kind: HealthCheckKind,
-    pub url: String,
+pub struct SecretReference {
+    /// Environment variable exposed to the managed application.
+    pub environment: String,
+    /// Kubernetes Secret name in the control-plane namespace.
+    pub secret: String,
+    /// Key within the Kubernetes Secret.
+    pub key: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    #[default]
+    Managed,
+    ProviderManaged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -216,41 +230,26 @@ pub struct TargetReference {
     pub sha256: String,
 }
 
-/// Immutable collection of overrides for capabilities normally supplied by the
-/// supervisor-owned built-in provider. The built-in provider is deliberately absent:
-/// it is compiled into, and has exactly the same version as, the supervisor.
+/// Immutable description of the one signed node reconciler required by a release.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSet {
     pub schema: u32,
     pub id: String,
-    pub overrides: Vec<ProviderOverride>,
+    pub reconciler: Reconciler,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderOverride {
-    pub capability: ProviderCapability,
+pub struct Reconciler {
     pub artifact: TargetReference,
     pub args: Vec<String>,
     pub timeout_millis: u64,
 }
 
-/// Capabilities that can be replaced by a separately signed provider artifact.
-/// Adding a capability is an explicit supervisor protocol change; arbitrary names are
-/// never accepted and silently ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderCapability {
-    Lifecycle,
-    /// An external CLI that answers the release's health/readiness (exit 0 = healthy). When
-    /// present it replaces the built-in HTTP readiness probe as the supervisor's health signal.
-    HealthCheck,
-}
-
 impl ProviderSet {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != 2 {
+        if self.schema != 1 {
             return Err(format!("unsupported provider-set schema {}", self.schema));
         }
         let valid_id = !self.id.is_empty()
@@ -261,35 +260,16 @@ impl ProviderSet {
         if !valid_id {
             return Err("provider-set id is invalid".into());
         }
-        if self.overrides.len() > 64 {
-            return Err("provider set has too many overrides".into());
+        if !(1..=86_400_000).contains(&self.reconciler.timeout_millis) {
+            return Err("node reconciler has an invalid timeout".into());
         }
-        let mut capabilities = std::collections::BTreeSet::new();
-        for provider in &self.overrides {
-            if !capabilities.insert(provider.capability) {
-                return Err(format!(
-                    "provider set contains duplicate {:?} overrides",
-                    provider.capability
-                ));
-            }
-            if !(1..=86_400_000).contains(&provider.timeout_millis) {
-                return Err(format!(
-                    "provider override {:?} has an invalid timeout",
-                    provider.capability
-                ));
-            }
-            if provider.args.len() > 256 || provider.args.iter().any(|arg| arg.len() > 16_384) {
-                return Err(format!(
-                    "provider override {:?} has invalid arguments",
-                    provider.capability
-                ));
-            }
-            if !valid_target_reference(&provider.artifact) {
-                return Err(format!(
-                    "provider override {:?} artifact reference is invalid",
-                    provider.capability
-                ));
-            }
+        if self.reconciler.args.len() > 256
+            || self.reconciler.args.iter().any(|arg| arg.len() > 16_384)
+        {
+            return Err("node reconciler has invalid arguments".into());
+        }
+        if !valid_target_reference(&self.reconciler.artifact) {
+            return Err("node reconciler artifact reference is invalid".into());
         }
         Ok(())
     }
@@ -378,6 +358,35 @@ impl ManagedRuntime {
         {
             return Err("managed runtime limits and timeouts must be non-zero".into());
         }
+        if self.secrets.len() > 64 {
+            return Err("managed runtime may declare at most 64 secret references".into());
+        }
+        if self.mode == RuntimeMode::ProviderManaged && !self.secrets.is_empty() {
+            return Err("provider-managed runtime cannot declare application secrets".into());
+        }
+        let mut environments = std::collections::BTreeSet::new();
+        for reference in &self.secrets {
+            let valid_environment = !reference.environment.is_empty()
+                && reference.environment.len() <= 128
+                && reference
+                    .environment
+                    .bytes()
+                    .enumerate()
+                    .all(|(index, byte)| {
+                        byte == b'_'
+                            || byte.is_ascii_uppercase()
+                            || (index > 0 && byte.is_ascii_digit())
+                    });
+            if !valid_environment
+                || reference.secret.is_empty()
+                || reference.secret.len() > 253
+                || reference.key.is_empty()
+                || reference.key.len() > 253
+                || !environments.insert(&reference.environment)
+            {
+                return Err("managed runtime secret references are invalid or duplicated".into());
+            }
+        }
         // A health streak of N successes spaced by `interval` needs at least (N-1)*interval of
         // grace to ever complete; otherwise a perfectly healthy app is failed on every gate and
         // its provisional head is needlessly rejected. (interval is ignored when successes == 1.)
@@ -390,31 +399,6 @@ impl ManagedRuntime {
                 self.timeouts.health_grace_seconds
             ));
         }
-        for check in &self.health_checks {
-            validate_health_check_url(&check.url)?;
-        }
-        for kind in [
-            HealthCheckKind::Startup,
-            HealthCheckKind::Readiness,
-            HealthCheckKind::Liveness,
-        ] {
-            if self
-                .health_checks
-                .iter()
-                .filter(|check| check.kind == kind)
-                .count()
-                > 1
-            {
-                return Err(format!(
-                    "managed runtime has more than one {kind:?} health check"
-                ));
-            }
-        }
-        // Every activation health-gates each release the same way — a readiness URL, a
-        // health-check provider, or simply surviving the grace window — so no activation
-        // needs a config-level readiness requirement. A delegated node with neither a
-        // readiness URL nor a health-check provider is caught at staging, where the provider
-        // set is known (a config that predates the provider fetch cannot see it here).
         Ok(())
     }
 
@@ -424,11 +408,12 @@ impl ManagedRuntime {
     /// launch args or health checks independently of the release version).
     pub fn application(&self) -> Application {
         Application {
+            mode: self.mode,
             product: self.product.clone(),
             channel: self.channel.clone(),
             install_root: self.install_root.clone(),
             args: self.args.clone(),
-            health_checks: self.health_checks.clone(),
+            secrets: self.secrets.clone(),
         }
     }
 
@@ -466,6 +451,7 @@ impl ManagedRuntime {
 
     pub fn materialize(
         &self,
+        deployment: &str,
         routing: Routing,
         release_root: &serde_json::Value,
         state_dir: &Path,
@@ -479,6 +465,7 @@ impl ManagedRuntime {
         )
         .map_err(|error| format!("materializing release root: {error}"))?;
         Ok(Config {
+            deployment: deployment.to_owned(),
             routing,
             repository: Repository {
                 root,
@@ -538,24 +525,14 @@ impl Default for Storage {
 /// The program being kept current.
 #[derive(Debug)]
 pub struct Application {
+    pub mode: RuntimeMode,
     pub product: String,
     pub channel: String,
     /// Root containing active-release, immutable versions, staging, and durable state.
     pub install_root: PathBuf,
     /// Arguments appended to the manifest-owned entrypoint.
     pub args: Vec<String>,
-    /// Tagged application probes. Each of startup, readiness, and liveness may appear
-    /// at most once; omitting a kind selects the documented process-lifetime fallback.
-    pub health_checks: Vec<ManagedHealthCheck>,
-}
-
-impl Application {
-    pub fn health_check_url(&self, kind: HealthCheckKind) -> Option<&str> {
-        self.health_checks
-            .iter()
-            .find(|check| check.kind == kind)
-            .map(|check| check.url.as_str())
-    }
+    pub secrets: Vec<SecretReference>,
 }
 
 /// Every tunable duration in the system, in one place. Omit any (or the whole
@@ -714,46 +691,18 @@ fn validate_report_url(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_health_check_url(raw: &str) -> Result<(), String> {
-    let url =
-        Url::parse(raw).map_err(|error| format!("application.health_checks[].url: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.cannot_be_a_base()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(
-            "application.health_checks[].url must be an HTTP(S) URL without credentials or a fragment"
-                .into(),
-        );
-    }
-    let loopback = match url.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(_)) => false,
-        None => false,
-    };
-    if !loopback {
-        return Err("application.health_checks[].url must use a numeric loopback address".into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn managed_runtime() -> ManagedRuntime {
         ManagedRuntime {
+            mode: RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
             args: vec![],
-            health_checks: vec![ManagedHealthCheck {
-                kind: HealthCheckKind::Readiness,
-                url: "http://127.0.0.1:8080/health".into(),
-            }],
+            secrets: vec![],
             repository: ManagedRepositoryLimits {
                 metadata_limit: 1 << 20,
                 target_limit: 512 << 20,
@@ -778,6 +727,44 @@ mod tests {
                 drain_hold_seconds: Some(0),
             },
         }
+    }
+
+    #[test]
+    fn runtime_mode_defaults_to_managed_and_accepts_provider_managed() {
+        let managed: RuntimeMode = serde_json::from_str("\"managed\"").unwrap();
+        let provider_managed: RuntimeMode = serde_json::from_str("\"provider-managed\"").unwrap();
+        assert_eq!(managed, RuntimeMode::Managed);
+        assert_eq!(provider_managed, RuntimeMode::ProviderManaged);
+
+        let value = serde_json::to_value(managed_runtime()).unwrap();
+        let mut without_mode = value.as_object().unwrap().clone();
+        without_mode.remove("mode");
+        let parsed: ManagedRuntime =
+            serde_json::from_value(serde_json::Value::Object(without_mode)).unwrap();
+        assert_eq!(parsed.mode, RuntimeMode::Managed);
+    }
+
+    #[test]
+    fn secret_references_are_strict_and_never_carry_values() {
+        let mut runtime = managed_runtime();
+        runtime.secrets.push(SecretReference {
+            environment: "DATABASE_PASSWORD".into(),
+            secret: "production-database".into(),
+            key: "password".into(),
+        });
+        runtime.validate().unwrap();
+        let json = serde_json::to_string(&runtime).unwrap();
+        assert!(json.contains("production-database"));
+        assert!(!json.contains("secretValue"));
+
+        runtime.secrets.push(SecretReference {
+            environment: "DATABASE_PASSWORD".into(),
+            secret: "other".into(),
+            key: "password".into(),
+        });
+        assert!(runtime.validate().is_err());
+        runtime.secrets[1].environment = "lowercase".into();
+        assert!(runtime.validate().is_err());
     }
 
     #[test]
@@ -877,7 +864,7 @@ mod tests {
         let unknown = r#"{"schema":2,"deployment":"d1","unexpected":true}"#;
         assert!(serde_json::from_str::<RepositoryAssignment>(unknown).is_err());
         let future = RepositoryAssignment {
-            schema: 3,
+            schema: 1,
             deployment: "future".into(),
             metadata_url: "https://cdn/m/".into(),
             targets_url: "https://cdn/t/".into(),
@@ -897,9 +884,8 @@ mod tests {
         assert!(future.validate().is_err());
     }
 
-    fn provider_override(capability: ProviderCapability) -> ProviderOverride {
-        ProviderOverride {
-            capability,
+    fn reconciler() -> Reconciler {
+        Reconciler {
             artifact: TargetReference {
                 path: "providers/lifecycle.bundle".into(),
                 sha256: "a".repeat(64),
@@ -910,63 +896,35 @@ mod tests {
     }
 
     #[test]
-    fn empty_provider_set_selects_the_supervisor_built_in_provider() {
+    fn provider_set_requires_one_valid_node_reconciler() {
         ProviderSet {
-            schema: 2,
-            id: "built-in".into(),
-            overrides: Vec::new(),
+            schema: 1,
+            id: "application-policy".into(),
+            reconciler: reconciler(),
         }
         .validate()
         .unwrap();
     }
 
     #[test]
-    fn provider_overrides_are_strict_unique_and_bounded() {
-        let provider = provider_override(ProviderCapability::Lifecycle);
-        let duplicate = ProviderSet {
-            schema: 2,
-            id: "duplicate".into(),
-            overrides: vec![provider.clone(), provider],
-        };
-        assert!(duplicate.validate().unwrap_err().contains("duplicate"));
-
-        let unknown = r#"{"schema":2,"id":"future","overrides":[{"capability":"future-capability","artifact":{"path":"provider","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"args":[],"timeout_millis":1}]}"#;
+    fn node_reconciler_is_strict_and_bounded() {
+        let unknown = r#"{"schema":1,"id":"future","reconciler":{"artifact":{"path":"provider","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"args":[],"timeout_millis":1,"future":true}}"#;
         assert!(serde_json::from_str::<ProviderSet>(unknown).is_err());
 
         let invalid_reference = ProviderSet {
-            schema: 2,
+            schema: 1,
             id: "unsafe".into(),
-            overrides: vec![ProviderOverride {
+            reconciler: Reconciler {
                 artifact: TargetReference {
                     path: "../escape".into(),
                     sha256: "a".repeat(64),
                 },
-                ..provider_override(ProviderCapability::Lifecycle)
-            }],
+                ..reconciler()
+            },
         };
         assert!(invalid_reference
             .validate()
             .unwrap_err()
             .contains("artifact reference"));
-    }
-
-    #[test]
-    fn health_check_urls_are_loopback_and_redirect_safe_by_construction() {
-        for valid in ["http://127.0.0.1:9090/healthz", "http://[::1]:9090/healthz"] {
-            validate_health_check_url(valid).unwrap();
-        }
-        for invalid in [
-            "http://example.com/healthz",
-            "http://localhost/healthz",
-            "file:///tmp/healthy",
-            "http://user:secret@localhost/healthz",
-            "http://localhost/healthz#fragment",
-            "not a url",
-        ] {
-            assert!(
-                validate_health_check_url(invalid).is_err(),
-                "accepted {invalid}"
-            );
-        }
     }
 }

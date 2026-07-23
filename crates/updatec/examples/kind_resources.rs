@@ -6,21 +6,12 @@ use updatec::*;
 
 fn runtime() -> RuntimeSpec {
     RuntimeSpec {
+        mode: RuntimeModeSpec::Managed,
         product: "app".into(),
         channel: "stable".into(),
         install_root: "/var/lib/updated".into(),
         args: vec!["--addr".into(), "0.0.0.0:8080".into()],
-        health_checks: [
-            HealthCheckKindSpec::Startup,
-            HealthCheckKindSpec::Readiness,
-            HealthCheckKindSpec::Liveness,
-        ]
-        .into_iter()
-        .map(|kind| HealthCheckSpec {
-            kind,
-            url: "http://127.0.0.1:8080/healthz".into(),
-        })
-        .collect(),
+        secrets: vec![],
         repository: RepositoryLimitsSpec {
             metadata_limit: 1_048_576,
             target_limit: 536_870_912,

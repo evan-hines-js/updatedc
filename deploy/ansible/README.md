@@ -1,4 +1,4 @@
-# `updated` with Ansible
+# `updatedc` with Ansible
 
 Two playbooks live here:
 
@@ -13,7 +13,7 @@ The entire demo UX is a single playbook, run **on the server** (an x86_64 Linux 
 Magnolia):
 
 ```sh
-git clone <this repo> updated && cd updated
+git clone <this repo> updatedc && cd updatedc
 ansible-playbook deploy/ansible/demo.yml
 # …then browse to http://<this-server>/
 ```
@@ -59,7 +59,7 @@ Run:
 
 ```sh
 ansible-playbook -i inventory.ini install-agent.yml \
-  -e updated_source=/path/to/updated \
+  -e updatedc_source=/path/to/updatedc \
   -e updated_enrollment_url=https://gateway.example.com \
   -e updated_enrollment_client_cert="$(base64 -w0 client.crt)" \
   -e updated_enrollment_client_key="$(base64 -w0 client.key)" \
@@ -69,7 +69,7 @@ ansible-playbook -i inventory.ini install-agent.yml \
 
 | Var | Required | Meaning |
 |-----|----------|---------|
-| `updated_source` | yes | Path to the `updated` workspace on the control node; rsync'd to the target and built there (native binaries, no cross-compile). |
+| `updatedc_source` | yes | Path to the `updatedc` workspace on the control node; rsync'd to the target and built there (native binaries, no cross-compile). The former `updated_source` name remains a compatibility alias. |
 | `updated_enrollment_url` | — | Control-plane enrollment endpoint, HTTPS (default `https://updatec-gateway`). |
 | `updated_enrollment_client_cert` / `_client_key` / `_ca` | yes | base64 PEM of the fleet client certificate, its key, and the fleet CA — the mTLS identity (cert-manager issues these; there is no shared secret). |
 | `updated_hostname` | — | Stable identity the control plane addresses the node by (default: inventory name). |

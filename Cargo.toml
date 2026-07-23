@@ -9,7 +9,6 @@ members = [
     "crates/server",
     "crates/bootstrap",
     "crates/supervisor",
-    "crates/oneshot",
     "crates/sampleapp",
     "crates/sampleapp-reexec",
     "crates/e2e",
@@ -25,7 +24,7 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "MIT"
+license = "PolyForm-Small-Business-1.0.0"
 
 # Pinned once here so every crate agrees on versions. All hashing and signing go
 # through `aws-lc-rs` (already pulled in by the TUF client), so there is one
