@@ -111,7 +111,6 @@ pub struct Ctx {
     pub server: PathBuf,
     pub supervisor: PathBuf,
     pub bootstrap: PathBuf,
-    pub oneshot: PathBuf,
     /// Rust's own OS-arch key, e.g. `macos-aarch64` / `windows-x86_64`; matches
     /// what the supervisor sends and the server keys manifests by.
     pub platkey: String,
@@ -192,7 +191,6 @@ impl Ctx {
             // scenario may execute that mutable build output directly.
             supervisor: work.join(format!("build/supervisor-chaos{exe}")),
             bootstrap: bin("bootstrap"),
-            oneshot: bin("updated-oneshot"),
             platkey: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             exe,
             work,
@@ -206,22 +204,14 @@ impl Ctx {
     /// which are compiled out of every ordinary build.
     pub fn build(&self) -> R {
         // `E2E_FIPS=1` runs the suite on FIPS-validated crypto: the binaries that do crypto (the
-        // mock CDN, the one-shot updater, and the supervisor — mTLS, the TUF transport, hashing,
+        // mock CDN and supervisor — mTLS, the TUF transport, hashing,
         // signing) are built `--features fips`, which links the validated aws-lc-rs. The guardian
         // and sample apps do no crypto, so they build unchanged. A FIPS build that cannot validate
         // its provider fails closed at startup.
         let fips = std::env::var_os("E2E_FIPS").is_some();
         let fips_feature: &[&str] = if fips { &["--features", "fips"] } else { &[] };
         let crypto_cdn = [
-            [
-                "build",
-                "--release",
-                "-p",
-                "server",
-                "-p",
-                "updated-oneshot",
-            ]
-            .as_slice(),
+            ["build", "--release", "-p", "server"].as_slice(),
             fips_feature,
         ]
         .concat();
@@ -247,7 +237,7 @@ impl Ctx {
 
     /// Build one release package (with optional extra env and cargo `--features`) and stage the
     /// resulting binary at `build/<dst_stem><exe>`. The single build-then-copy path behind
-    /// `build_app`, `build_reexec_app`, `build_supervisor`, and the post-ready-crash variant.
+    /// `build_app`, `build_supervisor`, and the post-ready-crash variant.
     fn build_and_stage(
         &self,
         pkg: &str,
@@ -274,15 +264,6 @@ impl Ctx {
     /// Build one version-agnostic sample binary. Release identity lives in its bundle config.
     pub fn build_app(&self, version: &str) -> R<PathBuf> {
         self.build_and_stage("sampleapp", &[], &[], &format!("app-{version}"))
-    }
-
-    pub fn build_reexec_app(&self, version: &str) -> R<PathBuf> {
-        self.build_and_stage(
-            "sampleapp-reexec",
-            &[],
-            &[],
-            &format!("reexec-app-{version}"),
-        )
     }
 
     /// Build `supervisor` with a baked version (so the bytes differ per version) and
@@ -434,13 +415,6 @@ impl Ctx {
 
     /// Serve the TUF repository at `dir/repo`; the returned handle keeps it alive.
     pub fn serve(&self, dir: &Path, addr: &str) -> R<Proc> {
-        run(Command::new(&self.server)
-            .arg("publish-provider-set")
-            .arg("--repo")
-            .arg(dir.join("repo"))
-            .arg("--keys")
-            .arg(dir.join("keys"))
-            .args(["--id", "default"]))?;
         std::fs::write(dir.join("assignment-addr"), addr).map_err(str_err)?;
         let certs = dir.join("certs");
         let mut server = Proc::spawn(
@@ -1012,14 +986,10 @@ pub fn dump_install_state(work: &Path) -> String {
                 })
                 .unwrap_or("n/a")
         };
-        let (lifecycle, healthcheck, pending) = (
-            present("lifecycle"),
-            present("healthcheck"),
-            present("pending"),
-        );
+        let (lifecycle, pending) = (present("lifecycle"), present("pending"));
         out.push_str(&format!(
             "\n  {label}: installed={installed} confirmed={confirmed} rejected=[{rejected}] \
-             transaction={transaction} lifecycle={lifecycle} healthcheck={healthcheck} pending={pending}"
+             transaction={transaction} lifecycle={lifecycle} pending={pending}"
         ));
     }
     out

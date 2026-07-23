@@ -52,7 +52,6 @@ pub(crate) struct Situation {
     /// Whether the release a recovery would restore reloads in place (its lifecycle ships an
     /// `activate` script). A reload leaves the predecessor process running through a failed
     /// candidate reload, so recovery adopts it rather than stop-starting it — no downtime.
-    pub reloads_in_place: bool,
     /// This boot performed a (re)install — [`ensure_installed`](crate::install::ensure_installed)
     /// changed the active bytes. Any process the guardian kept alive is therefore the *previous*
     /// release (e.g. a wedged head we just descended past), so the planner must stop it and launch
@@ -153,7 +152,6 @@ mod tests {
                 "https://repo/metadata/",
             ),
             lifecycle: None,
-            healthcheck: None,
             committed_at: 1000,
         }
     }

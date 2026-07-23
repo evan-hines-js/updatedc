@@ -1,5 +1,4 @@
-//! Dedicated same-PID reexec fixture. The implementation is shared with the ordinary
-//! sample application; this separate executable makes the deployment contract explicit.
+//! Dedicated same-PID reexec fixture used by the control-plane deployment demos.
 
 fn main() {
     sampleapp::run(true);

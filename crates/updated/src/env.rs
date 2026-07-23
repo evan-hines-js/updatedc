@@ -1,7 +1,7 @@
 //! Environment variable names the update tower still uses, in one place.
 //!
 //! The program that *sets* a variable and the program that *reads* it — the
-//! supervisor, the managed application, the operator lifecycle provider, the tests — all
+//! supervisor, the managed application, and the tests — all
 //! reference these constants instead of string literals, so a rename can never desync
 //! them. All share the `UPDATED_` prefix.
 //!
@@ -16,27 +16,10 @@
 /// supervisor knows the answer came from the exact process it launched.
 pub const HEALTH_TOKEN: &str = "UPDATED_HEALTH_TOKEN";
 
-// ── supervisor → operator lifecycle provider ───────────────────────────────────
+// ── supervisor → managed application ───────────────────────────────────────────
 
-/// PID of the running child, exposed to the operator's lifecycle provider.
-pub const CHILD_PID: &str = "UPDATED_CHILD_PID";
-/// Root of the managed installation, exposed to the operator's lifecycle provider.
+/// Root of the managed installation.
 pub const INSTALL_ROOT: &str = "UPDATED_INSTALL_ROOT";
-/// Immutable directory of the release the command is being asked to activate.
-pub const CANDIDATE: &str = "UPDATED_CANDIDATE";
-/// Immutable directory of the release currently being replaced.
-pub const PREDECESSOR: &str = "UPDATED_PREDECESSOR";
-/// Semantic version of [`CANDIDATE`].
-pub const CANDIDATE_VERSION: &str = "UPDATED_CANDIDATE_VERSION";
-/// Semantic version of [`PREDECESSOR`].
-pub const PREDECESSOR_VERSION: &str = "UPDATED_PREDECESSOR_VERSION";
-/// Stable content-derived identity for one update attempt and its recovery retries.
-pub const LIFECYCLE_ATTEMPT_ID: &str = "UPDATED_LIFECYCLE_ATTEMPT_ID";
-/// Lifecycle phase requested from the operator lifecycle provider.
-pub const LIFECYCLE_PHASE: &str = "UPDATED_LIFECYCLE_PHASE";
-/// Why the application is being launched — `install` | `restart` | `update`. Lets one
-/// provider script tell a first boot from a plain restart from an update.
-pub const LIFECYCLE_REASON: &str = "UPDATED_LIFECYCLE_REASON";
 
 // ── test-only fault injection ──────────────────────────────────────────────────
 
@@ -49,18 +32,7 @@ mod tests {
 
     #[test]
     fn every_var_is_prefixed() {
-        for var in [
-            HEALTH_TOKEN,
-            CHILD_PID,
-            INSTALL_ROOT,
-            CANDIDATE,
-            PREDECESSOR,
-            CANDIDATE_VERSION,
-            PREDECESSOR_VERSION,
-            LIFECYCLE_ATTEMPT_ID,
-            LIFECYCLE_PHASE,
-            CHAOS_POINT,
-        ] {
+        for var in [HEALTH_TOKEN, INSTALL_ROOT, CHAOS_POINT] {
             assert!(
                 var.starts_with("UPDATED_"),
                 "{var} must use the UPDATED_ prefix"

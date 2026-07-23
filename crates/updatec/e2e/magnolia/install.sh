@@ -1,19 +1,36 @@
 #!/usr/bin/env bash
-# Lifecycle provider for the "magnolia" product on a plain Ubuntu + agent node. This is the
+# Node reconciler for the "magnolia" product on a plain Ubuntu + agent node. This is the
 # whole point of the demo: the supervisor does its TUF job (download + verify the signed
 # release), then hands the install to this custom code. Two phases do real work:
 #
 #   pre-start : first-boot install of a JRE + real Magnolia CE onto the node's volume.
-#   activate  : the online, in-place UPGRADE under `custom` activation — back the JCR up to
+#   activate  : the upgrade — back the JCR up to
 #               another disk as a compressed tar, then upgrade the webapp in place, reusing
 #               the same repository (Magnolia's automatic update migrates it on start).
 #   rollback  : restore the pre-upgrade JCR from that backup so a failed upgrade reverts.
 #
-# Every other lifecycle phase is a no-op: the supervisor's stop-start plus Tomcat's own
-# graceful shutdown drain and relaunch the instance with no custom scripts.
+# Every other operation is a no-op: the supervisor's stop-start plus Tomcat's own graceful
+# shutdown drain and relaunch the instance.
 set -euo pipefail
 
-PHASE="${UPDATED_LIFECYCLE_PHASE:-}"
+PHASE=${1:?missing reconciler operation}
+shift
+PROTOCOL=
+PREDECESSOR_VERSION=
+CANDIDATE_VERSION=
+while (($#)); do
+  case "$1" in
+    --protocol) PROTOCOL=$2; shift 2 ;;
+    --predecessor-version) PREDECESSOR_VERSION=$2; shift 2 ;;
+    --candidate-version) CANDIDATE_VERSION=$2; shift 2 ;;
+    --attempt-id | --reason | --install-root | --state-dir | --candidate | --predecessor | --managed-pid)
+      shift 2
+      ;;
+    --) shift; break ;;
+    *) echo "magnolia-install: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+[[ $PROTOCOL == 1 ]] || { echo "magnolia-install: unsupported protocol" >&2; exit 2; }
 DATA="${MAGNOLIA_DATA:-/var/lib/magnolia}"
 BACKUPS="${MAGNOLIA_BACKUPS:-/var/lib/magnolia-backups}"
 INSTANCE="${MAGNOLIA_INSTANCE:-public}"
@@ -64,7 +81,7 @@ install_runtime() {
 # tar the live JCR to another disk before an in-place change, and remember it for rollback.
 backup_jcr() {
   mkdir -p "$BACKUPS"
-  local stamp="${UPDATED_PREDECESSOR_VERSION:-baseline}"
+  local stamp="${PREDECESSOR_VERSION:-baseline}"
   if [ -d "$DATA/repositories" ]; then
     local archive="repositories-$stamp.tar.gz"
     echo "magnolia-install: backing up the JCR (from $stamp) to $BACKUPS/$archive" >&2
@@ -89,8 +106,8 @@ case "$PHASE" in
     # automatic update (magnolia.update.auto, set by the launcher) migrates the JCR to the new
     # version on the next start. The CE bytes are pinned here, so this is the reuse-in-place
     # step of a genuine in-place upgrade rather than a versioned-directory swap.
-    echo "magnolia-install: upgrading Magnolia in place to ${UPDATED_CANDIDATE_VERSION:-?}, reusing the JCR at $DATA/repositories" >&2
-    printf '%s\n' "${UPDATED_CANDIDATE_VERSION:-?}" > "$DATA/installed-version"
+    echo "magnolia-install: upgrading Magnolia in place to ${CANDIDATE_VERSION:-?}, reusing the JCR at $DATA/repositories" >&2
+    printf '%s\n' "${CANDIDATE_VERSION:-?}" > "$DATA/installed-version"
     ;;
 
   rollback)
@@ -106,6 +123,6 @@ case "$PHASE" in
     ;;
 
   *)
-    : # every other lifecycle phase is a no-op for custom activation
+    : # every other reconciler operation is a no-op
     ;;
 esac

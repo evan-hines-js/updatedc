@@ -210,6 +210,7 @@ fn handle(mut stream: TcpStream) {
     // guardian ownership and adoption use the OS-derived child PID over `control` and
     // never depend on this endpoint.
     let pid = std::process::id().to_string();
+    let secret = std::env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "<missing>".into());
     let fault = *FAULT.get().expect("fault initialized");
     let health_request = path == "/healthz";
     let health_attempt = health_request.then(|| HEALTH_REQUESTS.fetch_add(1, Ordering::SeqCst));
@@ -231,6 +232,7 @@ fn handle(mut stream: TcpStream) {
         "/healthz" if injected_unhealthy => (503, "unhealthy"),
         "/healthz" => (200, "ok"),
         "/pid" => (200, pid.as_str()),
+        "/test-secret" => (200, secret.as_str()),
         "/crash" => (200, "crashing"),
         "/" => (200, if version() == "2.0.0" { "green" } else { "red" }),
         _ => (404, "not found"),

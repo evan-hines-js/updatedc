@@ -6,6 +6,19 @@ on:
   pull_request:
 
 jobs:
+  semgrep:
+    name: Semgrep static analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      # Version tags for the official image are immutable.
+      image: semgrep/semgrep:1.170.0
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Scan source code
+        run: semgrep scan --config auto --error .
+
   trivy:
     name: Trivy filesystem scan
     runs-on: ubuntu-latest
@@ -81,8 +94,7 @@ jobs:
           [[ $e2e_rc -eq 0 && $killfuzz_rc -eq 0 ]]
 
       # A main build produces the continuously-running update tower for each desktop
-      # target. The optional updated-oneshot companion remains independently buildable
-      # but is not part of this supervisor/application deployment bundle.
+      # target.
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         run: |
@@ -189,7 +201,7 @@ jobs:
   release:
     name: Publish immutable release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, trivy, windows-scm-e2e, linux-haproxy-e2e, updatec-e2e, updatec-demo-e2e]
+    needs: [test, semgrep, trivy, windows-scm-e2e, linux-haproxy-e2e, updatec-e2e, updatec-demo-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

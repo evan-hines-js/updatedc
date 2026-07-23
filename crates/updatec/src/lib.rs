@@ -83,31 +83,34 @@ pub struct ReleaseRepositorySpec {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSpec {
+    #[serde(default)]
+    pub mode: RuntimeModeSpec,
     pub product: String,
     pub channel: String,
     pub install_root: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
-    pub health_checks: Vec<HealthCheckSpec>,
+    pub secrets: Vec<SecretReferenceSpec>,
     pub repository: RepositoryLimitsSpec,
     pub storage: StorageSpec,
     pub timeouts: TimeoutsSpec,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum HealthCheckKindSpec {
-    Startup,
-    Readiness,
-    Liveness,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct HealthCheckSpec {
-    pub kind: HealthCheckKindSpec,
-    pub url: String,
+pub struct SecretReferenceSpec {
+    pub environment: String,
+    pub secret: String,
+    pub key: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeModeSpec {
+    #[default]
+    Managed,
+    ProviderManaged,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -173,27 +176,24 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
             },
             release_root,
             runtime: updated::config::ManagedRuntime {
+                mode: match value.runtime.mode {
+                    RuntimeModeSpec::Managed => updated::config::RuntimeMode::Managed,
+                    RuntimeModeSpec::ProviderManaged => {
+                        updated::config::RuntimeMode::ProviderManaged
+                    }
+                },
                 product: value.runtime.product,
                 channel: value.runtime.channel,
                 install_root: value.runtime.install_root.into(),
                 args: value.runtime.args,
-                health_checks: value
+                secrets: value
                     .runtime
-                    .health_checks
+                    .secrets
                     .into_iter()
-                    .map(|check| updated::config::ManagedHealthCheck {
-                        kind: match check.kind {
-                            HealthCheckKindSpec::Startup => {
-                                updated::config::HealthCheckKind::Startup
-                            }
-                            HealthCheckKindSpec::Readiness => {
-                                updated::config::HealthCheckKind::Readiness
-                            }
-                            HealthCheckKindSpec::Liveness => {
-                                updated::config::HealthCheckKind::Liveness
-                            }
-                        },
-                        url: check.url,
+                    .map(|reference| updated::config::SecretReference {
+                        environment: reference.environment,
+                        secret: reference.secret,
+                        key: reference.key,
                     })
                     .collect(),
                 repository: updated::config::ManagedRepositoryLimits {
@@ -809,16 +809,14 @@ mod tests {
         }
     }
 
-    fn managed_runtime() -> updated::config::ManagedRuntime {
+    pub(crate) fn managed_runtime() -> updated::config::ManagedRuntime {
         updated::config::ManagedRuntime {
+            mode: updated::config::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
             args: vec![],
-            health_checks: vec![updated::config::ManagedHealthCheck {
-                kind: updated::config::HealthCheckKind::Readiness,
-                url: "http://127.0.0.1:8080/health".into(),
-            }],
+            secrets: vec![],
             repository: updated::config::ManagedRepositoryLimits {
                 metadata_limit: 1_048_576,
                 target_limit: 536_870_912,
@@ -847,14 +845,12 @@ mod tests {
 
     fn runtime_spec() -> RuntimeSpec {
         RuntimeSpec {
+            mode: RuntimeModeSpec::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
             args: vec![],
-            health_checks: vec![HealthCheckSpec {
-                kind: HealthCheckKindSpec::Readiness,
-                url: "http://127.0.0.1:8080/health".into(),
-            }],
+            secrets: vec![],
             repository: RepositoryLimitsSpec {
                 metadata_limit: 1_048_576,
                 target_limit: 536_870_912,

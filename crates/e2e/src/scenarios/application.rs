@@ -345,8 +345,6 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
 /// Exercise failures in the managed process itself. These are real signed bundles and
 /// real localhost HTTP exchanges; no supervisor or guardian dependency is mocked.
 pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
-    use updated::config::HealthCheckKind::{Liveness, Readiness};
-
     let cases = [
         ("exit-before-bind", 22100u16, false),
         ("unhealthy", 22101, false),
@@ -370,7 +368,6 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
         ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
         let _server = ctx.serve(&dir, &srv)?;
         let unplaced = dir.join(format!("not-preinstalled{}", ctx.exe));
-        let health = format!("http://{svc}/healthz");
         let command = Sup::new(
             ctx,
             &dir,
@@ -382,8 +379,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
         .check_interval("1s")
         .health_grace("4s")
         .health_successes(if fault == "flapping" { 2 } else { 1 })
-        .health_check(Readiness, &health)
-        .health_check(Liveness, &health)
+        .readiness_health(&svc)
         .guardian_probes(&probes)
         .guardian()?;
         let tower = Service::spawn("chaotic-app", &command);

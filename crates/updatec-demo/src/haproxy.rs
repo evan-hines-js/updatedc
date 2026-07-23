@@ -182,7 +182,7 @@ pub(crate) fn publish_haproxy_bundles(
              art=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
                --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
                --product haproxy-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
-               --activate bin/lifecycle --source /tmp/hap-provider --platform {platform}); \
+               --source /tmp/hap-provider --platform {platform}); \
              set -- $art; \
              set_out=$(updatectl publish-provider-set --keys-dir /data/release-keys \
                --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
@@ -353,13 +353,9 @@ fn haproxy_group_deployment(
     deployment["reportUrl"] = DEMO_REPORT_URL.into();
     deployment["orderedInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
+    deployment["runtime"]["mode"] = "managed".into();
     deployment["runtime"]["installRoot"] = "/var/lib/updated/haproxy".into();
     deployment["runtime"]["args"] = serde_json::json!([]);
-    // The guardian gates readiness on HAProxy's own monitor-uri, served on the frontend.
-    deployment["runtime"]["healthChecks"] = serde_json::json!([{
-        "kind": "readiness",
-        "url": "http://127.0.0.1:8080/haproxy-healthz"
-    }]);
     deployment["runtime"]["timeouts"] = serde_json::json!({
         "checkIntervalSeconds": 1,
         "healthGraceSeconds": 12,

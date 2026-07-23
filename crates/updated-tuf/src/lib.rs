@@ -78,11 +78,12 @@ mod error_tests {
 
     fn runtime() -> updated::config::ManagedRuntime {
         updated::config::ManagedRuntime {
+            mode: updated::config::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
             args: vec![],
-            health_checks: vec![],
+            secrets: vec![],
             repository: updated::config::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,
@@ -144,11 +145,12 @@ mod error_tests {
     #[test]
     fn assigned_repositories_have_independent_stable_datastores() {
         let runtime = || updated::config::ManagedRuntime {
+            mode: updated::config::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
             args: vec![],
-            health_checks: vec![],
+            secrets: vec![],
             repository: updated::config::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,
@@ -186,7 +188,7 @@ mod error_tests {
             ordered_install_fallback: false,
             provider_set: updated::config::TargetReference {
                 path: "providers".into(),
-                sha256: "bb".into(),
+                sha256: "b".repeat(64),
             },
             release_root: serde_json::json!({}),
             runtime: runtime(),
@@ -212,16 +214,17 @@ mod error_tests {
             },
             ordered_install_fallback: false,
             provider_set: updated::config::TargetReference {
-                path: "provider-sets/1.json".into(),
+                path: "providers".into(),
                 sha256: "b".repeat(64),
             },
             release_root: serde_json::json!({}),
             runtime: updated::config::ManagedRuntime {
+                mode: updated::config::RuntimeMode::Managed,
                 product: "app".into(),
                 channel: "stable".into(),
                 install_root: "/app".into(),
                 args: vec![],
-                health_checks: vec![],
+                secrets: vec![],
                 repository: updated::config::ManagedRepositoryLimits {
                     metadata_limit: 1,
                     target_limit: 1,
@@ -250,7 +253,6 @@ mod error_tests {
         let datastore = assignment_identity(&first);
         first.deployment = "deploy-2".into();
         first.application.sha256 = "c".repeat(64);
-        first.provider_set.sha256 = "d".repeat(64);
         assert_eq!(datastore, assignment_identity(&first));
     }
 
@@ -272,7 +274,7 @@ mod error_tests {
             ordered_install_fallback: false,
             provider_set: updated::config::TargetReference {
                 path: "providers".into(),
-                sha256: "bb".into(),
+                sha256: "b".repeat(64),
             },
             release_root: serde_json::json!({}),
             runtime: runtime(),
@@ -290,7 +292,7 @@ mod error_tests {
             ordered_install_fallback: false,
             provider_set: updated::config::TargetReference {
                 path: "providers".into(),
-                sha256: "bb".into(),
+                sha256: "b".repeat(64),
             },
             release_root: serde_json::json!({}),
             runtime: runtime(),
@@ -418,7 +420,12 @@ pub async fn resolve_managed_config(
     let assignment = persisted_assignment(&embedded.runtime.install_root).unwrap_or(embedded);
     assignment
         .runtime
-        .materialize(routing, &assignment.release_root, enrollment_state)
+        .materialize(
+            &assignment.deployment,
+            routing,
+            &assignment.release_root,
+            enrollment_state,
+        )
         .map_err(Error::Trust)
 }
 

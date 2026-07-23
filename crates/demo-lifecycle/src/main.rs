@@ -4,7 +4,6 @@
 //! that process as one typed, idempotent state machine rather than a pile of shell
 //! entrypoints. The supervisor downloads this executable as a provider artifact.
 
-use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,9 +25,9 @@ enum Phase {
     Activate,
     Start,
     Verify,
+    Periodic,
     Finalize,
     Rollback,
-    Uninstall,
 }
 
 impl Phase {
@@ -43,9 +42,9 @@ impl Phase {
             "activate" => Ok(Self::Activate),
             "start" => Ok(Self::Start),
             "verify" => Ok(Self::Verify),
+            "periodic" => Ok(Self::Periodic),
             "finalize" => Ok(Self::Finalize),
             "rollback" => Ok(Self::Rollback),
-            "uninstall" => Ok(Self::Uninstall),
             _ => Err(format!("unknown lifecycle phase {value:?}").into()),
         }
     }
@@ -61,9 +60,9 @@ impl Phase {
             Self::Activate => "activate",
             Self::Start => "start",
             Self::Verify => "verify",
+            Self::Periodic => "periodic",
             Self::Finalize => "finalize",
             Self::Rollback => "rollback",
-            Self::Uninstall => "uninstall",
         }
     }
 }
@@ -74,7 +73,7 @@ struct Deployment {
     candidate: String,
     predecessor: String,
     candidate_dir: PathBuf,
-    child_pid: Option<String>,
+    managed_pid: Option<String>,
     state: PathBuf,
     effects: PathBuf,
     live: PathBuf,
@@ -83,11 +82,12 @@ struct Deployment {
 
 impl Deployment {
     fn load() -> Result<Self, Error> {
-        let phase = Phase::parse(&required(updated::env::LIFECYCLE_PHASE)?)?;
-        let attempt = required(updated::env::LIFECYCLE_ATTEMPT_ID)?;
-        let candidate = required(updated::env::CANDIDATE_VERSION)?;
-        let root = PathBuf::from(required(updated::env::INSTALL_ROOT)?);
-        let state = root.join("demo-enterprise-deployment");
+        let mut args = std::env::args().skip(1);
+        let phase = Phase::parse(&args.next().ok_or("missing reconciler operation")?)?;
+        let values = named_arguments(args)?;
+        let attempt = required_argument(&values, "--attempt-id")?.to_string();
+        let candidate = required_argument(&values, "--candidate-version")?.to_string();
+        let state = PathBuf::from(required_argument(&values, "--state-dir")?);
         Ok(Self {
             phase,
             effects: state.join("attempts").join(&attempt),
@@ -96,9 +96,9 @@ impl Deployment {
             state,
             attempt,
             candidate,
-            predecessor: required(updated::env::PREDECESSOR_VERSION)?,
-            candidate_dir: PathBuf::from(required(updated::env::CANDIDATE)?),
-            child_pid: env::var(updated::env::CHILD_PID).ok(),
+            predecessor: required_argument(&values, "--predecessor-version")?.to_string(),
+            candidate_dir: PathBuf::from(required_argument(&values, "--candidate")?),
+            managed_pid: values.get("--managed-pid").cloned(),
         })
     }
 
@@ -106,7 +106,7 @@ impl Deployment {
         fs::create_dir_all(&self.effects)?;
         fs::create_dir_all(&self.live)?;
         fs::create_dir_all(self.state.join("audit"))?;
-        if self.completed(self.phase) {
+        if self.phase != Phase::Periodic && self.completed(self.phase) {
             return Ok(());
         }
         self.audit("started")?;
@@ -120,14 +120,16 @@ impl Deployment {
             Phase::Activate => self.activate()?,
             Phase::Start => self.start()?,
             Phase::Verify => self.verify()?,
+            Phase::Periodic => self.periodic()?,
             Phase::Finalize => self.finalize()?,
             Phase::Rollback => self.rollback()?,
-            Phase::Uninstall => self.uninstall()?,
         }
-        self.write(
-            self.effects.join(format!("{}.done", self.phase.name())),
-            b"done\n",
-        )?;
+        if self.phase != Phase::Periodic {
+            self.write(
+                self.effects.join(format!("{}.done", self.phase.name())),
+                b"done\n",
+            )?;
+        }
         self.audit("completed")
     }
 
@@ -177,7 +179,7 @@ impl Deployment {
     fn pre_start(&self) -> Result<(), Error> {
         // Runs BEFORE the process launches, on *every* launch — first install, plain
         // restart, and update — so unlike the update-only phases it requires no prior
-        // step (there is no `stop` on a cold boot). `UPDATED_LIFECYCLE_REASON` says which.
+        // step (there is no `stop` on a cold boot). `--reason` says which.
         // Per-boot environment prep lives here: seed a JBoss home, warm a mount, run
         // schema pre-checks. Minutes in real life; a representative pause here.
         fs::create_dir_all(&self.live)?;
@@ -218,7 +220,7 @@ impl Deployment {
         expect(&self.live.join("removed-from-load-balancer"), &self.attempt)?;
         self.write(
             self.effects.join("stopped-process.pid"),
-            self.child_pid.as_deref().unwrap_or("unknown").as_bytes(),
+            self.managed_pid.as_deref().unwrap_or("unknown").as_bytes(),
         )
     }
 
@@ -233,20 +235,6 @@ impl Deployment {
             &self.effects.join("generated-install.properties"),
             &self.live.join("install.properties"),
         )?;
-        // Reload-in-place: the supervisor kept the app process running and passes its live PID
-        // (`UPDATED_CHILD_PID`) only when this deployment reloads in place — i.e. this provider
-        // ships an `activate` script. Signal it to reexec into the freshly activated release so
-        // readiness proves the new version. In the guardian-restart variant (no `activate`
-        // script) the supervisor stops the process before this phase and passes no PID, so this
-        // is skipped and the guardian launches the new version instead.
-        if let Some(pid) = self.child_pid.as_deref().filter(|pid| !pid.is_empty()) {
-            let status = std::process::Command::new("kill")
-                .args(["-HUP", pid])
-                .status()?;
-            if !status.success() {
-                return Err(format!("signalling reload (kill -HUP {pid}) failed: {status}").into());
-            }
-        }
         Ok(())
     }
 
@@ -271,6 +259,12 @@ impl Deployment {
             return Err(format!("expected {}, observed {observed:?}", self.candidate).into());
         }
         required_file(&self.live.join("migration.plan"))
+    }
+
+    fn periodic(&self) -> Result<(), Error> {
+        // Perform one observation. Cadence, retry, timeout, and failure policy belong to the
+        // hardened agent; the provider defines the application-specific evidence.
+        self.verify()
     }
 
     fn finalize(&self) -> Result<(), Error> {
@@ -301,16 +295,6 @@ impl Deployment {
         remove_if_present(&self.live.join("migration.plan"))?;
         remove_if_present(&self.live.join("removed-from-load-balancer"))?;
         Ok(())
-    }
-
-    fn uninstall(&self) -> Result<(), Error> {
-        // Decommission — the teardown mirror of prepare/activate/finalize. It removes the external
-        // system of record this deployment established (the simulated legacy Java home: the WAR,
-        // content repository, and generated configuration) — the state `updated` cannot see because
-        // it lives outside the install root it owns. Idempotent: removing an already-removed tree is
-        // success, so a replayed or partial wipe converges. It touches only what this provider
-        // created; a real one must never delete a shared mount or database it merely used.
-        remove_dir_all_if_present(&self.live)
     }
 
     fn require(&self, phase: Phase) -> Result<(), Error> {
@@ -355,8 +339,36 @@ impl Deployment {
     }
 }
 
-fn required(name: &str) -> Result<String, Error> {
-    env::var(name).map_err(|_| format!("missing {name}").into())
+fn named_arguments(
+    mut args: impl Iterator<Item = String>,
+) -> Result<std::collections::BTreeMap<String, String>, Error> {
+    let mut values = std::collections::BTreeMap::new();
+    while let Some(name) = args.next() {
+        if name == "--" {
+            break;
+        }
+        if !name.starts_with("--") {
+            return Err(format!("unexpected reconciler argument {name:?}").into());
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {name}"))?;
+        values.insert(name, value);
+    }
+    if values.get("--protocol").map(String::as_str) != Some("1") {
+        return Err("unsupported or missing reconciler protocol".into());
+    }
+    Ok(values)
+}
+
+fn required_argument<'a>(
+    values: &'a std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<&'a str, Error> {
+    values
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing {name}").into())
 }
 
 fn required_file(path: &Path) -> Result<(), Error> {
@@ -394,14 +406,6 @@ fn expect(path: &Path, expected: &str) -> Result<(), Error> {
 
 fn remove_if_present(path: &Path) -> Result<(), Error> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn remove_dir_all_if_present(path: &Path) -> Result<(), Error> {
-    match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),

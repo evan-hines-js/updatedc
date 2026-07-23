@@ -23,10 +23,12 @@ use futures::StreamExt;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, PostParams};
 use kube::Client;
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore, PutPayload};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -112,6 +114,32 @@ struct DataState {
     ca: Arc<crate::join::IssuingCa>,
 }
 
+#[async_trait::async_trait]
+trait SecretStore: Send + Sync {
+    async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, ()>;
+}
+
+#[derive(Clone)]
+struct KubernetesSecretStore {
+    client: Client,
+    namespace: String,
+}
+
+#[async_trait::async_trait]
+impl SecretStore for KubernetesSecretStore {
+    async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, ()> {
+        let secret = Api::<Secret>::namespaced(self.client.clone(), &self.namespace)
+            .get(name)
+            .await
+            .map_err(|_| ())?;
+        secret
+            .data
+            .and_then(|data| data.get(key).cloned())
+            .map(|value| value.0)
+            .ok_or(())
+    }
+}
+
 impl FromRef<DataState> for ContentState {
     fn from_ref(state: &DataState) -> Self {
         state.content.clone()
@@ -123,6 +151,7 @@ fn data_router(state: DataState) -> Router {
         .route("/healthz", get(healthz))
         .route("/enroll", post(enroll))
         .route("/telemetry/{file}", put(telemetry_put))
+        .route("/v1/node/secrets", get(node_secrets))
         .route("/metadata/{*rest}", get(repo_get).head(repo_get))
         .route("/targets/{*rest}", get(repo_get).head(repo_get))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -135,6 +164,109 @@ fn data_router(state: DataState) -> Router {
             IO_TIMEOUT,
         ))
         .with_state(state)
+}
+
+#[derive(Serialize)]
+struct SecretBundle {
+    deployment: String,
+    generation: String,
+    values: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+enum SecretBundleError {
+    Unavailable,
+    Invalid,
+}
+
+async fn resolve_secret_bundle(
+    assignment: &updated::config::RepositoryAssignment,
+    store: &dyn SecretStore,
+) -> Result<SecretBundle, SecretBundleError> {
+    const MAX_SECRET_BYTES: usize = 64 * 1024;
+    const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
+
+    let mut values = std::collections::BTreeMap::new();
+    let mut digest = Sha256::new();
+    let mut total = 0usize;
+    digest.update(assignment.deployment.as_bytes());
+    for reference in &assignment.runtime.secrets {
+        let bytes = store
+            .value(&reference.secret, &reference.key)
+            .await
+            .map_err(|()| SecretBundleError::Unavailable)?;
+        total = total.saturating_add(bytes.len());
+        if bytes.len() > MAX_SECRET_BYTES || total > MAX_BUNDLE_BYTES {
+            return Err(SecretBundleError::Invalid);
+        }
+        let value = String::from_utf8(bytes).map_err(|_| SecretBundleError::Invalid)?;
+        if value.contains('\0') {
+            return Err(SecretBundleError::Invalid);
+        }
+        digest.update(reference.environment.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0]);
+        values.insert(reference.environment.clone(), value);
+    }
+    Ok(SecretBundle {
+        deployment: assignment.deployment.clone(),
+        generation: hex::encode(digest.finalize()),
+        values,
+    })
+}
+
+/// Return exactly the secrets declared by the authenticated node's active signed assignment.
+/// The request contains no secret names: authorization is derived entirely from the verified
+/// certificate identity and the control plane's current assignment.
+async fn node_secrets(
+    State(state): State<DataState>,
+    Extension(identity): Extension<ClientIdentity>,
+) -> Response {
+    let Some(node) = identity.0 else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let repositories: Api<crate::UpdateRepository> =
+        Api::namespaced(state.enrollment.client.clone(), &state.enrollment.namespace);
+    let Ok(repository) = repositories.get(&state.enrollment.repository).await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let assignment = agent_assignment(&repository.spec.assignment_prefix, &node);
+    let signed =
+        match resolve_signed_enrollment(state.content.store(), state.content.prefix(), &assignment)
+            .await
+        {
+            Ok(signed) => signed,
+            Err(error) => return error.status_code().into_response(),
+        };
+    let assignment: updated::config::RepositoryAssignment =
+        match serde_json::from_str(&signed.managed_configuration) {
+            Ok(assignment) => assignment,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        };
+    if assignment.validate().is_err() {
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let store = KubernetesSecretStore {
+        client: state.enrollment.client.clone(),
+        namespace: state.enrollment.namespace.clone(),
+    };
+    let bundle = match resolve_secret_bundle(&assignment, &store).await {
+        Ok(bundle) => bundle,
+        Err(SecretBundleError::Unavailable) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(SecretBundleError::Invalid) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let mut response = Json(bundle).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
+    response
 }
 
 /// The plaintext health router: `/healthz` (and `/`) → 200, everything else 404. It serves no
@@ -857,6 +989,109 @@ mod tests {
     use axum::http::Request;
     use object_store::memory::InMemory;
     use tower::ServiceExt;
+
+    struct MemorySecrets {
+        values: std::collections::BTreeMap<(String, String), Vec<u8>>,
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretStore for MemorySecrets {
+        async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, ()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), key.to_owned()));
+            self.values
+                .get(&(name.to_owned(), key.to_owned()))
+                .cloned()
+                .ok_or(())
+        }
+    }
+
+    fn secret_assignment() -> updated::config::RepositoryAssignment {
+        let runtime = crate::tests::managed_runtime();
+        updated::config::RepositoryAssignment {
+            schema: 2,
+            deployment: "deployment".into(),
+            metadata_url: "https://control/metadata/".into(),
+            targets_url: "https://control/targets/".into(),
+            report_url: Some("https://control/telemetry/node.json".into()),
+            application: updated::config::TargetReference {
+                path: "releases/app/1/app.bundle".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: updated::config::TargetReference {
+                path: "provider-sets/default.json".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({}),
+            runtime,
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_resolution_reads_only_assignment_authorized_keys() {
+        let mut assignment = secret_assignment();
+        assignment.runtime.secrets = vec![
+            updated::config::SecretReference {
+                environment: "DATABASE_PASSWORD".into(),
+                secret: "database".into(),
+                key: "password".into(),
+            },
+            updated::config::SecretReference {
+                environment: "API_TOKEN".into(),
+                secret: "api".into(),
+                key: "token".into(),
+            },
+        ];
+        let store = MemorySecrets {
+            values: std::collections::BTreeMap::from([
+                (("database".into(), "password".into()), b"db-value".to_vec()),
+                (("api".into(), "token".into()), b"api-value".to_vec()),
+                (
+                    ("unassigned".into(), "root".into()),
+                    b"must-not-be-read".to_vec(),
+                ),
+            ]),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let bundle = resolve_secret_bundle(&assignment, &store).await.unwrap();
+        assert_eq!(bundle.values.get("DATABASE_PASSWORD").unwrap(), "db-value");
+        assert_eq!(bundle.values.get("API_TOKEN").unwrap(), "api-value");
+        assert_eq!(
+            *store.calls.lock().unwrap(),
+            vec![
+                ("database".into(), "password".into()),
+                ("api".into(), "token".into())
+            ]
+        );
+        assert!(!serde_json::to_string(&bundle.values)
+            .unwrap()
+            .contains("must-not-be-read"));
+    }
+
+    #[tokio::test]
+    async fn secret_resolution_fails_closed_on_missing_invalid_or_oversized_values() {
+        let mut assignment = secret_assignment();
+        assignment.runtime.secrets = vec![updated::config::SecretReference {
+            environment: "TOKEN".into(),
+            secret: "secret".into(),
+            key: "key".into(),
+        }];
+        for value in [None, Some(vec![0xff]), Some(vec![b'x'; 64 * 1024 + 1])] {
+            let store = MemorySecrets {
+                values: value
+                    .map(|value| {
+                        std::collections::BTreeMap::from([(("secret".into(), "key".into()), value)])
+                    })
+                    .unwrap_or_default(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            };
+            assert!(resolve_secret_bundle(&assignment, &store).await.is_err());
+        }
+    }
 
     /// A content-only router (repository + telemetry) over an in-memory store at prefix `routing`.
     /// The repository and telemetry handlers need no Kubernetes context, so this needs no client.

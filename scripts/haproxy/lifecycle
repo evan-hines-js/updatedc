@@ -1,100 +1,75 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# updated lifecycle provider for HAProxy (reexec / master-worker mode).
-#
-# `updated` invokes this once per phase as argv, reading its intent from UPDATED_* environment
-# variables (see LIFECYCLE_PROVIDER.md). It owns download, signature verification, release
-# selection, health/version gating, and durable rollback; this script only adapts those decisions
-# onto HAProxy's own seamless master-worker reload. It never reads untrusted network input.
-#
-# HAProxy updates *in place*: the guardian launches the master once (bin/launch) and every later
-# release is the same master re-execing itself. So only the phases that fit that model do work —
-# preflight validates the candidate, activate performs the reload, verify checks the management
-# plane, finalize records the receipt, rollback re-execs the predecessor. The stop/start cutover
-# phases (prepare, drain, stop, start, …) have nothing to do here and are explicit no-ops, not
-# forgotten hooks. Each phase is idempotent: preflight and verify are read-only, and stage+reload
-# reconverges, so a replayed (phase, attempt) call is always safe.
+# Signed HAProxy node reconciler. The agent supplies the operation and context as ordinary argv;
+# this script contains only HAProxy-specific machine-state policy.
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/haproxy/lib.sh
 source "$here/lib.sh"
 
-phase="$(require_env UPDATED_LIFECYCLE_PHASE)"
-attempt="${UPDATED_LIFECYCLE_ATTEMPT_ID:-unknown}"
-root="${UPDATED_INSTALL_ROOT:-}"
+operation=${1:?missing reconciler operation}
+shift
+
+protocol=
+attempt=unknown
+root=
+state_dir=
+candidate=
+predecessor=
+
+while (($#)); do
+  case "$1" in
+    --protocol) protocol=$2; shift 2 ;;
+    --attempt-id) attempt=$2; shift 2 ;;
+    --reason) shift 2 ;;
+    --install-root) root=$2; shift 2 ;;
+    --state-dir) state_dir=$2; shift 2 ;;
+    --candidate) candidate=$2; shift 2 ;;
+    --candidate-version) shift 2 ;;
+    --predecessor) predecessor=$2; shift 2 ;;
+    --predecessor-version) shift 2 ;;
+    --managed-pid) shift 2 ;;
+    --) shift; break ;;
+    *) die "unknown reconciler argument '$1'" ;;
+  esac
+done
+
+[[ $protocol == 1 ]] || die "unsupported reconciler protocol '$protocol'"
+[[ -n $root ]] || die "missing --install-root"
+[[ -n $state_dir ]] || die "missing --state-dir"
 runtime="$root/runtime"
 
-audit "$root" "$phase" "$attempt" started
+audit "$root" "$operation" "$attempt" started
 
-case "$phase" in
+case "$operation" in
   preflight)
-    # Candidate-specific validation only, with no effect on the running service: a malformed binary
-    # or configuration must be rejected before it can ever be activated. Nothing environmental goes
-    # here (that would wrongly condemn good release bytes when a dependency is briefly unavailable).
-    candidate="$(require_env UPDATED_CANDIDATE)"
     [[ -x "$candidate/bin/haproxy" ]] || die "candidate $candidate has no executable bin/haproxy"
     "$candidate/bin/haproxy" -c -f "$candidate/config/haproxy.cfg" >/dev/null \
-      || die "candidate HAProxy configuration failed validation (haproxy -c)"
+      || die "candidate HAProxy configuration failed validation"
     ;;
-
   activate)
-    # The reexec itself: project the candidate onto the stable runtime paths and make the running
-    # master adopt it via SIGUSR2, keeping its PID and its listening sockets so no connection drops.
-    candidate="$(require_env UPDATED_CANDIDATE)"
-    master="$(require_env UPDATED_CHILD_PID)"
     stage_runtime "$candidate" "$runtime"
-    reload_master "$master"
     ;;
-
   rollback)
-    # updated hands the predecessor back as UPDATED_CANDIDATE; the master adopts it by the identical
-    # mechanism. A failed rollback is fatal on purpose — reload_master dies rather than fake success,
-    # leaving updated's recovery evidence intact.
-    candidate="$(require_env UPDATED_CANDIDATE)"
-    master="$(require_env UPDATED_CHILD_PID)"
-    stage_runtime "$candidate" "$runtime"
-    reload_master "$master"
+    stage_runtime "$predecessor" "$runtime"
     ;;
-
-  verify)
-    # Provider-specific liveness of the management plane after updated's own authenticated
-    # health/version gate has already passed. It deliberately does NOT re-poll health or version —
-    # that would duplicate what updated proved — it only confirms the stable runtime the master
-    # re-execs from is actually in place.
-    [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing after activation"
-    [[ -f "$runtime/haproxy.pid" ]] || die "master pid file is missing after activation"
+  verify | periodic)
+    [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"
+    [[ -f "$runtime/haproxy.pid" ]] || die "master pid file is missing"
+    master=$(<"$runtime/haproxy.pid")
+    kill -0 "$master"
     ;;
-
   finalize)
-    # Nothing external to restore in the reexec model (there was no drain or traffic withdrawal);
-    # record the receipt so the completed change is auditable.
-    audit "$root" "$phase" "$attempt" receipt
+    audit "$root" "$operation" "$attempt" receipt
     ;;
-
-  uninstall)
-    # Decommission — the teardown mirror of install/activate. If the master is still running (the
-    # invoker may or may not have stopped it), drain and stop it gracefully; then remove the stable
-    # runtime this provider projected. Idempotent: a replayed or partial wipe removes only what
-    # remains, and stopping an already-stopped master is a no-op. Only ever removes state THIS
-    # provider created under the install root — never a shared resource it merely used. HAProxy keeps
-    # everything under the install root, so this is belt-and-suspenders to a full install-root teardown
-    # (the provider that matters here is one whose external state lives OUTSIDE the install root).
-    master="${UPDATED_CHILD_PID:-}"
-    [[ -n "$master" ]] && stop_master "$master"
-    rm -rf "$runtime"
-    ;;
-
   prepare | pre-drain | drain | stop | pre-start | start)
-    # These model a stop/start application's disruptive cutover — remove from the load balancer,
-    # stop, relaunch, warm caches. HAProxy has no such cutover (it reloads in place), so they are
-    # intentional no-ops. Kept and named so the mapping is explicit and adding one later is obvious.
+    # These operations need no HAProxy-specific mutation in guardian-managed stop/start mode.
     :
     ;;
-
   *)
-    die "unknown lifecycle phase '$phase'"
+    die "unknown reconciler operation '$operation'"
     ;;
 esac
 
-audit "$root" "$phase" "$attempt" completed
+audit "$root" "$operation" "$attempt" completed

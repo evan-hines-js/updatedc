@@ -36,7 +36,7 @@ impl RepositoryLineage {
     }
 }
 
-/// Exact independently signed provider (lifecycle or health-check) pinned to a release.
+/// Exact independently signed lifecycle provider pinned to a release.
 /// The supervisor stages it content-addressed on disk and invokes its manifest entrypoint
 /// as an external CLI; this record holds only the signed reference plus its invocation args.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,20 +57,12 @@ pub struct InstalledState {
     pub repository_lineage: RepositoryLineage,
     pub release: ReleaseId,
     pub archive_sha256: String,
-    /// The lifecycle provider of the currently-installed release, if the operator ships one.
+    /// The reconciler of the currently installed release.
     /// Persisted with the install so `pre-start` can run on every boot — install, plain
     /// restart, and update — without first re-resolving the assignment over the network. The
     /// provider bytes are already content-addressed on disk from when the release was staged;
-    /// this holds only the signed reference. `None` for a node with no operator provider.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub lifecycle: Option<Box<ProviderRelease>>,
-    /// The health-check provider of the currently-installed release, if the operator ships one.
-    /// When present it *replaces* the HTTP readiness probe as the health signal (exit 0 =
-    /// healthy); `null` means health falls back to the HTTP URL / process-lifetime. Like every
-    /// other field the key is always written and required on read — this is a single, strict
-    /// schema, not a migrated one.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub healthcheck: Option<Box<ProviderRelease>>,
+    /// this holds only the signed reference.
+    pub lifecycle: Box<ProviderRelease>,
     /// Set at the instant an update commits and cleared once it is confirmed. While it is
     /// set, the update is unconfirmed: a crash reactivates `previous_release`, and
     /// surviving the window confirms it. Absent for a
@@ -101,11 +93,7 @@ pub struct Pending {
     pub previous_archive_sha256: String,
     pub previous_repository_lineage: RepositoryLineage,
     /// A crash rollback requires the operator lifecycle provider.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub lifecycle: Option<Box<ProviderRelease>>,
-    /// The health-check provider to gate the restored predecessor with during a crash rollback.
-    #[serde(deserialize_with = "crate::required_option")]
-    pub healthcheck: Option<Box<ProviderRelease>>,
+    pub lifecycle: Box<ProviderRelease>,
     /// Unix seconds when the update committed.
     pub committed_at: u64,
 }
@@ -140,22 +128,17 @@ impl InstalledState {
                     "pending lifecycle id must not be empty",
                 ));
             }
-            if pending.previous_release == self.release {
+            if pending.previous_release == self.release && pending.lifecycle == self.lifecycle {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending predecessor must differ from the installed release",
+                    "pending predecessor must differ by application or node reconciler",
                 ));
             }
-            for provider in [pending.lifecycle.as_ref(), pending.healthcheck.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                if provider.product.is_empty() || provider.timeout_millis == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "pending provider identity is invalid",
-                    ));
-                }
+            if pending.lifecycle.product.is_empty() || pending.lifecycle.timeout_millis == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending provider identity is invalid",
+                ));
             }
         }
         Ok(())
@@ -167,13 +150,13 @@ impl InstalledState {
         repository_lineage: RepositoryLineage,
         release: ReleaseId,
         archive_sha256: String,
+        lifecycle: Box<ProviderRelease>,
     ) -> Self {
         InstalledState {
             repository_lineage,
             release,
             archive_sha256,
-            lifecycle: None,
-            healthcheck: None,
+            lifecycle,
             pending: None,
             confirmed: true,
         }
@@ -186,10 +169,11 @@ impl InstalledState {
         repository_lineage: RepositoryLineage,
         release: ReleaseId,
         archive_sha256: String,
+        lifecycle: Box<ProviderRelease>,
     ) -> Self {
         Self {
             confirmed: false,
-            ..Self::confirmed(repository_lineage, release, archive_sha256)
+            ..Self::confirmed(repository_lineage, release, archive_sha256, lifecycle)
         }
     }
 
@@ -197,21 +181,6 @@ impl InstalledState {
     /// Idempotent; returns whether the flag changed, so the caller only rewrites on transition.
     pub fn confirm(&mut self) -> bool {
         !std::mem::replace(&mut self.confirmed, true)
-    }
-
-    /// Record the lifecycle provider that ships with this installed release, so `pre-start`
-    /// can resolve it on every subsequent boot. `None` leaves the install provider-less.
-    pub fn with_lifecycle(mut self, lifecycle: Option<Box<ProviderRelease>>) -> Self {
-        self.lifecycle = lifecycle;
-        self
-    }
-
-    /// Record the health-check provider that ships with this installed release, so every
-    /// boot and steady-state probe resolves it without re-fetching the assignment. `None`
-    /// leaves health on the HTTP URL / process-lifetime fallback.
-    pub fn with_healthcheck(mut self, healthcheck: Option<Box<ProviderRelease>>) -> Self {
-        self.healthcheck = healthcheck;
-        self
     }
 
     /// Version ordering is meaningful only inside one metadata lineage.
@@ -226,11 +195,20 @@ impl InstalledState {
         lineage: RepositoryLineage,
         release: &ReleaseId,
         archive_sha256: &str,
+        reconciler: &ProviderRelease,
     ) -> Option<Self> {
         (self.repository_lineage != lineage
             && self.release == *release
-            && self.archive_sha256 == archive_sha256)
-            .then(|| Self::confirmed(lineage, self.release.clone(), self.archive_sha256.clone()))
+            && self.archive_sha256 == archive_sha256
+            && self.lifecycle.as_ref() == reconciler)
+        .then(|| {
+            Self::confirmed(
+                lineage,
+                self.release.clone(),
+                self.archive_sha256.clone(),
+                self.lifecycle.clone(),
+            )
+        })
     }
 }
 
@@ -317,6 +295,19 @@ pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn provider() -> Box<ProviderRelease> {
+        Box::new(ProviderRelease {
+            product: "reconciler".into(),
+            release: ReleaseId {
+                version: "1.0.0".into(),
+                manifest_sha256: "reconciler-manifest".into(),
+            },
+            archive_sha256: "reconciler-archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        })
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("state-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -336,8 +327,7 @@ mod tests {
                     manifest_sha256: "manifest".into(),
                 },
                 archive_sha256: "abcd".into(),
-                lifecycle: None,
-                healthcheck: None,
+                lifecycle: provider(),
                 pending: Some(Pending {
                     lifecycle_attempt_id: "lifecycle".into(),
                     previous_release: ReleaseId {
@@ -348,8 +338,7 @@ mod tests {
                     previous_repository_lineage: RepositoryLineage::from_metadata_url(
                         "https://old/metadata/",
                     ),
-                    lifecycle: None,
-                    healthcheck: None,
+                    lifecycle: provider(),
                     committed_at: 1_700_000_000,
                 }),
                 confirmed: true,
@@ -427,18 +416,33 @@ mod tests {
             version: "8.0.0".into(),
             manifest_sha256: "manifest".into(),
         };
-        let installed = InstalledState::confirmed(old.clone(), release.clone(), "archive".into());
+        let reconciler = ProviderRelease {
+            product: "reconciler".into(),
+            release: ReleaseId {
+                version: "1.0.0".into(),
+                manifest_sha256: "reconciler-manifest".into(),
+            },
+            archive_sha256: "reconciler-archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        };
+        let installed = InstalledState::confirmed(
+            old.clone(),
+            release.clone(),
+            "archive".into(),
+            Box::new(reconciler.clone()),
+        );
         assert_eq!(installed.version_floor_for(&old), Some("8.0.0"));
         assert_eq!(installed.version_floor_for(&new), None);
         assert_eq!(
             installed
-                .rebind_if_same_artifact(new.clone(), &release, "archive")
+                .rebind_if_same_artifact(new.clone(), &release, "archive", &reconciler)
                 .unwrap()
                 .repository_lineage,
             new
         );
         assert!(installed
-            .rebind_if_same_artifact(new, &release, "different")
+            .rebind_if_same_artifact(new, &release, "different", &reconciler)
             .is_none());
     }
 

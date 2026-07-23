@@ -4,5 +4,6 @@
 updated_enrollment_url: "https://updatec-gateway"
 # Stable identity the control plane addresses this node by; defaults to the inventory name.
 updated_hostname: "{{ inventory_hostname }}"
-# Required (no default): updated_source and the mTLS identity —
+# Required (no default): updatedc_source and the mTLS identity —
+# `updated_source` is accepted as a backwards-compatible alias.
 # updated_enrollment_client_cert / _client_key / _ca (base64 PEM).

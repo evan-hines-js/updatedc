@@ -112,9 +112,8 @@ try {
     $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $setTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
     $runtimeJson = @{
-        product = 'app'; channel = 'stable'; install_root = $install
+        mode = 'managed'; product = 'app'; channel = 'stable'; install_root = $install
         args = @('--addr', "127.0.0.1:$appPort")
-        health_checks = @(@{kind='readiness'; url="http://127.0.0.1:$appPort/healthz"}); activation = 'stop-start'
         repository = @{metadata_limit=1048576; target_limit=536870912; transport_timeout_seconds=30}
         storage = @{inactive_releases=2; inactive_providers=2; inactive_supervisors=1; inactive_bytes=1073741824; inactive_repository_caches=2}
         timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; retry_after_seconds=300; refresh_retry_seconds=5; confirmation_window_seconds=120; supervisor_check_interval_seconds=3600}

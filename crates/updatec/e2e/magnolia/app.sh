@@ -22,6 +22,6 @@ if [ ! -x "$CATALINA_HOME/bin/catalina.sh" ]; then
   exit 1
 fi
 
-echo "magnolia-app: starting Magnolia (release ${UPDATED_CANDIDATE_VERSION:-?})" >&2
+echo "magnolia-app: starting Magnolia" >&2
 # exec: the JVM inherits our PID so the tower manages it directly.
 exec "$CATALINA_HOME/bin/catalina.sh" run

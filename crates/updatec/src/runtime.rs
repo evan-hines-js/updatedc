@@ -1344,14 +1344,12 @@ mod lease_tests {
                     sha256: "2".repeat(64),
                 },
                 runtime: crate::RuntimeSpec {
+                    mode: crate::RuntimeModeSpec::Managed,
                     product: "app".into(),
                     channel: "stable".into(),
                     install_root: "/opt/app".into(),
                     args: vec![],
-                    health_checks: vec![crate::HealthCheckSpec {
-                        kind: crate::HealthCheckKindSpec::Readiness,
-                        url: "http://127.0.0.1:8080/health".into(),
-                    }],
+                    secrets: vec![],
                     repository: crate::RepositoryLimitsSpec {
                         metadata_limit: 1_048_576,
                         target_limit: 536_870_912,

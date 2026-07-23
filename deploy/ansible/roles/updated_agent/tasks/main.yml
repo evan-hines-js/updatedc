@@ -22,11 +22,11 @@
   args:
     creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
 
-- name: Synchronize the updated source
+- name: Synchronize the updatedc source
   become: false
   ansible.posix.synchronize:
-    src: "{{ updated_source }}/"
-    dest: "{{ ansible_env.HOME }}/updated-src/"
+    src: "{{ updatedc_source | default(updated_source) }}/"
+    dest: "{{ ansible_env.HOME }}/updatedc-src/"
     delete: false
     rsync_opts:
       - "--exclude=target"
@@ -38,12 +38,12 @@
     . "{{ ansible_env.HOME }}/.cargo/env" &&
     cargo build --release -p bootstrap -p supervisor
   args:
-    chdir: "{{ ansible_env.HOME }}/updated-src"
+    chdir: "{{ ansible_env.HOME }}/updatedc-src"
 
 - name: Install the agent binaries
   ansible.builtin.copy:
     remote_src: true
-    src: "{{ ansible_env.HOME }}/updated-src/target/release/{{ item }}"
+    src: "{{ ansible_env.HOME }}/updatedc-src/target/release/{{ item }}"
     dest: "/usr/local/bin/{{ item }}"
     mode: "0755"
   loop:

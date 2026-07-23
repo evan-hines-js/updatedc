@@ -268,8 +268,7 @@ async fn apply_install(
         release: prepared.release.clone(),
         archive_sha256: prepared.archive_sha256.clone(),
         repository_lineage: lineage,
-        lifecycle: providers.lifecycle.map(Box::new),
-        healthcheck: providers.healthcheck.map(Box::new),
+        lifecycle: Some(Box::new(providers)),
         phase: InstallPhase::Started,
     };
     let chaos = Chaos::from_env();
@@ -323,8 +322,7 @@ async fn place_and_commit(
             tx.release.clone(),
             tx.archive_sha256.clone(),
         )
-        .with_lifecycle(tx.lifecycle.clone())
-        .with_healthcheck(tx.healthcheck.clone()),
+        .with_lifecycle(tx.lifecycle.clone()),
     )?;
     advance_install(store, &mut tx, InstallPhase::Committed)?;
     chaos.crossing(install_boundary::COMMITTED);
