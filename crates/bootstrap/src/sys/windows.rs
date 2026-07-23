@@ -6,7 +6,7 @@
 
 use control::CommandSpec;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::HANDLE;
 
@@ -117,12 +117,34 @@ impl crate::sys::Process for Proc {
         self.exited
     }
 
-    fn stop(&mut self, _grace: Duration) {
+    /// Stop the app: `CTRL_BREAK` to its process group, wait up to `grace` for a clean
+    /// drain/flush, then `TerminateJobObject` as the hard fallback — mirroring the Unix
+    /// `SIGTERM`→wait→`SIGKILL` path so a planned update/stop gets the same graceful window
+    /// on every target rather than an abrupt kill.
+    ///
+    /// NOTE: needs Windows CI validation — this host cannot compile or exercise the
+    /// `CREATE_NEW_PROCESS_GROUP` + `CTRL_BREAK_EVENT` interaction.
+    fn stop(&mut self, grace: Duration) {
+        use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
         if self.poll_exit().is_some() {
             return;
         }
+        // Graceful: the app was spawned `CREATE_NEW_PROCESS_GROUP`, so its process-group id
+        // equals its PID; `CTRL_BREAK` lets it run its shutdown handler. (`CTRL_C` cannot be
+        // targeted at a specific group, so `CTRL_BREAK` is the one usable graceful signal.)
+        unsafe {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid);
+        }
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if self.poll_exit().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Hard fallback: kill the whole job.
         unsafe {
             TerminateJobObject(self.job, 1);
             WaitForSingleObject(self.process, 5_000);
@@ -143,39 +165,54 @@ impl Drop for Proc {
 }
 
 fn command_line_utf16(spec: &CommandSpec) -> Vec<u16> {
-    let mut parts = Vec::with_capacity(spec.args.len() + 1);
-    parts.push(quote_arg(&spec.program));
+    // Build the command line in raw UTF-16 code units, never via `to_string_lossy`: a
+    // `CommandSpec`'s program/args round-trip Windows WTF-16 faithfully (see `control`'s
+    // `os_units`/`os_from_units`), so an unpaired surrogate or other non-UTF-8 code unit in a
+    // valid path must reach `CreateProcessW` intact rather than be replaced with U+FFFD (which
+    // would launch the wrong image or ENOENT). This mirrors the Unix path's raw-bytes fidelity.
+    let mut line: Vec<u16> = Vec::new();
+    quote_arg_into(&mut line, &spec.program);
     for a in &spec.args {
-        parts.push(quote_arg(a));
+        line.push(u16::from(b' '));
+        quote_arg_into(&mut line, a);
     }
-    to_wide_nul(parts.join(" ").encode_utf16())
+    to_wide_nul(line.into_iter())
 }
 
-fn quote_arg(arg: &std::ffi::OsStr) -> String {
-    let s = arg.to_string_lossy();
-    if !s.is_empty() && !s.contains([' ', '\t', '"', '\\']) {
-        return s.into_owned();
+fn quote_arg_into(out: &mut Vec<u16>, arg: &std::ffi::OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+    const SPACE: u16 = b' ' as u16;
+    const TAB: u16 = b'\t' as u16;
+    const QUOTE: u16 = b'"' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    let units: Vec<u16> = arg.encode_wide().collect();
+    if !units.is_empty()
+        && !units
+            .iter()
+            .any(|&u| matches!(u, SPACE | TAB | QUOTE | BACKSLASH))
+    {
+        out.extend_from_slice(&units);
+        return;
     }
-    let mut out = String::from("\"");
+    out.push(QUOTE);
     let mut backslashes = 0usize;
-    for c in s.chars() {
-        match c {
-            '\\' => backslashes += 1,
-            '"' => {
-                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+    for &u in &units {
+        match u {
+            BACKSLASH => backslashes += 1,
+            QUOTE => {
+                out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
                 backslashes = 0;
-                out.push('"');
+                out.push(QUOTE);
             }
             _ => {
-                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.extend(std::iter::repeat_n(BACKSLASH, backslashes));
                 backslashes = 0;
-                out.push(c);
+                out.push(u);
             }
         }
     }
-    out.extend(std::iter::repeat_n('\\', backslashes * 2));
-    out.push('"');
-    out
+    out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
+    out.push(QUOTE);
 }
 
 fn environment_block(spec: &CommandSpec) -> Vec<u16> {
@@ -219,9 +256,19 @@ unsafe extern "system" fn handle_ctrl(_ctrl_type: u32) -> windows_sys::Win32::Fo
     1
 }
 
-/// A no-op on Windows: there is no graceful process signal, so the guardian simply waits
-/// out the grace and then hard-kills the supervisor.
-pub fn terminate_gracefully(_pid: u32) {}
+/// Ask a supervisor process to stop gracefully; the caller hard-kills it if the grace
+/// expires. The supervisor is spawned `CREATE_NEW_PROCESS_GROUP` (see
+/// `supervisor::Supervisor::launch`), so its process-group id equals its PID and
+/// `CTRL_BREAK` reaches it — the Windows analogue of the Unix `SIGTERM`, giving the
+/// supervisor a chance to shut down cleanly instead of only ever being job-terminated.
+///
+/// NOTE: needs Windows CI validation — this host cannot exercise the console-event path.
+pub fn terminate_gracefully(pid: u32) {
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+    unsafe {
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+    }
+}
 
 // ------------------------------ the control channel ------------------------------
 

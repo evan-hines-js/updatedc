@@ -219,14 +219,16 @@ expose its Service through an HTTPS ingress or load balancer:
 ```toml
 [enrollment]
 url = "https://updates.example/"
+name = "node-1"
 client_cert = "/etc/updated/agent-tls/tls.crt"
 client_key = "/etc/updated/agent-tls/tls.key"
 ca = "/etc/updated/agent-tls/ca.crt"
 ```
 
-Enrollment is authenticated by mutual TLS: the agent presents a client certificate the fleet
-CA signed, and trusts that CA for the gateway. cert-manager (or any issuer) mints the material;
-the config holds only paths, so it stays secretless.
+Enrollment is authenticated by mutual TLS: the agent presents the shared fleet enrollment
+certificate the fleet CA signed, and trusts that CA for the gateway. cert-manager (or any issuer)
+mints the material; the config holds only a self-asserted `name` and paths, so it stays secretless.
+The node names itself; the gateway mints a per-node certificate at `/enroll` under that name.
 
 The gateway registers a stable generated `UpdateAgent`; operators then select it through
 CRDs. Manual provisioning instead creates a manual `UpdateAgent` and exports the immutable

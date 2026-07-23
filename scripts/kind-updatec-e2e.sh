@@ -145,7 +145,7 @@ metadata: {name: gateway-tls, namespace: updated-system}
 spec:
   secretName: gateway-tls
   commonName: updatec-gateway
-  dnsNames: [updatec-gateway, release-default, release-edge, release-batch, release-join, localhost]
+  dnsNames: [updatec-gateway, release-default, release-edge, release-batch, localhost]
   usages: [server auth]
   issuerRef: {name: fleet-ca-issuer, kind: Issuer}
 ---
@@ -233,15 +233,6 @@ spec:
 apiVersion: v1
 kind: Service
 metadata: {name: release-default, namespace: updated-system}
-spec:
-  selector: {app: release-server}
-  ports: [{name: https, port: 443, targetPort: https}]
----
-# The join-mode cohort's bundle routes through https://release-join/ (deployment("join", …) in the
-# kind_resources example), so it needs the same release-server alias + TLS SAN that edge/batch have.
-apiVersion: v1
-kind: Service
-metadata: {name: release-join, namespace: updated-system}
 spec:
   selector: {app: release-server}
   ports: [{name: https, port: 443, targetPort: https}]
@@ -354,6 +345,7 @@ data:
   bootstrap.toml: |
     [enrollment]
     url = "https://127.0.0.1:1"
+    name = "manual-offline"
     client_cert = "/etc/agent-tls/tls.crt"
     client_key = "/etc/agent-tls/tls.key"
     ca = "/etc/agent-tls/ca.crt"
@@ -511,6 +503,7 @@ spec:
           cat >/tmp/bootstrap.toml <<EOF
           [enrollment]
           url = "https://updatec-gateway"
+          name = "intruder"
           client_cert = "/etc/intruder-tls/tls.crt"
           client_key = "/etc/intruder-tls/tls.key"
           ca = "/etc/agent-tls/ca.crt"
@@ -599,12 +592,20 @@ spec:
             - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/sampleapp, subPath: sampleapp, readOnly: true}
             - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/magnolia-like, subPath: magnolia-like, readOnly: true}
       volumes:
-        - {name: state, emptyDir: {}}
         - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 64Mi}}
-        # cert-manager issues the agents' shared client identity (fleet membership) here.
+        # cert-manager issues the agents' shared client identity here. In mount mode this fleet cert
+        # now ONLY authenticates the /enroll handshake; the node mints its own per-node cert (kept on
+        # the persistent `state` volume) and uses it for all steady-state traffic.
         - {name: agent-tls, secret: {secretName: agent-tls}}
         - name: poison-preinstalled-apps
           configMap: {name: poison-preinstalled-apps, defaultMode: 365}
+  # Persistent storage is now REQUIRED, not optional: the per-node minted key/cert and the install
+  # state live only here, so an emptyDir would lose the node's identity on every restart (a churn of
+  # re-enrollments and dead UpdateAgents) and re-cold-install every boot. Sized to the install
+  # footprint (installed app + retained inactive releases).
+  volumeClaimTemplates:
+    - metadata: {name: state}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
 YAML
 echo "waiting for all five real agent towers to reach their assigned versions"
 kubectl -n updated-system rollout status statefulset/agent --timeout=240s
@@ -639,130 +640,6 @@ for ordinal in 0 1 2 3 4; do
 done
 echo "all five empty agents enrolled online and cold-installed the network assignment"
 
-# --- Join-mode fleet (second StatefulSet) -----------------------------------------------------
-# A second StatefulSet whose nodes hold NO client certificate. They authenticate their join with
-# the controller-minted group token at the gateway's server-TLS-only /join port, generate a keypair
-# locally, and get a CSR signed into a client cert. That identity and the install state live on a
-# small PVC, because unlike mount mode the key exists nowhere else — an emptyDir would lose it on a
-# restart and force a fresh identity + cold reinstall. See docs/group-enrollment-design.md.
-echo "waiting for the controller to mint the join group's token"
-JOIN_GROUP_ID=""
-for attempt in {1..60}; do
-  JOIN_GROUP_ID="$(kubectl -n updated-system get updategroup join -o jsonpath='{.status.groupId}' 2>/dev/null || true)"
-  # The token Secret is named after the group id (join-<group_id>), so the gateway resolves it with
-  # a single keyed GET rather than listing every UpdateGroup on each /join.
-  if [[ -n "$JOIN_GROUP_ID" ]] && kubectl -n updated-system get secret "join-$JOIN_GROUP_ID" >/dev/null 2>&1; then break; fi
-  sleep 2
-done
-[[ -n "$JOIN_GROUP_ID" ]] || { echo "FAIL: join group id/token was never minted" >&2; kubectl -n updated-system get updategroup join -o yaml >&2 || true; exit 1; }
-# Verify the token key is present without decoding it into a shell var — the pod reads it straight
-# from the Secret via secretKeyRef (below), so the plaintext nonce never lands in the pod spec/etcd.
-kubectl -n updated-system get secret "join-$JOIN_GROUP_ID" -o jsonpath='{.data.nonce}' | grep -q . || { echo "FAIL: join token secret join-$JOIN_GROUP_ID carries no nonce" >&2; exit 1; }
-cat <<YAML | kubectl apply -f -
-apiVersion: apps/v1
-kind: StatefulSet
-metadata: {name: agent-join, namespace: updated-system}
-spec:
-  serviceName: agents
-  replicas: 2
-  podManagementPolicy: Parallel
-  selector: {matchLabels: {app: updated-agent, demo.updated.dev/enroll: join}}
-  template:
-    metadata: {labels: {app: updated-agent, demo.updated.dev/enroll: join}}
-    spec:
-      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
-      containers:
-        - name: agent
-          image: updatec-e2e:kind
-          imagePullPolicy: IfNotPresent
-          command: [/usr/local/bin/run-agent-join]
-          env:
-            # group_id is a non-secret UID; the nonce is the shared secret, so it is read from the
-            # Secret at runtime (secretKeyRef) rather than embedded as a plaintext env value.
-            - {name: JOIN_GROUP_ID, value: "$JOIN_GROUP_ID"}
-            - name: JOIN_NONCE
-              valueFrom: {secretKeyRef: {name: join-$JOIN_GROUP_ID, key: nonce}}
-          ports: [{name: http, containerPort: 8080}, {name: guardian, containerPort: 9090}]
-          startupProbe: {httpGet: {path: /startupz, port: guardian}, periodSeconds: 1, failureThreshold: 120}
-          readinessProbe: {httpGet: {path: /readyz, port: guardian}, periodSeconds: 1}
-          livenessProbe: {httpGet: {path: /livez, port: guardian}, periodSeconds: 2}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-          resources:
-            requests: {cpu: 25m, memory: 32Mi}
-            limits: {cpu: "1", memory: 256Mi}
-          volumeMounts:
-            - {name: state, mountPath: /var/lib/updated}
-            - {name: tmp, mountPath: /tmp}
-            # A join node needs ONLY the fleet CA (to trust the join server + gateway) — never the
-            # shared client cert/key. Projecting just ca.crt withholds the mount-mode identity that
-            # join mode is designed not to have.
-            - {name: fleet-ca, mountPath: /etc/agent-tls, readOnly: true}
-            - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/sampleapp, subPath: sampleapp, readOnly: true}
-      volumes:
-        - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 64Mi}}
-        # Project ONLY ca.crt from the agent-tls Secret — tls.crt/tls.key (the shared client
-        # identity) are deliberately not mounted into join pods.
-        - {name: fleet-ca, secret: {secretName: agent-tls, items: [{key: ca.crt, path: ca.crt}]}}
-        - name: poison-preinstalled-apps
-          configMap: {name: poison-preinstalled-apps, defaultMode: 365}
-  # Join mode REQUIRES persistent storage: the minted key/cert and the install state live only here.
-  # Sized to hold the installed app plus retained inactive releases (the runtime keeps 2), so it must
-  # match the fleet's install footprint, not just the tiny config/state-machine — 16Mi would ENOSPC
-  # on the first upgrade on a real CSI backend (kind's local-path ignores the request, masking it).
-  volumeClaimTemplates:
-    - metadata: {name: state}
-      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
-YAML
-kubectl -n updated-system rollout status statefulset/agent-join --timeout=300s
-# The join enrolled name mirrors agent.sh's derivation: instance = sha256(hostname), agent name =
-# agent-<first 24 hex of sha256(instance)>.
-join_resource_name() {
-  instance=$(printf %s "$1" | shasum -a 256 | awk '{print $1}')
-  registration=$(printf %s "$instance" | shasum -a 256 | awk '{print $1}')
-  printf 'agent-%s\n' "${registration%${registration#????????????????????????}}"
-}
-for pod in agent-join-0 agent-join-1; do
-  resource="$(join_resource_name "$pod")"
-  group=""
-  for attempt in {1..60}; do
-    group="$(kubectl -n updated-system get updateagent "$resource" -o jsonpath='{.status.selectedGroup}' 2>/dev/null || true)"
-    [[ "$group" == join ]] && break
-    sleep 2
-  done
-  [[ "$group" == join ]] || { echo "FAIL: $pod ($resource) did not join group 'join' (selectedGroup='$group')" >&2; kubectl -n updated-system get updateagent "$resource" -o yaml >&2 || true; exit 1; }
-  # The gateway signed its CSR (identity Enrolled) and it cold-installed the app over the same path.
-  identity="$(kubectl -n updated-system get updateagent "$resource" -o jsonpath='{.spec.identity.kind}')"
-  [[ "$identity" == enrolled ]] || { echo "FAIL: $pod registered with identity '$identity', expected enrolled" >&2; exit 1; }
-  log="$(kubectl -n updated-system logs "$pod" -c agent)"
-  [[ "$log" == *"cold-installed application"* ]] || { echo "FAIL: $pod did not install the app after joining" >&2; echo "$log" >&2; exit 1; }
-  [[ "$log" != *"FAIL: agent used the image-baked"* ]] || { echo "FAIL: $pod executed a masked image-baked application" >&2; exit 1; }
-done
-echo "join-mode nodes authenticated with the group token, minted client certificates, and cold-installed the app"
-
-# Restart = upgrade, not reinstall. The identity name alone proves nothing here: instance =
-# sha256(hostname) is deterministic, so a node that LOST its PVC would re-derive the identical
-# UpdateAgent name, re-join, and cold-install from scratch — and a name-exists check would still
-# pass. The real proof the PVC persisted install state is that the restarted container reuses the
-# committed release instead of cold-installing again, i.e. its fresh log has NO "cold-installed".
-restart_resource="$(join_resource_name agent-join-0)"
-kubectl -n updated-system delete pod agent-join-0 --wait=true
-kubectl -n updated-system rollout status statefulset/agent-join --timeout=300s
-kubectl -n updated-system get updateagent "$restart_resource" >/dev/null 2>&1 || {
-  echo "FAIL: join node lost its identity across a restart (resource $restart_resource gone)" >&2
-  exit 1
-}
-restart_log="$(kubectl -n updated-system logs agent-join-0 -c agent)"
-[[ "$restart_log" != *"cold-installed application"* ]] || {
-  echo "FAIL: join node re-cold-installed after restart — install state did not persist (PVC not reused)" >&2
-  echo "$restart_log" >&2
-  exit 1
-}
-echo "join node reused its persisted identity AND install state across a restart (upgrade, not reinstall)"
 for ordinal in 0 1; do
   kubectl -n updated-system patch updateagent "$(agent_resource_name "$ordinal")" --type merge \
     -p '{"spec":{"labels":{"updated.dev/role":"edge"}}}'

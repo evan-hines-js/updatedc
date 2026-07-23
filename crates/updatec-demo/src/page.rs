@@ -180,7 +180,7 @@ pub(crate) const PAGE: &str = r#"<!doctype html>
   <div class="masthead-inner">
     <div class="brand">
       <span class="brandmark" aria-hidden="true"></span>
-      <span class="wordmark">DOTA</span>
+      <span class="wordmark">updatec</span>
       <span class="brand-sub">Release Operations</span>
     </div>
     <div class="status-strip">

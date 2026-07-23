@@ -26,25 +26,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     updated::tls::install_crypto_provider();
 
     let config = Config::from_env()?;
-    let kube_client = kube::Client::try_default().await?;
-    let load_balancer: Arc<dyn LoadBalancer + Send + Sync> = Arc::new(EndpointSliceLb::new(
-        kube_client,
-        &config.namespace,
-        config.service.clone(),
-        config.port_name.clone(),
-        config.port,
-    ));
+    // The health→membership core is identical; only the backend differs. A HAProxy target programs a
+    // cluster of HAProxy admin sockets over the Runtime API; otherwise we program a Kubernetes
+    // EndpointSlice. The HAProxy backend needs no kube client, so only build one for the slice path.
+    let load_balancer: Arc<dyn LoadBalancer + Send + Sync> = match &config.haproxy {
+        Some(target) => {
+            eprintln!(
+                "healthproxy: programming {} HAProxy instance(s) (backend {}) from {} nodes, health {}",
+                target.endpoints.len(),
+                target.backend,
+                config.inventory.len(),
+                config.health_base
+            );
+            Arc::new(updated_healthproxy::haproxy::HAProxyLb::new(
+                target.endpoints.clone(),
+                target.backend.clone(),
+            ))
+        }
+        None => {
+            let kube_client = kube::Client::try_default().await?;
+            Arc::new(EndpointSliceLb::new(
+                kube_client,
+                &config.namespace,
+                config.service.clone(),
+                config.port_name.clone(),
+                config.port,
+            ))
+        }
+    };
+    // The EndpointSlice path logs its target here; the HAProxy path already logged its own above.
+    if config.haproxy.is_none() {
+        eprintln!(
+            "healthproxy: programming EndpointSlice for Service {}/{} from {} nodes, health {}",
+            config.namespace,
+            config.service,
+            config.inventory.len(),
+            config.health_base
+        );
+    }
     let http = reqwest::Client::builder()
         .timeout(config.health_timeout)
         .build()?;
-
-    eprintln!(
-        "healthproxy: programming EndpointSlice for Service {}/{} from {} nodes, health {}",
-        config.namespace,
-        config.service,
-        config.inventory.len(),
-        config.health_base
-    );
 
     run(http, config, load_balancer).await;
     Ok(())

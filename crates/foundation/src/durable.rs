@@ -194,6 +194,26 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// fsync `dir` and every directory beneath it, deepest first. [`sync_dir`] only flushes a
+/// single directory's dirents; a freshly extracted tree with nested subdirectories (e.g.
+/// `bin/`, `lib/`) needs each of those directories flushed too, or a power loss right after
+/// an atomic rename can surface the release with unpersisted nested dirents. Children are
+/// synced before their parent so the parent's link is never durable ahead of its contents.
+/// Symlinks are not followed; only real subdirectories are descended.
+pub fn sync_tree(dir: &Path) -> io::Result<()> {
+    let mut subdirs = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            subdirs.push(entry.path());
+        }
+    }
+    for subdir in subdirs {
+        sync_tree(&subdir)?;
+    }
+    sync_dir(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +333,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn sync_tree_flushes_nested_directories() {
+        // sync_tree must descend into every real subdirectory without erroring; a tree with
+        // nested dirs (bin/, lib/sub/) exercises the recursive descent.
+        let d = dir("sync-tree");
+        fs::create_dir_all(d.join("bin")).unwrap();
+        fs::create_dir_all(d.join("lib/sub")).unwrap();
+        fs::write(d.join("bin/app"), b"exe").unwrap();
+        fs::write(d.join("lib/sub/data"), b"payload").unwrap();
+        sync_tree(&d).unwrap();
     }
 
     #[cfg(unix)]

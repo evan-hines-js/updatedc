@@ -76,5 +76,3 @@ impl ReleasePublisher for KubernetesPublisher {
         Ok(())
     }
 }
-
-

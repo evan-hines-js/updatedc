@@ -100,6 +100,12 @@ impl crate::sys::Process for Proc {
         if self.poll_exit().is_some() {
             return;
         }
+        // PID-reuse is not a hazard in the window between the `poll_exit` check and this
+        // signal: `self.child` is our own descendant and we have not reaped it (`poll_exit`
+        // only `try_wait`s, and only when `exited` is still `None`), so its PID — and the
+        // process group whose id equals that PID — cannot have been recycled to some
+        // unrelated process. The worst case is signalling a group that just went empty,
+        // which is a harmless no-op.
         let group = -(self.pid as libc::pid_t);
         unsafe {
             libc::kill(group, libc::SIGTERM);

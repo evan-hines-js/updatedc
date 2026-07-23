@@ -90,8 +90,14 @@ impl BundleStore {
     pub fn resolve(&self, release: &ReleaseId) -> io::Result<Resolved> {
         let (manifest, program) = bundle::read_release(&self.versions, release)?;
         let cwd = self.location(release);
-        let activate = manifest.activate.as_ref().map(|relative| cwd.join(relative));
-        let rollback = manifest.rollback.as_ref().map(|relative| cwd.join(relative));
+        let activate = manifest
+            .activate
+            .as_ref()
+            .map(|relative| cwd.join(relative));
+        let rollback = manifest
+            .rollback
+            .as_ref()
+            .map(|relative| cwd.join(relative));
         Ok(Resolved {
             program,
             activate,

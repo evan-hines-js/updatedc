@@ -28,7 +28,13 @@ pub struct EndpointSliceLb {
 }
 
 impl EndpointSliceLb {
-    pub fn new(client: Client, namespace: &str, service: String, port_name: String, port: u16) -> Self {
+    pub fn new(
+        client: Client,
+        namespace: &str,
+        service: String,
+        port_name: String,
+        port: u16,
+    ) -> Self {
         Self {
             api: Api::namespaced(client, namespace),
             service,
@@ -61,7 +67,11 @@ impl LoadBalancer for EndpointSliceLb {
             );
         }
         self.api
-            .patch(&name, &PatchParams::apply(MANAGED_BY).force(), &Patch::Apply(&slice))
+            .patch(
+                &name,
+                &PatchParams::apply(MANAGED_BY).force(),
+                &Patch::Apply(&slice),
+            )
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -103,7 +113,10 @@ pub fn build_slice(
     let mut labels = BTreeMap::new();
     // The label kube-proxy/the EndpointSlice mirroring uses to attach this slice to its
     // Service, plus a manager marker so ownership is legible.
-    labels.insert("kubernetes.io/service-name".to_string(), service.to_string());
+    labels.insert(
+        "kubernetes.io/service-name".to_string(),
+        service.to_string(),
+    );
     labels.insert(
         "endpointslice.kubernetes.io/managed-by".to_string(),
         MANAGED_BY.to_string(),
@@ -201,7 +214,9 @@ mod tests {
         let labels = slice.metadata.labels.unwrap();
         assert_eq!(labels.get("kubernetes.io/service-name").unwrap(), "vm-db");
         assert_eq!(
-            labels.get("endpointslice.kubernetes.io/managed-by").unwrap(),
+            labels
+                .get("endpointslice.kubernetes.io/managed-by")
+                .unwrap(),
             MANAGED_BY
         );
 

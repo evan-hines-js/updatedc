@@ -260,10 +260,6 @@ fn scenarios() -> Vec<Scenario> {
             cold_install_descends_past_broken_head,
         ),
         (
-            "a crash at every install boundary then a stateless emptyDir wipe reconverges to a live cold install",
-            stateless_install_chaos,
-        ),
-        (
             "a cold node rejects a malformed (unextractable) assigned bundle at ingest and descends to a healthy release",
             cold_install_descends_past_corrupt_bundle,
         ),
@@ -492,16 +488,6 @@ fn step(msg: &str) {
 fn ok(msg: &str) {
     println!("\x1b[1;32m{msg}\x1b[0m");
 }
-
-
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {

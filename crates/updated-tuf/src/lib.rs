@@ -23,8 +23,8 @@ use url::Url;
 
 pub mod policy;
 pub mod repo;
-mod transport;
 pub mod select;
+mod transport;
 
 pub use policy::{DefaultPolicy, PolicyError};
 
@@ -75,6 +75,39 @@ fn classify(e: tough::error::Error) -> Error {
 mod error_tests {
     use super::{assignment_identity, transport_timeout, validate_release_url, Error};
     use updated::config::RepositoryAssignment;
+
+    fn runtime() -> updated::config::ManagedRuntime {
+        updated::config::ManagedRuntime {
+            product: "app".into(),
+            channel: "stable".into(),
+            install_root: "/app".into(),
+            args: vec![],
+            health_checks: vec![],
+            repository: updated::config::ManagedRepositoryLimits {
+                metadata_limit: 1,
+                target_limit: 1,
+                transport_timeout_seconds: 1,
+            },
+            storage: updated::config::ManagedStorage {
+                inactive_releases: 1,
+                inactive_providers: 1,
+                inactive_supervisors: 1,
+                inactive_bytes: 1,
+                inactive_repository_caches: 1,
+            },
+            timeouts: updated::config::ManagedTimeouts {
+                check_interval_seconds: 1,
+                health_grace_seconds: 1,
+                health_successes: 1,
+                health_interval_seconds: 1,
+                retry_after_seconds: 1,
+                refresh_retry_seconds: 1,
+                confirmation_window_seconds: 1,
+                supervisor_check_interval_seconds: 1,
+                drain_hold_seconds: Some(0),
+            },
+        }
+    }
 
     #[test]
     fn only_transport_is_retryable() {
@@ -222,6 +255,81 @@ mod error_tests {
     }
 
     #[test]
+    fn prune_retains_the_active_assignments_datastore_and_removes_a_stale_one() {
+        // Mirror the exact protected-set construction in `assigned`: the active assignment's
+        // identity is the one directory that must survive pruning, because it carries tough's
+        // anti-rollback floor. A stale inactive assignment's cache is fair game.
+        let active = assignment_identity(&RepositoryAssignment {
+            schema: 2,
+            deployment: "active".into(),
+            metadata_url: "https://cdn/active/metadata/".into(),
+            targets_url: "https://cdn/active/targets/".into(),
+            report_url: None,
+            application: updated::config::TargetReference {
+                path: "app".into(),
+                sha256: "aa".into(),
+            },
+            ordered_install_fallback: false,
+            provider_set: updated::config::TargetReference {
+                path: "providers".into(),
+                sha256: "bb".into(),
+            },
+            release_root: serde_json::json!({}),
+            runtime: runtime(),
+        });
+        let stale = assignment_identity(&RepositoryAssignment {
+            schema: 2,
+            deployment: "stale".into(),
+            metadata_url: "https://cdn/stale/metadata/".into(),
+            targets_url: "https://cdn/stale/targets/".into(),
+            report_url: None,
+            application: updated::config::TargetReference {
+                path: "app".into(),
+                sha256: "aa".into(),
+            },
+            ordered_install_fallback: false,
+            provider_set: updated::config::TargetReference {
+                path: "providers".into(),
+                sha256: "bb".into(),
+            },
+            release_root: serde_json::json!({}),
+            runtime: runtime(),
+        });
+        assert_ne!(active, stale);
+
+        let datastore = std::env::temp_dir().join(format!(
+            "updated-tuf-prune-{}-{}",
+            std::process::id(),
+            updated::rand::token().unwrap()
+        ));
+        for identity in [&active, &stale] {
+            let dir = datastore.join(identity);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("timestamp.json"), b"floor").unwrap();
+        }
+
+        // The active identity is excluded from the prune set exactly as in `assigned`.
+        let protected = std::iter::once(std::ffi::OsString::from(active.clone())).collect();
+        // Zero inactive retention: without protection, both directories would be eligible.
+        let removed =
+            updated::gc::prune_directories(&datastore, &protected, 0, 0).expect("prune succeeds");
+
+        assert_eq!(
+            removed, 1,
+            "only the stale inactive cache should be removed"
+        );
+        assert!(
+            datastore.join(&active).is_dir(),
+            "the active assignment's datastore (and its rollback floor) must survive pruning"
+        );
+        assert!(
+            !datastore.join(&stale).exists(),
+            "a stale inactive assignment's cache is eligible for GC"
+        );
+        let _ = std::fs::remove_dir_all(&datastore);
+    }
+
+    #[test]
     fn assigned_endpoints_are_bounded_http_base_urls() {
         assert!(validate_release_url("metadata_url", "https://cdn.example/metadata/").is_ok());
         assert!(validate_release_url("metadata_url", "file:///opt/update/metadata/").is_ok());
@@ -284,8 +392,8 @@ pub async fn resolve_managed_config(
     )
     .map_err(|error| Error::Local(format!("materializing routing root: {error}")))?;
     // The gateway that serves routing and release metadata is the same externally-exposed listener
-    // the agent enrolled through, so ongoing fetches present the same mTLS identity: the mounted
-    // cert (mount mode) or the certificate the node minted at `/join` (join mode).
+    // the agent enrolled through, so ongoing fetches present the same mTLS identity: the per-node
+    // certificate the node minted at `/enroll`.
     let mtls = bootstrap
         .enrollment
         .steady_identity(enrollment_state)
@@ -299,11 +407,34 @@ pub async fn resolve_managed_config(
         transport_timeout: std::time::Duration::from_secs(30),
         mtls,
     };
-    let assignment = verify_embedded_assignment(&bundle)?;
+    // The enrollment bundle carries the assignment as of enrollment. Once the node has resolved a
+    // live routing assignment (persisted by the update loop), THAT is the current managed config:
+    // a control-plane reassignment changes the launch spec, health checks, cadence, and retention,
+    // and the running supervisor must boot on those, not the enrollment-frozen values. The embedded
+    // assignment seeds only the very first boot, before any live resolution — and the loop still
+    // re-verifies and reconciles the live assignment every cycle, so a stale or tampered persisted
+    // file is corrected within one tick. Any read/parse/validate failure falls back to embedded.
+    let embedded = verify_embedded_assignment(&bundle)?;
+    let assignment = persisted_assignment(&embedded.runtime.install_root).unwrap_or(embedded);
     assignment
         .runtime
         .materialize(routing, &assignment.release_root, enrollment_state)
         .map_err(Error::Trust)
+}
+
+/// The last live routing assignment this node resolved, which the update loop persists to
+/// `<install_root>/state/repository-assignment.json` (see [`updated::config::Paths::resolve_paths`],
+/// which derives the same path). Returned only when it parses and structurally validates, so any
+/// failure leaves the caller on the enrollment-embedded assignment.
+fn persisted_assignment(install_root: &Path) -> Option<updated::config::RepositoryAssignment> {
+    // Mirrors `resolve_paths`: state_dir = <install_root>/state, assignment = state_dir/…json.
+    let path = install_root
+        .join("state")
+        .join("repository-assignment.json");
+    let bytes = std::fs::read(path).ok()?;
+    let assignment: updated::config::RepositoryAssignment = serde_json::from_slice(&bytes).ok()?;
+    assignment.validate().ok()?;
+    Some(assignment)
 }
 
 /// Verify the complete initial TUF chain carried by an enrollment bundle and return
@@ -537,6 +668,16 @@ impl TrustedRepository {
         validate_release_url("targets_url", &source.targets_url)?;
         let mut repository = Self::load(&source, &assignment_store).await?;
         repository.assignment = Some(assignment);
+        // The active assignment's datastore holds tough's version-monotonicity floor
+        // (the highest timestamp/snapshot version this node has ever accepted). Pruning it
+        // would let the next load restart with no floor and accept an older validly-signed,
+        // non-expired metadata set — a rollback attack. So the active identity is always in
+        // `protected` and can never be GC'd, regardless of retention limits.
+        //
+        // Residual: with the persisted floor gone we would still refuse *expired* metadata,
+        // so the anti-rollback window collapses to the timestamp/snapshot expiry horizon.
+        // Keeping that horizon short is a publishing-side concern, not enforced here; the
+        // floor below is the durable defense and must not be discarded.
         let protected = std::iter::once(assignment_key.into()).collect();
         if let Err(error) = updated::gc::prune_directories(
             &paths.datastore,
@@ -630,7 +771,10 @@ impl TrustedRepository {
             .get("sha256")
             .map(hex::encode)
             .ok_or_else(|| Error::Trust(format!("target {} has no sha256", target.path)))?;
-        if actual != reference.sha256 {
+        // Case-insensitive, matching `hash::verify_file` and `bundle.rs`: a signed assignment may
+        // carry an upper- or mixed-case digest, and `actual` is lowercase `hex::encode`. A
+        // case-sensitive `!=` here would spuriously reject a valid uppercase-digest assignment.
+        if !actual.eq_ignore_ascii_case(&reference.sha256) {
             return Err(Error::Trust(format!(
                 "desired target {} has sha256 {}, expected {}",
                 target.path, actual, reference.sha256

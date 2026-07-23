@@ -3427,6 +3427,7 @@ name = "updatec"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "chrono",
  "foundation",
@@ -3438,6 +3439,7 @@ dependencies = [
  "kube",
  "object_store",
  "rcgen",
+ "reqwest 0.13.4",
  "rustls",
  "schemars",
  "serde",

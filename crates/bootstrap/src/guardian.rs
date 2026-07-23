@@ -68,6 +68,16 @@ impl Backoff {
         }
     }
 
+    /// A backoff with an explicit base, for tests that need to advance it without a real
+    /// wall-clock sleep (a zero base yields a zero delay).
+    #[cfg(test)]
+    fn with_base(base: Duration) -> Self {
+        Backoff {
+            consecutive: 0,
+            base,
+        }
+    }
+
     /// The crash-loop base delay. Tunable via `UPDATED_GUARDIAN_BACKOFF_BASE_MS` so a test can
     /// widen the backoff window enough that a shutdown deterministically lands inside the sleep
     /// (never in the brief serve window) — no wall-clock margin to flake. Defaults to [`BASE`].
@@ -133,18 +143,20 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
         let launched = Instant::now();
         match run_supervisor(cfg, &mut service, next.take())? {
             Cycle::Stop => break,
-            Cycle::Continue => {}
+            Cycle::Continue => {
+                // A candidate was rejected (bad launch, missed readiness, exited before
+                // confirmation) or a commit was reverted, and we are about to relaunch the
+                // committed supervisor. Advance the SAME backoff here so a candidate that
+                // passes `send_hello` but fast-crashes before `Ready` cannot drive an
+                // unthrottled relaunch loop: the guardian is the backstop and must
+                // rate-limit on its own, independent of any supervisor-side policy. Quiet
+                // (no per-cycle warning) because this is the normal rejection path.
+                if backoff_pause(&mut backoff, launched.elapsed(), false) {
+                    break;
+                }
+            }
             Cycle::Backoff => {
-                let delay = backoff.next(launched.elapsed());
-                warn(&format!(
-                    "relaunching the supervisor in {}s (the application keeps running)",
-                    delay.as_secs()
-                ));
-                if sleep_interruptible(delay) {
-                    // Emitted ONLY when shutdown cut the backoff sleep short (never when the
-                    // sleep elapsed and we relaunch), so a test can prove interruption from
-                    // durable evidence instead of racing a wall clock.
-                    info("shutdown interrupted the relaunch backoff; exiting without relaunch");
+                if backoff_pause(&mut backoff, launched.elapsed(), true) {
                     break;
                 }
             }
@@ -307,8 +319,15 @@ fn serve_service<L: Link>(
             match sup.read_request() {
                 Ok(req) => {
                     if dispatch(cfg, sup, service, req, &mut activation).is_err() {
-                        // A channel write failed: the supervisor is gone. Fall to the
-                        // exit check below.
+                        // A response write failed — a partial/timed-out frame may already be on the
+                        // wire. Never keep serving this channel: the very next response would land
+                        // after a half-written one and desync the supervisor's frame reader (and on
+                        // Windows an abandoned write thread could interleave bytes). Stop the
+                        // supervisor and relaunch it on a fresh channel rather than trusting the
+                        // peer to eventually exit on its own.
+                        warn("control-channel write to the supervisor failed; restarting it on a fresh channel");
+                        sup.stop();
+                        return Ok(Cycle::Backoff);
                     }
                 }
                 Err(control::Error::UnknownTag(_)) => {
@@ -497,6 +516,17 @@ fn seed_desired_supervisor(cfg: &Config) -> Result<(), String> {
         .map_err(|e| format!("recording the initial supervisor: {e}"))
 }
 
+/// Validate that `path` is a safe supervisor binary to launch (a regular non-symlink file
+/// inside the content-addressed staging tree, or the durably-seeded initial path).
+///
+/// This is a TOCTOU check: the file could in principle be swapped between this validation
+/// and the subsequent `Supervisor::launch`. The window is acceptable and bounded because
+/// the staging tree lives under the guardian's own root-owned `state_dir` — an attacker who
+/// could rewrite content-addressed paths there already owns the node — and because the path
+/// is content-addressed (`supervisors/<sha256>/…`), so a swap that preserved the hash
+/// directory name would have to preserve the bytes. The check exists to reject
+/// misconfiguration and stray symlinks, not to defend a hostile-writer race, so re-opening
+/// atomically to close the window would buy nothing.
 fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|e| format!("inspecting supervisor {}: {e}", path.display()))?;
@@ -551,6 +581,32 @@ fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Resul
     Ok(())
 }
 
+/// Advance the relaunch backoff and sleep it out before the next supervisor launch.
+/// Returns `true` if a stop cut the sleep short (the caller then exits without relaunching).
+///
+/// Both the crash-loop path (`Cycle::Backoff`) and the candidate-rejection path
+/// (`Cycle::Continue`) funnel through here so relaunch is throttled the same way regardless
+/// of which one triggered it. `announce` logs the wait for the crash-loop case; the
+/// candidate-rejection case stays quiet to avoid a warning on every routine rejection.
+fn backoff_pause(backoff: &mut Backoff, ran_for: Duration, announce: bool) -> bool {
+    let delay = backoff.next(ran_for);
+    if announce {
+        warn(&format!(
+            "relaunching the supervisor in {}s (the application keeps running)",
+            delay.as_secs()
+        ));
+    }
+    if sleep_interruptible(delay) {
+        // Emitted ONLY when shutdown cut the backoff sleep short (never when the sleep
+        // elapsed and we relaunch), so a test can prove interruption from durable evidence
+        // instead of racing a wall clock.
+        info("shutdown interrupted the relaunch backoff; exiting without relaunch");
+        true
+    } else {
+        false
+    }
+}
+
 /// Sleep up to `dur`, returning `true` early if a stop signal arrives.
 fn sleep_interruptible(dur: Duration) -> bool {
     let deadline = Instant::now() + dur;
@@ -586,6 +642,28 @@ mod tests {
             b.next(INSTANT);
         }
         assert_eq!(b.next(INSTANT), Backoff::CAP);
+    }
+
+    #[test]
+    fn candidate_rejection_cycles_rate_limit_the_relaunch() {
+        // A candidate that passes `send_hello` but fast-crashes before `Ready` returns
+        // `Cycle::Continue`. The guardian must throttle the resulting relaunch itself rather
+        // than trust supervisor policy, so every rejection cycle advances the shared backoff.
+        // A zero base makes the pause a no-op sleep, so the test asserts the advance without
+        // a wall-clock delay.
+        let mut backoff = Backoff::with_base(Duration::ZERO);
+        assert_eq!(backoff.consecutive, 0);
+        for expected in 1..=4 {
+            // announce = false is exactly the candidate-rejection (Cycle::Continue) path.
+            assert!(
+                !backoff_pause(&mut backoff, INSTANT, false),
+                "no shutdown, so the pause completes and the guardian relaunches"
+            );
+            assert_eq!(
+                backoff.consecutive, expected,
+                "each candidate-rejection cycle advances the backoff, throttling the relaunch"
+            );
+        }
     }
 
     #[test]

@@ -140,39 +140,35 @@ stateDiagram-v2
 
 ## 4. Enrollment (one-way, consumed-once)
 
-A fresh node authenticates to the gateway, receives a signed bundle (its routing root + first
-assignment), and records a **consumed** marker it can never undo. Two modes, chosen by which
-credentials the bootstrap carries.
+A fresh node authenticates to the gateway with the shared fleet enrollment cert, mints its own
+per-node identity, receives a signed bundle (its routing root + first assignment), and records a
+**consumed** marker it can never undo. One path: mutual-TLS `POST /enroll`.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Fresh
-    Fresh --> Mount: client_cert + client_key present (Kubernetes / cert-manager)
-    Fresh --> Join: group_id + nonce present (immutable infra / userdata)
-    Mount --> Enrolling: POST /enroll over mTLS
-    Join --> Minting: POST /join over server-TLS (no client cert yet)
-    Minting --> Enrolling: CSR signed → agent.crt/agent.key persisted first
+    Fresh --> Minting: generate keypair + CSR
+    Minting --> Enrolling: POST /enroll over mTLS (shared fleet cert) → agent.crt/agent.key persisted first
     Enrolling --> Persisted: write enrollment.json
     Persisted --> Consumed: write .consumed marker
     Consumed --> [*]
     Consumed --> Enrolling: never (guard: consumed + no bundle ⇒ hard error)
 ```
 
-- **Mode precedence** (`EnrollmentBootstrap::mode`): cert paths win over a join token; a
-  half-specified pair is an error; resolved at load so a misconfig fails immediately.
-- **On-disk state:** `registration-nonce` (durable per-node id, reused on retry), `agent.crt`/
-  `agent.key` (join-mode minted identity, key `0600`), `enrollment.json` (the bundle),
-  `enrollment.consumed` (permanent "never re-enroll").
-- **Write ordering is the crash-safety hinge:** the bundle is written **before** the consumed
-  marker (a crash between → next boot loads the bundle, then writes the marker; the reverse order
-  could brick with "consumed but no bundle"). In join mode the minted **cert is persisted before**
-  the bundle (a crash between simply re-joins to the same identity, since the durable `instance`
-  is stable).
-- **Control-plane side:** `/enroll` (mTLS handshake *is* the auth) and `/join` (group token +
-  CSR) both create an `UpdateAgent`. Join additionally mints the client cert: the CA **ignores the
-  CSR subject**, certifies only its public key, and sets `CN` + a SPIFFE URI SAN
-  (`spiffe://updated.fleet/group/<group>/node/<agent>`). The agent name is
-  `agent-<first 24 hex of sha256(instance)>` in both modes.
+- **Bootstrap config** (`EnrollmentBootstrap`): `{ url, ca, name, client_cert, client_key }`,
+  `deny_unknown_fields` so a stale `group_id`/`nonce`/`token` field fails loudly at load.
+- **On-disk state:** the durable node keypair (reused on retry), `agent.crt`/`agent.key` (the
+  minted per-node identity, key `0600`), `enrollment.json` (the bundle), `enrollment.consumed`
+  (permanent "never re-enroll").
+- **Write ordering is the crash-safety hinge:** the minted **cert is persisted before** the
+  bundle (a crash between simply re-enrolls to the same identity, since the durable key is
+  stable), and the bundle is written **before** the consumed marker (a crash between → next boot
+  loads the bundle, then writes the marker; the reverse order could brick with "consumed but no
+  bundle").
+- **Control-plane side:** `/enroll` (the mTLS handshake with the shared fleet cert *is* the auth)
+  creates an `UpdateAgent` and mints the client cert: the CA **ignores the CSR subject**, certifies
+  only its public key, and sets `CN=<name>` + a SPIFFE URI SAN
+  (`spiffe://updated.fleet/scope/<repo>/node/<name>`). The node self-asserts `name`.
 
 ## 5. Cold install (provisional → confirmed)
 

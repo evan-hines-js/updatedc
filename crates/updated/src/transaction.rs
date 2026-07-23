@@ -11,7 +11,6 @@ use std::path::Path;
 use crate::bundle::ReleaseId;
 use crate::state::{ProviderRelease, RepositoryLineage};
 
-
 /// Durable intent for an in-flight executable replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +37,13 @@ pub struct Transaction {
     /// path used.
     #[serde(deserialize_with = "crate::required_option")]
     pub healthcheck: Option<Box<ProviderRelease>>,
+    /// How many consecutive boots have failed to health-gate the restored predecessor during a
+    /// crash-recovered rollback. The supervisor's boot health gate bounds this: once it reaches its
+    /// limit, a predecessor whose bytes can no longer pass the gate stops crash-looping the node and
+    /// instead descends via ordered fallback past it. Zero for a forward update; only the rollback
+    /// recovery path increments it. It survives the guardian relaunch precisely because it rides the
+    /// journal, which is what re-derives the rollback on each boot.
+    pub rollback_health_failures: u32,
     /// Last state-machine operation known to have completed durably. Recovery replays
     /// the next operation; adapters are idempotent across the action/journal-write gap.
     pub phase: Phase,
@@ -340,6 +346,7 @@ mod tests {
             candidate_rejection_required: false,
             lifecycle: None,
             healthcheck: None,
+            rollback_health_failures: 0,
             phase: Phase::PreflightStarted,
         }
     }

@@ -1,5 +1,8 @@
 [enrollment]
 url = "{{ demo_enrollment_url | default('https://updatec-gateway') }}"
+# This node's self-asserted enrollment name — the demo addresses the VM's UpdateAgent by the
+# sha-derived resource name it computes, so it passes that exact value as `updated_node_name`.
+name = "{{ updated_node_name | default(inventory_hostname) }}"
 client_cert = "/etc/updated/agent-tls/tls.crt"
 client_key = "/etc/updated/agent-tls/tls.key"
 ca = "/etc/updated/agent-tls/ca.crt"

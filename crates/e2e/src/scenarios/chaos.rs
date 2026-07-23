@@ -391,7 +391,11 @@ pub(crate) fn aborted_transition_chaos_recovery(ctx: &Ctx) -> R {
     drop(tower);
     drop(server);
     kill_stray(&dir.join("install"));
-    if !crash_seen || !durable || !live || phases != ["preflight", "prepare", "pre-drain", "drain", "rollback"] {
+    if !crash_seen
+        || !durable
+        || !live
+        || phases != ["preflight", "prepare", "pre-drain", "drain", "rollback"]
+    {
         return fail(format!(
             "aborted recovery failed (crash_seen={crash_seen}, durable={durable}, live={live}, \
              phases={phases:?}); attempts:\n{attempts}\nlog:\n{log}"
@@ -650,7 +654,14 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
 /// hang guard cannot target them.)
 pub(crate) fn provider_hook_hangs_are_bounded(ctx: &Ctx) -> R {
     const PHASES: &[&str] = &[
-        "preflight", "prepare", "pre-drain", "drain", "stop", "activate", "start", "verify",
+        "preflight",
+        "prepare",
+        "pre-drain",
+        "drain",
+        "stop",
+        "activate",
+        "start",
+        "verify",
         "finalize",
     ];
     for (index, phase) in PHASES.iter().enumerate() {

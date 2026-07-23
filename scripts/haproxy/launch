@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# First-launch entrypoint (bin/launch) for an updated-managed HAProxy node.
+#
+# The guardian launches this once for first process creation. It projects THIS immutable release's
+# binary and configuration onto the stable runtime paths and execs HAProxy in master-worker
+# foreground; the guardian then owns the master PID. Every later upgrade never relaunches — the
+# lifecycle provider's `activate` makes this same master re-exec in place (SIGUSR2).
+#
+# Self-contained on purpose: the application bundle carries no dependency on the separately signed
+# provider bundle, so the projection is inlined here rather than sourced.
+
+release="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+runtime="${UPDATED_INSTALL_ROOT:?UPDATED_INSTALL_ROOT is required}/runtime"
+mkdir -p "$runtime"
+
+bin_tmp="$runtime/.haproxy.$$"
+cfg_tmp="$runtime/.haproxy.cfg.$$"
+trap 'rm -f "$bin_tmp" "$cfg_tmp"' EXIT
+cp "$release/bin/haproxy" "$bin_tmp" && chmod 0755 "$bin_tmp"
+cp "$release/config/haproxy.cfg" "$cfg_tmp" && chmod 0644 "$cfg_tmp"
+mv -f "$bin_tmp" "$runtime/haproxy"
+mv -f "$cfg_tmp" "$runtime/haproxy.cfg"
+trap - EXIT
+
+# -W master-worker, -db foreground (the guardian is the supervisor), -p stable pid file the provider
+# reads to signal the master. The master keeps this PID across every future reexec.
+exec "$runtime/haproxy" -W -db -f "$runtime/haproxy.cfg" -p "$runtime/haproxy.pid"

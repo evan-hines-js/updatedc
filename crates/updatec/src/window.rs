@@ -314,7 +314,9 @@ mod tests {
     use super::*;
 
     fn at(rfc3339: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(rfc3339).unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     fn window() -> RolloutWindow {
@@ -366,13 +368,28 @@ mod tests {
             anchor_week: Some("2026-07-15".into()), // Wednesday in the on-week
             ..window()
         };
-        assert!(w.is_active(at("2026-07-19T12:00:00Z")), "anchor Sunday is on");
-        assert!(!w.is_active(at("2026-07-26T12:00:00Z")), "next Sunday is off");
-        assert!(w.is_active(at("2026-08-02T12:00:00Z")), "two weeks later is on");
+        assert!(
+            w.is_active(at("2026-07-19T12:00:00Z")),
+            "anchor Sunday is on"
+        );
+        assert!(
+            !w.is_active(at("2026-07-26T12:00:00Z")),
+            "next Sunday is off"
+        );
+        assert!(
+            w.is_active(at("2026-08-02T12:00:00Z")),
+            "two weeks later is on"
+        );
         assert!(!w.is_active(at("2026-08-09T12:00:00Z")), "odd week is off");
         // Parity holds symmetrically before the anchor, too.
-        assert!(w.is_active(at("2026-07-05T12:00:00Z")), "two weeks before is on");
-        assert!(!w.is_active(at("2026-07-12T12:00:00Z")), "one week before is off");
+        assert!(
+            w.is_active(at("2026-07-05T12:00:00Z")),
+            "two weeks before is on"
+        );
+        assert!(
+            !w.is_active(at("2026-07-12T12:00:00Z")),
+            "one week before is off"
+        );
     }
 
     #[test]
@@ -401,9 +418,15 @@ mod tests {
         // 2026-07-18 is a Saturday, 2026-07-19 a Sunday.
         assert!(!w.is_active(at("2026-07-18T21:59:00Z")));
         assert!(w.is_active(at("2026-07-18T22:30:00Z")), "Saturday evening");
-        assert!(w.is_active(at("2026-07-19T01:30:00Z")), "spills into Sunday morning");
+        assert!(
+            w.is_active(at("2026-07-19T01:30:00Z")),
+            "spills into Sunday morning"
+        );
         assert!(!w.is_active(at("2026-07-19T02:00:00Z")), "span closed");
-        assert!(!w.is_active(at("2026-07-19T12:00:00Z")), "Sunday midday is not its own on-day");
+        assert!(
+            !w.is_active(at("2026-07-19T12:00:00Z")),
+            "Sunday midday is not its own on-day"
+        );
     }
 
     #[test]
@@ -413,8 +436,14 @@ mod tests {
             dates: vec!["2026-07-20".into()], // a Monday
             ..window()
         };
-        assert!(w.is_active(at("2026-07-19T12:00:00Z")), "Sunday via weekday rule");
-        assert!(w.is_active(at("2026-07-20T12:00:00Z")), "Monday via explicit date");
+        assert!(
+            w.is_active(at("2026-07-19T12:00:00Z")),
+            "Sunday via weekday rule"
+        );
+        assert!(
+            w.is_active(at("2026-07-20T12:00:00Z")),
+            "Monday via explicit date"
+        );
         assert!(!w.is_active(at("2026-07-21T12:00:00Z")), "Tuesday: neither");
     }
 
@@ -437,7 +466,10 @@ mod tests {
         };
         assert!(w.is_active(at("2026-07-19T02:00:00Z")), "Sunday");
         assert!(w.is_active(at("2026-07-22T02:00:00Z")), "Wednesday");
-        assert!(!w.is_active(at("2026-07-22T04:00:00Z")), "outside the daily span");
+        assert!(
+            !w.is_active(at("2026-07-22T04:00:00Z")),
+            "outside the daily span"
+        );
     }
 
     #[test]
@@ -453,9 +485,18 @@ mod tests {
             ..window()
         };
         let windows = [sunday, wednesday_night];
-        assert!(is_open(&windows, at("2026-07-19T12:00:00Z")), "Sunday window");
-        assert!(is_open(&windows, at("2026-07-22T22:30:00Z")), "Wednesday window");
-        assert!(!is_open(&windows, at("2026-07-21T12:00:00Z")), "Tuesday: closed");
+        assert!(
+            is_open(&windows, at("2026-07-19T12:00:00Z")),
+            "Sunday window"
+        );
+        assert!(
+            is_open(&windows, at("2026-07-22T22:30:00Z")),
+            "Wednesday window"
+        );
+        assert!(
+            !is_open(&windows, at("2026-07-21T12:00:00Z")),
+            "Tuesday: closed"
+        );
     }
 
     #[test]
@@ -525,7 +566,10 @@ mod tests {
             ..window()
         };
         assert!(w.is_active(at("2026-07-19T00:00:00Z")), "00:00 inclusive");
-        assert!(w.is_active(at("2026-07-19T23:59:00Z")), "23:59 covered by the 24:00 end");
+        assert!(
+            w.is_active(at("2026-07-19T23:59:00Z")),
+            "23:59 covered by the 24:00 end"
+        );
     }
 
     #[test]
@@ -540,7 +584,10 @@ mod tests {
         };
         assert!(w.is_active(at("2026-07-19T00:00:00Z")));
         assert!(w.is_active(at("2026-07-19T23:59:00Z")));
-        assert!(!w.is_active(at("2026-07-20T09:00:00Z")), "still only on its weekday");
+        assert!(
+            !w.is_active(at("2026-07-20T09:00:00Z")),
+            "still only on its weekday"
+        );
     }
 
     #[test]
@@ -601,13 +648,25 @@ mod tests {
     fn calendar_admits_only_inside_a_dated_window() {
         // "only valid August 25 2026, 06:00–09:00 UTC".
         let cal = [entry("2026-08-25", "06:00", "09:00")];
-        assert!(!calendar_open(&cal, at("2026-08-25T05:59:00Z")), "before the window: frozen");
-        assert!(calendar_open(&cal, at("2026-08-25T06:00:00Z")), "start is inclusive");
-        assert!(calendar_open(&cal, at("2026-08-25T08:59:00Z")), "inside the window");
+        assert!(
+            !calendar_open(&cal, at("2026-08-25T05:59:00Z")),
+            "before the window: frozen"
+        );
+        assert!(
+            calendar_open(&cal, at("2026-08-25T06:00:00Z")),
+            "start is inclusive"
+        );
+        assert!(
+            calendar_open(&cal, at("2026-08-25T08:59:00Z")),
+            "inside the window"
+        );
         // A day before the window — same time of day — is still pending, so frozen. (A day
         // *after* the sole entry would instead be "ran out → open"; that fallback, including
         // the exclusive end boundary, is covered by the pending-entry and run-out tests.)
-        assert!(!calendar_open(&cal, at("2026-08-24T07:00:00Z")), "before the window day: frozen");
+        assert!(
+            !calendar_open(&cal, at("2026-08-24T07:00:00Z")),
+            "before the window day: frozen"
+        );
     }
 
     #[test]
@@ -615,8 +674,14 @@ mod tests {
         // A single past window: once its day is over the calendar is exhausted, so it stops
         // gating entirely — the set falls back to open rather than freezing forever.
         let cal = [entry("2026-08-25", "06:00", "09:00")];
-        assert!(calendar_open(&cal, at("2026-08-25T12:00:00Z")), "same day, after the window");
-        assert!(calendar_open(&cal, at("2027-01-01T00:00:00Z")), "long after: ran out, open");
+        assert!(
+            calendar_open(&cal, at("2026-08-25T12:00:00Z")),
+            "same day, after the window"
+        );
+        assert!(
+            calendar_open(&cal, at("2027-01-01T00:00:00Z")),
+            "long after: ran out, open"
+        );
     }
 
     #[test]
@@ -629,10 +694,22 @@ mod tests {
         ];
         // Exactly at the first window's exclusive end, with the second still pending: frozen.
         // This is where end-exclusivity is observable (a sole entry would have run out here).
-        assert!(!calendar_open(&cal, at("2026-08-25T09:00:00Z")), "first window's end is exclusive");
-        assert!(!calendar_open(&cal, at("2026-08-27T12:00:00Z")), "between windows: waiting");
-        assert!(calendar_open(&cal, at("2026-09-01T22:30:00Z")), "inside the later window");
-        assert!(calendar_open(&cal, at("2026-09-02T00:00:00Z")), "both past: ran out, open");
+        assert!(
+            !calendar_open(&cal, at("2026-08-25T09:00:00Z")),
+            "first window's end is exclusive"
+        );
+        assert!(
+            !calendar_open(&cal, at("2026-08-27T12:00:00Z")),
+            "between windows: waiting"
+        );
+        assert!(
+            calendar_open(&cal, at("2026-09-01T22:30:00Z")),
+            "inside the later window"
+        );
+        assert!(
+            calendar_open(&cal, at("2026-09-02T00:00:00Z")),
+            "both past: ran out, open"
+        );
     }
 
     #[test]
@@ -641,7 +718,10 @@ mod tests {
         // leaves the calendar effectively empty → open. validate() still flags it.
         let bad = entry("not-a-date", "06:00", "09:00");
         assert!(bad.validate().is_err());
-        assert!(calendar_open(std::slice::from_ref(&bad), at("2026-08-25T07:00:00Z")));
+        assert!(calendar_open(
+            std::slice::from_ref(&bad),
+            at("2026-08-25T07:00:00Z")
+        ));
 
         // end must be after start; dated entries do not wrap past midnight.
         assert!(entry("2026-08-25", "09:00", "06:00").validate().is_err());

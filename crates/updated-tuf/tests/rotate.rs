@@ -241,10 +241,15 @@ async fn a_retained_key_absent_from_the_current_root_is_rejected() {
     let stranger = fixture.mint_key("stranger.pk8").await;
     let successor = fixture.mint_key("successor.pk8").await;
 
-    let error = repo::rotate_root(&fixture.repo_dir, std::slice::from_ref(&stranger), &successor, 365)
-        .await
-        .unwrap_err()
-        .to_string();
+    let error = repo::rotate_root(
+        &fixture.repo_dir,
+        std::slice::from_ref(&stranger),
+        &successor,
+        365,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(
         error.contains("not in the current root"),
         "unexpected error: {error}"

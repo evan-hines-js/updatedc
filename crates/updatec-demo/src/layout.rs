@@ -81,12 +81,50 @@ pub(crate) const MAGNOLIA_COHORTS: [(&str, &str, &str, usize); 2] = [
     ("publisher", "public", "magnoliaPublic", 2),
 ];
 pub(crate) const DEMO_MAGNOLIA_TOTAL: usize = 4;
+
+/// The updated-managed HAProxy tier: a StatefulSet of this many HAProxy pods, each an ordinary
+/// `updated` agent that installs HAProxy from a signed tarball bundle (never a bespoke image) and
+/// upgrades it in place via the provider's SIGUSR2 master-worker re-exec. Two replicas so the
+/// control plane rolls them one at a time and the front Service always keeps one serving — the
+/// zero-downtime story. This is the thesis demonstrator: `updated` managing infrastructure
+/// (a load balancer) that fronts real services, which plain Kubernetes rollouts cannot express.
+pub(crate) const DEMO_HAPROXY_REPLICAS: usize = 2;
+/// The cohort label the HAProxy pods carry and the `haproxy` UpdateGroup selects on. Outside the
+/// per-set/fleet throttle and the pod-kill chaos, exactly like the Magnolia tier.
+pub(crate) const DEMO_HAPROXY_COHORT: &str = "haproxy";
+/// Name prefix for the per-node HAProxy UpdateGroups (`haproxy-0`, `haproxy-1`) that roll the tier
+/// from 1.0.0 → 2.0.0. Each group selects a single HAProxy node, and one concurrency-1
+/// `UpdateGroupSet` over the two rolls them ONE AT A TIME behind the front Service — the sample-app
+/// set machinery reused so the reexec is genuinely zero-downtime (never both nodes at once).
+pub(crate) const DEMO_HAPROXY_GROUP: &str = "haproxy";
+/// The group-metadata label the HAProxy `UpdateGroupSet` selects its two single-node member groups
+/// on, so the set caps them to one rolling at a time.
+/// The HAProxy `backend` section whose server membership the HAProxy-mode healthproxy programs
+/// from signed CDN health (`set server <backend>/<node> state ready|drain`).
+pub(crate) const DEMO_HAPROXY_BACKEND: &str = "fleet";
+/// TCP port each HAProxy exposes its admin runtime API (stats socket) on, reachable in-cluster at
+/// `haproxy-<n>.agents:<port>` so the healthproxy can flip backend server state.
+pub(crate) const DEMO_HAPROXY_ADMIN_PORT: u16 = 9999;
+/// The ClusterIP Service that fans traffic across the HAProxy pods — the fleet's front door. The
+/// synthetic load test drives it across the HAProxy upgrade to prove zero dropped requests.
+pub(crate) const DEMO_HAPROXY_FRONT_SERVICE: &str = "haproxy-front";
+/// The two release versions the HAProxy tier demonstrates an in-place upgrade between.
+pub(crate) const DEMO_HAPROXY_V1: &str = "1.0.0";
+pub(crate) const DEMO_HAPROXY_V2: &str = "2.0.0";
+/// Annotation on the `haproxy` UpdateGroup carrying the pre-published 2.0.0 target the e2e upgrade
+/// patches in — so the bytes are signed and in the store up front and the upgrade is a pure group
+/// patch (like the manual-Magnolia button), never a live publish.
+pub(crate) const DEMO_HAPROXY_NEXT_PATH_ANNOTATION: &str = "demo.updated.dev/next-path";
+pub(crate) const DEMO_HAPROXY_NEXT_SHA_ANNOTATION: &str = "demo.updated.dev/next-sha256";
 /// The group the "Upgrade Magnolia" button rolls from v1 to v2 — the out-of-cluster VM
 /// ([`DEMO_EXTERNAL_VM_HOSTNAME`]). Nothing rolls it automatically; it holds its baseline until
 /// an operator clicks the button, then runs the real custom in-place upgrade on the VM.
 pub(crate) const MAGNOLIA_MANUAL_GROUP: &str = "magnolia-manual";
+/// Extra pods the HAProxy tier consumes: the HAProxy replicas plus the one HAProxy-mode
+/// healthproxy Deployment that programs their backend membership.
+pub(crate) const DEMO_HAPROXY_TOTAL: usize = DEMO_HAPROXY_REPLICAS + 1;
 pub(crate) const DEMO_REQUIRED_POD_CAPACITY: usize =
-    DEMO_TOTAL_AGENTS + DEMO_MAGNOLIA_TOTAL + 40;
+    DEMO_TOTAL_AGENTS + DEMO_MAGNOLIA_TOTAL + DEMO_HAPROXY_TOTAL + 40;
 
 /// Serving pods a set is guaranteed to keep while it rolls: total pods minus the pods of the
 /// at-most-one group the per-set cap lets roll (`gps - 1` groups). Chaos never enters this
@@ -233,7 +271,6 @@ pub(crate) fn fleet_rollout_width(seed: u64) -> u32 {
     DEMO_FLEET_CONCURRENCY + offset as u32
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,7 +285,10 @@ mod tests {
         let mut seen = BTreeSet::new();
         for seed in 0..10_000u64 {
             let w = fleet_rollout_width(seed);
-            assert!(band.contains(&w), "width {w} out of the uptime-safe band for seed {seed}");
+            assert!(
+                band.contains(&w),
+                "width {w} out of the uptime-safe band for seed {seed}"
+            );
             seen.insert(w);
         }
         // ...and it actually varies across the whole band, not stuck on one value.

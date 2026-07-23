@@ -43,7 +43,7 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
                 pending.previous_archive_sha256.clone(),
             )
             .with_lifecycle(pending.lifecycle.clone())
-            .with_healthcheck(pending.healthcheck.clone())
+            .with_healthcheck(pending.healthcheck.clone()),
         );
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
@@ -143,7 +143,7 @@ fn reconcile_transaction(
                 tx.previous_archive_sha256.clone(),
             )
             .with_lifecycle(tx.lifecycle.clone())
-            .with_healthcheck(tx.healthcheck.clone())
+            .with_healthcheck(tx.healthcheck.clone()),
         );
         plan.current = Some(tx.previous_release.version.clone());
     }
@@ -189,7 +189,7 @@ fn confirm_or_revert(
                 pending.previous_archive_sha256.clone(),
             )
             .with_lifecycle(pending.lifecycle.clone())
-            .with_healthcheck(pending.healthcheck.clone())
+            .with_healthcheck(pending.healthcheck.clone()),
         );
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
@@ -205,7 +205,7 @@ fn confirm_or_revert(
                 installed.archive_sha256.clone(),
             )
             .with_lifecycle(installed.lifecycle.clone())
-            .with_healthcheck(installed.healthcheck.clone())
+            .with_healthcheck(installed.healthcheck.clone()),
         );
         plan.info(format!("release {} confirmed", installed.release.version));
     }
@@ -260,7 +260,10 @@ mod tests {
 
         let plan = plan_boot(&situation);
 
-        assert!(plan.quiesce, "a re-install with a kept-alive process must stop it");
+        assert!(
+            plan.quiesce,
+            "a re-install with a kept-alive process must stop it"
+        );
         assert_eq!(
             plan.acquire,
             Acquire::Launch,
@@ -306,6 +309,7 @@ mod tests {
             candidate_rejection_required: false,
             lifecycle: None,
             healthcheck: None,
+            rollback_health_failures: 0,
             phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
@@ -334,6 +338,7 @@ mod tests {
             candidate_rejection_required: false,
             lifecycle: None,
             healthcheck: None,
+            rollback_health_failures: 0,
             phase: TransactionPhase::CandidateActivated,
         });
         let plan = plan_boot(&situation);
@@ -368,6 +373,7 @@ mod tests {
             candidate_rejection_required: true,
             lifecycle: None,
             healthcheck: None,
+            rollback_health_failures: 0,
             phase: TransactionPhase::RollbackStarted,
         });
 
@@ -393,6 +399,7 @@ mod tests {
             candidate_rejection_required: true,
             lifecycle: None,
             healthcheck: None,
+            rollback_health_failures: 0,
             phase: TransactionPhase::PreflightStarted,
         });
 

@@ -345,6 +345,14 @@ impl RepositoryAssignment {
         if !self.release_root.is_object() {
             return Err("repository assignment release_root must be a JSON object".into());
         }
+        // `metadata_url`/`targets_url` carry the offline-repair grammar (HTTP(S), `file://`,
+        // or an absolute directory path) and are validated by the single canonical
+        // `repository_base` parser on the trust path before any fetch — duplicating that
+        // grammar here is what previously rejected a legitimate local repository. `report_url`
+        // is a network report endpoint with no other validator, so it is checked here.
+        if let Some(report_url) = &self.report_url {
+            validate_report_url(report_url)?;
+        }
         self.runtime.validate()?;
         Ok(())
     }
@@ -410,6 +418,52 @@ impl ManagedRuntime {
         Ok(())
     }
 
+    /// The launch spec and probes derived from this runtime. The single construction path
+    /// for [`Application`] — used both when the config is first materialized and when a
+    /// running supervisor reconciles a control-plane reassignment (which may change the
+    /// launch args or health checks independently of the release version).
+    pub fn application(&self) -> Application {
+        Application {
+            product: self.product.clone(),
+            channel: self.channel.clone(),
+            install_root: self.install_root.clone(),
+            args: self.args.clone(),
+            health_checks: self.health_checks.clone(),
+        }
+    }
+
+    /// The inactive-material retention bounds this runtime signs. Single construction path
+    /// for [`Storage`], shared by materialization and steady-state reassignment.
+    pub fn storage(&self) -> Storage {
+        Storage {
+            inactive_releases: self.storage.inactive_releases,
+            inactive_providers: self.storage.inactive_providers,
+            inactive_supervisors: self.storage.inactive_supervisors,
+            inactive_bytes: self.storage.inactive_bytes,
+            inactive_repository_caches: self.storage.inactive_repository_caches,
+        }
+    }
+
+    /// The cadence and health-gate windows this runtime signs. Single construction path for
+    /// [`Timeouts`], shared by materialization and steady-state reassignment.
+    pub fn timeouts(&self) -> Timeouts {
+        Timeouts {
+            check_interval: Duration::from_secs(self.timeouts.check_interval_seconds),
+            health_grace: Duration::from_secs(self.timeouts.health_grace_seconds),
+            health_successes: self.timeouts.health_successes,
+            health_interval: Duration::from_secs(self.timeouts.health_interval_seconds),
+            retry_after: Duration::from_secs(self.timeouts.retry_after_seconds),
+            refresh_retry: Duration::from_secs(self.timeouts.refresh_retry_seconds),
+            confirmation_window: Duration::from_secs(self.timeouts.confirmation_window_seconds),
+            supervisor_check_interval: Duration::from_secs(
+                self.timeouts.supervisor_check_interval_seconds,
+            ),
+            // `None` (indefinite) is preserved; a finite value (including 0 = no hold) becomes
+            // a bounded ceiling.
+            drain_hold: self.timeouts.drain_hold_seconds.map(Duration::from_secs),
+        }
+    }
+
     pub fn materialize(
         &self,
         routing: Routing,
@@ -433,35 +487,9 @@ impl ManagedRuntime {
                 target_limit: self.repository.target_limit,
                 transport_timeout: Duration::from_secs(self.repository.transport_timeout_seconds),
             },
-            application: Application {
-                product: self.product.clone(),
-                channel: self.channel.clone(),
-                install_root: self.install_root.clone(),
-                args: self.args.clone(),
-                health_checks: self.health_checks.clone(),
-            },
-            storage: Storage {
-                inactive_releases: self.storage.inactive_releases,
-                inactive_providers: self.storage.inactive_providers,
-                inactive_supervisors: self.storage.inactive_supervisors,
-                inactive_bytes: self.storage.inactive_bytes,
-                inactive_repository_caches: self.storage.inactive_repository_caches,
-            },
-            timeouts: Timeouts {
-                check_interval: Duration::from_secs(self.timeouts.check_interval_seconds),
-                health_grace: Duration::from_secs(self.timeouts.health_grace_seconds),
-                health_successes: self.timeouts.health_successes,
-                health_interval: Duration::from_secs(self.timeouts.health_interval_seconds),
-                retry_after: Duration::from_secs(self.timeouts.retry_after_seconds),
-                refresh_retry: Duration::from_secs(self.timeouts.refresh_retry_seconds),
-                confirmation_window: Duration::from_secs(self.timeouts.confirmation_window_seconds),
-                supervisor_check_interval: Duration::from_secs(
-                    self.timeouts.supervisor_check_interval_seconds,
-                ),
-                // `None` (indefinite) is preserved; a finite value (including 0 = no hold) becomes
-                // a bounded ceiling.
-                drain_hold: self.timeouts.drain_hold_seconds.map(Duration::from_secs),
-            },
+            application: self.application(),
+            storage: self.storage(),
+            timeouts: self.timeouts(),
         })
     }
 }
@@ -654,6 +682,38 @@ pub fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+/// A repository transport endpoint must be a well-formed absolute HTTP(S) URL with a real
+/// host and no embedded credentials or fragment, so an empty or garbage assignment fails
+/// closed here in `validate()` rather than masquerading as a valid lineage until a fetch
+/// tries to use it. Unlike a health check these point at a remote gateway, so any host is
+/// allowed — the check mirrors the health-check validator's rigor without the loopback pin.
+/// The heartbeat report endpoint is always a remote HTTP(S) POST target (never the
+/// offline `file://`/directory form the metadata/targets bases allow), so it is held to
+/// the same rigor as the health-check URLs.
+fn validate_report_url(raw: &str) -> Result<(), String> {
+    let url =
+        Url::parse(raw).map_err(|error| format!("repository assignment report_url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.cannot_be_a_base()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "repository assignment report_url must be an absolute HTTP(S) URL without credentials or a fragment"
+                .into(),
+        );
+    }
+    match url.host() {
+        Some(Host::Domain(domain)) if !domain.is_empty() => {}
+        Some(Host::Ipv4(_)) | Some(Host::Ipv6(_)) => {}
+        _ => {
+            return Err("repository assignment report_url must have a host".into());
+        }
+    }
+    Ok(())
+}
+
 fn validate_health_check_url(raw: &str) -> Result<(), String> {
     let url =
         Url::parse(raw).map_err(|error| format!("application.health_checks[].url: {error}"))?;
@@ -781,6 +841,38 @@ mod tests {
             runtime: managed_runtime(),
         };
         assignment.validate().unwrap();
+
+        // A report_url is optional but, when present, must be a well-formed remote endpoint.
+        let mut with_report = assignment.clone();
+        with_report.report_url = Some("https://cdn/report".into());
+        with_report.validate().unwrap();
+
+        // metadata_url/targets_url deliberately accept the offline signed-repair grammar
+        // (a `file://` URL or an absolute directory path); their well-formedness is enforced
+        // by the canonical trust-path parser, not here.
+        let mut offline = assignment.clone();
+        offline.metadata_url = "/opt/update/metadata/".into();
+        offline.targets_url = "file:///opt/update/targets/".into();
+        offline.validate().unwrap();
+
+        // The report endpoint, by contrast, is always a remote HTTP(S) target: empty,
+        // relative, scheme-less, or credentialed values fail closed here rather than
+        // masquerading as a valid endpoint until the first heartbeat tries to use them.
+        for bad in [
+            "",
+            "not-a-url",
+            "/relative/only",
+            "ftp://cdn/m/",
+            "https://",
+            "https://user:pass@cdn/report",
+        ] {
+            let mut invalid = assignment.clone();
+            invalid.report_url = Some(bad.into());
+            assert!(
+                invalid.validate().is_err(),
+                "expected report_url {bad:?} to be rejected"
+            );
+        }
 
         let unknown = r#"{"schema":2,"deployment":"d1","unexpected":true}"#;
         assert!(serde_json::from_str::<RepositoryAssignment>(unknown).is_err());

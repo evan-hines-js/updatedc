@@ -468,6 +468,7 @@ is for development and for control planes built on other orchestrators.
 - [Control-plane API contract](CONTROLPLANE_API_CONTRACT.md)
 - [Kubernetes operator guide](deploy/kubernetes/README.md)
 - [Group join tokens + CSR enrollment](docs/group-enrollment-design.md)
+- [Node decommission via signed tombstone](docs/decommission-design.md)
 - [Deployment adapters](deploy/README.md)
 - [Reference bootstrap](deploy/bootstrap.toml)
 

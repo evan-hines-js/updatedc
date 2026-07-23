@@ -35,7 +35,7 @@ selection, process health gating, or durable rollback; `updated` owns those conc
 
 The dispatcher is invoked directly as argv, not through a shell. It reads:
 - UPDATED_LIFECYCLE_PHASE: preflight, prepare, drain, stop, activate, start, verify,
-  finalize, or rollback
+  finalize, rollback, or uninstall
 - UPDATED_LIFECYCLE_ATTEMPT_ID: fresh identity for this attempt, stable across its recovery retries
 - UPDATED_CHILD_PID: managed master/application PID
 - UPDATED_INSTALL_ROOT: mutable installation root
@@ -53,6 +53,14 @@ Map the current deployment operations onto these phases:
 - verify: provider-specific verification after the supervisor's independent health gate
 - finalize: restore traffic and finish external changes after candidate health passes
 - rollback: undo drain/prepare/finalize effects after failure or crash recovery
+- uninstall: decommission — the teardown mirror of install/activate/finalize. Stop the
+  managed process cleanly and remove the external state this provider created (LB/DNS/cloud
+  registrations, generated configuration, external installs, mounts it made) when the node
+  is retired. `updated` tears down the install root it owns; this reverses only what the
+  provider established outside it. Idempotent across a partial or replayed wipe, and it must
+  never delete a shared resource it merely used (do not unmount a shared filesystem or drop
+  a shared database). If an exact teardown is impossible, fail and explain rather than leak
+  silently. Invoked by a local decommission command or runbook, not during an update.
 
 For stop-start mode, the supervisor asks the guardian to stop after `stop`, then asks it
 to launch the selected release before `start`.

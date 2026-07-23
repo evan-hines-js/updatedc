@@ -2,11 +2,11 @@
 //!
 //! The transport is Axum over hyper, one `Router` per listener role, but the TLS accept loops stay
 //! ours (`tokio-rustls`) so the crypto provider remains aws-lc-rs and the mTLS client-certificate
-//! requirement is enforced at the handshake exactly as before. Three listeners:
+//! requirement is enforced at the handshake exactly as before. Two listeners:
 //!
-//! * **data** (mTLS, client cert required): repository content, `/enroll`, telemetry `PUT`.
+//! * **data** (mTLS, client cert required): repository content, `/enroll` (the shared fleet
+//!   enrollment cert authenticates it), telemetry `PUT`.
 //! * **health** (plaintext): `/healthz` only, for orchestrator probes that cannot present a cert.
-//! * **join** (server-TLS, no client cert): `/join` only — a join-mode node has no cert yet.
 //!
 //! Each listener is a different `Router`, so a route it must not expose simply is not mounted.
 
@@ -18,7 +18,7 @@ use axum::extract::{DefaultBodyLimit, FromRef, OriginalUri, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use futures::StreamExt;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -44,13 +44,25 @@ const BODY_LIMIT: usize = 64 * 1024;
 
 /// Max concurrent connections on the authenticated data listener.
 const DATA_CONNECTIONS: usize = 256;
-/// The join listener is unauthenticated at the transport layer, so it gets its own, smaller budget:
-/// a flood of join connections must not consume the data plane's permits and starve the
-/// authenticated mTLS clients the fleet depends on.
-const JOIN_CONNECTIONS: usize = 64;
-/// The plaintext health listener is unauthenticated too; bound it so a slow-loris there cannot
-/// exhaust process file descriptors and starve the mTLS/join listeners' `accept` calls.
+/// The plaintext health listener is unauthenticated; bound it so a slow-loris there cannot exhaust
+/// process file descriptors and starve the mTLS data listener's `accept` calls.
 const HEALTH_CONNECTIONS: usize = 64;
+
+/// The verified per-connection client identity: the Common Name of the mTLS leaf that rustls has
+/// already validated against the fleet CA before any handler runs. `None` on a connection with no
+/// client certificate (the health listener) or a leaf carrying no CN. The node cannot forge
+/// this — it is read from the CA-signed certificate, not from anything the node puts in the request
+/// — so it is the trusted answer to "who is this?" that per-node authorization checks against.
+#[derive(Clone, Debug)]
+struct ClientIdentity(Option<String>);
+
+/// Extract the leaf certificate's Common Name from a completed server-side TLS connection.
+fn peer_common_name(conn: &tokio_rustls::rustls::ServerConnection) -> Option<String> {
+    let leaf = conn.peer_certificates()?.first()?;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    let cn = cert.subject().iter_common_name().next()?.as_str().ok()?;
+    Some(cn.to_owned())
+}
 
 #[derive(Clone)]
 pub struct EnrollmentContext {
@@ -60,37 +72,23 @@ pub struct EnrollmentContext {
     pub public_url: String,
 }
 
-/// Everything the `/join` endpoint needs beyond the shared repository data plane: the same
-/// Kubernetes/publication context as enrollment, plus the fleet CA that signs join-mode node CSRs.
-/// The CA is the very cert-manager CA the gateway trusts as its mTLS `client_ca`, so a leaf minted
-/// here is accepted on the steady-state gateway exactly like a mount-mode client cert.
-#[derive(Clone)]
-pub struct JoinContext {
-    pub enrollment: EnrollmentContext,
-    pub ca: Arc<crate::join::IssuingCa>,
-}
-
 /// The gateway's server TLS material, mounted from a cert-manager-issued secret. The gateway
 /// presents `cert`/`key` and admits a connection only if the client presents a certificate the
-/// fleet `client_ca` signed — that mutual TLS *is* the enrollment authentication. The join
-/// listener reuses the same server identity but requires no client certificate.
+/// fleet `client_ca` signed — that mutual TLS *is* the enrollment authentication.
 pub struct GatewayTls {
     pub cert: std::path::PathBuf,
     pub key: std::path::PathBuf,
     pub client_ca: std::path::PathBuf,
 }
 
-/// The three TCP addresses the gateway binds: the mTLS data listener, the plaintext health
-/// listener, and the server-auth-only join listener.
+/// The two TCP addresses the gateway binds: the mTLS data listener and the plaintext health listener.
 pub struct GatewayAddresses {
     pub data: String,
     pub health: String,
-    pub join: String,
 }
 
-/// Store + prefix — everything the repository and telemetry handlers need. Both the data and join
-/// routers derive it (via [`FromRef`]), so those handlers require no Kubernetes context and stay
-/// trivially testable.
+/// Store + prefix — everything the repository and telemetry handlers need. The data router derives
+/// it (via [`FromRef`]), so those handlers require no Kubernetes context and stay trivially testable.
 #[derive(Clone)]
 struct ContentState {
     store: Arc<dyn ObjectStore>,
@@ -110,21 +108,12 @@ impl ContentState {
 struct DataState {
     content: ContentState,
     enrollment: EnrollmentContext,
-}
-
-#[derive(Clone)]
-struct JoinState {
-    content: ContentState,
-    join: JoinContext,
+    /// The fleet CA that signs per-node leaves at `/enroll`.
+    ca: Arc<crate::join::IssuingCa>,
 }
 
 impl FromRef<DataState> for ContentState {
     fn from_ref(state: &DataState) -> Self {
-        state.content.clone()
-    }
-}
-impl FromRef<JoinState> for ContentState {
-    fn from_ref(state: &JoinState) -> Self {
         state.content.clone()
     }
 }
@@ -148,18 +137,6 @@ fn data_router(state: DataState) -> Router {
         .with_state(state)
 }
 
-fn join_router(state: JoinState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/join", post(join))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            IO_TIMEOUT,
-        ))
-        .with_state(state)
-}
-
 /// The plaintext health router: `/healthz` (and `/`) → 200, everything else 404. It serves no
 /// repository content, so exposing it without mTLS reveals nothing — it exists only for the
 /// orchestrator's probes, which cannot present a client certificate.
@@ -174,7 +151,7 @@ pub async fn serve(
     store: Arc<dyn ObjectStore>,
     prefix: String,
     enrollment: EnrollmentContext,
-    join: JoinContext,
+    ca: Arc<crate::join::IssuingCa>,
     tls: GatewayTls,
 ) -> std::io::Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(updated::tls::server_config(
@@ -182,31 +159,24 @@ pub async fn serve(
         &tls.key,
         &tls.client_ca,
     )?));
-    // The join listener presents the same server certificate but requires no client cert: a
-    // join-mode node reaches it before it has any identity, and proves itself with the group token.
-    let join_acceptor = TlsAcceptor::from(Arc::new(updated::tls::server_config_no_client_auth(
-        &tls.cert, &tls.key,
-    )?));
 
     let data_listener = TcpListener::bind(&addresses.data).await?;
     let health_listener = TcpListener::bind(&addresses.health).await?;
-    let join_listener = TcpListener::bind(&addresses.join).await?;
     tracing::info!(
-        data = %addresses.data, health = %addresses.health, join = %addresses.join,
-        "repository gateway listening (mTLS data + plaintext health + join)"
+        data = %addresses.data, health = %addresses.health,
+        "repository gateway listening (mTLS data + plaintext health)"
     );
 
     let content = ContentState {
         store,
         prefix: Arc::from(prefix),
     };
+    // Enrollment is a route on the one mTLS data listener now: the shared fleet enrollment cert
+    // authenticates it, so there is no separate client-cert-less listener.
     let data_router = data_router(DataState {
-        content: content.clone(),
-        enrollment,
-    });
-    let join_router = join_router(JoinState {
         content,
-        join,
+        enrollment,
+        ca,
     });
 
     // Health: plaintext, no TLS, its own small connection budget.
@@ -214,14 +184,6 @@ pub async fn serve(
         health_listener,
         health_router(),
         Arc::new(Semaphore::new(HEALTH_CONNECTIONS)),
-    ));
-    // Join: server-TLS, no client cert, its own connection budget.
-    tokio::spawn(serve_tls(
-        join_listener,
-        join_acceptor,
-        join_router,
-        Arc::new(Semaphore::new(JOIN_CONNECTIONS)),
-        "join",
     ));
     // Data: mTLS, runs on this task so `serve` stays alive for the whole process.
     serve_tls(
@@ -267,6 +229,11 @@ async fn serve_tls(
                     return;
                 }
             };
+            // Bind the CA-verified client identity to every request on this connection, so a
+            // per-node authorization check (e.g. telemetry) reads the trusted cert CN rather than
+            // the node's self-claimed path. `None` on the client-cert-less join/health listeners.
+            let identity = ClientIdentity(peer_common_name(tls.get_ref().1));
+            let app = app.layer(Extension(identity));
             serve_http(TokioIo::new(tls), app).await;
         });
     }
@@ -303,7 +270,9 @@ where
 {
     let service = TowerToHyperService::new(app);
     let mut builder = http1::Builder::new();
-    builder.timer(TokioTimer::new()).header_read_timeout(IO_TIMEOUT);
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(IO_TIMEOUT);
     if let Err(error) = builder.serve_connection(io, service).await {
         tracing::debug!(%error, "gateway connection error");
     }
@@ -314,17 +283,21 @@ async fn healthz() -> &'static str {
 }
 
 async fn enroll(State(state): State<DataState>, body: Bytes) -> Response {
-    // Authentication already happened at the mTLS handshake: this connection exists only because
-    // the client presented a certificate the fleet CA signed. There is no bearer secret.
-    let Ok(request) = serde_json::from_slice::<updated::enrollment::EnrollmentRequest>(&body) else {
+    // Authentication already happened at the mTLS handshake: this connection exists only because the
+    // client presented the shared fleet enrollment certificate the fleet CA signed. There is no
+    // bearer secret; the node self-asserts its name in the body, and an approval gate on the
+    // resulting UpdateAgent is the place to require a human to authorize that name.
+    let Ok(request) = serde_json::from_slice::<updated::enrollment::EnrollmentRequest>(&body)
+    else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if !request.registration_is_wellformed() {
+    if !request.name_is_wellformed() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let registration_sha256 = sha256(request.registration.as_bytes());
-    // Mount and join mode name agents the same way; `agent_name` is the single source of that rule.
-    let name = crate::join::agent_name(&request.registration);
+    let name = request.name.as_str();
+    // A stable per-node identifier for idempotent re-enrollment, derived from the self-asserted name:
+    // the same node coming back on the same name is the same UpdateAgent.
+    let registration_sha256 = sha256(name.as_bytes());
     let context = &state.enrollment;
     let matches = |existing: &crate::UpdateAgent| {
         existing.spec.identity.kind == crate::AgentIdentityKind::Enrolled
@@ -332,102 +305,41 @@ async fn enroll(State(state): State<DataState>, body: Bytes) -> Response {
                 == Some(registration_sha256.as_str())
             && existing.spec.repository_ref.name == context.repository
     };
+    // Pin the CSR's public key so the throttle can later verify this node's signed telemetry, then
+    // sign the CSR into a per-node leaf (CN=<name>). The CP certifies only the CSR's public key; a
+    // malformed CSR is the caller's fault (400). `register_agent` runs `sign` only after the
+    // create/conflict check passes, so a conflicting name never mints a certificate.
+    let Ok(public_key) = crate::join::csr_public_key(&request.csr) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let sign = || {
+        state
+            .ca
+            .sign_client_csr(&context.repository, name, &request.csr)
+            .map_err(|_| StatusCode::BAD_REQUEST)
+    };
     match register_agent(
         context,
         state.content.store(),
         state.content.prefix(),
-        &name,
+        name,
         registration_sha256.clone(),
-        // Mount enrollment stamps only the repository's trusted enrollment labels.
+        Some(hex::encode(public_key)),
+        // Enrollment stamps the repository's trusted enrollment labels.
         |repository| repository.spec.enrollment.labels.clone(),
-        matches,
-        || Ok::<(), StatusCode>(()),
-    )
-    .await
-    {
-        Ok((bundle, ())) => Json(bundle).into_response(),
-        Err(response) => response,
-    }
-}
-
-/// Join-mode enrollment. Unlike `/enroll` there is no client-certificate handshake to authenticate
-/// the peer: the request carries a group join token, which the control plane checks against the
-/// group's Secret before signing the node's CSR. The control plane sets the certificate identity
-/// itself (see [`crate::join::IssuingCa::sign_client_csr`]); the CSR contributes only its public
-/// key. On success the node is registered as a member of the joined group and receives the same
-/// enrollment bundle a mount-mode node would.
-async fn join(State(state): State<JoinState>, body: Bytes) -> Response {
-    let Ok(request) = serde_json::from_slice::<updated::enrollment::JoinRequest>(&body) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    if request.group_id.is_empty() || request.nonce.is_empty() || !request.instance_is_wellformed() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let context = &state.join.enrollment;
-    // Authenticate the join against the group token, resolved by a single keyed GET. An unknown
-    // group id and a wrong token are both 401 with no distinguishing detail, so a caller cannot
-    // probe which group ids exist.
-    let (group_name, expected) = match lookup_group_nonce(context, &request.group_id).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    if !crate::join::nonce_matches(&request.nonce, &expected) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-
-    let instance_sha256 = sha256(request.instance.as_bytes());
-    let name = crate::join::agent_name(&request.instance);
-
-    // A re-join with the same durable instance into the same group is idempotent. A different
-    // registration, repository, or *group* under the same name is a genuine conflict — the group
-    // check is the isolation boundary: a caller holding one group's token must not be handed
-    // another group's node bundle/leaf merely by knowing its instance value.
-    let matches = |existing: &crate::UpdateAgent| {
-        existing.spec.identity.registration_sha256.as_deref() == Some(instance_sha256.as_str())
-            && existing.spec.repository_ref.name == context.repository
-            && existing.spec.labels.get(crate::GROUP_LABEL) == Some(&group_name)
-    };
-    // Sign the node CSR only after the create/conflict check passes, so a conflicting request (wrong
-    // group or instance) never mints a certificate. A malformed CSR is the caller's fault (400); the
-    // CP sets the subject/SAN and certifies only the CSR's public key. `register_agent` runs this
-    // between its create and its bundle resolution.
-    let sign = || {
-        state
-            .join
-            .ca
-            .sign_client_csr(&request.group_id, &name, &request.csr)
-            .map_err(|_| StatusCode::BAD_REQUEST)
-    };
-    let (bundle, leaf) = match register_agent(
-        context,
-        state.content.store(),
-        state.content.prefix(),
-        &name,
-        instance_sha256.clone(),
-        // Stamp the group-membership label so the group's selector routes this agent to its
-        // deployment, on top of the repository's trusted enrollment labels.
-        |repository| {
-            let mut labels = repository.spec.enrollment.labels.clone();
-            labels.insert(crate::GROUP_LABEL.to_string(), group_name.clone());
-            labels
-        },
         matches,
         sign,
     )
     .await
     {
-        Ok(pair) => pair,
-        Err(response) => return response,
-    };
-    // The fleet CA signs leaves directly, so there is no intermediate chain to return; the node
-    // already pins the CA via its bootstrap.
-    Json(updated::enrollment::JoinResponse {
-        leaf,
-        chain: String::new(),
-        bundle,
-    })
-    .into_response()
+        Ok((bundle, leaf)) => Json(updated::enrollment::EnrollResponse {
+            leaf,
+            chain: String::new(),
+            bundle,
+        })
+        .into_response(),
+        Err(response) => response,
+    }
 }
 
 /// The registration flow shared by `/enroll` and `/join`: resolve the `UpdateRepository`, create
@@ -445,6 +357,7 @@ async fn register_agent<T>(
     prefix: &str,
     name: &str,
     registration_sha256: String,
+    public_key: Option<String>,
     labels: impl FnOnce(&crate::UpdateRepository) -> std::collections::BTreeMap<String, String>,
     matches: impl Fn(&crate::UpdateAgent) -> bool,
     after_create: impl FnOnce() -> Result<T, StatusCode>,
@@ -465,6 +378,7 @@ async fn register_agent<T>(
             identity: crate::AgentIdentity {
                 kind: crate::AgentIdentityKind::Enrolled,
                 registration_sha256: Some(registration_sha256),
+                public_key,
             },
             labels: labels(&repository),
         },
@@ -521,14 +435,30 @@ pub(crate) fn agent_assignment(assignment_prefix: &str, name: &str) -> String {
 /// Store a node's running-state report at `<prefix>/telemetry/<node>.json`. The report must be
 /// well-formed and name the same node as the path — a report can only release a rollout throttle
 /// slot, so a malformed or misattributed one is rejected, not stored.
+///
+/// Trust model: this is authenticated by the fleet mTLS handshake but NOT authorized per node. In
+/// mount mode the whole fleet shares one client certificate (`CN=updated-agent`) by design — there
+/// is no per-node identity in the certificate to bind `node` against — so any fleet member could
+/// write another node's report. This is the accepted flat-trust property of the shared-cert mount
+/// model; the per-node-identity alternative is join mode (each node carries a CP-signed cert whose
+/// `CN` is its agent name). Tightening this to per-node authorization is only meaningful for
+/// join-mode nodes and would reject every mount-mode report, so it is deliberately not enforced
+/// here.
 async fn telemetry_put(
     State(state): State<ContentState>,
+    Extension(identity): Extension<ClientIdentity>,
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Response {
     let Some(node) = updated::telemetry::node_from_path(uri.path()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // Per-node authorization: the mTLS leaf CN rustls verified is the trusted identity; the path
+    // node is the caller's claim. A node may write ONLY its own report — otherwise any fleet member
+    // could forge another node's healthy/settled report and drive its rollout past unhealthy peers.
+    if identity.0.as_deref() != Some(node) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Ok(report) = serde_json::from_slice::<updated::telemetry::NodeReport>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -674,41 +604,6 @@ fn range_not_satisfiable(length: u64) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// Resolve a group's join token by the presented `group_id`. The token Secret is named
-/// `join-<group_id>`, so this is a single GET by a deterministic key — never a list/scan — which is
-/// what keeps the transport-unauthenticated `/join` from being amplified into a full apiserver
-/// `UpdateGroup` scan on every (even bogus) request. Returns the group's name (for the membership
-/// label) and its shared nonce; `None` when no such token exists or it belongs to another
-/// repository (both surface to the caller as an indistinguishable 401).
-async fn lookup_group_nonce(
-    context: &EnrollmentContext,
-    group_id: &str,
-) -> std::io::Result<Option<(String, String)>> {
-    let secrets: Api<k8s_openapi::api::core::v1::Secret> =
-        Api::namespaced(context.client.clone(), &context.namespace);
-    let secret = match secrets.get(&format!("join-{group_id}")).await {
-        Ok(secret) => secret,
-        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(None),
-        Err(error) => return Err(std::io::Error::other(error)),
-    };
-    let field = |key: &str| {
-        secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get(key))
-            .and_then(|bytes| String::from_utf8(bytes.0.clone()).ok())
-    };
-    let (Some(nonce), Some(group), Some(repository)) =
-        (field("nonce"), field("group"), field("repository"))
-    else {
-        return Ok(None);
-    };
-    if nonce.is_empty() || repository != context.repository {
-        return Ok(None);
-    }
-    Ok(Some((group, nonce)))
-}
-
 /// The signed documents an [`crate::EnrollmentBundle`] pins for one agent, resolved from a
 /// published repository's consistent snapshot.
 pub(crate) struct SignedEnrollment {
@@ -801,18 +696,26 @@ pub(crate) async fn resolve_signed_enrollment(
         .map_err(|_| Unavailable("timestamp metadata".into()))?;
     let timestamp_value: serde_json::Value =
         serde_json::from_str(&timestamp).map_err(|_| Malformed("timestamp metadata".into()))?;
-    let snapshot_version = crate::runtime::metadata_version(&timestamp_value, "snapshot.json")
-        .map_err(Malformed)?;
-    let snapshot = object_text(store, prefix, &format!("metadata/{snapshot_version}.snapshot.json"))
-        .await
-        .map_err(|_| Unavailable("snapshot metadata".into()))?;
+    let snapshot_version =
+        crate::runtime::metadata_version(&timestamp_value, "snapshot.json").map_err(Malformed)?;
+    let snapshot = object_text(
+        store,
+        prefix,
+        &format!("metadata/{snapshot_version}.snapshot.json"),
+    )
+    .await
+    .map_err(|_| Unavailable("snapshot metadata".into()))?;
     let snapshot_value: serde_json::Value =
         serde_json::from_str(&snapshot).map_err(|_| Malformed("snapshot metadata".into()))?;
     let targets_version =
         crate::runtime::metadata_version(&snapshot_value, "targets.json").map_err(Malformed)?;
-    let targets = object_text(store, prefix, &format!("metadata/{targets_version}.targets.json"))
-        .await
-        .map_err(|_| Unavailable("targets metadata".into()))?;
+    let targets = object_text(
+        store,
+        prefix,
+        &format!("metadata/{targets_version}.targets.json"),
+    )
+    .await
+    .map_err(|_| Unavailable("targets metadata".into()))?;
     let targets_value: serde_json::Value =
         serde_json::from_str(&targets).map_err(|_| Malformed("targets metadata".into()))?;
 
@@ -989,7 +892,10 @@ mod tests {
         store
     }
 
-    async fn send(store: Arc<InMemory>, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
+    async fn send(
+        store: Arc<InMemory>,
+        request: Request<Body>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
         let response = router(store).oneshot(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
@@ -1044,8 +950,11 @@ mod tests {
     #[tokio::test]
     async fn supports_bounded_and_suffix_ranges() {
         // Bounded `bytes=0-2` is the inclusive first three bytes of "hello".
-        let (status, headers, body) =
-            send(seeded().await, get("/targets/nested/app", Some("bytes=0-2"))).await;
+        let (status, headers, body) = send(
+            seeded().await,
+            get("/targets/nested/app", Some("bytes=0-2")),
+        )
+        .await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(headers[header::CONTENT_RANGE], "bytes 0-2/5");
         assert_eq!(body, b"hel");
@@ -1059,9 +968,19 @@ mod tests {
     #[test]
     fn parse_range_accepts_open_bounded_and_suffix() {
         assert_eq!(parse_range_value("bytes=100-"), Ok(GetRange::Offset(100)));
-        assert_eq!(parse_range_value("bytes=0-99"), Ok(GetRange::Bounded(0..100)));
+        assert_eq!(
+            parse_range_value("bytes=0-99"),
+            Ok(GetRange::Bounded(0..100))
+        );
         assert_eq!(parse_range_value("bytes=-500"), Ok(GetRange::Suffix(500)));
-        for invalid in ["bytes=-", "bytes=-0", "bytes=5-2", "bytes=0-1,3-4", "1-2", "bytes="] {
+        for invalid in [
+            "bytes=-",
+            "bytes=-0",
+            "bytes=5-2",
+            "bytes=0-1,3-4",
+            "1-2",
+            "bytes=",
+        ] {
             assert_eq!(parse_range_value(invalid), Err(()), "{invalid}");
         }
     }
@@ -1106,16 +1025,26 @@ mod tests {
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
+    /// A telemetry PUT carrying a verified client identity (the mTLS leaf CN `serve_tls` would
+    /// inject). `identity == None` models a connection with no client cert.
+    fn telemetry_request(node_path: &str, identity: Option<&str>, body: Vec<u8>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri(format!("/telemetry/{node_path}"))
+            .body(Body::from(body))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ClientIdentity(identity.map(str::to_owned)));
+        request
+    }
+
     #[tokio::test]
     async fn stores_a_well_formed_node_report() {
         let store = Arc::new(InMemory::new());
         let report = updated::telemetry::NodeReport::new("agent-9", "deploy-2", "2.0.0", true);
         let body = serde_json::to_vec(&report).unwrap();
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/telemetry/agent-9.json")
-            .body(Body::from(body.clone()))
-            .unwrap();
+        let request = telemetry_request("agent-9.json", Some("agent-9"), body.clone());
         let (status, _, _) = send(store.clone(), request).await;
         assert_eq!(status, StatusCode::OK);
         let stored = store
@@ -1130,24 +1059,51 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_misattributed_or_malformed_reports() {
-        // The report names a different node than the path it was written to.
-        let mismatched =
-            serde_json::to_vec(&updated::telemetry::NodeReport::new("other", "d", "1.0.0", true))
-                .unwrap();
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/telemetry/agent-9.json")
-            .body(Body::from(mismatched))
-            .unwrap();
+        // The report names a different node than the path it was written to (identity matches the
+        // path, so it passes the mTLS check and fails the body/path consistency check).
+        let mismatched = serde_json::to_vec(&updated::telemetry::NodeReport::new(
+            "other", "d", "1.0.0", true,
+        ))
+        .unwrap();
+        let request = telemetry_request("agent-9.json", Some("agent-9"), mismatched);
         let (status, _, _) = send(Arc::new(InMemory::new()), request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         // Not a node report at all.
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/telemetry/agent-9.json")
-            .body(Body::from("not json"))
-            .unwrap();
+        let request = telemetry_request("agent-9.json", Some("agent-9"), b"not json".to_vec());
         let (status, _, _) = send(Arc::new(InMemory::new()), request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_report_for_a_node_other_than_the_verified_client() {
+        // The connection's verified leaf CN is `agent-attacker`, but it writes to `agent-9`'s
+        // telemetry key with a well-formed report that even self-consistently names `agent-9`.
+        // Per-node authorization must reject it (403) BEFORE the object is stored — otherwise any
+        // fleet member could forge another node's healthy/settled report and unblock its rollout.
+        let store = Arc::new(InMemory::new());
+        let forged = serde_json::to_vec(&updated::telemetry::NodeReport::new(
+            "agent-9", "deploy-2", "2.0.0", true,
+        ))
+        .unwrap();
+        let request = telemetry_request("agent-9.json", Some("agent-attacker"), forged);
+        let (status, _, _) = send(store.clone(), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // Nothing was written.
+        assert!(store
+            .get(&ObjectPath::from("routing/telemetry/agent-9.json"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_telemetry_with_no_verified_client_identity() {
+        // A connection with no client certificate (identity None) cannot write any node's report.
+        let report = serde_json::to_vec(&updated::telemetry::NodeReport::new(
+            "agent-9", "d", "1.0.0", true,
+        ))
+        .unwrap();
+        let request = telemetry_request("agent-9.json", None, report);
+        let (status, _, _) = send(Arc::new(InMemory::new()), request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

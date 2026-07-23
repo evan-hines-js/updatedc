@@ -142,7 +142,10 @@ fn guardian_stays_alive_until_sigterm_then_exits_cleanly() {
 fn start_guardian_backoff_probe(
     tag: &str,
     supervisor: &std::path::Path,
-) -> (std::process::Child, std::sync::Arc<std::sync::Mutex<String>>) {
+) -> (
+    std::process::Child,
+    std::sync::Arc<std::sync::Mutex<String>>,
+) {
     use std::io::Read;
     let state = temp_dir(tag);
     let mut child = bootstrap()
@@ -165,7 +168,9 @@ fn start_guardian_backoff_probe(
             if n == 0 {
                 break;
             }
-            sink.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+            sink.lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buf[..n]));
         }
     });
     (child, log)

@@ -9,11 +9,24 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create"]
+  # The durable rollout-admission set (per-group pinned deployment) lives in a ConfigMap in etcd, not
+  # on the node-local PVC, so it survives a leader change / cold PVC and the throttle can never
+  # re-baseline and mass-admit a set. get_opt + create + replace(CAS) is get/create/update.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update"]
   - apiGroups: ["updated.dev"]
-    resources: ["updategroups", "updategroupsets", "updateagents", "updaterepositories"]
+    resources: ["updategroups", "updategroupsets", "updateagents", "updaterepositories", "updatesubscriptions"]
     verbs: ["get", "list", "watch", "create"]
+  # The controller finalizes its UpdateRepository: it patches `.metadata.finalizers` to hold a deleted
+  # repository open until its published TUF prefix is pruned from object storage (state Kubernetes GC
+  # cannot reach), then patches the finalizer off so deletion completes. That is a patch of the main
+  # resource, distinct from the `/status` patch below.
   - apiGroups: ["updated.dev"]
-    resources: ["updategroups/status", "updategroupsets/status", "updateagents/status", "updaterepositories/status"]
+    resources: ["updaterepositories"]
+    verbs: ["patch", "update"]
+  - apiGroups: ["updated.dev"]
+    resources: ["updategroups/status", "updategroupsets/status", "updateagents/status", "updaterepositories/status", "updatesubscriptions/status"]
     verbs: ["get", "patch", "update"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
@@ -62,6 +75,10 @@ spec:
             - {name: state, mountPath: /var/lib/updatec}
             - {name: tmp, mountPath: /tmp}
       volumes:
+        # This PVC holds only rebuildable local caches (the signed TUF repository dir + materialized
+        # signing keys, kept for TUF version monotonicity). It is NOT the source of truth for rollout
+        # admission — that state is a ConfigMap in etcd (see the configmaps RBAC rule above), so
+        # losing or reattaching this RWO PVC across a leader change never disables the throttle.
         - name: state
           persistentVolumeClaim: {claimName: updatec-state}
         - name: tmp
@@ -88,9 +105,6 @@ spec:
             - {name: http, containerPort: 8080}
             # Plaintext health port for the kubelet probes, which cannot present a client cert.
             - {name: health, containerPort: 8081}
-            # Server-TLS-only join port: a join-mode node has no client cert yet, so it proves
-            # itself with the group join token in the request body. Serves only POST /join.
-            - {name: join, containerPort: 8443}
           readinessProbe: {httpGet: {path: /healthz, port: health}}
           livenessProbe: {httpGet: {path: /healthz, port: health}}
           securityContext:
@@ -106,7 +120,6 @@ spec:
             - {name: UPDATED_NAMESPACE, value: updated-system}
             - {name: UPDATED_REPOSITORY, value: default}
             - {name: UPDATED_LISTEN, value: "0.0.0.0:8080"}
-            - {name: UPDATED_JOIN_LISTEN, value: "0.0.0.0:8443"}
             - {name: UPDATED_ISSUING_CA_DIR, value: /etc/issuing-ca}
             - {name: UPDATED_PUBLIC_URL, value: "https://updates.example/routing"}
             - {name: UPDATED_GATEWAY_TLS_DIR, value: /etc/gateway-tls}
@@ -116,8 +129,8 @@ spec:
             # The gateway is externally exposed, so it terminates mTLS. cert-manager issues its
             # server cert + the fleet CA into this secret (tls.crt/tls.key/ca.crt).
             - {name: gateway-tls, mountPath: /etc/gateway-tls, readOnly: true}
-            # The fleet CA *with its private key*, so the join handler can sign join-mode node
-            # CSRs into client certs the mTLS listener accepts. Holding the CA key here widens the
+            # The fleet CA *with its private key*, so the /enroll handler can sign a node's CSR into
+            # a per-node client cert the mTLS listener accepts. Holding the CA key here widens the
             # gateway's blast radius; see docs/group-enrollment-design.md.
             - {name: issuing-ca, mountPath: /etc/issuing-ca, readOnly: true}
       volumes:
@@ -137,9 +150,6 @@ spec:
   # container's mTLS data port. The plaintext health port is probe-only and not exposed here.
   ports:
     - {name: https, port: 443, targetPort: http}
-    # Join-mode nodes reach the server-TLS-only join listener here (no client cert). Mount-mode
-    # nodes never use this port; repository content and /enroll stay behind the mTLS port above.
-    - {name: join, port: 8443, targetPort: join}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

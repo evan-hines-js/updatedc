@@ -186,7 +186,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let bootstrap = tmp.join("bootstrap.toml");
     std::fs::write(
         &bootstrap,
-        "[enrollment]\nurl='https://127.0.0.1:9'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
+        "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline-node'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
     )
     .unwrap();
     let enrollment_state = tmp.join("enrollment-state");

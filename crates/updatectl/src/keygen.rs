@@ -42,7 +42,10 @@ pub(crate) async fn run(args: KeygenArgs) -> Result<(), Error> {
     match args.output {
         OutputFormat::Text => println!("keys_dir={}", args.keys_dir.display()),
         OutputFormat::Json => {
-            let names: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
+            let names: Vec<String> = paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
             let document = serde_json::json!({
                 "keysDir": args.keys_dir,
                 "keys": names,

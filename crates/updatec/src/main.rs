@@ -22,8 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = std::env::var("UPDATED_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
         let health_addr =
             std::env::var("UPDATED_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:8081".into());
-        let join_addr =
-            std::env::var("UPDATED_JOIN_LISTEN").unwrap_or_else(|_| "0.0.0.0:8443".into());
         let (destination, store) = loop {
             match updatec::runtime::repository_store(client.clone(), &namespace, &repository).await
             {
@@ -58,20 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|error| format!("reading issuing CA certificate: {error}"))?;
         let ca_key = std::fs::read_to_string(std::path::Path::new(&ca_dir).join("tls.key"))
             .map_err(|error| format!("reading issuing CA key: {error}"))?;
-        let join = updatec::gateway::JoinContext {
-            enrollment: enrollment.clone(),
-            ca: std::sync::Arc::new(updatec::join::IssuingCa::load(&ca_cert, &ca_key)?),
-        };
+        let ca = std::sync::Arc::new(updatec::join::IssuingCa::load(&ca_cert, &ca_key)?);
         return updatec::gateway::serve(
             updatec::gateway::GatewayAddresses {
                 data: addr,
                 health: health_addr,
-                join: join_addr,
             },
             store,
             destination.prefix,
             enrollment,
-            join,
+            ca,
             tls,
         )
         .await
@@ -106,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &repository,
             std::path::Path::new(&state),
             &public_url,
+            &identity,
         );
         tokio::pin!(reconciliation);
         loop {
@@ -114,9 +109,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match result {
                         Ok(digest) => tracing::info!(%digest, "desired state reconciled"),
                         Err(error) => {
+                            // Full detail (which may name the bucket/endpoint/object key) goes to the
+                            // operator log only; the CR status gets a generic category so a reader with
+                            // `get` on the CRs learns nothing about the storage backend.
                             tracing::error!(%error, "reconciliation failed; last publication remains active");
+                            let status_message =
+                                updatec::runtime::generic_failure_status(error.as_ref());
                             if let Err(status_error) = updatec::runtime::record_repository_failure(
-                                client.clone(), &namespace, &repository, &error.to_string(),
+                                client.clone(), &namespace, &repository, status_message,
                             ).await {
                                 tracing::error!(%status_error, "recording repository failure status failed");
                             }

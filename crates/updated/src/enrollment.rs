@@ -11,101 +11,70 @@ pub struct BootstrapConfig {
     pub enrollment: EnrollmentBootstrap,
 }
 
-/// The agent's sole node-local input. It always carries the gateway `url` and the fleet `ca` it
-/// trusts for the gateway's server certificate, plus exactly one credential set:
+/// The agent's sole node-local input, and deliberately minimal — a name, the shared fleet
+/// enrollment certificate, a CA, and where to reach the gateway. Nothing else, and never an implicit
+/// environment variable:
 ///
-/// * **Mount mode** (Kubernetes / cert-manager): `client_cert` + `client_key` are pre-provisioned
-///   PEM paths — no secret in the file. The agent presents them as mTLS to `/enroll`.
-/// * **Join mode** (immutable infra / Rancher userdata): `group_id` + a shared secret `nonce`
-///   join token. The agent generates a keypair, gets a CSR signed at `/join`, and uses the minted
-///   certificate thereafter. Here the file *does* hold a secret (the nonce), so it must be mounted
-///   from a Secret.
+/// * `url` — the gateway to enroll against.
+/// * `ca` — a PEM path for the CA that signs the gateway's (self-signed) server certificate, so the
+///   node can verify the server it talks to without trusting the public web PKI.
+/// * `name` — this node's name. Self-asserted; it becomes the minted certificate's `CN`, the
+///   `UpdateAgent` the enrollment creates, and the node key the control plane pins.
+/// * `client_cert` / `client_key` — the shared, fleet-wide enrollment certificate (two PEM files,
+///   issued by cert-manager into a Secret). It authenticates the `/enroll` handshake by mutual TLS
+///   and nothing else; a party that holds it may enroll a node under any name. This is the single
+///   credential — there is no plaintext token and no per-group join secret. Individual attribution
+///   and revocation come from the per-node certificate minted at enrollment, not from this.
 ///
-/// If the cert paths are present they win (mount mode); otherwise the join token is used. Exactly
-/// one complete set must be present.
+/// The node generates a keypair and CSR, presents `name` + its CSR at `/enroll` over that mutual
+/// TLS, and receives a per-node certificate it uses for every steady-state request thereafter.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollmentBootstrap {
     pub url: String,
     pub ca: PathBuf,
-    #[serde(default)]
-    pub client_cert: Option<PathBuf>,
-    #[serde(default)]
-    pub client_key: Option<PathBuf>,
-    #[serde(default)]
-    pub group_id: Option<String>,
-    #[serde(default)]
-    pub nonce: Option<String>,
-}
-
-/// The resolved bootstrap credential — which enrollment path this node takes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BootstrapMode {
-    /// Pre-provisioned client identity, presented as mTLS to `/enroll`.
-    Mount {
-        client_cert: PathBuf,
-        client_key: PathBuf,
-    },
-    /// Group join token; the node mints its own identity via a CSR at `/join`.
-    Join { group_id: String, nonce: String },
+    pub name: String,
+    pub client_cert: PathBuf,
+    pub client_key: PathBuf,
 }
 
 impl EnrollmentBootstrap {
-    /// Resolve the credential set. Cert paths take precedence over a join token; a partially
-    /// specified set (only one of a pair, or an empty path/value) is an error, as is neither.
-    pub fn mode(&self) -> io::Result<BootstrapMode> {
-        let cert = self.client_cert.as_ref().filter(|p| !p.as_os_str().is_empty());
-        let key = self.client_key.as_ref().filter(|p| !p.as_os_str().is_empty());
-        if self.client_cert.is_some() || self.client_key.is_some() {
-            return match (cert, key) {
-                (Some(cert), Some(key)) => Ok(BootstrapMode::Mount {
-                    client_cert: cert.clone(),
-                    client_key: key.clone(),
-                }),
-                _ => Err(invalid(
-                    "mount-mode bootstrap needs both client_cert and client_key",
-                )),
-            };
+    /// Reject an empty `name` (the one free-form field). `serde(deny_unknown_fields)` already rejects
+    /// a leftover mount/join/token field and a missing cert path, so a stale config fails loudly
+    /// rather than silently enrolling wrong.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(invalid("bootstrap enrollment name must not be empty"));
         }
-        let group = self.group_id.as_ref().filter(|s| !s.is_empty());
-        let nonce = self.nonce.as_ref().filter(|s| !s.is_empty());
-        if self.group_id.is_some() || self.nonce.is_some() {
-            return match (group, nonce) {
-                (Some(group), Some(nonce)) => Ok(BootstrapMode::Join {
-                    group_id: group.clone(),
-                    nonce: nonce.clone(),
-                }),
-                _ => Err(invalid("join-mode bootstrap needs both group_id and nonce")),
-            };
-        }
-        Err(invalid(
-            "bootstrap needs client_cert+client_key (mount) or group_id+nonce (join)",
+        Ok(())
+    }
+
+    /// The mTLS identity the agent presents on every steady-state request to the gateway: the
+    /// per-node certificate it minted at enrollment, persisted under `state_dir`. The shared fleet
+    /// enrollment cert authenticates only the one enrollment handshake and never steady-state
+    /// traffic, so every node is individually attributable and revocable by its own cert.
+    pub fn steady_identity(&self, state_dir: &Path) -> io::Result<crate::tls::Identity> {
+        Ok(crate::tls::Identity::new(
+            joined_cert_path(state_dir),
+            joined_key_path(state_dir),
+            self.ca.clone(),
         ))
     }
 
-    /// The mTLS identity the agent presents on every steady-state request to the gateway. In
-    /// mount mode it is the bootstrap-provided cert/key; in join mode it is the certificate the
-    /// node minted at `/join`, persisted under `state_dir`.
-    pub fn steady_identity(&self, state_dir: &Path) -> io::Result<crate::tls::Identity> {
-        match self.mode()? {
-            BootstrapMode::Mount {
-                client_cert,
-                client_key,
-            } => Ok(crate::tls::Identity::new(
-                client_cert,
-                client_key,
-                self.ca.clone(),
-            )),
-            BootstrapMode::Join { .. } => Ok(crate::tls::Identity::new(
-                joined_cert_path(state_dir),
-                joined_key_path(state_dir),
-                self.ca.clone(),
-            )),
-        }
+    /// The identity the node presents to authenticate its one enrollment handshake: the shared,
+    /// fleet-wide enrollment certificate. That mutual TLS *is* the enrollment authentication; it is
+    /// used for nothing else, and steady-state traffic uses the per-node cert from
+    /// [`Self::steady_identity`].
+    pub fn enroll_identity(&self) -> io::Result<crate::tls::Identity> {
+        Ok(crate::tls::Identity::new(
+            self.client_cert.clone(),
+            self.client_key.clone(),
+            self.ca.clone(),
+        ))
     }
 }
 
-/// Where a join-mode node persists the certificate and key it minted at `/join`.
+/// Where a node persists the per-node certificate it minted at enrollment.
 pub(crate) fn joined_cert_path(state_dir: &Path) -> PathBuf {
     state_dir.join("agent.crt")
 }
@@ -119,18 +88,16 @@ impl BootstrapConfig {
         let config: Self = toml::from_str(&bytes).map_err(|error| invalid(&error.to_string()))?;
         let url = url::Url::parse(&config.enrollment.url)
             .map_err(|error| invalid(&format!("invalid enrollment URL: {error}")))?;
-        // The gateway is externally exposed and always TLS, so enrollment is always HTTPS —
-        // in mount mode the node verifies the gateway (and presents its client cert); in join
-        // mode it verifies the gateway before it has any cert of its own.
+        // The gateway is externally exposed and always TLS, so enrollment is always HTTPS: the node
+        // verifies the gateway against the pinned `ca` and presents the shared fleet enrollment cert.
         if url.scheme() != "https" {
             return Err(invalid("enrollment URL must use HTTPS"));
         }
         if config.enrollment.ca.as_os_str().is_empty() {
             return Err(invalid("enrollment ca path must not be empty"));
         }
-        // Resolve the credential set eagerly so a misconfigured bootstrap fails at load, not at
-        // first network use.
-        config.enrollment.mode()?;
+        // Validate eagerly so a misconfigured bootstrap fails at load, not at first network use.
+        config.enrollment.validate()?;
         Ok(config)
     }
 }
@@ -165,62 +132,47 @@ fn bootstrap_path_from(
     }
 }
 
-/// The control-plane-agnostic enrollment endpoint: an agent `POST`s [`EnrollmentRequest`]
-/// here over mutual TLS, and any control plane implementing the contract returns an
-/// [`EnrollmentBundle`]. Nothing node-identifying rides in the URL.
+/// The one enrollment endpoint: a node `POST`s an [`EnrollmentRequest`] here over mutual TLS
+/// (the shared fleet enrollment cert), and the control plane signs its CSR and returns an
+/// [`EnrollResponse`]. Nothing node-identifying rides in the URL.
 pub const ENROLL_PATH: &str = "/enroll";
 
-/// The join endpoint: a join-mode agent `POST`s a [`JoinRequest`] here over a server-authenticated
-/// (not mutual) TLS connection — it has no client certificate yet. The control plane authenticates
-/// the *join* with the group token, signs the node's CSR, and returns a [`JoinResponse`].
-pub const JOIN_PATH: &str = "/join";
-
-/// The enrollment request body. The request is authenticated by the agent's mTLS client
-/// certificate (fleet membership); the registration nonce is a non-secret, per-node identifier
-/// carried in the body (not the URL) that names the node. No secret rides in the request.
+/// The enrollment request body. The request is authenticated by the mutual-TLS handshake with the
+/// shared fleet enrollment certificate; `name` is a non-secret, self-asserted node name carried in
+/// the body (never the URL). Any holder of the fleet cert may assert any name — individual
+/// attribution comes from the per-node cert minted in response, and an approval gate on the
+/// `UpdateAgent` can require a human to authorize the requested name.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollmentRequest {
-    pub registration: String,
-}
-
-impl EnrollmentRequest {
-    /// A registration nonce is exactly 64 hex characters (a sha256 digest).
-    pub fn registration_is_wellformed(&self) -> bool {
-        crate::hash::is_sha256_hex(&self.registration)
-    }
-}
-
-/// A join-mode agent's request. `nonce` is the shared group join token (a secret, authenticating
-/// the join); `instance` is a durable, locally-generated, per-node value (64 lowercase hex) that
-/// names the agent and makes the join idempotent on retry — it is *not* secret, and it is what
-/// keeps two nodes sharing one group `nonce` from colliding onto one identity. `csr` is a PEM
-/// certificate-signing request; only its public key is certified — the control plane sets the
-/// subject and SAN itself and ignores whatever the CSR asks for.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct JoinRequest {
-    pub group_id: String,
-    pub nonce: String,
-    pub instance: String,
+    pub name: String,
+    /// A PEM certificate-signing request. Only the CSR's public key is certified — the control plane
+    /// sets the subject (`CN=<name>`) and SAN itself. Steady-state traffic uses the minted per-node
+    /// cert, never the shared fleet cert.
     pub csr: String,
 }
 
-impl JoinRequest {
-    /// The durable per-node `instance` is exactly 64 hex characters (a sha256 digest), like the
-    /// mount-mode registration nonce it is derived from.
-    pub fn instance_is_wellformed(&self) -> bool {
-        crate::hash::is_sha256_hex(&self.instance)
+impl EnrollmentRequest {
+    /// A node name must be a non-empty DNS-safe label (lowercase alphanumeric plus `-`), so it is a
+    /// valid `CN`, `UpdateAgent` name, and SPIFFE path segment.
+    pub fn name_is_wellformed(&self) -> bool {
+        !self.name.is_empty()
+            && self.name.len() <= 253
+            && self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !self.name.starts_with('-')
+            && !self.name.ends_with('-')
     }
 }
 
-/// The control plane's response to a successful join: the minted client certificate (`leaf`), any
-/// issuer chain below the trusted CA (`chain`, empty when the fleet CA signs leaves directly), and
-/// the same [`EnrollmentBundle`] the mount-mode `/enroll` returns — so join-mode and mount-mode
-/// nodes converge on an identical steady state.
+/// The control plane's response to a successful enrollment: the minted client certificate (`leaf`),
+/// any issuer chain below the trusted CA (`chain`, empty when the fleet CA signs leaves directly),
+/// and the [`EnrollmentBundle`] the node runs on.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct JoinResponse {
+pub struct EnrollResponse {
     pub leaf: String,
     #[serde(default)]
     pub chain: String,
@@ -322,19 +274,53 @@ pub fn load_or_enroll(
     }
 }
 
-/// Obtain the enrollment bundle over the network, dispatching by bootstrap mode. Mount-mode nodes
-/// present their pre-provisioned client cert to `/enroll`; join-mode nodes mint an identity via a
-/// CSR at `/join`. Both converge on the same persisted bundle and consumed-once semantics.
+/// Obtain the enrollment bundle over the network: the single enrollment path. The node presents the
+/// shared fleet enrollment cert as mutual TLS to `/enroll`, self-asserting its configured `name`,
+/// and receives a per-node leaf it persists and uses thereafter. Idempotent on retry (the durable
+/// per-node key plus the stable config name yield the same agent and the same pinned key) and
+/// one-way: once the bundle is consumed, enrollment can never re-run.
 pub async fn load_or_enroll_http(
     bootstrap: &BootstrapConfig,
     state_dir: &Path,
 ) -> io::Result<EnrollmentBundle> {
-    match bootstrap.enrollment.mode()? {
-        BootstrapMode::Mount { .. } => enroll_mount(bootstrap, state_dir).await,
-        BootstrapMode::Join { group_id, nonce } => {
-            join_http(bootstrap, state_dir, &group_id, &nonce).await
-        }
+    let bundle_path = state_dir.join("enrollment.json");
+    if let Some(loaded) = load_existing_or_fresh(&bundle_path, "enrollment") {
+        return loaded;
     }
+    std::fs::create_dir_all(state_dir)?;
+    let key_pem = durable_key_pem(state_dir)?;
+    let csr_pem = crate::csr::csr_for(&key_pem, "updated enroll")
+        .map_err(|error| invalid(&format!("generating enrollment CSR: {error}")))?;
+    let endpoint = format!(
+        "{}{ENROLL_PATH}",
+        bootstrap.enrollment.url.trim_end_matches('/')
+    );
+    let request = EnrollmentRequest {
+        name: bootstrap.enrollment.name.clone(),
+        csr: csr_pem,
+    };
+    let body = serde_json::to_vec(&request).map_err(io::Error::other)?;
+    // The shared fleet enrollment cert authenticates ONLY this mutual-TLS handshake; the minted
+    // per-node cert below is what every steady-state request uses.
+    let response = bootstrap
+        .enrollment
+        .enroll_identity()?
+        .reqwest_client()?
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+    let bytes = success_body(response, "enrollment").await?;
+    let enrolled: EnrollResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
+    enrolled.bundle.validate_shape()?;
+    let bundle_bytes = serde_json::to_vec(&enrolled.bundle).map_err(io::Error::other)?;
+    // Persist the minted leaf BEFORE the bundle/consumed marker (the key is already persisted):
+    // steady state cannot run without the cert, and a crash after the leaf but before the bundle
+    // simply re-enrolls (same durable key + name ⇒ same agent, same pinned key ⇒ idempotent).
+    persist_leaf(state_dir, &enrolled.leaf, &enrolled.chain)?;
+    load_or_enroll(&bundle_path, || Ok(bundle_bytes.clone()))
 }
 
 /// If enrollment has already run (the bundle is present, or the consumed marker is set), return the
@@ -367,116 +353,31 @@ async fn success_body(response: reqwest::Response, what: &str) -> io::Result<Vec
     Ok(response.bytes().await.map_err(io::Error::other)?.to_vec())
 }
 
-/// Mount mode: the node already holds a client certificate, so the mTLS handshake at `/enroll`
-/// authenticates it and nothing secret rides in the request.
-async fn enroll_mount(
-    bootstrap: &BootstrapConfig,
-    state_dir: &Path,
-) -> io::Result<EnrollmentBundle> {
-    let bundle_path = state_dir.join("enrollment.json");
-    if let Some(loaded) = load_existing_or_fresh(&bundle_path, "enrollment HTTP") {
-        return loaded;
-    }
-    std::fs::create_dir_all(state_dir)?;
-    let endpoint = format!(
-        "{}{ENROLL_PATH}",
-        bootstrap.enrollment.url.trim_end_matches('/')
-    );
-    let request = EnrollmentRequest {
-        registration: durable_instance(state_dir)?,
-    };
-    let body = serde_json::to_vec(&request).map_err(io::Error::other)?;
-    let response = bootstrap
-        .enrollment
-        .steady_identity(state_dir)?
-        .reqwest_client()?
-        .post(endpoint)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(io::Error::other)?;
-    let bytes = success_body(response, "enrollment").await?;
-    load_or_enroll(&bundle_path, move || Ok(bytes))
-}
-
-/// Join mode: the node has no certificate yet. It generates a keypair and CSR, authenticates the
-/// join with the group token over server-authenticated TLS, persists the minted identity, and
-/// returns the embedded bundle. The persisted identity is what every steady-state request uses.
-async fn join_http(
-    bootstrap: &BootstrapConfig,
-    state_dir: &Path,
-    group_id: &str,
-    nonce: &str,
-) -> io::Result<EnrollmentBundle> {
-    let bundle_path = state_dir.join("enrollment.json");
-    if let Some(loaded) = load_existing_or_fresh(&bundle_path, "join") {
-        return loaded;
-    }
-    std::fs::create_dir_all(state_dir)?;
-    let instance = durable_instance(state_dir)?;
-    let (key_pem, csr_pem) = crate::csr::generate(&format!("updated join {group_id}"))
-        .map_err(|error| invalid(&format!("generating join CSR: {error}")))?;
-    let endpoint = format!("{}{JOIN_PATH}", bootstrap.enrollment.url.trim_end_matches('/'));
-    let request = JoinRequest {
-        group_id: group_id.to_string(),
-        nonce: nonce.to_string(),
-        instance,
-        csr: csr_pem,
-    };
-    let body = serde_json::to_vec(&request).map_err(io::Error::other)?;
-    // The node has no client certificate yet, so the listener is server-authenticated only: the
-    // node verifies the gateway against the pinned CA and proves itself with the join token.
-    let response = crate::tls::server_auth_client(&bootstrap.enrollment.ca)?
-        .post(endpoint)
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await
-        .map_err(io::Error::other)?;
-    let bytes = success_body(response, "join").await?;
-    let joined: JoinResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
-    joined.bundle.validate_shape()?;
-    let bundle_bytes = serde_json::to_vec(&joined.bundle).map_err(io::Error::other)?;
-    // Persist the minted identity BEFORE the bundle/consumed marker. Steady state cannot run
-    // without the cert, and once the consumed marker exists join can never re-run; a crash after
-    // the identity but before the bundle simply re-joins (same durable `instance` ⇒ same agent).
-    persist_identity(state_dir, &key_pem, &joined.leaf, &joined.chain)?;
-    load_or_enroll(&bundle_path, || Ok(bundle_bytes.clone()))
-}
-
-/// The durable, per-node registration value: 64 lowercase hex, generated once and reused on every
-/// retry. It names the agent (both modes) and, in join mode, keeps nodes sharing one group token
-/// from colliding onto a single identity.
-fn durable_instance(state_dir: &Path) -> io::Result<String> {
-    let path = state_dir.join("registration-nonce");
-    match std::fs::read_to_string(&path) {
-        Ok(value) if crate::hash::is_sha256_hex(&value) => Ok(value),
-        Ok(_) => Err(invalid("registration nonce is corrupt")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let value = crate::rand::token()?;
-            foundation::durable::atomic_write(&path, ".registration-", value.as_bytes())?;
-            Ok(value)
+/// The node's durable per-node key (PKCS#8 PEM): generated once, persisted owner-only, and reused
+/// on every enrollment retry — written BEFORE the CSR is sent so the certificate the control plane
+/// pins and the key the node later signs telemetry with are always the same, even if a first
+/// attempt reaches the control plane but its response is lost. A leaked key is time-bounded by the
+/// leaf TTL, not the key's lifetime, since the leaf is re-minted on re-enrollment.
+fn durable_key_pem(state_dir: &Path) -> io::Result<String> {
+    let path = joined_key_path(state_dir);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if !existing.trim().is_empty() {
+            return Ok(existing);
         }
-        Err(error) => Err(error),
     }
-}
-
-/// Durably write the minted key (owner-only) and certificate. The cert file is the leaf followed
-/// by any issuer chain below the trusted CA; the root/CA itself stays the bootstrap-pinned `ca`.
-fn persist_identity(
-    state_dir: &Path,
-    key_pem: &str,
-    leaf_pem: &str,
-    chain_pem: &str,
-) -> io::Result<()> {
-    let key_path = joined_key_path(state_dir);
-    foundation::durable::atomic_write(&key_path, ".agent-key-", key_pem.as_bytes())?;
+    let key_pem = crate::csr::generate_key()?;
+    foundation::durable::atomic_write(&path, ".agent-key-", key_pem.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
+    Ok(key_pem)
+}
+
+/// Durably write the minted leaf (+ any issuer chain below the trusted CA). The key was persisted
+/// earlier by [`durable_key_pem`]; the root/CA itself stays the bootstrap-pinned `ca`.
+fn persist_leaf(state_dir: &Path, leaf_pem: &str, chain_pem: &str) -> io::Result<()> {
     let mut cert = leaf_pem.to_string();
     if !chain_pem.trim().is_empty() {
         if !cert.ends_with('\n') {
@@ -597,75 +498,61 @@ mod tests {
     }
 
     #[test]
-    fn mount_mode_bootstrap_uses_the_provisioned_cert() {
+    fn bootstrap_is_name_plus_shared_cert_and_mints_a_per_node_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let base = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
+        let base = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
         let config = BootstrapConfig::load(&write_bootstrap(dir.path(), base)).unwrap();
-        assert_eq!(
-            config.enrollment.mode().unwrap(),
-            BootstrapMode::Mount {
-                client_cert: "/id/tls.crt".into(),
-                client_key: "/id/tls.key".into(),
-            }
-        );
-        // Steady-state identity in mount mode is the mounted cert, verbatim.
-        let identity = config
-            .enrollment
-            .steady_identity(Path::new("/var/lib/updated/state"))
-            .unwrap();
-        assert_eq!(identity.client_cert.to_str(), Some("/id/tls.crt"));
-
-        // An unknown field is still rejected, and a half-specified pair is an error.
-        assert!(BootstrapConfig::load(&write_bootstrap(dir.path(), &format!("{base}key='x'\n")))
-            .is_err());
-        assert!(BootstrapConfig::load(&write_bootstrap(
-            dir.path(),
-            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nclient_key='/id/tls.key'\n",
-        ))
-        .is_err());
-    }
-
-    #[test]
-    fn join_mode_bootstrap_uses_the_group_token_and_mints_its_own_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\ngroup_id='canary'\nnonce='s3cret-join-token'\n";
-        let config = BootstrapConfig::load(&write_bootstrap(dir.path(), base)).unwrap();
-        assert_eq!(
-            config.enrollment.mode().unwrap(),
-            BootstrapMode::Join {
-                group_id: "canary".into(),
-                nonce: "s3cret-join-token".into(),
-            }
-        );
-        // In join mode the steady-state identity resolves to the certificate the node will mint
-        // into its state directory, not anything from the bootstrap file.
-        let identity = config
+        assert_eq!(config.enrollment.name, "agent-7");
+        // The shared fleet cert authenticates ONLY the enrollment handshake.
+        let enroll = config.enrollment.enroll_identity().unwrap();
+        assert_eq!(enroll.client_cert.to_str(), Some("/id/tls.crt"));
+        // Steady-state identity is the PER-NODE cert minted at enrollment (state_dir/agent.crt),
+        // never the shared fleet cert.
+        let steady = config
             .enrollment
             .steady_identity(Path::new("/var/lib/updated/state"))
             .unwrap();
         assert_eq!(
-            identity.client_cert,
+            steady.client_cert,
             Path::new("/var/lib/updated/state/agent.crt")
         );
-
-        // A join token without a group (or vice versa) is a misconfiguration.
-        assert!(BootstrapConfig::load(&write_bootstrap(
-            dir.path(),
-            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\ngroup_id='canary'\n",
-        ))
-        .is_err());
     }
 
     #[test]
-    fn cert_paths_take_precedence_over_a_join_token() {
+    fn bootstrap_rejects_incomplete_or_stale_config() {
         let dir = tempfile::tempdir().unwrap();
-        // Both sets present (e.g. a shared template with stale cert paths): mount wins.
-        let both = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\ngroup_id='canary'\nnonce='tok'\n";
-        let config = BootstrapConfig::load(&write_bootstrap(dir.path(), both)).unwrap();
-        assert!(matches!(
-            config.enrollment.mode().unwrap(),
-            BootstrapMode::Mount { .. }
-        ));
+        let ok = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
+        assert!(BootstrapConfig::load(&write_bootstrap(dir.path(), ok)).is_ok());
+        // A missing required field (name / cert / key) is rejected.
+        for missing in [
+            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n",
+            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\nclient_key='/id/tls.key'\n",
+        ] {
+            assert!(BootstrapConfig::load(&write_bootstrap(dir.path(), missing)).is_err());
+        }
+        // An empty name is rejected by `validate()`.
+        let empty = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname=''\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
+        assert!(BootstrapConfig::load(&write_bootstrap(dir.path(), empty)).is_err());
+        // A stale mount/join/token field is rejected by `deny_unknown_fields`, so a half-migrated
+        // config fails loudly instead of silently ignoring a credential.
+        let stale = format!("{ok}group_id='canary'\n");
+        assert!(BootstrapConfig::load(&write_bootstrap(dir.path(), &stale)).is_err());
+    }
+
+    #[test]
+    fn a_node_name_must_be_a_dns_safe_label() {
+        let name = |value: &str| EnrollmentRequest {
+            name: value.into(),
+            csr: String::new(),
+        };
+        assert!(name("agent-7").name_is_wellformed());
+        assert!(name("magnolia-author-0").name_is_wellformed());
+        for bad in ["", "-agent", "agent-", "Agent", "a_b", "a/b", "a.b"] {
+            assert!(
+                !name(bad).name_is_wellformed(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]

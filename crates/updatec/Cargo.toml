@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# Outbound webhook delivery for UpdateSubscription (change-tracking push); rustls via the workspace.
+reqwest = { workspace = true }
+# HMAC-SHA256 signing of webhook bodies — the one crypto library (same backend as the gateway mTLS).
+aws-lc-rs = { workspace = true }
 # The gateway HTTP data plane is Axum over hyper; hyper-util drives the per-connection serve loop
 # behind our own tokio-rustls accept loops (so TLS/mTLS and the aws-lc-rs provider stay ours).
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "matched-path", "original-uri"] }
@@ -38,11 +42,11 @@ updated-tuf = { path = "../updated-tuf" }
 # library); x509-parser lets it read the CSR's public key for proof-of-possession.
 rcgen = { workspace = true, features = ["x509-parser"] }
 tempfile = "3"
+# The mTLS data listener reads the verified leaf's Common Name to authorize per-node telemetry
+# writes (the trusted identity, vs the node's self-claimed path); join tests also introspect leaves.
+x509-parser = "0.16"
 
 [dev-dependencies]
-# Introspect minted leaf certificates in join tests: subject, SAN, and public key, to prove the
-# control plane certifies the CSR's key while setting the identity itself.
-x509-parser = "0.16"
 # Drive Axum routers directly in gateway tests via `ServiceExt::oneshot`, no socket needed.
 tower = { version = "0.5", features = ["util"] }
 

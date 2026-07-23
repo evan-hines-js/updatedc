@@ -212,20 +212,35 @@ impl Ctx {
         // its provider fails closed at startup.
         let fips = std::env::var_os("E2E_FIPS").is_some();
         let fips_feature: &[&str] = if fips { &["--features", "fips"] } else { &[] };
-        let crypto_cdn =
-            [["build", "--release", "-p", "server", "-p", "updated-oneshot"].as_slice(), fips_feature]
-                .concat();
+        let crypto_cdn = [
+            [
+                "build",
+                "--release",
+                "-p",
+                "server",
+                "-p",
+                "updated-oneshot",
+            ]
+            .as_slice(),
+            fips_feature,
+        ]
+        .concat();
         cargo(&self.root, None, &crypto_cdn)?;
         cargo(&self.root, None, &["build", "--release", "-p", "bootstrap"])?;
         let supervisor_features = if fips { "chaos,fips" } else { "chaos" };
         cargo(
             &self.root,
             None,
-            &["build", "--release", "-p", "supervisor", "--features", supervisor_features],
+            &[
+                "build",
+                "--release",
+                "-p",
+                "supervisor",
+                "--features",
+                supervisor_features,
+            ],
         )?;
-        let built = self
-            .target
-            .join(format!("release/supervisor{}", self.exe));
+        let built = self.target.join(format!("release/supervisor{}", self.exe));
         std::fs::copy(built, &self.supervisor).map_err(str_err)?;
         Ok(())
     }
@@ -953,7 +968,12 @@ pub fn dump_install_state(work: &Path) -> String {
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
         let installed = installed_doc
             .as_ref()
-            .and_then(|doc| doc.get("release")?.get("version")?.as_str().map(str::to_owned))
+            .and_then(|doc| {
+                doc.get("release")?
+                    .get("version")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| "none".into());
         // `confirmed=false` marks a provisional cold-install head still awaiting its first passing
         // health gate — the state that drives the ordered-fallback descent.
@@ -983,11 +1003,20 @@ pub fn dump_install_state(work: &Path) -> String {
         let present = |key: &str| {
             installed_doc
                 .as_ref()
-                .map(|doc| if doc.get(key).is_some_and(|v| !v.is_null()) { "yes" } else { "none" })
+                .map(|doc| {
+                    if doc.get(key).is_some_and(|v| !v.is_null()) {
+                        "yes"
+                    } else {
+                        "none"
+                    }
+                })
                 .unwrap_or("n/a")
         };
-        let (lifecycle, healthcheck, pending) =
-            (present("lifecycle"), present("healthcheck"), present("pending"));
+        let (lifecycle, healthcheck, pending) = (
+            present("lifecycle"),
+            present("healthcheck"),
+            present("pending"),
+        );
         out.push_str(&format!(
             "\n  {label}: installed={installed} confirmed={confirmed} rejected=[{rejected}] \
              transaction={transaction} lifecycle={lifecycle} healthcheck={healthcheck} pending={pending}"

@@ -90,7 +90,12 @@ fn reap(install: &Path, supervisor: &Path) {
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
-        .and_then(|v| v.trim_start_matches("0x").parse().ok().or_else(|| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+        .and_then(|v| {
+            v.trim_start_matches("0x")
+                .parse()
+                .ok()
+                .or_else(|| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        })
         .unwrap_or(default)
 }
 
@@ -227,7 +232,7 @@ fn run() -> R {
     let state_path = install.join("state/installed.json");
     let ver_url = format!("http://{svc}/version");
     let rounds = env_u64("KILLFUZZ_ROUNDS", 12) as usize;
-    let seed = env_u64("KILLFUZZ_SEED", 0xC0FFEE_D00D);
+    let seed = env_u64("KILLFUZZ_SEED", 0x00C0_FFEE_D00D);
     let mut rng = Lcg(seed);
 
     println!(
@@ -239,8 +244,18 @@ fn run() -> R {
     // cold-install/confirm/steady must reconverge to a live, committed 1.0.0. This is the only round
     // that wipes the disk (emptyDir restart churn).
     fuzz_phase(
-        "install", "1.0.0", true, rounds, seed, &mut rng, &cmd, &install, &ctx.supervisor,
-        &state_path, svc, &ver_url,
+        "install",
+        "1.0.0",
+        true,
+        rounds,
+        seed,
+        &mut rng,
+        &cmd,
+        &install,
+        &ctx.supervisor,
+        &state_path,
+        svc,
+        &ver_url,
     )?;
 
     // Round 2 — a broken 2.0.0 begins rolling out. Its bundle stages and verifies (a valid, signed
@@ -276,8 +291,18 @@ fn run() -> R {
     println!("killfuzz [broken-rollout]: node began the 2.0.0 rollout — 3.0.0 will not be published until now");
 
     fuzz_phase(
-        "broken-rollout", "1.0.0", false, rounds, seed, &mut rng, &cmd, &install, &ctx.supervisor,
-        &state_path, svc, &ver_url,
+        "broken-rollout",
+        "1.0.0",
+        false,
+        rounds,
+        seed,
+        &mut rng,
+        &cmd,
+        &install,
+        &ctx.supervisor,
+        &state_path,
+        svc,
+        &ver_url,
     )?;
 
     // Round 3 — a healthy 3.0.0 supersedes the failing 2.0.0 head. Only now — after the node has
@@ -286,8 +311,18 @@ fn run() -> R {
     // Persistent disk — no wipes.
     ctx.publish(&dir, "app", "3.0.0", &app_v(&ctx, "1.0.0"))?;
     fuzz_phase(
-        "roll-forward", "3.0.0", false, rounds, seed, &mut rng, &cmd, &install, &ctx.supervisor,
-        &state_path, svc, &ver_url,
+        "roll-forward",
+        "3.0.0",
+        false,
+        rounds,
+        seed,
+        &mut rng,
+        &cmd,
+        &install,
+        &ctx.supervisor,
+        &state_path,
+        svc,
+        &ver_url,
     )?;
 
     // Round 4 — TRUE INTERLEAVE: a broken head is superseded by a healthy one *while the broken
@@ -307,8 +342,11 @@ fn run() -> R {
         // Fresh broken bytes → a new archive hash → never a stale rejection from a prior trial. The
         // bundle stages and verifies but its entrypoint cannot exec, so activating it fails.
         let broken = dir.join(format!("interleave-broken-{trial}"));
-        std::fs::write(&broken, format!("not-a-runnable-application-entrypoint trial {trial}\n"))
-            .map_err(str_err)?;
+        std::fs::write(
+            &broken,
+            format!("not-a-runnable-application-entrypoint trial {trial}\n"),
+        )
+        .map_err(str_err)?;
         ctx.publish(&dir, "app", &broken_v, &broken)?;
 
         // Bring the broken update in-flight, then SIGKILL the tree with its transaction journal on
@@ -383,9 +421,9 @@ fn run() -> R {
         // Prove recovery actually reconciled the in-flight broken transaction (rather than the node
         // simply never having engaged the broken head): a recovery line must name broken_v. Which
         // classification fires depends on where the kill landed, so accept any of them.
-        let reconciled = tower
-            .log_contains(&format!("recovery: rejected {broken_v} after failed activation"))
-            || tower.log_contains(&format!("interrupted activation of {broken_v}"))
+        let reconciled = tower.log_contains(&format!(
+            "recovery: rejected {broken_v} after failed activation"
+        )) || tower.log_contains(&format!("interrupted activation of {broken_v}"))
             || tower.log_contains(&format!("activation of {broken_v} never landed"))
             || tower.log_contains(&format!("completing rollback from {broken_v}"));
         let log = tower.captured_log();

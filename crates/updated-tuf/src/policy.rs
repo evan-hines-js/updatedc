@@ -66,7 +66,29 @@ impl DefaultPolicy {
                 return Err(PolicyError(format!("{k} is `{got}`, expected `{want}`")));
             }
         }
-        parse_semver(field("version")?)
+        let version = field("version")?;
+        // Cross-check the target path's version segment against the signed `custom.version`.
+        // The canonical layout is `products/<product>/<channel>/<version>/<os>-<arch>/<file>`
+        // (see `repo::PublishTarget::application`). Both segments are TUF-authentic, but if
+        // they disagree the target is ambiguous: two authentic targets could then claim the
+        // same `custom.version` while living at different paths, leaving the tie-break to
+        // decorative path bytes. Requiring agreement makes `custom.version` the single
+        // authority and rejects any candidate whose path says otherwise.
+        let segments: Vec<&str> = candidate.path.split('/').collect();
+        if segments.first().copied() == Some("products") {
+            let path_version = segments.get(3).copied().ok_or_else(|| {
+                PolicyError(format!(
+                    "product target path `{}` omits its version segment",
+                    candidate.path
+                ))
+            })?;
+            if path_version != version {
+                return Err(PolicyError(format!(
+                    "path version segment `{path_version}` disagrees with signed version `{version}`"
+                )));
+            }
+        }
+        parse_semver(version)
     }
 
     /// Authorize an authenticated candidate for this installation, including
@@ -91,4 +113,55 @@ impl DefaultPolicy {
 
 fn parse_semver(v: &str) -> Result<semver::Version, PolicyError> {
     semver::Version::parse(v).map_err(|e| PolicyError(format!("invalid version `{v}`: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const OS: &str = std::env::consts::OS;
+    const ARCH: &str = std::env::consts::ARCH;
+
+    fn target(path: &str, custom_version: &str) -> VerifiedTarget {
+        let mut hashes = BTreeMap::new();
+        hashes.insert("sha256".to_string(), vec![1u8; 32]);
+        VerifiedTarget {
+            path: path.to_string(),
+            length: 1,
+            hashes,
+            custom: serde_json::json!({
+                "product": "app",
+                "channel": "stable",
+                "version": custom_version,
+                "os": OS,
+                "arch": ARCH,
+            }),
+        }
+    }
+
+    fn policy() -> DefaultPolicy {
+        DefaultPolicy::current("app", "stable")
+    }
+
+    #[test]
+    fn path_version_segment_must_match_signed_version() {
+        // The path's version segment agrees with `custom.version`: accepted.
+        let good = target(
+            &format!("products/app/stable/2.0.0/{OS}-{ARCH}/app"),
+            "2.0.0",
+        );
+        assert_eq!(
+            policy().candidate_version(&good).unwrap(),
+            semver::Version::parse("2.0.0").unwrap()
+        );
+
+        // A target whose signed version claims 2.0.0 but whose path says 1.0.0 is ambiguous
+        // and must be rejected, so decorative path bytes can never break a version tie.
+        let mismatched = target(
+            &format!("products/app/stable/1.0.0/{OS}-{ARCH}/app"),
+            "2.0.0",
+        );
+        assert!(policy().candidate_version(&mismatched).is_err());
+    }
 }

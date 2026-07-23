@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use updated::config::Routing;
-use updated::telemetry::{report_object_key, NodeReport};
+use updated::telemetry::NodeReport;
 
 /// The node's own identity, derived from the exact routing target it resolves
 /// (`.../agents/<node>.json`). Returns `None` if the assignment path has no usable
@@ -26,15 +26,6 @@ pub fn node_identity(routing: &Routing) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Join a report base URL with the node's telemetry object key.
-fn report_target(report_url: &str, node: &str) -> String {
-    format!(
-        "{}/{}",
-        report_url.trim_end_matches('/'),
-        report_object_key(node)
-    )
-}
-
 /// Write the node's running state to its report location. Strictly best-effort: any
 /// error (no report URL, no derivable identity, network failure, non-success status)
 /// is logged and swallowed so reporting can never disrupt the update loop.
@@ -45,19 +36,33 @@ pub async fn report_running_state(
     deployment: &str,
     version: &str,
     healthy: bool,
+    signing_key: Option<&[u8]>,
 ) {
     let (Some(report_url), Some(node)) = (report_url, node) else {
         return;
     };
-    let report = NodeReport::new(node, deployment, version, healthy);
+    let mut report = NodeReport::new(node, deployment, version, healthy);
+    // Sign with the node's per-node key so the throttle can verify authenticity end-to-end. A
+    // signing failure leaves the report unsigned — best-effort, but it will fail closed at the
+    // throttle (treated as not-yet-settled), never trusted.
+    if let Some(key) = signing_key {
+        match updated::telemetry::sign_report(&report, key) {
+            Ok(signature) => report.signature = signature,
+            Err(error) => crate::warn(&format!(
+                "signing rollout telemetry failed ({error}); continuing unsigned"
+            )),
+        }
+    }
     let body = match serde_json::to_vec(&report) {
         Ok(body) => body,
         Err(error) => {
-            crate::warn(&format!("encoding rollout telemetry failed ({error}); continuing"));
+            crate::warn(&format!(
+                "encoding rollout telemetry failed ({error}); continuing"
+            ));
             return;
         }
     };
-    let target = report_target(report_url, node);
+    let target = updated::telemetry::report_url(report_url, node);
     let result = client
         .put(&target)
         .timeout(Duration::from_secs(5))
@@ -105,17 +110,5 @@ mod tests {
     fn node_identity_is_none_without_a_usable_stem() {
         assert_eq!(node_identity(&routing("assignments/agents/.json")), None);
         assert_eq!(node_identity(&routing("agents/agent")), None);
-    }
-
-    #[test]
-    fn report_target_joins_base_and_key_without_double_slash() {
-        assert_eq!(
-            report_target("https://cdn/", "agent-1"),
-            "https://cdn/telemetry/agent-1.json"
-        );
-        assert_eq!(
-            report_target("https://cdn", "agent-1"),
-            "https://cdn/telemetry/agent-1.json"
-        );
     }
 }

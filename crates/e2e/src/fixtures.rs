@@ -217,31 +217,30 @@ impl Sup {
             .ok_or("provider command requires an executable")?;
         let program = resolve_executable(program)?;
         #[cfg(unix)]
-        let materialized =
-            if program.file_name().and_then(|name| name.to_str()) == Some("sh")
-                && provider_args.first().map(String::as_str) == Some("-c")
-                && provider_args.len() == 2
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let tree = self.dir.join(format!("{kind}-provider-source"));
-                let published_entrypoint = format!("bin/{kind}");
-                std::fs::create_dir_all(tree.join("bin")).map_err(str_err)?;
-                let entrypoint = tree.join(&published_entrypoint);
-                std::fs::write(&entrypoint, format!("#!/bin/sh\n{}\n", provider_args[1]))
-                    .map_err(str_err)?;
-                let mut permissions = std::fs::metadata(&entrypoint)
-                    .map_err(str_err)?
-                    .permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&entrypoint, permissions).map_err(str_err)?;
-                (tree, published_entrypoint, Vec::new())
-            } else {
-                (
-                    program.clone(),
-                    format!("bin/{kind}{}", self.exe),
-                    provider_args.to_vec(),
-                )
-            };
+        let materialized = if program.file_name().and_then(|name| name.to_str()) == Some("sh")
+            && provider_args.first().map(String::as_str) == Some("-c")
+            && provider_args.len() == 2
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tree = self.dir.join(format!("{kind}-provider-source"));
+            let published_entrypoint = format!("bin/{kind}");
+            std::fs::create_dir_all(tree.join("bin")).map_err(str_err)?;
+            let entrypoint = tree.join(&published_entrypoint);
+            std::fs::write(&entrypoint, format!("#!/bin/sh\n{}\n", provider_args[1]))
+                .map_err(str_err)?;
+            let mut permissions = std::fs::metadata(&entrypoint)
+                .map_err(str_err)?
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&entrypoint, permissions).map_err(str_err)?;
+            (tree, published_entrypoint, Vec::new())
+        } else {
+            (
+                program.clone(),
+                format!("bin/{kind}{}", self.exe),
+                provider_args.to_vec(),
+            )
+        };
         #[cfg(not(unix))]
         let materialized = (
             program.clone(),
@@ -269,8 +268,12 @@ impl Sup {
         // needs a real tree with the entrypoint at its relative path, so assemble one either way.
         let tree = self.dir.join(format!("{kind}-seed-bundle"));
         let entry_file = tree.join(&entrypoint);
-        std::fs::create_dir_all(entry_file.parent().ok_or("provider entrypoint has no parent")?)
-            .map_err(str_err)?;
+        std::fs::create_dir_all(
+            entry_file
+                .parent()
+                .ok_or("provider entrypoint has no parent")?,
+        )
+        .map_err(str_err)?;
         let entry_source = if source.is_dir() {
             source.join(&entrypoint)
         } else {
@@ -338,7 +341,11 @@ impl Sup {
                 .args(["--entrypoint", &published_entrypoint])
                 // A `custom` lifecycle deployment reloads in place: ship the same script as the
                 // `activate` entrypoint so the supervisor derives reload mode from the artifact.
-                .args(reload_activate_args(kind, self.custom, &published_entrypoint)),
+                .args(reload_activate_args(
+                    kind,
+                    self.custom,
+                    &published_entrypoint,
+                )),
         )?;
         let provider_path = crate::harness::release_target(
             &provider_product,
@@ -386,7 +393,7 @@ impl Sup {
             }
             crate::harness::run(&mut provider_set)?;
         }
-                static SEQ: AtomicU32 = AtomicU32::new(0);
+        static SEQ: AtomicU32 = AtomicU32::new(0);
         let seconds = |value: Option<&String>, default: u64| -> R<u64> {
             let Some(value) = value else {
                 return Ok(default);
@@ -469,15 +476,22 @@ impl Sup {
                 .arg("--output")
                 .arg(state_dir.join("enrollment.json")),
         )?;
+        let certs = self.dir.join("certs");
+        // Steady-state identity is the per-node cert a node mints at enrollment. In this offline,
+        // pre-placed scenario the installer supplies it directly (enrollment.json is pre-placed, so
+        // the node never reaches the network `/enroll`), so copy the fleet cert in as that identity —
+        // the release-server verifies it against the same CA. A live enrollment would mint a distinct
+        // per-node leaf; the e2e needs no per-node attribution.
+        std::fs::copy(certs.join("client.crt"), state_dir.join("agent.crt")).map_err(str_err)?;
+        std::fs::copy(certs.join("client.key"), state_dir.join("agent.key")).map_err(str_err)?;
         let bootstrap = self.dir.join(format!(
             "bootstrap-{}.toml",
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let certs = self.dir.join("certs");
         std::fs::write(
             &bootstrap,
             format!(
-                "[enrollment]\nurl = {}\nclient_cert = {}\nclient_key = {}\nca = {}\n",
+                "[enrollment]\nurl = {}\nname = \"agent\"\nclient_cert = {}\nclient_key = {}\nca = {}\n",
                 lit(if self.repository_base_url.starts_with("https://") {
                     self.repository_base_url.trim_end_matches('/')
                 } else {
@@ -561,14 +575,18 @@ impl Sup {
         let mut installed =
             updated::state::InstalledState::confirmed(lineage, staged.id, staged.archive_sha256);
         if let Some(command) = self.lifecycle_command.clone() {
-            installed = installed.with_lifecycle(Some(Box::new(
-                self.stage_seed_provider(&paths, "lifecycle", &command)?,
-            )));
+            installed = installed.with_lifecycle(Some(Box::new(self.stage_seed_provider(
+                &paths,
+                "lifecycle",
+                &command,
+            )?)));
         }
         if let Some(command) = self.health_command.clone() {
-            installed = installed.with_healthcheck(Some(Box::new(
-                self.stage_seed_provider(&paths, "healthcheck", &command)?,
-            )));
+            installed = installed.with_healthcheck(Some(Box::new(self.stage_seed_provider(
+                &paths,
+                "healthcheck",
+                &command,
+            )?)));
         }
         updated::state::write_installed(&paths.state, &installed).map_err(str_err)
     }

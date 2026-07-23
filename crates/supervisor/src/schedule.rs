@@ -61,7 +61,13 @@ mod tests {
     }
 
     fn entropy_for_residue(span: u64, residue: u64) -> u64 {
-        (0u64..).find(|&e| mix(e) % span == residue).unwrap()
+        // Bounded so a residue the mixer never produces fails fast instead of hanging the test.
+        // The spans here are tiny (a handful of buckets), so a match appears almost immediately.
+        (0u64..1 << 20)
+            .find(|&e| mix(e) % span == residue)
+            .unwrap_or_else(|| {
+                panic!("no entropy in [0, 2^20) maps to residue {residue} mod {span}")
+            })
     }
 
     #[test]
