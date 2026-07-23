@@ -35,6 +35,14 @@ pub fn report_object_key(node: &str) -> String {
     format!("telemetry/{node}.json")
 }
 
+/// The absolute URL of a node's report under a base location: `<base>/telemetry/<node>.json`,
+/// tolerant of a trailing slash on the base. The single place a report base and a node identity
+/// become one fetchable/writable URL — shared by the agent that writes its report and any reader
+/// (the health proxy) that fetches it, so the two can never drift.
+pub fn report_url(base: &str, node: &str) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), report_object_key(node))
+}
+
 /// The request path a node `PUT`s its report to, relative to the report base.
 pub const REPORT_PATH_PREFIX: &str = "/telemetry/";
 
@@ -82,6 +90,14 @@ pub struct NodeReport {
     /// hence stale — the safe default).
     #[serde(default)]
     pub reported_at_ms: u64,
+    /// Hex ECDSA-P256 signature over [`NodeReport::signing_bytes`], produced by the node's per-node
+    /// key (the same key certifies its mTLS leaf). The control plane verifies it against the node's
+    /// pinned public key before trusting the report, so a report is attributable end-to-end
+    /// (node → throttle) rather than merely authenticated on the write hop — a compromised gateway
+    /// or a direct bucket write cannot forge a node's health. `#[serde(default)]` (empty) for a
+    /// record predating signing, which fails verification and so fails closed.
+    #[serde(default)]
+    pub signature: String,
 }
 
 impl NodeReport {
@@ -100,7 +116,26 @@ impl NodeReport {
             version: version.into(),
             healthy,
             reported_at_ms: now_ms(),
+            signature: String::new(),
         }
+    }
+
+    /// The canonical bytes a node signs and the control plane verifies: every field EXCEPT the
+    /// signature, length-prefixed in a fixed order, so the signature binds the report's identity and
+    /// state to the signing node independent of JSON key ordering, whitespace, or transport.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut push = |bytes: &[u8]| {
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(bytes);
+        };
+        push(&self.schema.to_be_bytes());
+        push(self.node.as_bytes());
+        push(self.deployment.as_bytes());
+        push(self.version.as_bytes());
+        push(&[u8::from(self.healthy)]);
+        push(&self.reported_at_ms.to_be_bytes());
+        out
     }
 
     /// Milliseconds elapsed between when this report was stamped and `now_ms`, saturating at
@@ -111,13 +146,99 @@ impl NodeReport {
     }
 }
 
+/// Sign a report with a node's private key (PKCS#8 DER — the aws-lc-rs form of the rcgen-minted
+/// ECDSA P-256 key that also certifies the node's mTLS leaf). Returns the hex signature to place in
+/// [`NodeReport::signature`].
+pub fn sign_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<String, String> {
+    use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der)
+        .map_err(|e| format!("loading telemetry signing key: {e}"))?;
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let signature = key
+        .sign(&rng, &report.signing_bytes())
+        .map_err(|e| format!("signing telemetry report: {e}"))?;
+    Ok(hex::encode(signature.as_ref()))
+}
+
+/// Verify a report's signature against the node's pinned public key (the uncompressed EC point from
+/// its leaf certificate). Returns false on any missing/decode/verify failure so the caller treats an
+/// unverifiable report as absent — a report only ever *releases* a throttle slot, so failing closed
+/// keeps the slot held.
+pub fn verify_report(report: &NodeReport, public_key_point: &[u8]) -> bool {
+    use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+    let Ok(signature) = hex::decode(&report.signature) else {
+        return false;
+    };
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key_point)
+        .verify(&report.signing_bytes(), &signature)
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn sign_verify_round_trip_and_reject_tampering_and_wrong_key() {
+        use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
+        let pubkey = key.public_key().as_ref().to_vec();
+
+        let mut report = NodeReport::new("agent-9", "deploy-2", "2.0.0", true);
+        report.signature = sign_report(&report, pkcs8.as_ref()).unwrap();
+        assert!(
+            verify_report(&report, &pubkey),
+            "genuine report must verify"
+        );
+
+        // Any tamper to a signed field breaks verification.
+        let mut flipped = report.clone();
+        flipped.healthy = false;
+        assert!(
+            !verify_report(&flipped, &pubkey),
+            "tampered healthy must fail"
+        );
+        let mut renamed = report.clone();
+        renamed.node = "agent-attacker".into();
+        assert!(!verify_report(&renamed, &pubkey), "tampered node must fail");
+
+        // A signature from a different key must not verify against this node's pinned key.
+        let other = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let other_key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, other.as_ref()).unwrap();
+        assert!(
+            !verify_report(&report, other_key.public_key().as_ref()),
+            "wrong key must fail"
+        );
+
+        // An unsigned (legacy) report fails closed.
+        let unsigned = NodeReport::new("agent-9", "deploy-2", "2.0.0", true);
+        assert!(
+            !verify_report(&unsigned, &pubkey),
+            "empty signature fails closed"
+        );
+    }
+
+    #[test]
     fn report_key_is_namespaced_by_node() {
         assert_eq!(report_object_key("agent-7"), "telemetry/agent-7.json");
+    }
+
+    #[test]
+    fn report_url_joins_base_and_key_without_a_double_slash() {
+        // The writer (agent) and every reader (health proxy) resolve a report URL through here, so
+        // a trailing slash on the base must not produce `//` either way.
+        assert_eq!(
+            report_url("https://cdn/", "agent-1"),
+            "https://cdn/telemetry/agent-1.json"
+        );
+        assert_eq!(
+            report_url("https://cdn", "agent-1"),
+            "https://cdn/telemetry/agent-1.json"
+        );
     }
 
     #[test]

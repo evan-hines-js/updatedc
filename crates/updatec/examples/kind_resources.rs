@@ -58,7 +58,7 @@ fn deployment(
 ) -> DeploymentSpec {
     DeploymentSpec {
         name: name.into(),
-        report_url: None,
+        report_url: "http://updatec.updated-system.svc:8080/v1/telemetry".into(),
         release_repository: ReleaseRepositorySpec {
             metadata_url: format!("https://release-{name}/metadata/"),
             targets_url: format!("https://release-{name}/targets/"),
@@ -111,7 +111,7 @@ fn main() {
                     &provider_sha,
                     &root,
                 ),
-                rotate_nonce: None,
+                max_unavailable: None,
             },
         );
         group.metadata.namespace = Some("updated-system".into());
@@ -131,32 +131,12 @@ fn main() {
                     match_labels: BTreeMap::from([("updated.dev/role".into(), name.into())]),
                 },
                 deployment: deployment(name, version, &platform, sha, &provider_sha, &root),
-                rotate_nonce: None,
+                max_unavailable: None,
             },
         );
         group.metadata.namespace = Some("updated-system".into());
         emit(&group);
     }
-
-    // A join-mode group. Its members carry no client certificate: they authenticate their join
-    // with this group's controller-minted token at /join, and the control plane stamps them
-    // `updated.dev/group=join`, which this selector matches. Same app as the cert-mounted cohorts,
-    // so the demo exercises both enrollment paths converging through one rollout.
-    let mut join = UpdateGroup::new(
-        "join",
-        UpdateGroupSpec {
-            repository_ref: LocalObjectReference {
-                name: "default".into(),
-            },
-            selector: LabelSelector {
-                match_labels: BTreeMap::from([(GROUP_LABEL.into(), "join".into())]),
-            },
-            deployment: deployment("join", "2.0.0", &platform, &v2_sha, &provider_sha, &root),
-            rotate_nonce: None,
-        },
-    );
-    join.metadata.namespace = Some("updated-system".into());
-    emit(&join);
 
     let mut repository = UpdateRepository::new(
         "default",

@@ -1,13 +1,13 @@
 use crate::*;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use sha2::{Digest, Sha256};
 
 /// `kubectl` argument prefix that execs into the in-cluster release-server container. Every
 /// release-repository query and mutation runs through it, so it lives in one place.
-const RELEASE_SERVER_EXEC: [&str; 6] = [
+pub(crate) const RELEASE_SERVER_EXEC: [&str; 6] = [
     "-n",
     "updated-system",
     "exec",
@@ -16,7 +16,10 @@ const RELEASE_SERVER_EXEC: [&str; 6] = [
     "release-server",
 ];
 
-pub(crate) async fn start_demo(automated: bool, exit_after: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn start_demo(
+    automated: bool,
+    exit_after: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     for command in ["docker", "kind", "kubectl", "cargo", "curl"] {
         command_exists(command)?;
     }
@@ -98,7 +101,9 @@ pub(crate) async fn start_demo(automated: bool, exit_after: bool) -> Result<(), 
                     }
                 }
                 Err(error) => {
-                    println!("[demo] external VM provisioning failed ({error}); continuing without it")
+                    println!(
+                        "[demo] external VM provisioning failed ({error}); continuing without it"
+                    )
                 }
             }
         }
@@ -196,6 +201,11 @@ async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
         "statefulset/agent",
         "--timeout=480s",
     ]))?;
+    // The updated-managed HAProxy tier: 2 HAProxies (installed from a signed tarball, upgraded in
+    // place) fronting the external slice, with a HAProxy-mode healthproxy programming their backend
+    // membership from signed CDN health. Runs after the release keys + external slice exist. Sits
+    // outside the cohort/set/chaos machinery, so it never perturbs the convergence/SLA math.
+    prepare_haproxy_tier(&platform).await?;
     Ok(magnolia_enabled)
 }
 
@@ -210,7 +220,12 @@ pub(crate) async fn setup_demo() -> Result<(), Box<dyn std::error::Error>> {
     use_demo_context(&cluster)?;
     println!("[demo] removing the base E2E's intentionally ambiguous group");
     run(Command::new("kubectl").args([
-        "-n", "updated-system", "delete", "updategroup", "overlapping-edge", "--ignore-not-found",
+        "-n",
+        "updated-system",
+        "delete",
+        "updategroup",
+        "overlapping-edge",
+        "--ignore-not-found",
     ]))?;
     println!("[demo] scaling the managed fleet to {DEMO_TOTAL_AGENTS} agents");
     run(Command::new("kubectl").args([
@@ -230,14 +245,19 @@ pub(crate) async fn setup_demo() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     deploy_external_reconciler(magnolia_enabled)?;
-    println!("[demo] setup complete: fleet, groups, per-set services/ingress, and reconciler applied");
+    println!(
+        "[demo] setup complete: fleet, groups, per-set services/ingress, and reconciler applied"
+    );
     Ok(())
 }
 
 /// Driving adapter for CI. The UI is observational: this verifies the prepared fleet
 /// and provider-owned durable state independently, then starts the same group scenario
 /// the browser exposes.
-pub(crate) async fn exercise_demo(url: &str, exit_after: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn exercise_demo(
+    url: &str,
+    exit_after: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     wait_for_fleet_convergence(&client, url, "22.0.0", 240).await?;
     assert_set_isolation().await?;
@@ -282,6 +302,7 @@ pub(crate) async fn exercise_demo(url: &str, exit_after: bool) -> Result<(), Box
     if !receipt.contains("green release 22.0.0") {
         return Err(format!("missing lifecycle audit receipt: {receipt:?}").into());
     }
+    assert_haproxy_zero_downtime_upgrade().await?;
     exercise_fleet_actions(&client, url, CHAOS_SEED_BASE, exit_after).await?;
     println!("E2E PASS: {DEMO_COHORT_COUNT} stable cohorts exercised ordered lifecycle hooks, group rollback, and exact fleet convergence");
     Ok(())
@@ -329,7 +350,8 @@ pub(crate) async fn assert_set_isolation() -> Result<(), Box<dyn std::error::Err
 /// selectorless `external` Service's EndpointSlice — stamped with its manager label — from the
 /// out-of-cluster nodes' CDN health, and every external node came up ready. This exercises the
 /// exact product code path (the one that fronts VMs) end to end against a live cluster.
-pub(crate) async fn assert_external_endpoints_reconciled() -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn assert_external_endpoints_reconciled() -> Result<(), Box<dyn std::error::Error>>
+{
     for _ in 0..90 {
         let json = output(Command::new("kubectl").args([
             "-n",
@@ -519,7 +541,9 @@ pub(crate) fn fleet_converged(nodes: &[FleetNode], version: &str) -> bool {
     // all converged.
     let cohort: Vec<&FleetNode> = nodes.iter().filter(|node| is_cohort_member(node)).collect();
     cohort.len() == DEMO_NODE_COUNT
-        && cohort.iter().all(|node| fleet_node_converged(node, version))
+        && cohort
+            .iter()
+            .all(|node| fleet_node_converged(node, version))
 }
 
 /// A node that belongs to a demo *cohort* (`demo-cohort-<n>`), as opposed to the external
@@ -613,11 +637,11 @@ pub(crate) fn repository_target_sha(name: &str) -> Result<String, Box<dyn std::e
 }
 
 pub(crate) fn repository_platform() -> Result<String, Box<dyn std::error::Error>> {
-    output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
-        "--",
-        "cat",
-        "/data/platform",
-    ]))
+    output(
+        Command::new("kubectl")
+            .args(RELEASE_SERVER_EXEC)
+            .args(["--", "cat", "/data/platform"]),
+    )
 }
 
 /// Retry-patch one node's demo labels until the operator has registered its `UpdateAgent`.
@@ -701,7 +725,11 @@ pub(crate) fn apply_magnolia_fleet() -> Result<(), Box<dyn std::error::Error>> {
     apply_json(&serde_json::json!({ "apiVersion": "v1", "kind": "List", "items": items }))
 }
 
-pub(crate) fn magnolia_statefulset(role: &str, instance: &str, replicas: usize) -> serde_json::Value {
+pub(crate) fn magnolia_statefulset(
+    role: &str,
+    instance: &str,
+    replicas: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
@@ -813,7 +841,12 @@ where
 {
     println!("[demo] waiting for the Rust demo service to become ready");
     run(Command::new("kubectl").args([
-        "-n", "updated-system", "rollout", "status", "deployment/updatec-demo", "--timeout=120s",
+        "-n",
+        "updated-system",
+        "rollout",
+        "status",
+        "deployment/updatec-demo",
+        "--timeout=120s",
     ]))?;
     let mut forward = Command::new("kubectl")
         .args([
@@ -896,10 +929,18 @@ pub(crate) fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
 /// The base64 value of one key in a Secret, as the API stores it — used to hand the fleet
 /// client certificate (from the cert-manager-issued `agent-tls`) to the external-VM Ansible run.
 pub(crate) fn secret_value(name: &str, key: &str) -> Result<String, Box<dyn std::error::Error>> {
-    kubectl_value("secret", name, &format!("{{.data.{}}}", key.replace('.', "\\.")))
+    kubectl_value(
+        "secret",
+        name,
+        &format!("{{.data.{}}}", key.replace('.', "\\.")),
+    )
 }
 
-pub(crate) fn kubectl_value(kind: &str, name: &str, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn kubectl_value(
+    kind: &str,
+    name: &str,
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     output(Command::new("kubectl").args([
         "-n",
         "updated-system",
@@ -934,7 +975,9 @@ pub(crate) fn label_external_agents() -> Result<(), Box<dyn std::error::Error>> 
 /// OpenStack/VMware VM list — built here from the external pods' identities and current IPs.
 /// The reconciler then programs the selectorless `external` Service's EndpointSlice purely
 /// from those nodes' CDN health, with no knowledge that they happen to be pods.
-pub(crate) fn deploy_external_reconciler(magnolia_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn deploy_external_reconciler(
+    magnolia_enabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut members = Vec::with_capacity(DEMO_EXTERNAL_COUNT);
     for index in 0..DEMO_EXTERNAL_COUNT {
         let ordinal = external_ordinal(index);
@@ -952,7 +995,10 @@ pub(crate) fn deploy_external_reconciler(magnolia_enabled: bool) -> Result<(), B
     // `node=address` entry indistinguishable from a genuine VM's, which is exactly the point.
     if magnolia_enabled {
         if let Some((_, address)) = external_vm_target() {
-            members.push(format!("{}={address}", resource_name(DEMO_EXTERNAL_VM_HOSTNAME)));
+            members.push(format!(
+                "{}={address}",
+                resource_name(DEMO_EXTERNAL_VM_HOSTNAME)
+            ));
         }
     }
     let members = members.join(",");
@@ -988,7 +1034,9 @@ pub(crate) fn deploy_external_reconciler(magnolia_enabled: bool) -> Result<(), B
 /// `(ssh_target, address)`. `None` — unset, or no key-based SSH — skips the crude VM path
 /// entirely (it is demo-only and best-effort, and this guard is exactly "only if sudoless SSH").
 pub(crate) fn external_vm_target() -> Option<(String, String)> {
-    let target = env::var("DEMO_EXTERNAL_VM").ok().filter(|value| !value.is_empty())?;
+    let target = env::var("DEMO_EXTERNAL_VM")
+        .ok()
+        .filter(|value| !value.is_empty())?;
     let reachable = Command::new("ssh")
         .args([
             "-o",
@@ -1077,12 +1125,45 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
         .args(["-e", "updated_enrollment_url=https://updatec-gateway"])
         // The external VM presents the same fleet client certificate as the in-cluster agents,
         // read from the cert-manager-issued secret (base64; Ansible b64decodes it onto the VM).
-        .args(["-e", &format!("updated_enrollment_client_cert={}", secret_value("agent-tls", "tls.crt")?)])
-        .args(["-e", &format!("updated_enrollment_client_key={}", secret_value("agent-tls", "tls.key")?)])
-        .args(["-e", &format!("updated_enrollment_ca={}", secret_value("agent-tls", "ca.crt")?)])
-        .args(["-e", &format!("updated_hostname={DEMO_EXTERNAL_VM_HOSTNAME}")])
+        .args([
+            "-e",
+            &format!(
+                "updated_enrollment_client_cert={}",
+                secret_value("agent-tls", "tls.crt")?
+            ),
+        ])
+        .args([
+            "-e",
+            &format!(
+                "updated_enrollment_client_key={}",
+                secret_value("agent-tls", "tls.key")?
+            ),
+        ])
+        .args([
+            "-e",
+            &format!(
+                "updated_enrollment_ca={}",
+                secret_value("agent-tls", "ca.crt")?
+            ),
+        ])
+        .args([
+            "-e",
+            &format!("updated_hostname={DEMO_EXTERNAL_VM_HOSTNAME}"),
+        ])
+        // The self-asserted enrollment name must be the sha-derived resource name the demo addresses
+        // the VM's UpdateAgent by (label_external_vm_agent uses the same), not the raw hostname.
+        .args([
+            "-e",
+            &format!(
+                "updated_node_name={}",
+                resource_name(DEMO_EXTERNAL_VM_HOSTNAME)
+            ),
+        ])
         .args(["-e", &format!("updated_demo_shim_host={host_ip}")])
-        .args(["-e", &format!("updated_demo_shim_port={DEMO_EXTERNAL_VM_GATEWAY_PORT}")]))
+        .args([
+            "-e",
+            &format!("updated_demo_shim_port={DEMO_EXTERNAL_VM_GATEWAY_PORT}"),
+        ]))
 }
 
 /// Label the enrolled VM's UpdateAgent into the `external-vm` cohort the Magnolia group selects.
@@ -1106,10 +1187,15 @@ pub(crate) fn label_external_vm_agent() -> Result<(), Box<dyn std::error::Error>
 ///
 /// Idempotent: re-running against an already-initialized repo is a no-op for the keys and a
 /// content-addressed republish for the baseline (same bytes → same target).
+/// `(release_root, baseline_path, baseline_sha, restart_provider_sha, reload_provider_sha)` — the
+/// signed identities [`bootstrap_minio_release_repo`] mints and republishes onto the shared PVC.
+type ReleaseBootstrap = (String, String, String, String, String);
+
 pub(crate) fn bootstrap_minio_release_repo(
     edge: &serde_json::Value,
     platform: &str,
-) -> Result<(String, String, String, String), Box<dyn std::error::Error>> {
+) -> Result<ReleaseBootstrap, Box<dyn std::error::Error>> {
+    // Returns (release_root, baseline_path, baseline_sha, restart_provider_sha, reload_provider_sha).
     // 1. Mint keys + initialize the repo once, onto the shared PVC (skip if already there).
     run(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
         "--",
@@ -1152,7 +1238,7 @@ pub(crate) fn bootstrap_minio_release_repo(
         &format!(
             "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
              rm -rf /tmp/seed && mkdir -p /tmp/seed/bin /tmp/seed/config; \
-             cp /usr/local/bin/sampleapp /tmp/seed/bin/app; \
+             cp /usr/local/bin/sampleapp-reexec /tmp/seed/bin/app; \
              printf 'version = \"22.0.0\"\\n' >/tmp/seed/config/release.toml; \
              updatectl deploy --keys-dir /data/release-keys --bucket updates --prefix releases \
              --endpoint http://minio:9000 --region us-east-1 --namespace updated-system \
@@ -1186,15 +1272,22 @@ pub(crate) fn bootstrap_minio_release_repo(
         "release-seed",
         "--ignore-not-found",
     ]))?;
-    // 3. Publish the `rube-goldberg` provider chain into MinIO. The sample-app cohorts point at
-    //    the MinIO repo for BOTH the app and the provider set, so the lifecycle artifact and the
-    //    set that references it must live here too — publishing the app baseline alone left every
-    //    agent stuck at `provider-set ... absent from verified metadata`, unable to roll. There is
-    //    no `server publish-provider-*` for S3, so this uses the S3-native `updatectl` publish
-    //    commands (added for exactly this). `demo-lifecycle` is the same binary release-server.sh
-    //    publishes into the mTLS repo; the 15s timeout matches. Each command prints `path sha256`
-    //    on stdout, so we chain artifact → set and read the set's sha to bind into the cohorts.
-    let provider_set = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
+    // 3. Publish the `rube-goldberg` provider chain into MinIO, in TWO variants from the SAME
+    //    `demo-lifecycle` binary so the demo can run both process seams side by side:
+    //      * `rube-goldberg`        — no `activate` script ⇒ the guardian STOP/STARTS the process
+    //                                 (a fresh launch reads the new version; restart-mode cohorts).
+    //      * `rube-goldberg-reload` — ships an `activate` script (the same binary) ⇒ the deployment
+    //                                 RELOADS IN PLACE; its `activate` phase SIGHUPs the live app so
+    //                                 the reexec-capable baseline reexecs into the new version and
+    //                                 readiness proves it (reexec-mode cohorts).
+    //    The sample-app cohorts resolve BOTH the app and their provider set from MinIO, so both
+    //    lifecycle artifacts and both sets must live here (publishing the app baseline alone left
+    //    every agent stuck at `provider-set ... absent from verified metadata`). There is no
+    //    `server publish-provider-*` for S3, so this uses the S3-native `updatectl` commands. Each
+    //    `publish-provider-set` prints `path sha256`; we emit both shas as `restart <sha>` /
+    //    `reload <sha>` lines and parse them to bind into the cohorts. Well-known set paths follow
+    //    the `--id` (`provider-sets/<id>.json`).
+    let provider_sets = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
         "-c",
@@ -1206,26 +1299,42 @@ pub(crate) fn bootstrap_minio_release_repo(
              art=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
                --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
                --product demo-enterprise-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
-               --activate bin/lifecycle \
                --source /tmp/rube --platform {platform}); \
              set -- $art; \
-             updatectl publish-provider-set --keys-dir /data/release-keys \
+             restart=$(updatectl publish-provider-set --keys-dir /data/release-keys \
                --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
                --id rube-goldberg --provider-path \"$1\" --provider-sha256 \"$2\" \
-               --provider-timeout-ms 15000"
+               --provider-timeout-ms 15000); \
+             artr=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
+               --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
+               --product demo-enterprise-lifecycle-reload --version 1.0.0 --entrypoint bin/lifecycle \
+               --activate bin/lifecycle --source /tmp/rube --platform {platform}); \
+             set -- $artr; \
+             reload=$(updatectl publish-provider-set --keys-dir /data/release-keys \
+               --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
+               --id rube-goldberg-reload --provider-path \"$1\" --provider-sha256 \"$2\" \
+               --provider-timeout-ms 15000); \
+             printf 'restart %s\\nreload %s\\n' \"$(echo $restart | awk '{{print $NF}}')\" \
+               \"$(echo $reload | awk '{{print $NF}}')\""
         ),
     ]))?;
-    // stdout's last field is the provider set's content-addressed sha256.
-    let provider_sha = provider_set
-        .split_whitespace()
-        .next_back()
-        .ok_or("updatectl publish-provider-set printed no provider-set path/sha")?
-        .to_owned();
+    // Parse the `restart <sha>` / `reload <sha>` lines into the two content-addressed set shas.
+    let field = |key: &str| {
+        provider_sets
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.split_whitespace().next())
+            .map(str::to_owned)
+    };
+    let restart_provider_sha =
+        field("restart ").ok_or("publish-provider-set printed no restart set sha")?;
+    let reload_provider_sha =
+        field("reload ").ok_or("publish-provider-set printed no reload set sha")?;
     Ok((
         release_root,
         baseline_path.trim().to_owned(),
         baseline_sha.trim().to_owned(),
-        provider_sha,
+        restart_provider_sha,
+        reload_provider_sha,
     ))
 }
 
@@ -1272,12 +1381,19 @@ pub(crate) fn apply_demo_resources(
         ]
     }))?;
     let platform = repository_platform()?;
-    let (release_root, baseline_path, baseline_sha, minio_provider_sha) =
+    let (release_root, baseline_path, baseline_sha, restart_provider_sha, reload_provider_sha) =
         bootstrap_minio_release_repo(&edge, &platform)?;
-    // The sample-app cohorts resolve their provider set from MinIO, so bind the sha
-    // `bootstrap_minio_release_repo` just published there. The path (`provider_path`) is the same
-    // well-known `provider-sets/rube-goldberg.json` target in either repo.
-    let provider_sha = minio_provider_sha.as_str();
+    // The sample-app cohorts resolve their provider set from MinIO, so bind the shas
+    // `bootstrap_minio_release_repo` just published there. Two variants of the same lifecycle
+    // chain are available so the demo runs both process seams: the caller-supplied `provider_path`
+    // (`provider-sets/rube-goldberg.json`) is the guardian-restart set; its reload-in-place twin is
+    // the well-known `-reload` set. Each cohort binds one or the other (see `mode_for`).
+    let restart_provider =
+        serde_json::json!({"path": provider_path, "sha256": restart_provider_sha.clone()});
+    let reload_provider = serde_json::json!({
+        "path": "provider-sets/rube-goldberg-reload.json",
+        "sha256": reload_provider_sha,
+    });
     let minio_release_repository = serde_json::json!({
         "metadataUrl": "http://minio:9000/updates/releases/metadata/",
         "targetsUrl": "http://minio:9000/updates/releases/targets/",
@@ -1287,15 +1403,30 @@ pub(crate) fn apply_demo_resources(
     // demo then rolls with `updatectl deploy`, not the release-server baseline the callers pass.
     let success_path = baseline_path.as_str();
     let success_sha = baseline_sha.as_str();
-    let group = |name: &str, cohort: &str, set: &str, path: &str, sha256: &str| {
+    let group = |name: &str, cohort: &str, set: &str, path: &str, sha256: &str, reload: bool| {
         let mut deployment = edge["spec"]["deployment"].clone();
         deployment["name"] = name.into();
         deployment["application"] = serde_json::json!({"path": path, "sha256": sha256});
         // Point the cohort at MinIO: this is the repository `updatectl deploy` publishes to and
         // patches. The Magnolia groups below keep edge's release-server repo (the default path).
         deployment["releaseRepository"] = minio_release_repository.clone();
-        deployment["providerSet"] =
-            serde_json::json!({"path": provider_path, "sha256": provider_sha});
+        // Bind the process seam this cohort demonstrates. The reload-in-place variant also arms the
+        // reexec-capable baseline: `--reload-mode reexec` makes the app reexec (same PID) on the
+        // SIGHUP the reload provider's `activate` phase sends, instead of the guardian restarting
+        // it. The restart cohorts inherit edge's default args (a plain `--addr` launch).
+        if reload {
+            deployment["providerSet"] = reload_provider.clone();
+            deployment["runtime"]["args"] = serde_json::json!([
+                "--addr",
+                "0.0.0.0:8080",
+                "--reload-mode",
+                "reexec",
+                "--reload-signal",
+                "HUP"
+            ]);
+        } else {
+            deployment["providerSet"] = restart_provider.clone();
+        }
         // Nodes write rollout telemetry here so the control plane can throttle the fleet.
         deployment["reportUrl"] = DEMO_REPORT_URL.into();
         // Signed opt-in to first-install ordered fallback: a killed, stateless agent
@@ -1361,12 +1492,16 @@ pub(crate) fn apply_demo_resources(
     .cloned()
     .expect("demo resource list is an array");
     for index in 0..DEMO_COHORT_COUNT {
+        // Split the fleet across both process seams, alternating by set so the UI interleaves
+        // them: even-numbered sets reload in place (reexec), odd-numbered sets guardian-restart.
+        let reload = cohort_set_index(index).is_multiple_of(2);
         items.push(group(
             &cohort_group(index),
             &cohort_label(index),
             &set_name(cohort_set_index(index)),
             success_path,
             success_sha,
+            reload,
         ));
     }
     // The two real-Magnolia cohorts (author, publisher): same clean group path, just
@@ -1486,12 +1621,15 @@ pub(crate) fn apply_demo_resources(
     // The external slice: same app + fast cadence as a cohort, but with NO fleet/set labels —
     // deliberately outside the per-set load balancers and the fleet throttle. It stands in for
     // a fleet that lives outside Kubernetes; the reconciler, not a selector, gives it endpoints.
+    // The external slice reloads in place (reexec): it stands in for an out-of-cluster fleet whose
+    // intermediary reloads the service without a supervisor-driven process restart.
     let mut external_group = group(
         DEMO_EXTERNAL_COHORT,
         DEMO_EXTERNAL_COHORT,
         DEMO_EXTERNAL_COHORT,
         success_path,
         success_sha,
+        true,
     );
     external_group["metadata"]
         .as_object_mut()
@@ -1563,7 +1701,7 @@ pub(crate) fn apply_demo_resources(
                 {"name":"DEMO_APPLICATION_PATH","value":green_path},
                 {"name":"DEMO_APPLICATION_SHA256","value":green_sha},
                 {"name":"DEMO_PROVIDER_PATH","value":provider_path},
-                {"name":"DEMO_PROVIDER_SHA256","value":provider_sha},
+                {"name":"DEMO_PROVIDER_SHA256","value":restart_provider_sha},
                 {"name":"DEMO_APPLICATION_URL","value":"http://agent-4.agents:8080"},
                 {"name":"DEMO_REPOSITORY_DATA","value":"/release-data"},
                 {"name":"AWS_ACCESS_KEY_ID","value":"minio"},

@@ -78,7 +78,11 @@ impl GoldenSignals {
         let availability =
             (requests > 0).then(|| (requests - errors) as f64 / requests as f64 * 100.0);
         let error_rate = availability.map(|avail| 100.0 - avail);
-        let mut latencies: Vec<u64> = window.samples.iter().map(|sample| sample.latency_ms).collect();
+        let mut latencies: Vec<u64> = window
+            .samples
+            .iter()
+            .map(|sample| sample.latency_ms)
+            .collect();
         latencies.sort_unstable();
         let percentile = |sorted: &[u64], p: f64| -> u64 {
             if sorted.is_empty() {

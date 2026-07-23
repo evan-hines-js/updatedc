@@ -57,7 +57,9 @@ pub(crate) fn cold_install_descends_past_wedged_head(ctx: &Ctx) -> R {
     drop(tower);
     kill_stray(&dir.join("install"));
     if !settled {
-        return fail("descended app served 1.0.0 but the committed install record never settled on it");
+        return fail(
+            "descended app served 1.0.0 but the committed install record never settled on it",
+        );
     }
     ok("cold-installed wedged assigned heads, stopped them, and ordered fallback descended past two to the healthy 1.0.0");
     Ok(())

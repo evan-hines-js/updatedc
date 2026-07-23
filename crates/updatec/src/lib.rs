@@ -15,20 +15,16 @@ pub use updated::config::{
 };
 pub use updated::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
 
+pub(crate) mod domain;
 pub mod gateway;
 pub mod join;
 pub mod publisher;
+pub(crate) mod rollout;
 pub mod runtime;
-pub mod throttle;
+pub mod subscription;
 pub mod window;
 
 pub use window::{CalendarEntry, RolloutWindow, Weekday};
-
-/// The control-plane label a join-mode agent is stamped with at `/join`, binding it to the group
-/// whose token it presented (`updated.dev/group=<group name>`). The plan compiler treats it as an
-/// implicit membership match, so a joined agent routes to its group's deployment without the
-/// operator having to hand-write the group's selector to include it.
-pub const GROUP_LABEL: &str = "updated.dev/group";
 
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[kube(
@@ -48,12 +44,12 @@ pub struct UpdateGroupSpec {
     pub repository_ref: LocalObjectReference,
     pub selector: LabelSelector,
     pub deployment: DeploymentSpec,
-    /// Rotate the group's join token. Changing this value to anything new makes the controller
-    /// regenerate the shared `nonce` Secret; the old token stops working immediately, and
-    /// already-joined nodes are unaffected (they hold their own node certificates). Absent or
-    /// unchanged leaves the current token in place.
+    /// Maximum unavailable agents while this group changes deployment. This is group rollout
+    /// policy, deliberately outside `deployment` so changing it does not change the signed
+    /// assignment identity. Defaults to one; zero is rejected during reconciliation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rotate_nonce: Option<String>,
+    #[schemars(range(min = 1))]
+    pub max_unavailable: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -69,11 +65,9 @@ pub struct DeploymentSpec {
     pub ordered_install_fallback: bool,
     pub provider_set: TargetSpec,
     pub runtime: RuntimeSpec,
-    /// Optional telemetry write location signed into each agent's assignment. Nodes
-    /// write their running-state document here; the control plane reads it back to
-    /// gate rollouts (see [`UpdateGroupSet`]). Absent disables completion gating.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub report_url: Option<String>,
+    /// Telemetry write location signed into each agent's assignment. Rollout safety requires
+    /// attributable node feedback, so every deployment must provide it.
+    pub report_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -115,7 +109,6 @@ pub struct HealthCheckSpec {
     pub kind: HealthCheckKindSpec,
     pub url: String,
 }
-
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -168,7 +161,7 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
             deployment: value.name,
             metadata_url: value.release_repository.metadata_url,
             targets_url: value.release_repository.targets_url,
-            report_url: value.report_url,
+            report_url: Some(value.report_url),
             application: ExactTarget {
                 path: value.application.path,
                 sha256: value.application.sha256,
@@ -249,17 +242,6 @@ pub struct UpdateGroupStatus {
     pub observed_generation: Option<i64>,
     pub matched_agents: Option<u32>,
     pub published_digest: Option<String>,
-    /// The stable group id minted by the controller (bound to the resource UID). Join-mode nodes
-    /// present it to `/join`; the control plane resolves it back to this group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_id: Option<String>,
-    /// The Secret holding this group's shared join token (`nonce`), minted and rotated by the
-    /// controller. Never the token itself — the control plane keeps the secret out of CRD status.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join_secret_ref: Option<LocalSecretReference>,
-    /// The `rotateNonce` value last applied, so a changed spec value triggers exactly one rotation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rotated_nonce: Option<String>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
 }
@@ -270,8 +252,8 @@ pub struct UpdateGroupStatus {
 /// more than [`Self::effective_max_concurrent`] members at once, holding the rest on
 /// their last-admitted deployment until an in-flight member settles (all its agents
 /// report the desired deployment, healthy). A member "settles" only through the node
-/// telemetry the control plane reads out of storage — when no telemetry is configured
-/// the operator logs and rolls without gating.
+/// telemetry the control plane reads out of storage. Deployments require a report URL;
+/// unverifiable or missing telemetry fails closed.
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[kube(
     group = "updated.dev",
@@ -318,10 +300,7 @@ impl UpdateGroupSetSpec {
     /// specially codified beyond the floor of 1.)
     pub fn effective_max_concurrent(&self, members: usize) -> usize {
         let ceiling = members.saturating_sub(1).max(1);
-        let requested = self
-            .max_concurrent
-            .map(|n| n as usize)
-            .unwrap_or(ceiling);
+        let requested = self.max_concurrent.map(|n| n as usize).unwrap_or(ceiling);
         requested.clamp(1, ceiling)
     }
 }
@@ -387,6 +366,13 @@ pub struct AgentIdentity {
     /// Present only for controller-created dynamic inventory. It binds retries to the
     /// nonce generated and durably stored by that installation.
     pub registration_sha256: Option<String>,
+    /// The node's pinned public key (hex uncompressed EC point), set at enrollment from its CSR —
+    /// the same key that certifies its mTLS leaf. Rollout planning verifies the node's *signed*
+    /// telemetry against this, so a report is attributable end-to-end (node → planner), not merely
+    /// authenticated on the write hop. `None` for a manual or pre-signing agent, whose reports then
+    /// fail verification and so fail closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -483,6 +469,65 @@ pub struct ResourceCondition {
     pub last_transition_time: String,
 }
 
+/// A generic webhook that is notified when a repository publishes a new generation. This is how
+/// external change-tracking systems (compliance engines, audit stores, chat notifiers) subscribe to
+/// updates without polling S3 or depending on bucket event notifications: the publisher pushes.
+///
+/// Delivery is at-least-once and rides the controller's single-writer reconcile. Each subscription
+/// carries a per-repository high-water mark in its status; every reconcile the controller delivers
+/// one event per generation from that mark up to the currently published version, advancing the
+/// mark on each success. A subscriber that was down is caught up on the next tick; nothing is
+/// skipped and, because the mark only moves forward on a delivered POST, nothing is lost.
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[kube(
+    group = "updated.dev",
+    version = "v1alpha1",
+    kind = "UpdateSubscription",
+    plural = "updatesubscriptions",
+    namespaced,
+    shortname = "usub",
+    status = "UpdateSubscriptionStatus",
+    printcolumn = r#"{"name":"URL","type":"string","jsonPath":".spec.webhook.url"}"#,
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type == 'Ready')].status"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSubscriptionSpec {
+    /// Where update events are delivered.
+    pub webhook: WebhookSpec,
+    /// Restrict this subscription to one repository. Omit to be notified for every
+    /// `UpdateRepository` in the namespace (each tracked independently in status).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_ref: Option<LocalObjectReference>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookSpec {
+    /// Absolute `http(s)` URL the controller `POST`s each update event to as JSON.
+    pub url: String,
+    /// Secret in the same namespace whose `key` entry is the HMAC-SHA256 secret used to sign the
+    /// request body. The signature rides `X-Updated-Signature: sha256=<hex>` so the subscriber can
+    /// authenticate the event and reject a forged one. Omit for an unsigned POST over TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<LocalSecretReference>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSubscriptionStatus {
+    pub observed_generation: Option<i64>,
+    /// Highest generation successfully delivered, per repository (repository name → version). One
+    /// entry per repository this subscription covers; the controller delivers versions above each
+    /// mark. Per-repository because each repository has its own independent generation counter.
+    #[serde(default)]
+    pub delivered_versions: BTreeMap<String, u64>,
+    /// RFC 3339 time of the most recent successful delivery, for operator visibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivery_time: Option<String>,
+    #[serde(default)]
+    pub conditions: Vec<ResourceCondition>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct S3Destination {
@@ -522,6 +567,7 @@ pub struct ResolvedGroup {
     pub name: String,
     pub match_labels: BTreeMap<String, String>,
     pub deployment: DesiredDeployment,
+    pub max_unavailable: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -539,34 +585,15 @@ pub enum PlanError {
     InvalidNodeName,
     InvalidPrefix,
     InvalidDeployment(String),
+    NodeDeploymentMismatch,
     Serialize(String),
 }
 
-impl std::fmt::Display for PlanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for PlanError {}
-
-/// Compile a deterministic, all-or-nothing TUF target batch.
-pub fn build_publication_plan(
-    repository: &UpdateRepositorySpec,
+/// Resolve selectors before rollout admission without constructing a throwaway publication.
+pub(crate) fn resolve_node_groups(
     groups: impl IntoIterator<Item = ResolvedGroup>,
     nodes: impl IntoIterator<Item = ResolvedNode>,
-) -> Result<PublicationPlan, PlanError> {
-    let prefix = repository.assignment_prefix.trim_matches('/');
-    if prefix.is_empty()
-        || prefix
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || prefix.contains(['\\', ':'])
-        || prefix.chars().any(char::is_control)
-    {
-        return Err(PlanError::InvalidPrefix);
-    }
-
+) -> Result<BTreeMap<String, String>, PlanError> {
     let mut indexed = BTreeMap::new();
     for group in groups {
         let name = group.name.clone();
@@ -577,15 +604,6 @@ pub fn build_publication_plan(
             return Err(PlanError::DuplicateGroup(name));
         }
     }
-    let mut group_bytes = BTreeMap::new();
-    let default = DesiredDeployment::try_from(repository.default_deployment.clone())
-        .map_err(PlanError::InvalidDeployment)?;
-    group_bytes.insert("default".to_string(), canonical_json(&default)?);
-    for (name, group) in &indexed {
-        let bytes = canonical_json(&group.deployment)?;
-        group_bytes.insert(name.clone(), bytes);
-    }
-
     let mut node_groups = BTreeMap::new();
     for node in nodes {
         let name = node.name;
@@ -602,12 +620,7 @@ pub fn build_publication_plan(
         }
         let matches: Vec<_> = indexed
             .iter()
-            .filter(|(group_name, group)| {
-                // A join-mode agent carries the group-membership label directly; a mount-mode agent
-                // matches through the group's selector. Either binds the node to the group.
-                node.labels.get(GROUP_LABEL).map(String::as_str) == Some(group_name.as_str())
-                    || selector_matches(&group.match_labels, &node.labels)
-            })
+            .filter(|(_, group)| selector_matches(&group.match_labels, &node.labels))
             .map(|(name, _)| name.clone())
             .collect();
         let selected = match matches.as_slice() {
@@ -617,31 +630,66 @@ pub fn build_publication_plan(
                 return Err(PlanError::AmbiguousNode {
                     node: name,
                     groups: matches,
-                })
+                });
             }
         };
         node_groups.insert(name, selected);
     }
+    Ok(node_groups)
+}
 
+impl std::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for PlanError {}
+
+/// Compile the deterministic, all-or-nothing publication selected by rollout admission.
+/// Config targets are content-addressed, so nodes held on the same deployment share one target
+/// without conflating deployment choice with group membership.
+pub(crate) fn build_publication_plan(
+    repository: &UpdateRepositorySpec,
+    node_groups: BTreeMap<String, String>,
+    node_deployments: BTreeMap<String, DesiredDeployment>,
+) -> Result<PublicationPlan, PlanError> {
+    let prefix = repository.assignment_prefix.trim_matches('/');
+    if prefix.is_empty()
+        || prefix
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || prefix.contains(['\\', ':'])
+        || prefix.chars().any(char::is_control)
+    {
+        return Err(PlanError::InvalidPrefix);
+    }
+    if node_groups.keys().ne(node_deployments.keys()) {
+        return Err(PlanError::NodeDeploymentMismatch);
+    }
     let mut targets = Vec::new();
-    let mut group_references = BTreeMap::new();
-    for (name, bytes) in &group_bytes {
-        let group = target(format!("{prefix}/configs/{name}.json"), bytes.clone());
-        group_references.insert(
-            name.clone(),
+    let mut references = BTreeMap::new();
+    for deployment in node_deployments.values() {
+        let bytes = canonical_json(deployment)?;
+        let id = hex_digest(&bytes);
+        if references.contains_key(&id) {
+            continue;
+        }
+        let config = target(format!("{prefix}/configs/{id}.json"), bytes);
+        references.insert(
+            id,
             ExactTarget {
-                path: group.path.clone(),
-                sha256: group.sha256.clone(),
+                path: config.path.clone(),
+                sha256: config.sha256.clone(),
             },
         );
-        targets.push(group);
+        targets.push(config);
     }
-    for (node, group) in &node_groups {
+    for (node, deployment) in &node_deployments {
+        let id = hex_digest(&canonical_json(deployment)?);
         let assignment = updated::config::AgentDocument {
             schema: 1,
-            config: group_references[group].clone(),
-            // Populated with observed rotation state in a later reconcile stage; the routing
-            // pointer is signed unconditionally.
+            config: references[&id].clone(),
             status: None,
         };
         let bytes = serde_json::to_vec(&assignment)
@@ -746,7 +794,7 @@ mod tests {
             deployment: id.into(),
             metadata_url: "https://cdn.example/tuf/metadata/".into(),
             targets_url: "https://cdn.example/tuf/targets/".into(),
-            report_url: None,
+            report_url: Some("https://control.example/v1/telemetry".into()),
             application: ExactTarget {
                 path: "app".into(),
                 sha256: "1".repeat(64),
@@ -836,7 +884,7 @@ mod tests {
     fn deployment_spec(id: &str) -> DeploymentSpec {
         DeploymentSpec {
             name: id.into(),
-            report_url: None,
+            report_url: "https://control.example/v1/telemetry".into(),
             release_repository: ReleaseRepositorySpec {
                 metadata_url: "https://cdn.example/tuf/metadata/".into(),
                 targets_url: "https://cdn.example/tuf/targets/".into(),
@@ -863,6 +911,7 @@ mod tests {
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
             deployment: deployment(name),
+            max_unavailable: 1,
         }
     }
 
@@ -898,19 +947,15 @@ mod tests {
 
     #[test]
     fn agent_documents_point_to_the_exact_selected_config_bundle() {
-        let plan = build_publication_plan(
-            &repository(),
-            [group("edge", &[("role", "edge")])],
-            [node("a", &[("role", "edge")]), node("b", &[])],
-        )
-        .unwrap();
+        let node_groups =
+            BTreeMap::from([("a".into(), "edge".into()), ("b".into(), "default".into())]);
+        let node_deployments = BTreeMap::from([
+            ("a".into(), deployment("edge")),
+            ("b".into(), deployment("default")),
+        ]);
+        let plan = build_publication_plan(&repository(), node_groups, node_deployments).unwrap();
         assert_eq!(plan.node_groups["a"], "edge");
         assert_eq!(plan.node_groups["b"], "default");
-        let config = plan
-            .targets
-            .iter()
-            .find(|t| t.path == "assignments/configs/edge.json")
-            .unwrap();
         let node = plan
             .targets
             .iter()
@@ -918,15 +963,18 @@ mod tests {
             .unwrap();
         let assignment: updated::config::AgentDocument =
             serde_json::from_slice(&node.bytes).unwrap();
-        assert_eq!(assignment.config.path, config.path);
+        let config = plan
+            .targets
+            .iter()
+            .find(|target| target.path == assignment.config.path)
+            .unwrap();
         assert_eq!(assignment.config.sha256, config.sha256);
         assert_ne!(node.bytes, config.bytes);
     }
 
     #[test]
     fn overlapping_non_default_groups_fail_closed() {
-        let error = build_publication_plan(
-            &repository(),
+        let error = resolve_node_groups(
             [
                 group("a", &[("role", "edge")]),
                 group("b", &[("role", "edge")]),
@@ -945,16 +993,18 @@ mod tests {
 
     #[test]
     fn output_is_deterministic_across_input_order() {
-        let first = build_publication_plan(
-            &repository(),
-            [group("edge", &[("role", "edge")])],
-            [node("b", &[]), node("a", &[("role", "edge")])],
-        )
-        .unwrap();
+        let mappings =
+            BTreeMap::from([("a".into(), "edge".into()), ("b".into(), "default".into())]);
+        let deployments = BTreeMap::from([
+            ("a".into(), deployment("edge")),
+            ("b".into(), deployment("default")),
+        ]);
+        let first =
+            build_publication_plan(&repository(), mappings.clone(), deployments.clone()).unwrap();
         let second = build_publication_plan(
             &repository(),
-            [group("edge", &[("role", "edge")])],
-            [node("a", &[("role", "edge")]), node("b", &[])],
+            mappings.into_iter().rev().collect(),
+            deployments.into_iter().rev().collect(),
         )
         .unwrap();
         assert_eq!(first, second);

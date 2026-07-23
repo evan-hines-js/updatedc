@@ -129,29 +129,17 @@ rm -rf "$WORK"
 mkdir -p "$BIN" "$WORK/guardian-state"
 (cd "$ROOT" && cargo build --release -p server -p bootstrap -p supervisor)
 cp "$ROOT/target/release/"{server,bootstrap,supervisor} "$BIN/"
-cp "$ROOT/scripts/haproxy-activate.sh" "$BIN/activate"
-chmod 0755 "$BIN/activate"
-cat >"$BIN/lifecycle" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-case "${UPDATED_LIFECYCLE_PHASE:?}" in
-  preflight)
-    exec "$UPDATED_CANDIDATE/bin/haproxy" -c -f "$UPDATED_CANDIDATE/config/haproxy.cfg"
-    ;;
-  activate)
-    exec "$(dirname "$0")/activate" "$UPDATED_CANDIDATE" "$UPDATED_INSTALL_ROOT/runtime" "$UPDATED_CHILD_PID"
-    ;;
-  drain|prepare|stop|start|verify|finalize|rollback)
-    exit 0
-    ;;
-esac
-EOF
+# The lifecycle provider and its helpers are the real, tested bundle scripts under scripts/haproxy/ —
+# the same bytes the demo publishes — so this e2e proves the shipped provider, not an inline copy.
+cp "$ROOT/scripts/haproxy/lifecycle" "$BIN/lifecycle"
+cp "$ROOT/scripts/haproxy/lib.sh" "$BIN/lib.sh"
 chmod 0755 "$BIN/lifecycle"
 
 "$BIN/server" init --repo "$REPO" --keys "$KEYS"
 mkdir -p "$WORK/adapter/bin"
-cp "$BIN/lifecycle" "$WORK/adapter/bin/lifecycle"
-cp "$BIN/activate" "$WORK/adapter/bin/activate"
+cp "$ROOT/scripts/haproxy/lifecycle" "$WORK/adapter/bin/lifecycle"
+cp "$ROOT/scripts/haproxy/lib.sh" "$WORK/adapter/bin/lib.sh"
+chmod 0755 "$WORK/adapter/bin/lifecycle"
 "$BIN/server" publish-provider-artifact --repo "$REPO" --keys "$KEYS" \
   --product app-lifecycle --version 1.0.0 \
   --bundle "linux-x86_64=$WORK/adapter" --entrypoint bin/lifecycle
@@ -162,21 +150,11 @@ provider_path="products/app-lifecycle/stable/1.0.0/linux-x86_64/app-lifecycle"
 for version in 1.0.0 2.0.0 4.0.0; do make_config "$WORK/bundle-$version" "$version"; done
 make_config "$WORK/bundle-3.0.0" 3.0.0 invalid-binary
 
-# The launcher is the manifested entrypoint only for first process creation. It puts
-# HAProxy at a stable path; subsequent upgrades are HAProxy's own SIGUSR2 re-execs.
+# The launcher is the manifested entrypoint only for first process creation. It puts HAProxy at a
+# stable path; subsequent upgrades are HAProxy's own SIGUSR2 re-execs. It is the real bundle
+# launcher (scripts/haproxy/launch), the same one the demo ships.
 for tree in "$WORK"/bundle-*; do
-  cat >"$tree/bin/launch" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-runtime="$UPDATED_INSTALL_ROOT/runtime"
-mkdir -p "$runtime"
-cp "$(dirname "$0")/haproxy" "$runtime/.haproxy.initial"
-chmod 0755 "$runtime/.haproxy.initial"
-cp "$(dirname "$0")/../config/haproxy.cfg" "$runtime/.haproxy.cfg.initial"
-mv -f "$runtime/.haproxy.initial" "$runtime/haproxy"
-mv -f "$runtime/.haproxy.cfg.initial" "$runtime/haproxy.cfg"
-exec "$runtime/haproxy" -W -db -f "$runtime/haproxy.cfg" -p "$runtime/haproxy.pid"
-EOF
+  cp "$ROOT/scripts/haproxy/launch" "$tree/bin/launch"
   chmod 0755 "$tree/bin/launch"
 done
 
@@ -190,10 +168,16 @@ publish 1.0.0 "$WORK/bundle-1.0.0"
 "$BIN/server" export-enrollment --repo "$REPO" --assignment assignments/agents/agent.json \
   --agent-id agent --routing-base-url "http://127.0.0.1:$REPO_PORT/" \
   --output "$WORK/guardian-state/enrollment.json"
+# Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never calls
+# /enroll — but the bootstrap config must still be a complete, valid EnrollmentBootstrap. The name
+# and cert paths are never read in this offline path; they only satisfy config validation.
 cat >"$BOOTSTRAP" <<EOF
 [enrollment]
 url = "http://127.0.0.1:$REPO_PORT/"
-key = "unused-preplaced"
+name = "agent"
+client_cert = "unused-preplaced.crt"
+client_key = "unused-preplaced.key"
+ca = "unused-preplaced-ca.crt"
 EOF
 
 : >"$TOWER_LOG"; : >"$REPO_LOG"; : >"$TRAFFIC_LOG"

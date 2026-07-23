@@ -43,7 +43,8 @@ fn content_length(headers: &[u8]) -> usize {
         .lines()
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.trim().eq_ignore_ascii_case("content-length")
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
                 .then(|| value.trim().parse().ok())
                 .flatten()
         })
@@ -52,7 +53,10 @@ fn content_length(headers: &[u8]) -> usize {
 
 /// A JSON error response in the `(status, content_type, body)` shape every route arm returns —
 /// `{"error": "<message>"}` with `application/json`. Collapses the ~10 identical error arms below.
-fn json_error(status: &'static str, error: impl std::fmt::Display) -> (&'static str, &'static str, String) {
+fn json_error(
+    status: &'static str,
+    error: impl std::fmt::Display,
+) -> (&'static str, &'static str, String) {
     (
         status,
         "application/json",
@@ -60,7 +64,10 @@ fn json_error(status: &'static str, error: impl std::fmt::Display) -> (&'static 
     )
 }
 
-pub(crate) async fn serve(mut stream: TcpStream, demo: Demo) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn serve(
+    mut stream: TcpStream,
+    demo: Demo,
+) -> Result<(), Box<dyn std::error::Error>> {
     let request = read_request(&mut stream).await?;
     let request = request.as_str();
     let mut words = request

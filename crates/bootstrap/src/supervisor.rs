@@ -8,8 +8,10 @@
 
 use std::io;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
+
+use foundation::process::ContainedChild;
 
 use crate::rand;
 use crate::sys::Channel;
@@ -17,9 +19,12 @@ use control::{Nonce, Request, Response, APP_PID_ENV, CONTROL_ENV, READY_NONCE_EN
 
 const POLL: Duration = Duration::from_millis(100);
 
-/// A launched supervisor and the guardian's end of its control channel.
+/// A launched supervisor and the guardian's end of its control channel. The supervisor is
+/// death-contained ([`ContainedChild`]): a SIGKILLed guardian can never orphan it — on
+/// Linux `PR_SET_PDEATHSIG` has the kernel kill it, on Windows the kill-on-close job object
+/// ties its lifetime to the guardian's handle.
 pub struct Supervisor {
-    child: Child,
+    child: ContainedChild,
     channel: Channel,
     nonce: Nonce,
     stop_grace: Duration,
@@ -53,7 +58,20 @@ impl Supervisor {
                 cmd.env_remove(APP_PID_ENV);
             }
         }
-        let child = cmd.spawn()?;
+        // Death-contain the supervisor so a SIGKILLed guardian can never orphan it — it is
+        // the guardian's disposable child, exactly the "churning tower" case `ContainedChild`
+        // exists for. On Linux `arrange_parent_death_signal` adds `PR_SET_PDEATHSIG`; on
+        // Windows the kill-on-close job `ContainedChild` assigns ties the supervisor to the
+        // guardian's handle. `CREATE_NEW_PROCESS_GROUP` (Windows) additionally puts it in its
+        // own process group so the guardian can signal it with `CTRL_BREAK` for a graceful
+        // stop, mirroring the Unix `SIGTERM` path (see `sys::terminate_gracefully`).
+        foundation::process::arrange_parent_death_signal(&mut cmd);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+        }
+        let child = ContainedChild::spawn(cmd)?;
         // The supervisor inherited the child end; the guardian drops its copy so it is
         // the sole holder of the guardian end (and the channel closes when the
         // supervisor dies).
@@ -87,7 +105,8 @@ impl Supervisor {
                 Err(_) => break,
             }
         }
-        let _ = self.child.kill();
+        // Grace expired: hard-kill the whole supervisor tree, not just the root child.
+        let _ = self.child.kill_tree();
         let _ = self.child.wait();
     }
 }

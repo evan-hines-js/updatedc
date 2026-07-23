@@ -87,13 +87,26 @@ async fn membership_reflects_each_node_health_and_drives_the_balancer() {
     ]);
     let client = reqwest::Client::new();
 
-    let members = resolve_members(&client, &base, &inventory).await;
+    let mut cache = std::collections::HashMap::new();
+    let members = resolve_members(&client, &base, &inventory, &mut cache).await;
     assert_eq!(
         members,
         vec![
-            Member { node: "agent-0".into(), address: "10.0.0.1".into(), ready: true },
-            Member { node: "agent-1".into(), address: "10.0.0.2".into(), ready: false },
-            Member { node: "agent-2".into(), address: "10.0.0.3".into(), ready: false },
+            Member {
+                node: "agent-0".into(),
+                address: "10.0.0.1".into(),
+                ready: true
+            },
+            Member {
+                node: "agent-1".into(),
+                address: "10.0.0.2".into(),
+                ready: false
+            },
+            Member {
+                node: "agent-2".into(),
+                address: "10.0.0.3".into(),
+                ready: false
+            },
         ]
     );
 
@@ -105,7 +118,45 @@ async fn membership_reflects_each_node_health_and_drives_the_balancer() {
     // Only the healthy, settled node is in rotation; the rest are present but not-ready, so
     // the balancer keeps routing to agent-0 alone.
     assert_eq!(
-        programmed.iter().filter(|m| m.ready).map(|m| m.node.as_str()).collect::<Vec<_>>(),
+        programmed
+            .iter()
+            .filter(|m| m.ready)
+            .map(|m| m.node.as_str())
+            .collect::<Vec<_>>(),
         vec!["agent-0"]
+    );
+}
+
+/// A transient CDN outage must not drain an otherwise-healthy fleet: a node fetched ready one cycle
+/// stays ready the next when the CDN is unreachable, because the last good report is reused (still
+/// within `REPORT_FRESHNESS`). This is the difference between failing closed on a genuine not-ready
+/// report and blindly mass-evicting when the checker's own dependency blinks.
+#[tokio::test]
+async fn a_transient_cdn_outage_does_not_drain_a_freshly_healthy_node() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let cdn = spawn_cdn(vec![("agent-0".into(), true)]).await;
+    let live = format!("http://{cdn}");
+    let inventory = inventory(&[("agent-0", "10.0.0.1")]);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let mut cache = std::collections::HashMap::new();
+
+    // Cycle 1: the live CDN reports the node healthy; the cache is populated.
+    let live_members = resolve_members(&client, &live, &inventory, &mut cache).await;
+    assert!(
+        live_members[0].ready,
+        "node should be ready from the live CDN"
+    );
+
+    // Cycle 2: the CDN is unreachable (a dead endpoint stands in for the outage). The fresh fetch
+    // fails, but the cached healthy report is still within the freshness window, so the node stays
+    // in rotation instead of being drained by a transport error alone.
+    let dead = "http://127.0.0.1:1";
+    let outage_members = resolve_members(&client, dead, &inventory, &mut cache).await;
+    assert!(
+        outage_members[0].ready,
+        "a healthy node must survive a transient CDN outage via its last good report"
     );
 }

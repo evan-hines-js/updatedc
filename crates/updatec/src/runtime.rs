@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-use k8s_openapi::api::core::v1::Secret;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, OwnerReference};
 use k8s_openapi::ByteString;
 use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use kube::{Client, Resource, ResourceExt};
@@ -13,12 +13,12 @@ use object_store::aws::AmazonS3Builder;
 use object_store::{ObjectStore, PutPayload};
 
 use crate::publisher::{upload_order, PublishError};
-use crate::throttle::{apply_throttle, SetStatus, ThrottleInputs};
+use crate::rollout::SetStatus;
 use crate::S3Destination;
 use crate::{
-    build_publication_plan, ResolvedGroup, ResolvedNode, ResourceCondition, UpdateAgent,
-    UpdateAgentStatus, UpdateGroup, UpdateGroupSet, UpdateGroupSetStatus, UpdateGroupStatus,
-    UpdateRepository, UpdateRepositoryStatus,
+    ResolvedGroup, ResolvedNode, ResourceCondition, UpdateAgent, UpdateAgentStatus, UpdateGroup,
+    UpdateGroupSet, UpdateGroupSetStatus, UpdateGroupStatus, UpdateRepository,
+    UpdateRepositoryStatus, UpdateSubscription,
 };
 use sha2::{Digest, Sha256};
 use updated::telemetry::NodeReport;
@@ -71,6 +71,11 @@ pub async fn acquire_or_renew_lease(
         }
     }
     *spec = next;
+    // `lease` still carries the `resourceVersion` we read, so this PUT is a compare-and-swap: if any
+    // other candidate acquired or renewed in the meantime, the apiserver rejects it with a 409 and we
+    // become a follower. That makes the lease a strict single writer — two candidates can never both
+    // believe they hold it — which, together with the in-cluster admitted set, is what serializes
+    // publication across a leader change.
     match leases.replace(name, &PostParams::default(), &lease).await {
         Ok(_) => Ok(true),
         Err(kube::Error::Api(error)) if error.code == 409 => Ok(false),
@@ -100,6 +105,27 @@ fn lease_expired(spec: &LeaseSpec, now: chrono::DateTime<chrono::Utc>) -> bool {
     };
     let seconds = spec.lease_duration_seconds.unwrap_or_default().max(0) as i64;
     renewed + chrono::Duration::seconds(seconds) <= now
+}
+
+/// Read-only check that `identity` still holds the lease `name` and it has not expired. Used to
+/// re-verify leadership right before the irreversible S3 publish: the main loop only renews on a 5s
+/// tick, and CPU-bound TUF signing can starve that past the lease deadline, so a former leader whose
+/// lease was already taken over could otherwise keep uploading.
+async fn holds_lease(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    identity: &str,
+) -> Result<bool, kube::Error> {
+    let leases: Api<Lease> = Api::namespaced(client.clone(), namespace);
+    let Some(lease) = leases.get_opt(name).await? else {
+        return Ok(false);
+    };
+    let Some(spec) = lease.spec else {
+        return Ok(false);
+    };
+    Ok(spec.holder_identity.as_deref() == Some(identity)
+        && !lease_expired(&spec, chrono::Utc::now()))
 }
 
 #[derive(Debug)]
@@ -220,19 +246,155 @@ fn from_publish(error: PublishError) -> StorageError {
     StorageError(error.to_string())
 }
 
+/// Whether the object store already holds a published TUF generation (its `timestamp.json`). Used
+/// to fail closed when the local publisher state is empty but the store is not — re-initializing a
+/// fresh v1 TUF repo over an existing higher-versioned one would roll the generation back below the
+/// fleet's rollback floor and stall convergence.
+async fn store_has_published_metadata(
+    store: &dyn ObjectStore,
+    destination: &S3Destination,
+) -> Result<bool, StorageError> {
+    let key = crate::object_key(&destination.prefix, "metadata/timestamp.json");
+    match store.head(&key).await {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(e) => Err(StorageError(format!("probing published metadata: {e}"))),
+    }
+}
+
+/// The finalizer that keeps a deleted [`UpdateRepository`] in `Terminating` until its published
+/// object-storage prefix has been pruned. The signed TUF metadata and bundles under that prefix are
+/// durable, external state Kubernetes garbage collection cannot reach, so without this a deleted
+/// repository would orphan signed artifacts in the bucket/CDN indefinitely. In-cluster children
+/// (enrollment/join Secrets, the admitted-state ConfigMap) instead carry owner references and are
+/// reclaimed by ordinary Kubernetes GC — the finalizer is reserved for what GC cannot see.
+const REPOSITORY_FINALIZER: &str = "updated.dev/published-artifacts";
+
+/// The finalizer list with ours appended, or `None` if it is already present (so the caller can skip
+/// a needless write). A foreign finalizer another controller owns is preserved.
+fn finalizers_with(existing: &[String]) -> Option<Vec<String>> {
+    if existing.iter().any(|f| f == REPOSITORY_FINALIZER) {
+        return None;
+    }
+    let mut next = existing.to_vec();
+    next.push(REPOSITORY_FINALIZER.to_string());
+    Some(next)
+}
+
+/// The finalizer list with ours removed, retaining any others a different controller owns.
+fn finalizers_without(existing: &[String]) -> Vec<String> {
+    existing
+        .iter()
+        .filter(|f| f.as_str() != REPOSITORY_FINALIZER)
+        .cloned()
+        .collect()
+}
+
+/// Add our finalizer to a live repository if it is missing, so a later deletion is held open until
+/// the published prefix is pruned. A merge patch of the full finalizer list; skipped when present.
+async fn ensure_repository_finalizer(
+    repositories: &Api<UpdateRepository>,
+    repository: &UpdateRepository,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(finalizers) = finalizers_with(repository.finalizers()) else {
+        return Ok(());
+    };
+    repositories
+        .patch(
+            &repository.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "metadata": { "finalizers": finalizers } })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Prune a deleting repository's published prefix, then drop our finalizer so Kubernetes can complete
+/// deletion. Idempotent and resumable: the finalizer holds the object in `Terminating`, so a crash
+/// mid-prune simply re-runs next reconcile, and re-pruning an already-empty prefix is a no-op.
+async fn finalize_repository(
+    repositories: &Api<UpdateRepository>,
+    secrets: &Api<Secret>,
+    repository: &UpdateRepository,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !repository
+        .finalizers()
+        .iter()
+        .any(|f| f == REPOSITORY_FINALIZER)
+    {
+        // A prior pass already pruned and released the finalizer; nothing left but to let GC finish.
+        return Ok(());
+    }
+    let store = build_store(secrets, &repository.spec.s3).await?;
+    let pruned = prune_prefix(store.as_ref(), &repository.spec.s3.prefix).await?;
+    tracing::info!(
+        repository = %repository.name_any(),
+        prefix = %repository.spec.s3.prefix,
+        pruned,
+        "pruned a deleted repository's published artifacts",
+    );
+    repositories
+        .patch(
+            &repository.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "finalizers": finalizers_without(repository.finalizers()) }
+            })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Delete every object under `prefix` in `store`, returning the count removed. Locations are collected
+/// before deletion so the list connection is not held open across the deletes; a TUF repository's
+/// object count is modest (metadata plus a bounded set of bundles), so this stays bounded. An empty
+/// prefix scopes to the whole bucket — the repository's contract is that its prefix namespaces exactly
+/// its own artifacts.
+async fn prune_prefix(store: &dyn ObjectStore, prefix: &str) -> Result<usize, StorageError> {
+    let trimmed = prefix.trim_matches('/');
+    let scope = (!trimmed.is_empty()).then(|| object_store::path::Path::from(trimmed));
+    let mut listing = store.list(scope.as_ref());
+    let mut locations = Vec::new();
+    while let Some(entry) = listing.next().await {
+        let meta = entry.map_err(|e| StorageError(format!("listing objects to prune: {e}")))?;
+        locations.push(meta.location);
+    }
+    drop(listing);
+    let pruned = locations.len();
+    for location in locations {
+        store
+            .delete(&location)
+            .await
+            .map_err(|e| StorageError(format!("deleting {location}: {e}")))?;
+    }
+    Ok(pruned)
+}
+
 pub async fn reconcile_once(
     client: Client,
     namespace: &str,
     repository_name: &str,
     state_dir: &Path,
     public_url: &str,
+    identity: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let repositories: Api<UpdateRepository> = Api::namespaced(client.clone(), namespace);
     let repository = repositories.get(repository_name).await?;
     let groups_api: Api<UpdateGroup> = Api::namespaced(client.clone(), namespace);
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let nodes_api: Api<UpdateAgent> = Api::namespaced(client.clone(), namespace);
-    let sets_api: Api<UpdateGroupSet> = Api::namespaced(client, namespace);
+    let sets_api: Api<UpdateGroupSet> = Api::namespaced(client.clone(), namespace);
+    let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+
+    // Finalizer gate. The published TUF metadata and signed bundles live under this repository's S3
+    // prefix — durable, external state Kubernetes GC cannot reach — so a finalizer holds a deleted
+    // UpdateRepository in `Terminating` until that prefix is pruned, and is placed on a live one so
+    // the guarantee is in effect before anything is ever published.
+    if repository.metadata.deletion_timestamp.is_some() {
+        finalize_repository(&repositories, &secrets, &repository).await?;
+        return Ok(format!("finalized repository {repository_name}"));
+    }
+    ensure_repository_finalizer(&repositories, &repository).await?;
 
     let mut group_resources = groups_api.list(&ListParams::default()).await?;
     group_resources
@@ -278,6 +440,20 @@ pub async fn reconcile_once(
                 name: name.clone(),
                 match_labels: group.spec.selector.match_labels.clone(),
                 deployment,
+                max_unavailable: match group.spec.max_unavailable {
+                    Some(0) => {
+                        quarantine_group(
+                            &groups_api,
+                            group,
+                            "InvalidMaxUnavailable",
+                            "maxUnavailable must be at least one",
+                        )
+                        .await?;
+                        quarantined_groups.insert(name);
+                        continue;
+                    }
+                    value => value.unwrap_or(1),
+                },
             },
         );
         group_labels.insert(name, group.labels().clone());
@@ -286,25 +462,16 @@ pub async fn reconcile_once(
         .items
         .retain(|group| !quarantined_groups.contains(&group.name_any()));
 
-    // Join-mode enrollment: ensure each surviving group has a stable id and a shared join-token
-    // Secret, minting or rotating as needed. A failure here withholds new joins for that group
-    // until a later reconcile but never blocks the rest of publication.
-    for group in group_resources.iter() {
-        if let Err(error) =
-            ensure_group_join_credentials(&groups_api, &secrets, namespace, group).await
-        {
-            tracing::warn!(group = %group.name_any(), %error, "ensuring group join credentials failed");
-        }
-    }
-
     let mut agent_resources = nodes_api.list(&ListParams::default()).await?;
     agent_resources
         .items
         .retain(|agent| agent.spec.repository_ref.name == repository_name);
-    // Quarantine an agent — never the whole reconcile — when its identity is malformed or its
-    // labels match more than one non-default group (overlapping selectors). Ambiguity is
-    // detected here, exactly as `build_publication_plan` would, so the surviving fleet still
-    // publishes and the plan below cannot then fault on this agent.
+    // Quarantine a malformed-identity agent — never the whole reconcile — and drop it from this
+    // generation: a bad identity never resolved to an assignment, so there is nothing to preserve.
+    // Overlapping selectors are deliberately NOT handled here. An ambiguous node must hold the last
+    // known-good routing (fail safe, never fail open — docs/state-machines.md), so we leave it in
+    // the plan and let `build_publication_plan` fault the whole generation closed with
+    // `AmbiguousNode`; `reconcile_once` returns that error and the previous publication stays live.
     let mut quarantined_agents: HashSet<String> = HashSet::new();
     for agent in &agent_resources.items {
         let identity = &agent.spec.identity;
@@ -324,25 +491,6 @@ pub async fn reconcile_once(
             )
             .await?;
             quarantined_agents.insert(agent.name_any());
-            continue;
-        }
-        let matches: Vec<String> = groups
-            .iter()
-            .filter(|(_, group)| crate::selector_matches(&group.match_labels, &agent.spec.labels))
-            .map(|(name, _)| name.clone())
-            .collect();
-        if matches.len() > 1 {
-            quarantine_agent(
-                &nodes_api,
-                agent,
-                "AmbiguousSelector",
-                &format!(
-                    "This agent's labels match multiple groups ({}); refine selectors so at most one matches.",
-                    matches.join(", ")
-                ),
-            )
-            .await?;
-            quarantined_agents.insert(agent.name_any());
         }
     }
     agent_resources
@@ -358,20 +506,24 @@ pub async fn reconcile_once(
         .collect();
 
     // The object store is needed every reconcile — not only to publish, but to read the
-    // node telemetry that drives throttling — so build it up front.
+    // node telemetry that drives rollout planning — so build it up front.
     let store = build_store(&secrets, &repository.spec.s3).await?;
 
-    // Map nodes to groups from the desired generation (selectors are independent of the
-    // throttle), then apply each UpdateGroupSet's throttle so held-back members carry
-    // their last-admitted deployment before the plan is signed.
-    let mapping_plan = build_publication_plan(
-        &repository.spec,
-        groups.values().cloned(),
-        resolved_nodes.clone(),
-    )?;
-    let agent_names: Vec<String> = resolved_nodes.iter().map(|node| node.name.clone()).collect();
-    let reports =
-        read_node_reports(store.as_ref(), &repository.spec.s3.prefix, &agent_names).await;
+    let agent_names: Vec<String> = resolved_nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect();
+    let reports = read_node_reports(store.as_ref(), &repository.spec.s3.prefix, &agent_names).await;
+    // Node → pinned public key (raw EC point), decoded from each agent's enrollment identity. The
+    // planner verifies every report's signature against it, so only health it can cryptographically
+    // attribute to the node itself advances a rollout — a forged or tampered report is ignored.
+    let public_keys: HashMap<String, Vec<u8>> = agent_resources
+        .iter()
+        .filter_map(|agent| {
+            let hex_point = agent.spec.identity.public_key.as_ref()?;
+            Some((agent.name_any(), hex::decode(hex_point).ok()?))
+        })
+        .collect();
     let mut set_resources = sets_api.list(&ListParams::default()).await?;
     set_resources.items.sort_by_key(|set| set.name_any());
     // Surface misconfigured schedule entries in the controller log. An invalid window or
@@ -396,24 +548,50 @@ pub async fn reconcile_once(
             }
         }
     }
-    let admitted_dir = state_dir.join("admitted");
-    let set_statuses = apply_throttle(
-        &set_resources.items,
-        ThrottleInputs {
-            groups: &mut groups,
+    // The admitted set (each group's currently-pinned deployment) lives durably in-cluster — a
+    // ConfigMap keyed by group — NOT on the node-local PVC. That is what survives an HA leader
+    // change or a cold/rescheduled PVC: a fresh leader loads the real admitted baseline from etcd
+    // instead of re-seeding every group to the current desired and admitting a whole set at once
+    // (the `max_concurrent` breach that node-local state allowed). The single publisher lease keeps
+    // this a single writer; the write below is a resourceVersion compare-and-swap as a second guard.
+    let admitted_name = admitted_configmap_name(repository_name);
+    let (mut admitted, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
+    let reconcile_now = chrono::Utc::now();
+    let outcome = crate::domain::plan_reconcile(
+        crate::domain::DesiredState {
+            repository: &repository.spec,
+            groups: &groups,
             group_labels: &group_labels,
-            node_groups: &mapping_plan.node_groups,
-            reports: &reports,
+            sets: &set_resources.items,
+            nodes: &resolved_nodes,
         },
-        &admitted_dir,
-        chrono::Utc::now(),
+        crate::domain::ObservedState {
+            reports: &reports,
+            public_keys: &public_keys,
+            admitted: &admitted,
+            now: reconcile_now,
+        },
     )?;
+    let crate::domain::ReconcilePlan {
+        publication: plan,
+        admitted: planned_admitted,
+        set_statuses,
+    } = outcome;
+    // Reconcile runs every second; only write when the admitted set actually changed so a steady
+    // generation makes no apiserver writes.
+    if admitted != planned_admitted {
+        admitted = planned_admitted;
+        store_admitted_state(
+            &configmaps,
+            &admitted_name,
+            namespace,
+            &admitted,
+            admitted_version,
+            repository.controller_owner_ref(&()),
+        )
+        .await?;
+    }
 
-    let plan = build_publication_plan(
-        &repository.spec,
-        groups.into_values(),
-        resolved_nodes.clone(),
-    )?;
     let desired_digest = desired_publication_digest(&repository.spec, &plan.digest)?;
     let published_digest = state_dir.join("published-plan.sha256");
     if tokio::fs::read_to_string(&published_digest)
@@ -437,14 +615,20 @@ pub async fn reconcile_once(
                 groups: &groups_api,
                 agents: &nodes_api,
             },
-            &repository,
-            &group_resources.items,
-            &agent_resources.items,
-            &plan,
-            &reports,
+            StatusSnapshot {
+                repository: &repository,
+                groups: &group_resources.items,
+                agents: &agent_resources.items,
+                plan: &plan,
+                reports: &reports,
+                admitted: &admitted,
+                public_keys: &public_keys,
+                now: reconcile_now,
+            },
         )
         .await?;
         publish_group_set_statuses(&sets_api, &set_resources.items, &set_statuses).await?;
+        deliver_subscriptions(&client, namespace, &repository, state_dir, public_url).await;
         return Ok(plan.digest);
     }
 
@@ -455,10 +639,33 @@ pub async fn reconcile_once(
     materialize_signing_keys(&signing, &keys_dir).await?;
     let repo_dir = state_dir.join("repository");
     if !repo_dir.join("metadata/root.json").exists() {
+        // A fresh local state_dir (a lost PVC or a replica that never held the lease) must NOT
+        // re-init a v1 TUF repo when the object store already holds a published generation: clients
+        // enforce a rollback floor, so a v1 (< their current) would be rejected and the fleet would
+        // stop converging until numbering caught back up. Fail closed — refuse rather than roll back.
+        if store_has_published_metadata(store.as_ref(), &repository.spec.s3).await? {
+            return Err(Box::new(StorageError(
+                "local publisher state is empty but the object store already holds a published \
+                 generation; refusing to re-initialize a v1 TUF repo (restore the state volume)"
+                    .into(),
+            )));
+        }
         updated_tuf::repo::init(&repo_dir, &updated_tuf::repo::Keys::in_dir(&keys_dir), 365)
             .await?;
     }
     crate::publisher::sign_plan(&repo_dir, &keys_dir, &plan, 365).await?;
+
+    // Re-verify leadership right before the irreversible S3 publish. The CPU-bound signing above can
+    // starve the main loop's 5s lease renewal past the 15s deadline; without this a former leader
+    // whose lease already expired (and was taken over by another replica) would still upload here,
+    // double-writing the generation. This closes the largest window (post-signing); the residual
+    // check→PUT gap is one request wide. Fail closed — skip the publish rather than split-brain write.
+    if !holds_lease(&client, namespace, "updatec-publisher", identity).await? {
+        return Err(Box::new(StorageError(
+            "publisher lease lost during reconcile; skipping publish to avoid a split-brain write"
+                .into(),
+        )));
+    }
 
     publish_repository(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
     publish_enrollment_secrets(
@@ -477,15 +684,59 @@ pub async fn reconcile_once(
             groups: &groups_api,
             agents: &nodes_api,
         },
-        &repository,
-        &group_resources.items,
-        &agent_resources.items,
-        &plan,
-        &reports,
+        StatusSnapshot {
+            repository: &repository,
+            groups: &group_resources.items,
+            agents: &agent_resources.items,
+            plan: &plan,
+            reports: &reports,
+            admitted: &admitted,
+            public_keys: &public_keys,
+            now: reconcile_now,
+        },
     )
     .await?;
     publish_group_set_statuses(&sets_api, &set_resources.items, &set_statuses).await?;
+    deliver_subscriptions(&client, namespace, &repository, state_dir, public_url).await;
     Ok(plan.digest)
+}
+
+/// Push change-tracking events to every [`UpdateSubscription`](crate::UpdateSubscription) covering
+/// this repository, catching each subscriber up to the currently published generation. Runs on every
+/// reconcile — including the no-change path — so a subscription created (or a webhook recovered)
+/// after a publish is still caught up on the next tick. Best-effort: a delivery or status-write
+/// failure is logged and retried, never allowed to block publication.
+async fn deliver_subscriptions(
+    client: &Client,
+    namespace: &str,
+    repository: &UpdateRepository,
+    state_dir: &Path,
+    public_url: &str,
+) {
+    let repo_dir = state_dir.join("repository");
+    if !repo_dir.join("metadata/timestamp.json").exists() {
+        return; // nothing has been published yet — no generation to announce.
+    }
+    let outcome = async {
+        let version = updated_tuf::repo::current_version(&repo_dir).await?;
+        let subscriptions: Api<UpdateSubscription> = Api::namespaced(client.clone(), namespace);
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+        crate::subscription::deliver_updates(
+            &subscriptions,
+            &secrets,
+            &repository.name_any(),
+            namespace,
+            &repository.spec.s3.prefix,
+            public_url,
+            version,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = outcome {
+        tracing::warn!(error = %error, "delivering update subscriptions");
+    }
 }
 
 /// Read the latest report for each *known* agent from `<prefix>/telemetry/<node>.json`, rather
@@ -513,6 +764,80 @@ async fn read_node_reports(
         .await
 }
 
+/// The ConfigMap name that durably holds this repository's admitted set (group → pinned
+/// deployment). Named from the repository so two repositories in one namespace never collide;
+/// the repository name is itself a valid Kubernetes resource name, so this always is too.
+fn admitted_configmap_name(repository_name: &str) -> String {
+    format!("updatec-admitted-{repository_name}")
+}
+
+/// Load the durable admitted set from its in-cluster ConfigMap. Returns the map (empty the very
+/// first time, before the ConfigMap exists) and the ConfigMap's `resourceVersion` for a
+/// compare-and-swap on write. The state is one document and fails closed as one document: partial
+/// recovery could silently rebaseline a group and violate rollout concurrency.
+async fn load_admitted_state(
+    configmaps: &Api<ConfigMap>,
+    name: &str,
+) -> Result<
+    (
+        BTreeMap<String, crate::rollout::AdmittedDeployment>,
+        Option<String>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let Some(configmap) = configmaps.get_opt(name).await? else {
+        return Ok((BTreeMap::new(), None));
+    };
+    let resource_version = configmap.metadata.resource_version.clone();
+    let encoded = configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get("state.json"))
+        .ok_or_else(|| StorageError("admitted-state ConfigMap has no state.json".into()))?;
+    let admitted = serde_json::from_str(encoded)
+        .map_err(|error| StorageError(format!("invalid admitted state: {error}")))?;
+    Ok((admitted, resource_version))
+}
+
+/// Persist the admitted set back to its ConfigMap. `resource_version` is `Some` when the ConfigMap
+/// already existed: the write is then a `replace` gated on that version, so a second writer that
+/// briefly overlapped a leader change cannot clobber the winner's admitted set — a conflicting
+/// write is a 409 the caller surfaces and retries, never a silent last-writer-wins. The very first
+/// write (`None`) is a `create`, which 409s if another writer created it first.
+async fn store_admitted_state(
+    configmaps: &Api<ConfigMap>,
+    name: &str,
+    namespace: &str,
+    admitted: &BTreeMap<String, crate::rollout::AdmittedDeployment>,
+    resource_version: Option<String>,
+    owner: Option<OwnerReference>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = BTreeMap::from([("state.json".into(), serde_json::to_string(admitted)?)]);
+    // Own the ConfigMap by its repository so deleting the repository reclaims this admitted-state
+    // through ordinary Kubernetes GC — no finalizer needed for an in-cluster child.
+    let configmap = ConfigMap {
+        metadata: kube::api::ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            resource_version: resource_version.clone(),
+            owner_references: owner.map(|owner| vec![owner]),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    };
+    if resource_version.is_some() {
+        configmaps
+            .replace(name, &PostParams::default(), &configmap)
+            .await?;
+    } else {
+        configmaps
+            .create(&PostParams::default(), &configmap)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Publish each `UpdateGroupSet`'s observed rollout state as its status.
 async fn publish_group_set_statuses(
     sets: &Api<UpdateGroupSet>,
@@ -520,8 +845,10 @@ async fn publish_group_set_statuses(
     statuses: &[SetStatus],
 ) -> Result<(), kube::Error> {
     let params = PatchParams::default();
-    let by_name: HashMap<&str, &SetStatus> =
-        statuses.iter().map(|status| (status.name.as_str(), status)).collect();
+    let by_name: HashMap<&str, &SetStatus> = statuses
+        .iter()
+        .map(|status| (status.name.as_str(), status))
+        .collect();
     for set in set_resources {
         let name = set.name_any();
         let Some(status) = by_name.get(name.as_str()) else {
@@ -573,7 +900,8 @@ async fn publish_enrollment_secrets(
         }
         let name = agent.name_any();
         let secret_name = format!("{name}-enrollment");
-        let assignment = crate::gateway::agent_assignment(&repository.spec.assignment_prefix, &name);
+        let assignment =
+            crate::gateway::agent_assignment(&repository.spec.assignment_prefix, &name);
         // Resolve the exact signed documents this agent pins straight from the published
         // consistent snapshot, through the one walk the gateway's `/enroll` also uses.
         let signed = crate::gateway::resolve_signed_enrollment(store, prefix, &assignment)
@@ -627,81 +955,6 @@ async fn publish_enrollment_secrets(
     Ok(())
 }
 
-/// Ensure a group has join-mode credentials: a stable `group_id` (derived once from the resource
-/// UID) and a shared join-token Secret (`<group>-join`, key `nonce`). The token is (re)generated
-/// only when the Secret is first needed or the spec's `rotateNonce` value changes; the token lives
-/// only in the Secret, never in CRD status. The Secret is owned by the group, so deleting the
-/// group deletes its token and revokes all future joins.
-async fn ensure_group_join_credentials(
-    groups: &Api<UpdateGroup>,
-    secrets: &Api<Secret>,
-    namespace: &str,
-    group: &UpdateGroup,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let name = group.name_any();
-    let status = group.status.clone().unwrap_or_default();
-    let Some(group_id) = status.group_id.clone().or_else(|| group.uid()) else {
-        // A persisted resource always has a UID; if it is somehow absent, retry next reconcile.
-        return Ok(());
-    };
-    // Name the Secret from the stable group id so the gateway resolves it with a single GET keyed by
-    // the group_id a joining node presents — never an UpdateGroup list. Stash the group name (for the
-    // membership label) and repository (for scoping) alongside the token, so that one GET carries
-    // everything /join needs to authenticate and route without any further pre-auth apiserver work.
-    let secret_name = format!("join-{group_id}");
-    let desired_rotation = group.spec.rotate_nonce.clone();
-    let needs_token = status.join_secret_ref.is_none() || status.rotated_nonce != desired_rotation;
-    if needs_token {
-        let nonce = updated::rand::token()?;
-        let mut data = std::collections::BTreeMap::new();
-        data.insert("nonce".to_string(), ByteString(nonce.into_bytes()));
-        data.insert("group".to_string(), ByteString(name.clone().into_bytes()));
-        data.insert(
-            "repository".to_string(),
-            ByteString(group.spec.repository_ref.name.clone().into_bytes()),
-        );
-        let desired = Secret {
-            metadata: kube::api::ObjectMeta {
-                name: Some(secret_name.clone()),
-                namespace: Some(namespace.to_string()),
-                owner_references: group.controller_owner_ref(&()).map(|owner| vec![owner]),
-                ..Default::default()
-            },
-            data: Some(data.clone()),
-            type_: Some("updated.dev/group-join-token".into()),
-            ..Default::default()
-        };
-        match secrets.create(&PostParams::default(), &desired).await {
-            Ok(_) => {}
-            Err(kube::Error::Api(error)) if error.code == 409 => {
-                // Rotation: overwrite the token on the existing Secret.
-                secrets
-                    .patch(
-                        &secret_name,
-                        &PatchParams::default(),
-                        &Patch::Merge(serde_json::json!({ "data": data })),
-                    )
-                    .await?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    groups
-        .patch_status(
-            &name,
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({
-                "status": {
-                    "groupId": group_id,
-                    "joinSecretRef": { "name": secret_name },
-                    "rotatedNonce": desired_rotation,
-                }
-            })),
-        )
-        .await?;
-    Ok(())
-}
-
 pub(crate) fn metadata_version(metadata: &serde_json::Value, name: &str) -> Result<u64, String> {
     metadata
         .pointer(&format!("/signed/meta/{name}/version"))
@@ -731,11 +984,9 @@ fn failed_condition(generation: Option<i64>, reason: &str, message: &str) -> Res
     condition(false, generation, reason, message)
 }
 
-/// An [`UpdateGroupStatus`] carrying only the generation-scoped fields (matched count, digest,
-/// condition). The three join-credential fields are always `None`: [`ensure_group_join_credentials`]
-/// owns them and writes them to the same status object, and because they skip-serialize when
-/// `None`, a JSON *merge* patch built from this leaves the existing credential values untouched.
-/// Centralized so that invariant lives in one place instead of being re-stated at every writer.
+/// An [`UpdateGroupStatus`] carrying the generation-scoped fields (matched count, digest,
+/// condition). Centralized so the status shape lives in one place instead of being re-stated at
+/// every writer.
 fn group_generation_status(
     generation: Option<i64>,
     matched_agents: Option<u32>,
@@ -746,9 +997,6 @@ fn group_generation_status(
         observed_generation: generation,
         matched_agents,
         published_digest,
-        group_id: None,
-        join_secret_ref: None,
-        rotated_nonce: None,
         conditions: vec![condition],
     }
 }
@@ -822,19 +1070,36 @@ struct ResourceApis<'a> {
     agents: &'a Api<UpdateAgent>,
 }
 
+struct StatusSnapshot<'a> {
+    repository: &'a UpdateRepository,
+    groups: &'a [UpdateGroup],
+    agents: &'a [UpdateAgent],
+    plan: &'a crate::PublicationPlan,
+    reports: &'a HashMap<String, NodeReport>,
+    admitted: &'a BTreeMap<String, crate::rollout::AdmittedDeployment>,
+    public_keys: &'a HashMap<String, Vec<u8>>,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
 async fn publish_resource_statuses(
     apis: ResourceApis<'_>,
-    repository: &UpdateRepository,
-    group_resources: &[UpdateGroup],
-    agent_resources: &[UpdateAgent],
-    plan: &crate::PublicationPlan,
-    reports: &HashMap<String, NodeReport>,
+    snapshot: StatusSnapshot<'_>,
 ) -> Result<(), kube::Error> {
     let ResourceApis {
         repositories,
         groups,
         agents,
     } = apis;
+    let StatusSnapshot {
+        repository,
+        groups: group_resources,
+        agents: agent_resources,
+        plan,
+        reports,
+        admitted,
+        public_keys,
+        now,
+    } = snapshot;
     let params = PatchParams::default();
     let repository_generation = repository.metadata.generation;
     let repository_status = UpdateRepositoryStatus {
@@ -862,15 +1127,37 @@ async fn publish_resource_statuses(
             .values()
             .filter(|selected| *selected == &name)
             .count();
+        let rolling = admitted
+            .get(&name)
+            .is_some_and(|state| state.previous.is_some());
+        let held = admitted
+            .get(&name)
+            .is_some_and(|state| state.current.deployment != group.spec.deployment.name);
         let status = group_generation_status(
             group.metadata.generation,
             Some(matched as u32),
             Some(plan.digest.clone()),
-            ready_condition(
-                group.metadata.generation,
-                "Published",
-                "This group's deployment is part of the published routing generation.",
-            ),
+            if held || rolling {
+                ResourceCondition {
+                    condition_type: "Ready".into(),
+                    status: "False".into(),
+                    reason: if held { "Held" } else { "Rolling" }.into(),
+                    message: if held {
+                        "This group's desired deployment is waiting for rollout capacity."
+                    } else {
+                        "This group is incrementally advancing to its admitted deployment."
+                    }
+                    .into(),
+                    observed_generation: group.metadata.generation,
+                    last_transition_time: chrono::Utc::now().to_rfc3339(),
+                }
+            } else {
+                ready_condition(
+                    group.metadata.generation,
+                    "Published",
+                    "This group's deployment is fully admitted in the published routing generation.",
+                )
+            },
         );
         groups
             .patch_status(
@@ -884,7 +1171,14 @@ async fn publish_resource_statuses(
     for agent in agent_resources {
         let name = agent.name_any();
         let selected = plan.node_groups[&name].clone();
-        let report = reports.get(&name);
+        let report = reports.get(&name).filter(|report| {
+            let now_ms = now.timestamp_millis().max(0) as u64;
+            report.node == name
+                && report.age_ms(now_ms) <= updated::telemetry::REPORT_FRESHNESS.as_millis() as u64
+                && public_keys
+                    .get(&name)
+                    .is_some_and(|key| updated::telemetry::verify_report(report, key))
+        });
         let status = UpdateAgentStatus {
             observed_generation: agent.metadata.generation,
             selected_group: Some(selected),
@@ -918,6 +1212,27 @@ async fn publish_resource_statuses(
     Ok(())
 }
 
+/// A GENERIC, categorized failure message safe to write into the `UpdateRepository` `.status`,
+/// which anyone with `get` on the CR can read. The underlying `object_store`/`kube` error can carry
+/// infrastructure detail (bucket, endpoint, object key), so it must NEVER be serialized into status
+/// — the caller logs the full `error` at error-level for operators and writes only this category
+/// here. Downcast is best-effort; anything unrecognized maps to the fully generic bucket.
+pub fn generic_failure_status(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if error.is::<kube::Error>() {
+        "reconciliation failed: kubernetes API error (see controller logs)"
+    } else if error.is::<StorageError>() {
+        "reconciliation failed: repository storage error (see controller logs)"
+    } else if error.is::<std::io::Error>() {
+        "reconciliation failed: local state error (see controller logs)"
+    } else if error.is::<serde_json::Error>() {
+        "reconciliation failed: serialization error (see controller logs)"
+    } else {
+        "reconciliation failed (see controller logs)"
+    }
+}
+
+/// Write a failure to the `UpdateRepository` `.status`. `message` MUST be a generic, non-sensitive
+/// string (see [`generic_failure_status`]); the full error belongs only in the controller log.
 pub async fn record_repository_failure(
     client: Client,
     namespace: &str,
@@ -931,7 +1246,11 @@ pub async fn record_repository_failure(
         observed_generation: generation,
         published_digest: repository.status.and_then(|status| status.published_digest),
         agent_count: None,
-        conditions: vec![failed_condition(generation, "ReconciliationFailed", message)],
+        conditions: vec![failed_condition(
+            generation,
+            "ReconciliationFailed",
+            message,
+        )],
     };
     repositories
         .patch_status(
@@ -1009,7 +1328,7 @@ mod lease_tests {
         crate::UpdateRepositorySpec {
             default_deployment: crate::DeploymentSpec {
                 name: "default".into(),
-                report_url: None,
+                report_url: "https://control.example/v1/telemetry".into(),
                 release_repository: crate::ReleaseRepositorySpec {
                     metadata_url: "https://example.test/metadata/".into(),
                     targets_url: "https://example.test/targets/".into(),
@@ -1105,5 +1424,61 @@ mod lease_tests {
         for invalid in ["/routing", "routing/", "a//b", "a/../b", "a\\b", "a:b"] {
             assert!(validate_object_prefix(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn finalizer_list_adds_once_and_removes_cleanly() {
+        // Absent -> appended; already present -> no write needed.
+        assert_eq!(
+            finalizers_with(&[]),
+            Some(vec![REPOSITORY_FINALIZER.to_string()])
+        );
+        assert_eq!(finalizers_with(&[REPOSITORY_FINALIZER.to_string()]), None);
+        // A finalizer another controller owns is preserved when adding and when removing ours.
+        let mixed = vec!["other/keep".to_string(), REPOSITORY_FINALIZER.to_string()];
+        assert_eq!(finalizers_with(&mixed), None);
+        assert_eq!(finalizers_without(&mixed), vec!["other/keep".to_string()]);
+        assert_eq!(finalizers_without(&[]), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn prune_prefix_removes_only_the_repositorys_objects() {
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjPath;
+
+        let store = InMemory::new();
+        let put = |key: &'static str| {
+            let store = &store;
+            async move {
+                store
+                    .put(
+                        &ObjPath::from(key),
+                        PutPayload::from_bytes(b"x".to_vec().into()),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        put("tenant/routing/metadata/timestamp.json").await;
+        put("tenant/routing/metadata/root.json").await;
+        put("tenant/routing/targets/app/1.0.0").await;
+        // A different repository under a sibling prefix must survive.
+        put("tenant/other/metadata/timestamp.json").await;
+
+        let pruned = prune_prefix(&store, "tenant/routing").await.unwrap();
+        assert_eq!(pruned, 3);
+
+        let mut remaining = store.list(None);
+        let mut keys = Vec::new();
+        while let Some(entry) = remaining.next().await {
+            keys.push(entry.unwrap().location.to_string());
+        }
+        assert_eq!(
+            keys,
+            vec!["tenant/other/metadata/timestamp.json".to_string()]
+        );
+
+        // Re-pruning an already-clean prefix is a no-op — the resumability the finalizer relies on.
+        assert_eq!(prune_prefix(&store, "tenant/routing").await.unwrap(), 0);
     }
 }

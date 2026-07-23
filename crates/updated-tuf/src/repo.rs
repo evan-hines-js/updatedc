@@ -157,7 +157,10 @@ pub async fn generate_keys(keys_dir: &Path) -> Result<Keys> {
 /// Mint a single fresh ed25519 root key at `path` (mode 0600). Used to provision the new
 /// successor when rotating the root. Fails if `path` already exists.
 pub async fn generate_root_key(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| err("creating key dir", e))?;
@@ -344,7 +347,8 @@ pub async fn rotate_root(
     let bytes = tokio::fs::read(&root_path)
         .await
         .map_err(|e| err("reading root.json", e))?;
-    let current: Signed<Root> = serde_json::from_slice(&bytes).map_err(|e| err("parsing root.json", e))?;
+    let current: Signed<Root> =
+        serde_json::from_slice(&bytes).map_err(|e| err("parsing root.json", e))?;
     let old = &current.signed;
     let old_root_role = old
         .roles
@@ -636,6 +640,24 @@ pub async fn target_sha256(repo_dir: &Path, name: &str) -> Result<String> {
         .get(&name)
         .ok_or_else(|| RepoError(format!("target {:?} is absent from metadata", name.raw())))?;
     Ok(hex::encode(&target.hashes.sha256))
+}
+
+/// The current generation number of the published repository: the TUF `timestamp` version, bumped
+/// once per [`replace_release`]. It is the monotonic id of "what the fleet is pointed at right now",
+/// the value change-tracking subscribers watermark against.
+pub async fn current_version(repo_dir: &Path) -> Result<u64> {
+    let metadata_dir = repo_dir.join("metadata");
+    let targets_dir = repo_dir.join("targets");
+    let root = tokio::fs::read(metadata_dir.join("root.json"))
+        .await
+        .map_err(|e| err("reading root.json", e))?;
+    let repo = RepositoryLoader::new(&root, dir_url(&metadata_dir)?, dir_url(&targets_dir)?)
+        .transport(FilesystemTransport)
+        .expiration_enforcement(tough::ExpirationEnforcement::Unsafe)
+        .load()
+        .await
+        .map_err(|e| err("loading repository to read version", e))?;
+    Ok(repo.timestamp().signed.version.get())
 }
 
 #[derive(Default)]

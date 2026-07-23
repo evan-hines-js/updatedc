@@ -28,6 +28,7 @@ enum Phase {
     Verify,
     Finalize,
     Rollback,
+    Uninstall,
 }
 
 impl Phase {
@@ -44,6 +45,7 @@ impl Phase {
             "verify" => Ok(Self::Verify),
             "finalize" => Ok(Self::Finalize),
             "rollback" => Ok(Self::Rollback),
+            "uninstall" => Ok(Self::Uninstall),
             _ => Err(format!("unknown lifecycle phase {value:?}").into()),
         }
     }
@@ -61,6 +63,7 @@ impl Phase {
             Self::Verify => "verify",
             Self::Finalize => "finalize",
             Self::Rollback => "rollback",
+            Self::Uninstall => "uninstall",
         }
     }
 }
@@ -119,6 +122,7 @@ impl Deployment {
             Phase::Verify => self.verify()?,
             Phase::Finalize => self.finalize()?,
             Phase::Rollback => self.rollback()?,
+            Phase::Uninstall => self.uninstall()?,
         }
         self.write(
             self.effects.join(format!("{}.done", self.phase.name())),
@@ -228,7 +232,22 @@ impl Deployment {
         self.copy(
             &self.effects.join("generated-install.properties"),
             &self.live.join("install.properties"),
-        )
+        )?;
+        // Reload-in-place: the supervisor kept the app process running and passes its live PID
+        // (`UPDATED_CHILD_PID`) only when this deployment reloads in place — i.e. this provider
+        // ships an `activate` script. Signal it to reexec into the freshly activated release so
+        // readiness proves the new version. In the guardian-restart variant (no `activate`
+        // script) the supervisor stops the process before this phase and passes no PID, so this
+        // is skipped and the guardian launches the new version instead.
+        if let Some(pid) = self.child_pid.as_deref().filter(|pid| !pid.is_empty()) {
+            let status = std::process::Command::new("kill")
+                .args(["-HUP", pid])
+                .status()?;
+            if !status.success() {
+                return Err(format!("signalling reload (kill -HUP {pid}) failed: {status}").into());
+            }
+        }
+        Ok(())
     }
 
     fn start(&self) -> Result<(), Error> {
@@ -282,6 +301,16 @@ impl Deployment {
         remove_if_present(&self.live.join("migration.plan"))?;
         remove_if_present(&self.live.join("removed-from-load-balancer"))?;
         Ok(())
+    }
+
+    fn uninstall(&self) -> Result<(), Error> {
+        // Decommission — the teardown mirror of prepare/activate/finalize. It removes the external
+        // system of record this deployment established (the simulated legacy Java home: the WAR,
+        // content repository, and generated configuration) — the state `updated` cannot see because
+        // it lives outside the install root it owns. Idempotent: removing an already-removed tree is
+        // success, so a replayed or partial wipe converges. It touches only what this provider
+        // created; a real one must never delete a shared mount or database it merely used.
+        remove_dir_all_if_present(&self.live)
     }
 
     fn require(&self, phase: Phase) -> Result<(), Error> {
@@ -365,6 +394,14 @@ fn expect(path: &Path, expected: &str) -> Result<(), Error> {
 
 fn remove_if_present(path: &Path) -> Result<(), Error> {
     match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_dir_all_if_present(path: &Path) -> Result<(), Error> {
+    match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),

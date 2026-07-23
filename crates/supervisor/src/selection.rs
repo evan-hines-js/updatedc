@@ -1,7 +1,9 @@
 use super::*;
 
 pub(crate) enum AppOutcome {
-    Upgraded { version: String },
+    Upgraded {
+        version: String,
+    },
     Unchanged,
     Fatal(String),
     /// A post-activation update failure: the candidate is rejected and its rollback journal is

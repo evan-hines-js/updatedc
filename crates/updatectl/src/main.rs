@@ -36,8 +36,8 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
-use updated_tuf::repo::{self, PublishTarget};
 use updatec::{S3Destination, UpdateGroup};
+use updated_tuf::repo::{self, PublishTarget};
 
 mod keygen;
 
@@ -192,11 +192,19 @@ struct DeployArgs {
     /// `--provider-set-sha256`), it is signed into the app target's custom metadata, so an
     /// ordered-fallback descent to this version re-selects exactly these providers — app and
     /// providers roll back as one unit. Omit to leave provider selection to the assignment head.
-    #[arg(long, env = "UPDATECTL_PROVIDER_SET_PATH", requires = "provider_set_sha256")]
+    #[arg(
+        long,
+        env = "UPDATECTL_PROVIDER_SET_PATH",
+        requires = "provider_set_sha256"
+    )]
     provider_set_path: Option<String>,
 
     /// sha256 of the provider set named by `--provider-set-path`.
-    #[arg(long, env = "UPDATECTL_PROVIDER_SET_SHA256", requires = "provider_set_path")]
+    #[arg(
+        long,
+        env = "UPDATECTL_PROVIDER_SET_SHA256",
+        requires = "provider_set_path"
+    )]
     provider_set_sha256: Option<String>,
 
     /// Days until the re-signed TUF metadata expires.
@@ -428,7 +436,13 @@ async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
     // (which retires the old active key) and the successor.
     repo::generate_root_key(&args.new_key_out).await?;
     let retained = &keys.roots[1..];
-    repo::rotate_root(repo_dir.path(), retained, &args.new_key_out, args.expiry_days).await?;
+    repo::rotate_root(
+        repo_dir.path(),
+        retained,
+        &args.new_key_out,
+        args.expiry_days,
+    )
+    .await?;
     let root_json = tokio::fs::read(metadata_dir.join("root.json")).await?;
     updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
 
@@ -488,7 +502,10 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
     let client = Client::try_default().await?;
     let groups: Api<UpdateGroup> = Api::namespaced(client, &args.namespace);
     groups.get(&args.group).await.map_err(|error| {
-        format!("UpdateGroup {} not found in {}: {error}", args.group, args.namespace)
+        format!(
+            "UpdateGroup {} not found in {}: {error}",
+            args.group, args.namespace
+        )
     })?;
 
     // Work in a throwaway temp dir: the repository checkout never outlives the process.
@@ -565,7 +582,15 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
 /// for a new target to be added and republished. Shared by the provider publish commands.
 async fn checkout_repository(
     backend: &Backend,
-) -> Result<(S3Destination, Arc<dyn ObjectStore>, repo::Keys, tempfile::TempDir), Error> {
+) -> Result<
+    (
+        S3Destination,
+        Arc<dyn ObjectStore>,
+        repo::Keys,
+        tempfile::TempDir,
+    ),
+    Error,
+> {
     let (destination, store) = build_store(backend)?;
     let keys = open_keys(&backend.keys_dir)?;
     let repo_dir = tempfile::tempdir()?;
@@ -704,7 +729,12 @@ fn provider_override(
 
 /// Emit the machine-readable deploy result: a clean stdout payload (text or JSON) plus,
 /// under GitHub Actions, `target`/`sha256`/`version` step outputs for later steps.
-fn report_deploy(args: &DeployArgs, platform: &str, target: &str, sha256: &str) -> Result<(), Error> {
+fn report_deploy(
+    args: &DeployArgs,
+    platform: &str,
+    target: &str,
+    sha256: &str,
+) -> Result<(), Error> {
     match args.output {
         OutputFormat::Text => {
             println!("target={target}");
@@ -738,7 +768,10 @@ fn emit_github_outputs(pairs: &[(&str, &str)]) -> Result<(), Error> {
         return Ok(());
     };
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
     for (key, value) in pairs {
         writeln!(file, "{key}={value}")?;
     }
@@ -877,7 +910,10 @@ mod tests {
     #[test]
     fn object_key_normalizes_prefix_and_drops_empties() {
         assert_eq!(object_key("", "metadata"), "metadata");
-        assert_eq!(object_key("/p/", "metadata/root.json"), "p/metadata/root.json");
+        assert_eq!(
+            object_key("/p/", "metadata/root.json"),
+            "p/metadata/root.json"
+        );
         assert_eq!(object_key("a/b", "metadata"), "a/b/metadata");
     }
 
@@ -923,7 +959,9 @@ mod tests {
         let work = root.join("work");
         let work_metadata = work.join("metadata");
         tokio::fs::create_dir_all(&work_metadata).await.unwrap();
-        tokio::fs::create_dir_all(work.join("targets")).await.unwrap();
+        tokio::fs::create_dir_all(work.join("targets"))
+            .await
+            .unwrap();
         download_metadata(&store, &dest, &work_metadata)
             .await
             .unwrap();
@@ -945,17 +983,19 @@ mod tests {
         let mirror = root.join("mirror");
         let mirror_metadata = mirror.join("metadata");
         tokio::fs::create_dir_all(&mirror_metadata).await.unwrap();
-        tokio::fs::create_dir_all(mirror.join("targets")).await.unwrap();
+        tokio::fs::create_dir_all(mirror.join("targets"))
+            .await
+            .unwrap();
         download_metadata(&store, &dest, &mirror_metadata)
             .await
             .unwrap();
 
         let metadata_url =
-            url::Url::from_directory_path(std::fs::canonicalize(&mirror_metadata).unwrap()).unwrap();
-        let targets_url = url::Url::from_directory_path(
-            std::fs::canonicalize(mirror.join("targets")).unwrap(),
-        )
-        .unwrap();
+            url::Url::from_directory_path(std::fs::canonicalize(&mirror_metadata).unwrap())
+                .unwrap();
+        let targets_url =
+            url::Url::from_directory_path(std::fs::canonicalize(mirror.join("targets")).unwrap())
+                .unwrap();
         let repo = tough::RepositoryLoader::new(&pinned, metadata_url, targets_url)
             .transport(tough::FilesystemTransport)
             .expiration_enforcement(tough::ExpirationEnforcement::Safe)

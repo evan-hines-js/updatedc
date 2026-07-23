@@ -61,7 +61,9 @@ pub(crate) fn spawn_load_generator(demo: Demo) {
             // process: a set can never be answered by another set's pod, by construction.
             let url = format!("{DEMO_INGRESS_URL}/set-{set}/version");
             tokio::spawn(async move {
-                let client = match reqwest::Client::builder().timeout(LOAD_REQUEST_TIMEOUT).build()
+                let client = match reqwest::Client::builder()
+                    .timeout(LOAD_REQUEST_TIMEOUT)
+                    .build()
                 {
                     Ok(client) => client,
                     Err(_) => return,

@@ -26,7 +26,12 @@ if [ ! -f /data/ready ]; then
       artifact=$(publish_fuzz_artifact "$version")
       case "$artifact" in
         magnolia) cp /usr/local/bin/magnolia-like "$source/bin/app" ;;
-        sampleapp) cp /usr/local/bin/sampleapp "$source/bin/app" ;;
+        # The universal sample binary for the kind world: reexec-capable, so any cohort's
+        # launch args (a reload cohort's `--reload-mode reexec` included) are valid whatever
+        # version a node currently runs. It reports the same `sampleapp` artifact identity and,
+        # with the default `restart` reload mode, behaves exactly like the plain fixture — so
+        # the restart cohorts and the fleet-identity checks are unaffected.
+        sampleapp) cp /usr/local/bin/sampleapp-reexec "$source/bin/app" ;;
         *) echo "unknown fuzz artifact: $artifact" >&2; exit 1 ;;
       esac
     fi

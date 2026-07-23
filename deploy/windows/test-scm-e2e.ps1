@@ -134,10 +134,16 @@ try {
         --routing-base-url "http://127.0.0.1:$repoPort/" `
         --output (Join-Path $guardianState 'enrollment.json')
     if ($LASTEXITCODE) { throw 'exporting enrollment bundle failed' }
+    # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never
+    # calls /enroll — but the bootstrap must still be a complete, valid EnrollmentBootstrap. The name
+    # and cert paths are never read in this offline path; they only satisfy config validation.
     $configText = @"
 [enrollment]
 url = 'http://127.0.0.1:$repoPort/enroll'
-key = 'unused-preplaced'
+name = 'agent'
+client_cert = 'unused-preplaced.crt'
+client_key = 'unused-preplaced.key'
+ca = 'unused-preplaced-ca.crt'
 "@
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
 

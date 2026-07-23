@@ -49,6 +49,7 @@ fn select_update_from(
     policy: &DefaultPolicy,
     current: Option<&str>,
     ceiling: Option<&Version>,
+    head_sha: Option<&str>,
     mut note_skip: impl FnMut(&str),
     mut rejected: impl FnMut(&VerifiedTarget, &str) -> bool,
 ) -> Option<(VerifiedTarget, String)> {
@@ -61,6 +62,19 @@ fn select_update_from(
         // shared targets metadata contains other groups' higher releases.
         if ceiling.is_some_and(|ceiling| &version > ceiling) {
             continue;
+        }
+        // At the assigned head version, only the exact assigned bytes are acceptable.
+        // Two TUF-authentic targets can share the head version; without this pin ordered
+        // fallback could install bytes other than the sha256 the control plane assigned.
+        // A head-version candidate that isn't those bytes is skipped so descent continues
+        // to a lower, well-defined version rather than picking an ambiguous sibling.
+        if let (Some(ceiling), Some(head_sha)) = (ceiling, head_sha) {
+            if &version == ceiling && target_sha(&target) != head_sha {
+                note_skip(&format!(
+                    "skipping {version}: not the assigned head bytes (sha256 mismatch)"
+                ));
+                continue;
+            }
         }
         if current_version
             .as_ref()
@@ -146,6 +160,7 @@ impl TrustedRepository {
                 policy,
                 current,
                 Some(&ceiling),
+                Some(assignment.application.sha256.as_str()),
                 note_skip,
                 rejected,
             )
@@ -201,7 +216,9 @@ impl TrustedRepository {
             "assigned={} ordered_install_fallback={} ceiling={} current={}",
             assignment.application.path,
             assignment.ordered_install_fallback,
-            ceiling.as_ref().map_or_else(|| "<none>".to_string(), |v| v.to_string()),
+            ceiling
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |v| v.to_string()),
             current.unwrap_or("<none>"),
         )];
         let candidates = matching_targets(self, policy);
@@ -236,6 +253,7 @@ impl TrustedRepository {
             matching_targets(self, policy),
             policy,
             current,
+            None,
             None,
             note_skip,
             rejected,
@@ -320,6 +338,7 @@ mod tests {
             &policy(),
             Some("2.0.0"),
             None,
+            None,
             |_| {},
             |_, v| v == "4.0.0",
         )
@@ -335,6 +354,7 @@ mod tests {
             targets.clone(),
             &policy(),
             Some("3.0.0"),
+            None,
             None,
             |message| diagnostics.push(message.to_string()),
             |_, _| false,
@@ -360,6 +380,7 @@ mod tests {
             &policy(),
             Some("4.0.0"),
             None,
+            None,
             |message| diagnostics.push(message.to_string()),
             |_, _| false,
         )
@@ -371,6 +392,44 @@ mod tests {
     }
 
     #[test]
+    fn ordered_fallback_pins_the_assigned_sha_at_the_head_version() {
+        let ceiling = Version::parse("2.0.0").unwrap();
+        let assigned_head_sha = target_sha(&candidate("2.0.0", 2).0);
+
+        // A different, still TUF-authentic target sits at the head version (bytes sha=9), but
+        // it is not the assigned sha. With the head pin, that candidate is skipped and ordered
+        // fallback descends to the well-defined predecessor rather than installing foreign
+        // head bytes.
+        let foreign_head = vec![candidate("2.0.0", 9), candidate("1.0.0", 1)];
+        let selected = select_update_from(
+            foreign_head,
+            &policy(),
+            None,
+            Some(&ceiling),
+            Some(assigned_head_sha.as_str()),
+            |_| {},
+            |_, _| false,
+        )
+        .expect("descends past the unassigned head bytes");
+        assert_eq!(selected.1, "1.0.0");
+
+        // When the exact assigned bytes are present at the head, they are selected.
+        let with_assigned_head = vec![candidate("2.0.0", 2), candidate("1.0.0", 1)];
+        let selected = select_update_from(
+            with_assigned_head,
+            &policy(),
+            None,
+            Some(&ceiling),
+            Some(assigned_head_sha.as_str()),
+            |_| {},
+            |_, _| false,
+        )
+        .expect("the assigned head bytes are selectable");
+        assert_eq!(selected.1, "2.0.0");
+        assert_eq!(target_sha(&selected.0), assigned_head_sha);
+    }
+
+    #[test]
     fn rejects_by_hash_and_accepts_corrected_republish() {
         let rejected_hash = target_sha(&candidate("2.0.0", 1).0);
         let targets = vec![candidate("2.0.0", 1), candidate("2.0.0", 2)];
@@ -378,6 +437,7 @@ mod tests {
             targets,
             &policy(),
             Some("1.0.0"),
+            None,
             None,
             |_| {},
             |t, _| target_sha(t) == rejected_hash,
@@ -452,10 +512,12 @@ mod provider_binding {
         let v2_src = tmp.join("app-2");
         std::fs::write(&v1_src, b"app-1.0.0").unwrap();
         std::fs::write(&v2_src, b"app-2.0.0").unwrap();
-        let v1 = repo::PublishTarget::application("app", "stable", "1.0.0", OS, ARCH, "app", v1_src)
-            .with_provider_set("provider-sets/a.json", &"a".repeat(64));
-        let v2 = repo::PublishTarget::application("app", "stable", "2.0.0", OS, ARCH, "app", v2_src)
-            .with_provider_set("provider-sets/b.json", &"b".repeat(64));
+        let v1 =
+            repo::PublishTarget::application("app", "stable", "1.0.0", OS, ARCH, "app", v1_src)
+                .with_provider_set("provider-sets/a.json", &"a".repeat(64));
+        let v2 =
+            repo::PublishTarget::application("app", "stable", "2.0.0", OS, ARCH, "app", v2_src)
+                .with_provider_set("provider-sets/b.json", &"b".repeat(64));
         repo::add_release(&repo_dir, &keys, vec![v1, v2], 365)
             .await
             .unwrap();
@@ -553,7 +615,10 @@ mod provider_binding {
             .expect("a healthy predecessor is selectable");
         assert_eq!(selected.version, "1.0.0");
         assert_eq!(
-            selected.provider_set.expect("descent binds a provider set").path,
+            selected
+                .provider_set
+                .expect("descent binds a provider set")
+                .path,
             "provider-sets/a.json",
             "a descended app must roll back to the providers signed with it"
         );
@@ -570,7 +635,10 @@ mod provider_binding {
             .expect("the head is selectable");
         assert_eq!(selected.version, "2.0.0");
         assert_eq!(
-            selected.provider_set.expect("head binds its provider set").path,
+            selected
+                .provider_set
+                .expect("head binds its provider set")
+                .path,
             "provider-sets/b.json"
         );
     }

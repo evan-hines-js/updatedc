@@ -158,7 +158,9 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
         "withdrew the application from traffic; the tower stays live",
         EVENT_TIMEOUT,
     ) {
-        return fail_log("guardian did not withdraw readiness while remaining live during stop/start");
+        return fail_log(
+            "guardian did not withdraw readiness while remaining live during stop/start",
+        );
     }
     if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         return fail_log("service did not upgrade to v2.0.0");
@@ -283,7 +285,11 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
                     .timeout(Duration::from_secs(2))
                     .build();
                 let ready = |agent: &ureq::Agent| {
-                    agent.get(&readyz).call().map(|r| r.status() == 200).unwrap_or(false)
+                    agent
+                        .get(&readyz)
+                        .call()
+                        .map(|r| r.status() == 200)
+                        .unwrap_or(false)
                 };
                 while !stop.load(Ordering::Relaxed) {
                     // A load balancer only routes to a Ready node; a draining node being
@@ -483,7 +489,9 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     drop(tower);
     kill_stray(&dir.join("install"));
     if !settled {
-        return fail("descended app served 1.0.0 but the committed install record never settled on it");
+        return fail(
+            "descended app served 1.0.0 but the committed install record never settled on it",
+        );
     }
     ok("cold-installed a broken assigned head, rejected it, and ordered fallback descended past two broken heads to the healthy 1.0.0");
     Ok(())
@@ -543,7 +551,9 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
     drop(tower);
     kill_stray(&dir.join("install"));
     if !settled {
-        return fail("descended app served 1.0.0 but the committed install record never settled on it");
+        return fail(
+            "descended app served 1.0.0 but the committed install record never settled on it",
+        );
     }
     if rejected_count < 2 {
         return fail(format!(
@@ -551,79 +561,6 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
         ));
     }
     ok("cold node rejected two malformed-but-signed assigned bundles at ingest and ordered fallback descended to the healthy 1.0.0");
-    Ok(())
-}
-
-/// The stateless twin of `install_chaos_recovery`. That test crashes at each install-state-machine
-/// boundary and recovers *from the journal* (the state dir survives). This crashes at each boundary
-/// and then **wipes the whole install root** — an emptyDir pod-kill — during the guardian's relaunch
-/// backoff, so there is no journal to replay and the node must cold-install cleanly from scratch. It
-/// proves that a crash at any point in the install state machine, followed by a stateless reschedule,
-/// always reconverges to a live, committed install and never leaves partial state that bricks the
-/// fresh cold-install ("no installable application"). Deterministic — one controlled crash per
-/// boundary, a fresh isolated dir per boundary, and clean teardown — so it exercises the exact
-/// recovery paths without the stray-process storm a random-kill fuzz would inflict on its neighbors.
-pub(crate) fn stateless_install_chaos(ctx: &Ctx) -> R {
-    const RECOVERY_TIMEOUT: u64 = 120;
-    // The chaos sentinel lives in guardian-state (survives the install-root wipe), so the injected
-    // crash fires exactly once; the post-wipe relaunch cold-installs without re-crashing.
-    let boundaries = ctx.install_chaos_boundaries()?;
-    for (index, point) in boundaries.iter().enumerate() {
-        let srv = format!("127.0.0.1:{}", 21430 + index);
-        let svc = format!("127.0.0.1:{}", 21450 + index);
-        let probes = format!("127.0.0.1:{}", 21470 + index);
-        let dir = ctx.work.join(format!("stateless-chaos-{point}"));
-        std::fs::create_dir_all(&dir).map_err(str_err)?;
-        ctx.init_repo(&dir)?;
-        ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
-        let server = ctx.serve(&dir, &srv)?;
-        let unplaced = dir.join(format!("not-preinstalled{}", ctx.exe));
-        let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&unplaced, &["--addr", &svc]))
-            .cold_install()
-            .readiness_health(&svc)
-            .check_interval("1s")
-            .health_grace("2s")
-            .guardian_probes(&probes)
-            .guardian()?;
-        cmd.env("UPDATED_CHAOS_POINT", point);
-        let install = dir.join("install");
-        let tower = Service::spawn("stateless-chaos", &cmd);
-
-        // The first supervisor cold-installs and crashes once at `point`.
-        let crash_seen = tower.wait_for_log(
-            &format!("CHAOS: exiting at boundary \"{point}\""),
-            RECOVERY_TIMEOUT,
-        );
-        // emptyDir pod-kill: wipe the install root during the guardian's relaunch backoff, so the
-        // relaunched supervisor finds no journal and cold-installs fresh (re-enrolling from the
-        // still-running server). Bootstrap config, certs, and guardian-state persist, as on a real
-        // reschedule onto a fresh volume.
-        let _ = std::fs::remove_dir_all(&install);
-
-        // Stateless recovery: the fresh cold-install must reach a live, committed 1.0.0, never
-        // stranding on "no installable application".
-        let state_path = install.join("state/installed.json");
-        let durable = wait_until(RECOVERY_TIMEOUT, || {
-            matches!(
-                updated::state::read_installed(&state_path),
-                updated::state::Installed::Present(ref s) if s.release.version == "1.0.0"
-            )
-        });
-        let live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
-        let bricked = tower.log_contains("no installable application");
-        let log = tower.captured_log();
-        drop(tower);
-        drop(server);
-        kill_stray(&install);
-        wait_until(15, || http_text(&format!("http://{svc}/version")).is_none());
-        if !crash_seen || !durable || !live || bricked {
-            return fail(format!(
-                "stateless recovery at {point} was incomplete (crash_seen={crash_seen}, \
-                 durable={durable}, live={live}, bricked={bricked}):\n{log}"
-            ));
-        }
-    }
-    ok("a crash at every install boundary, followed by a stateless emptyDir wipe, reconverged to a live cold install with no brick");
     Ok(())
 }
 

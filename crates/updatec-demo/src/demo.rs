@@ -1,4 +1,6 @@
 use crate::*;
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
+use kube::{Client, ResourceExt};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -7,8 +9,6 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use std::time::Instant;
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
-use kube::{Client, ResourceExt};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
@@ -106,9 +106,21 @@ impl Demo {
                     .as_str(),
                 "1" | "true" | "yes" | "on"
             ),
-            load: Arc::new((0..DEMO_SET_COUNT).map(|_| StdMutex::new(LoadWindow::default())).collect()),
-            ready: Arc::new((0..DEMO_SET_COUNT).map(|_| StdMutex::new(Vec::new())).collect()),
-            counting: Arc::new((0..DEMO_SET_COUNT).map(|_| AtomicBool::new(false)).collect()),
+            load: Arc::new(
+                (0..DEMO_SET_COUNT)
+                    .map(|_| StdMutex::new(LoadWindow::default()))
+                    .collect(),
+            ),
+            ready: Arc::new(
+                (0..DEMO_SET_COUNT)
+                    .map(|_| StdMutex::new(Vec::new()))
+                    .collect(),
+            ),
+            counting: Arc::new(
+                (0..DEMO_SET_COUNT)
+                    .map(|_| AtomicBool::new(false))
+                    .collect(),
+            ),
             readyz_failing_since: Arc::new(Mutex::new(std::collections::HashMap::new())),
             left_lb: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             readiness: Arc::new(StdMutex::new(std::collections::HashMap::new())),
@@ -116,7 +128,10 @@ impl Demo {
         })
     }
 
-    pub(crate) async fn apply(&self, requested: &ReleaseRequest) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) async fn apply(
+        &self,
+        requested: &ReleaseRequest,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if requested != &self.release {
             return Err("release declaration does not match the advertised signed target".into());
         }
@@ -262,7 +277,10 @@ impl Demo {
             let elapsed = now.saturating_duration_since(since);
             if elapsed < READYZ_DEBOUNCE {
                 node.in_load_balancer = true;
-                let debounced = format!("readyz failing {}ms (debounced, still IN)", elapsed.as_millis());
+                let debounced = format!(
+                    "readyz failing {}ms (debounced, still IN)",
+                    elapsed.as_millis()
+                );
                 node.probe_note = Some(match node.probe_note.take() {
                     Some(existing) => format!("{existing}; {debounced}"),
                     None => debounced,
@@ -498,8 +516,7 @@ impl Demo {
         let assignments: Vec<(usize, bool)> = (0..DEMO_COHORT_COUNT)
             .filter(|&cohort| {
                 let group = cohort_group(cohort);
-                !state.rolled_back_groups.contains(&group)
-                    && !state.updated_groups.contains(&group)
+                !state.rolled_back_groups.contains(&group) && !state.updated_groups.contains(&group)
             })
             .map(|cohort| (cohort, cohort_set_index(cohort).is_multiple_of(2)))
             .collect();
@@ -752,8 +769,10 @@ impl Demo {
             let all_settled = settled_broken.len() == broken_groups.len()
                 && settled_valid.len() == valid_groups.len();
             if all_settled {
-                self.event(format!("gen (seed {seed}): generation settled in {elapsed}s"))
-                    .await;
+                self.event(format!(
+                    "gen (seed {seed}): generation settled in {elapsed}s"
+                ))
+                .await;
                 return Ok(());
             }
             if elapsed >= last_logged_secs + 3 {
@@ -820,7 +839,8 @@ impl Demo {
             // `/fleet` listing (total is 32 cohort + `DEMO_EXTERNAL_COUNT`) but is not part of
             // the throttled rollout, so scope both the target and the count to cohort members.
             let fleet = self.fleet().await?;
-            let cohort: Vec<&FleetNode> = fleet.iter().filter(|node| is_cohort_member(node)).collect();
+            let cohort: Vec<&FleetNode> =
+                fleet.iter().filter(|node| is_cohort_member(node)).collect();
             let on_target = cohort
                 .iter()
                 .filter(|node| {
@@ -833,7 +853,11 @@ impl Demo {
             // Log progress each second so a slow or churning convergence is visible
             // (e.g. agents briefly reverting under the load of a fleet-wide upgrade).
             if !converged && attempt.is_multiple_of(2) {
-                let gate = if frozen { " (frozen — clock paused)" } else { "" };
+                let gate = if frozen {
+                    " (frozen — clock paused)"
+                } else {
+                    ""
+                };
                 self.event(format!(
                     "convergence: {on_target}/{DEMO_NODE_COUNT} agents on {converge_version}{gate}"
                 ))
@@ -879,7 +903,10 @@ impl Demo {
         std::fs::create_dir_all(bundle.join("bin"))?;
         std::fs::create_dir_all(bundle.join("config"))?;
         if broken {
-            std::fs::write(bundle.join("bin/app"), b"intentionally corrupt entrypoint\n")?;
+            std::fs::write(
+                bundle.join("bin/app"),
+                b"intentionally corrupt entrypoint\n",
+            )?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -889,7 +916,13 @@ impl Demo {
                 )?;
             }
         } else {
-            std::fs::copy("/usr/local/bin/sampleapp", bundle.join("bin/app"))?;
+            // The universal reexec-capable sample binary (as the baseline seed and edge use), so
+            // a reload cohort can reexec in place into every version the loop publishes. Plain
+            // `sampleapp` would refuse the reload cohort's `--reload-mode reexec` launch and strand
+            // those cohorts one version behind, so the fleet would never converge. It reports the
+            // same `sampleapp` identity and, in the default restart mode the restart cohorts run,
+            // behaves identically.
+            std::fs::copy("/usr/local/bin/sampleapp-reexec", bundle.join("bin/app"))?;
         }
         std::fs::write(
             bundle.join("config/release.toml"),
@@ -916,7 +949,9 @@ impl Demo {
         let data = PathBuf::from(
             env::var("DEMO_REPOSITORY_DATA").unwrap_or_else(|_| "/release-data".into()),
         );
-        let platform = std::fs::read_to_string(data.join("platform"))?.trim().to_owned();
+        let platform = std::fs::read_to_string(data.join("platform"))?
+            .trim()
+            .to_owned();
         let source = source.to_str().ok_or("non-UTF-8 source path")?;
         // Backend defaults match the demo's in-cluster MinIO; the signing keys live on the
         // shared release-repository PVC the bootstrap wrote them to. AWS creds come from the
@@ -995,15 +1030,17 @@ impl Demo {
             .trim()
             .to_owned();
         let path = format!("products/magnolia/stable/2.0.0/{platform}/app");
-        let sha256 = output(Command::new("/usr/local/bin/server").args([
-            "target-sha256",
-            "--repo",
-            data.join("repository")
-                .to_str()
-                .ok_or("non-UTF-8 repo path")?,
-            "--name",
-            &path,
-        ]))?;
+        let sha256 = output(
+            Command::new("/usr/local/bin/server").args([
+                "target-sha256",
+                "--repo",
+                data.join("repository")
+                    .to_str()
+                    .ok_or("non-UTF-8 repo path")?,
+                "--name",
+                &path,
+            ]),
+        )?;
         self.publisher
             .groups()
             .patch(
@@ -1015,8 +1052,10 @@ impl Demo {
                 }}})),
             )
             .await?;
-        self.event("manual Magnolia upgrade to v2 requested (custom in-place, backup + restore)".into())
-            .await;
+        self.event(
+            "manual Magnolia upgrade to v2 requested (custom in-place, backup + restore)".into(),
+        )
+        .await;
         Ok(())
     }
 
@@ -1113,13 +1152,16 @@ impl Demo {
     /// Drop every calendar entry from `set`, so it stops gating on dates (falls back to open,
     /// or to its recurring `rolloutWindows` if any). Lets the demo reset the panel.
     pub(crate) async fn clear_calendar(&self, set: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.publisher.sets().patch(
-            set,
-            &PatchParams::default(),
-            &Patch::Merge(serde_json::json!({"spec": {"calendar": []}})),
-        )
-        .await?;
-        self.event(format!("rollout calendar: cleared set {set}")).await;
+        self.publisher
+            .sets()
+            .patch(
+                set,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({"spec": {"calendar": []}})),
+            )
+            .await?;
+        self.event(format!("rollout calendar: cleared set {set}"))
+            .await;
         Ok(())
     }
 
@@ -1163,8 +1205,10 @@ impl Demo {
         };
         // Draining (out-of-pool) pods, grouped by set and then by cohort group, so we can cap
         // disruption to one group per set. Chaos never touches an in-pool (serving) pod.
-        let mut draining: std::collections::HashMap<usize, std::collections::HashMap<usize, Vec<String>>> =
-            std::collections::HashMap::new();
+        let mut draining: std::collections::HashMap<
+            usize,
+            std::collections::HashMap<usize, Vec<String>>,
+        > = std::collections::HashMap::new();
         for node in &fleet {
             if node.in_load_balancer {
                 continue;
@@ -1251,8 +1295,10 @@ impl Demo {
                 .await;
             }
             Err(error) => {
-                self.event(format!("chaos: could not delete the controller pod: {error}"))
-                    .await;
+                self.event(format!(
+                    "chaos: could not delete the controller pod: {error}"
+                ))
+                .await;
             }
         }
     }

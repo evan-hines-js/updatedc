@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{
-    with_suffix, Application, Paths, Repository, Routing, Storage, Timeouts,
-};
+use updated::config::{with_suffix, Application, Paths, Repository, Routing, Storage, Timeouts};
 use updated::{env, health};
 mod app;
 mod boot;
@@ -54,6 +52,27 @@ struct Options {
     /// Canonical bundle installation layout.
     paths: Paths,
     supervisor_update: SupervisorUpdate,
+}
+
+impl Options {
+    /// Reconcile the managed runtime against the live assignment resolved this cycle. The
+    /// runtime (launch args, health checks, cadence, retention) is signed into the SAME
+    /// assignment that carries the version and provider set, so a control-plane reassignment
+    /// can change it with no version bump. The version/provider are reconciled by
+    /// `check_application`; this reconciles everything else onto the one live source.
+    ///
+    /// Returns whether the *launch spec* changed — an app running the old args must be
+    /// relaunched to pick up the new ones, since a live process's argv cannot be rewritten in
+    /// place. That relaunch is load-bearing: a node moved into a reload-in-place (reexec)
+    /// cohort keeps running with its old launch until relaunched, so the reload signal the
+    /// activate hook later sends would hit a process that never learned to honour it.
+    fn apply_runtime(&mut self, runtime: &updated::config::ManagedRuntime) -> bool {
+        let relaunch = self.application.args != runtime.args;
+        self.application = runtime.application();
+        self.timeouts = runtime.timeouts();
+        self.storage = runtime.storage();
+        relaunch
+    }
 }
 
 /// The supervisor stages a verified release from the reserved `supervisor` product
@@ -128,10 +147,10 @@ fn main() {
 
 fn usage() {
     eprintln!("usage: supervisor --config <bootstrap.toml>");
-    eprintln!("the bootstrap file contains only the enrollment URL and shared key");
+    eprintln!("the bootstrap file contains the node name, enrollment URL, CA, and shared fleet cert paths");
 }
 
-async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // One owner protects the shared binary, state, journal, and staging paths.
     let _lock = updated::lock::InstanceLock::acquire(&with_suffix(&opts.paths.state, ".lock"))
         .map_err(|e| format!("another supervisor already owns this install: {e}"))?;
@@ -186,7 +205,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut recovery_transaction = recovery_transaction(&situation);
     // A *provisional* committed head (`confirmed == false`, never health-proven) that crashed (the
     // guardian recorded a service exit) with no pending update to revert is a broken assigned head
-    // that a stateless pod-kill cold-installed. Reject its bytes and restart *before* relaunching
+    // that a first-install cold-installed. Reject its bytes and restart *before* relaunching
     // it: the next boot's cold install descends via ordered fallback to the newest healthy release.
     // A confirmed head that crashes transiently is a no-op here, so it falls through to the normal
     // relaunch-and-recover path — the single-crash recovery the base e2e relies on.
@@ -411,6 +430,34 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .await?
     };
     if !boot_healthy {
+        // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
+        // dangerous case: `reject_provisional_head` below would no-op (the still-deferred
+        // `store.installed()` holds the CONFIRMED candidate, not the predecessor), so without a
+        // bound the guardian relaunches, the journal re-derives the identical rollback, and it runs
+        // forever with the node down. Bound it: count failures durably in the journal (which is what
+        // survives the relaunch) and, once the limit is hit, reject the predecessor's bytes and
+        // descend via the same ordered-fallback path a cold install uses.
+        if let Some(tx) = recovery_transaction.as_mut().filter(|tx| tx.is_rollback()) {
+            let predecessor = tx.previous_release.version.clone();
+            match bound_unhealthy_rollback(&mut store, tx) {
+                Ok(RollbackHealthOutcome::Descend) => error(&format!(
+                    "rollback target {predecessor} is unhealthy after {MAX_ROLLBACK_HEALTH_ATTEMPTS} \
+                     attempts; rejected its bytes and cleared the rollback so the next boot descends \
+                     via ordered fallback past it"
+                )),
+                Ok(RollbackHealthOutcome::Retry(attempt)) => warn(&format!(
+                    "rollback target {predecessor} unhealthy (attempt {attempt} of \
+                     {MAX_ROLLBACK_HEALTH_ATTEMPTS}); retrying the same predecessor on the next boot"
+                )),
+                Err(error) => warn(&format!(
+                    "recording the unhealthy rollback target failed: {error}"
+                )),
+            }
+            app.guardian
+                .application_failed()
+                .map_err(|error| format!("reporting rollback-target health failure: {error}"))?;
+            return Err("the rollback target failed its health gate".into());
+        }
         // A still-provisional head that never becomes healthy is a broken assigned head wedged
         // alive (a crash instead tears the tower down before here — see the service-exit path at
         // boot gather). Reject its bytes so the next boot's cold install descends via ordered
@@ -532,15 +579,20 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("publishing initial application readiness: {error}"))?;
 
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
-    let readiness_url = opts
+    // Owned so the loop can re-derive them after a control-plane reassignment updates
+    // `opts.application` (see `Options::apply_runtime`); a borrowed `&str` into `opts` would
+    // pin it immutable for the whole loop.
+    let mut readiness_url: Option<String> = opts
         .application
-        .health_check_url(updated::config::HealthCheckKind::Readiness);
-    let liveness_url = opts
+        .health_check_url(updated::config::HealthCheckKind::Readiness)
+        .map(str::to_owned);
+    let mut liveness_url: Option<String> = opts
         .application
-        .health_check_url(updated::config::HealthCheckKind::Liveness);
-    let health_probe = (readiness_url.is_some() || liveness_url.is_some())
-        .then(HealthProbe::new)
-        .transpose()?;
+        .health_check_url(updated::config::HealthCheckKind::Liveness)
+        .map(str::to_owned);
+    // Built once and reused: the probe is just a pooled HTTP client, so a reassignment that
+    // adds or changes a health URL is picked up by re-deriving the URLs above, not the client.
+    let health_probe = Some(HealthProbe::new()?);
     // The installed release's health-check provider, if it ships one, is the single steady-state
     // signal — it drives both readiness and liveness, replacing the HTTP probes. Refreshed when
     // an update commits, since the provider travels with the release.
@@ -562,6 +614,13 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .mtls
         .reqwest_client()
         .unwrap_or_else(|_| reqwest::Client::new());
+    // The node signs each report with the SAME per-node key that certifies its mTLS leaf, so the
+    // control plane verifies authenticity end-to-end (not just on the write hop). Loaded once as
+    // PKCS#8 DER; absent only for a mis-provisioned node, whose unsigned reports then fail closed at
+    // the throttle (treated as not-yet-settled) rather than being trusted.
+    let telemetry_signing_key = std::fs::read_to_string(&opts.routing.mtls.client_key)
+        .ok()
+        .and_then(|pem| updated::csr::key_pem_to_pkcs8_der(&pem).ok());
     // Latest readiness observation, so a report reflects whether the running deployment is
     // actually serving. `None` until first sampled (or when no readiness check exists).
     let mut last_ready: Option<bool> = None;
@@ -642,7 +701,7 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // A tagged URL is sampled at most once per tick. When readiness and
             // liveness intentionally share an application endpoint, both policies see
             // the same observation rather than racing a flapping handler.
-            let readiness = match readiness_url {
+            let readiness = match readiness_url.as_deref() {
                 Some(url) => Some(probe.sample(&app, url, None, None).await),
                 None => None,
             };
@@ -651,8 +710,8 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 app.traffic_ready(ready)
                     .map_err(|error| format!("publishing application readiness: {error}"))?;
             }
-            if let Some(url) = liveness_url {
-                let live = if readiness_url == Some(url) {
+            if let Some(url) = liveness_url.as_deref() {
+                let live = if readiness_url.as_deref() == Some(url) {
                     readiness.expect("the shared readiness URL was sampled")
                 } else {
                     probe.sample(&app, url, None, None).await
@@ -743,6 +802,45 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         };
         loop_state.refresh_failures = 0;
 
+        // Reconcile the managed runtime onto the one live source before acting on version or
+        // provider changes. `check_application` reconciles the version and provider set; the
+        // rest of the runtime — launch args, health URLs, cadence, retention — is signed into
+        // the same assignment and can change on a control-plane reassignment with no version
+        // bump. Applying it here keeps every launch on the current launch spec.
+        if let Some(assignment) = repo.assignment() {
+            let relaunch = opts.apply_runtime(&assignment.runtime);
+            // The health URLs live in the runtime we just applied; re-derive them (owned) so a
+            // reassignment that retargets a probe takes effect on the next tick.
+            readiness_url = opts
+                .application
+                .health_check_url(updated::config::HealthCheckKind::Readiness)
+                .map(str::to_owned);
+            liveness_url = opts
+                .application
+                .health_check_url(updated::config::HealthCheckKind::Liveness)
+                .map(str::to_owned);
+            if relaunch {
+                // The launch spec changed. A live process cannot have its argv rewritten, so
+                // stop it and relaunch on the new args. This is the ONLY way a node reassigned
+                // into a reload-in-place (reexec) cohort starts honouring the reload signal the
+                // activate hook will later send — without it the process keeps its old launch
+                // and the reload upgrade silently no-ops, then rolls back on the version proof.
+                log("assignment runtime changed the launch spec; relaunching the application to apply it");
+                app::stop(&mut app.guardian, &opts.paths.app_token).map_err(|error| {
+                    format!("stopping the application to apply a new launch spec: {error}")
+                })?;
+                app.launch(&opts).map_err(|error| {
+                    format!("relaunching the application with the new launch spec: {error}")
+                })?;
+                // Re-gate readiness from scratch and let the next tick drive the version/provider
+                // reconciliation against the freshly relaunched, correctly-configured process.
+                last_ready = None;
+                next_health_probe = Instant::now() + opts.timeouts.health_interval;
+                loop_state.next_app_check = Instant::now();
+                continue;
+            }
+        }
+
         // Self-update first: on an accepted handoff this process exits.
         if self_due {
             self_update
@@ -795,8 +893,8 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // boot), do NOT report settled on the strength of the boot gate alone — wait for a
             // steady-state observation. When no readiness signal exists there is nothing to sample,
             // so the boot gate (already passed) is the answer.
-            let has_readiness = steady_healthcheck.is_some()
-                || (health_probe.is_some() && readiness_url.is_some());
+            let has_readiness =
+                steady_healthcheck.is_some() || (health_probe.is_some() && readiness_url.is_some());
             let settled = pending.is_none() && last_ready.unwrap_or(!has_readiness);
             telemetry::report_running_state(
                 &telemetry_client,
@@ -805,12 +903,12 @@ async fn run(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 &assignment.deployment,
                 current.as_deref().unwrap_or_default(),
                 settled,
+                telemetry_signing_key.as_deref(),
             )
             .await;
         }
     }
 }
-
 
 /// Repair a damaged committed release from the same signed deployment contract used by
 /// normal updates, but only when its routing repository is explicitly local. This path
@@ -855,7 +953,7 @@ async fn repair_from_local_assignment(
             prepared.archive_sha256,
         )
         .with_lifecycle(providers.lifecycle.map(Box::new))
-        .with_healthcheck(providers.healthcheck.map(Box::new))
+        .with_healthcheck(providers.healthcheck.map(Box::new)),
     )?;
     store.activate(&prepared.release)?;
     log(&format!(
@@ -949,6 +1047,51 @@ fn reject_provisional_head(
     Ok(true)
 }
 
+/// How many consecutive boots may fail to health-gate a crash-recovered rollback's predecessor
+/// before the supervisor stops retrying it and descends via ordered fallback. More than one so a
+/// merely slow-to-start predecessor is not abandoned on its first miss; small so a genuinely broken
+/// predecessor cannot keep the node down for long.
+const MAX_ROLLBACK_HEALTH_ATTEMPTS: u32 = 3;
+
+/// What a boot does after a crash-recovered rollback's predecessor fails its health gate.
+#[derive(Debug, PartialEq, Eq)]
+enum RollbackHealthOutcome {
+    /// Still under the bound: the incremented counter is persisted and the same predecessor is
+    /// retried on the next boot. Carries the attempt number for the log.
+    Retry(u32),
+    /// The bound was reached: the predecessor's bytes are rejected, it is recorded as a provisional
+    /// (now-rejected) head, and the rollback journal is cleared, so the next boot's
+    /// [`ensure_installed`] descends via ordered fallback past it exactly as a cold install does.
+    Descend,
+}
+
+/// Bound rollback-target health failures so a predecessor whose bytes can no longer pass the gate
+/// cannot crash-loop the node forever. The failure count rides the journal (the very thing that
+/// re-derives the rollback on each boot, so it survives the guardian relaunch). Once it reaches
+/// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], this rejects the predecessor, records it provisional, and drops
+/// the journal — the next boot then descends via the cold-install ordered-fallback path instead of
+/// relaunching the same broken predecessor.
+fn bound_unhealthy_rollback(
+    store: &mut dyn Store,
+    tx: &mut Transaction,
+) -> io::Result<RollbackHealthOutcome> {
+    tx.rollback_health_failures = tx.rollback_health_failures.saturating_add(1);
+    if tx.rollback_health_failures >= MAX_ROLLBACK_HEALTH_ATTEMPTS {
+        store.reject(&tx.previous_repository_lineage, &tx.previous_archive_sha256)?;
+        store.commit_installed(&updated::state::InstalledState::provisional(
+            tx.previous_repository_lineage.clone(),
+            tx.previous_release.clone(),
+            tx.previous_archive_sha256.clone(),
+        ))?;
+        store.clear_journal()?;
+        Ok(RollbackHealthOutcome::Descend)
+    } else {
+        // Persist the incremented count (phase unchanged) so the next boot resumes the tally.
+        persist_transaction(store, tx)?;
+        Ok(RollbackHealthOutcome::Retry(tx.rollback_health_failures))
+    }
+}
+
 fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
     if let Some(tx) = &situation.journal {
         let committed = match &situation.installed {
@@ -985,6 +1128,7 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
                     candidate_rejection_required: situation.service_exited,
                     lifecycle: pending.lifecycle.clone(),
                     healthcheck: pending.healthcheck.clone(),
+                    rollback_health_failures: 0,
                     phase: TransactionPhase::RollbackStarted,
                 });
             }
@@ -1050,7 +1194,9 @@ fn gather_situation(
         .as_ref()
         .and_then(|tx| tx.lifecycle.as_deref())
         .or_else(|| match &installed {
-            Installed::Present(state) => state.pending.as_ref().and_then(|p| p.lifecycle.as_deref()),
+            Installed::Present(state) => {
+                state.pending.as_ref().and_then(|p| p.lifecycle.as_deref())
+            }
             _ => None,
         });
     let reloads_in_place =
@@ -1226,4 +1372,160 @@ fn warn(msg: &str) {
 }
 fn error(msg: &str) {
     foundation::log::error("supervisor", msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use updated::bundle::ReleaseId;
+    use updated::install::InstallTransaction;
+    use updated::state::{Installed, InstalledState, RepositoryLineage};
+    use updated::transaction::{Kind, Phase, Transaction};
+
+    /// A durable-store double that keeps everything in memory, so the counter-persistence loop can
+    /// be driven across simulated boots without touching the filesystem.
+    #[derive(Default)]
+    struct MemStore {
+        installed: Option<InstalledState>,
+        journal: Option<Transaction>,
+        install_journal: Option<InstallTransaction>,
+        active: Option<ReleaseId>,
+        rejected: HashSet<String>,
+    }
+
+    impl Store for MemStore {
+        fn installed(&self) -> Installed {
+            match &self.installed {
+                Some(state) => Installed::Present(Box::new(state.clone())),
+                None => Installed::Missing,
+            }
+        }
+        fn journal(&self) -> io::Result<Option<Transaction>> {
+            Ok(self.journal.clone())
+        }
+        fn install_journal(&self) -> io::Result<Option<InstallTransaction>> {
+            Ok(self.install_journal.clone())
+        }
+        fn active_release(&self) -> io::Result<Option<ReleaseId>> {
+            Ok(self.active.clone())
+        }
+        fn is_rejected(&self, lineage: &RepositoryLineage, digest: &str) -> bool {
+            self.rejected.contains(&lineage.rejection_key(digest))
+        }
+        fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
+            self.installed = Some(state.clone());
+            Ok(())
+        }
+        fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
+            self.journal = Some(tx.clone());
+            Ok(())
+        }
+        fn clear_journal(&mut self) -> io::Result<()> {
+            self.journal = None;
+            Ok(())
+        }
+        fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
+            self.install_journal = Some(tx.clone());
+            Ok(())
+        }
+        fn clear_install_journal(&mut self) -> io::Result<()> {
+            self.install_journal = None;
+            Ok(())
+        }
+        fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+            self.rejected.insert(lineage.rejection_key(digest));
+            Ok(())
+        }
+        fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+            self.rejected.remove(&lineage.rejection_key(digest));
+            Ok(())
+        }
+        fn verify_release(&self, _: &ReleaseId) -> io::Result<()> {
+            Ok(())
+        }
+        fn point_active(&mut self, release: &ReleaseId) -> io::Result<()> {
+            self.active = Some(release.clone());
+            Ok(())
+        }
+    }
+
+    fn release(version: &str, digest: &str) -> ReleaseId {
+        ReleaseId {
+            version: version.into(),
+            manifest_sha256: digest.into(),
+        }
+    }
+
+    #[test]
+    fn a_persistently_unhealthy_rollback_target_descends_instead_of_looping() {
+        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let tx = Transaction {
+            id: "attempt".into(),
+            kind: Kind::Supervised,
+            previous_release: predecessor.clone(),
+            previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage.clone(),
+            candidate_release: candidate.clone(),
+            candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage.clone(),
+            candidate_rejection_required: true,
+            lifecycle: None,
+            healthcheck: None,
+            rollback_health_failures: 0,
+            phase: Phase::RollbackHealthStarted,
+        };
+        let mut store = MemStore {
+            installed: Some(InstalledState::confirmed(
+                lineage.clone(),
+                candidate.clone(),
+                "archive-two".into(),
+            )),
+            journal: Some(tx),
+            ..MemStore::default()
+        };
+
+        // Each iteration models one boot that re-derives the rollback from the durable journal and
+        // fails the predecessor's health gate. The loop must terminate (descend), never spin.
+        let mut outcomes = Vec::new();
+        for _ in 0..MAX_ROLLBACK_HEALTH_ATTEMPTS + 5 {
+            let Some(mut derived) = store.journal().unwrap() else {
+                break; // journal cleared: we descended, so the next boot no longer rolls back.
+            };
+            assert!(derived.is_rollback());
+            let outcome = bound_unhealthy_rollback(&mut store, &mut derived).unwrap();
+            let done = outcome == RollbackHealthOutcome::Descend;
+            outcomes.push(outcome);
+            if done {
+                break;
+            }
+        }
+
+        assert_eq!(
+            outcomes,
+            vec![
+                RollbackHealthOutcome::Retry(1),
+                RollbackHealthOutcome::Retry(2),
+                RollbackHealthOutcome::Descend,
+            ],
+            "the rollback must be bounded at {MAX_ROLLBACK_HEALTH_ATTEMPTS} attempts, then descend"
+        );
+        // On descent the predecessor's bytes are rejected and it is recorded provisional with the
+        // journal cleared — exactly the state `ensure_installed` treats as "descend via ordered
+        // fallback past this head" on the next boot.
+        assert!(store.is_rejected(&lineage, "archive-one"));
+        assert!(store.journal().unwrap().is_none());
+        match store.installed() {
+            Installed::Present(state) => {
+                assert_eq!(state.release, predecessor);
+                assert!(
+                    !state.confirmed,
+                    "the descended-from predecessor is recorded provisional so cold install re-descends"
+                );
+            }
+            _ => panic!("expected a provisional predecessor record"),
+        }
+    }
 }

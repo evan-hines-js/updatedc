@@ -9,24 +9,26 @@ use std::net::SocketAddr;
 
 use tokio::net::TcpListener;
 
-mod layout;
-mod publisher;
-mod state;
-mod golden;
-mod demo;
-mod setup;
 mod background;
-mod server;
+mod demo;
+mod golden;
+mod haproxy;
+mod layout;
 mod page;
-pub(crate) use layout::*;
-pub(crate) use publisher::*;
-pub(crate) use state::*;
-pub(crate) use golden::*;
-pub(crate) use demo::*;
-pub(crate) use setup::*;
+mod publisher;
+mod server;
+mod setup;
+mod state;
 pub(crate) use background::*;
-pub(crate) use server::*;
+pub(crate) use demo::*;
+pub(crate) use golden::*;
+pub(crate) use haproxy::*;
+pub(crate) use layout::*;
 pub(crate) use page::*;
+pub(crate) use publisher::*;
+pub(crate) use server::*;
+pub(crate) use setup::*;
+pub(crate) use state::*;
 
 pub(crate) fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("missing {name}").into())
@@ -43,7 +45,10 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("setup") => return setup_demo().await,
         Some("exercise") => {
-            let passes = env::args().nth(2).and_then(|arg| arg.parse().ok()).unwrap_or(1);
+            let passes = env::args()
+                .nth(2)
+                .and_then(|arg| arg.parse().ok())
+                .unwrap_or(1);
             return exercise_existing_cluster(passes).await;
         }
         Some("reset") => return reset_demo(),
@@ -76,7 +81,6 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::agent_resource_name;
@@ -87,4 +91,3 @@ mod tests {
         assert_eq!(agent_resource_name(4), "agent-9f815b3ffd9a32a533b577d9");
     }
 }
-

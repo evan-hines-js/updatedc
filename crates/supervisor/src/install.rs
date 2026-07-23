@@ -118,11 +118,11 @@ pub(crate) async fn ensure_installed(
         ),
         (updated::state::Installed::Present(state), updated::state::EnrollmentState::Present) => {
             // A *provisional* head (`confirmed == false`, never passed a health gate) that has
-            // been rejected must not be relaunched into a crash loop. This is the stateless
-            // pod-kill case: an emptyDir node returns cold with no rejection history, cold-installs
-            // its broken assigned head, the boot rejects it on crash/wedge, and it restarts. Re-run
-            // the cold install so ordered fallback descends past the rejected head to the newest
-            // healthy release.
+            // been rejected must not be relaunched into a crash loop. This is the first-install
+            // case: a fresh node cold-installs its (broken) assigned head, the boot rejects it on
+            // crash/wedge, and it restarts. Re-run the cold install so ordered fallback descends
+            // past the rejected head to the newest healthy release. (Storage is persistent, so this
+            // only ever happens during a node's initial install, never a mid-life state loss.)
             //
             // The `confirmed` gate is load-bearing: a *confirmed* head that a normal update/rollback
             // later rejects is recovered by the update state machine (its journal restores the
@@ -142,8 +142,8 @@ pub(crate) async fn ensure_installed(
                     // release is already committed on disk. Bricking (exit fatal → guardian
                     // crash-loop) is never better than relaunching a release we already committed
                     // and verified — hold it and keep serving; it confirms on a passing gate. This
-                    // is the stateless node whose only healthy floor was transiently rejected (e.g.
-                    // a slow first-boot gate under load): it must recover, not strand.
+                    // is a first-install node whose only healthy floor was transiently rejected
+                    // (e.g. a slow first-boot gate under load): it must recover, not strand.
                     ColdInstall::NothingSelectable(diagnostics) => {
                         warn(&format!(
                             "ordered fallback found nothing selectable below the rejected head; \
@@ -194,7 +194,7 @@ async fn apply_install(
     // Resolve, download and verify the first application, descending past any *malformed* bundle
     // inline. A malformed head (corrupt archive, bad manifest, bad/missing entrypoint) passes its
     // signed archive sha but fails to extract/validate — the update path rejects it and moves on
-    // (see `check_application`), and cold install must do the same or a stateless node stalls
+    // (see `check_application`), and cold install must do the same or a first-install node stalls
     // forever re-downloading a bundle it can never install. Each iteration rejects one malformed
     // head and re-selects, so ordered fallback monotonically descends to the newest *installable*
     // release; the loop terminates when one installs or nothing selectable remains.
@@ -324,7 +324,7 @@ async fn place_and_commit(
             tx.archive_sha256.clone(),
         )
         .with_lifecycle(tx.lifecycle.clone())
-        .with_healthcheck(tx.healthcheck.clone())
+        .with_healthcheck(tx.healthcheck.clone()),
     )?;
     advance_install(store, &mut tx, InstallPhase::Committed)?;
     chaos.crossing(install_boundary::COMMITTED);

@@ -29,6 +29,7 @@ pub fn activate(
         candidate_rejection_required: false,
         lifecycle: None,
         healthcheck: None,
+        rollback_health_failures: 0,
         phase: Phase::Started,
     };
     transaction::write(&paths.journal, &transaction)?;

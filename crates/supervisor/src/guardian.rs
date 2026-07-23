@@ -60,22 +60,30 @@ impl Guardian {
         }
     }
 
-    fn exchange(&mut self, req: &Request) -> Result<Response, String> {
+    fn exchange(&mut self, req: &Request) -> Result<Response, GuardianError> {
+        // A write/read failure on the channel is a transport failure, not a refusal: the
+        // guardian died, the pipe broke, or a frame was truncated. Tag it `Channel` so the
+        // update path recovers rather than blaming the candidate.
         req.write(self.conn.writer())
-            .map_err(|e| format!("sending control request: {e}"))?;
-        Response::read(self.conn.reader()).map_err(|e| format!("reading control response: {e}"))
+            .map_err(|e| GuardianError::Channel(format!("sending control request: {e}")))?;
+        Response::read(self.conn.reader())
+            .map_err(|e| GuardianError::Channel(format!("reading control response: {e}")))
     }
 
     /// Ask the guardian to launch the application from `spec`. Returns the application's
-    /// PID.
-    pub(crate) fn launch(&mut self, spec: &CommandSpec) -> Result<u32, String> {
-        self.require(control::CAP_LAUNCH_APP_V1, "LAUNCH")?;
+    /// PID. A `Channel` error means the control channel failed (e.g. a SIGKILLed guardian);
+    /// a `Refused` error means the guardian answered but the launch itself failed.
+    pub(crate) fn launch(&mut self, spec: &CommandSpec) -> Result<u32, GuardianError> {
+        self.require(control::CAP_LAUNCH_APP_V1, "LAUNCH")
+            .map_err(GuardianError::Refused)?;
         match self.exchange(&Request::Launch(spec.clone()))? {
             Response::Launched { pid } => Ok(pid),
-            Response::Error(msg) => {
-                Err(format!("guardian could not launch the application: {msg}"))
-            }
-            other => Err(format!("unexpected reply to LAUNCH: {other:?}")),
+            Response::Error(msg) => Err(GuardianError::Refused(format!(
+                "guardian could not launch the application: {msg}"
+            ))),
+            other => Err(GuardianError::Refused(format!(
+                "unexpected reply to LAUNCH: {other:?}"
+            ))),
         }
     }
 
@@ -115,10 +123,42 @@ impl Guardian {
     }
 
     fn expect_ok(&mut self, req: &Request, what: &str) -> Result<(), String> {
-        match self.exchange(req)? {
+        match self.exchange(req).map_err(|e| e.to_string())? {
             Response::Ok => Ok(()),
             Response::Error(msg) => Err(format!("guardian rejected {what}: {msg}")),
             other => Err(format!("unexpected reply to {what}: {other:?}")),
+        }
+    }
+}
+
+/// Why a guardian request failed, distinguished by fault attribution. `Refused` is a real
+/// operation failure the managed candidate owns (a bad launch spec, a missing capability, an
+/// unexpected reply). `Channel` is a control-channel transport failure — a SIGKILLed guardian,
+/// a broken pipe, a closed or malformed frame — which is NEVER the candidate's fault. It maps to
+/// `io::ErrorKind::ConnectionReset` so the update path can let it drive boot recovery (which
+/// retries) instead of permanently rejecting a healthy release.
+pub(crate) enum GuardianError {
+    Channel(String),
+    Refused(String),
+}
+
+impl std::fmt::Display for GuardianError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuardianError::Channel(message) | GuardianError::Refused(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+impl From<GuardianError> for std::io::Error {
+    fn from(error: GuardianError) -> Self {
+        match error {
+            GuardianError::Channel(message) => {
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, message)
+            }
+            GuardianError::Refused(message) => std::io::Error::other(message),
         }
     }
 }

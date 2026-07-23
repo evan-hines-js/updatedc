@@ -1,7 +1,10 @@
 [enrollment]
 url = "{{ updated_enrollment_url }}"
-# Identity is mutual TLS: this node presents a client certificate the fleet CA signed. The
-# config file holds only paths — the certificate material is written by this role.
+# This node's self-asserted enrollment name — becomes the minted cert's CN and its UpdateAgent.
+name = "{{ updated_node_name | default(inventory_hostname) }}"
+# Identity is mutual TLS: this node presents the shared fleet enrollment certificate the fleet CA
+# signed. The config file holds only a name and paths — the certificate material is written by this
+# role.
 client_cert = "/etc/updated/agent-tls/tls.crt"
 client_key = "/etc/updated/agent-tls/tls.key"
 ca = "/etc/updated/agent-tls/ca.crt"

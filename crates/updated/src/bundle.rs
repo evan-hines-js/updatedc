@@ -129,7 +129,10 @@ pub fn create_bundle(
 ) -> io::Result<()> {
     semver::Version::parse(version).map_err(invalid)?;
     validate_relative(entrypoints.entrypoint, 1024)?;
-    for script in [entrypoints.activate, entrypoints.rollback].into_iter().flatten() {
+    for script in [entrypoints.activate, entrypoints.rollback]
+        .into_iter()
+        .flatten()
+    {
         validate_relative(script, 1024)?;
     }
     let metadata = fs::symlink_metadata(source)?;
@@ -336,7 +339,10 @@ pub(crate) fn stage_bundle(
             fs::remove_dir_all(&stage)?;
             return Ok(StagedRelease { id, archive_sha256 });
         }
-        foundation::durable::sync_dir(&stage)?;
+        // Flush the entire staged tree — nested subdirectories (e.g. `bin/`, `lib/`) as well
+        // as the top dir — so a power loss right after the rename cannot surface a release
+        // whose nested dirents were never persisted.
+        foundation::durable::sync_tree(&stage)?;
         fs::rename(&stage, &destination)?;
         foundation::durable::sync_dir(versions_root)?;
         // Re-verify the freshly published tree against its manifest.
@@ -732,7 +738,8 @@ mod tests {
             )
             .into_bytes()
         };
-        let entry = format!(r#"{{"path":"bin/app","sha256":"{digest}","size":1,"executable":true}}"#);
+        let entry =
+            format!(r#"{{"path":"bin/app","sha256":"{digest}","size":1,"executable":true}}"#);
         let rollback_ok =
             format!(r#"{{"path":"bin/rollback","sha256":"{digest}","size":1,"executable":true}}"#);
         let rollback_not_exec =
@@ -740,7 +747,10 @@ mod tests {
 
         // A declared, executable rollback script is accepted.
         BundleManifest::parse(
-            &manifest(&format!("{entry},{rollback_ok}"), r#","rollback":"bin/rollback""#),
+            &manifest(
+                &format!("{entry},{rollback_ok}"),
+                r#","rollback":"bin/rollback""#,
+            ),
             &expected,
         )
         .unwrap();
@@ -754,7 +764,10 @@ mod tests {
         .contains("rollback script is not declared"));
         // A declared-but-not-executable rollback is rejected.
         assert!(BundleManifest::parse(
-            &manifest(&format!("{entry},{rollback_not_exec}"), r#","rollback":"bin/rollback""#),
+            &manifest(
+                &format!("{entry},{rollback_not_exec}"),
+                r#","rollback":"bin/rollback""#
+            ),
             &expected
         )
         .unwrap_err()

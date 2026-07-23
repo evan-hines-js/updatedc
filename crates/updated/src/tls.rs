@@ -72,11 +72,11 @@ impl Identity {
         let key = load_key(&self.client_key, "client key")?;
 
         ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
-        .with_root_certificates(roots)
-        .with_client_auth_cert(certs, key)
-        .map_err(|error| invalid(&format!("loading the client identity failed: {error}")))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certs, key)
+            .map_err(|error| invalid(&format!("loading the client identity failed: {error}")))
     }
 
     /// A reqwest client that presents this identity — used for enrollment and any direct HTTP
@@ -87,26 +87,6 @@ impl Identity {
             .build()
             .map_err(io::Error::other)
     }
-}
-
-/// A rustls client config that verifies the gateway against `ca` but presents NO client
-/// certificate. This is the join-mode transport: a node reaches `/join` before it has any
-/// identity, so the connection is server-authenticated only. Fail-closed on unreadable/invalid PEM.
-pub fn server_auth_config(ca: &Path) -> io::Result<ClientConfig> {
-    let roots = load_roots(ca, "enrollment CA")?;
-    Ok(ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
-        .with_root_certificates(roots)
-        .with_no_client_auth())
-}
-
-/// A reqwest client for the join endpoint — server-authenticated, no client certificate.
-pub fn server_auth_client(ca: &Path) -> io::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .use_preconfigured_tls(server_auth_config(ca)?)
-        .build()
-        .map_err(io::Error::other)
 }
 
 /// Build an aws-lc-rs rustls server config for an externally-exposed listener: it presents
@@ -126,7 +106,11 @@ pub fn server_config(
         provider.clone(),
     )
     .build()
-    .map_err(|error| invalid(&format!("building the client-certificate verifier: {error}")))?;
+    .map_err(|error| {
+        invalid(&format!(
+            "building the client-certificate verifier: {error}"
+        ))
+    })?;
 
     let certs = load_cert_chain(cert, "server certificate")?;
     let key = load_key(key, "server key")?;
@@ -135,22 +119,6 @@ pub fn server_config(
         .with_safe_default_protocol_versions()
         .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
         .with_client_cert_verifier(verifier)
-        .with_single_cert(certs, key)
-        .map_err(|error| invalid(&format!("loading the server identity failed: {error}")))
-}
-
-/// A server config for a listener that does NOT require a client certificate — the join endpoint,
-/// which a node reaches before it has any identity of its own. It presents the same `cert`/`key`
-/// server identity as the mTLS gateway but admits any client; the group join token (in the request
-/// body), not a client certificate, authenticates the peer. Fail-closed on unreadable/invalid PEM.
-pub fn server_config_no_client_auth(cert: &Path, key: &Path) -> io::Result<rustls::ServerConfig> {
-    let provider = Arc::new(crypto_provider());
-    let certs = load_cert_chain(cert, "server certificate")?;
-    let key = load_key(key, "server key")?;
-    rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
-        .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|error| invalid(&format!("loading the server identity failed: {error}")))
 }

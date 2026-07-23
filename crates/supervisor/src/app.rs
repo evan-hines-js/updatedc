@@ -43,7 +43,9 @@ impl App {
         let token = updated::rand::token()?;
         write_app_token(&opts.paths.app_token, &token)?;
         let spec = app_spec(opts, &token)?;
-        let pid = self.guardian.launch(&spec).map_err(io::Error::other)?;
+        // A guardian `Channel` failure becomes `io::ErrorKind::ConnectionReset` (see
+        // `GuardianError`); the update path recognizes that and recovers instead of rejecting.
+        let pid = self.guardian.launch(&spec)?;
         self.pid = pid;
         self.health_token = token;
         Ok(())
@@ -399,11 +401,26 @@ mod tests {
         assert!(health_headers_match("tok", Some("2.0.0"), None, None));
         // A cooperating app that echoes the launch token keeps the stronger check.
         assert!(health_headers_match("tok", None, Some("tok"), None));
-        assert!(health_headers_match("tok", Some("2.0.0"), Some("tok"), Some("2.0.0")));
+        assert!(health_headers_match(
+            "tok",
+            Some("2.0.0"),
+            Some("tok"),
+            Some("2.0.0")
+        ));
         // A header that is present but wrong is a forged or stale answer — still rejected.
         assert!(!health_headers_match("tok", None, Some("forged"), None));
-        assert!(!health_headers_match("tok", Some("2.0.0"), Some("tok"), Some("1.0.0")));
+        assert!(!health_headers_match(
+            "tok",
+            Some("2.0.0"),
+            Some("tok"),
+            Some("1.0.0")
+        ));
         // A missing version when one was expected is skipped (best-effort), not a failure.
-        assert!(health_headers_match("tok", Some("2.0.0"), Some("tok"), None));
+        assert!(health_headers_match(
+            "tok",
+            Some("2.0.0"),
+            Some("tok"),
+            None
+        ));
     }
 }

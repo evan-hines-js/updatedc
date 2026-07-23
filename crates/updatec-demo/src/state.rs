@@ -1,4 +1,3 @@
-
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FleetNode {
@@ -84,5 +83,3 @@ pub(crate) struct ChaosState {
     pub(crate) events: Vec<String>,
     pub(crate) error: Option<String>,
 }
-
-

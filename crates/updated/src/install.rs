@@ -190,10 +190,7 @@ mod tests {
             classify_install_recovery(&t, Some(&t.release)),
             InstallRecovery::Committed
         );
-        assert_eq!(
-            classify_install_recovery(&t, None),
-            InstallRecovery::Resume
-        );
+        assert_eq!(classify_install_recovery(&t, None), InstallRecovery::Resume);
         assert_eq!(
             classify_install_recovery(&t, Some(&release("9.9.9", "other"))),
             InstallRecovery::Resume
@@ -212,7 +209,11 @@ mod tests {
         let path = tmp("journal");
         assert_eq!(read(&path).unwrap(), None, "absent journal reads as None");
         write(&path, &tx()).unwrap();
-        assert_eq!(read(&path).unwrap(), Some(tx()), "written journal reads back");
+        assert_eq!(
+            read(&path).unwrap(),
+            Some(tx()),
+            "written journal reads back"
+        );
         clear(&path).unwrap();
         assert_eq!(read(&path).unwrap(), None, "cleared journal reads as None");
     }
@@ -225,6 +226,9 @@ mod tests {
             br#"{"id":"x","release":{"version":"1","manifest_sha256":"a"},"legacy":true}"#,
         )
         .unwrap();
-        assert!(read(&path).is_err(), "unknown fields are not a second schema");
+        assert!(
+            read(&path).is_err(),
+            "unknown fields are not a second schema"
+        );
     }
 }

@@ -224,23 +224,24 @@ async fn publish_provider_set(args: &[String]) -> R {
     let id = flag(args, "--id").ok_or("--id <provider-set-id> is required")?;
     // Each capability is published from its own flag prefix; a set may carry a lifecycle
     // override, a health-check override, both, or (for a provider-less set) neither.
-    let override_for = |prefix: &str,
-                        arg_flag: &str,
-                        timeout_flag: &str,
-                        capability: updated::config::ProviderCapability|
-     -> Result<Option<updated::config::ProviderOverride>, Box<dyn std::error::Error>> {
-        if flag(args, &format!("--{prefix}-path")).is_none() {
-            return Ok(None);
-        }
-        Ok(Some(updated::config::ProviderOverride {
-            capability,
-            artifact: target_reference(args, prefix)?,
-            args: flags_all(args, arg_flag),
-            timeout_millis: flag(args, timeout_flag)
-                .unwrap_or_else(|| "300000".into())
-                .parse()?,
-        }))
-    };
+    let override_for =
+        |prefix: &str,
+         arg_flag: &str,
+         timeout_flag: &str,
+         capability: updated::config::ProviderCapability|
+         -> Result<Option<updated::config::ProviderOverride>, Box<dyn std::error::Error>> {
+            if flag(args, &format!("--{prefix}-path")).is_none() {
+                return Ok(None);
+            }
+            Ok(Some(updated::config::ProviderOverride {
+                capability,
+                artifact: target_reference(args, prefix)?,
+                args: flags_all(args, arg_flag),
+                timeout_millis: flag(args, timeout_flag)
+                    .unwrap_or_else(|| "300000".into())
+                    .parse()?,
+            }))
+        };
     let overrides = [
         override_for(
             "provider",
@@ -542,9 +543,8 @@ async fn serve(args: &[String]) -> R {
     let cert = PathBuf::from(flag(args, "--cert").ok_or("--cert <server.crt> is required")?);
     let key = PathBuf::from(flag(args, "--key").ok_or("--key <server.key> is required")?);
     let ca = PathBuf::from(flag(args, "--ca").ok_or("--ca <ca.crt> is required")?);
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(updated::tls::server_config(
-        &cert, &key, &ca,
-    )?));
+    let acceptor =
+        tokio_rustls::TlsAcceptor::from(Arc::new(updated::tls::server_config(&cert, &key, &ca)?));
 
     let listener = TcpListener::bind(&addr).await?;
     let connections = Arc::new(Semaphore::new(128));

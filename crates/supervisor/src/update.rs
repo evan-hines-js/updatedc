@@ -383,10 +383,7 @@ impl BuiltInPhases {
 }
 
 impl<'a> LoadedPhaseProvider<'a> {
-    fn load(
-        opts: &'a Options,
-        external: Option<&'a updated::state::ProviderRelease>,
-    ) -> Self {
+    fn load(opts: &'a Options, external: Option<&'a updated::state::ProviderRelease>) -> Self {
         match external {
             Some(release) => Self::External { release, opts },
             None => Self::BuiltIn(BuiltInPhases),
@@ -665,6 +662,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
         // already carries the predecessor's providers.
         lifecycle: installed.lifecycle.clone(),
         healthcheck: installed.healthcheck.clone(),
+        rollback_health_failures: 0,
         phase: TransactionPhase::PreflightStarted,
     };
     persist_transaction(store, &tx)?;
@@ -707,9 +705,12 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     // yet, so a failure here defers cleanly. No-op when the provider defines no pre-drain
     // phase.
     advance_transaction(store, &mut tx, TransactionPhase::PreDrainStarted)?;
-    if let Err(error) =
-        tower.lifecycle(LifecyclePhase::PreDrain, &tx.id, candidate, &installed.release)
-    {
+    if let Err(error) = tower.lifecycle(
+        LifecyclePhase::PreDrain,
+        &tx.id,
+        candidate,
+        &installed.release,
+    ) {
         warn(&format!(
             "candidate {} was deferred during pre-drain ({error}); the running release remains active",
             candidate.version
@@ -771,9 +772,22 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     advance_transaction(store, &mut tx, TransactionPhase::Stopped)?;
 
     advance_transaction(store, &mut tx, TransactionPhase::ActivateStarted)?;
-    if let Err(e) = store.activate(candidate) {
-        warn(&format!("release activation failed before commit ({e})"));
+    // Split the activation into its two failure classes. A re-verification failure means the
+    // candidate's on-disk bytes are corrupt — genuinely its fault — so reject. A pointer-write
+    // failure is pure infrastructure (ENOSPC, transient I/O), never the candidate's fault: restart
+    // for boot recovery WITHOUT rejecting, so the healthy release is retried instead of stranded a
+    // version behind (same fail-safe class as the guardian-channel case below).
+    if let Err(e) = store.verify_release(candidate) {
+        warn(&format!(
+            "release re-verification failed before commit ({e})"
+        ));
         return reject_then_recover(store, &mut tx);
+    }
+    if let Err(e) = store.point_active(candidate) {
+        warn(&format!(
+            "writing the active-release pointer failed ({e}); restarting for boot recovery"
+        ));
+        return Ok(Outcome::RollbackPending);
     }
     chaos.crossing(boundary::CANDIDATE_POINTER_APPLIED);
 
@@ -785,6 +799,22 @@ pub(crate) async fn apply_update<T: DeploymentProvider + Health>(
     advance_transaction(store, &mut tx, TransactionPhase::CandidateActivated)?;
     advance_transaction(store, &mut tx, TransactionPhase::StartStarted)?;
     if let Err(e) = tower.start() {
+        // A control-channel transport failure here (a SIGKILLed guardian, a broken pipe) is never
+        // the candidate's fault, and the candidate process never started. Restart for boot
+        // recovery *without* recording a rejection (unlike `reject_then_recover`): recovery
+        // restores the predecessor and rejects the candidate only if it actually ran and exited
+        // (`boot::recover`'s service-exit check), so a healthy release is retried rather than
+        // stranded a version behind. Return `RollbackPending` — the clean-exit-for-recovery path
+        // (`AppOutcome::RestartForRecovery`) — NOT `Err`, which maps to the hold-forever `Fatal`
+        // branch and would leave the node with no application running until shutdown. Only a
+        // genuine start failure (the guardian answered but refused) rejects. See
+        // `GuardianError::Channel`.
+        if e.kind() == io::ErrorKind::ConnectionReset {
+            warn(&format!(
+                "starting the new version could not reach the guardian ({e}); restarting for boot recovery"
+            ));
+            return Ok(Outcome::RollbackPending);
+        }
         warn(&format!("starting the new version failed ({e})"));
         return reject_then_recover(store, &mut tx);
     }
@@ -1104,7 +1134,11 @@ fn run_provider_probe(
     let Ok(mut child) = foundation::process::ContainedChild::spawn(cmd) else {
         return (false, None);
     };
-    let stdout = if capture_stdout { child.take_stdout() } else { None };
+    let stdout = if capture_stdout {
+        child.take_stdout()
+    } else {
+        None
+    };
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -1244,9 +1278,7 @@ mod tests {
         fn journal(&self) -> io::Result<Option<Transaction>> {
             Ok(self.journal.clone())
         }
-        fn install_journal(
-            &self,
-        ) -> io::Result<Option<updated::install::InstallTransaction>> {
+        fn install_journal(&self) -> io::Result<Option<updated::install::InstallTransaction>> {
             Ok(None)
         }
         fn active_release(&self) -> io::Result<Option<updated::bundle::ReleaseId>> {
@@ -1291,7 +1323,10 @@ mod tests {
         ) -> io::Result<()> {
             Ok(())
         }
-        fn activate(&mut self, release: &updated::bundle::ReleaseId) -> io::Result<()> {
+        fn verify_release(&self, _: &updated::bundle::ReleaseId) -> io::Result<()> {
+            Ok(())
+        }
+        fn point_active(&mut self, release: &updated::bundle::ReleaseId) -> io::Result<()> {
             self.active = release.clone();
             Ok(())
         }
@@ -1473,10 +1508,20 @@ mod tests {
         assert_eq!(
             tower.phases,
             [
-                "preflight", "prepare", "pre-drain", "drain", "stop", "start", "verify", "finalize",
+                "preflight",
+                "prepare",
+                "pre-drain",
+                "drain",
+                "stop",
+                "start",
+                "verify",
+                "finalize",
             ]
         );
-        assert_eq!(tower.activations, 1, "candidate started; no restore in-process");
+        assert_eq!(
+            tower.activations, 1,
+            "candidate started; no restore in-process"
+        );
         assert_eq!(store.active, candidate);
         assert_eq!(store.rejected, vec!["archive-two"]);
         assert!(
@@ -1516,7 +1561,14 @@ mod tests {
         assert_eq!(provider.activations, 0);
         assert_eq!(
             provider.phases,
-            ["preflight", "prepare", "pre-drain", "drain", "stop", "rollback"]
+            [
+                "preflight",
+                "prepare",
+                "pre-drain",
+                "drain",
+                "stop",
+                "rollback"
+            ]
         );
     }
 
@@ -1585,7 +1637,10 @@ mod tests {
             assert_eq!(store.active, candidate);
             assert_eq!(store.rejected, ["archive-two"]);
             assert!(!provider.phases.contains(&"rollback"));
-            assert!(store.journal.is_some(), "boot recovery needs the rollback journal");
+            assert!(
+                store.journal.is_some(),
+                "boot recovery needs the rollback journal"
+            );
         }
     }
 

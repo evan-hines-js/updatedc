@@ -86,6 +86,48 @@ impl ContainedChild {
     }
 }
 
+/// Additively arrange for a child spawned from `command` to be killed if THIS process
+/// dies — parent-death containment for a child that is *not* wrapped in [`ContainedChild`],
+/// such as the guardian's disposable supervisor. On Linux this installs a `pre_exec` hook
+/// setting `PR_SET_PDEATHSIG(SIGKILL)` and re-checks the parent immediately after, closing
+/// the fork/exec race where the guardian already died before the signal was armed. Off
+/// Linux it is a no-op — macOS is a dev/test target, and Windows death-containment is a
+/// kill-on-close job object ([`ContainedChild`]) rather than a signal.
+///
+/// It only *adds* a `pre_exec` hook: it changes no other command configuration and does not
+/// disturb a hook the caller already installed, so it composes with [`ContainedChild::spawn`]
+/// and with the existing `updated`/app spawn paths (this is a new function, added additively).
+pub fn arrange_parent_death_signal(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let expected_ppid = std::process::id() as libc::pid_t;
+        // Safety: the hook runs in the forked child before exec and calls only
+        // async-signal-safe functions.
+        unsafe {
+            command.pre_exec(move || {
+                libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+                // If the guardian already died between fork and here, the signal will never
+                // arrive; check the parent is still who we expect and self-exit if not.
+                if libc::getppid() != expected_ppid {
+                    libc::_exit(0);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use std::io;
