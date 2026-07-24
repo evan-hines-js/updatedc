@@ -98,7 +98,7 @@ defaults
 
 frontend test
     bind 127.0.0.1:$HTTP_PORT
-    http-request return status 200 content-type text/plain hdr X-Updated-Token %[env(UPDATED_HEALTH_TOKEN)] hdr X-Updated-Version $version string $version
+    http-request return status 200 content-type text/plain string $version
 EOF
   if [[ "$validity" == valid ]]; then
     haproxy -c -f "$destination/config/haproxy.cfg" >/dev/null
@@ -158,9 +158,6 @@ for tree in "$WORK"/bundle-*; do
   chmod 0755 "$tree/bin/launch"
 done
 
-"$BIN/server" install-app --install-root "$INSTALL" --product app --version 1.0.0 \
-  --platform linux-x86_64 --bundle "$WORK/bundle-1.0.0" --entrypoint bin/launch \
-  --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/"
 cat >"$RUNTIME" <<EOF
 {"mode":"managed","product":"app","channel":"stable","install_root":"$INSTALL","args":[],"repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_supervisors":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"retry_after_seconds":60,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"supervisor_check_interval_seconds":3600}}
 EOF

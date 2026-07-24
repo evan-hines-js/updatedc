@@ -53,9 +53,10 @@ pub fn node_from_path(request_path: &str) -> Option<&str> {
     let node = request_path
         .strip_prefix(REPORT_PATH_PREFIX)?
         .strip_suffix(".json")?;
-    let safe = !node.is_empty()
-        && !node.contains(['/', '\\', '.', '%', '?', '#', ':'])
-        && !node.chars().any(char::is_control);
+    // Traversal safety is the shared `crate::path` component check; on top of that a report node is
+    // a URL segment and a clean identity, so it additionally forbids `.` (any dot, not just `.`/`..`)
+    // and the URL-significant `% ? #`.
+    let safe = crate::path::is_safe_component(node) && !node.contains(['.', '%', '?', '#']);
     safe.then_some(node)
 }
 
@@ -174,6 +175,24 @@ pub fn verify_report(report: &NodeReport, public_key_point: &[u8]) -> bool {
         .is_ok()
 }
 
+/// The one trust gate for consuming a node report.
+///
+/// A report is usable only when it names the expected node, is still inside the shared freshness
+/// window, and verifies against that node's pinned enrollment key. Rollout admission and
+/// load-balancer membership both call this function so attribution, replay resistance, and
+/// signature policy cannot drift between control-plane consumers. Health and deployment matching
+/// remain consumer-specific decisions made only after this gate succeeds.
+pub fn report_is_authentic_and_fresh(
+    report: &NodeReport,
+    expected_node: &str,
+    public_key_point: &[u8],
+    now_ms: u64,
+) -> bool {
+    report.node == expected_node
+        && report.age_ms(now_ms) <= REPORT_FRESHNESS.as_millis() as u64
+        && verify_report(report, public_key_point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +212,26 @@ mod tests {
             verify_report(&report, &pubkey),
             "genuine report must verify"
         );
+        assert!(report_is_authentic_and_fresh(
+            &report,
+            "agent-9",
+            &pubkey,
+            report.reported_at_ms
+        ));
+        assert!(!report_is_authentic_and_fresh(
+            &report,
+            "another-agent",
+            &pubkey,
+            report.reported_at_ms
+        ));
+        assert!(!report_is_authentic_and_fresh(
+            &report,
+            "agent-9",
+            &pubkey,
+            report
+                .reported_at_ms
+                .saturating_add(REPORT_FRESHNESS.as_millis() as u64 + 1)
+        ));
 
         // Any tamper to a signed field breaks verification.
         let mut flipped = report.clone();

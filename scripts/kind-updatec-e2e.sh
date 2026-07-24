@@ -282,11 +282,12 @@ kubectl apply -f "$WORK/resources.yaml"
 
 docker build -f crates/updatec/Dockerfile -t updatec:kind .
 kind load docker-image --name "$NAME" updatec:kind
-kubectl apply -f deploy/kubernetes/updatec.yaml
-kubectl -n updated-system set env deployment/updatec-controller \
-  UPDATED_PUBLIC_URL=https://updatec-gateway
-kubectl -n updated-system set env deployment/updatec-gateway \
-  UPDATED_PUBLIC_URL=https://updatec-gateway
+# Deploy the operator with its public URL already pointing at the in-cluster gateway. Substituting
+# it into the manifest BEFORE apply (rather than `kubectl set env` after) means the controller never
+# starts on the placeholder URL — otherwise a reconcile during the env rollout can mint an
+# *immutable* enrollment bundle that points a node at the placeholder, wedging that node's first boot.
+sed 's#https://updates.example/routing#https://updatec-gateway#g' deploy/kubernetes/updatec.yaml \
+  | kubectl apply -f -
 kubectl -n updated-system rollout status deployment/updatec-controller --timeout=180s
 kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=180s
 
@@ -308,11 +309,10 @@ if ! kubectl_log_contains deployment/updatec-controller 'desired state reconcile
 fi
 echo "initial routing generation published"
 
-# Exercise the operator-driven installer route end to end. The controller must turn a
-# manual UpdateAgent into an immutable signed enrollment Secret. An init container models
-# the external installer: it places the baseline bundle and enrollment artifact before the
-# runtime starts. The runtime receives an unreachable bootstrap URL, so its first launch
-# can succeed only from those fully local, verified inputs.
+# Exercise the operator-driven enrollment route end to end. The controller turns a manual
+# UpdateAgent into an immutable signed enrollment Secret. The init container places only that
+# trust artifact; the supervisor then performs the same repository-backed cold install used by
+# every other fresh node.
 cat <<'YAML' | kubectl apply -f -
 apiVersion: updated.dev/v1alpha1
 kind: UpdateAgent
@@ -344,7 +344,11 @@ metadata: {name: manual-offline-bootstrap, namespace: updated-system}
 data:
   bootstrap.toml: |
     [enrollment]
-    url = "https://127.0.0.1:1"
+    # The preplaced signed bundle gives this node its routing/assignment/initial config for a
+    # network-free first start, so it never fetches the bundle over the network. Identity is
+    # separate: it still mints its per-node steady-state leaf at /enroll the first time it reaches
+    # the real gateway (the node generates its own key + CSR — the key never leaves the node).
+    url = "https://updatec-gateway"
     name = "manual-offline"
     client_cert = "/etc/agent-tls/tls.crt"
     client_key = "/etc/agent-tls/tls.key"
@@ -358,9 +362,6 @@ metadata:
   labels: {test: manual-offline}
 spec:
   restartPolicy: Never
-  hostAliases:
-    - ip: 127.0.0.1
-      hostnames: [updatec-gateway, release-default]
   securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
   initContainers:
     - name: external-installer
@@ -369,13 +370,7 @@ spec:
       command: [/bin/sh, -ec]
       args:
         - |
-          mkdir -p /tmp/installer/bin /tmp/installer/config /var/lib/updated/guardian
-          cp /usr/local/bin/sampleapp /tmp/installer/bin/app
-          printf 'version = "1.0.0"\n' >/tmp/installer/config/release.toml
-          printf 'sampleapp\n' >/tmp/installer/config/artifact
-          server install-app --install-root /var/lib/updated --bundle /tmp/installer \
-            --product app --version 1.0.0 --platform $PLATFORM --entrypoint bin/app \
-            --metadata-url https://release-default/metadata/
+          mkdir -p /var/lib/updated/guardian
           cp /signed/enrollment.json /var/lib/updated/guardian/enrollment.json
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
@@ -399,27 +394,32 @@ spec:
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
         - {name: bootstrap, mountPath: /bootstrap, readOnly: true}
+        # The offline agent still fronts the real gateway for routing/secrets after its
+        # network-free cold install, so it carries the same shared fleet mTLS identity every
+        # other agent does (its bootstrap.toml points its client cert/key/CA here).
+        - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
   volumes:
     - {name: state, emptyDir: {}}
     - name: enrollment
       secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
     - name: bootstrap
       configMap: {name: manual-offline-bootstrap}
+    - {name: agent-tls, secret: {secretName: agent-tls}}
 YAML
 kubectl apply -f "$WORK/manual-offline.yaml"
 kubectl -n updated-system wait pod/manual-offline --for=condition=Ready --timeout=120s
 MANUAL_VERSION="$(kubectl -n updated-system exec manual-offline -c agent -- \
   curl -fsS http://127.0.0.1:8080/version)"
 [[ "$MANUAL_VERSION" == 1.0.0 ]] || {
-  echo "FAIL: offline manual installer launched version '$MANUAL_VERSION', expected 1.0.0" >&2
+  echo "FAIL: pre-enrolled manual agent launched version '$MANUAL_VERSION', expected 1.0.0" >&2
   exit 1
 }
 kubectl_log_contains manual-offline 'started application pid' -c agent
-echo "manual CRD export installed and launched 1.0.0 with enrollment networking unavailable"
+echo "manual CRD export enrolled, cold-installed, and launched 1.0.0"
 
-# A malformed installer artifact is terminal: it must never fall back to the URL/key or
-# launch the preinstalled baseline. `timeout` bounds bootstrap's intentional supervision
-# retries so Kubernetes records an observable failed container for this negative test.
+# A malformed enrollment artifact is terminal: it must never fall back to the URL/key or launch
+# an application. `timeout` bounds bootstrap's intentional supervision retries so Kubernetes
+# records an observable failed container for this negative test.
 cat >"$WORK/manual-bad-enrollment.yaml" <<YAML
 apiVersion: v1
 kind: Pod
@@ -435,13 +435,7 @@ spec:
       command: [/bin/sh, -ec]
       args:
         - |
-          mkdir -p /tmp/installer/bin /tmp/installer/config /var/lib/updated/guardian
-          cp /usr/local/bin/sampleapp /tmp/installer/bin/app
-          printf 'version = "1.0.0"\n' >/tmp/installer/config/release.toml
-          printf 'sampleapp\n' >/tmp/installer/config/artifact
-          server install-app --install-root /var/lib/updated --bundle /tmp/installer \
-            --product app --version 1.0.0 --platform $PLATFORM --entrypoint bin/app \
-            --metadata-url https://release-default/metadata/
+          mkdir -p /var/lib/updated/guardian
           cp /signed/enrollment.json /var/lib/updated/guardian/enrollment.json
           printf tampered >>/var/lib/updated/guardian/enrollment.json
       volumeMounts:

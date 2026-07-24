@@ -640,10 +640,7 @@ mod tests {
             args: vec![OsString::from("--addr"), OsString::from("127.0.0.1:8080")],
             env: vec![
                 (OsString::from("PATH"), OsString::from("/usr/bin")),
-                (
-                    OsString::from("UPDATED_HEALTH_TOKEN"),
-                    OsString::from("abc"),
-                ),
+                (OsString::from("DATABASE_PASSWORD"), OsString::from("abc")),
             ],
             cwd: Some(OsString::from("/opt/app")),
         }

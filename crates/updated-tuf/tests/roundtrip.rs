@@ -127,7 +127,6 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             path: config_path.clone(),
             sha256: config_sha,
         },
-        status: None,
     };
     let agent_bytes = serde_json::to_vec(&agent).unwrap();
     let config_source = tmp.join("managed.json");
@@ -187,11 +186,16 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let bootstrap = tmp.join("bootstrap.toml");
     std::fs::write(
         &bootstrap,
-        "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline-node'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
+        "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
     )
     .unwrap();
     let enrollment_state = tmp.join("enrollment-state");
     std::fs::create_dir_all(&enrollment_state).unwrap();
+    // A network-free first boot against a remote gateway must preplace both halves of
+    // steady state: the signed enrollment bundle and the node's already-minted identity.
+    // The transport does not parse these fixtures until a request is made.
+    std::fs::write(enrollment_state.join("agent.crt"), "preplaced leaf").unwrap();
+    std::fs::write(enrollment_state.join("agent.key"), "preplaced key").unwrap();
     std::fs::write(
         enrollment_state.join("enrollment.json"),
         serde_json::to_vec(&bundle).unwrap(),
@@ -209,6 +213,8 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     tampered.initial.managed_configuration = serde_json::to_string(&tampered_config).unwrap();
     let tampered_state = tmp.join("tampered-state");
     std::fs::create_dir_all(&tampered_state).unwrap();
+    std::fs::write(tampered_state.join("agent.crt"), "preplaced leaf").unwrap();
+    std::fs::write(tampered_state.join("agent.key"), "preplaced key").unwrap();
     std::fs::write(
         tampered_state.join("enrollment.json"),
         serde_json::to_vec(&tampered).unwrap(),

@@ -124,18 +124,8 @@ pub(crate) fn plan_rollouts(
         let report = reports.get(node)?;
         // No pinned key ⇒ the report is unverifiable ⇒ never settled (fail closed).
         let public_key = public_keys.get(node)?;
-        // A report older than the shared freshness bound reads as not-settled. Without this a
-        // node that reported healthy once and then went silent (dead hardware, power loss)
-        // would count "settled" forever, letting the throttle admit the next group over a node
-        // that has since failed — the fail-*open* direction. The healthproxy ages reports this
-        // way too; the throttle must agree.
-        (report.node == node
-            && report.age_ms(now_ms) <= updated::telemetry::REPORT_FRESHNESS.as_millis() as u64
-            // Verify the node itself signed this exact report with its pinned per-node key. An
-            // unsigned, forged, or tampered report fails here and is treated as absent — so the
-            // throttle acts only on health it can cryptographically attribute to the node.
-            && updated::telemetry::verify_report(report, public_key))
-        .then_some(report)
+        updated::telemetry::report_is_authentic_and_fresh(report, node, public_key, now_ms)
+            .then_some(report)
     };
     let fresh_healthy = |node: &str, published_id: &str| -> bool {
         fresh_report(node).is_some_and(|report| report.deployment == published_id && report.healthy)

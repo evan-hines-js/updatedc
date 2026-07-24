@@ -89,10 +89,12 @@ a leaked or misused role key still cannot make a client run unsigned content.
 
 The installer always places the bootstrap and initial supervisor and passes the latter
 with `bootstrap --supervisor`; the bootstrap seeds its durable supervisor pointer on
-first launch. For offline-first installation it also preplaces the exported signed
-`enrollment.json` and verified initial application bundle. For online-first installation
-it places the enrollment URL/key bootstrap file and the supervisor cold-installs the
-first trusted assignment. Both paths converge on the same durable layout and transaction.
+first launch. For offline-first installation against a remote gateway it also preplaces
+the exported signed `enrollment.json`, the node's already-minted `agent.crt`/`agent.key`,
+and the verified initial application bundle. For online-first installation it places the
+enrollment bootstrap file and the supervisor mints its per-node identity and cold-installs
+the first trusted assignment. Both paths converge on the same durable layout and
+transaction.
 
 **Offline-capable, fail-closed first start.** If signed installer material is present,
 the supervisor verifies every manifested file before launch and refuses missing,

@@ -471,8 +471,13 @@ pub(crate) fn apply_haproxy_front_service() -> Result<(), Box<dyn std::error::Er
 pub(crate) fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::error::Error>> {
     let members = backend_servers()
         .into_iter()
-        .map(|server| format!("{}={}", server.node, server.address))
-        .collect::<Vec<_>>()
+        .map(|server| {
+            // Append each node's pinned public key so the healthproxy verifies the signed report,
+            // not merely its shape — the same key the control-plane throttle pins.
+            let key = crate::setup::agent_pinned_public_key(&server.node)?;
+            Ok(format!("{}={}={key}", server.node, server.address))
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
         .join(",");
     let endpoints = (0..DEMO_HAPROXY_REPLICAS)
         .map(|ordinal| format!("haproxy-{ordinal}.agents:{}", DEMO_HAPROXY_ADMIN_PORT))

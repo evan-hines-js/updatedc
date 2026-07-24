@@ -484,7 +484,6 @@ impl Sup {
             journal: self.install_root.join("state/transaction.json"),
             install_journal: self.install_root.join("state/install.json"),
             rejected: self.install_root.join("state/rejected"),
-            app_token: self.install_root.join("state/app-token"),
             provider_versions: self.install_root.join("providers/versions"),
             provider_staging: self.install_root.join("providers/staging"),
             provider_download: self.install_root.join("providers/staging/bundle.download"),
@@ -609,8 +608,19 @@ fn resolve_executable(program: &str) -> R<PathBuf> {
         .ok_or_else(|| format!("lifecycle executable {program:?} was not found on PATH"))
 }
 
-pub fn republish_assignment(sup: &Sup, deployment: &str) -> R {
-    let desired = std::fs::read_to_string(sup.dir.join("desired-app")).map_err(str_err)?;
+/// The single builder of the `server publish-assignment` invocation — the signed-assignment format.
+/// Both the harness's initial publish and a `Sup` republish go through it, so a change to how an
+/// assignment is published (a new required flag, a changed marker) lands in exactly one place and
+/// the two entry points can never drift. The metadata/targets URLs are the only per-caller inputs
+/// (the harness derives them from a listen address; a `Sup` from its repository base).
+pub fn publish_assignment(
+    server: &Path,
+    dir: &Path,
+    metadata_url: &str,
+    targets_url: &str,
+    deployment: &str,
+) -> R {
+    let desired = std::fs::read_to_string(dir.join("desired-app")).map_err(str_err)?;
     let mut desired = desired.lines();
     let app_path = desired
         .next()
@@ -619,24 +629,18 @@ pub fn republish_assignment(sup: &Sup, deployment: &str) -> R {
         .next()
         .ok_or("desired application hash is missing")?;
     let set_path = "provider-sets/default.json";
-    let set_sha = target_sha256(&sup.server_bin, &sup.dir, set_path)?;
-    let runtime = sup.dir.join("assignment-runtime.json");
-    let mut command = Command::new(&sup.server_bin);
+    let set_sha = target_sha256(server, dir, set_path)?;
+    let runtime = dir.join("assignment-runtime.json");
+    let mut command = Command::new(server);
     command
         .arg("publish-assignment")
         .arg("--repo")
-        .arg(sup.dir.join("repo"))
+        .arg(dir.join("repo"))
         .arg("--keys")
-        .arg(sup.dir.join("keys"))
+        .arg(dir.join("keys"))
         .args(["--name", "assignments/agents/agent.json"])
-        .args([
-            "--metadata-url",
-            &format!("{}metadata/", sup.repository_base_url),
-        ])
-        .args([
-            "--targets-url",
-            &format!("{}targets/", sup.repository_base_url),
-        ])
+        .args(["--metadata-url", metadata_url])
+        .args(["--targets-url", targets_url])
         .args(["--deployment", deployment])
         .args(["--application-path", app_path])
         .args(["--application-sha256", app_sha])
@@ -647,8 +651,18 @@ pub fn republish_assignment(sup: &Sup, deployment: &str) -> R {
     // The Sup builder drops this marker when ordered-install fallback is opted into; it must
     // ride the *initial* assignment (this is the doc a cold node resolves), not only later
     // republishes, or the first install pins the assigned head exactly and cannot descend.
-    if sup.dir.join("ordered-install-fallback").exists() {
+    if dir.join("ordered-install-fallback").exists() {
         command.arg("--ordered-install-fallback");
     }
     crate::harness::run(&mut command)
+}
+
+pub fn republish_assignment(sup: &Sup, deployment: &str) -> R {
+    publish_assignment(
+        &sup.server_bin,
+        &sup.dir,
+        &format!("{}metadata/", sup.repository_base_url),
+        &format!("{}targets/", sup.repository_base_url),
+        deployment,
+    )
 }

@@ -755,7 +755,7 @@ async fn read_node_reports(
         let key = crate::object_key(prefix, &updated::telemetry::report_object_key(node));
         let bytes = store.get(&key).await.ok()?.bytes().await.ok()?;
         let report = serde_json::from_slice::<NodeReport>(&bytes).ok()?;
-        (report.node == *node).then(|| (node.clone(), report))
+        Some((node.clone(), report))
     });
     futures::stream::iter(fetches)
         .buffer_unordered(16)
@@ -1138,19 +1138,18 @@ async fn publish_resource_statuses(
             Some(matched as u32),
             Some(plan.digest.clone()),
             if held || rolling {
-                ResourceCondition {
-                    condition_type: "Ready".into(),
-                    status: "False".into(),
-                    reason: if held { "Held" } else { "Rolling" }.into(),
-                    message: if held {
-                        "This group's desired deployment is waiting for rollout capacity."
-                    } else {
-                        "This group is incrementally advancing to its admitted deployment."
-                    }
-                    .into(),
-                    observed_generation: group.metadata.generation,
-                    last_transition_time: chrono::Utc::now().to_rfc3339(),
-                }
+                let (reason, message) = if held {
+                    (
+                        "Held",
+                        "This group's desired deployment is waiting for rollout capacity.",
+                    )
+                } else {
+                    (
+                        "Rolling",
+                        "This group is incrementally advancing to its admitted deployment.",
+                    )
+                };
+                failed_condition(group.metadata.generation, reason, message)
             } else {
                 ready_condition(
                     group.metadata.generation,
@@ -1173,11 +1172,9 @@ async fn publish_resource_statuses(
         let selected = plan.node_groups[&name].clone();
         let report = reports.get(&name).filter(|report| {
             let now_ms = now.timestamp_millis().max(0) as u64;
-            report.node == name
-                && report.age_ms(now_ms) <= updated::telemetry::REPORT_FRESHNESS.as_millis() as u64
-                && public_keys
-                    .get(&name)
-                    .is_some_and(|key| updated::telemetry::verify_report(report, key))
+            public_keys.get(&name).is_some_and(|key| {
+                updated::telemetry::report_is_authentic_and_fresh(report, &name, key, now_ms)
+            })
         });
         let status = UpdateAgentStatus {
             observed_generation: agent.metadata.generation,

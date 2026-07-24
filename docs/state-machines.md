@@ -440,4 +440,4 @@ sequenceDiagram
 | Supervisor self-update | `supervisor/src/self_update.rs`; `bootstrap/src/supervisor.rs` |
 
 Related design docs: `docs/crash-safety-review.md` (provisional/confirmed deep-dive),
-`docs/group-enrollment-design.md` (enrollment/join), `docs/fleet-rollout-endpoints.md`.
+`docs/group-enrollment-design.md` (enrollment), `docs/fleet-rollout-endpoints.md`.

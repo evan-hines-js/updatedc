@@ -11,7 +11,6 @@ design problem: the control plane was assembled as a PoC, and the seams are now 
 
 | # | Doc | What it covers |
 |---|-----|----------------|
-| 1 | [01-fixes-landed.md](01-fixes-landed.md) | The regression that was found and **fixed + validated** — runtime config must follow the live assignment. Uncommitted changes currently in the working tree. |
 | 2 | [02-haproxy-zero-downtime.md](02-haproxy-zero-downtime.md) | The HAProxy tier drops ~1/90 requests on upgrade. Diagnosis: two nodes reexec simultaneously because the throttle has no within-group concurrency. |
 | 3 | [03-rollout-model.md](03-rollout-model.md) | What **group** and **set** actually mean, why "a group is not intrinsically protected" is the surprising-and-wrong part, and the safe-by-default direction. |
 | 4 | [04-intra-group-rolling-design.md](04-intra-group-rolling-design.md) | Concrete design for **self-protecting groups**: `maxUnavailable`, node-granularity admission, stateless per-node staging, publication changes, test plan. |
@@ -19,9 +18,6 @@ design problem: the control plane was assembled as a PoC, and the seams are now 
 
 ## Status at time of writing
 
-- **Fixed and validated end-to-end** (uncommitted, in the working tree): the reload/reexec
-  cohorts now converge to the 22.0.0 baseline (`all 32 cohort members are healthy at 22.0.0`),
-  with a proven same-PID reexec. See doc 1 for the exact changes and evidence.
 - **Diagnosed, not yet fixed**: the HAProxy zero-downtime flake (doc 2) and its root cause in
   the rollout model (doc 3).
 - **Designed, not yet built**: intra-group rolling (doc 4) and the hexagonal refactor (doc 5).

@@ -26,10 +26,6 @@ pub struct PreparedApplication {
     pub release: ReleaseId,
     pub version: String,
     pub archive_sha256: String,
-    /// The provider set signed with this app version, present only when ordered fallback
-    /// descended below the assigned head. The caller stages *these* providers instead of the
-    /// assignment's `provider_set`, so a rolled-back app runs its own signed providers.
-    pub provider_set: Option<updated::config::TargetReference>,
 }
 
 #[derive(Debug)]
@@ -157,7 +153,6 @@ pub async fn prepare_assigned_application(
         release: id,
         version: selected.version,
         archive_sha256: selected.sha256,
-        provider_set: selected.provider_set,
     }))
 }
 

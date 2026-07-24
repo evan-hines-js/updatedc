@@ -90,11 +90,9 @@ fn reap(install: &Path, supervisor: &Path) {
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
-        .and_then(|v| {
-            v.trim_start_matches("0x")
-                .parse()
-                .ok()
-                .or_else(|| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
         })
         .unwrap_or(default)
 }

@@ -82,8 +82,12 @@ pub async fn deliver_updates(
     version: u64,
     now: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Webhook URLs are operator-supplied (inside the CRD trust boundary), but refuse to follow
+    // redirects so a webhook cannot bounce the signed event body to an internal-only endpoint
+    // (cloud metadata, in-cluster services) that the configured host would not otherwise reach.
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     for sub in subscriptions.list(&ListParams::default()).await? {
         if !covers(

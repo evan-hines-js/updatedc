@@ -443,42 +443,18 @@ impl Ctx {
     }
 
     fn publish_current_assignment(&self, dir: &Path, addr: &str, deployment: &str) -> R {
-        let runtime = dir.join("assignment-runtime.json");
-        if !runtime.exists() {
+        // Only publish once the runtime fixture exists; the assignment builder itself is shared with
+        // the `Sup` republish path in `fixtures`, so the format lives in one place.
+        if !dir.join("assignment-runtime.json").exists() {
             return Ok(());
         }
-        let desired = std::fs::read_to_string(dir.join("desired-app")).map_err(str_err)?;
-        let mut desired = desired.lines();
-        let app_path = desired
-            .next()
-            .ok_or("desired application path is missing")?;
-        let app_sha = desired
-            .next()
-            .ok_or("desired application hash is missing")?;
-        let set_path = "provider-sets/default.json";
-        let set_sha = self.target_sha256(dir, set_path)?;
-        let mut command = Command::new(&self.server);
-        command
-            .arg("publish-assignment")
-            .arg("--repo")
-            .arg(dir.join("repo"))
-            .arg("--keys")
-            .arg(dir.join("keys"))
-            .args(["--name", "assignments/agents/agent.json"])
-            .args(["--metadata-url", &self.meta_url(addr)])
-            .args(["--targets-url", &self.targets_url(addr)])
-            .args(["--deployment", deployment])
-            .args(["--application-path", app_path])
-            .args(["--application-sha256", app_sha])
-            .args(["--provider-set-path", set_path])
-            .args(["--provider-set-sha256", &set_sha])
-            .arg("--runtime")
-            .arg(runtime);
-        // The Sup builder drops this marker when ordered-install fallback is opted into.
-        if dir.join("ordered-install-fallback").exists() {
-            command.arg("--ordered-install-fallback");
-        }
-        run(&mut command)
+        crate::fixtures::publish_assignment(
+            &self.server,
+            dir,
+            &self.meta_url(addr),
+            &self.targets_url(addr),
+            deployment,
+        )
     }
 
     /// The installer-pinned root a client trusts for the repo under `dir`.
@@ -487,24 +463,9 @@ impl Ctx {
     }
 
     pub fn target_sha256(&self, dir: &Path, name: &str) -> R<String> {
-        let output = Command::new(&self.server)
-            .arg("target-sha256")
-            .arg("--repo")
-            .arg(dir.join("repo"))
-            .arg("--name")
-            .arg(name)
-            .output()
-            .map_err(str_err)?;
-        if !output.status.success() {
-            return fail(format!(
-                "reading target {name} digest failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        Ok(String::from_utf8(output.stdout)
-            .map_err(|error| error.to_string())?
-            .trim()
-            .to_string())
+        // One implementation of the `server target-sha256` shell-out, in `fixtures`; this method
+        // only supplies the server binary the `Ctx` already holds.
+        crate::fixtures::target_sha256(&self.server, dir, name)
     }
     pub fn meta_url(&self, srv: &str) -> String {
         format!("https://{srv}/metadata/")

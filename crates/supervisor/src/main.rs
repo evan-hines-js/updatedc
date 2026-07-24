@@ -66,9 +66,7 @@ impl Options {
     ///
     /// Returns whether the *launch spec* changed — an app running the old args must be
     /// relaunched to pick up the new ones, since a live process's argv cannot be rewritten in
-    /// place. That relaunch is load-bearing: a node moved into a reload-in-place (reexec)
-    /// cohort keeps running with its old launch until relaunched, so the reload signal the
-    /// activate hook later sends would hit a process that never learned to honour it.
+    /// place.
     fn apply_runtime(&mut self, runtime: &updated::config::ManagedRuntime) -> bool {
         let relaunch = self.application.args != runtime.args
             || self.application.mode != runtime.mode
@@ -347,7 +345,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     {
         let tx = recovery_transaction.as_ref().expect("checked above");
         if let Err(error) = invoke_deployment_provider(
-            tx.lifecycle.as_deref(),
+            tx.lifecycle.as_ref(),
             &opts,
             LifecycleInvocation {
                 phase: LifecyclePhase::Start,
@@ -401,15 +399,16 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // operator set staged for exactly this rollback) — not the candidate's. Otherwise an update that
     // revised the lifecycle provider, then failed, would gate the healthy predecessor with the
     // candidate's policy, reject it, and crash-loop a good release.
-    let installed_lifecycle = match recovery_transaction.as_ref() {
-        Some(tx) if tx.is_rollback() => tx.lifecycle.clone(),
-        _ => installed_lifecycle_provider(&store),
-    };
-    let installed = match store.installed() {
-        Installed::Present(installed) => installed.release,
+    let installed_state = match store.installed() {
+        Installed::Present(installed) => installed,
         _ => return Err("cannot verify a boot without an installed release".into()),
     };
-    let mut tower = DefaultProvider::new(&mut app, &opts, installed_lifecycle.as_deref());
+    let installed = installed_state.release.clone();
+    let installed_lifecycle = match recovery_transaction.as_ref() {
+        Some(tx) if tx.is_rollback() => tx.lifecycle.clone(),
+        _ => installed_state.lifecycle,
+    };
+    let mut tower = DefaultProvider::new(&mut app, &opts, installed_lifecycle.as_ref());
     let boot_healthy = update::became_verified(&mut tower, "boot", &installed, &installed).await;
     if !boot_healthy {
         // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
@@ -474,7 +473,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     {
         let tx = recovery_transaction.as_ref().expect("checked above");
         if let Err(error) = invoke_deployment_provider(
-            tx.lifecycle.as_deref(),
+            tx.lifecycle.as_ref(),
             &opts,
             LifecycleInvocation {
                 phase: LifecyclePhase::Verify,
@@ -512,7 +511,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             recovery_transaction.as_ref(),
             recovery_transaction
                 .as_ref()
-                .and_then(|tx| tx.lifecycle.as_ref()),
+                .map(|tx| tx.lifecycle.as_ref()),
         ) {
             if let Err(error) = run_lifecycle_command(
                 lifecycle,
@@ -563,7 +562,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
     // The installed lifecycle provider's periodic phase is the steady-state signal. It drives
     // readiness and liveness and is refreshed when an update commits.
-    let mut steady_lifecycle = installed_lifecycle_provider(&store);
+    let mut steady_lifecycle = installed_lifecycle_provider(&store)?;
     let mut next_health_probe = Instant::now() + opts.timeouts.health_interval;
     let mut liveness_failures = 0u32;
     // Rollout telemetry: this node's identity and a client for best-effort reports. Both
@@ -628,9 +627,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             opts.timeouts.check_interval
         };
         let mut wait = app_wait.min(self_update.due_in(now));
-        if steady_lifecycle.is_some() {
-            wait = wait.min(next_health_probe.saturating_duration_since(now));
-        }
+        wait = wait.min(next_health_probe.saturating_duration_since(now));
         let wait = wait.max(Duration::from_millis(100));
 
         if sleep_interruptible(wait, &shutdown).await {
@@ -639,7 +636,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let now = Instant::now();
-        if steady_lifecycle.is_some() && now >= next_health_probe {
+        if now >= next_health_probe {
             // One periodic hook invocation per tick drives readiness and liveness.
             next_health_probe = now + opts.timeouts.health_interval;
             let installed = match store.installed() {
@@ -647,7 +644,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("periodic verification has no installed release".into()),
             };
             let healthy = invoke_deployment_provider(
-                steady_lifecycle.as_deref(),
+                steady_lifecycle.as_ref(),
                 &opts,
                 LifecycleInvocation {
                     phase: LifecyclePhase::Periodic,
@@ -691,7 +688,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) =
                 updated::bundle::verify_release(&opts.paths.versions, &installed.release)
             {
-                let _ = app::stop_runtime(&mut app, &opts.paths.app_token);
+                let _ = app::stop_runtime(&mut app);
                 repair_from_local_assignment(&opts, &mut store)
                     .await
                     .map_err(|repair| {
@@ -774,12 +771,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             let relaunch = opts.apply_runtime(&assignment.runtime) || secrets_changed;
             if relaunch {
                 // The launch spec changed. A live process cannot have its argv rewritten, so
-                // stop it and relaunch on the new args. This is the ONLY way a node reassigned
-                // into a reload-in-place (reexec) cohort starts honouring the reload signal the
-                // activate hook will later send — without it the process keeps its old launch
-                // and the reload upgrade silently no-ops, then rolls back on the version proof.
+                // stop it and relaunch on the new args.
                 log("assignment runtime changed the launch spec; relaunching the application to apply it");
-                app::stop_runtime(&mut app, &opts.paths.app_token).map_err(|error| {
+                app::stop_runtime(&mut app).map_err(|error| {
                     format!("stopping the application to apply a new launch spec: {error}")
                 })?;
                 app.launch(&opts).map_err(|error| {
@@ -810,7 +804,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // window is watched and a crash is caught on the next boot.
                     pending = installed_pending(&store);
                     // The new release's lifecycle provider travels with it.
-                    steady_lifecycle = installed_lifecycle_provider(&store);
+                    steady_lifecycle = installed_lifecycle_provider(&store)?;
                     garbage_collect(&opts, &store);
                 }
                 AppOutcome::Unchanged => {}
@@ -841,12 +835,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // current assignment's report URL, so adding or removing telemetry just starts or
         // stops the heartbeat.
         if let Some(assignment) = repo.assignment() {
-            // If a readiness signal is configured but has not been sampled yet (first tick after
-            // boot), do NOT report settled on the strength of the boot gate alone — wait for a
-            // steady-state observation. When no readiness signal exists there is nothing to sample,
-            // so the boot gate (already passed) is the answer.
-            let has_readiness = steady_lifecycle.is_some();
-            let settled = pending.is_none() && last_ready.unwrap_or(!has_readiness);
+            // Do not report settled until the first steady-state observation has passed.
+            let settled = pending.is_none() && last_ready.unwrap_or(false);
             telemetry::report_running_state(
                 &telemetry_client,
                 assignment.report_url.as_deref(),
@@ -868,9 +858,7 @@ async fn repair_from_local_assignment(
     opts: &Options,
     store: &mut FileStore,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let local = opts.routing.base_url.starts_with("file:")
-        || Path::new(&opts.routing.base_url).is_absolute();
-    if !local {
+    if !opts.routing.is_local() {
         return Err("the signed routing repository is not local".into());
     }
     let repo =
@@ -897,14 +885,12 @@ async fn repair_from_local_assignment(
     let providers = selection::stage_providers(opts, &repo, store, None)
         .await
         .map_err(|error| format!("staging the providers for local repair: {error}"))?;
-    store.commit_installed(
-        &updated::state::InstalledState::confirmed(
-            lineage,
-            prepared.release.clone(),
-            prepared.archive_sha256,
-        )
-        .with_lifecycle(Some(Box::new(providers))),
-    )?;
+    store.commit_installed(&updated::state::InstalledState::confirmed(
+        lineage,
+        prepared.release.clone(),
+        prepared.archive_sha256,
+        Box::new(providers),
+    ))?;
     store.activate(&prepared.release)?;
     log(&format!(
         "repaired the committed application from signed local deployment {}",
@@ -938,10 +924,10 @@ fn garbage_collect(opts: &Options, store: &dyn Store) {
     let mut providers = Vec::new();
     // Protect the installed release's own providers — they run on every boot (pre-start,
     // verification) — and the pending predecessor's, which a rollback would replay.
-    providers.extend(installed.lifecycle.map(|provider| provider.release));
+    providers.push(installed.lifecycle.release);
     if let Some(pending) = installed.pending {
         releases.push(pending.previous_release);
-        providers.extend(pending.lifecycle.map(|provider| provider.release));
+        providers.push(pending.lifecycle.release);
     }
     match updated::gc::prune_releases(
         &opts.paths.versions,
@@ -1030,6 +1016,7 @@ fn bound_unhealthy_rollback(
             tx.previous_repository_lineage.clone(),
             tx.previous_release.clone(),
             tx.previous_archive_sha256.clone(),
+            tx.lifecycle.clone(),
         ))?;
         store.clear_journal()?;
         Ok(RollbackHealthOutcome::Descend)
@@ -1098,7 +1085,7 @@ fn complete_recovery_activation(
     // candidate. Managed mode has already stopped the candidate; provider-managed mode never
     // exposes or manipulates an application PID.
     invoke_deployment_provider(
-        tx.lifecycle.as_deref(),
+        tx.lifecycle.as_ref(),
         opts,
         LifecycleInvocation {
             phase: LifecyclePhase::Activate,
@@ -1168,7 +1155,7 @@ fn execute_boot_plan(
     if needs_quiesce {
         if let Some(tx) = recovery.as_ref() {
             invoke_deployment_provider(
-                tx.lifecycle.as_deref(),
+                tx.lifecycle.as_ref(),
                 opts,
                 LifecycleInvocation {
                     phase: LifecyclePhase::Stop,
@@ -1183,7 +1170,7 @@ fn execute_boot_plan(
     }
     if plan.quiesce && needs_quiesce {
         warn("stopping the uncommitted candidate before reconciling its release");
-        stop(guardian, &opts.paths.app_token)?;
+        stop(guardian)?;
     }
     if needs_quiesce && recovery.is_some() {
         Chaos::from_env().crossing(update::boundary::ROLLBACK_STOP_APPLIED);
@@ -1244,10 +1231,15 @@ fn installed_pending(store: &dyn Store) -> Option<Pending> {
 }
 
 /// The committed release's lifecycle provider.
-fn installed_lifecycle_provider(store: &dyn Store) -> Option<Box<updated::state::ProviderRelease>> {
+fn installed_lifecycle_provider(
+    store: &dyn Store,
+) -> io::Result<Box<updated::state::ProviderRelease>> {
     match store.installed() {
-        Installed::Present(state) => state.lifecycle,
-        _ => None,
+        Installed::Present(state) => Ok(state.lifecycle),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a verified installed release is required",
+        )),
     }
 }
 
@@ -1372,6 +1364,16 @@ mod tests {
         }
     }
 
+    fn provider() -> Box<updated::state::ProviderRelease> {
+        Box::new(updated::state::ProviderRelease {
+            product: "reconciler".into(),
+            release: release("1.0.0", "reconciler-manifest"),
+            archive_sha256: "reconciler-archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        })
+    }
+
     #[test]
     fn a_persistently_unhealthy_rollback_target_descends_instead_of_looping() {
         let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
@@ -1386,7 +1388,7 @@ mod tests {
             candidate_archive_sha256: "archive-two".into(),
             candidate_repository_lineage: lineage.clone(),
             candidate_rejection_required: true,
-            lifecycle: None,
+            lifecycle: provider(),
             rollback_health_failures: 0,
             phase: Phase::RollbackHealthStarted,
         };
@@ -1395,6 +1397,7 @@ mod tests {
                 lineage.clone(),
                 candidate.clone(),
                 "archive-two".into(),
+                provider(),
             )),
             journal: Some(tx),
             ..MemStore::default()

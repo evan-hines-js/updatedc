@@ -1,3 +1,3 @@
 fn main() {
-    sampleapp::run_artifact(false, "magnolia");
+    sampleapp::run_artifact("magnolia");
 }

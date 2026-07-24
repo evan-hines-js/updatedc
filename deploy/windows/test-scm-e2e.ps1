@@ -96,10 +96,6 @@ try {
 
     & (Join-Path $bin 'server.exe') init --repo $repo --keys $keys
     if ($LASTEXITCODE) { throw 'repository initialization failed' }
-    & (Join-Path $bin 'server.exe') install-app --install-root $install --bundle $bundle `
-        --product app --version 1.0.0 --platform windows-x86_64 --entrypoint bin/app.exe `
-        --metadata-url "http://127.0.0.1:$repoPort/metadata/"
-    if ($LASTEXITCODE) { throw 'installer bundle seeding failed' }
     & (Join-Path $bin 'server.exe') publish-app --repo $repo --keys $keys --product app `
         --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }

@@ -119,8 +119,16 @@ impl Transaction {
         )
     }
 
-    /// Position in the recovery path. This lets a fresh supervisor resume after the
-    /// last durable boundary without re-running an operation already recorded complete.
+    /// Position in the recovery path (0 = rollback just began, 10 = fully rolled back), or `None`
+    /// when the transaction is not on the rollback path at all. This lets a fresh supervisor resume
+    /// after the last durable boundary without re-running an operation already recorded complete.
+    ///
+    /// The recovery driver in the supervisor gates each replay step on this rank with the
+    /// convention `rollback_rank() < RANK_OF(step's recorded phase)` — i.e. "still on the rollback
+    /// path AND has not yet reached the phase this step records, so the step is pending." Every
+    /// `rank < N` literal in the supervisor's recovery flow is exactly the `Some(N)` arm below, so
+    /// this match is the single source of truth for that ordering: reordering a phase here (or the
+    /// numbering) is what moves every gate in lockstep, and nothing else must be edited to match.
     pub fn rollback_rank(&self) -> Option<u8> {
         match self.phase {
             Phase::RollbackStarted => Some(0),

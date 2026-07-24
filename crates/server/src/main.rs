@@ -2,7 +2,6 @@
 //!
 //! - `init`    mint the four ed25519 role keys and an empty signed repository.
 //! - `publish-app` build and publish application bundles.
-//! - `install-app` seed an installer-verified application bundle.
 //! - `publish-supervisor` publish supervisor bootstrap binaries.
 //! - `publish-provider-set` publish an immutable exact provider collection.
 //! - `publish-assignment` publish an exact desired deployment last.
@@ -34,7 +33,6 @@ async fn main() {
     let result = match cmd {
         "init" => init(rest).await,
         "publish-app" | "publish-provider-artifact" => publish(rest, true).await,
-        "install-app" => install_app(rest),
         "publish-supervisor" => publish(rest, false).await,
         "publish-provider-set" => publish_provider_set(rest).await,
         "publish-assignment" => publish_assignment(rest).await,
@@ -45,7 +43,7 @@ async fn main() {
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|install-app|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|export-enrollment|target-sha256|serve> [flags]"
+                "usage: server <init|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|export-enrollment|target-sha256|serve> [flags]"
             );
             exit(2);
         }
@@ -185,9 +183,6 @@ async fn publish_assignment(args: &[String]) -> R {
             path: config_name.clone(),
             sha256: config_sha256,
         },
-        // The dev/e2e publisher does not model an external intermediary; nodes it seeds
-        // self-manage with their own probes.
-        status: None,
     };
     node.validate()?;
     foundation::durable::atomic_write(&config_source, ".config-", &config_bytes)?;
@@ -263,62 +258,13 @@ fn target_reference(
         .ok_or_else(|| format!("--{prefix}-path <target> is required"))?;
     let sha256 = flag(args, &format!("--{prefix}-sha256"))
         .ok_or_else(|| format!("--{prefix}-sha256 <hex> is required"))?;
-    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !updated::hash::is_sha256_hex(&sha256) {
         return Err(format!("--{prefix}-sha256 must be 64 hexadecimal characters").into());
     }
     Ok(updated::config::TargetReference {
         path,
         sha256: sha256.to_ascii_lowercase(),
     })
-}
-
-fn install_app(args: &[String]) -> R {
-    let install_root =
-        PathBuf::from(flag(args, "--install-root").ok_or("--install-root <dir> is required")?);
-    let source = PathBuf::from(flag(args, "--bundle").ok_or("--bundle <dir> is required")?);
-    let product = flag(args, "--product").ok_or("--product <name> is required")?;
-    let version = flag(args, "--version").ok_or("--version <semver> is required")?;
-    semver::Version::parse(&version).map_err(|e| format!("invalid --version: {e}"))?;
-    let platform = flag(args, "--platform").ok_or("--platform <os>-<arch> is required")?;
-    let entrypoint =
-        flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
-    let metadata_url = flag(args, "--metadata-url")
-        .ok_or("--metadata-url <trusted repository metadata base URL> is required")?;
-    let state_dir = install_root.join("state");
-    let staging = install_root.join("staging");
-    let versions = install_root.join("versions");
-    std::fs::create_dir_all(&state_dir)?;
-    let archive = staging.join("installer-bundle.tar.zst");
-    updated::bundle::create_bundle(
-        &source,
-        &archive,
-        &product,
-        &version,
-        &platform,
-        &updated::bundle::Entrypoints::new(&entrypoint),
-    )?;
-    // Seed the baseline through the same default provider the tower installs with, so
-    // the installer and the running system agree on exactly one ingest path.
-    let staged = updated::provider::BundleStore::new(versions, staging).install(
-        &archive,
-        &updated::bundle::ExpectedBundle {
-            product: &product,
-            version: &version,
-            platform: &platform,
-        },
-    )?;
-    updated::bundle::write_active(&install_root.join("active-release"), &staged.id)?;
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&metadata_url);
-    updated::state::enroll(&state_dir.join("installed.json"), lineage.clone())?;
-    updated::state::write_installed(
-        &state_dir.join("installed.json"),
-        &updated::state::InstalledState::confirmed(lineage, staged.id, staged.archive_sha256),
-    )?;
-    println!(
-        "installed {product} {version} into {}",
-        install_root.display()
-    );
-    Ok(())
 }
 
 // --- init -------------------------------------------------------------------
@@ -382,34 +328,15 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
             let archive = repo_dir
                 .join(".bundle-build")
                 .join(format!("{product}-{version}-{platform}.tar.zst"));
-            let input = Path::new(source);
-            let prepared;
-            let input = if input.is_file() {
-                prepared = repo_dir
-                    .join(".bundle-build")
-                    .join(format!("tree-{product}-{version}-{platform}"));
-                if prepared.exists() {
-                    std::fs::remove_dir_all(&prepared)?;
-                }
-                let entrypoint =
-                    flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
-                let destination = prepared.join(&entrypoint);
-                std::fs::create_dir_all(destination.parent().ok_or("entrypoint has no parent")?)?;
-                std::fs::create_dir_all(prepared.join("config"))?;
-                std::fs::copy(input, destination)?;
-                std::fs::write(
-                    prepared.join("config/release.toml"),
-                    format!("version = {version:?}\n"),
-                )?;
-                prepared.as_path()
-            } else {
-                input
-            };
+            let wrap_dir = repo_dir
+                .join(".bundle-build")
+                .join(format!("tree-{product}-{version}-{platform}"));
             let entrypoint =
                 flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
-            updated::bundle::create_bundle(
-                input,
+            updated::bundle::create_bundle_from_source(
+                Path::new(source),
                 &archive,
+                &wrap_dir,
                 &product,
                 &version,
                 platform,
@@ -646,6 +573,14 @@ where
 /// `<root>/telemetry/<node>.json`. Mirrors the k8s gateway's telemetry contract: the
 /// body must be a well-formed [`updated::telemetry::NodeReport`] naming the same node as
 /// the path, so a malformed or misattributed report is rejected rather than stored.
+///
+/// Unlike the production k8s gateway (`updatec::gateway::telemetry_put`), this dev/mock CDN does
+/// NOT authorize the report against the caller's mTLS leaf identity: `gen_certs` mints a single
+/// shared fleet client certificate, so there is no per-node identity to bind the path node against
+/// — the check is not expressible here. The report signature is still what makes a report
+/// trustworthy end-to-end (the control plane and health proxy verify it against the node's pinned
+/// key), so this omission only lets a shared-cert peer overwrite another node's report with bytes
+/// that then fail verification and fail closed. Do not copy this handler as the production contract.
 async fn serve_telemetry_put<S>(
     stream: &mut S,
     root: &Path,
@@ -894,47 +829,6 @@ fn flags_all(args: &[String], name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn installer_seed_uses_the_canonical_bundle_layout() {
-        let root = std::env::temp_dir().join(format!("server-install-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let source = root.join("source");
-        let install = root.join("install");
-        std::fs::create_dir_all(source.join("bin")).unwrap();
-        std::fs::create_dir_all(source.join("config")).unwrap();
-        std::fs::write(source.join("bin/app"), b"fixture").unwrap();
-        std::fs::write(source.join("config/release.toml"), b"version = \"1.0.0\"\n").unwrap();
-        let args = vec![
-            "--install-root".into(),
-            install.display().to_string(),
-            "--bundle".into(),
-            source.display().to_string(),
-            "--product".into(),
-            "app".into(),
-            "--version".into(),
-            "1.0.0".into(),
-            "--platform".into(),
-            "macos-aarch64".into(),
-            "--entrypoint".into(),
-            "bin/app".into(),
-            "--metadata-url".into(),
-            "https://repo/metadata/".into(),
-        ];
-        install_app(&args).unwrap();
-        let state = match updated::state::read_installed(&install.join("state/installed.json")) {
-            updated::state::Installed::Present(state) => state,
-            _ => panic!("installer did not write strict installed state"),
-        };
-        assert_eq!(
-            updated::bundle::read_active(&install.join("active-release")).unwrap(),
-            Some(state.release.clone())
-        );
-        updated::provider::BundleStore::new(install.join("versions"), install.join("staging"))
-            .resolve(&state.release)
-            .unwrap();
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     #[test]
     fn resolve_allows_nested_target_paths() {

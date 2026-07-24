@@ -44,7 +44,7 @@ pub(crate) fn tampered_root_fails_closed(ctx: &Ctx) -> R {
         ));
     }
     let log = tower.captured_log();
-    if log.contains("started application pid") || log.contains("upgraded to") {
+    if log.contains("started managed application pid") || log.contains("upgraded to") {
         return fail(format!(
             "tampered enrollment trust authorized an application launch:\n{log}"
         ));

@@ -21,9 +21,17 @@ tokio = { workspace = true }
 futures = { workspace = true }
 # Health documents are fetched over HTTP(S) from the CDN/object store nodes write to.
 reqwest = { workspace = true }
+# The pinned per-node public key is carried in config as hex (the enrollment EC point).
+hex = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 # The first load-balancer backend programs Kubernetes EndpointSlices; kube-proxy forwards.
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+
+[dev-dependencies]
+# Tests mint a per-node keypair to sign the health reports readiness is verified against — the
+# same aws-lc-rs ECDSA path a real node's telemetry signing and the control-plane pin use.
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }

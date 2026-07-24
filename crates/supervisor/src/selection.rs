@@ -68,6 +68,12 @@ pub(crate) async fn stage_providers(
         .get("product")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "node reconciler metadata has no product".to_string())?;
+    // The reconciler product becomes a directory name under the install root (per-product state),
+    // so it is confined by the same shared traversal guard as every other joined path component —
+    // a signed-but-hostile `../…` product must not escape.
+    if !updated::path::is_safe_component(product) {
+        return Err("node reconciler metadata product is not a safe path component".to_string());
+    }
     let version = target
         .custom
         .get("version")
@@ -158,13 +164,12 @@ pub(crate) async fn check_application(
         Ok(Some(prepared)) => prepared,
         Ok(None) => match &installed {
             updated::state::Installed::Present(state)
-                if state.lifecycle.as_deref() != Some(&reconciler) =>
+                if state.lifecycle.as_ref() != &reconciler =>
             {
                 update_client::PreparedApplication {
                     release: state.release.clone(),
                     version: state.release.version.clone(),
                     archive_sha256: state.archive_sha256.clone(),
-                    provider_set: None,
                 }
             }
             _ => return AppOutcome::Unchanged,
@@ -215,14 +220,14 @@ pub(crate) async fn check_application(
     // Drive the transaction over the live-application port; scope the tower so its borrow of
     // `app` is released before the arms below read `app.pid()`.
     let outcome = {
-        let mut tower = DefaultProvider::new(app, opts, Some(&reconciler));
+        let mut tower = DefaultProvider::new(app, opts, &reconciler);
         apply_update(
             &mut tower,
             store,
             &prepared.release,
             &prepared.archive_sha256,
             lineage.clone(),
-            Some(reconciler.clone()),
+            reconciler.clone(),
         )
         .await
     };

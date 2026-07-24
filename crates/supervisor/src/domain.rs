@@ -49,9 +49,6 @@ pub(crate) struct Situation {
     pub service_exited: bool,
     /// The PID of an application the guardian is already running (adopt, do not relaunch).
     pub app_running: Option<u32>,
-    /// Whether the release a recovery would restore reloads in place (its lifecycle ships an
-    /// `activate` script). A reload leaves the predecessor process running through a failed
-    /// candidate reload, so recovery adopts it rather than stop-starting it — no downtime.
     /// This boot performed a (re)install — [`ensure_installed`](crate::install::ensure_installed)
     /// changed the active bytes. Any process the guardian kept alive is therefore the *previous*
     /// release (e.g. a wedged head we just descended past), so the planner must stop it and launch
@@ -140,6 +137,19 @@ pub(crate) enum Level {
 mod tests {
     use super::*;
 
+    fn provider() -> Box<updated::state::ProviderRelease> {
+        Box::new(updated::state::ProviderRelease {
+            product: "reconciler".into(),
+            release: updated::bundle::ReleaseId {
+                version: "1.0.0".into(),
+                manifest_sha256: "manifest".into(),
+            },
+            archive_sha256: "archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        })
+    }
+
     fn pending() -> Pending {
         Pending {
             lifecycle_attempt_id: "attempt".into(),
@@ -151,7 +161,7 @@ mod tests {
             previous_repository_lineage: updated::state::RepositoryLineage::from_metadata_url(
                 "https://repo/metadata/",
             ),
-            lifecycle: None,
+            lifecycle: provider(),
             committed_at: 1000,
         }
     }

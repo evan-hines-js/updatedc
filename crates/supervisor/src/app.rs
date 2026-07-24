@@ -8,9 +8,7 @@ use std::ffi::OsString;
 /// stops, and (if it crashes) rolls it up. The supervisor never touches the process
 /// directly and never polls it for liveness: if this supervisor is alive, the app is
 /// alive, because the guardian tears the whole tower down when the app exits. `App` is a
-/// thin handle bundling the control connection, the app's PID, and the per-launch health
-/// token (persisted so a replacement supervisor that adopts the running app can still
-/// verify its health responses).
+/// thin handle bundling the control connection and the app's PID.
 pub(crate) struct App {
     pub(crate) guardian: Guardian,
     pid: Option<u32>,
@@ -32,9 +30,7 @@ impl App {
         self.guardian.traffic_ready(ready)
     }
 
-    /// Ask the guardian to (re)launch the application, updating our PID/token. The token
-    /// is persisted *before* the launch so a crash mid-launch never leaves a running app
-    /// whose token we forgot.
+    /// Ask the guardian to (re)launch the application, updating our PID.
     pub(crate) fn launch(&mut self, opts: &Options) -> io::Result<()> {
         self.mode = opts.application.mode;
         if self.mode == updated::config::RuntimeMode::ProviderManaged {
@@ -50,8 +46,7 @@ impl App {
     }
 }
 
-/// Adopt the application the guardian is already running (no restart). The health token
-/// the previous supervisor persisted is reloaded so health checks still verify responses.
+/// Adopt the application the guardian is already running (no restart).
 pub(crate) fn adopt(mut guardian: Guardian, opts: &Options, pid: u32) -> io::Result<App> {
     if opts.application.mode == updated::config::RuntimeMode::ProviderManaged {
         // The guardian can only offer a PID for a process from the previous managed contract.
@@ -132,20 +127,20 @@ fn apply_secret_environment(
     }
 }
 
-/// Ask the guardian to stop the application (it escalates to a hard kill), then clear the
-/// persisted health token. The single path for quiescing the running app — before
-/// activating a release, and when the boot planner stops an uncommitted candidate.
-pub(crate) fn stop(guardian: &mut Guardian, _app_token: &Path) -> io::Result<()> {
+/// Ask the guardian to stop the application (it escalates to a hard kill). The single path
+/// for quiescing the running app — before activating a release, and when the boot planner
+/// stops an uncommitted candidate.
+pub(crate) fn stop(guardian: &mut Guardian) -> io::Result<()> {
     guardian.stop().map_err(io::Error::other)
 }
 
 /// Stop the runtime only when the guardian owns it. In provider-managed mode the signed node
 /// reconciler is the sole authority for application effects.
-pub(crate) fn stop_runtime(app: &mut App, app_token: &Path) -> io::Result<()> {
+pub(crate) fn stop_runtime(app: &mut App) -> io::Result<()> {
     if app.mode == updated::config::RuntimeMode::ProviderManaged {
         return Ok(());
     }
-    stop(&mut app.guardian, app_token)
+    stop(&mut app.guardian)
 }
 
 /// Progress toward readiness: a run of `need` consecutive healthy probes, any failure

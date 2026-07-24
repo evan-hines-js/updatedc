@@ -268,7 +268,7 @@ async fn apply_install(
         release: prepared.release.clone(),
         archive_sha256: prepared.archive_sha256.clone(),
         repository_lineage: lineage,
-        lifecycle: Some(Box::new(providers)),
+        lifecycle: Box::new(providers),
         phase: InstallPhase::Started,
     };
     let chaos = Chaos::from_env();
@@ -316,14 +316,12 @@ async fn place_and_commit(
     // out to be a broken assigned head (crashes or wedges before its first passing gate) the boot
     // rejects it from this record and ordered fallback descends past it; the first passing health
     // gate flips it to confirmed.
-    store.commit_installed(
-        &updated::state::InstalledState::provisional(
-            tx.repository_lineage.clone(),
-            tx.release.clone(),
-            tx.archive_sha256.clone(),
-        )
-        .with_lifecycle(tx.lifecycle.clone()),
-    )?;
+    store.commit_installed(&updated::state::InstalledState::provisional(
+        tx.repository_lineage.clone(),
+        tx.release.clone(),
+        tx.archive_sha256.clone(),
+        tx.lifecycle.clone(),
+    ))?;
     advance_install(store, &mut tx, InstallPhase::Committed)?;
     chaos.crossing(install_boundary::COMMITTED);
     store.clear_install_journal()?;
