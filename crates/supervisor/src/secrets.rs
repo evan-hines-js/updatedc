@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use updated::config::{Routing, SecretReference};
 
@@ -28,9 +27,7 @@ impl SecretManager {
         deployment: &str,
         references: &[SecretReference],
     ) -> Result<Self, String> {
-        let local =
-            routing.base_url.starts_with("file:") || Path::new(&routing.base_url).is_absolute();
-        let (endpoint, client) = if local {
+        let (endpoint, client) = if routing.is_local() {
             (None, None)
         } else {
             (

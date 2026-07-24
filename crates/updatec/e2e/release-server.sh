@@ -26,12 +26,7 @@ if [ ! -f /data/ready ]; then
       artifact=$(publish_fuzz_artifact "$version")
       case "$artifact" in
         magnolia) cp /usr/local/bin/magnolia-like "$source/bin/app" ;;
-        # The universal sample binary for the kind world: reexec-capable, so any cohort's
-        # launch args (a reload cohort's `--reload-mode reexec` included) are valid whatever
-        # version a node currently runs. It reports the same `sampleapp` artifact identity and,
-        # with the default `restart` reload mode, behaves exactly like the plain fixture — so
-        # the restart cohorts and the fleet-identity checks are unaffected.
-        sampleapp) cp /usr/local/bin/sampleapp-reexec "$source/bin/app" ;;
+        sampleapp) cp /usr/local/bin/sampleapp "$source/bin/app" ;;
         *) echo "unknown fuzz artifact: $artifact" >&2; exit 1 ;;
       esac
     fi
@@ -40,16 +35,34 @@ if [ ! -f /data/ready ]; then
       --product app --channel stable --version "$version" --entrypoint bin/app \
       --bundle "$platform=$source"
   done
-  server publish-provider-set --repo "$repo" --keys "$keys" --id default
-  mkdir -p "$fixtures/rube-goldberg-provider/bin"
-  cp /usr/local/bin/demo-lifecycle "$fixtures/rube-goldberg-provider/bin/lifecycle"
-  chmod 0755 "$fixtures/rube-goldberg-provider/bin/lifecycle"
+  # Every release now carries exactly one signed node reconciler — there is no reconciler-less
+  # provider set. The ordinary fleet runs plain, guardian-owned HTTP apps, so its `default` set uses
+  # a MINIMAL, stateless reconciler: the guardian owns process lifecycle, so every phase is a no-op
+  # except health verification. `verify` (the update gate) and `periodic` (the steady-state liveness
+  # signal) confirm the managed app answers `/healthz`; a non-zero exit fails the update and rolls
+  # back. It must be stateless — a stateful provider that gates `verify` on a prior `start` marker
+  # (like the demo's enterprise reconciler) can never pass a Managed-mode cold install, whose first
+  # boot health-gates the freshly installed release without running a transaction's start phase.
+  mkdir -p "$fixtures/default-provider/bin"
+  cat >"$fixtures/default-provider/bin/lifecycle" <<'RECONCILER'
+#!/bin/sh
+case "$1" in
+  verify|periodic)
+    curl -fsS -o /dev/null --max-time 3 http://127.0.0.1:8080/healthz || {
+      echo "managed application failed its health check during $1" >&2
+      exit 1
+    }
+    ;;
+esac
+exit 0
+RECONCILER
+  chmod 0755 "$fixtures/default-provider/bin/lifecycle"
   server publish-provider-artifact --repo "$repo" --keys "$keys" \
-    --product demo-enterprise-lifecycle --version 1.0.0 \
-    --bundle "$platform=$fixtures/rube-goldberg-provider" --entrypoint bin/lifecycle
-  provider_path="products/demo-enterprise-lifecycle/stable/1.0.0/$platform/demo-enterprise-lifecycle"
+    --product default-reconciler --version 1.0.0 \
+    --bundle "$platform=$fixtures/default-provider" --entrypoint bin/lifecycle
+  provider_path="products/default-reconciler/stable/1.0.0/$platform/default-reconciler"
   provider_sha=$(server target-sha256 --repo "$repo" --name "$provider_path")
-  server publish-provider-set --repo "$repo" --keys "$keys" --id rube-goldberg \
+  server publish-provider-set --repo "$repo" --keys "$keys" --id default \
     --provider-path "$provider_path" --provider-sha256 "$provider_sha" \
     --provider-timeout-ms 15000
   # Real Magnolia CMS as a managed product — ONLY on linux-x86_64 (the install provider fetches

@@ -550,13 +550,56 @@ async fn create_agent_idempotent(
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if matches(&existing) {
+                // An idempotent re-registration of the same already-enrolled node.
                 Ok(())
+            } else if adopts_preapproval(&existing, desired) {
+                // The operator pre-approved this exact name as a `manual` agent — an intentional
+                // admission gate — but deferred identity to the node. The node has now presented its
+                // CSR over the shared fleet cert, so complete the pre-approval in place: stamp ONLY
+                // the identity (pinned public key + registration, flipped to `Enrolled`) onto the
+                // object the operator created, preserving the labels/finalizers/metadata it set —
+                // the operator's labels drive group membership, so enrollment must not rewrite them.
+                // `replace` carries the fetched `resourceVersion`, so concurrent completions leave
+                // exactly one winner; the loser re-reads and, if the name is now a settled match,
+                // accepts (its own leaf is still minted in the caller's `after_create`, so a write
+                // that never lands never yields a cert).
+                let mut completed = existing.clone();
+                completed.spec.identity = desired.spec.identity.clone();
+                match agents
+                    .replace(name, &PostParams::default(), &completed)
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(kube::Error::Api(conflict)) if conflict.code == 409 => {
+                        let now = agents
+                            .get(name)
+                            .await
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        if matches(&now) {
+                            Ok(())
+                        } else {
+                            Err(StatusCode::CONFLICT)
+                        }
+                    }
+                    Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+                }
             } else {
                 Err(StatusCode::CONFLICT)
             }
         }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// Whether `existing` is an operator pre-approval this enrollment may complete in place: a `manual`
+/// agent (admission-gated by the operator, with identity deferred to the node — hence no
+/// `registration_sha256`) bound to the same repository the node is enrolling into. Any other state —
+/// a different repository, or an already-`Enrolled` agent whose registration differs — is a real
+/// conflict and is never overwritten, so a node can never seize another node's established identity.
+fn adopts_preapproval(existing: &crate::UpdateAgent, desired: &crate::UpdateAgent) -> bool {
+    existing.spec.identity.kind == crate::AgentIdentityKind::Manual
+        && existing.spec.identity.registration_sha256.is_none()
+        && existing.spec.repository_ref.name == desired.spec.repository_ref.name
 }
 
 /// The routing assignment target path for an agent: `<prefix>/agents/<name>.json`.
@@ -568,14 +611,11 @@ pub(crate) fn agent_assignment(assignment_prefix: &str, name: &str) -> String {
 /// well-formed and name the same node as the path — a report can only release a rollout throttle
 /// slot, so a malformed or misattributed one is rejected, not stored.
 ///
-/// Trust model: this is authenticated by the fleet mTLS handshake but NOT authorized per node. In
-/// mount mode the whole fleet shares one client certificate (`CN=updated-agent`) by design — there
-/// is no per-node identity in the certificate to bind `node` against — so any fleet member could
-/// write another node's report. This is the accepted flat-trust property of the shared-cert mount
-/// model; the per-node-identity alternative is join mode (each node carries a CP-signed cert whose
-/// `CN` is its agent name). Tightening this to per-node authorization is only meaningful for
-/// join-mode nodes and would reject every mount-mode report, so it is deliberately not enforced
-/// here.
+/// Trust model: authenticated AND authorized per node. Steady-state traffic carries the minted
+/// per-node client certificate (its `CN` is the agent name; see `updated::enrollment`), so the
+/// mTLS leaf identity rustls verified is bound against the `node` in the path below: a node may
+/// write ONLY its own report. Without that check any fleet member could forge another node's
+/// settled/healthy report and drive its rollout past unhealthy peers, defeating the throttle.
 async fn telemetry_put(
     State(state): State<ContentState>,
     Extension(identity): Extension<ClientIdentity>,
@@ -883,7 +923,7 @@ fn consistent_target_object(targets: &serde_json::Value, logical_path: &str) -> 
         .get("hashes")?
         .get("sha256")?
         .as_str()?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !updated::hash::is_sha256_hex(digest) {
         return None;
     }
     Some(format!("targets/{digest}.{logical_path}"))

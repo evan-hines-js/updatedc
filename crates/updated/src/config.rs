@@ -35,6 +35,16 @@ pub struct Routing {
     pub mtls: crate::tls::Identity,
 }
 
+impl Routing {
+    /// Whether this routing repository is local (a `file:` URL or an absolute directory path)
+    /// rather than a network gateway. The single definition of "local" — the offline-repair path
+    /// and the secrets manager both gate on it, and must agree: one deciding to reach the network
+    /// while the other assumes offline would split the trust model.
+    pub fn is_local(&self) -> bool {
+        self.base_url.starts_with("file:") || Path::new(&self.base_url).is_absolute()
+    }
+}
+
 /// Locally pinned trust and resource limits for the repository selected by the
 /// routing assignment. Its URLs deliberately do not live in local config.
 #[derive(Debug, Clone)]
@@ -162,14 +172,9 @@ pub struct ManagedTimeouts {
     /// rotation first (no in-flight request lands on a stopping process).
     ///
     /// `Some(0)` or absent = **no hold**; `Some(n)` = hold up to `n` seconds (a bounded ceiling, a
-    /// fixed sleep today). A `custom` deployment ignores this — its own Drain hook owns the wait.
+    /// fixed sleep today). A `provider-managed` deployment ignores this — its own Drain hook owns the wait.
     /// Absent deserializes to no-hold, matching the struct default, so an assignment that omits the
     /// field never accidentally stalls.
-    ///
-    /// FUTURE (not yet built — tracked in `docs/crash-safety-review.md`): let the intermediary's
-    /// signed [`ManagedStatus::ready`] end the wait early (turning `Some(n)` into a true ceiling),
-    /// and add an explicit externally-managed "wait for the drain-ack" mode. That needs the status
-    /// signal ([`AgentDocument::status`], a separate document) correlated at drain time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_hold_seconds: Option<u64>,
 }
@@ -183,41 +188,6 @@ pub struct ManagedTimeouts {
 pub struct AgentDocument {
     pub schema: u32,
     pub config: TargetReference,
-    /// Externally-managed health status, signed in by the control plane. Its **presence is
-    /// the switch**: when set, this node is managed by an intermediary (here, the Kubernetes
-    /// operator through the healthproxy) and trusts this verdict instead of probing locally;
-    /// when absent, the node runs its own probes (e.g. an ansible-deployed host with no
-    /// orchestrator). It only ever *withdraws* traffic — a node is taken out of rotation via
-    /// readiness, never killed for an unhealthy backend.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<ManagedStatus>,
-}
-
-/// The control plane's signed verdict on a node's current rotation state — see
-/// [`AgentDocument::status`]. Written each cycle by the intermediary from what it observes
-/// (in Kubernetes, whether the node's healthproxy is a live Service endpoint).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ManagedStatus {
-    /// The deployment this verdict is about, so the node ignores a status left over from a
-    /// previous deployment generation rather than acting on stale rotation state.
-    pub deployment: String,
-    /// Whether the intermediary currently routes traffic to this node. During a drain it is
-    /// intended to go false once the node has actually left the load balancer, so the built-in
-    /// drain can proceed the instant it sees that instead of waiting out a timer. NOTE: this
-    /// field is **not yet consumed** — the drain hold does not read it today (see
-    /// `drain_hold_seconds` and `docs/crash-safety-review.md`); it is signed-in scaffolding for
-    /// that not-yet-wired early-proceed path.
-    pub ready: bool,
-}
-
-impl ManagedStatus {
-    fn validate(&self) -> Result<(), String> {
-        if self.deployment.is_empty() {
-            return Err("managed status deployment must not be empty".into());
-        }
-        Ok(())
-    }
 }
 
 /// A content-addressed reference to a target authenticated by release-repository TUF
@@ -276,14 +246,9 @@ impl ProviderSet {
 }
 
 fn valid_target_reference(reference: &TargetReference) -> bool {
-    !reference.path.is_empty()
-        && !reference.path.starts_with('/')
-        && !reference
-            .path
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | ".."))
-        && !reference.path.contains(['\\', ':'])
-        && !reference.path.chars().any(char::is_control)
+    // Path-traversal safety is decided once, in `crate::path`; a target reference is a confined
+    // relative path (it may carry subdirectories) plus a well-formed digest.
+    crate::path::is_confined_relative(&reference.path)
         && crate::hash::is_sha256_hex(&reference.sha256)
 }
 
@@ -340,7 +305,13 @@ impl RepositoryAssignment {
 
 impl ManagedRuntime {
     fn validate(&self) -> Result<(), String> {
-        if self.product.is_empty() || self.channel.is_empty() || !self.install_root.is_absolute() {
+        // `product` is joined onto the install root as a single directory name (per-product state,
+        // staged trees), so it must be a safe path component — the same traversal guard the bundle
+        // and target paths use — not merely non-empty, or a signed `../…` product could escape it.
+        if !crate::path::is_safe_component(&self.product)
+            || self.channel.is_empty()
+            || !self.install_root.is_absolute()
+        {
             return Err("managed runtime product/channel/install_root is invalid".into());
         }
         if self.repository.metadata_limit == 0
@@ -376,7 +347,13 @@ impl ManagedRuntime {
                         byte == b'_'
                             || byte.is_ascii_uppercase()
                             || (index > 0 && byte.is_ascii_digit())
-                    });
+                    })
+                // Defence-in-depth: a secret is injected into the application's environment, so a
+                // signed-but-hostile assignment must not name it a dynamic-loader hook
+                // (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, …) and load attacker
+                // code into the launched process. These prefixes are never legitimate secret names.
+                && !reference.environment.starts_with("LD_")
+                && !reference.environment.starts_with("DYLD_");
             if !valid_environment
                 || reference.secret.is_empty()
                 || reference.secret.len() > 253
@@ -489,11 +466,6 @@ impl AgentDocument {
         if !valid_target_reference(&self.config) {
             return Err("agent document config reference is invalid".into());
         }
-        // A present status is load-bearing (it flips the node to externally-managed), so a
-        // malformed one must fail closed rather than be ignored.
-        if let Some(status) = &self.status {
-            status.validate()?;
-        }
         Ok(())
     }
 }
@@ -565,9 +537,9 @@ pub struct Timeouts {
     /// How often to check for a supervisor release.
     pub supervisor_check_interval: Duration,
     /// Ceiling on the managed drain hold — how long to wait, after readiness is withdrawn, for the
-    /// load balancer to drop this node before stopping the running release. `None` = wait
-    /// indefinitely for the intermediary's drain acknowledgement (externally managed only);
-    /// `Some(Duration::ZERO)` = no hold. See [`ManagedTimeouts::drain_hold_seconds`].
+    /// load balancer to drop this node before stopping the running release. `None` or
+    /// `Some(Duration::ZERO)` = no hold (stop immediately); `Some(n)` = wait up to `n`. Never an
+    /// indefinite wait. See [`ManagedTimeouts::drain_hold_seconds`].
     pub drain_hold: Option<Duration>,
 }
 
@@ -607,7 +579,6 @@ pub struct Paths {
     pub journal: PathBuf,
     pub install_journal: PathBuf,
     pub rejected: PathBuf,
-    pub app_token: PathBuf,
     pub provider_versions: PathBuf,
     pub provider_staging: PathBuf,
     pub provider_download: PathBuf,
@@ -638,7 +609,6 @@ impl Config {
             journal: state_dir.join("transaction.json"),
             install_journal: state_dir.join("install.json"),
             rejected: state_dir.join("rejected"),
-            app_token: state_dir.join("app-token"),
             provider_versions: install_root.join("providers/versions"),
             provider_staging: install_root.join("providers/staging"),
             provider_download: install_root.join("providers/staging/bundle.download"),
@@ -674,10 +644,11 @@ fn validate_report_url(raw: &str) -> Result<(), String> {
         || url.cannot_be_a_base()
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(
-            "repository assignment report_url must be an absolute HTTP(S) URL without credentials or a fragment"
+            "repository assignment report_url must be an absolute HTTP(S) URL without credentials, a query, or a fragment"
                 .into(),
         );
     }
@@ -768,42 +739,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_document_status_is_optional_and_switches_management() {
-        let reference = TargetReference {
-            path: "assignments/configs/abc.json".into(),
-            sha256: "a".repeat(64),
-        };
-        // Absent status: self-managed, and it does not appear in the serialized form.
-        let self_managed = AgentDocument {
+    fn agent_document_round_trips_and_validates_its_config_reference() {
+        let valid = AgentDocument {
             schema: 1,
-            config: reference.clone(),
-            status: None,
+            config: TargetReference {
+                path: "assignments/configs/abc.json".into(),
+                sha256: "a".repeat(64),
+            },
         };
-        self_managed.validate().unwrap();
-        let json = serde_json::to_string(&self_managed).unwrap();
-        assert!(!json.contains("status"));
+        valid.validate().unwrap();
         assert_eq!(
-            serde_json::from_str::<AgentDocument>(&json).unwrap(),
-            self_managed
+            serde_json::from_str::<AgentDocument>(&serde_json::to_string(&valid).unwrap()).unwrap(),
+            valid
         );
 
-        // Present status: externally managed, round-trips, and rejects an empty deployment.
-        let managed = AgentDocument {
-            schema: 1,
-            config: reference,
-            status: Some(ManagedStatus {
-                deployment: "d7".into(),
-                ready: false,
-            }),
-        };
-        managed.validate().unwrap();
-        assert_eq!(
-            serde_json::from_str::<AgentDocument>(&serde_json::to_string(&managed).unwrap())
-                .unwrap(),
-            managed
-        );
-        let mut invalid = managed;
-        invalid.status.as_mut().unwrap().deployment.clear();
+        // A malformed config reference fails closed.
+        let mut invalid = valid;
+        invalid.config.sha256 = "not-a-sha".into();
         assert!(invalid.validate().is_err());
     }
 

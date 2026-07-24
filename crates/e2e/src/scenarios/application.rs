@@ -215,9 +215,10 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     Ok(())
 }
 
-/// The general form of the reexec zero-downtime guarantee, for a *stop-start* (full
-/// process restart) upgrade. A reexec keeps the same socket; a stop-start does not — so
-/// zero-downtime here depends entirely on the drain: the built-in drain flips this node's
+/// Zero-downtime for a *stop-start* (full process restart) upgrade. Unlike a same-socket
+/// reexec (proven separately by the HAProxy master-worker test), a stop-start drops the
+/// listening socket — so zero-downtime here depends entirely on the drain: the built-in drain
+/// flips this node's
 /// readiness probe to unready *before* the old process is stopped, the guardian keeps it
 /// unready until the new release is healthy, and a tiny post-drain provider holds long
 /// enough for a readiness-aware load balancer to observe it. We prove that by putting a
@@ -349,7 +350,6 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
         ("exit-before-bind", 22100u16, false),
         ("unhealthy", 22101, false),
         ("hang-health", 22102, false),
-        ("wrong-identity", 22104, false),
         ("flapping", 22105, false),
         ("crash-on-health", 22106, false),
         // This one becomes ready and commits first, then continuous readiness and

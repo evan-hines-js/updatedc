@@ -54,10 +54,10 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
         kill_stray(&app);
         return fail("app never came up under the tower");
     }
-    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
+    if !boot.wait_for_log("started managed application pid", EVENT_TIMEOUT) {
         return fail("supervisor did not record the application launch");
     }
-    let pid1 = pid_number_after(&boot.captured_log(), "started application pid")
+    let pid1 = pid_number_after(&boot.captured_log(), "started managed application pid")
         .ok_or("could not read the guardian-reported application PID")?;
     ok("tower up on supervisor 1.0.0; app live");
 
@@ -124,10 +124,10 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
         kill_stray(&app);
         return fail("app never came up under the tower");
     }
-    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
+    if !boot.wait_for_log("started managed application pid", EVENT_TIMEOUT) {
         return fail("supervisor did not record the application launch");
     }
-    let pid1 = pid_number_after(&boot.captured_log(), "started application pid")
+    let pid1 = pid_number_after(&boot.captured_log(), "started managed application pid")
         .ok_or("could not read the guardian-reported application PID")?;
     ok("tower up on supervisor 1.0.0; app live");
 
@@ -191,12 +191,12 @@ pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
     let boot = Proc::spawn("guardian", &mut tower(ctx, &dir, srv, svc, &app, &sup_v1)?)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT)
-        || !boot.wait_for_log("started application pid", EVENT_TIMEOUT)
+        || !boot.wait_for_log("started managed application pid", EVENT_TIMEOUT)
     {
         kill_stray(&app);
         return fail("tower did not establish its baseline");
     }
-    let app_pid = pid_number_after(&boot.captured_log(), "started application pid")
+    let app_pid = pid_number_after(&boot.captured_log(), "started managed application pid")
         .ok_or("could not read the guardian-reported application PID")?;
 
     ctx.publish(&dir, "supervisor", "2.0.0", &unstable)?;

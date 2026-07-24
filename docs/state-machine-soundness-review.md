@@ -6,9 +6,9 @@ transitions, uncovered crash windows, and machines that disagree with each other
 independent reviewers (install/update/rollback, guardian/self-update, control plane,
 enrollment/health/telemetry) read the machines against their own stated invariants.
 
-Nothing here is fixed yet — this is the assessment. Each item is tagged **CONFIRMED** (a real code
-path, traced) or **RISKY** (reachable only in a degenerate/topology/operator-error case), and
-**NEW** or **KNOWN** (already tracked in `docs/join-axum-hardening-review.md` / prior notes).
+This records the assessment and the disposition of its findings. Each item is tagged
+**CONFIRMED** (a real code path, traced) or **RISKY** (reachable only in a
+degenerate/topology/operator-error case).
 
 Bottom line: **the crash-safety core is sound** — the provisional/confirmed pivot, the three
 recovery modes' partitioning, `classify_recovery`, the rank-driven rollback replay, ordered-fallback
@@ -138,12 +138,10 @@ not) and a path/identity match. Compounds S2.
 
 ## Risky — reachable only in a degenerate / operator-error / topology case
 
-- **S7 — Enrollment brick: join mode, `enrollment.json` + `.consumed` present, `agent.crt` gone**
-  (`enrollment.rs:88-105, 345-356`). `steady_identity` points unconditionally at the persisted cert;
-  re-enrollment is gated on bundle-or-consumed, never on the cert. If the cert (not the bundle) is
-  lost after consumption (partial restore, operator wipe), the node loads its bundle happily but has
-  no client identity and can *never* re-mint (consumed blocks `/join` forever) → silent permanent
-  brick. Not crash-reachable; an unhandled on-disk combination the machine claims to cover.
+- **S7 — Resolved: enrollment bundle present, `agent.crt` gone.** The single `/enroll`
+  path now treats the signed bundle and node-owned identity separately. A remote deployment with
+  a valid bundle but no per-node leaf reuses its durable key and mints the missing leaf before
+  steady-state traffic. The bundle's agent identity must match the configured enrollment name.
 - **S8 — Calendar "runs out → permanently open" (KNOWN)** (`window.rs:177-189`). Once every dated
   entry is past, gating stops entirely — a set whose only gate was an approved-dates calendar becomes
   ungated at *any* hour, the opposite of intent, and the recurring-window path fails *closed* while
@@ -218,9 +216,11 @@ not) and a path/identity match. Compounds S2.
 
 ## Too many / redundant states
 Almost none — the state sets are right-sized (every `Phase`/`InstallPhase`/`Cycle` variant is
-written and consumed). The only dead scaffolding:
-- **`ManagedStatus.ready`** (`config.rs:199-212`) is signed into the assignment but explicitly not
-  consumed (the drain hold ignores it) — a wired-in state with no reader today.
+written and consumed).
+- **`ManagedStatus` (removed).** The `AgentDocument.status` / `ManagedStatus.ready` external-verdict
+  scaffolding was deleted: the product manages nodes outside an orchestrator, so every node
+  self-probes through its signed reconciler — one health path, no external-verdict state to leave
+  unread.
 - Cosmetic: `begin_rollback` permits `Aborted→RollbackStarted` / `RollbackStarted→RollbackStarted`
   (unreachable-or-idempotent); `dispatch`'s `Ready` inner `if let Some(path)` is always `Some`. Not
   exploitable.

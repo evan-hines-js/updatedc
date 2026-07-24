@@ -12,7 +12,7 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
         .await
         .map_err(|error| format!("resolving signed managed configuration: {error}"))?;
     // One shared resolver derives every on-disk path (binary, state, datastore, and the
-    // staging/journal/rejected/app-token siblings) so the supervisor and the
+    // staging/journal/rejected siblings) so the supervisor and the
     // one-shot updater never re-derive them by hand and drift apart.
     let paths = cfg.resolve_paths()?;
 

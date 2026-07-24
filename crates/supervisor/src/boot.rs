@@ -34,16 +34,13 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
         let pending = state.pending.as_ref().expect("checked above");
         plan.release = ReleaseFix::Activate(pending.previous_release.clone());
         // Carry the predecessor's providers (the operator set `pending` holds for exactly this
-        // rollback) onto the restored record — otherwise the reverted release runs with no
-        // process crash-watch, no provider health, and no pre-start hook until the next update.
-        plan.commit = Some(
-            InstalledState::confirmed(
-                pending.previous_repository_lineage.clone(),
-                pending.previous_release.clone(),
-                pending.previous_archive_sha256.clone(),
-            )
-            .with_lifecycle(pending.lifecycle.clone()),
-        );
+        // rollback) onto the restored record.
+        plan.commit = Some(InstalledState::confirmed(
+            pending.previous_repository_lineage.clone(),
+            pending.previous_release.clone(),
+            pending.previous_archive_sha256.clone(),
+            pending.lifecycle.clone(),
+        ));
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
             "recovery: completing rollback from {} to {}",
@@ -135,14 +132,12 @@ fn reconcile_transaction(
         // Restore the predecessor *with* the operator providers the transaction staged, so a
         // crash-recovered rollback health-gates and crash-watches the predecessor identically to
         // an in-process one rather than committing a provider-less record.
-        plan.commit = Some(
-            InstalledState::confirmed(
-                tx.previous_repository_lineage.clone(),
-                tx.previous_release.clone(),
-                tx.previous_archive_sha256.clone(),
-            )
-            .with_lifecycle(tx.lifecycle.clone()),
-        );
+        plan.commit = Some(InstalledState::confirmed(
+            tx.previous_repository_lineage.clone(),
+            tx.previous_release.clone(),
+            tx.previous_archive_sha256.clone(),
+            tx.lifecycle.clone(),
+        ));
         plan.current = Some(tx.previous_release.version.clone());
     }
     recovery
@@ -180,14 +175,12 @@ fn confirm_or_revert(
         // Revert to the predecessor carrying its providers (held in `pending`) so the restored
         // release keeps its crash-watch, provider health, and pre-start hook — see the confirm
         // branch below, which carries the same three for the forward case.
-        plan.commit = Some(
-            InstalledState::confirmed(
-                pending.previous_repository_lineage.clone(),
-                pending.previous_release.clone(),
-                pending.previous_archive_sha256.clone(),
-            )
-            .with_lifecycle(pending.lifecycle.clone()),
-        );
+        plan.commit = Some(InstalledState::confirmed(
+            pending.previous_repository_lineage.clone(),
+            pending.previous_release.clone(),
+            pending.previous_archive_sha256.clone(),
+            pending.lifecycle.clone(),
+        ));
         plan.current = Some(pending.previous_release.version.clone());
         plan.warn(format!(
             "release {} exited within its confirmation window; reverting to {}",
@@ -195,14 +188,12 @@ fn confirm_or_revert(
         ));
     } else if window_passed(pending, situation.confirm_window, situation.now) {
         // Confirming the current install: carry its providers forward unchanged.
-        plan.commit = Some(
-            InstalledState::confirmed(
-                installed.repository_lineage.clone(),
-                installed.release.clone(),
-                installed.archive_sha256.clone(),
-            )
-            .with_lifecycle(installed.lifecycle.clone()),
-        );
+        plan.commit = Some(InstalledState::confirmed(
+            installed.repository_lineage.clone(),
+            installed.release.clone(),
+            installed.archive_sha256.clone(),
+            installed.lifecycle.clone(),
+        ));
         plan.info(format!("release {} confirmed", installed.release.version));
     }
 }
@@ -224,6 +215,16 @@ mod tests {
         updated::state::RepositoryLineage::from_metadata_url("https://repo/metadata/")
     }
 
+    fn provider() -> Box<updated::state::ProviderRelease> {
+        Box::new(updated::state::ProviderRelease {
+            product: "reconciler".into(),
+            release: release("1.0.0", "reconciler-manifest"),
+            archive_sha256: "reconciler-archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        })
+    }
+
     fn steady() -> Situation {
         let current = release("1.0.0", "one");
         Situation {
@@ -231,6 +232,7 @@ mod tests {
                 lineage(),
                 current.clone(),
                 "archive-one".into(),
+                provider(),
             ))),
             active: Some(current),
             journal: None,
@@ -301,7 +303,7 @@ mod tests {
             candidate_archive_sha256: "archive-two".into(),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
-            lifecycle: None,
+            lifecycle: provider(),
             rollback_health_failures: 0,
             phase: TransactionPhase::CandidateActivated,
         });
@@ -328,7 +330,7 @@ mod tests {
             candidate_archive_sha256: "archive-two".into(),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
-            lifecycle: None,
+            lifecycle: provider(),
             rollback_health_failures: 0,
             phase: TransactionPhase::CandidateActivated,
         });
@@ -346,7 +348,7 @@ mod tests {
             repository_lineage: lineage(),
             release: candidate.clone(),
             archive_sha256: "archive-two".into(),
-            lifecycle: None,
+            lifecycle: provider(),
             pending: None,
             confirmed: true,
         }));
@@ -360,7 +362,7 @@ mod tests {
             candidate_archive_sha256: "archive-two".into(),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
-            lifecycle: None,
+            lifecycle: provider(),
             rollback_health_failures: 0,
             phase: TransactionPhase::RollbackStarted,
         });
@@ -384,7 +386,7 @@ mod tests {
             candidate_archive_sha256: "archive-two".into(),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
-            lifecycle: None,
+            lifecycle: provider(),
             rollback_health_failures: 0,
             phase: TransactionPhase::PreflightStarted,
         });
@@ -406,14 +408,14 @@ mod tests {
             repository_lineage: lineage(),
             release: candidate,
             archive_sha256: "archive-two".into(),
-            lifecycle: None,
+            lifecycle: provider(),
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
                 previous_release: predecessor.clone(),
                 previous_archive_sha256: "archive-one".into(),
                 previous_repository_lineage: lineage(),
                 committed_at: 100,
-                lifecycle: None,
+                lifecycle: provider(),
             }),
             confirmed: true,
         }));
@@ -427,7 +429,8 @@ mod tests {
             Some(InstalledState::confirmed(
                 lineage(),
                 predecessor,
-                "archive-one".into()
+                "archive-one".into(),
+                provider(),
             ))
         );
     }

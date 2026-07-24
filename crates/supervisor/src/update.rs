@@ -25,8 +25,8 @@ pub(crate) enum LifecyclePhase {
     PreStart,
     /// The provider's activation hand-off, run for every mode right after the built-in pointer
     /// swap (`store.activate`) and before the process is (re)launched. `stop-start` treats it as a
-    /// no-op hook (the fresh process is launched in the later `Start` phase); `custom` does its
-    /// program-specific work here — reload the running process in place (a SIGHUP, an exec),
+    /// no-op hook (the fresh process is launched in the later `Start` phase); `provider-managed`
+    /// does its program-specific work here — reload the running process in place (a SIGHUP, an exec),
     /// reuse the same directory, move files in, migrate — on top of, not instead of, the pointer
     /// swap that already made the candidate current, and is handed the live PID. Fail-closed: a
     /// failure rolls the update back.
@@ -296,12 +296,12 @@ pub(crate) const ABORT_BOUNDARIES: &[&str] = &[boundary::ABORTED];
 /// stopped, so the load balancer has removed this node from rotation first (no in-flight request
 /// lands on a stopping process).
 pub(crate) enum DrainHold {
-    /// Stop immediately — a `custom` deployment (its provider owns the drain), or a managed one
-    /// that set the hold to zero.
+    /// Stop immediately — a `provider-managed` deployment (its provider owns the drain), or a
+    /// managed one that set the hold to zero.
     None,
     /// Hold up to this long — a bounded ceiling on how long we wait after withdrawing readiness
-    /// before stopping the running release. Today it is a fixed sleep; a future increment can let
-    /// the intermediary's signed drain acknowledgement (`ManagedStatus.ready`) end the wait early.
+    /// before stopping the running release, giving a readiness-aware load balancer time to remove
+    /// this node. A fixed sleep.
     Bounded(Duration),
 }
 
@@ -310,7 +310,7 @@ pub(crate) trait DeploymentProvider {
     fn traffic_ready(&mut self, ready: bool) -> io::Result<()>;
     /// The drain hold policy: how long to wait, after readiness is withdrawn, before stopping.
     fn drain_hold(&self) -> DrainHold;
-    /// Invoke the optional operator-owned lifecycle provider.
+    /// Invoke the release's signed node reconciler.
     fn lifecycle(
         &mut self,
         phase: LifecyclePhase,
@@ -341,37 +341,28 @@ pub(crate) struct DefaultProvider<'a> {
     phases: LoadedPhaseProvider<'a>,
 }
 
-/// The release-bound provider. A missing reference is corrupt state and fails closed.
+/// The release-bound provider: the signed node reconciler that always travels with the install.
 struct LoadedPhaseProvider<'a> {
-    release: Option<&'a updated::state::ProviderRelease>,
+    release: &'a updated::state::ProviderRelease,
     opts: &'a Options,
 }
 
 impl<'a> LoadedPhaseProvider<'a> {
-    fn load(opts: &'a Options, external: Option<&'a updated::state::ProviderRelease>) -> Self {
-        Self {
-            release: external,
-            opts,
-        }
+    fn load(opts: &'a Options, release: &'a updated::state::ProviderRelease) -> Self {
+        Self { release, opts }
     }
 
     fn invoke(&self, invocation: LifecycleInvocation<'_>) -> io::Result<()> {
-        let release = self.release.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "installed release has no signed lifecycle provider",
-            )
-        })?;
-        run_lifecycle_command(release, self.opts, invocation)
+        run_lifecycle_command(self.release, self.opts, invocation)
     }
 }
 
 pub(crate) fn invoke_deployment_provider(
-    external: Option<&updated::state::ProviderRelease>,
+    release: &updated::state::ProviderRelease,
     opts: &Options,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<()> {
-    LoadedPhaseProvider::load(opts, external).invoke(invocation)
+    LoadedPhaseProvider::load(opts, release).invoke(invocation)
 }
 
 /// Launch a fresh application, running the operator's `pre-start` hook first — the one
@@ -398,11 +389,11 @@ pub(crate) fn launch_with_pre_start(
             let release = installed.release;
             let lifecycle = installed.lifecycle;
             // Pre-start is a per-boot environment hook, run on every launch. Release placement
-            // (including Custom's provider hook) already happened durably — in the install
+            // (including the provider-managed activation hook) already happened durably — in the install
             // machine on a first boot, in the update transaction on an upgrade — so this path
             // never places; it only prepares the environment before the launch.
             invoke_deployment_provider(
-                lifecycle.as_deref(),
+                lifecycle.as_ref(),
                 opts,
                 LifecycleInvocation {
                     phase: LifecyclePhase::PreStart,
@@ -413,31 +404,43 @@ pub(crate) fn launch_with_pre_start(
                     predecessor: &release,
                 },
             )?;
-            let app = crate::app::start(guardian, opts)?;
-            if opts.application.mode == updated::config::RuntimeMode::ProviderManaged {
-                let lifecycle = lifecycle.as_deref().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "provider-managed runtime requires a signed node reconciler",
-                    )
-                })?;
-                invoke_deployment_provider(
-                    Some(lifecycle),
-                    opts,
-                    LifecycleInvocation {
-                        phase: LifecyclePhase::Start,
-                        reason,
-                        id: "boot",
-                        pid: None,
-                        candidate: &release,
-                        predecessor: &release,
-                    },
-                )?;
-            }
-            return Ok(app);
+            return launch_and_start(guardian, opts, lifecycle.as_ref(), &release, reason, "boot");
         }
     }
     crate::app::start(guardian, opts)
+}
+
+/// Launch the application and run its post-launch `start` integration — the single sequence every
+/// launch takes. `App::launch` creates the process in stop-start mode and is a deliberate no-op in
+/// provider-managed mode, where the `start` hook itself brings the application up; the `start` hook
+/// then runs unconditionally. There is no mode branch here on purpose: the same launch→start pair
+/// drives a first boot, a restart, and (via the transaction's `start()` + `Start` hook) every
+/// update, so a reconciler always sees `start` before `verify` — never a `verify` with no preceding
+/// `start`, the asymmetry that previously skipped `start` on a stop-start first boot.
+fn launch_and_start(
+    guardian: Guardian,
+    opts: &Options,
+    lifecycle: &updated::state::ProviderRelease,
+    release: &updated::bundle::ReleaseId,
+    reason: LifecycleReason,
+    id: &str,
+) -> io::Result<App> {
+    let app = crate::app::start(guardian, opts)?;
+    invoke_deployment_provider(
+        lifecycle,
+        opts,
+        LifecycleInvocation {
+            phase: LifecyclePhase::Start,
+            reason,
+            id,
+            // In stop-start mode the guardian just created the process, so hand its PID to the
+            // reconciler (the same identity the update path's `start` hook receives).
+            pid: app.pid(),
+            candidate: release,
+            predecessor: release,
+        },
+    )?;
+    Ok(app)
 }
 
 impl<'a> DefaultProvider<'a> {
@@ -448,7 +451,7 @@ impl<'a> DefaultProvider<'a> {
     pub(crate) fn new(
         app: &'a mut App,
         opts: &'a Options,
-        lifecycle: Option<&'a updated::state::ProviderRelease>,
+        lifecycle: &'a updated::state::ProviderRelease,
     ) -> Self {
         DefaultProvider {
             app,
@@ -481,8 +484,7 @@ impl DeploymentProvider for DefaultProvider<'_> {
         match self.opts.timeouts.drain_hold {
             Some(hold) if hold.is_zero() => DrainHold::None,
             Some(hold) => DrainHold::Bounded(hold),
-            // An unset drain hold is *no* hold — deterministic and never a stall. (An indefinite
-            // "wait for the intermediary's drain-ack" mode is future work; see config docs.)
+            // An unset drain hold is *no* hold — deterministic and never a stall.
             None => DrainHold::None,
         }
     }
@@ -508,7 +510,7 @@ impl DeploymentProvider for DefaultProvider<'_> {
         if self.opts.application.mode == updated::config::RuntimeMode::ProviderManaged {
             return Ok(());
         }
-        crate::app::stop_runtime(self.app, &self.opts.paths.app_token)
+        crate::app::stop_runtime(self.app)
     }
     fn activate(
         &mut self,
@@ -588,7 +590,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     candidate: &updated::bundle::ReleaseId,
     candidate_archive_sha256: &str,
     candidate_repository_lineage: updated::state::RepositoryLineage,
-    lifecycle: Option<updated::state::ProviderRelease>,
+    lifecycle: updated::state::ProviderRelease,
 ) -> io::Result<Outcome> {
     // Recovery belongs to the boot state machine. A live supervisor must never mutate
     // recovery evidence or restore an executable underneath a guardian-owned process.
@@ -690,8 +692,8 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     // Built-in drain hold: having withdrawn readiness, wait for the load balancer to actually
     // remove this node before we stop the running release — otherwise an in-flight request lands
     // on a stopping process (the downtime a bare readiness flip leaves when endpoint removal lags
-    // the switchover). Bounded is a ceiling; a `custom` deployment and an unset hold wait nothing
-    // here (the custom Drain hook owns it, or the operator opted out).
+    // the switchover). Bounded is a ceiling; a `provider-managed` deployment and an unset hold wait
+    // nothing here (the provider-managed Drain hook owns it, or the operator opted out).
     match tower.drain_hold() {
         DrainHold::None => {}
         DrainHold::Bounded(hold) => tokio::time::sleep(hold).await,
@@ -836,7 +838,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
         // pre-start and verification can run them on the next boot. (This is the
         // candidate provider passed in — `tx.lifecycle` holds the *predecessor's*
         // now, for rollback.)
-        lifecycle: lifecycle.map(Box::new),
+        lifecycle: Box::new(lifecycle),
         pending,
         // An update always has a proven predecessor: its failure recovery is this state machine's
         // rollback, never an ordered-fallback descent, so the new head commits already confirmed.
@@ -901,7 +903,7 @@ fn require_candidate_rejection(store: &mut dyn Store, tx: &mut Transaction) -> i
 /// supervisor stops the candidate and restores the predecessor with the predecessor's *own*
 /// providers (carried in the transaction). Rolling back here in-process would be a second rollback
 /// path to keep in lockstep with boot recovery — and, because a live supervisor runs the candidate's
-/// tower, it would gate the restored predecessor with the *candidate's* health provider. One path,
+/// tower, it would gate the restored predecessor with the *candidate's* reconciler. One path,
 /// one set of providers, no divergence.
 fn reject_then_recover(store: &mut dyn Store, tx: &mut Transaction) -> io::Result<Outcome> {
     require_candidate_rejection(store, tx)?;
@@ -1152,6 +1154,16 @@ mod tests {
         }
     }
 
+    fn reconciler_release() -> updated::state::ProviderRelease {
+        updated::state::ProviderRelease {
+            product: "reconciler".into(),
+            release: release("1.0.0", "reconciler-manifest"),
+            archive_sha256: "reconciler-archive".into(),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        }
+    }
+
     struct MemoryStore {
         installed: Installed,
         journal: Option<Transaction>,
@@ -1166,6 +1178,7 @@ mod tests {
                     test_lineage(),
                     previous.clone(),
                     "previous-archive".into(),
+                    Box::new(reconciler_release()),
                 ))),
                 journal: None,
                 active: previous,
@@ -1339,7 +1352,7 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None,
+            reconciler_release(),
         )
         .await
         .unwrap();
@@ -1370,7 +1383,7 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None,
+            reconciler_release(),
         )
         .await
         .is_err());
@@ -1393,7 +1406,7 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None,
+            reconciler_release(),
         )
         .await
         .unwrap();
@@ -1447,7 +1460,7 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None,
+            reconciler_release(),
         )
         .await
         .unwrap();
@@ -1485,7 +1498,7 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None,
+            reconciler_release(),
         )
         .await
         {
@@ -1520,7 +1533,7 @@ mod tests {
                 &candidate,
                 "archive-two",
                 test_lineage(),
-                None,
+                reconciler_release(),
             )
             .await
             .unwrap();
@@ -1555,7 +1568,7 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None,
+            reconciler_release(),
         )
         .await
         .unwrap();
@@ -1581,7 +1594,7 @@ mod tests {
             &candidate,
             "archive-two",
             test_lineage(),
-            None,
+            reconciler_release(),
         )
         .await
         .unwrap();
@@ -1597,6 +1610,38 @@ mod tests {
                 .is_some_and(|tx| tx.candidate_rejection_required),
             "rollback evidence must retain the rejection decision"
         );
+    }
+
+    #[tokio::test]
+    async fn reconciler_only_revision_uses_the_normal_transaction() {
+        let application_release = release("1.0.0", "one");
+        let mut store = MemoryStore::new(application_release.clone());
+        let mut tower = FakeTower::default();
+        let mut revised = reconciler_release();
+        revised.release = release("2.0.0", "reconciler-two");
+        revised.archive_sha256 = "reconciler-archive-two".into();
+
+        let outcome = apply_update(
+            &mut tower,
+            &mut store,
+            &application_release,
+            "previous-archive",
+            test_lineage(),
+            revised.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, Outcome::Committed));
+        let Installed::Present(installed) = store.installed else {
+            panic!("the reconciler revision must commit installed state");
+        };
+        assert_eq!(installed.release, application_release);
+        assert_eq!(installed.lifecycle.as_ref(), &revised);
+        let pending = installed
+            .pending
+            .expect("the reconciler revision must retain rollback intent");
+        assert_ne!(pending.lifecycle.as_ref(), &revised);
     }
 
     #[test]

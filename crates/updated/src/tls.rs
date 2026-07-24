@@ -35,12 +35,6 @@ pub fn install_crypto_provider() {
     let _ = crypto_provider().install_default();
 }
 
-/// Whether this binary was built for FIPS (the `fips` feature). Lets a front end log or assert
-/// its crypto posture at startup.
-pub const fn fips_enabled() -> bool {
-    cfg!(feature = "fips")
-}
-
 /// Where the agent's mTLS material lives on disk — three paths, no secrets. `ca` is the fleet
 /// CA the agent trusts for the gateway's server certificate.
 #[derive(Clone, Debug)]

@@ -1,6 +1,6 @@
 //! Reusable client-side installation primitives shared by the supervisor:
-//! crash-safe filesystem replacement, a single-instance lock, the health-proof
-//! constants, health-rejection tracking, the committed
+//! crash-safe filesystem replacement, a single-instance lock,
+//! health-rejection tracking, the committed
 //! installed-state record, and the shared operator-config loader (which also resolves
 //! the tower's canonical on-disk paths).
 //!
@@ -17,9 +17,9 @@ pub mod enrollment;
 pub mod env;
 pub mod gc;
 pub mod hash;
-pub mod health;
 pub mod install;
 pub mod lock;
+pub mod path;
 pub mod provider;
 pub mod rand;
 pub mod reject;

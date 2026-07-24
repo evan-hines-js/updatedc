@@ -648,7 +648,6 @@ name = "demo-lifecycle"
 version = "0.1.0"
 dependencies = [
  "foundation",
- "updated",
  "ureq",
 ]
 
@@ -2580,18 +2579,9 @@ dependencies = [
 name = "sampleapp"
 version = "0.1.0"
 dependencies = [
- "libc",
  "serde",
  "socket2 0.5.10",
  "toml",
- "updated",
-]
-
-[[package]]
-name = "sampleapp-reexec"
-version = "0.1.0"
-dependencies = [
- "sampleapp",
 ]
 
 [[package]]
@@ -3524,7 +3514,9 @@ name = "updated-healthproxy"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "futures",
+ "hex",
  "k8s-openapi",
  "kube",
  "reqwest 0.13.4",

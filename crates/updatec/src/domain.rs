@@ -58,6 +58,13 @@ pub fn plan_reconcile(
         observed.now,
     );
 
+    // Nodes that match no `UpdateGroup` route to the pseudo-group "default" and receive the
+    // repository's `default_deployment` directly. This cohort is DELIBERATELY NOT throttled: it has
+    // no `UpdateGroup`/`UpdateGroupSet` to carry a `maxUnavailable` or health gate, so there is no
+    // staged rollout to apply — changing `default_deployment` moves every unmatched node at once.
+    // The safety guarantees (one-at-a-time staging, health/telemetry gating, concurrency caps) are a
+    // property of *grouped* rollouts; a node that needs them must be placed in a group. Treat
+    // `default_deployment` as a fleet-wide switch, not a throttled rollout.
     let default = DesiredDeployment::try_from(desired.repository.default_deployment.clone())
         .map_err(PlanError::InvalidDeployment)?;
     for (node, selected) in &node_groups {

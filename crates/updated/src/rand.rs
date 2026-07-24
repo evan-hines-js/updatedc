@@ -1,9 +1,9 @@
 //! Cryptographically-random identifiers used across the tower.
 //!
-//! These values correlate readiness with a particular launch and prevent stale or
-//! accidentally forged responses. They are not a sandbox boundary against code
-//! running as the same OS identity. The supervisor uses this helper for application
-//! health tokens; the deliberately dependency-free bootstrap has its own freshness nonce.
+//! Unique, unguessable names for ephemeral artifacts — content-addressed staging directories
+//! and per-attempt lifecycle IDs — so two concurrent operations never collide and a stale one
+//! can't be mistaken for a fresh one. They are not a sandbox boundary against code running as the
+//! same OS identity. The deliberately dependency-free bootstrap has its own freshness nonce.
 
 use std::io;
 

@@ -74,11 +74,10 @@ Run: `cargo test -p updated-tuf --test rotate` and `cargo test -p updatectl`.
   "env"] }`. `updatectl/Cargo.toml` dev-deps: `tough`, `url`.
 - Business-facing guide already written: `crates/updatectl/ROLLOUT-SETUP.md`.
 
-### Pre-existing unrelated breakage (NOT mine)
-`crates/updated-tuf/tests/roundtrip.rs` fails to compile: it constructs
-`updated::config::AgentDocument` without the new `status: Option<ManagedStatus>` field that
-this branch (`feature/operator`) added to `crates/updated/src/config.rs`. Trivial fix:
-`status: None,`. Left untouched as it's the user's in-flight WIP.
+### Pre-existing unrelated breakage (NOT mine) — OBSOLETE
+This once described a compile break from an `AgentDocument.status: Option<ManagedStatus>` field.
+That external-managed-health scaffolding has since been removed (the product manages nodes outside
+an orchestrator; nodes self-probe via their signed reconciler), so the field and the break are gone.
 
 ---
 

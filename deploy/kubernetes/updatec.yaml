@@ -18,6 +18,12 @@ rules:
   - apiGroups: ["updated.dev"]
     resources: ["updategroups", "updategroupsets", "updateagents", "updaterepositories", "updatesubscriptions"]
     verbs: ["get", "list", "watch", "create"]
+  # `/enroll` completes an operator pre-approved `manual` UpdateAgent in place — it stamps the node's
+  # minted identity (pinned public key + registration) onto the agent and flips it to `Enrolled` via a
+  # resourceVersion-guarded replace — so the gateway needs `update` on the main updateagents resource.
+  - apiGroups: ["updated.dev"]
+    resources: ["updateagents"]
+    verbs: ["update"]
   # The controller finalizes its UpdateRepository: it patches `.metadata.finalizers` to hold a deleted
   # repository open until its published TUF prefix is pruned from object storage (state Kubernetes GC
   # cannot reach), then patches the finalizer off so deletion completes. That is a patch of the main

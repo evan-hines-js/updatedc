@@ -3,12 +3,11 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p bootstrap -p supervisor -p server -p sampleapp -p sampleapp-reexec -p updatec-demo -p demo-lifecycle -p updated-healthproxy -p updatectl && \
+    cargo build --release -p bootstrap -p supervisor -p server -p sampleapp -p updatec-demo -p demo-lifecycle -p updated-healthproxy -p updatectl && \
     cp /src/target/release/bootstrap /out-bootstrap && \
     cp /src/target/release/supervisor /out-supervisor && \
     cp /src/target/release/server /out-server && \
     cp /src/target/release/sampleapp /out-sampleapp && \
-    cp /src/target/release/sampleapp-reexec /out-sampleapp-reexec && \
     cp /src/target/release/updatec-demo /out-updatec-demo && \
     cp /src/target/release/demo-lifecycle /out-demo-lifecycle && \
     cp /src/target/release/updated-healthproxy /out-updated-healthproxy && \
@@ -30,7 +29,6 @@ COPY --from=build /out-bootstrap /usr/local/bin/bootstrap
 COPY --from=build /out-supervisor /usr/local/bin/supervisor
 COPY --from=build /out-server /usr/local/bin/server
 COPY --from=build /out-sampleapp /usr/local/bin/sampleapp
-COPY --from=build /out-sampleapp-reexec /usr/local/bin/sampleapp-reexec
 COPY --from=build /out-updatec-demo /usr/local/bin/updatec-demo
 COPY --from=build /out-demo-lifecycle /usr/local/bin/demo-lifecycle
 COPY --from=build /out-updated-healthproxy /usr/local/bin/updated-healthproxy

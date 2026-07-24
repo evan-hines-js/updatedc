@@ -140,8 +140,8 @@ pub struct TimeoutsSpec {
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
     pub supervisor_check_interval_seconds: u64,
-    /// Upper bound (seconds) on the managed drain hold; `None` = wait indefinitely for the
-    /// intermediary's drain acknowledgement (only sound when externally managed). See
+    /// Upper bound (seconds) on the managed drain hold; `None` or `0` = no hold (stop immediately),
+    /// `Some(n)` = wait up to `n`. Never an indefinite wait. See
     /// [`updated::config::ManagedTimeouts::drain_hold_seconds`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_hold_seconds: Option<u64>,
@@ -363,8 +363,8 @@ pub struct UpdateAgentSpec {
 #[serde(rename_all = "camelCase")]
 pub struct AgentIdentity {
     pub kind: AgentIdentityKind,
-    /// Present only for controller-created dynamic inventory. It binds retries to the
-    /// nonce generated and durably stored by that installation.
+    /// Present only for controller-created dynamic inventory. It is the stable digest of the
+    /// validated enrollment name and makes retries resolve to the same agent.
     pub registration_sha256: Option<String>,
     /// The node's pinned public key (hex uncompressed EC point), set at enrollment from its CSR —
     /// the same key that certifies its mTLS leaf. Rollout planning verifies the node's *signed*
@@ -607,11 +607,7 @@ pub(crate) fn resolve_node_groups(
     let mut node_groups = BTreeMap::new();
     for node in nodes {
         let name = node.name;
-        if name.is_empty()
-            || name.contains(['/', '\\', ':'])
-            || name.chars().any(char::is_control)
-            || node_groups.contains_key(&name)
-        {
+        if !updated::path::is_safe_component(&name) || node_groups.contains_key(&name) {
             return if node_groups.contains_key(&name) {
                 Err(PlanError::DuplicateNode(name))
             } else {
@@ -690,7 +686,6 @@ pub(crate) fn build_publication_plan(
         let assignment = updated::config::AgentDocument {
             schema: 1,
             config: references[&id].clone(),
-            status: None,
         };
         let bytes = serde_json::to_vec(&assignment)
             .map_err(|error| PlanError::Serialize(error.to_string()))?;
@@ -985,6 +980,19 @@ mod tests {
                 groups: vec!["a".into(), "b".into()]
             }
         );
+    }
+
+    #[test]
+    fn node_group_resolution_uses_the_shared_safe_component_invariant() {
+        for name in ["", ".", "..", "a/b", "a\\b", "a:b", "a\0b"] {
+            let mut invalid = node("placeholder", &[("role", "edge")]);
+            invalid.name = name.into();
+            assert_eq!(
+                resolve_node_groups([group("edge", &[("role", "edge")])], [invalid]),
+                Err(PlanError::InvalidNodeName),
+                "{name:?} must not enter assignment path construction"
+            );
+        }
     }
 
     #[test]

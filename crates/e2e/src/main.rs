@@ -71,32 +71,58 @@ fn run_lifecycle_fixture() -> R {
         .map(PathBuf::from)
         .ok_or("missing fixture state directory")?;
     let mode = provider_args.get(fixture + 2).cloned().unwrap_or_default();
-    // `pre-start` is a per-boot environment hook (attempt id "boot"), not a transaction lifecycle
-    // phase. Every attempts.log assertion reads the file as the transaction's phase sequence, so a
-    // faithfully-provisioned seed — whose installed record now carries its provider set and thus
-    // fires pre-start on each launch — must not pollute it. Succeed as a no-op without recording.
+    let magnolia_mode = mode.starts_with("magnolia-shaped");
+    // The same signed provider now belongs to the installed release from the beginning; there is
+    // no provider-less seed path. Magnolia's transactional checks apply only once the
+    // Magnolia-shaped candidate is active. The ordinary 1.0.0 predecessor therefore has no
+    // Magnolia state to inspect, while periodic checks after the 2.0.0 commit require the
+    // migration receipt produced by finalize.
+    if magnolia_mode
+        && candidate_version == "1.0.0"
+        && matches!(phase.as_str(), "verify" | "periodic")
+    {
+        return Ok(());
+    }
+    if magnolia_mode && phase == "periodic" {
+        if root.join("magnolia-state/migration-finalized").is_file() {
+            return Ok(());
+        }
+        return fail("Magnolia periodic health ran before migration finalized");
+    }
+    // `pre-start` is a per-boot environment hook with no fixture behavior of its own.
     if phase == "pre-start" {
         return Ok(());
     }
-    std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
-    let mut attempts = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root.join("attempts.log"))
-        .map_err(str_err)?;
-    writeln!(attempts, "{phase}\t{id}").map_err(str_err)?;
+    // The attempts.log + effects dir model the TRANSACTION phase sequence that the recovery and
+    // attempt-id scenarios assert (they require one attempt id and the exact preflight..rollback
+    // order). Per-boot launch hooks (the first-boot `start`) and the boot health gate (`verify`),
+    // both at attempt id "boot", plus the steady-state `periodic` signal, are NOT transaction
+    // phases, so they must not pollute those records. Only the recording is gated — the health/fail
+    // behavior below still runs for every phase, so an `http-health` periodic probe still detects a
+    // degraded app.
+    let is_transaction_phase =
+        !(id == "boot" && matches!(phase.as_str(), "start" | "verify")) && phase != "periodic";
+    if is_transaction_phase {
+        std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
+        let mut attempts = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("attempts.log"))
+            .map_err(str_err)?;
+        writeln!(attempts, "{phase}\t{id}").map_err(str_err)?;
 
-    let marker = root.join("effects").join(format!("{id}-{phase}"));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(marker)
-    {
-        Ok(mut file) => {
-            writeln!(file, "{id}").map_err(str_err)?;
+        let marker = root.join("effects").join(format!("{id}-{phase}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)
+        {
+            Ok(mut file) => {
+                writeln!(file, "{id}").map_err(str_err)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(str_err(error)),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(str_err(error)),
     }
     let fail_once_phase = mode.strip_prefix("fail-first-");
     let fail_once = fail_once_phase == Some(phase.as_str())
@@ -261,7 +287,6 @@ fn run_lifecycle_fixture() -> R {
 type Scenario = (&'static str, fn(&Ctx) -> R);
 
 fn scenarios() -> Vec<Scenario> {
-    #[allow(unused_mut)]
     let mut s: Vec<Scenario> = vec![
         (
             "application upgrade v1->v2, then rollback of a broken v3",

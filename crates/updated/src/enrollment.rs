@@ -274,19 +274,74 @@ pub fn load_or_enroll(
     }
 }
 
-/// Obtain the enrollment bundle over the network: the single enrollment path. The node presents the
-/// shared fleet enrollment cert as mutual TLS to `/enroll`, self-asserting its configured `name`,
-/// and receives a per-node leaf it persists and uses thereafter. Idempotent on retry (the durable
-/// per-node key plus the stable config name yield the same agent and the same pinned key) and
-/// one-way: once the bundle is consumed, enrollment can never re-run.
+/// Resolve the enrollment bundle and ensure the node holds its steady-state identity. The bundle
+/// (routing, assignment, and the initial signed configuration) may be **preplaced** for a
+/// network-free first start, or fetched over the network — but identity is a separate, node-owned
+/// concern. The per-node leaf (`agent.crt`) is ALWAYS minted through the `/enroll` mutual-TLS
+/// handshake the first time the gateway is reachable: the node presents the shared fleet enrollment
+/// cert, self-asserts its configured `name`, and receives a leaf it persists and uses for every
+/// steady-state request thereafter. Idempotent on retry (the durable per-node key plus the stable
+/// name yield the same agent and the same pinned leaf); the bundle remains one-way (once consumed,
+/// enrollment can never re-run).
 pub async fn load_or_enroll_http(
     bootstrap: &BootstrapConfig,
     state_dir: &Path,
 ) -> io::Result<EnrollmentBundle> {
     let bundle_path = state_dir.join("enrollment.json");
-    if let Some(loaded) = load_existing_or_fresh(&bundle_path, "enrollment") {
-        return loaded;
+    match load_existing_or_fresh(&bundle_path, "enrollment") {
+        // A preplaced (or already-loaded) bundle supplies routing/assignment/config, but carries no
+        // identity. Mint the steady-state leaf now unless a prior boot already did — decoupling the
+        // one-way bundle from the per-node cert is what lets an offline-seeded node still obtain a
+        // real identity the first time it reaches the gateway.
+        Some(loaded) => {
+            let bundle = loaded?;
+            // Mint the per-node steady-state leaf only when the node will actually present it: a
+            // REMOTE gateway routing. A local/offline deployment (a `file:` or absolute-path
+            // repository) reads routing and secrets straight from disk and never makes an mTLS
+            // request, so it needs no per-node identity — and forcing an `/enroll` handshake it
+            // cannot reach would wedge its boot. This mirrors the split the secrets client uses.
+            if routing_is_remote(&bundle.routing_base_url) && !joined_cert_path(state_dir).exists()
+            {
+                // The leaf's identity (`CN`) comes from the configured enrollment name, so it must
+                // name the same agent the preplaced bundle was issued for. Otherwise the node would
+                // run on one agent's routing/assignment while holding another agent's steady-state
+                // certificate — a split identity. Fail closed on that misconfiguration.
+                if bundle.agent_id != bootstrap.enrollment.name {
+                    return Err(invalid(&format!(
+                        "preplaced enrollment bundle is for agent {:?}, but this node is configured \
+                         to enroll as {:?}",
+                        bundle.agent_id, bootstrap.enrollment.name
+                    )));
+                }
+                mint_leaf(bootstrap, state_dir).await?;
+            }
+            Ok(bundle)
+        }
+        // No bundle yet: the `/enroll` handshake yields BOTH the minted leaf and the signed bundle.
+        None => {
+            let enrolled = mint_leaf(bootstrap, state_dir).await?;
+            let bundle_bytes = serde_json::to_vec(&enrolled).map_err(io::Error::other)?;
+            load_or_enroll(&bundle_path, || Ok(bundle_bytes.clone()))
+        }
     }
+}
+
+/// Whether a routing base URL is a remote gateway (reached over mTLS) rather than a local `file:`
+/// or absolute-path repository read straight from disk. Mirrors the split the secrets client uses
+/// (`SecretManager::initialize`): only a remote deployment ever presents the per-node leaf, so only
+/// it needs one minted.
+fn routing_is_remote(base_url: &str) -> bool {
+    !(base_url.starts_with("file:") || Path::new(base_url).is_absolute())
+}
+
+/// Mint the node's per-node steady-state certificate through the `/enroll` mutual-TLS handshake and
+/// return the signed enrollment bundle the gateway issued alongside it. The node generates a durable
+/// per-node key and a CSR, presents its configured `name` over the shared fleet enrollment cert
+/// (which authenticates ONLY this handshake), and persists the minted leaf before returning — the
+/// key is already durable and steady state cannot run without the cert. Idempotent: the durable key
+/// and stable name mean a retry re-mints the same agent's leaf, so a crash after the leaf is written
+/// but before its caller finishes simply re-enrolls to the same identity.
+async fn mint_leaf(bootstrap: &BootstrapConfig, state_dir: &Path) -> io::Result<EnrollmentBundle> {
     std::fs::create_dir_all(state_dir)?;
     let key_pem = durable_key_pem(state_dir)?;
     let csr_pem = crate::csr::csr_for(&key_pem, "updated enroll")
@@ -300,8 +355,6 @@ pub async fn load_or_enroll_http(
         csr: csr_pem,
     };
     let body = serde_json::to_vec(&request).map_err(io::Error::other)?;
-    // The shared fleet enrollment cert authenticates ONLY this mutual-TLS handshake; the minted
-    // per-node cert below is what every steady-state request uses.
     let response = bootstrap
         .enrollment
         .enroll_identity()?
@@ -315,12 +368,8 @@ pub async fn load_or_enroll_http(
     let bytes = success_body(response, "enrollment").await?;
     let enrolled: EnrollResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
     enrolled.bundle.validate_shape()?;
-    let bundle_bytes = serde_json::to_vec(&enrolled.bundle).map_err(io::Error::other)?;
-    // Persist the minted leaf BEFORE the bundle/consumed marker (the key is already persisted):
-    // steady state cannot run without the cert, and a crash after the leaf but before the bundle
-    // simply re-enrolls (same durable key + name ⇒ same agent, same pinned key ⇒ idempotent).
     persist_leaf(state_dir, &enrolled.leaf, &enrolled.chain)?;
-    load_or_enroll(&bundle_path, || Ok(bundle_bytes.clone()))
+    Ok(enrolled.bundle)
 }
 
 /// If enrollment has already run (the bundle is present, or the consumed marker is set), return the

@@ -27,13 +27,13 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
     }
     // Wait until the supervisor has launched the app (so the guardian's "launched
     // supervisor" line with the PID is present), then read that supervisor PID.
-    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
+    if !boot.wait_for_log("started managed application pid", EVENT_TIMEOUT) {
         return fail("the supervisor never reported launching the application");
     }
     let initial_log = boot.captured_log();
     let sup_pid = pid_after(&initial_log, "launched supervisor")
         .ok_or("could not find the supervisor PID in the guardian log")?;
-    let pid1 = pid_number_after(&initial_log, "started application pid")
+    let pid1 = pid_number_after(&initial_log, "started managed application pid")
         .ok_or("supervisor did not record the guardian-reported application PID")?;
 
     // Crash ONLY the supervisor (not the guardian, not the app). The guardian owns the
@@ -103,10 +103,10 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
         return fail("app never came up under the tower");
     }
-    if !boot.wait_for_log("started application pid", EVENT_TIMEOUT) {
+    if !boot.wait_for_log("started managed application pid", EVENT_TIMEOUT) {
         return fail("the supervisor never reported launching the application");
     }
-    let app_pid = pid_number_after(&boot.captured_log(), "started application pid")
+    let app_pid = pid_number_after(&boot.captured_log(), "started managed application pid")
         .ok_or("supervisor did not record the guardian-reported application PID")?;
     let guardian_pid = boot.pid();
     let sup_pid = pid_after(&boot.captured_log(), "launched supervisor");

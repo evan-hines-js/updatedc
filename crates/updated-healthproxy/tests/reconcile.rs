@@ -5,10 +5,18 @@
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
+use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use updated::telemetry::{report_object_key, NodeReport};
-use updated_healthproxy::{resolve_members, LoadBalancer, Member};
+use updated_healthproxy::{resolve_members, FleetNode, LoadBalancer, Member};
+
+static TEST_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| {
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
+    (pkcs8.as_ref().to_vec(), key.public_key().as_ref().to_vec())
+});
 
 /// A CDN standing in for the object store: serves each node's report at
 /// `/telemetry/<node>.json`, 404 for anything it was not given.
@@ -18,8 +26,9 @@ async fn spawn_cdn(reports: Vec<(String, bool)>) -> SocketAddr {
     let bodies: Vec<(String, String)> = reports
         .into_iter()
         .map(|(node, healthy)| {
-            let body = serde_json::to_string(&NodeReport::new(&node, "deploy-3", "3.0.0", healthy))
-                .unwrap();
+            let mut report = NodeReport::new(&node, "deploy-3", "3.0.0", healthy);
+            report.signature = updated::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
+            let body = serde_json::to_string(&report).unwrap();
             (format!("/{}", report_object_key(&node)), body)
         })
         .collect();
@@ -63,10 +72,14 @@ impl LoadBalancer for RecordingLb {
     }
 }
 
-fn inventory(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+fn inventory(pairs: &[(&str, &str)]) -> Vec<FleetNode> {
     pairs
         .iter()
-        .map(|(node, address)| (node.to_string(), address.to_string()))
+        .map(|(node, address)| FleetNode {
+            node: node.to_string(),
+            address: address.to_string(),
+            public_key: TEST_KEY.1.clone(),
+        })
         .collect()
 }
 

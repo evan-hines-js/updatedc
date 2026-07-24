@@ -65,11 +65,12 @@ cargo test --workspace
 CI runs the end-to-end system on Linux, Intel and ARM macOS, and Windows. Windows CI
 also installs and controls the program through the native Service Control Manager.
 
-The E2E harness covers both portable stop/activate/start and Unix reexec activation.
-The reexec scenario continuously probes availability and asserts that the managed master
-PID survives while the application adopts the newly active bundle. A real HAProxy
-master-worker test independently proves the contract against an unmodified third-party
-service rather than relying only on the sample fixture.
+The Rust E2E harness covers portable stop/activate/start, including a zero-downtime
+stop-start upgrade that a stand-in readiness-aware load balancer proves loses no requests
+across the restart. Same-socket reexec activation is proven separately by a real HAProxy
+master-worker test, which continuously probes availability and asserts the managed master
+PID survives while the application adopts the newly active bundle — exercising the contract
+against an unmodified third-party service rather than the sample fixture.
 
 ## Suggested code tour
 
@@ -188,30 +189,26 @@ reclassified as ordinary network errors.
 ## Native desktop applications
 
 The same verified bundle primitives support conventional native desktop applications
-such as Discord-style clients. For an update-on-launch product, the application's
-installer can place `updated-oneshot` behind its shortcut or login item:
+such as Discord-style clients. A desktop product runs the bootstrap/supervisor under a
+login item, desktop startup host, launchd, or SCM — the same one path every other
+platform uses:
 
 ```text
-user opens application
-  → launcher acquires the update lock
+startup host launches the supervisor
+  → acquire the installation lock
   → reconcile any interrupted replacement
   → refresh and verify signed metadata
   → stage and atomically activate an eligible bundle, if available
   → verify the complete active release against committed state
-  → exec the desktop application
+  → request a clean shutdown, then start the application
+  → commit only after an application-specific readiness check succeeds
 ```
 
-Network unavailability does not prevent launch: the wrapper verifies and runs the
-currently committed bundle. Because activation happens before the GUI process starts,
-there is no need to overwrite a running executable or keep a permanent supervisor
-alive. Concurrent launches serialize on the same installation lock.
-
-An application with an always-running tray process or background agent can instead use
-the bootstrap/supervisor model under a login item, desktop startup host, launchd, or SCM:
-request a clean shutdown, activate the verified candidate bundle, start it, and commit
-only after an application-specific readiness check succeeds. Multi-process desktop
-applications need a launcher-owned shutdown contract so every process releases the
-installation before activation.
+Network unavailability does not prevent launch: the supervisor verifies and runs the
+currently committed bundle, and trust failures fail closed rather than being
+reclassified as network errors. Concurrent launches serialize on the same installation
+lock, and multi-process applications need a launcher-owned shutdown contract so every
+process releases the installation before activation.
 
 Production desktop packaging still needs platform integration outside this project:
 preserve macOS code signing/notarization and Windows Authenticode packaging, respect

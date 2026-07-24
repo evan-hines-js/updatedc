@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use updated::telemetry::{now_ms, report_url, NodeReport};
+use updated::telemetry::{now_ms, report_is_authentic_and_fresh, report_url, NodeReport};
 
 /// A healthy report older than this is treated as not-ready — the one freshness bound, defined once
 /// in [`updated::telemetry`] and shared with the control plane so a reader and the throttle can
@@ -44,6 +44,19 @@ pub struct Member {
     pub ready: bool,
 }
 
+/// One node in the fleet this proxy fronts: its identity, the address the load balancer routes to,
+/// and the public key its health reports are pinned against. The key is the raw EC point from the
+/// node's enrollment identity (the same key the control-plane throttle pins) and must reach this
+/// proxy over a trusted channel — the operator's config — never the CDN it reads reports from, or
+/// an attacker able to write the report could supply the key that verifies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetNode {
+    pub node: String,
+    pub address: String,
+    /// Raw EC point (uncompressed) the node's report signature is verified against.
+    pub public_key: Vec<u8>,
+}
+
 /// A load balancer whose backend membership is reconciled from health. An implementation maps
 /// `members` onto its own mechanism — EndpointSlices, DNS records, HAProxy servers. Reconcile
 /// is called every cycle with the *full* desired set, so it must be idempotent and converge
@@ -53,16 +66,17 @@ pub trait LoadBalancer {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String>;
 }
 
-/// Interpret a fetched health document. Ready only when the body is an authentic
-/// [`NodeReport`] *for this node* whose node has settled healthy *and whose timestamp is within
-/// [`REPORT_FRESHNESS`]*; anything else — a report for a different node, malformed JSON, an
-/// empty body, or a stale report from a node that stopped heartbeating — is not-ready.
-pub fn report_is_ready(node: &str, body: &[u8]) -> bool {
+/// Interpret a fetched health document. Ready only when the body is an *authentic* [`NodeReport`]
+/// *for this node* — its signature verifies against the node's pinned `public_key` — whose node has
+/// settled healthy *and whose timestamp is within [`REPORT_FRESHNESS`]*. Anything else — a report
+/// for a different node, an unsigned or forged report (a compromised gateway or a direct bucket
+/// write cannot forge one without the node's key), malformed JSON, an empty body, or a stale report
+/// from a node that stopped heartbeating — is not-ready. An empty `public_key` (no pin) makes every
+/// report unverifiable, so the node can never be ready: the fail-closed default.
+pub fn report_is_ready(node: &str, public_key: &[u8], body: &[u8]) -> bool {
     serde_json::from_slice::<NodeReport>(body)
         .map(|report| {
-            report.node == node
-                && report.healthy
-                && report.age_ms(now_ms()) <= REPORT_FRESHNESS.as_millis() as u64
+            report.healthy && report_is_authentic_and_fresh(&report, node, public_key, now_ms())
         })
         .unwrap_or(false)
 }
@@ -106,7 +120,7 @@ const POLL_CONCURRENCY: usize = 32;
 pub async fn resolve_members(
     client: &reqwest::Client,
     health_base: &str,
-    inventory: &[(String, String)],
+    inventory: &[FleetNode],
     cache: &mut std::collections::HashMap<String, Vec<u8>>,
 ) -> Vec<Member> {
     use futures::stream::StreamExt;
@@ -116,8 +130,8 @@ pub async fn resolve_members(
         inventory
             .iter()
             .enumerate()
-            .map(|(index, (node, _))| async move {
-                (index, fetch_report(client, health_base, node).await)
+            .map(|(index, member)| async move {
+                (index, fetch_report(client, health_base, &member.node).await)
             }),
     )
     .buffer_unordered(POLL_CONCURRENCY)
@@ -128,14 +142,15 @@ pub async fn resolve_members(
         fresh[index] = body;
     }
     // Sequential resolve pass: a fresh fetch updates the cache; a failed one falls back to the
-    // cached body; readiness is always judged through the freshness bound in `report_is_ready`.
+    // cached body; readiness is always judged through the freshness bound AND the pinned-key
+    // signature check in `report_is_ready`.
     inventory
         .iter()
         .zip(fresh)
-        .map(|((node, address), fresh_body)| Member {
-            node: node.clone(),
-            address: address.clone(),
-            ready: resolve_readiness(node, fresh_body, cache),
+        .map(|(member, fresh_body)| Member {
+            node: member.node.clone(),
+            address: member.address.clone(),
+            ready: resolve_readiness(&member.node, &member.public_key, fresh_body, cache),
         })
         .collect()
 }
@@ -147,6 +162,7 @@ pub async fn resolve_members(
 /// the fail-closed / fail-operational readiness rule lives, so it can be fuzzed without any I/O.
 pub fn resolve_readiness(
     node: &str,
+    public_key: &[u8],
     fresh: Option<Vec<u8>>,
     cache: &mut std::collections::HashMap<String, Vec<u8>>,
 ) -> bool {
@@ -159,7 +175,7 @@ pub fn resolve_readiness(
     };
     effective
         .as_deref()
-        .map(|body| report_is_ready(node, body))
+        .map(|body| report_is_ready(node, public_key, body))
         .unwrap_or(false)
 }
 
@@ -269,9 +285,10 @@ pub struct Config {
     pub port_name: String,
     /// The port endpoints are published on.
     pub port: u16,
-    /// The fleet this load balancer fronts: `(node, address)` pairs. Readiness per node comes
-    /// from health; the address is where the balancer routes when the node is ready.
-    pub inventory: Vec<(String, String)>,
+    /// The fleet this load balancer fronts. Readiness per node comes from its signed health report,
+    /// verified against the node's pinned public key; the address is where the balancer routes when
+    /// the node is ready.
+    pub inventory: Vec<FleetNode>,
     pub interval: Duration,
     pub health_timeout: Duration,
     /// When set, program a cluster of HAProxy instances via the Runtime API instead of a
@@ -379,25 +396,30 @@ fn parse_secs(
     }
 }
 
-/// Parse `node=address,node=address,…` into `(node, address)` pairs. The address must parse
-/// as a host — an `ip:port` or bare host — but the port is carried by the Service, so only the
-/// host portion is kept.
-fn parse_inventory(raw: &str) -> Result<Vec<(String, String)>, String> {
+/// Parse `node=address=pubkeyhex,node=address=pubkeyhex,…` into [`FleetNode`]s. The address must
+/// parse as a host — an `ip:port` or bare host — but the port is carried by the Service, so only the
+/// host portion is kept. The pinned public key is the node's enrollment EC point in hex; it is
+/// required because a report is trusted only when it verifies against it (a keyless member could
+/// never be ready, so a missing key is a configuration error, not a silently-drained node).
+fn parse_inventory(raw: &str) -> Result<Vec<FleetNode>, String> {
     let mut inventory = Vec::new();
     for entry in raw
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
     {
-        let (node, address) = entry
-            .split_once('=')
-            .ok_or_else(|| format!("HEALTHPROXY_MEMBERS entry {entry:?} must be node=address"))?;
-        let (node, address) = (node.trim(), address.trim());
-        if node.is_empty() || address.is_empty() {
+        let mut parts = entry.splitn(3, '=');
+        let node = parts.next().unwrap_or_default().trim();
+        let address = parts.next().unwrap_or_default().trim();
+        let key_hex = parts.next().unwrap_or_default().trim();
+        if node.is_empty() || address.is_empty() || key_hex.is_empty() {
             return Err(format!(
-                "HEALTHPROXY_MEMBERS entry {entry:?} has an empty half"
+                "HEALTHPROXY_MEMBERS entry {entry:?} must be node=address=pubkeyhex"
             ));
         }
+        let public_key = hex::decode(key_hex).map_err(|_| {
+            format!("HEALTHPROXY_MEMBERS entry {entry:?} has a non-hex pinned public key")
+        })?;
         // Keep only the host: the Service owns the port. A bare IP literal (v4 *or* v6) is kept
         // verbatim — an unbracketed IPv6 like `::1` has no port to strip and must not be split on
         // its own colons. Otherwise an `ip:port`/`[ip]:port`/`host:port` has its trailing port
@@ -413,7 +435,11 @@ fn parse_inventory(raw: &str) -> Result<Vec<(String, String)>, String> {
                 .unwrap_or(address)
                 .to_string()
         };
-        inventory.push((node.to_string(), host));
+        inventory.push(FleetNode {
+            node: node.to_string(),
+            address: host,
+            public_key,
+        });
     }
     if inventory.is_empty() {
         return Err("HEALTHPROXY_MEMBERS listed no members".into());
@@ -424,7 +450,16 @@ fn parse_inventory(raw: &str) -> Result<Vec<(String, String)>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
     use std::collections::HashMap;
+
+    static TEST_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| {
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
+        (pkcs8.as_ref().to_vec(), key.public_key().as_ref().to_vec())
+    });
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
@@ -435,7 +470,9 @@ mod tests {
     }
 
     fn report(node: &str, healthy: bool) -> Vec<u8> {
-        serde_json::to_vec(&NodeReport::new(node, "deploy-3", "3.0.0", healthy)).unwrap()
+        let mut report = NodeReport::new(node, "deploy-3", "3.0.0", healthy);
+        report.signature = updated::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
+        serde_json::to_vec(&report).unwrap()
     }
 
     /// The distinct outcomes a single health fetch can produce for a node in one cycle. Every one
@@ -470,6 +507,7 @@ mod tests {
                 let mut old = NodeReport::new(node, "deploy-3", "3.0.0", true);
                 old.reported_at_ms =
                     now_ms().saturating_sub(REPORT_FRESHNESS.as_millis() as u64 + 10_000);
+                old.signature = updated::telemetry::sign_report(&old, &TEST_KEY.0).unwrap();
                 Some(serde_json::to_vec(&old).unwrap())
             }
             Outcome::Missing => None,
@@ -539,7 +577,8 @@ mod tests {
                     let expected = expected_ready(outcome, cached);
 
                     // The behavior under test must agree with the independent model.
-                    let ready = resolve_readiness(node, body_for(outcome, node), &mut cache);
+                    let ready =
+                        resolve_readiness(node, &TEST_KEY.1, body_for(outcome, node), &mut cache);
                     assert_eq!(
                         ready, expected,
                         "seed {seed}: outcome {outcome:?} over cached {cached:?} for {node}"
@@ -595,17 +634,29 @@ mod tests {
 
     #[test]
     fn ready_only_for_a_settled_healthy_report_for_this_node() {
-        assert!(report_is_ready("agent-7", &report("agent-7", true)));
-        assert!(!report_is_ready("agent-7", &report("agent-7", false)));
+        assert!(report_is_ready(
+            "agent-7",
+            &TEST_KEY.1,
+            &report("agent-7", true)
+        ));
+        assert!(!report_is_ready(
+            "agent-7",
+            &TEST_KEY.1,
+            &report("agent-7", false)
+        ));
         // A report for a different node never marks this one ready.
-        assert!(!report_is_ready("agent-7", &report("agent-8", true)));
+        assert!(!report_is_ready(
+            "agent-7",
+            &TEST_KEY.1,
+            &report("agent-8", true)
+        ));
     }
 
     #[test]
     fn malformed_or_empty_documents_fail_closed() {
-        assert!(!report_is_ready("agent-7", b""));
-        assert!(!report_is_ready("agent-7", b"not json"));
-        assert!(!report_is_ready("agent-7", b"{}"));
+        assert!(!report_is_ready("agent-7", &TEST_KEY.1, b""));
+        assert!(!report_is_ready("agent-7", &TEST_KEY.1, b"not json"));
+        assert!(!report_is_ready("agent-7", &TEST_KEY.1, b"{}"));
     }
 
     #[test]
@@ -615,7 +666,7 @@ mod tests {
             ("HEALTHPROXY_SERVICE", "vm-db"),
             (
                 "HEALTHPROXY_MEMBERS",
-                "agent-0=10.0.0.1:8080, agent-1=10.0.0.2",
+                "agent-0=10.0.0.1:8080=aa01, agent-1=10.0.0.2=bb02",
             ),
         ]))
         .unwrap();
@@ -624,19 +675,27 @@ mod tests {
         assert_eq!(
             ok.inventory,
             vec![
-                ("agent-0".to_string(), "10.0.0.1".to_string()),
-                ("agent-1".to_string(), "10.0.0.2".to_string()),
+                FleetNode {
+                    node: "agent-0".into(),
+                    address: "10.0.0.1".into(),
+                    public_key: vec![0xaa, 0x01],
+                },
+                FleetNode {
+                    node: "agent-1".into(),
+                    address: "10.0.0.2".into(),
+                    public_key: vec![0xbb, 0x02],
+                },
             ]
         );
 
         assert!(Config::build(env(&[
             ("HEALTHPROXY_SERVICE", "x"),
-            ("HEALTHPROXY_MEMBERS", "a=1")
+            ("HEALTHPROXY_MEMBERS", "a=1=aa")
         ]))
         .is_err());
         assert!(Config::build(env(&[
             ("HEALTHPROXY_HEALTH_BASE", "x"),
-            ("HEALTHPROXY_MEMBERS", "a=1")
+            ("HEALTHPROXY_MEMBERS", "a=1=aa")
         ]))
         .is_err());
         assert!(Config::build(env(&[
@@ -652,7 +711,7 @@ mod tests {
         let slice = Config::build(env(&[
             ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
             ("HEALTHPROXY_SERVICE", "vm-db"),
-            ("HEALTHPROXY_MEMBERS", "agent-0=10.0.0.1"),
+            ("HEALTHPROXY_MEMBERS", "agent-0=10.0.0.1=aa01"),
         ]))
         .unwrap();
         assert_eq!(slice.haproxy, None);
@@ -661,7 +720,10 @@ mod tests {
         let haproxy = Config::build(env(&[
             ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
             ("HEALTHPROXY_SERVICE", "fleet-haproxy"),
-            ("HEALTHPROXY_MEMBERS", "agent-0=10.0.0.1, agent-1=10.0.0.2"),
+            (
+                "HEALTHPROXY_MEMBERS",
+                "agent-0=10.0.0.1=aa01, agent-1=10.0.0.2=bb02",
+            ),
             (
                 "HEALTHPROXY_HAPROXY_ENDPOINTS",
                 "10.0.0.9:9999, 10.0.0.10:9999",
@@ -680,19 +742,28 @@ mod tests {
     #[test]
     fn inventory_rejects_malformed_entries() {
         assert!(parse_inventory("agent-0").is_err());
-        assert!(parse_inventory("=10.0.0.1").is_err());
+        assert!(parse_inventory("=10.0.0.1=aa").is_err());
         assert!(parse_inventory("agent-0=").is_err());
         assert!(parse_inventory("").is_err());
+        // A member without a pinned key is rejected — a keyless node could never verify, so it is a
+        // configuration error rather than a silently-never-ready node.
+        assert!(parse_inventory("agent-0=10.0.0.1").is_err());
+        // A non-hex pinned key is rejected.
+        assert!(parse_inventory("agent-0=10.0.0.1=zz").is_err());
     }
 
     #[test]
     fn inventory_keeps_only_the_host_across_address_forms() {
         let parsed = parse_inventory(
-            "v4=10.0.0.1, v4p=10.0.0.2:8080, v6=::1, v6p=[fe80::1]:8080, h=vm-db.internal, hp=vm-db.internal:5432",
+            "v4=10.0.0.1=aa, v4p=10.0.0.2:8080=bb, v6=::1=cc, v6p=[fe80::1]:8080=dd, h=vm-db.internal=ee, hp=vm-db.internal:5432=ff",
         )
         .unwrap();
+        let hosts: Vec<(String, String)> = parsed
+            .into_iter()
+            .map(|member| (member.node, member.address))
+            .collect();
         assert_eq!(
-            parsed,
+            hosts,
             vec![
                 ("v4".into(), "10.0.0.1".to_string()),
                 ("v4p".into(), "10.0.0.2".to_string()),

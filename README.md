@@ -33,9 +33,10 @@ verified, rollback-safe identity.
 
 > `updated` is update infrastructure, not the first installer. An installer places the
 > bootstrap and initial supervisor, provisions permissions, and registers the platform
-> lifecycle owner. It may also preplace a signed enrollment artifact and verified
-> application bundle for a network-free first start. Otherwise the first supervisor
-> enrolls and cold-installs online. Loose preinstalled files are never trusted.
+> lifecycle owner. It may also preplace a signed enrollment artifact, the node's minted
+> identity, and a verified application bundle for a network-free first start. Otherwise
+> the first supervisor enrolls and cold-installs online. Loose preinstalled files are
+> never trusted.
 
 ## One-command operator demo
 
@@ -119,7 +120,7 @@ authenticate the archive through TUF
     verifies the manifested bundle into an immutable release)
   → write the transaction journal
   → atomically switch active-release
-  → start the candidate (or let a custom provider bring it into service)
+  → start the candidate (or let the provider-managed reconciler bring it into service)
   → require health
   → commit, or reactivate and reject the predecessor
 ```
@@ -135,7 +136,7 @@ their config changed. Four custom resources (`updated.dev`) describe a fleet:
 | Resource | Role |
 | --- | --- |
 | `UpdateRepository` | The object-store/CDN destination, signing keys, and enrollment policy for one fleet. |
-| `UpdateGroup` | A set of nodes (by label selector) and the exact deployment they should run. Mints a group join token. |
+| `UpdateGroup` | A set of nodes (by label selector) and the exact deployment they should run. |
 | `UpdateGroupSet` | A throttle + schedule spanning several groups: `maxConcurrent`, rollout windows, and dated maintenance calendars. |
 | `UpdateAgent` | One enrolled node: its identity, resolved group, assignment path, and last self-reported running version/health. |
 
@@ -145,23 +146,14 @@ selector against the enrolled agents, builds one plan, signs it, and uploads it 
 A single malformed resource is quarantined (its own status fails) rather than aborting the
 whole repository.
 
-**Enrollment** happens over the gateway's TLS listeners and comes in two modes (a node
-picks one by which fields its bootstrap carries):
-
-- **Mount mode** (Kubernetes / cert-manager): a client certificate and key are
-  pre-provisioned; the agent presents them as mTLS to `/enroll`. The mutual TLS *is* the
-  authentication.
-- **Join mode** (immutable infra / VM userdata): the bootstrap carries only a `groupId`
-  and a shared `nonce` join token. The agent generates a keypair locally, gets its CSR
-  signed at `/join` (server-authenticated TLS, no client cert), and uses the minted
-  certificate thereafter. The control plane sets the certificate identity itself and
-  certifies only the CSR's public key, so a shared token can never mint an arbitrary
-  identity, and two nodes sharing one token get two distinct, individually-revocable
-  identities. Deleting the group deletes its token; rotate it with `spec.rotateNonce`.
-
-The join listener is unauthenticated at the transport layer, so it runs on its own
-connection budget and exposes nothing but `/join` — never `/enroll`, telemetry, or
-repository content. See [group join design](docs/group-enrollment-design.md).
+**Enrollment** has one path: mutual-TLS `POST /enroll` on the gateway data listener.
+Every node receives the same fleet enrollment certificate and a unique configured name,
+generates its durable private key locally, and sends only a CSR. The control plane ignores
+the CSR subject, sets the certificate identity from that validated name, pins the public
+key on the `UpdateAgent`, and returns the per-node certificate plus the signed enrollment
+bundle. The shared credential is used only to enroll; all routing, repository, secrets,
+and telemetry requests use the minted per-node identity. See the
+[enrollment design](docs/group-enrollment-design.md).
 
 **Throttled rollouts.** An `UpdateGroupSet` never advances more than
 `maxConcurrent` members at once (default `members − 1`), holding the rest until the
@@ -235,31 +227,27 @@ See [LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md) for copyable Bash and PowerSh
 
 ## Bootstrap and enrollment
 
-A node's entire local configuration is one `bootstrap.toml`. It always carries the gateway
-`url` and the fleet `ca` it trusts for the gateway's server certificate, plus exactly one
-credential set — mount **or** join:
+A node's entire local configuration is one `bootstrap.toml`. It carries the gateway URL,
+the fleet CA, the shared fleet enrollment credential, and the node's unique configured
+name:
 
 ```toml
 [enrollment]
 url = "https://updates.example.com"
 ca  = "/etc/updated/fleet-ca.crt"
-
-# Mount mode: pre-provisioned client identity (no secret in this file).
-client_cert = "/etc/updated/tls/tls.crt"
-client_key  = "/etc/updated/tls/tls.key"
-
-# — or — Join mode: a shared group join token (this file then holds a secret).
-# group_id = "…"
-# nonce    = "…"
+name = "node-001"
+client_cert = "/etc/updated/enrollment/tls.crt"
+client_key  = "/etc/updated/enrollment/tls.key"
 ```
 
-Cert paths win when present (mount mode); otherwise the join token is used. Enrollment
-returns the pinned routing root plus the complete TUF-signed runtime and repository
-configuration. An installer may preplace `enrollment.json` in guardian state, in which case
-HTTP enrollment is never attempted. The same signed deployment accepts HTTP(S), `file:`
-URLs, or absolute local repository directories, so an operator can repair a deployment
-fully offline. Raw edits inside an immutable installed release remain untrusted and are
-rejected. See [deploy/bootstrap.toml](deploy/bootstrap.toml).
+Enrollment returns the pinned routing root plus the complete TUF-signed runtime and
+repository configuration. For a network-free first boot against a remote gateway, an
+installer must preplace both `enrollment.json` and the already-minted `agent.crt` /
+`agent.key`; a bundle alone still requires `/enroll` to establish the per-node identity.
+The same signed deployment accepts HTTP(S), `file:` URLs, or absolute local repository
+directories, so an operator can repair a deployment fully offline. Raw edits inside an
+immutable installed release remain untrusted and are rejected. See
+[deploy/bootstrap.toml](deploy/bootstrap.toml).
 
 Run the bootstrap — not the supervisor — under the chosen lifecycle owner:
 
@@ -340,13 +328,12 @@ cargo clippy --workspace --all-targets --no-deps -- -D warnings
 The E2E harness creates a real signed repository and disposable towers under
 `target/e2e-work/`. It covers application upgrade and rollback, a tampered trust root,
 offline launch, rejection persistence, transaction-boundary crashes, locking, supervisor
-adoption/self-update, one-shot launch, and the custom provider lifecycle (including a
+adoption/self-update, one-shot launch, and the provider-managed lifecycle (including a
 Magnolia-shaped enterprise upgrade that backs up state, drains, activates a new artifact,
 verifies health, finalizes, and rolls back on failure). Its signed chaotic-application
 fixture separately proves fail-closed behavior for an exit before bind, persistent 503, a
-health request held for five minutes, missing or forged health identity, flapping
-readiness, a crash during probing, and health that degrades only after initially becoming
-ready.
+health request held for five minutes, flapping readiness, a crash during probing, and
+health that degrades only after initially becoming ready.
 
 ### Rejected releases and break glass
 
@@ -433,7 +420,7 @@ is for development and for control planes built on other orchestrators.
 - [System walkthrough](WALKTHROUGH.md)
 - [Control-plane API contract](CONTROLPLANE_API_CONTRACT.md)
 - [Kubernetes operator guide](deploy/kubernetes/README.md)
-- [Group join tokens + CSR enrollment](docs/group-enrollment-design.md)
+- [Single-path mTLS + CSR enrollment](docs/group-enrollment-design.md)
 - [Node decommission via signed tombstone](docs/decommission-design.md)
 - [Deployment adapters](deploy/README.md)
 - [Reference bootstrap](deploy/bootstrap.toml)

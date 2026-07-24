@@ -916,13 +916,7 @@ impl Demo {
                 )?;
             }
         } else {
-            // The universal reexec-capable sample binary (as the baseline seed and edge use), so
-            // a reload cohort can reexec in place into every version the loop publishes. Plain
-            // `sampleapp` would refuse the reload cohort's `--reload-mode reexec` launch and strand
-            // those cohorts one version behind, so the fleet would never converge. It reports the
-            // same `sampleapp` identity and, in the default restart mode the restart cohorts run,
-            // behaves identically.
-            std::fs::copy("/usr/local/bin/sampleapp-reexec", bundle.join("bin/app"))?;
+            std::fs::copy("/usr/local/bin/sampleapp", bundle.join("bin/app"))?;
         }
         std::fs::write(
             bundle.join("config/release.toml"),

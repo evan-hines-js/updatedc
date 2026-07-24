@@ -8,7 +8,9 @@
 //! - `HEALTHPROXY_HEALTH_BASE`         (required) CDN base; a node's report is at
 //!   `<base>/telemetry/<node>.json`.
 //! - `HEALTHPROXY_SERVICE`             (required) selectorless Service to program.
-//! - `HEALTHPROXY_MEMBERS`             (required) `node=address,…` fleet inventory.
+//! - `HEALTHPROXY_MEMBERS`             (required) `node=address=pubkeyhex,…` fleet inventory; the
+//!   pinned public key (the node's enrollment EC point in hex) is what its health report is
+//!   verified against, so a report the node did not sign can never place it in rotation.
 //! - `HEALTHPROXY_NAMESPACE`           Service namespace (default `default`).
 //! - `HEALTHPROXY_PORT` / `_PORT_NAME` endpoint port and name (default `8080` / `http`).
 //! - `HEALTHPROXY_INTERVAL_SECS`       reconcile cadence (default `2`).

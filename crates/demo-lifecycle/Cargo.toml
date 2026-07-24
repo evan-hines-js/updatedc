@@ -6,5 +6,4 @@ license.workspace = true
 
 [dependencies]
 foundation = { path = "../foundation" }
-updated = { path = "../updated" }
 ureq.workspace = true

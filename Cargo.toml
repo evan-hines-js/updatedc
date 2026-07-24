@@ -10,7 +10,6 @@ members = [
     "crates/bootstrap",
     "crates/supervisor",
     "crates/sampleapp",
-    "crates/sampleapp-reexec",
     "crates/e2e",
     "crates/killfuzz",
     "crates/windows-service",

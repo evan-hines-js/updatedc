@@ -673,8 +673,10 @@ pub(crate) fn provider_hook_hangs_are_bounded(ctx: &Ctx) -> R {
 }
 
 fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
-    let srv = format!("127.0.0.1:{}", 22300 + index);
-    let svc = format!("127.0.0.1:{}", 22350 + index);
+    // Keep this range disjoint from `chaotic_application_health_failures`, whose guardian
+    // probes occupy 22300..22307 while the scenarios run concurrently.
+    let srv = format!("127.0.0.1:{}", 23300 + index);
+    let svc = format!("127.0.0.1:{}", 23350 + index);
     let dir = ctx.work.join(format!("provider-hang-{phase}"));
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     let app = dir.join(format!("app{}", ctx.exe));

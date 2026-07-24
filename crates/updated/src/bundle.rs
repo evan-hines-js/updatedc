@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::hash::{is_sha256_hex, sha256_bytes, sha256_file};
 
@@ -160,6 +160,43 @@ pub fn create_bundle(
     let encoder = tar.into_inner()?;
     encoder.finish()?.sync_all()?;
     Ok(())
+}
+
+/// Build the canonical archive from a `source` that is *either* a prepared directory tree or a
+/// single executable file. A directory is bundled as-is; a lone file is first wrapped into a fresh
+/// tree — the file placed at `entrypoints.entrypoint`, plus a generated `config/release.toml`
+/// carrying the version — built inside `wrap_dir`, then bundled. This is the one definition of the
+/// "wrap a lone binary" publishing shorthand, shared by every publish front end so the generated
+/// tree layout (and its `release.toml`) cannot drift between them. `wrap_dir` is (re)created fresh,
+/// so any stale contents from a previous build are removed first.
+pub fn create_bundle_from_source(
+    source: &Path,
+    archive: &Path,
+    wrap_dir: &Path,
+    product: &str,
+    version: &str,
+    platform: &str,
+    entrypoints: &Entrypoints<'_>,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.is_file() {
+        return create_bundle(source, archive, product, version, platform, entrypoints);
+    }
+    if wrap_dir.exists() {
+        fs::remove_dir_all(wrap_dir)?;
+    }
+    let destination = wrap_dir.join(entrypoints.entrypoint);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid("bundle entrypoint has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    fs::create_dir_all(wrap_dir.join("config"))?;
+    fs::copy(source, &destination)?;
+    fs::write(
+        wrap_dir.join("config/release.toml"),
+        format!("version = {version:?}\n"),
+    )?;
+    create_bundle(wrap_dir, archive, product, version, platform, entrypoints)
 }
 
 impl BundleManifest {
@@ -568,15 +605,12 @@ fn collect_release_files(root: &Path, directory: &Path, out: &mut Vec<String>) -
 }
 
 fn validate_relative(path: &str, max: usize) -> io::Result<()> {
-    if path.is_empty() || path.len() > max || path.contains('\\') {
+    // The byte-length bound is bundle-specific (the archive's `path_bytes` limit); confinement —
+    // the traversal-critical part — is the one shared decision in `crate::path`.
+    if path.len() > max {
         return Err(invalid("invalid bundle path"));
     }
-    let parsed = Path::new(path);
-    if parsed.is_absolute()
-        || parsed
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !crate::path::is_confined_relative(path) {
         return Err(invalid("bundle path is not a confined relative path"));
     }
     Ok(())

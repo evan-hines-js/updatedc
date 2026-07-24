@@ -166,11 +166,11 @@ Fixed this round:
   `None`-default → `Indefinite` → warn-and-proceed footgun is gone: `DrainHold::Indefinite` (an
   unimplemented no-op) is deleted, an unset `drain_hold_seconds` now maps to `DrainHold::None` (no
   hold — deterministic, never a stall), matching the struct default, and the docs describe actual
-  behavior (`Some(0)`/absent = no hold; `Some(n)` = bounded ceiling). The remaining piece — an
-  *early-proceed* on the intermediary's signed `ManagedStatus.ready` and an explicit
-  externally-managed "wait for drain-ack" mode — is a genuine **feature** (Increment 2), not a
-  safety gap, and is tracked as future work in the config docs. `ManagedStatus.ready` stays as
-  signed scaffolding for it.
+  behavior (`Some(0)`/absent = no hold; `Some(n)` = bounded ceiling). The once-envisioned
+  *early-proceed* on an external intermediary's signed `ManagedStatus.ready` (and an
+  externally-managed "wait for drain-ack" mode) has been **removed**: the product manages nodes
+  *outside* an orchestrator, so every node self-probes through its signed reconciler and the
+  drain hold is a bounded timer — there is one health path, not an external-verdict second one.
 
 - [ ] **D7 — Gateway telemetry ingest trusts a client-chosen node identity (security).**
   `gateway.rs` `telemetry_put` checks only `report.node == <path node>`; it never inspects the mTLS

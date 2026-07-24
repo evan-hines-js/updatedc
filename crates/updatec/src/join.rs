@@ -172,7 +172,11 @@ mod tests {
         updated::tls::install_crypto_provider();
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let ca = IssuingCa::load(&ca_cert_pem, &ca_key_pem).unwrap();
-        let (_key, csr) = updated::csr::generate("updated enroll canary").unwrap();
+        let csr = updated::csr::csr_for(
+            &updated::csr::generate_key().unwrap(),
+            "updated enroll canary",
+        )
+        .unwrap();
         let leaf = ca.sign_client_csr("canary", "agent-7", &csr).unwrap();
 
         // The minted leaf must verify against the fleet CA exactly as the gateway's mTLS client
@@ -199,7 +203,8 @@ mod tests {
         // not in the year 2100. Guards against regressing back to a fixed wide window.
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let ca = IssuingCa::load(&ca_cert_pem, &ca_key_pem).unwrap();
-        let (_key, csr) = updated::csr::generate("ttl canary").unwrap();
+        let csr =
+            updated::csr::csr_for(&updated::csr::generate_key().unwrap(), "ttl canary").unwrap();
         let leaf = ca.sign_client_csr("canary", "agent-3", &csr).unwrap();
         let der = parse_leaf(&leaf);
         let (_, cert) = X509Certificate::from_der(&der).unwrap();
@@ -224,7 +229,8 @@ mod tests {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let ca = IssuingCa::load(&ca_cert_pem, &ca_key_pem).unwrap();
         // A hostile CSR that asks to be someone else entirely.
-        let (_key, csr) = updated::csr::generate("CN=admin,O=evil").unwrap();
+        let csr = updated::csr::csr_for(&updated::csr::generate_key().unwrap(), "CN=admin,O=evil")
+            .unwrap();
         let name = "agent-9";
         let leaf = ca.sign_client_csr("canary", name, &csr).unwrap();
 
@@ -332,7 +338,8 @@ mod tests {
             let subject = rng.ascii(subject_len);
             let scope = rng.ascii(scope_len);
             let name = format!("agent-{i}");
-            let (_key, csr) = updated::csr::generate(&subject).unwrap();
+            let csr =
+                updated::csr::csr_for(&updated::csr::generate_key().unwrap(), &subject).unwrap();
             let leaf = ca.sign_client_csr(&scope, &name, &csr).unwrap();
             let leaf_der = CertificateDer::from(parse_leaf(&leaf));
             verifier
@@ -358,8 +365,8 @@ mod tests {
         let (ca_cert_pem, ca_key_pem) = test_ca();
         let ca = IssuingCa::load(&ca_cert_pem, &ca_key_pem).unwrap();
         let (name_a, name_b) = ("agent-a", "agent-b");
-        let (_ka, csr_a) = updated::csr::generate("a").unwrap();
-        let (_kb, csr_b) = updated::csr::generate("b").unwrap();
+        let csr_a = updated::csr::csr_for(&updated::csr::generate_key().unwrap(), "a").unwrap();
+        let csr_b = updated::csr::csr_for(&updated::csr::generate_key().unwrap(), "b").unwrap();
         let leaf_a = ca.sign_client_csr("canary", name_a, &csr_a).unwrap();
         let leaf_b = ca.sign_client_csr("canary", name_b, &csr_b).unwrap();
         assert_ne!(name_a, name_b);

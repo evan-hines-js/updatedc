@@ -201,14 +201,14 @@ impl InstalledState {
             && self.release == *release
             && self.archive_sha256 == archive_sha256
             && self.lifecycle.as_ref() == reconciler)
-        .then(|| {
-            Self::confirmed(
-                lineage,
-                self.release.clone(),
-                self.archive_sha256.clone(),
-                self.lifecycle.clone(),
-            )
-        })
+            .then(|| {
+                Self::confirmed(
+                    lineage,
+                    self.release.clone(),
+                    self.archive_sha256.clone(),
+                    self.lifecycle.clone(),
+                )
+            })
     }
 }
 

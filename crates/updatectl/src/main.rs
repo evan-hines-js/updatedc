@@ -394,18 +394,7 @@ async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
     }
 
     // Pull the current metadata so the new root version bumps from it.
-    let repo_dir = tempfile::tempdir()?;
-    let metadata_dir = repo_dir.path().join("metadata");
-    tokio::fs::create_dir_all(&metadata_dir).await?;
-    tokio::fs::create_dir_all(repo_dir.path().join("targets")).await?;
-    download_metadata(store.as_ref(), &destination, &metadata_dir).await?;
-    if !metadata_dir.join("root.json").exists() {
-        return Err(format!(
-            "release repository at s3://{}/{} is not initialized (no metadata/root.json)",
-            backend.bucket, backend.prefix
-        )
-        .into());
-    }
+    let repo_dir = checkout_metadata(store.as_ref(), &destination, backend).await?;
 
     // Mint the successor, then publish a new root version co-signed by the retained standby
     // (which retires the old active key) and the successor.
@@ -418,7 +407,8 @@ async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
         args.expiry_days,
     )
     .await?;
-    let root_json = tokio::fs::read(metadata_dir.join("root.json")).await?;
+    let root_json =
+        tokio::fs::read(repo_dir.path().join("metadata").join("root.json")).await?;
     updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
 
     eprintln!(
@@ -484,19 +474,7 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
     })?;
 
     // Work in a throwaway temp dir: the repository checkout never outlives the process.
-    let repo_dir = tempfile::tempdir()?;
-    let metadata_dir = repo_dir.path().join("metadata");
-    tokio::fs::create_dir_all(&metadata_dir).await?;
-    tokio::fs::create_dir_all(repo_dir.path().join("targets")).await?;
-    download_metadata(store, &destination, &metadata_dir).await?;
-    if !metadata_dir.join("root.json").exists() {
-        return Err(format!(
-            "release repository at s3://{}/{} is not initialized (no metadata/root.json); run \
-             `updatectl trust-root` first",
-            backend.bucket, backend.prefix
-        )
-        .into());
-    }
+    let repo_dir = checkout_metadata(store, &destination, backend).await?;
 
     // Build the bundle into a scratch dir, then register it as a signed target.
     let build_dir = tempfile::tempdir()?;
@@ -565,11 +543,25 @@ async fn checkout_repository(
 > {
     let (destination, store) = build_store(backend)?;
     let keys = open_keys(&backend.keys_dir)?;
+    let repo_dir = checkout_metadata(store.as_ref(), &destination, backend).await?;
+    Ok((destination, store, keys, repo_dir))
+}
+
+/// Check out a repository's current TUF metadata into a throwaway temp dir: create `metadata/` and
+/// `targets/`, download the metadata, and confirm the repository is initialized (has
+/// `metadata/root.json`). The single definition of that checkout preamble — deploy, root rotation,
+/// and the provider-publish path all go through it, so they cannot drift on the directory layout or
+/// the uninitialized-repository guard.
+async fn checkout_metadata(
+    store: &dyn ObjectStore,
+    destination: &S3Destination,
+    backend: &Backend,
+) -> Result<tempfile::TempDir, Error> {
     let repo_dir = tempfile::tempdir()?;
     let metadata_dir = repo_dir.path().join("metadata");
     tokio::fs::create_dir_all(&metadata_dir).await?;
     tokio::fs::create_dir_all(repo_dir.path().join("targets")).await?;
-    download_metadata(store.as_ref(), &destination, &metadata_dir).await?;
+    download_metadata(store, destination, &metadata_dir).await?;
     if !metadata_dir.join("root.json").exists() {
         return Err(format!(
             "release repository at s3://{}/{} is not initialized (no metadata/root.json); run \
@@ -578,7 +570,7 @@ async fn checkout_repository(
         )
         .into());
     }
-    Ok((destination, store, keys, repo_dir))
+    Ok(repo_dir)
 }
 
 /// Publish a provider artifact bundle as a signed target, without rolling any group.
@@ -669,7 +661,7 @@ fn reconciler(
     args: &[String],
     timeout_millis: u64,
 ) -> Result<updated::config::Reconciler, Error> {
-    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !updated::hash::is_sha256_hex(sha256) {
         return Err(format!("provider sha256 {sha256:?} must be 64 hexadecimal characters").into());
     }
     Ok(updated::config::Reconciler {
@@ -792,7 +784,9 @@ fn object_key(prefix: &str, rest: &str) -> String {
 }
 
 /// Build the deterministic application archive. A directory is bundled as-is; a single file
-/// is wrapped into a fresh tree at `--entrypoint` (matching `server publish-app`).
+/// is wrapped into a fresh tree at `--entrypoint` (matching `server publish-app`). Both the
+/// wrapping shorthand and the archive format live in `updated::bundle` so every publish front end
+/// emits byte-identical trees.
 #[allow(clippy::too_many_arguments)]
 fn build_bundle(
     source: &Path,
@@ -803,30 +797,17 @@ fn build_bundle(
     platform: &str,
     entrypoint: &str,
 ) -> Result<(), Error> {
-    let metadata = std::fs::symlink_metadata(source)
-        .map_err(|error| format!("reading --source {}: {error}", source.display()))?;
-    let owned_tree;
-    let tree = if metadata.is_file() {
-        let tree = scratch.join("tree");
-        let destination = tree.join(entrypoint);
-        let parent = destination
-            .parent()
-            .ok_or("--entrypoint must have a parent directory")?;
-        std::fs::create_dir_all(parent)?;
-        std::fs::create_dir_all(tree.join("config"))?;
-        std::fs::copy(source, &destination)?;
-        std::fs::write(
-            tree.join("config/release.toml"),
-            format!("version = {version:?}\n"),
-        )?;
-        owned_tree = tree;
-        owned_tree.as_path()
-    } else {
-        source
-    };
     let entrypoints = updated::bundle::Entrypoints { entrypoint };
-    updated::bundle::create_bundle(tree, archive, product, version, platform, &entrypoints)
-        .map_err(|error| format!("building bundle: {error}"))?;
+    updated::bundle::create_bundle_from_source(
+        source,
+        archive,
+        &scratch.join("tree"),
+        product,
+        version,
+        platform,
+        &entrypoints,
+    )
+    .map_err(|error| format!("building bundle: {error}"))?;
     Ok(())
 }
 
