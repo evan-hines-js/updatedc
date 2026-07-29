@@ -16,53 +16,29 @@ type Error = Box<dyn std::error::Error>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    Preflight,
-    Prepare,
-    PreDrain,
-    Drain,
-    Stop,
-    PreStart,
-    Activate,
-    Start,
-    Verify,
-    Periodic,
-    Finalize,
+    Apply,
+    Healthcheck,
     Rollback,
+    Inspect,
 }
 
 impl Phase {
     fn parse(value: &str) -> Result<Self, Error> {
         match value {
-            "preflight" => Ok(Self::Preflight),
-            "prepare" => Ok(Self::Prepare),
-            "pre-drain" => Ok(Self::PreDrain),
-            "drain" => Ok(Self::Drain),
-            "stop" => Ok(Self::Stop),
-            "pre-start" => Ok(Self::PreStart),
-            "activate" => Ok(Self::Activate),
-            "start" => Ok(Self::Start),
-            "verify" => Ok(Self::Verify),
-            "periodic" => Ok(Self::Periodic),
-            "finalize" => Ok(Self::Finalize),
+            "apply" => Ok(Self::Apply),
+            "healthcheck" => Ok(Self::Healthcheck),
             "rollback" => Ok(Self::Rollback),
+            "inspect" => Ok(Self::Inspect),
             _ => Err(format!("unknown lifecycle phase {value:?}").into()),
         }
     }
 
     fn name(self) -> &'static str {
         match self {
-            Self::Preflight => "preflight",
-            Self::Prepare => "prepare",
-            Self::PreDrain => "pre-drain",
-            Self::Drain => "drain",
-            Self::Stop => "stop",
-            Self::PreStart => "pre-start",
-            Self::Activate => "activate",
-            Self::Start => "start",
-            Self::Verify => "verify",
-            Self::Periodic => "periodic",
-            Self::Finalize => "finalize",
+            Self::Apply => "apply",
+            Self::Healthcheck => "healthcheck",
             Self::Rollback => "rollback",
+            Self::Inspect => "inspect",
         }
     }
 }
@@ -74,6 +50,7 @@ struct Deployment {
     predecessor: String,
     candidate_dir: PathBuf,
     managed_pid: Option<String>,
+    reason: String,
     state: PathBuf,
     effects: PathBuf,
     live: PathBuf,
@@ -99,6 +76,7 @@ impl Deployment {
             predecessor: required_argument(&values, "--predecessor-version")?.to_string(),
             candidate_dir: PathBuf::from(required_argument(&values, "--candidate")?),
             managed_pid: values.get("--managed-pid").cloned(),
+            reason: required_argument(&values, "--reason")?.to_string(),
         })
     }
 
@@ -106,31 +84,55 @@ impl Deployment {
         fs::create_dir_all(&self.effects)?;
         fs::create_dir_all(&self.live)?;
         fs::create_dir_all(self.state.join("audit"))?;
-        if self.phase != Phase::Periodic && self.completed(self.phase) {
+        // Completion markers make ONE update attempt idempotent, so a crash mid-apply resumes
+        // without repeating finished work. A per-boot hook is not an attempt: the supervisor
+        // invokes it under a constant id on every launch, so honouring a marker there would turn
+        // "run this before every start" into "run this once, ever".
+        if !matches!(self.phase, Phase::Healthcheck | Phase::Inspect)
+            && !self.is_per_boot()
+            && self.completed(self.phase)
+        {
             return Ok(());
         }
         self.audit("started")?;
         match self.phase {
-            Phase::Preflight => self.preflight()?,
-            Phase::Prepare => self.prepare()?,
-            Phase::PreDrain => self.pre_drain()?,
-            Phase::Drain => self.drain()?,
-            Phase::Stop => self.stop()?,
-            Phase::PreStart => self.pre_start()?,
-            Phase::Activate => self.activate()?,
-            Phase::Start => self.start()?,
-            Phase::Verify => self.verify()?,
-            Phase::Periodic => self.periodic()?,
-            Phase::Finalize => self.finalize()?,
+            Phase::Apply => self.apply()?,
+            Phase::Healthcheck => self.periodic()?,
             Phase::Rollback => self.rollback()?,
+            Phase::Inspect => self.fingerprint()?,
         }
-        if self.phase != Phase::Periodic {
+        if !matches!(self.phase, Phase::Healthcheck | Phase::Inspect) && !self.is_per_boot() {
             self.write(
                 self.effects.join(format!("{}.done", self.phase.name())),
                 b"done\n",
             )?;
         }
         self.audit("completed")
+    }
+
+    fn apply(&self) -> Result<(), Error> {
+        if self.reason == "restart" || self.candidate == self.predecessor {
+            self.pre_start()?;
+            return self.start();
+        }
+        self.preflight()?;
+        self.write(self.effects.join("preflight.done"), b"done\n")?;
+        self.prepare()?;
+        self.write(self.effects.join("prepare.done"), b"done\n")?;
+        self.pre_drain()?;
+        self.write(self.effects.join("pre-drain.done"), b"done\n")?;
+        self.drain()?;
+        self.write(self.effects.join("drain.done"), b"done\n")?;
+        self.stop()?;
+        self.write(self.effects.join("stop.done"), b"done\n")?;
+        self.pre_start()?;
+        self.activate()?;
+        self.write(self.effects.join("activate.done"), b"done\n")?;
+        self.start()?;
+        self.write(self.effects.join("start.done"), b"done\n")?;
+        self.verify()?;
+        self.write(self.effects.join("verify.done"), b"done\n")?;
+        self.finalize()
     }
 
     fn preflight(&self) -> Result<(), Error> {
@@ -144,7 +146,7 @@ impl Deployment {
     }
 
     fn prepare(&self) -> Result<(), Error> {
-        self.require(Phase::Preflight)?;
+        self.require("preflight")?;
         self.initialize_legacy_file("application.war", &self.predecessor)?;
         self.initialize_legacy_file("content.repository", "schema=1 owner=legacy")?;
         self.initialize_legacy_file(
@@ -164,7 +166,7 @@ impl Deployment {
     }
 
     fn pre_drain(&self) -> Result<(), Error> {
-        self.require(Phase::Prepare)?;
+        self.require("prepare")?;
         // Runs BEFORE the guardian withdraws readiness, while the app is still serving.
         // A real integration signals workers to stop accepting new sessions and lets
         // in-flight work wind down — meaningful wall-clock time in an enterprise app.
@@ -205,7 +207,7 @@ impl Deployment {
     }
 
     fn drain(&self) -> Result<(), Error> {
-        self.require(Phase::Prepare)?;
+        self.require("prepare")?;
         self.write(
             self.live.join("removed-from-load-balancer"),
             self.attempt.as_bytes(),
@@ -216,7 +218,7 @@ impl Deployment {
     }
 
     fn stop(&self) -> Result<(), Error> {
-        self.require(Phase::Drain)?;
+        self.require("drain")?;
         expect(&self.live.join("removed-from-load-balancer"), &self.attempt)?;
         self.write(
             self.effects.join("stopped-process.pid"),
@@ -225,7 +227,7 @@ impl Deployment {
     }
 
     fn activate(&self) -> Result<(), Error> {
-        self.require(Phase::Stop)?;
+        self.require("stop")?;
         self.write(self.live.join("application.war"), self.candidate.as_bytes())?;
         self.write(
             self.live.join("migration.plan"),
@@ -239,7 +241,22 @@ impl Deployment {
     }
 
     fn start(&self) -> Result<(), Error> {
-        self.require(Phase::Activate)?;
+        if self.attempt == "boot" {
+            // Cold install and ordinary restart have no update transaction. Materialize any
+            // provider-owned steady state that an update's activate/finalize phases would have
+            // produced, without overwriting an existing deployment on restart.
+            self.initialize_legacy_file("application.war", &self.candidate)?;
+            self.initialize_legacy_file(
+                "content.repository",
+                &format!("schema=2 version={} migrated=true", self.candidate),
+            )?;
+            self.initialize_legacy_file(
+                "change-ticket.receipt",
+                &format!("green release {} established on boot", self.candidate),
+            )?;
+        } else {
+            self.require("activate")?;
+        }
         expect(&self.live.join("application.war"), &self.candidate)?;
         self.write(
             self.live.join("cache-warmup"),
@@ -250,25 +267,62 @@ impl Deployment {
     }
 
     fn verify(&self) -> Result<(), Error> {
-        self.require(Phase::Start)?;
+        self.require("start")?;
+        self.verify_running_version()?;
+        required_file(&self.live.join("migration.plan"))
+    }
+
+    /// Observe the steady deployment without consulting transaction-local markers.
+    ///
+    /// `verify` runs inside the activation transaction and therefore proves that `start`
+    /// completed in that same attempt. `periodic` runs after the transaction has finished
+    /// (and after supervisor or pod restarts), so its evidence must come exclusively from
+    /// durable live state and the running application.
+    fn verify_running_version(&self) -> Result<(), Error> {
         let observed = ureq::get("http://127.0.0.1:8080/version")
             .timeout(Duration::from_secs(2))
             .call()?
             .into_string()?;
+        self.validate_running_version(&observed)
+    }
+
+    fn validate_running_version(&self, observed: &str) -> Result<(), Error> {
         if observed.trim() != self.candidate {
             return Err(format!("expected {}, observed {observed:?}", self.candidate).into());
         }
-        required_file(&self.live.join("migration.plan"))
+        Ok(())
     }
 
     fn periodic(&self) -> Result<(), Error> {
         // Perform one observation. Cadence, retry, timeout, and failure policy belong to the
-        // hardened agent; the provider defines the application-specific evidence.
-        self.verify()
+        // hardened agent; the provider defines the application-specific evidence. Periodic is
+        // deliberately independent of rollout-attempt markers: those belong to a completed
+        // transaction and are not steady-state health.
+        self.verify_running_version()?;
+        // Finalization consumes the transient migration plan. Steady health proves the durable
+        // post-finalize state instead of requiring transaction-temporary evidence.
+        expect(
+            &self.live.join("content.repository"),
+            &format!("schema=2 version={} migrated=true", self.candidate),
+        )?;
+        required_file(&self.live.join("change-ticket.receipt"))
+    }
+
+    fn fingerprint(&self) -> Result<(), Error> {
+        // The provider chooses the measured state; the supervisor hashes these exact bytes and
+        // never logs them. Keep the representation explicit and stable across filesystem order.
+        self.periodic()?;
+        let application = fs::read_to_string(self.live.join("application.war"))?;
+        let repository = fs::read_to_string(self.live.join("content.repository"))?;
+        let server = fs::read_to_string(self.live.join("server.xml"))?;
+        print!(
+            "application.war={application:?}\ncontent.repository={repository:?}\nserver.xml={server:?}\n"
+        );
+        Ok(())
     }
 
     fn finalize(&self) -> Result<(), Error> {
-        self.require(Phase::Verify)?;
+        self.require("verify")?;
         self.write(
             self.live.join("content.repository"),
             format!("schema=2 version={} migrated=true\n", self.candidate).as_bytes(),
@@ -297,12 +351,18 @@ impl Deployment {
         Ok(())
     }
 
-    fn require(&self, phase: Phase) -> Result<(), Error> {
-        if self.completed(phase) {
+    fn require(&self, phase: &str) -> Result<(), Error> {
+        if self.effects.join(format!("{phase}.done")).is_file() {
             Ok(())
         } else {
-            Err(format!("{} requires completed {}", self.phase.name(), phase.name()).into())
+            Err(format!("{} requires completed {phase}", self.phase.name()).into())
         }
+    }
+
+    /// Whether this invocation is the supervisor's per-boot environment hook (`install`/`restart`
+    /// reasons, run on every launch under a constant attempt id) rather than one update attempt.
+    fn is_per_boot(&self) -> bool {
+        matches!(self.reason.as_str(), "install" | "restart")
     }
 
     fn completed(&self, phase: Phase) -> bool {
@@ -416,5 +476,78 @@ fn main() {
     if let Err(error) = Deployment::load().and_then(|deployment| deployment.run()) {
         eprintln!("demo lifecycle failed: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deployment(root: PathBuf, phase: Phase, attempt: &str) -> Deployment {
+        Deployment {
+            phase,
+            attempt: attempt.into(),
+            candidate: "22.0.0".into(),
+            predecessor: "1.0.0".into(),
+            candidate_dir: root.join("candidate"),
+            managed_pid: None,
+            reason: "update".into(),
+            state: root.clone(),
+            effects: root.join("attempts").join(attempt),
+            live: root.join("live"),
+            backup: root.join("backups").join(attempt),
+        }
+    }
+
+    #[test]
+    fn cold_boot_start_does_not_require_an_update_activation() {
+        let root = std::env::temp_dir().join(format!(
+            "updated-demo-lifecycle-cold-boot-{}",
+            std::process::id()
+        ));
+        let mut deployment = deployment(root.clone(), Phase::Apply, "boot");
+        deployment.reason = "install".into();
+        fs::create_dir_all(&deployment.live).unwrap();
+
+        assert!(!deployment.effects.join("activate.done").exists());
+        deployment.start().unwrap();
+        expect(&deployment.live.join("application.war"), "22.0.0").unwrap();
+        expect(
+            &deployment.live.join("content.repository"),
+            "schema=2 version=22.0.0 migrated=true",
+        )
+        .unwrap();
+        required_file(&deployment.live.join("change-ticket.receipt")).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn steady_state_verification_does_not_require_transaction_markers() {
+        let root = std::env::temp_dir().join(format!(
+            "updated-demo-lifecycle-periodic-{}",
+            std::process::id()
+        ));
+        let live = root.join("live");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(
+            live.join("content.repository"),
+            b"schema=2 version=22.0.0 migrated=true\n",
+        )
+        .unwrap();
+        fs::write(live.join("change-ticket.receipt"), b"complete\n").unwrap();
+        let deployment = deployment(root.clone(), Phase::Healthcheck, "healthcheck");
+
+        assert!(!deployment.effects.join("start.done").exists());
+        assert!(!deployment.live.join("migration.plan").exists());
+        deployment.validate_running_version("22.0.0\n").unwrap();
+        expect(
+            &deployment.live.join("content.repository"),
+            "schema=2 version=22.0.0 migrated=true",
+        )
+        .unwrap();
+        required_file(&deployment.live.join("change-ticket.receipt")).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

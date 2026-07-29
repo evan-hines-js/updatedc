@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 foundation = { path = "../foundation" }
 updated = { path = "../updated" }
+updated-contracts = { path = "../updated-contracts" }
 updated-tuf = { path = "../updated-tuf" }
 tokio = { workspace = true }
 semver = { workspace = true }

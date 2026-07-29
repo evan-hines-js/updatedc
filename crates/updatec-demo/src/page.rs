@@ -246,7 +246,7 @@ pub(crate) const PAGE: &str = r#"<!doctype html>
     <div class="step"><b>7 · verify</b>prove live candidate identity</div>
     <div class="step"><b>8 · finalize</b>migrate + write change receipt</div>
   </div>
-  <pre class="tree">/var/lib/updated/demo-enterprise-deployment/
+  <pre class="tree">/var/lib/updated/providers/state/demo-enterprise-lifecycle/
 ├── attempts/&lt;signed-attempt-id&gt;/
 │   ├── preflight.done
 │   ├── prepare.done

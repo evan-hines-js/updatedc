@@ -132,11 +132,32 @@ impl SelfUpdateState {
 }
 
 fn prune_supervisor_cache(opts: &Options) {
-    let root = opts.supervisor_update.state_dir.join("supervisors");
+    let state_dir = &opts.supervisor_update.state_dir;
+    let root = state_dir.join("supervisors");
+    // Two entries are never candidates for collection: the running supervisor's own directory, and
+    // the one the guardian has COMMITTED. This process may itself be an unconfirmed candidate the
+    // guardian is trialling, in which case the committed entry is the rollback target — older than
+    // everything else and therefore exactly what an age-ordered GC removes first. Deleting it
+    // leaves the guardian with a pointer to a missing binary and no way back.
+    let staged_dir_name =
+        |path: PathBuf| path.parent().and_then(Path::file_name).map(OsString::from);
+    let committed =
+        match control::read_supervisor_pointer(&state_dir.join(control::DESIRED_SUPERVISOR_FILE)) {
+            Ok(committed) => committed,
+            Err(error) => {
+                // Unreadable pointer: skip this pass rather than prune blind. A GC deferred to the
+                // next boot costs disk; one that eats the rollback target costs the node.
+                warn(&format!(
+                "could not read the guardian's committed supervisor ({error}); skipping cache prune"
+            ));
+                return;
+            }
+        };
     let protected: HashSet<OsString> = std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().and_then(Path::file_name).map(OsString::from))
         .into_iter()
+        .chain(committed)
+        .filter_map(staged_dir_name)
         .collect();
     match updated::gc::prune_directories(
         &root,

@@ -3,9 +3,10 @@
 The supervisor is a transactional host for one signed node reconciler. It is not a workflow
 engine and does not execute independently configured hooks.
 
-The reconciler bundle declares one executable. The supervisor invokes it with an operation and
-named argv context using protocol version 1. The same executable implements preparation,
-activation, verification, steady-state observation, and rollback. See
+The reconciler bundle declares one executable. The supervisor invokes it with one of four public
+operations (`apply`, `healthcheck`, `rollback`, `inspect`) and named argv context using protocol
+version 1. Internal preparation, draining, process transitions, commit, and crash recovery are not
+part of the provider ABI. See
 [`LIFECYCLE_PROVIDER.md`](../LIFECYCLE_PROVIDER.md) for the complete Bash/PowerShell-oriented
 contract.
 

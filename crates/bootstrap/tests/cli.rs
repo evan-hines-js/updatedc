@@ -84,6 +84,30 @@ fn first_boot_without_a_supervisor_fails_closed() {
 }
 
 #[test]
+fn the_config_path_defaults_so_a_standard_deployment_never_names_it() {
+    // Omitting --supervisor-config must NOT be a usage error: a node's config has one canonical
+    // location (`control::DEFAULT_BOOTSTRAP_CONFIG`) and every deployment adapter relies on that
+    // default rather than restating a path. Reaching the *supervisor* fail-closed check (exit 1)
+    // rather than an argument error (exit 2) is what proves the default was applied.
+    let state = temp_dir("default-config");
+    let output = bootstrap()
+        .args(["--state-dir", state.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("fatal: no committed supervisor and no --supervisor to seed one"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("--supervisor-config is required"),
+        "the config path must default, not be required: {stderr}"
+    );
+}
+
+#[test]
 fn help_prints_the_complete_operator_contract() {
     let output = bootstrap().arg("--help").output().unwrap();
     assert!(output.status.success());

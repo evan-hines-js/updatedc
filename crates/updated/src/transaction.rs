@@ -73,7 +73,6 @@ pub enum Phase {
     PredecessorHealthy,
     RollbackFinalizeStarted,
     RolledBack,
-    Aborted,
 }
 
 impl Transaction {
@@ -84,8 +83,8 @@ impl Transaction {
                 "transaction id must not be empty",
             ));
         }
-        if !crate::hash::is_sha256_hex(self.previous_repository_lineage.as_str())
-            || !crate::hash::is_sha256_hex(self.candidate_repository_lineage.as_str())
+        if !updated_contracts::is_sha256_hex(self.previous_repository_lineage.as_str())
+            || !updated_contracts::is_sha256_hex(self.candidate_repository_lineage.as_str())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -115,22 +114,21 @@ impl Transaction {
                 | Phase::PredecessorHealthy
                 | Phase::RollbackFinalizeStarted
                 | Phase::RolledBack
-                | Phase::Aborted
         )
     }
 
     /// Position in the recovery path (0 = rollback just began, 10 = fully rolled back), or `None`
     /// when the transaction is not on the rollback path at all. This lets a fresh supervisor resume
     /// after the last durable boundary without re-running an operation already recorded complete.
-    ///
-    /// The recovery driver in the supervisor gates each replay step on this rank with the
-    /// convention `rollback_rank() < RANK_OF(step's recorded phase)` — i.e. "still on the rollback
-    /// path AND has not yet reached the phase this step records, so the step is pending." Every
-    /// `rank < N` literal in the supervisor's recovery flow is exactly the `Some(N)` arm below, so
-    /// this match is the single source of truth for that ordering: reordering a phase here (or the
-    /// numbering) is what moves every gate in lockstep, and nothing else must be edited to match.
     pub fn rollback_rank(&self) -> Option<u8> {
-        match self.phase {
+        Self::rollback_rank_of(self.phase)
+    }
+
+    /// The recovery rank of a phase — its position on the rollback path, or `None` for a phase that
+    /// is not on that path. The single mapping every resume gate reads, so the ordering lives in one
+    /// place; [`recovery_pending`](Self::recovery_pending) is how the driver consumes it.
+    fn rollback_rank_of(phase: Phase) -> Option<u8> {
+        match phase {
             Phase::RollbackStarted => Some(0),
             Phase::RollbackStopStarted => Some(1),
             Phase::RollbackStopped => Some(2),
@@ -141,9 +139,23 @@ impl Transaction {
             Phase::RollbackHealthStarted => Some(7),
             Phase::PredecessorHealthy => Some(8),
             Phase::RollbackFinalizeStarted => Some(9),
-            Phase::RolledBack | Phase::Aborted => Some(10),
+            Phase::RolledBack => Some(10),
             _ => None,
         }
+    }
+
+    /// True when this transaction is on the rollback path and has not yet advanced *into* `target` —
+    /// so the recovery step that records `target` is still pending and must be (re)run on resume.
+    /// Off the rollback path (or when `target` is not a rollback phase) it is false: nothing to
+    /// replay. This is the single home of the "resume until the target phase is reached" convention,
+    /// so recovery call sites name the phase they drive toward instead of a bare rank integer —
+    /// reorder [`rollback_rank_of`](Self::rollback_rank_of) and every gate moves with it, by
+    /// construction rather than by matching literals.
+    pub fn recovery_pending(&self, target: Phase) -> bool {
+        matches!(
+            (self.rollback_rank(), Self::rollback_rank_of(target)),
+            (Some(current), Some(boundary)) if current < boundary
+        )
     }
 
     pub fn advance(&mut self, next: Phase) -> io::Result<()> {
@@ -182,7 +194,6 @@ impl Transaction {
                 | (Phase::RollbackHealthStarted, Phase::PredecessorHealthy)
                 | (Phase::PredecessorHealthy, Phase::RollbackFinalizeStarted)
                 | (Phase::RollbackFinalizeStarted, Phase::RolledBack)
-                | (Phase::RollbackStarted, Phase::Aborted)
         );
         if !(forward || begin_rollback || rollback) {
             return Err(io::Error::new(
@@ -232,9 +243,7 @@ pub fn classify_recovery(
         {
             Recovery::NeverSwapped
         }
-        Phase::RolledBack | Phase::Aborted if active == Some(&tx.previous_release) => {
-            Recovery::NeverSwapped
-        }
+        Phase::RolledBack if active == Some(&tx.previous_release) => Recovery::NeverSwapped,
         _ => Recovery::RestorePredecessor,
     }
 }
@@ -268,23 +277,7 @@ pub fn clear(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn release(version: &str, digest: &str) -> ReleaseId {
-        ReleaseId {
-            version: version.into(),
-            manifest_sha256: digest.into(),
-        }
-    }
-
-    fn provider() -> Box<ProviderRelease> {
-        Box::new(ProviderRelease {
-            product: "reconciler".into(),
-            release: release("1.0.0", "reconciler-manifest"),
-            archive_sha256: "reconciler-archive".into(),
-            args: Vec::new(),
-            timeout_millis: 1_000,
-        })
-    }
+    use crate::testing::{provider, release};
 
     fn tx() -> Transaction {
         Transaction {
@@ -394,6 +387,45 @@ mod tests {
             assert_eq!(transaction.rollback_rank(), Some(rank));
         }
         assert!(transaction.advance(Phase::PredecessorStarted).is_err());
+    }
+
+    #[test]
+    fn recovery_pending_is_true_only_for_phases_not_yet_reached() {
+        // Sit the transaction at RollbackStopped (rank 2). Every rollback phase strictly ahead is
+        // pending; the current phase and everything behind it are not — the exact resume gate the
+        // supervisor drives, expressed without a single rank literal.
+        let mut transaction = tx();
+        transaction.phase = Phase::CandidateHealthy;
+        transaction.advance(Phase::RollbackStarted).unwrap();
+        transaction.advance(Phase::RollbackStopStarted).unwrap();
+        transaction.advance(Phase::RollbackStopped).unwrap();
+
+        // Behind / at the current phase: nothing to replay.
+        for done in [
+            Phase::RollbackStarted,
+            Phase::RollbackStopStarted,
+            Phase::RollbackStopped,
+        ] {
+            assert!(!transaction.recovery_pending(done), "{done:?} already done");
+        }
+        // Ahead on the rollback path: still pending.
+        for pending in [
+            Phase::RollbackActivateStarted,
+            Phase::PredecessorActivated,
+            Phase::RollbackStartStarted,
+            Phase::RolledBack,
+        ] {
+            assert!(
+                transaction.recovery_pending(pending),
+                "{pending:?} still pending"
+            );
+        }
+        // A phase that is not on the rollback path is never "pending".
+        assert!(!transaction.recovery_pending(Phase::Committed));
+
+        // A transaction that is not rolling back has nothing pending at all.
+        let forward = tx();
+        assert!(!forward.recovery_pending(Phase::RolledBack));
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {

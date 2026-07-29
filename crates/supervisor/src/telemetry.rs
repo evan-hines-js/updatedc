@@ -11,7 +11,11 @@
 use std::time::Duration;
 
 use updated::config::Routing;
-use updated::telemetry::NodeReport;
+use updated_contracts::telemetry::{
+    report_url as telemetry_report_url, sign_report, NodeReport, OutputManifest,
+};
+
+const MAX_OUTPUT_MANIFEST_BYTES: u64 = 64 * 1024;
 
 /// The node's own identity, derived from the exact routing target it resolves
 /// (`.../agents/<node>.json`). Returns `None` if the assignment path has no usable
@@ -26,6 +30,62 @@ pub fn node_identity(routing: &Routing) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// What the node is running right now — the signed payload of one heartbeat, gathered by the
+/// caller from the assignment it just acted on and its own committed install record.
+pub struct RunningState<'a> {
+    /// The deployment identity the control plane currently assigns this node.
+    pub deployment: &'a str,
+    /// Digest of the exact signed assignment document behind that deployment name. This is what
+    /// lets the control plane stage a change that keeps the name — a new archive, argument,
+    /// secret, or resolved input — one `maxUnavailable` batch at a time.
+    pub assignment_sha256: &'a str,
+    /// The version actually answering, empty before the first install completes.
+    pub version: &'a str,
+    /// The SHA-256 of the archive that version was installed from, empty alongside `version`.
+    pub archive_sha256: &'a str,
+    /// Settled: acted on the assignment and healthy. Never true mid-rollout.
+    pub healthy: bool,
+    /// Latest successful opaque node-state fingerprint, when one is currently publishable.
+    pub fingerprint: Option<&'a updated_contracts::telemetry::Fingerprint>,
+    /// Validated outputs emitted by the exact running archive.
+    pub outputs: Option<&'a OutputManifest>,
+}
+
+/// Read and validate the running archive's bounded output manifest. A missing file means the
+/// reconciler emitted no outputs; malformed or oversized data is omitted rather than weakening
+/// the health report itself.
+pub fn load_outputs(
+    install_root: &std::path::Path,
+    archive_sha256: &str,
+) -> Option<OutputManifest> {
+    if archive_sha256.is_empty() {
+        return None;
+    }
+    let path = crate::update::reconciler_output_path(install_root, archive_sha256);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_OUTPUT_MANIFEST_BYTES {
+        crate::warn("reconciler output manifest is not a bounded regular file; omitting outputs");
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let manifest: OutputManifest = match serde_json::from_slice(&bytes) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            crate::warn(&format!(
+                "decoding reconciler output manifest failed ({error}); omitting outputs"
+            ));
+            return None;
+        }
+    };
+    if let Err(error) = manifest.validate() {
+        crate::warn(&format!(
+            "invalid reconciler output manifest ({error}); omitting outputs"
+        ));
+        return None;
+    }
+    Some(manifest)
+}
+
 /// Write the node's running state to its report location. Strictly best-effort: any
 /// error (no report URL, no derivable identity, network failure, non-success status)
 /// is logged and swallowed so reporting can never disrupt the update loop.
@@ -33,36 +93,45 @@ pub async fn report_running_state(
     client: &reqwest::Client,
     report_url: Option<&str>,
     node: Option<&str>,
-    deployment: &str,
-    version: &str,
-    healthy: bool,
+    state: &RunningState<'_>,
     signing_key: Option<&[u8]>,
 ) {
     let (Some(report_url), Some(node)) = (report_url, node) else {
         return;
     };
-    let mut report = NodeReport::new(node, deployment, version, healthy);
-    // Sign with the node's per-node key so the throttle can verify authenticity end-to-end. A
-    // signing failure leaves the report unsigned — best-effort, but it will fail closed at the
-    // throttle (treated as not-yet-settled), never trusted.
-    if let Some(key) = signing_key {
-        match updated::telemetry::sign_report(&report, key) {
-            Ok(signature) => report.signature = signature,
-            Err(error) => crate::warn(&format!(
-                "signing rollout telemetry failed ({error}); continuing unsigned"
-            )),
-        }
-    }
-    let body = match serde_json::to_vec(&report) {
+    // No key means nothing publishable. A report is a signed DSSE envelope — there is no unsigned
+    // form — and writing one no reader could verify would be worse than writing nothing: it would
+    // OVERWRITE this node's last good report, so a consumer that had a fresh healthy record would be
+    // left with an unverifiable one and drain the node. Staying quiet leaves the previous report to
+    // age out honestly on its own freshness bound.
+    let Some(key) = signing_key else {
+        crate::warn("no telemetry signing key available; skipping the rollout heartbeat");
+        return;
+    };
+    let mut report = NodeReport::new(
+        node,
+        state.deployment,
+        state.assignment_sha256,
+        state.version,
+        state.archive_sha256,
+        state.healthy,
+    );
+    report.fingerprint = state.fingerprint.cloned();
+    report.outputs = state.healthy.then(|| state.outputs.cloned()).flatten();
+    // Signed with the node's per-node key so the throttle and the health proxy can verify authenticity
+    // end-to-end, rather than trusting the write hop.
+    let body = match sign_report(&report, key).and_then(|envelope| {
+        serde_json::to_vec(&envelope).map_err(|e| format!("encoding rollout telemetry: {e}"))
+    }) {
         Ok(body) => body,
         Err(error) => {
             crate::warn(&format!(
-                "encoding rollout telemetry failed ({error}); continuing"
+                "preparing rollout telemetry failed ({error}); continuing"
             ));
             return;
         }
     };
-    let target = updated::telemetry::report_url(report_url, node);
+    let target = telemetry_report_url(report_url, node);
     let result = client
         .put(&target)
         .timeout(Duration::from_secs(5))
@@ -85,13 +154,13 @@ pub async fn report_running_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn routing(assignment: &str) -> Routing {
         Routing {
             root: std::path::PathBuf::from("/root"),
             base_url: "https://cdn/".into(),
             assignment: assignment.into(),
-            datastore: None,
             metadata_limit: 1024,
             transport_timeout: Duration::from_secs(5),
             mtls: updated::tls::Identity::new("tls.crt", "tls.key", "ca.crt"),
@@ -104,6 +173,29 @@ mod tests {
             node_identity(&routing("assignments/agents/agent-123.json")).as_deref(),
             Some("agent-123")
         );
+    }
+
+    #[test]
+    fn output_files_are_release_partitioned_bounded_and_validated() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = "a".repeat(64);
+        let path = crate::update::reconciler_output_path(root.path(), &identity);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let manifest = OutputManifest {
+            schema: OutputManifest::SCHEMA,
+            values: BTreeMap::from([(
+                "endpoint".into(),
+                updated_contracts::telemetry::OutputValue::String {
+                    value: "https://vault-0:8200".into(),
+                },
+            )]),
+        };
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(load_outputs(root.path(), &identity), Some(manifest));
+        assert_eq!(load_outputs(root.path(), &"b".repeat(64)), None);
+
+        std::fs::write(path, vec![b'x'; MAX_OUTPUT_MANIFEST_BYTES as usize + 1]).unwrap();
+        assert_eq!(load_outputs(root.path(), &identity), None);
     }
 
     #[test]

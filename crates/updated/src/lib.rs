@@ -1,8 +1,12 @@
-//! Reusable client-side installation primitives shared by the supervisor:
+//! Reusable node-side installation primitives shared by the supervisor:
 //! crash-safe filesystem replacement, a single-instance lock,
 //! health-rejection tracking, the committed
-//! installed-state record, and the shared operator-config loader (which also resolves
+//! installed-state record, and the operator-config loader (which also resolves
 //! the tower's canonical on-disk paths).
+//!
+//! Cross-process artifact, enrollment, and telemetry contracts live in
+//! [`updated-contracts`](../updated_contracts/index.html); this crate is not a compatibility facade
+//! for those protocol definitions.
 //!
 //! The trust and download path — authenticating releases and streaming verified
 //! target bytes — lives in [`updated-tuf`](../updated_tuf/index.html) on top of
@@ -17,14 +21,15 @@ pub mod enrollment;
 pub mod env;
 pub mod gc;
 pub mod hash;
+pub mod http;
 pub mod install;
 pub mod lock;
-pub mod path;
 pub mod provider;
 pub mod rand;
 pub mod reject;
 pub mod state;
-pub mod telemetry;
+#[cfg(test)]
+mod testing;
 pub mod tls;
 pub mod transaction;
 

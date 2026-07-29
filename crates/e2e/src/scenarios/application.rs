@@ -403,7 +403,18 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
                 ));
             }
         } else {
+            // "Not ready" only means something once the guardian's probe endpoint is actually
+            // listening: before it binds, every request fails for an unrelated reason and a single
+            // poll passes trivially. Wait for the endpoint, then require it to STAY unready.
             if !wait_until(EVENT_TIMEOUT, || {
+                http_text(&format!("http://{probes}/livez")).is_some()
+            }) {
+                return fail(format!(
+                    "fault {fault}: the guardian probe endpoint never came up, so readiness was \
+                     never actually observed"
+                ));
+            }
+            if !stays_true(READINESS_SETTLE, || {
                 http_text(&format!("http://{probes}/readyz")).is_none()
             }) {
                 return fail(format!("fault {fault}: guardian incorrectly became ready"));
@@ -595,8 +606,7 @@ pub(crate) fn app_post_health_crash_reverts(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
     // Trigger the crash only after the durable commit. A timer from process start races
     // lifecycle finalization on loaded CI and can accidentally test interrupted activation.
-    if !sup.wait_for_log("upgraded to 2.0.0", EVENT_TIMEOUT)
-        || http_text(&format!("http://{svc}/crash")).as_deref() != Some("crashing")
+    if !sup.wait_for_log("upgraded to 2.0.0", EVENT_TIMEOUT) || !wait_for_crash(svc, EVENT_TIMEOUT)
     {
         kill_stray(&app);
         return fail("could not trigger the committed v2.0.0 test crash");
@@ -668,7 +678,7 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
     if !services[1]
         .4
         .wait_for_log("upgraded to 2.0.0", EVENT_TIMEOUT)
-        || http_text("http://127.0.0.1:21131/crash").as_deref() != Some("crashing")
+        || !wait_for_crash("127.0.0.1:21131", EVENT_TIMEOUT)
     {
         return fail("could not trigger the failing peer's committed v2.0.0 crash");
     }

@@ -549,13 +549,20 @@ mod tests {
         String::from_utf16(&v[..v.len() - 1]).unwrap()
     }
 
+    /// The quoted form of one argument, decoded back to a `String` for comparison.
+    fn quote_arg(arg: &OsStr) -> String {
+        let mut out = Vec::new();
+        quote_arg_into(&mut out, arg);
+        String::from_utf16(&out).unwrap()
+    }
+
     #[test]
     fn windows_arguments_follow_create_process_quoting_rules() {
         assert_eq!(quote_arg(OsStr::new("plain")), "plain");
         assert_eq!(quote_arg(OsStr::new("")), "\"\"");
         assert_eq!(quote_arg(OsStr::new("two words")), "\"two words\"");
-        assert_eq!(quote_arg(OsStr::new(r#"a\"b"#)), "\"a\\\\\\\"b\"");
-        assert_eq!(quote_arg(OsStr::new(r#"trail\"#)), "\"trail\\\\\"");
+        assert_eq!(quote_arg(OsStr::new(r#"a\"b"#)), r#""a\\\"b""#);
+        assert_eq!(quote_arg(OsStr::new(r"trail\")), r#""trail\\""#);
     }
 
     #[test]

@@ -414,7 +414,7 @@ MANUAL_VERSION="$(kubectl -n updated-system exec manual-offline -c agent -- \
   echo "FAIL: pre-enrolled manual agent launched version '$MANUAL_VERSION', expected 1.0.0" >&2
   exit 1
 }
-kubectl_log_contains manual-offline 'started application pid' -c agent
+kubectl_log_contains manual-offline 'started managed application pid' -c agent
 echo "manual CRD export enrolled, cold-installed, and launched 1.0.0"
 
 # A malformed enrollment artifact is terminal: it must never fall back to the URL/key or launch
@@ -633,6 +633,160 @@ for ordinal in 0 1 2 3 4; do
   }
 done
 echo "all five empty agents enrolled online and cold-installed the network assignment"
+
+# Exercise certificate renewal through the live gateway without restarting the pod, container, or
+# application. Replace agent-4's leaf with a fleet-CA-signed one-day leaf for the SAME durable key,
+# terminate only the supervisor, and let the guardian adopt the still-running application. The new
+# supervisor sees the short lifetime immediately, calls /renew with that current identity, installs
+# the replacement atomically, and exits once so the guardian rebuilds every authenticated client.
+ROTATION_AGENT=agent-4
+ROTATION_RESOURCE="$(agent_resource_name 4)"
+ROTATION_STATE=/var/lib/updated/guardian
+ROTATION_DIR="$WORK/certificate-rotation"
+mkdir -p "$ROTATION_DIR"
+kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+  cat "$ROTATION_STATE/agent.key" >"$ROTATION_DIR/agent.key"
+kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+  cat "$ROTATION_STATE/agent.crt" >"$ROTATION_DIR/original.crt"
+kubectl -n updated-system get secret fleet-ca -o jsonpath='{.data.tls\.crt}' \
+  | openssl base64 -d -A >"$ROTATION_DIR/ca.crt"
+kubectl -n updated-system get secret fleet-ca -o jsonpath='{.data.tls\.key}' \
+  | openssl base64 -d -A >"$ROTATION_DIR/ca.key"
+openssl req -new -key "$ROTATION_DIR/agent.key" \
+  -subj "/CN=$ROTATION_RESOURCE" -out "$ROTATION_DIR/agent.csr"
+cat >"$ROTATION_DIR/extensions.cnf" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=clientAuth
+subjectAltName=URI:spiffe://updated.fleet/scope/default/node/$ROTATION_RESOURCE
+EOF
+openssl x509 -req -in "$ROTATION_DIR/agent.csr" \
+  -CA "$ROTATION_DIR/ca.crt" -CAkey "$ROTATION_DIR/ca.key" -CAcreateserial \
+  -days 1 -extfile "$ROTATION_DIR/extensions.cnf" -out "$ROTATION_DIR/short.crt"
+
+pod_uid_before="$(kubectl -n updated-system get pod "$ROTATION_AGENT" -o jsonpath='{.metadata.uid}')"
+restart_before="$(kubectl -n updated-system get pod "$ROTATION_AGENT" \
+  -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+key_before="$(shasum -a 256 "$ROTATION_DIR/agent.key" | awk '{print $1}')"
+original_cert="$(shasum -a 256 "$ROTATION_DIR/original.crt" | awk '{print $1}')"
+short_cert="$(shasum -a 256 "$ROTATION_DIR/short.crt" | awk '{print $1}')"
+[[ "$short_cert" != "$original_cert" ]]
+process_pid() {
+  local process="$1"
+  kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- sh -ec '
+    for path in /proc/[0-9]*; do
+      [ "$(cat "$path/comm" 2>/dev/null || true)" = "$1" ] || continue
+      echo "${path##*/}"
+      exit 0
+    done
+    exit 1
+  ' sh "$process"
+}
+supervisor_before="$(process_pid supervisor)"
+application_before="$(process_pid app)"
+
+cat <<'YAML' | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata: {name: observe-certificate-rotation, namespace: updated-system}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 90
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: observe
+          image: updatec-e2e:kind
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              failures=0
+              for attempt in $(seq 1 45); do
+                version=$(curl -fsS --max-time 1 http://agent-4.agents:8080/version || true)
+                [ "$version" = 1.0.0 ] || failures=$((failures + 1))
+                sleep 1
+              done
+              [ "$failures" -eq 0 ] || {
+                echo "application was unavailable for $failures observation(s)" >&2
+                exit 1
+              }
+              echo "application stayed available throughout certificate renewal"
+YAML
+kubectl -n updated-system wait --for=condition=ready \
+  pod -l job-name=observe-certificate-rotation --timeout=30s
+
+# Install the near-expiry leaf completely before signalling the supervisor. Existing clients keep
+# using their in-memory identity until the guardian relaunches the supervisor.
+kubectl -n updated-system exec -i "$ROTATION_AGENT" -c agent -- \
+  sh -c "cat >'$ROTATION_STATE/agent.crt'" <"$ROTATION_DIR/short.crt"
+kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+  kill -TERM "$supervisor_before"
+
+renewed=false
+for attempt in $(seq 1 90); do
+  kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+    cat "$ROTATION_STATE/agent.crt" >"$ROTATION_DIR/renewed.crt"
+  renewed_cert="$(shasum -a 256 "$ROTATION_DIR/renewed.crt" | awk '{print $1}')"
+  supervisor_after="$(process_pid supervisor 2>/dev/null || true)"
+  if [[ "$renewed_cert" != "$short_cert" && -n "$supervisor_after" \
+      && "$supervisor_after" != "$supervisor_before" ]]; then
+    renewed=true
+    break
+  fi
+  sleep 1
+done
+[[ "$renewed" == true ]] || {
+  echo "FAIL: agent-4 did not renew its short-lived certificate and relaunch its supervisor" >&2
+  kubectl -n updated-system logs "$ROTATION_AGENT" -c agent --tail=200 >&2 || true
+  exit 1
+}
+
+pod_uid_after="$(kubectl -n updated-system get pod "$ROTATION_AGENT" -o jsonpath='{.metadata.uid}')"
+restart_after="$(kubectl -n updated-system get pod "$ROTATION_AGENT" \
+  -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+application_after="$(process_pid app)"
+kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+  cat "$ROTATION_STATE/agent.key" >"$ROTATION_DIR/renewed.key"
+key_after="$(shasum -a 256 "$ROTATION_DIR/renewed.key" | awk '{print $1}')"
+[[ "$pod_uid_after" == "$pod_uid_before" ]]
+[[ "$restart_after" == "$restart_before" ]]
+[[ "$application_after" == "$application_before" ]]
+[[ "$key_after" == "$key_before" ]]
+openssl x509 -in "$ROTATION_DIR/renewed.crt" -noout -checkend $((60 * 24 * 60 * 60))
+renewed_subject="$(openssl x509 -in "$ROTATION_DIR/renewed.crt" \
+  -noout -subject -nameopt RFC2253)"
+[[ "$renewed_subject" == "subject=CN=$ROTATION_RESOURCE" ]]
+kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+  curl -fsS --cert "$ROTATION_STATE/agent.crt" --key "$ROTATION_STATE/agent.key" \
+    --cacert /etc/agent-tls/ca.crt https://updatec-gateway/metadata/timestamp.json \
+    >/dev/null
+kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+  curl -fsS --cert "$ROTATION_STATE/agent.crt" --key "$ROTATION_STATE/agent.key" \
+    --cacert /etc/agent-tls/ca.crt https://updatec-gateway/v1/node/secrets \
+    >/dev/null
+# The shared fleet bootstrap certificate authenticates the one /enroll handshake and NOTHING else.
+# It is signed by the same fleet CA, so it completes the mTLS handshake — but it carries no SPIFFE
+# node SAN, so every steady-state route must refuse it. Otherwise any holder of the fleet-wide
+# enrollment Secret could read a node's assigned secrets. Repository content stays readable (it is
+# not node-scoped), which the timestamp.json fetch above already proves for the same certificate.
+if kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+  curl -fsS --cert /etc/agent-tls/tls.crt --key /etc/agent-tls/tls.key \
+    --cacert /etc/agent-tls/ca.crt https://updatec-gateway/v1/node/secrets \
+    >/dev/null 2>&1; then
+  echo "FAIL: the shared bootstrap certificate was served node secrets" >&2
+  exit 1
+fi
+echo "the shared bootstrap certificate is refused on steady-state node routes"
+kubectl -n updated-system wait --for=condition=complete \
+  job/observe-certificate-rotation --timeout=90s
+kubectl -n updated-system logs job/observe-certificate-rotation
+kubectl_log_contains deployment/updatec-gateway \
+  "renewed node certificate" || {
+  echo "FAIL: gateway did not record the authenticated certificate renewal" >&2
+  exit 1
+}
+echo "agent-4 renewed its certificate with no pod/container/app restart and retained mTLS access"
 
 for ordinal in 0 1; do
   kubectl -n updated-system patch updateagent "$(agent_resource_name "$ordinal")" --type merge \

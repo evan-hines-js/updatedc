@@ -629,8 +629,15 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
             .await
             .is_ok();
 
-    // Let the probe run a moment past convergence, then stop and score it.
+    // Let the probe run past convergence and collect a window large enough to measure the stated
+    // SLA. At 99.5%, fewer than 200 observations cannot tolerate even one transient failure, which
+    // turns an otherwise identical upgrade into a pass or failure based only on how quickly it
+    // converged. Keep the wall-clock bound so a wedged probe still fails promptly below.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    let sample_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while total.load(Ordering::Relaxed) < 200 && tokio::time::Instant::now() < sample_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     stop.store(true, Ordering::Relaxed);
     let _ = probe.await;
     converged?;
@@ -651,7 +658,7 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
     // HAProxies one at a time) drops no connection, so availability stays pinned here; a botched
     // upgrade that dropped the front would tank it far below. A tiny tolerance absorbs port-forward
     // reconnect blips (the probe crosses the host↔cluster boundary), not a real outage.
-    if total < 20 {
+    if total < 200 {
         return Err(format!(
             "HAProxy load probe recorded too few samples ({total}) to judge availability"
         )

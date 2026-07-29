@@ -3,6 +3,11 @@
 //! confined here first, so the "can this escape the directory it lands in?" question has a single
 //! answer the whole system shares instead of each call site hand-rolling (and drifting on) its own
 //! component check.
+//!
+//! It lives in the contracts crate because protocol grammars (the enrollment assignment path, a
+//! signed target reference, a telemetry node identity) must apply exactly the same rule as the
+//! node-side code that later joins those values onto a real directory. `std::path` is used purely as a parser
+//! here; nothing in this module touches the filesystem.
 
 use std::path::{Component, Path};
 

@@ -10,7 +10,8 @@ use rcgen::{CertificateParams, DnType, KeyPair};
 /// Generate a fresh keypair and return its PKCS#8 PEM. The private key never leaves the node; it is
 /// generated once, persisted, and reused for both the mTLS leaf and telemetry signing.
 pub fn generate_key() -> io::Result<String> {
-    let key = KeyPair::generate().map_err(|error| other(format!("generating keypair: {error}")))?;
+    let key = KeyPair::generate()
+        .map_err(|error| io::Error::other(format!("generating keypair: {error}")))?;
     Ok(key.serialize_pem())
 }
 
@@ -19,29 +20,25 @@ pub fn generate_key() -> io::Result<String> {
 /// label. Reusing a durable key (rather than a fresh one per attempt) keeps the certificate the
 /// control plane pins and the key the node signs telemetry with identical across enrollment retries.
 pub fn csr_for(key_pem: &str, subject_cn: &str) -> io::Result<String> {
-    let key =
-        KeyPair::from_pem(key_pem).map_err(|error| other(format!("loading keypair: {error}")))?;
-    let mut params =
-        CertificateParams::new(Vec::<String>::new()).map_err(|error| other(error.to_string()))?;
+    let key = KeyPair::from_pem(key_pem)
+        .map_err(|error| io::Error::other(format!("loading keypair: {error}")))?;
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|error| io::Error::other(error.to_string()))?;
     params
         .distinguished_name
         .push(DnType::CommonName, subject_cn);
     let csr = params
         .serialize_request(&key)
-        .map_err(|error| other(format!("serializing CSR: {error}")))?;
+        .map_err(|error| io::Error::other(format!("serializing CSR: {error}")))?;
     csr.pem()
-        .map_err(|error| other(format!("encoding CSR: {error}")))
+        .map_err(|error| io::Error::other(format!("encoding CSR: {error}")))
 }
 
 /// The PKCS#8 DER form of a PEM key, for aws-lc-rs signing (`telemetry::sign_report`).
 pub fn key_pem_to_pkcs8_der(key_pem: &str) -> io::Result<Vec<u8>> {
-    let key =
-        KeyPair::from_pem(key_pem).map_err(|error| other(format!("loading keypair: {error}")))?;
+    let key = KeyPair::from_pem(key_pem)
+        .map_err(|error| io::Error::other(format!("loading keypair: {error}")))?;
     Ok(key.serialize_der())
-}
-
-fn other(message: String) -> io::Error {
-    io::Error::other(message)
 }
 
 #[cfg(test)]

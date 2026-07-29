@@ -7,7 +7,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::hash::{is_sha256_hex, sha256_bytes, sha256_file};
+use crate::hash::{sha256_bytes, sha256_file};
+use updated_contracts::is_sha256_hex;
 
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 pub(crate) const MANIFEST_SCHEMA: u32 = 1;
@@ -379,6 +380,7 @@ fn extract(
     let mut tar = tar::Archive::new(decoder);
     let mut manifest_bytes = None;
     let mut extracted = BTreeMap::<String, (u64, String)>::new();
+    let mut entries_seen = 0usize;
     let mut expanded = 0u64;
     for entry in tar.entries()? {
         let mut entry = entry?;
@@ -387,7 +389,10 @@ fn extract(
         }
         let path = entry.path()?.to_string_lossy().into_owned();
         validate_relative(&path, limits.path_bytes)?;
-        if extracted.len() >= limits.files {
+        // Count entries seen, not entries recorded in `extracted` (which excludes the manifest), so
+        // the limit bounds the archive's real entry count rather than that count plus one.
+        entries_seen += 1;
+        if entries_seen > limits.files {
             return Err(invalid("bundle exceeds file-count limit"));
         }
         let size = entry.size();
@@ -610,7 +615,7 @@ fn validate_relative(path: &str, max: usize) -> io::Result<()> {
     if path.len() > max {
         return Err(invalid("invalid bundle path"));
     }
-    if !crate::path::is_confined_relative(path) {
+    if !updated_contracts::path::is_confined_relative(path) {
         return Err(invalid("bundle path is not a confined relative path"));
     }
     Ok(())

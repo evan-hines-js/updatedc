@@ -322,7 +322,16 @@ fn build_store(backend: &Backend) -> Result<(S3Destination, Arc<dyn ObjectStore>
     };
     let access = std::env::var("AWS_ACCESS_KEY_ID").ok();
     let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-    let store = updatec::runtime::s3_store(&destination, access.as_deref(), secret.as_deref())?;
+    // Temporary credentials (STS AssumeRole, SSO, IRSA) are only valid with their session token.
+    let token = std::env::var("AWS_SESSION_TOKEN").ok();
+    let store = updatec::runtime::s3_store(
+        &destination,
+        updatec::runtime::S3Credentials {
+            access_key: access.as_deref(),
+            secret_key: secret.as_deref(),
+            session_token: token.as_deref(),
+        },
+    )?;
     Ok((destination, store))
 }
 
@@ -331,7 +340,8 @@ async fn trust_root(args: TrustRootArgs) -> Result<(), Error> {
     let (destination, store) = build_store(backend)?;
 
     // Refuse to silently invalidate an already-published repository.
-    if !args.force && repo_initialized(store.as_ref(), &destination).await? {
+    let initialized = repo_initialized(store.as_ref(), &destination).await?;
+    if !args.force && initialized {
         return Err(format!(
             "release repository at s3://{}/{} is already initialized; pass --force to replace \
              it (this invalidates everything signed under the old root)",
@@ -339,13 +349,27 @@ async fn trust_root(args: TrustRootArgs) -> Result<(), Error> {
         )
         .into());
     }
+    // A replacement must start ABOVE the versions the live repository has already published.
+    // TUF clients remember the highest version they accepted and refuse anything lower, so a
+    // replacement republished at version 1 is silently rejected by every node that ever saw the
+    // old repository — no error at the publisher, and every agent stalled indefinitely.
+    let start_version = if initialized {
+        let next = live_metadata_version(store.as_ref(), &destination).await? + 1;
+        eprintln!(
+            "replacing a live repository: starting its metadata at version {next} so clients \
+             past the old versions still accept it (nodes must still be re-pinned to the new root)"
+        );
+        next
+    } else {
+        1
+    };
 
     // Mint the role keys into the target directory (the operator loads these into Vault),
     // then build an empty signed repository in a throwaway temp dir.
     let keys = repo::generate_keys(&backend.keys_dir).await?;
     eprintln!("wrote role keys to {}", backend.keys_dir.display());
     let repo_dir = tempfile::tempdir()?;
-    repo::init(repo_dir.path(), &keys, args.expiry_days).await?;
+    repo::init_from_version(repo_dir.path(), &keys, args.expiry_days, start_version).await?;
     let root_json = tokio::fs::read(repo_dir.path().join("metadata/root.json")).await?;
 
     updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
@@ -407,8 +431,7 @@ async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
         args.expiry_days,
     )
     .await?;
-    let root_json =
-        tokio::fs::read(repo_dir.path().join("metadata").join("root.json")).await?;
+    let root_json = tokio::fs::read(repo_dir.path().join("metadata").join("root.json")).await?;
     updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
 
     eprintln!(
@@ -501,6 +524,16 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
     // Bind the provider set into this app version's signed metadata (clap guarantees both flags
     // are present together), so a later ordered-fallback descent rolls providers back with it.
     if let (Some(path), Some(sha256)) = (&args.provider_set_path, &args.provider_set_sha256) {
+        // Validate the digest here, at publish time. It is signed into the app target's metadata
+        // and only read much later, by an ordered-fallback descent on a node — where a typo'd or
+        // truncated digest surfaces as "provider set unresolvable" during a recovery, the worst
+        // moment to discover a publishing mistake.
+        if !updated_contracts::is_sha256_hex(sha256) {
+            return Err(format!(
+                "--provider-set-sha256 {sha256:?} is not a 64-character hex SHA-256"
+            )
+            .into());
+        }
         target = target.with_provider_set(path, sha256);
     }
     let target_name = target.name.clone();
@@ -629,7 +662,7 @@ async fn publish_provider_set(args: ProviderSetArgs) -> Result<(), Error> {
         &args.provider_arg,
         args.provider_timeout_ms,
     )?;
-    let set = updated::config::ProviderSet {
+    let set = updated_contracts::artifact::ProviderSet {
         schema: 1,
         id: args.id.clone(),
         reconciler,
@@ -660,12 +693,12 @@ fn reconciler(
     sha256: &str,
     args: &[String],
     timeout_millis: u64,
-) -> Result<updated::config::Reconciler, Error> {
-    if !updated::hash::is_sha256_hex(sha256) {
+) -> Result<updated_contracts::artifact::Reconciler, Error> {
+    if !updated_contracts::is_sha256_hex(sha256) {
         return Err(format!("provider sha256 {sha256:?} must be 64 hexadecimal characters").into());
     }
-    Ok(updated::config::Reconciler {
-        artifact: updated::config::TargetReference {
+    Ok(updated_contracts::artifact::Reconciler {
+        artifact: updated_contracts::artifact::TargetReference {
             path: path.to_owned(),
             sha256: sha256.to_ascii_lowercase(),
         },
@@ -740,6 +773,35 @@ fn open_keys(dir: &Path) -> Result<repo::Keys, Error> {
 
 /// Whether the release repository has already been initialized (its `metadata/root.json`
 /// exists in S3).
+/// The highest metadata version the live repository has published, across root, timestamp,
+/// snapshot, and targets. Missing or unreadable documents count as zero: the point is a floor to
+/// start above, and every document that IS present raises it.
+async fn live_metadata_version(
+    store: &dyn ObjectStore,
+    destination: &S3Destination,
+) -> Result<u64, Error> {
+    let mut highest = 0;
+    for name in [
+        "root.json",
+        "timestamp.json",
+        "snapshot.json",
+        "targets.json",
+    ] {
+        let key = ObjectPath::from(object_key(&destination.prefix, &format!("metadata/{name}")));
+        let bytes = match store.get(&key).await {
+            Ok(result) => result.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|document| document.pointer("/signed/version")?.as_u64())
+            .unwrap_or(0);
+        highest = highest.max(version);
+    }
+    Ok(highest)
+}
+
 async fn repo_initialized(
     store: &dyn ObjectStore,
     destination: &S3Destination,
@@ -839,12 +901,16 @@ mod tests {
 
     #[test]
     fn object_key_normalizes_prefix_and_drops_empties() {
-        assert_eq!(object_key("", "metadata"), "metadata");
+        // Only prefixes `s3_store` actually accepts: it requires an already-normalized, non-empty,
+        // confined prefix, so a `/p/` case here proved nothing about any reachable input — the
+        // store rejects that shape long before a key is ever joined.
+        assert_eq!(object_key("routing", "metadata"), "routing/metadata");
         assert_eq!(
-            object_key("/p/", "metadata/root.json"),
-            "p/metadata/root.json"
+            object_key("a/b", "metadata/root.json"),
+            "a/b/metadata/root.json"
         );
-        assert_eq!(object_key("a/b", "metadata"), "a/b/metadata");
+        // An empty sub-path must not leave a trailing slash.
+        assert_eq!(object_key("a/b", ""), "a/b");
     }
 
     #[tokio::test]

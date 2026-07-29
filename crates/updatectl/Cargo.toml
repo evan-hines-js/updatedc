@@ -22,6 +22,7 @@ tokio.workspace = true
 # Reused so CI publication uses the exact same bundle format, TUF authoring, S3
 # object layout, and CRD types as the operator — one code path, no drift.
 updated = { path = "../updated" }
+updated-contracts = { path = "../updated-contracts" }
 updated-tuf = { path = "../updated-tuf" }
 updatec = { path = "../updatec" }
 

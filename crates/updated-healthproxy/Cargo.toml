@@ -16,6 +16,7 @@ path = "src/main.rs"
 # The one telemetry contract every part of the system already speaks; membership readiness
 # is derived from the exact `NodeReport` a managed node publishes to the CDN.
 updated = { path = "../updated" }
+updated-contracts = { path = "../updated-contracts" }
 tokio = { workspace = true }
 # Poll every node's health concurrently so one slow fetch cannot serialize the reconcile.
 futures = { workspace = true }

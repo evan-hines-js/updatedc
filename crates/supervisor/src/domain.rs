@@ -68,7 +68,6 @@ pub(crate) struct Plan {
     /// Refuse to run (invalid/missing state, drift with no rollback image). When set,
     /// no other field is acted on.
     pub fail_closed: Option<String>,
-    pub updates_enabled: bool,
     pub current: Option<String>,
     /// Stop the running application before changing its active release.
     pub quiesce: bool,

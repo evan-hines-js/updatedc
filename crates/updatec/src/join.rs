@@ -19,29 +19,25 @@ use rcgen::{
 /// minted leaf so a verified client cert names both the group it joined and its unique node.
 const TRUST_DOMAIN: &str = "updated.fleet";
 
-/// Default validity of a minted leaf certificate. Bounded so a leaked leaf is time-limited rather
-/// than permanent. Kept a single clear default here rather than a per-group spec field until
-/// renewal-over-mTLS (`/renew`) lands to make a shorter TTL sustainable.
+/// Default validity of a minted leaf certificate. Bounded so a leaked leaf is time-limited;
+/// supervisors renew through the authenticated `/renew` endpoint during the final 30 days.
 const LEAF_CERT_TTL_DAYS: i64 = 90;
 
-/// The node's public key (uncompressed EC point) extracted from its PEM CSR — the value the control
-/// plane pins on the `UpdateAgent` so it can later verify the node's *signed* telemetry against the
-/// same key that certifies its mTLS leaf. Only the public half; possession of the private key is
-/// proven by the CSR self-signature the CA checks at signing time. This is the exact bytes
-/// `aws-lc-rs` `ECDSA_P256_SHA256` verification (in `updated::telemetry::verify_report`) expects.
+/// The node's public key (uncompressed EC point) from its PEM CSR — the value the control plane
+/// pins on the `UpdateAgent` so it can later verify the node's *signed* telemetry against the same
+/// key that certifies its mTLS leaf. This is the exact bytes `aws-lc-rs` `ECDSA_P256_SHA256`
+/// verification (in `updated_contracts::telemetry::report_is_authentic_and_fresh`) expects.
+///
+/// Extraction goes through the SAME parse the CA signs with, which verifies the CSR self-signature,
+/// the signature algorithm, and the extension set. Proof-of-possession therefore holds at the
+/// moment the key is read, not merely later at signing time: a caller that pins first and signs
+/// afterwards would otherwise durably pin an attacker-chosen key onto a node name from a CSR whose
+/// self-signature is garbage — the enrollment fails, but the pin (and the object) survives.
 pub fn csr_public_key(csr_pem: &str) -> io::Result<Vec<u8>> {
-    use x509_parser::prelude::FromDer;
-    let (_, pem) = x509_parser::pem::parse_x509_pem(csr_pem.as_bytes())
-        .map_err(|error| other(format!("parsing CSR PEM: {error}")))?;
-    let (_, csr) =
-        x509_parser::certification_request::X509CertificationRequest::from_der(&pem.contents)
-            .map_err(|error| other(format!("parsing CSR: {error}")))?;
-    Ok(csr
-        .certification_request_info
-        .subject_pki
-        .subject_public_key
-        .data
-        .to_vec())
+    use rcgen::PublicKeyData;
+    let csr = CertificateSigningRequestParams::from_pem(csr_pem)
+        .map_err(|error| io::Error::other(format!("parsing CSR: {error}")))?;
+    Ok(csr.public_key.der_bytes().to_vec())
 }
 
 /// The fleet CA that signs per-node client certificates at `/enroll`. Loaded from the same
@@ -56,12 +52,13 @@ impl IssuingCa {
     /// Load the CA from its PEM certificate and private key (the mounted `tls.crt` / `tls.key`).
     pub fn load(cert_pem: &str, key_pem: &str) -> io::Result<Self> {
         let key = KeyPair::from_pem(key_pem)
-            .map_err(|error| other(format!("loading issuing CA key: {error}")))?;
-        let params = CertificateParams::from_ca_cert_pem(cert_pem)
-            .map_err(|error| other(format!("loading issuing CA certificate: {error}")))?;
+            .map_err(|error| io::Error::other(format!("loading issuing CA key: {error}")))?;
+        let params = CertificateParams::from_ca_cert_pem(cert_pem).map_err(|error| {
+            io::Error::other(format!("loading issuing CA certificate: {error}"))
+        })?;
         let cert = params
             .self_signed(&key)
-            .map_err(|error| other(format!("reconstructing issuing CA: {error}")))?;
+            .map_err(|error| io::Error::other(format!("reconstructing issuing CA: {error}")))?;
         Ok(Self { cert, key })
     }
 
@@ -73,7 +70,7 @@ impl IssuingCa {
         // `from_pem` parses and verifies the CSR self-signature (proof the requester holds the
         // private key for the public key it presents).
         let mut csr = CertificateSigningRequestParams::from_pem(csr_pem)
-            .map_err(|error| other(format!("parsing enrollment CSR: {error}")))?;
+            .map_err(|error| io::Error::other(format!("parsing enrollment CSR: {error}")))?;
         // Overwrite everything identity-bearing; keep only `csr.public_key` (used by `signed_by`).
         csr.params.is_ca = IsCa::NoCa;
         csr.params.distinguished_name = rcgen::DistinguishedName::new();
@@ -81,15 +78,14 @@ impl IssuingCa {
         let uri = format!("spiffe://{TRUST_DOMAIN}/scope/{scope}/node/{name}");
         csr.params.subject_alt_names =
             vec![SanType::URI(uri.clone().try_into().map_err(|error| {
-                other(format!("encoding node URI SAN {uri}: {error}"))
+                io::Error::other(format!("encoding node URI SAN {uri}: {error}"))
             })?)];
         csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         // Bound the leaf's validity so a leaked leaf is not effectively permanent fleet-client-cert
         // access: it expires within LEAF_CERT_TTL_DAYS and access ends unless renewed. `not_before`
         // is backdated to the issuing day's midnight UTC to tolerate modest node clock skew. This
-        // TTL is the single clear default; renewal-over-mTLS (a `/renew` endpoint that re-signs with
-        // the current cert) is the intended follow-up that makes a short TTL sustainable.
+        // TTL is the single clear default; renewal re-signs the same pinned durable key.
         let issued = chrono::Utc::now().date_naive();
         let expires = issued + chrono::Duration::days(LEAF_CERT_TTL_DAYS);
         csr.params.not_before =
@@ -98,18 +94,18 @@ impl IssuingCa {
             rcgen::date_time_ymd(expires.year(), expires.month() as u8, expires.day() as u8);
         let leaf = csr
             .signed_by(&self.cert, &self.key)
-            .map_err(|error| other(format!("signing join CSR: {error}")))?;
+            .map_err(|error| io::Error::other(format!("signing join CSR: {error}")))?;
         Ok(leaf.pem())
     }
-}
-
-fn other(message: String) -> io::Error {
-    io::Error::other(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A well-formed running digest for report fixtures. Nothing in this module reads it; a report
+    /// simply needs one to be well formed.
+    const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     use rcgen::PublicKeyData;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, UnixTime};
@@ -124,22 +120,50 @@ mod tests {
         let pinned = csr_public_key(&csr_pem).unwrap();
 
         let pkcs8_der = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
-        let mut report = updated::telemetry::NodeReport::new("agent-9", "deploy-2", "2.0.0", true);
-        report.signature = updated::telemetry::sign_report(&report, &pkcs8_der).unwrap();
+        let report = updated_contracts::telemetry::NodeReport::new(
+            "agent-9", "deploy-2", DIGEST, "2.0.0", DIGEST, true,
+        );
+        let envelope = updated_contracts::telemetry::sign_report(&report, &pkcs8_der).unwrap();
+        let now_ms = updated_contracts::telemetry::now_ms();
+
+        // The whole point of pinning the CSR's key at enrollment: it is the key that later verifies
+        // this node's own signed telemetry, end to end.
         assert!(
-            updated::telemetry::verify_report(&report, &pinned),
+            updated_contracts::telemetry::report_is_authentic_and_fresh(
+                &envelope, "agent-9", &pinned, now_ms
+            )
+            .is_some(),
             "pinned CSR key must verify the node's own signed report"
         );
 
-        let mut tampered = report.clone();
-        tampered.healthy = false;
-        assert!(!updated::telemetry::verify_report(&tampered, &pinned));
+        // Tampering with the signed payload after the fact breaks it.
+        let mut tampered = envelope.clone();
+        let mut inner: updated_contracts::telemetry::NodeReport = serde_json::from_slice(
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &envelope.payload,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        inner.healthy = false;
+        tampered.payload = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&inner).unwrap(),
+        );
+        assert!(updated_contracts::telemetry::report_is_authentic_and_fresh(
+            &tampered, "agent-9", &pinned, now_ms
+        )
+        .is_none());
 
         let other_key = updated::csr::generate_key().unwrap();
         let other_csr = updated::csr::csr_for(&other_key, "x").unwrap();
         let other_pin = csr_public_key(&other_csr).unwrap();
         assert!(
-            !updated::telemetry::verify_report(&report, &other_pin),
+            updated_contracts::telemetry::report_is_authentic_and_fresh(
+                &envelope, "agent-9", &other_pin, now_ms
+            )
+            .is_none(),
             "a different node's pinned key must not verify this report"
         );
     }

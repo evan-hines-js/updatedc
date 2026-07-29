@@ -14,6 +14,16 @@ pub(crate) fn jitter(duration: Duration, percent: u32) -> Duration {
     jitter_with(duration, percent, entropy)
 }
 
+/// Stable fleet spreading for work whose cadence should survive process restarts. The node identity
+/// chooses one offset inside the jitter window, so peers do not stampede while one node does not
+/// randomly move its schedule on every refresh.
+pub(crate) fn jitter_for_key(duration: Duration, percent: u32, key: &str) -> Duration {
+    let entropy = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    jitter_with(duration, percent, entropy)
+}
+
 /// The pure jitter computation, taking its entropy explicitly so the arithmetic is
 /// deterministically testable (`jitter` supplies wall-clock nanoseconds XOR the PID).
 fn jitter_with(duration: Duration, percent: u32, entropy: u64) -> Duration {
@@ -97,6 +107,19 @@ mod tests {
         assert_eq!(
             jitter_with(Duration::from_millis(500), 0, 12345),
             Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn keyed_jitter_is_stable_for_a_node() {
+        let interval = Duration::from_secs(300);
+        assert_eq!(
+            jitter_for_key(interval, 10, "node-a"),
+            jitter_for_key(interval, 10, "node-a")
+        );
+        assert_ne!(
+            jitter_for_key(interval, 10, "node-a"),
+            jitter_for_key(interval, 10, "node-b")
         );
     }
 }

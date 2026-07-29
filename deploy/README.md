@@ -78,9 +78,9 @@ that activation.
 
 | Path | Contents |
 | --- | --- |
-| `/usr/lib/selfupdate/bootstrap` (Linux), `/etc/selfupdate/bootstrap` (macOS) | Installer-owned `bootstrap` — the root we ship; never self-updates, read-only |
-| `/etc/selfupdate/bootstrap.toml` | Read-only enrollment URL and shared key |
-| `/var/lib/selfupdate/` (Linux), `/usr/local/var/selfupdate/` (macOS) | Writable guardian state, the consumed signed enrollment bundle, supervisor candidates, application state, and TUF caches |
+| `/usr/lib/updated/bootstrap` (Linux), `/etc/updated/bootstrap` (macOS) | Installer-owned `bootstrap` — the root we ship; never self-updates, read-only |
+| `/etc/updated/bootstrap.toml` (Windows: `C:\Program Files\updated\bootstrap.toml`) | Read-only enrollment URL and shared key. The **canonical** config location — `control::DEFAULT_BOOTSTRAP_CONFIG`, which the bootstrap reads with no argument. Not a per-deployment choice: a co-resident process that must learn which fleet node it runs on looks exactly here. |
+| `/var/lib/updated/` (Linux), `/usr/local/var/updated/` (macOS) | Writable guardian state, the consumed signed enrollment bundle, supervisor candidates, application state, and TUF caches |
 
 Because supervisor candidates and immutable application bundles are updated, they live
 in writable state directories. The two things that must never be forged — the
@@ -106,14 +106,16 @@ application launches.
 ## Linux (systemd)
 
 ```sh
-install -m0644 systemd/selfupdate-supervisor.service /etc/systemd/system/
+install -m0644 systemd/updated-supervisor.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now selfupdate-supervisor
-journalctl -u selfupdate-supervisor -f      # watch bootstrap + supervisor + app
+systemctl enable --now updated-supervisor
+journalctl -u updated-supervisor -f      # watch bootstrap + supervisor + app
 ```
 
-Install `bootstrap.toml` read-only:
-`install -m0644 bootstrap.toml /etc/selfupdate/bootstrap.toml`.
+Install `bootstrap.toml` read-only at the canonical path:
+`install -m0644 bootstrap.toml /etc/updated/bootstrap.toml`. No template passes
+`--supervisor-config` — the bootstrap defaults to that path. Pass the flag only for a
+deployment that deliberately keeps the config elsewhere.
 
 The templates enable the guardian probe listener on loopback port 9090. `/readyz`
 withdraws before a planned stop while `/livez` remains successful; an application crash
@@ -128,8 +130,8 @@ bootstrap activates it under the readiness gate.
 ## macOS (launchd)
 
 ```sh
-sudo cp launchd/com.example.selfupdate-supervisor.plist /Library/LaunchDaemons/
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.selfupdate-supervisor.plist
+sudo cp launchd/com.example.updated-supervisor.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.updated-supervisor.plist
 ```
 
 ## Windows (Service Control Manager)
@@ -149,12 +151,12 @@ the Windows equivalents of systemd `Restart=always` plus a restricted `User=`:
 
 Build `selfupdate-service.exe` for Windows and install it alongside the bootstrap.
 The full native SCM registration and ACL configuration is
-[`windows/install-selfupdate-supervisor.bat`](windows/install-selfupdate-supervisor.bat);
+[`windows/install-updated-supervisor.bat`](windows/install-updated-supervisor.bat);
 edit the paths at its top, then run it from an elevated prompt:
 
 ```bat
 :: from an Administrator command prompt
-windows\install-selfupdate-supervisor.bat
+windows\install-updated-supervisor.bat
 ```
 
 The template runs under the restricted `NT SERVICE\SelfUpdateSupervisor` virtual
@@ -168,12 +170,12 @@ separate OS identity or sandbox and a platform-specific launch/control bridge, w
 this reference supervisor deliberately leaves out.
 
 The bootstrap binary itself is installer-owned and read-only (place it under
-`C:\Program Files\selfupdate`). Because supervisor candidates and immutable application
+`C:\Program Files\updated`). Because supervisor candidates and immutable application
 bundles update in writable storage, place the bootstrap state directory
-(`C:\ProgramData\selfupdate`) where the service account can write and grant it write access to only that
+(`C:\ProgramData\updated`) where the service account can write and grant it write access to only that
 (`icacls ... /grant "NT SERVICE\SelfUpdateSupervisor:(OI)(CI)M"`). Keep the pinned
 TUF root administrator-owned and read-only. This mirrors the systemd
-`User=selfupdate` + `ReadWritePaths=` and launchd `UserName=_selfupdate` templates.
+`User=updated` + `ReadWritePaths=` and launchd `UserName=_updated` templates.
 
 The initial supervisor path is passed directly; its own version is baked into that
 executable at build time. The installer must seed the exact initial bundle identity and

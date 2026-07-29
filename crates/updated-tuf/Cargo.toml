@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 updated = { path = "../updated" }
+updated-contracts = { path = "../updated-contracts" }
 foundation = { path = "../foundation" }
 tough = { workspace = true }
 tokio = { workspace = true }

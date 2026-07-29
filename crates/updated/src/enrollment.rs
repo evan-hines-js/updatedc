@@ -3,7 +3,17 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use rustls::pki_types::pem::PemObject;
+use serde::Deserialize;
+
+#[cfg(test)]
+use updated_contracts::enrollment::InitialSignedConfiguration;
+use updated_contracts::enrollment::{
+    EnrollResponse, EnrollmentBundle, EnrollmentRequest, RenewalRequest, RenewalResponse,
+    ENROLL_PATH, RENEW_PATH,
+};
+
+const ENROLLMENT_RESPONSE_LIMIT: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +50,7 @@ pub struct EnrollmentBootstrap {
 
 impl EnrollmentBootstrap {
     /// Reject an empty `name` (the one free-form field). `serde(deny_unknown_fields)` already rejects
-    /// a leftover mount/join/token field and a missing cert path, so a stale config fails loudly
+    /// removed enrollment fields and a missing cert path, so a stale config fails loudly
     /// rather than silently enrolling wrong.
     pub fn validate(&self) -> io::Result<()> {
         if self.name.trim().is_empty() {
@@ -132,113 +142,6 @@ fn bootstrap_path_from(
     }
 }
 
-/// The one enrollment endpoint: a node `POST`s an [`EnrollmentRequest`] here over mutual TLS
-/// (the shared fleet enrollment cert), and the control plane signs its CSR and returns an
-/// [`EnrollResponse`]. Nothing node-identifying rides in the URL.
-pub const ENROLL_PATH: &str = "/enroll";
-
-/// The enrollment request body. The request is authenticated by the mutual-TLS handshake with the
-/// shared fleet enrollment certificate; `name` is a non-secret, self-asserted node name carried in
-/// the body (never the URL). Any holder of the fleet cert may assert any name — individual
-/// attribution comes from the per-node cert minted in response, and an approval gate on the
-/// `UpdateAgent` can require a human to authorize the requested name.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnrollmentRequest {
-    pub name: String,
-    /// A PEM certificate-signing request. Only the CSR's public key is certified — the control plane
-    /// sets the subject (`CN=<name>`) and SAN itself. Steady-state traffic uses the minted per-node
-    /// cert, never the shared fleet cert.
-    pub csr: String,
-}
-
-impl EnrollmentRequest {
-    /// A node name must be a non-empty DNS-safe label (lowercase alphanumeric plus `-`), so it is a
-    /// valid `CN`, `UpdateAgent` name, and SPIFFE path segment.
-    pub fn name_is_wellformed(&self) -> bool {
-        !self.name.is_empty()
-            && self.name.len() <= 253
-            && self
-                .name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !self.name.starts_with('-')
-            && !self.name.ends_with('-')
-    }
-}
-
-/// The control plane's response to a successful enrollment: the minted client certificate (`leaf`),
-/// any issuer chain below the trusted CA (`chain`, empty when the fleet CA signs leaves directly),
-/// and the [`EnrollmentBundle`] the node runs on.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnrollResponse {
-    pub leaf: String,
-    #[serde(default)]
-    pub chain: String,
-    pub bundle: EnrollmentBundle,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EnrollmentBundle {
-    pub schema: u32,
-    pub agent_id: String,
-    pub routing_base_url: String,
-    pub assignment: String,
-    /// Exact UTF-8 bytes of the signed metadata. Strings are intentional: TUF
-    /// length and digest checks cover the serialized bytes, not an equivalent JSON value.
-    pub routing_root: String,
-    pub initial: InitialSignedConfiguration,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InitialSignedConfiguration {
-    pub timestamp: String,
-    pub snapshot: String,
-    pub targets: String,
-    pub agent_document: String,
-    pub managed_configuration: String,
-}
-
-impl EnrollmentBundle {
-    pub fn validate_shape(&self) -> io::Result<()> {
-        if self.schema != 1 || self.agent_id.is_empty() {
-            return Err(invalid(
-                "unsupported enrollment bundle or empty agent identity",
-            ));
-        }
-        if !self.routing_base_url.ends_with('/') || self.assignment.starts_with('/') {
-            return Err(invalid("invalid enrollment routing location"));
-        }
-        if self
-            .assignment
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | ".."))
-        {
-            return Err(invalid("invalid enrollment assignment path"));
-        }
-        for (name, value) in [
-            ("routingRoot", &self.routing_root),
-            ("timestamp", &self.initial.timestamp),
-            ("snapshot", &self.initial.snapshot),
-            ("targets", &self.initial.targets),
-            ("agentDocument", &self.initial.agent_document),
-            ("managedConfiguration", &self.initial.managed_configuration),
-        ] {
-            let value: serde_json::Value = serde_json::from_str(value)
-                .map_err(|error| invalid(&format!("enrollment {name} is invalid JSON: {error}")))?;
-            if !value.is_object() {
-                return Err(invalid(&format!(
-                    "enrollment {name} must encode a JSON object"
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Load a preplaced bundle or enroll exactly once. Missing and corrupt are deliberately
 /// distinct; once the consumed marker exists, absence can never re-enable enrollment.
 pub fn load_or_enroll(
@@ -320,6 +223,17 @@ pub async fn load_or_enroll_http(
         // No bundle yet: the `/enroll` handshake yields BOTH the minted leaf and the signed bundle.
         None => {
             let enrolled = mint_leaf(bootstrap, state_dir).await?;
+            // The same split-identity check the preplaced path makes. The gateway names the agent
+            // it registered; if that is not the name this node minted its leaf under, the node
+            // would run on one agent's routing while presenting another's certificate. A gateway
+            // that adopts a differently-named pre-existing agent is exactly how that happens.
+            if enrolled.agent_id != bootstrap.enrollment.name {
+                return Err(invalid(&format!(
+                    "the control plane enrolled this node as agent {:?}, but it is configured to \
+                     enroll as {:?}",
+                    enrolled.agent_id, bootstrap.enrollment.name
+                )));
+            }
             let bundle_bytes = serde_json::to_vec(&enrolled).map_err(io::Error::other)?;
             load_or_enroll(&bundle_path, || Ok(bundle_bytes.clone()))
         }
@@ -368,8 +282,126 @@ async fn mint_leaf(bootstrap: &BootstrapConfig, state_dir: &Path) -> io::Result<
     let bytes = success_body(response, "enrollment").await?;
     let enrolled: EnrollResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
     enrolled.bundle.validate_shape()?;
+    validate_leaf(
+        &enrolled.leaf,
+        &enrolled.chain,
+        &request.csr,
+        &request.name,
+        &bootstrap.enrollment.ca,
+    )?;
     persist_leaf(state_dir, &enrolled.leaf, &enrolled.chain)?;
     Ok(enrolled.bundle)
+}
+
+/// Renew the current per-node certificate when it enters its renewal window. The durable key is
+/// never replaced and the request is authenticated with the still-valid current certificate.
+/// Returns `true` only after a new leaf has been durably installed.
+pub async fn renew_identity_if_due(
+    bootstrap: &BootstrapConfig,
+    state_dir: &Path,
+) -> io::Result<bool> {
+    const RENEW_BEFORE_SECS: i64 = 30 * 24 * 60 * 60;
+
+    let cert_path = joined_cert_path(state_dir);
+    let pem = match std::fs::read(&cert_path) {
+        Ok(pem) => pem,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let (_, pem) = x509_parser::pem::parse_x509_pem(&pem)
+        .map_err(|error| invalid(&format!("parsing node certificate PEM: {error}")))?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents)
+        .map_err(|error| invalid(&format!("parsing node certificate: {error}")))?;
+    let remaining = cert.validity().not_after.timestamp() - chrono_now_unix();
+    if remaining > RENEW_BEFORE_SECS {
+        return Ok(false);
+    }
+    if remaining <= 0 {
+        return Err(invalid(
+            "node certificate expired before renewal; operator re-enrollment is required",
+        ));
+    }
+
+    let key_pem = std::fs::read_to_string(joined_key_path(state_dir))?;
+    let csr = crate::csr::csr_for(&key_pem, "updated renew")
+        .map_err(|error| invalid(&format!("generating renewal CSR: {error}")))?;
+    let endpoint = format!(
+        "{}{RENEW_PATH}",
+        bootstrap.enrollment.url.trim_end_matches('/')
+    );
+    let request = RenewalRequest { csr };
+    let body = serde_json::to_vec(&request).map_err(io::Error::other)?;
+    let response = bootstrap
+        .enrollment
+        .steady_identity(state_dir)?
+        .reqwest_client()?
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+    let bytes = success_body(response, "certificate renewal").await?;
+    let renewed: RenewalResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
+    validate_leaf(
+        &renewed.leaf,
+        &renewed.chain,
+        &request.csr,
+        &bootstrap.enrollment.name,
+        &bootstrap.enrollment.ca,
+    )?;
+    persist_leaf(state_dir, &renewed.leaf, &renewed.chain)?;
+    Ok(true)
+}
+
+fn validate_leaf(
+    leaf_pem: &str,
+    chain_pem: &str,
+    csr_pem: &str,
+    expected_name: &str,
+    ca: &Path,
+) -> io::Result<()> {
+    use x509_parser::prelude::FromDer;
+
+    let (_, leaf_pem) = x509_parser::pem::parse_x509_pem(leaf_pem.as_bytes())
+        .map_err(|error| invalid(&format!("parsing issued certificate PEM: {error}")))?;
+    let (_, leaf) = x509_parser::parse_x509_certificate(&leaf_pem.contents)
+        .map_err(|error| invalid(&format!("parsing issued certificate: {error}")))?;
+    let common_names = leaf
+        .subject()
+        .iter_common_name()
+        .map(|name| name.as_str().ok())
+        .collect::<Vec<_>>();
+    if common_names.as_slice() != [Some(expected_name)] {
+        return Err(invalid("issued certificate has the wrong node identity"));
+    }
+    if leaf.is_ca() {
+        return Err(invalid("issued node certificate must not be a CA"));
+    }
+
+    let (_, csr_pem) = x509_parser::pem::parse_x509_pem(csr_pem.as_bytes())
+        .map_err(|error| invalid(&format!("parsing requested CSR PEM: {error}")))?;
+    let (_, csr) =
+        x509_parser::certification_request::X509CertificationRequest::from_der(&csr_pem.contents)
+            .map_err(|error| invalid(&format!("parsing requested CSR: {error}")))?;
+    if leaf.public_key().raw != csr.certification_request_info.subject_pki.raw {
+        return Err(invalid(
+            "issued certificate does not contain the requested durable key",
+        ));
+    }
+    let leaf_der = rustls::pki_types::CertificateDer::from(leaf_pem.contents);
+    let intermediates = rustls::pki_types::CertificateDer::pem_slice_iter(chain_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| invalid(&format!("parsing issued certificate chain: {error}")))?;
+    crate::tls::verify_client_chain(leaf_der, &intermediates, ca)?;
+    Ok(())
+}
+
+fn chrono_now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 /// If enrollment has already run (the bundle is present, or the consumed marker is set), return the
@@ -390,16 +422,10 @@ fn load_existing_or_fresh(
     })
 }
 
-/// Read a successful response body, mapping a non-2xx status to an error naming the `what`
-/// operation. Shared by the mount `/enroll` and join `/join` fetches.
+/// Read a successful response body, bounded by [`ENROLLMENT_RESPONSE_LIMIT`]. Shared by enrollment
+/// and certificate renewal, through the one bounded-read helper every control-plane response uses.
 async fn success_body(response: reqwest::Response, what: &str) -> io::Result<Vec<u8>> {
-    if !response.status().is_success() {
-        return Err(io::Error::other(format!(
-            "{what} returned HTTP {}",
-            response.status()
-        )));
-    }
-    Ok(response.bytes().await.map_err(io::Error::other)?.to_vec())
+    crate::http::read_bounded(response, what, ENROLLMENT_RESPONSE_LIMIT).await
 }
 
 /// The node's durable per-node key (PKCS#8 PEM): generated once, persisted owner-only, and reused
@@ -409,18 +435,27 @@ async fn success_body(response: reqwest::Response, what: &str) -> io::Result<Vec
 /// leaf TTL, not the key's lifetime, since the leaf is re-minted on re-enrollment.
 fn durable_key_pem(state_dir: &Path) -> io::Result<String> {
     let path = joined_key_path(state_dir);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if !existing.trim().is_empty() {
-            return Ok(existing);
+    // Only a genuinely ABSENT key may be replaced. Every other failure — EACCES because the mode
+    // or owner changed, EIO on a failing disk, invalid UTF-8 from a single flipped byte — means a
+    // key file is there, and generating over it destroys the durable identity the control plane
+    // pinned: the node's telemetry stops verifying and it can never prove it is itself again.
+    match std::fs::read_to_string(&path) {
+        Ok(existing) if !existing.trim().is_empty() => return Ok(existing),
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "reading the durable node key at {} failed ({error}); refusing to overwrite it",
+                    path.display()
+                ),
+            ))
         }
     }
     let key_pem = crate::csr::generate_key()?;
+    // `atomic_write` commits owner-only, so no chmod follows.
     foundation::durable::atomic_write(&path, ".agent-key-", key_pem.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
     Ok(key_pem)
 }
 
@@ -474,6 +509,10 @@ fn invalid_error(error: serde_json::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::{
+        CertificateParams, CertificateSigningRequestParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
+    };
     use std::cell::Cell;
     use std::ffi::OsString;
 
@@ -582,7 +621,7 @@ mod tests {
         // An empty name is rejected by `validate()`.
         let empty = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname=''\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
         assert!(BootstrapConfig::load(&write_bootstrap(dir.path(), empty)).is_err());
-        // A stale mount/join/token field is rejected by `deny_unknown_fields`, so a half-migrated
+        // A removed enrollment field is rejected by `deny_unknown_fields`, so a half-migrated
         // config fails loudly instead of silently ignoring a credential.
         let stale = format!("{ok}group_id='canary'\n");
         assert!(BootstrapConfig::load(&write_bootstrap(dir.path(), &stale)).is_err());
@@ -602,6 +641,46 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    fn test_ca() -> (String, KeyPair) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "test enrollment CA");
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key)
+    }
+
+    fn issue_test_leaf(ca_pem: &str, ca_key: &KeyPair, csr_pem: &str, name: &str) -> String {
+        let ca_params = CertificateParams::from_ca_cert_pem(ca_pem).unwrap();
+        let ca = ca_params.self_signed(ca_key).unwrap();
+        let mut csr = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+        csr.params.is_ca = IsCa::NoCa;
+        csr.params.distinguished_name = rcgen::DistinguishedName::new();
+        csr.params.distinguished_name.push(DnType::CommonName, name);
+        csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        csr.signed_by(&ca, ca_key).unwrap().pem()
+    }
+
+    #[test]
+    fn issued_leaf_must_validate_as_client_auth_under_the_pinned_ca() {
+        crate::tls::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_pem, ca_key) = test_ca();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+        let csr = crate::csr::csr_for(&crate::csr::generate_key().unwrap(), "test").unwrap();
+        let leaf = issue_test_leaf(&ca_pem, &ca_key, &csr, "agent-7");
+        validate_leaf(&leaf, "", &csr, "agent-7", &ca_path).unwrap();
+
+        let (wrong_ca, _) = test_ca();
+        std::fs::write(&ca_path, wrong_ca).unwrap();
+        assert!(validate_leaf(&leaf, "", &csr, "agent-7", &ca_path).is_err());
     }
 
     #[test]

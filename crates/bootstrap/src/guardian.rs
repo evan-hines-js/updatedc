@@ -141,7 +141,26 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
     let mut backoff = Backoff::new();
     while !crate::sys::shutdown_requested() {
         let launched = Instant::now();
-        match run_supervisor(cfg, &mut service, next.take())? {
+        // A failed supervisor cycle must not take the guardian down with it. By this point the
+        // guardian may own a running, healthy application, and its own exit stops that application
+        // — so a transient durable-state failure (ENOSPC or EIO recording a rejection, an
+        // unwritable state dir) would turn one bad write into a service outage. Log it, back off,
+        // and try the cycle again; the application keeps serving throughout. Startup failures that
+        // genuinely cannot be recovered from happen before this loop, while nothing is running.
+        let cycle = match run_supervisor(cfg, &mut service, next.take()) {
+            Ok(cycle) => cycle,
+            Err(error) => {
+                warn(&format!(
+                    "supervisor cycle failed ({error}); the application keeps running and the \
+                     cycle is retried"
+                ));
+                if backoff_pause(&mut backoff, launched.elapsed(), true) {
+                    break;
+                }
+                continue;
+            }
+        };
+        match cycle {
             Cycle::Stop => break,
             Cycle::Continue => {
                 // A candidate was rejected (bad launch, missed readiness, exited before
@@ -333,7 +352,19 @@ fn serve_service<L: Link>(
                 Err(control::Error::UnknownTag(_)) => {
                     let _ = sup.send_response(&Response::Unsupported);
                 }
-                Err(control::Error::Closed) | Err(control::Error::Io(_)) => {}
+                // The peer's end of the channel is gone (or unreadable). This is NOT a quiet
+                // condition to swallow: a closed socketpair reports readable-and-hung-up forever,
+                // so `poll_readable` returns immediately on every iteration and this loop pins a
+                // core at 100% for as long as the supervisor keeps running without its channel.
+                // Treat it like any other unusable channel — stop the supervisor and relaunch it
+                // on a fresh one.
+                Err(error @ (control::Error::Closed | control::Error::Io(_))) => {
+                    warn(&format!(
+                        "the supervisor's control channel is unusable ({error}); restarting it on a fresh channel"
+                    ));
+                    sup.stop();
+                    return Ok(Cycle::Backoff);
+                }
                 Err(e) => {
                     warn(&format!(
                         "supervisor sent a malformed control frame ({e}); restarting it"
@@ -395,6 +426,18 @@ fn serve_service<L: Link>(
                     path.display()
                 ));
                 sup.stop();
+                // Reject it as well. The candidate reached readiness and survived its window, so
+                // nothing about it will change on a retry — but the commit that would end the
+                // handoff failed. Without a rejection the supervisor re-selects the same bytes,
+                // re-stages them into the same content-addressed slot, and hands them off again,
+                // forever. Recording the rejection is what makes this terminate; a corrected
+                // republish (new bytes, new hash) is unaffected.
+                record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
+                    format!(
+                        "recording uncommittable supervisor {} rejection: {e}",
+                        path.display()
+                    )
+                })?;
                 return Ok(Cycle::Continue);
             }
             info(&format!(
@@ -484,16 +527,6 @@ fn dispatch<L: Link>(
         }
     };
     sup.send_response(&response)
-}
-
-#[cfg(test)]
-fn serve<L: Link>(
-    cfg: &Config,
-    sup: &mut L,
-    service: &mut Service,
-    candidate: Option<PathBuf>,
-) -> Result<Cycle, String> {
-    serve_service(cfg, sup, service, candidate)
 }
 
 /// On first boot, record the supplied initial supervisor as the committed one.
@@ -1004,7 +1037,7 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/slow/supervisor");
         let mut sup = FakeLink::new();
         let mut app = Service::with_process(App::none());
-        let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(
             matches!(cycle, Cycle::Continue),
             "a timed-out candidate rolls back to the committed supervisor"
@@ -1024,7 +1057,7 @@ mod tests {
         let mut sup = FakeLink::new();
         sup.exited.push_back(true); // exits before any Ready
         let mut app = Service::with_process(App::none());
-        let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Continue));
         assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
     }
@@ -1040,7 +1073,7 @@ mod tests {
         sup.exited.push_back(false); // still running right after readying...
         sup.exited.push_back(true); // ...then exits
         let mut app = Service::with_process(App::none());
-        let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(
             matches!(cycle, Cycle::Continue),
             "an unconfirmed supervisor rolls back immediately"
@@ -1068,7 +1101,7 @@ mod tests {
         sup.exited.push_back(false);
         sup.exited.push_back(true);
         let mut app = Service::with_process(App::none());
-        let cycle = serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Backoff));
         assert_eq!(
             record::desired_supervisor(&c.state_dir).unwrap(),
@@ -1089,7 +1122,7 @@ mod tests {
         sup.exited.push_back(true);
         let mut app = Service::with_process(App::none());
         assert!(matches!(
-            serve(&c, &mut sup, &mut app, Some(cand.clone())).unwrap(),
+            serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap(),
             Cycle::Continue
         ));
         assert_eq!(record::desired_supervisor(&c.state_dir).unwrap(), None);
@@ -1103,7 +1136,7 @@ mod tests {
         let mut sup = FakeLink::new();
         sup.exited.push_back(true); // a plain committed supervisor that crashes
         let mut app = Service::with_process(App::none());
-        let cycle = serve(&c, &mut sup, &mut app, None).unwrap(); // candidate None ⇒ already committed
+        let cycle = serve_service(&c, &mut sup, &mut app, None).unwrap(); // candidate None ⇒ already committed
         assert!(
             matches!(cycle, Cycle::Backoff),
             "a committed supervisor is never rejected by the readiness deadline"

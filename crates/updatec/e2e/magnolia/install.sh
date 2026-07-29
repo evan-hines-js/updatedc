@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Node reconciler for the "magnolia" product on a plain Ubuntu + agent node. This is the
 # whole point of the demo: the supervisor does its TUF job (download + verify the signed
-# release), then hands the install to this custom code. Two phases do real work:
+# release), then hands the install to this custom code through four operations:
 #
 #   pre-start : first-boot install of a JRE + real Magnolia CE onto the node's volume.
 #   activate  : the upgrade — back the JCR up to
@@ -23,7 +23,7 @@ while (($#)); do
     --protocol) PROTOCOL=$2; shift 2 ;;
     --predecessor-version) PREDECESSOR_VERSION=$2; shift 2 ;;
     --candidate-version) CANDIDATE_VERSION=$2; shift 2 ;;
-    --attempt-id | --reason | --install-root | --state-dir | --candidate | --predecessor | --managed-pid)
+    --attempt-id | --reason | --install-root | --state-dir | --candidate | --predecessor | --managed-pid | --input-file | --output-file)
       shift 2
       ;;
     --) shift; break ;;
@@ -91,23 +91,26 @@ backup_jcr() {
 }
 
 case "$PHASE" in
-  pre-start)
-    # Runs on every launch; idempotent, so a restart with a persisted volume is a fast no-op
-    # and only the first boot pays for the download.
+  apply)
     install_runtime
-    ;;
-
-  activate)
-    # Custom activation: the real online, in-place upgrade. The supervisor has already stopped
-    # the predecessor, so the files are free to change and the JCR is free to migrate.
-    install_runtime
-    backup_jcr
+    if [ -n "$PREDECESSOR_VERSION" ] && [ "$PREDECESSOR_VERSION" != "$CANDIDATE_VERSION" ]; then
+      backup_jcr
+    fi
     # Upgrade the webapp in place over the SAME directory, reusing the repository. Magnolia's
     # automatic update (magnolia.update.auto, set by the launcher) migrates the JCR to the new
     # version on the next start. The CE bytes are pinned here, so this is the reuse-in-place
     # step of a genuine in-place upgrade rather than a versioned-directory swap.
     echo "magnolia-install: upgrading Magnolia in place to ${CANDIDATE_VERSION:-?}, reusing the JCR at $DATA/repositories" >&2
     printf '%s\n' "${CANDIDATE_VERSION:-?}" > "$DATA/installed-version"
+    ;;
+
+  healthcheck)
+    test -x "$JRE/bin/java"
+    test -x "$TOMCAT/bin/catalina.sh"
+    ;;
+
+  inspect)
+    printf 'magnolia-version=%s\n' "$(cat "$DATA/installed-version" 2>/dev/null || true)"
     ;;
 
   rollback)
@@ -123,6 +126,7 @@ case "$PHASE" in
     ;;
 
   *)
-    : # every other reconciler operation is a no-op
+    echo "magnolia-install: unknown operation '$PHASE'" >&2
+    exit 2
     ;;
 esac

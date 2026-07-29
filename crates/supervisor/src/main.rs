@@ -8,11 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{with_suffix, Application, Paths, Repository, Routing, Storage, Timeouts};
+use updated::config::{
+    with_suffix, Application, MaterializeRuntime, Paths, Repository, Routing, Storage, Timeouts,
+};
 use updated::env;
 mod app;
 mod boot;
 mod domain;
+mod fingerprint;
 mod guardian;
 mod install;
 mod options;
@@ -55,6 +58,12 @@ struct Options {
     paths: Paths,
     supervisor_update: SupervisorUpdate,
     secrets: secrets::SecretManager,
+    identity_renewal: IdentityRenewal,
+}
+
+struct IdentityRenewal {
+    bootstrap: PathBuf,
+    state_dir: PathBuf,
 }
 
 impl Options {
@@ -67,11 +76,28 @@ impl Options {
     /// Returns whether the *launch spec* changed — an app running the old args must be
     /// relaunched to pick up the new ones, since a live process's argv cannot be rewritten in
     /// place.
-    fn apply_runtime(&mut self, runtime: &updated::config::ManagedRuntime) -> bool {
+    fn apply_runtime(&mut self, runtime: &updated_contracts::assignment::ManagedRuntime) -> bool {
         let relaunch = self.application.args != runtime.args
             || self.application.mode != runtime.mode
-            || self.application.secrets != runtime.secrets;
+            || self.application.secrets != runtime.secrets
+            || self.application.inputs != runtime.inputs;
+        let boot_install_root = self.application.install_root.clone();
         self.application = runtime.application();
+        // `install_root` is a BOOT-time property: `self.paths` (versions, staging, active release,
+        // installed state, journal, rejections, provider trees) was derived from it once and is not
+        // recomputed here. Adopting a new root without those would leave every path pointing into
+        // the old tree while the assignment claims the new one — installs, rollback evidence, and
+        // the running binary silently disagreeing. Moving a node's install root is a migration, so
+        // keep the root this process booted with and let a restart pick up the new one.
+        if self.application.install_root != boot_install_root {
+            warn(&format!(
+                "the assignment moves the install root to {}; keeping {} until this supervisor \
+                 restarts, since every resolved path derives from the boot-time root",
+                self.application.install_root.display(),
+                boot_install_root.display()
+            ));
+            self.application.install_root = boot_install_root;
+        }
         self.timeouts = runtime.timeouts();
         self.storage = runtime.storage();
         relaunch
@@ -94,6 +120,7 @@ struct SupervisorUpdate {
 struct LoopState {
     refresh_failures: u32,
     next_app_check: Instant,
+    next_identity_check: Instant,
 }
 
 impl LoopState {
@@ -101,6 +128,7 @@ impl LoopState {
         Self {
             refresh_failures: 0,
             next_app_check: Instant::now() + jitter(check_interval, 20),
+            next_identity_check: Instant::now(),
         }
     }
 }
@@ -112,14 +140,12 @@ fn main() {
     if let Some(kind) = std::env::args().find(|a| {
         a == "--list-chaos-boundaries"
             || a == "--list-rollback-chaos-boundaries"
-            || a == "--list-abort-chaos-boundaries"
             || a == "--list-install-chaos-boundaries"
     }) {
         let boundaries = match kind.as_str() {
-            "--list-chaos-boundaries" => update::BOUNDARIES,
             "--list-rollback-chaos-boundaries" => update::ROLLBACK_BOUNDARIES,
             "--list-install-chaos-boundaries" => install::INSTALL_BOUNDARIES,
-            _ => update::ABORT_BOUNDARIES,
+            _ => update::BOUNDARIES,
         };
         for b in boundaries {
             println!("{b}");
@@ -241,7 +267,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         error(reason);
         return Err(reason.clone().into());
     }
-    let updates_enabled = plan.updates_enabled;
     let mut current = plan.current.clone();
 
     let mut self_update = SelfUpdateState::load(&opts)?;
@@ -258,7 +283,16 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     if let Some(tx) = recovery_transaction.as_mut() {
-        if !tx.is_rollback() {
+        // Only a transaction that can still begin a rollback is moved onto the rollback path. A
+        // journal already in a terminal phase (committed, or rolled back) has nothing left to
+        // undo, and asking it to advance is an invalid transition — one that would fail this boot,
+        // and every boot after it, on a journal that is merely spent.
+        if !tx.is_rollback()
+            && !matches!(
+                tx.phase,
+                TransactionPhase::Committed | TransactionPhase::RolledBack
+            )
+        {
             advance_transaction(&mut store, tx, TransactionPhase::RollbackStarted)?;
         }
     }
@@ -267,7 +301,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // still-unconfirmed update (if any) for the loop to confirm once its window passes.
     let mut pending = match execute_boot_plan(
         &plan,
-        &opts,
         &mut store,
         &mut guardian,
         &mut self_update,
@@ -296,7 +329,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .await;
     }
     if let Some(tx) = recovery_transaction.as_mut() {
-        if tx.rollback_rank().is_some_and(|rank| rank < 5) {
+        if tx.recovery_pending(TransactionPhase::RollbackStartStarted) {
             advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
         }
     }
@@ -309,13 +342,12 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     log(&format!(
-        "supervisor {SELF_VERSION} (default provider {}) supervising {:?} (product {} channel {}, installed {}, updates {}, check every {}s)",
+        "supervisor {SELF_VERSION} (default provider {}) supervising {:?} (product {} channel {}, installed {}, check every {}s)",
         DefaultProvider::VERSION,
         opts.paths.install_root,
         opts.application.product,
         opts.application.channel,
         current.as_deref().unwrap_or("none"),
-        if updates_enabled { "enabled" } else { "DISABLED" },
         opts.timeouts.check_interval.as_secs()
     ));
 
@@ -341,34 +373,15 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     };
     if recovery_transaction
         .as_ref()
-        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 6))
+        .is_some_and(|tx| tx.recovery_pending(TransactionPhase::PredecessorStarted))
     {
-        let tx = recovery_transaction.as_ref().expect("checked above");
-        if let Err(error) = invoke_deployment_provider(
-            tx.lifecycle.as_ref(),
-            &opts,
-            LifecycleInvocation {
-                phase: LifecyclePhase::Start,
-                reason: LifecycleReason::Update,
-                id: &tx.id,
-                pid: app.pid(),
-                candidate: &tx.previous_release,
-                predecessor: &tx.candidate_release,
-            },
-        ) {
-            return hold_recovery_after_provider_failure(
-                &shutdown,
-                format!("predecessor start recovery hook failed: {error}"),
-            )
-            .await;
-        }
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_START_APPLIED);
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::PredecessorStarted)?;
     }
 
     if let Some(tx) = recovery_transaction.as_mut() {
-        if tx.rollback_rank().is_some_and(|rank| rank < 7) {
+        if tx.recovery_pending(TransactionPhase::RollbackHealthStarted) {
             advance_transaction(&mut store, tx, TransactionPhase::RollbackHealthStarted)?;
         }
     }
@@ -409,7 +422,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         _ => installed_state.lifecycle,
     };
     let mut tower = DefaultProvider::new(&mut app, &opts, installed_lifecycle.as_ref());
-    let boot_healthy = update::became_verified(&mut tower, "boot", &installed, &installed).await;
+    let boot_healthy = update::became_steady(&mut tower, &installed).await;
     if !boot_healthy {
         // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
         // dangerous case: `reject_provisional_head` below would no-op (the still-deferred
@@ -469,27 +482,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     if recovery_transaction
         .as_ref()
-        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 8))
+        .is_some_and(|tx| tx.recovery_pending(TransactionPhase::PredecessorHealthy))
     {
-        let tx = recovery_transaction.as_ref().expect("checked above");
-        if let Err(error) = invoke_deployment_provider(
-            tx.lifecycle.as_ref(),
-            &opts,
-            LifecycleInvocation {
-                phase: LifecyclePhase::Verify,
-                reason: LifecycleReason::Update,
-                id: &tx.id,
-                pid: app.pid(),
-                candidate: &tx.previous_release,
-                predecessor: &tx.candidate_release,
-            },
-        ) {
-            return hold_recovery_after_provider_failure(
-                &shutdown,
-                format!("predecessor verify recovery hook failed: {error}"),
-            )
-            .await;
-        }
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_HEALTH_APPLIED);
         let tx = recovery_transaction.as_mut().expect("checked above");
         advance_transaction(&mut store, tx, TransactionPhase::PredecessorHealthy)?;
@@ -500,10 +494,10 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // transaction identity before declaring the recovered tower ready.
     let rollback_incomplete = recovery_transaction
         .as_ref()
-        .is_some_and(|tx| tx.rollback_rank().is_some_and(|rank| rank < 10));
+        .is_some_and(|tx| tx.recovery_pending(TransactionPhase::RolledBack));
     if rollback_incomplete {
         if let Some(tx) = recovery_transaction.as_mut() {
-            if tx.rollback_rank().is_some_and(|rank| rank < 9) {
+            if tx.recovery_pending(TransactionPhase::RollbackFinalizeStarted) {
                 advance_transaction(&mut store, tx, TransactionPhase::RollbackFinalizeStarted)?;
             }
         }
@@ -590,6 +584,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // Latest readiness observation, so a report reflects whether the running deployment is
     // actually serving. `None` until first sampled (or when no readiness check exists).
     let mut last_ready: Option<bool> = None;
+    let mut fingerprints = fingerprint::Tracker::new(Instant::now());
     loop {
         // An unconfirmed update that ran its whole window without crashing is confirmed.
         let confirm_due = pending
@@ -621,13 +616,16 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 window_remaining(p, opts.timeouts.confirmation_window, now_unix())
             }
-        } else if updates_enabled {
-            loop_state.next_app_check.saturating_duration_since(now)
         } else {
-            opts.timeouts.check_interval
+            loop_state.next_app_check.saturating_duration_since(now)
         };
         let mut wait = app_wait.min(self_update.due_in(now));
         wait = wait.min(next_health_probe.saturating_duration_since(now));
+        wait = wait.min(
+            loop_state
+                .next_identity_check
+                .saturating_duration_since(now),
+        );
         let wait = wait.max(Duration::from_millis(100));
 
         if sleep_interruptible(wait, &shutdown).await {
@@ -636,6 +634,32 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let now = Instant::now();
+        if now >= loop_state.next_identity_check {
+            const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+            loop_state.next_identity_check = now + IDENTITY_CHECK_INTERVAL;
+            match updated::enrollment::BootstrapConfig::load(&opts.identity_renewal.bootstrap) {
+                Ok(bootstrap) => {
+                    match updated::enrollment::renew_identity_if_due(
+                        &bootstrap,
+                        &opts.identity_renewal.state_dir,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            log("renewed node certificate; restarting to rebuild authenticated clients");
+                            return Ok(());
+                        }
+                        Ok(false) => {}
+                        Err(error) => warn(&format!(
+                            "node certificate renewal check failed; retrying in 12h: {error}"
+                        )),
+                    }
+                }
+                Err(error) => warn(&format!(
+                    "loading bootstrap for certificate renewal failed; retrying in 12h: {error}"
+                )),
+            }
+        }
         if now >= next_health_probe {
             // One periodic hook invocation per tick drives readiness and liveness.
             next_health_probe = now + opts.timeouts.health_interval;
@@ -647,7 +671,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 steady_lifecycle.as_ref(),
                 &opts,
                 LifecycleInvocation {
-                    phase: LifecyclePhase::Periodic,
+                    phase: LifecyclePhase::Healthcheck,
                     reason: LifecycleReason::Restart,
                     id: "periodic",
                     pid: app.pid(),
@@ -656,6 +680,29 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .is_ok();
+            if let Some(Err(error)) = fingerprints.poll(
+                now,
+                healthy,
+                telemetry_node.as_deref().unwrap_or("unidentified-node"),
+                || {
+                    prepare_fingerprint_job(
+                        steady_lifecycle.as_ref(),
+                        &opts,
+                        LifecycleInvocation {
+                            phase: LifecyclePhase::Inspect,
+                            reason: LifecycleReason::Restart,
+                            id: "fingerprint",
+                            pid: app.pid(),
+                            candidate: &installed,
+                            predecessor: &installed,
+                        },
+                    )
+                },
+            ) {
+                warn(&format!(
+                    "node fingerprint observation failed ({error}); omitting it from telemetry"
+                ));
+            }
             last_ready = Some(healthy);
             app.traffic_ready(healthy)
                 .map_err(|error| format!("publishing application readiness: {error}"))?;
@@ -664,7 +711,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 liveness_failures = liveness_failures.saturating_add(1);
                 if liveness_failures >= 3
-                    && opts.application.mode == updated::config::RuntimeMode::Managed
+                    && opts.application.mode == updated_contracts::assignment::RuntimeMode::Managed
                 {
                     app.guardian.application_failed().map_err(|error| {
                         format!("reporting application liveness failure: {error}")
@@ -674,12 +721,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let self_due = self_update.due(now);
-        let app_due = application_check_due(
-            updates_enabled,
-            pending.is_some(),
-            now,
-            loop_state.next_app_check,
-        );
+        let app_due = application_check_due(pending.is_some(), now, loop_state.next_app_check);
         if !self_due && !app_due {
             continue;
         }
@@ -688,6 +730,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) =
                 updated::bundle::verify_release(&opts.paths.versions, &installed.release)
             {
+                fingerprints.restart_after_deployment(Instant::now());
                 let _ = app::stop_runtime(&mut app);
                 repair_from_local_assignment(&opts, &mut store)
                     .await
@@ -762,8 +805,14 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     warn(&format!(
                         "assigned secrets could not be reconciled; keeping the running application and retrying: {error}"
                     ));
-                    loop_state.next_app_check =
-                        Instant::now() + jitter(opts.timeouts.refresh_retry, 20);
+                    let retry = jitter(opts.timeouts.refresh_retry, 20);
+                    loop_state.next_app_check = Instant::now() + retry;
+                    // Defer the self-update check too. It is due right after boot and is only
+                    // advanced by `check` below — which this `continue` skips — so leaving it alone
+                    // collapses `wait` to its 100 ms floor and turns a failing secrets endpoint into
+                    // every node in the fleet re-running a TUF refresh and a secrets fetch ten times
+                    // a second, against the control plane that is already unwell.
+                    self_update.defer(Instant::now() + retry);
                     continue;
                 }
             };
@@ -773,6 +822,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 // The launch spec changed. A live process cannot have its argv rewritten, so
                 // stop it and relaunch on the new args.
                 log("assignment runtime changed the launch spec; relaunching the application to apply it");
+                fingerprints.restart_after_deployment(Instant::now());
                 app::stop_runtime(&mut app).map_err(|error| {
                     format!("stopping the application to apply a new launch spec: {error}")
                 })?;
@@ -797,7 +847,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
         if app_due {
             loop_state.next_app_check = Instant::now() + jitter(opts.timeouts.check_interval, 20);
-            match check_application(&opts, &repo, &mut store, &mut app).await {
+            match check_application(&opts, &repo, &mut store, &mut app, || {
+                fingerprints.restart_after_deployment(Instant::now());
+            })
+            .await
+            {
                 AppOutcome::Upgraded { version } => {
                     current = Some(version);
                     // The commit recorded the update as unconfirmed; pick it up so its
@@ -837,13 +891,24 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(assignment) = repo.assignment() {
             // Do not report settled until the first steady-state observation has passed.
             let settled = pending.is_none() && last_ready.unwrap_or(false);
+            let archive_sha256 = installed_archive_sha256(&store);
+            let manifest_sha256 = installed_manifest_sha256(&store);
+            let outputs = settled
+                .then(|| telemetry::load_outputs(&opts.paths.install_root, &manifest_sha256))
+                .flatten();
             telemetry::report_running_state(
                 &telemetry_client,
                 assignment.report_url.as_deref(),
                 telemetry_node.as_deref(),
-                &assignment.deployment,
-                current.as_deref().unwrap_or_default(),
-                settled,
+                &telemetry::RunningState {
+                    deployment: &assignment.deployment,
+                    assignment_sha256: repo.assignment_sha256().unwrap_or_default(),
+                    version: current.as_deref().unwrap_or_default(),
+                    archive_sha256: &archive_sha256,
+                    healthy: settled,
+                    fingerprint: fingerprints.current(),
+                    outputs: outputs.as_ref(),
+                },
                 telemetry_signing_key.as_deref(),
             )
             .await;
@@ -882,7 +947,7 @@ async fn repair_from_local_assignment(
     .await
     .map_err(|error| format!("preparing signed local repair: {error}"))?
     .ok_or("the signed local assignment contains no installable application")?;
-    let providers = selection::stage_providers(opts, &repo, store, None)
+    let (providers, _) = selection::stage_providers(opts, &repo, store, None)
         .await
         .map_err(|error| format!("staging the providers for local repair: {error}"))?;
     store.commit_installed(&updated::state::InstalledState::confirmed(
@@ -1078,7 +1143,7 @@ fn complete_recovery_activation(
     let Some(tx) = recovery else {
         return Ok(());
     };
-    if tx.rollback_rank().is_none_or(|rank| rank >= 4) {
+    if !tx.recovery_pending(TransactionPhase::PredecessorActivated) {
         return Ok(());
     }
     // Restore the predecessor's machine state through the same reconciler operation used for the
@@ -1088,7 +1153,7 @@ fn complete_recovery_activation(
         tx.lifecycle.as_ref(),
         opts,
         LifecycleInvocation {
-            phase: LifecyclePhase::Activate,
+            phase: LifecyclePhase::Apply,
             reason: LifecycleReason::Update,
             id: &tx.id,
             pid: None,
@@ -1137,7 +1202,6 @@ fn gather_situation(
 /// update (if any) for the loop to watch.
 fn execute_boot_plan(
     plan: &Plan,
-    opts: &Options,
     store: &mut dyn Store,
     guardian: &mut Guardian,
     self_update: &mut SelfUpdateState,
@@ -1145,29 +1209,13 @@ fn execute_boot_plan(
     mut recovery: Option<&mut Transaction>,
 ) -> io::Result<Option<Pending>> {
     if let Some(tx) = recovery.as_mut() {
-        if tx.rollback_rank().is_some_and(|rank| rank < 1) {
+        if tx.recovery_pending(TransactionPhase::RollbackStopStarted) {
             advance_transaction(store, tx, TransactionPhase::RollbackStopStarted)?;
         }
     }
     let needs_quiesce = recovery
         .as_ref()
-        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 2));
-    if needs_quiesce {
-        if let Some(tx) = recovery.as_ref() {
-            invoke_deployment_provider(
-                tx.lifecycle.as_ref(),
-                opts,
-                LifecycleInvocation {
-                    phase: LifecyclePhase::Stop,
-                    reason: LifecycleReason::Update,
-                    id: &tx.id,
-                    pid: guardian::adopted_app_pid(),
-                    candidate: &tx.previous_release,
-                    predecessor: &tx.candidate_release,
-                },
-            )?;
-        }
-    }
+        .is_none_or(|tx| tx.recovery_pending(TransactionPhase::RollbackStopped));
     if plan.quiesce && needs_quiesce {
         warn("stopping the uncommitted candidate before reconciling its release");
         stop(guardian)?;
@@ -1176,16 +1224,16 @@ fn execute_boot_plan(
         Chaos::from_env().crossing(update::boundary::ROLLBACK_STOP_APPLIED);
     }
     if let Some(tx) = recovery.as_mut() {
-        if tx.rollback_rank().is_some_and(|rank| rank < 2) {
+        if tx.recovery_pending(TransactionPhase::RollbackStopped) {
             advance_transaction(store, tx, TransactionPhase::RollbackStopped)?;
         }
-        if tx.rollback_rank().is_some_and(|rank| rank < 3) {
+        if tx.recovery_pending(TransactionPhase::RollbackActivateStarted) {
             advance_transaction(store, tx, TransactionPhase::RollbackActivateStarted)?;
         }
     }
     let activate_release = recovery
         .as_ref()
-        .is_none_or(|tx| tx.rollback_rank().is_some_and(|rank| rank < 4));
+        .is_none_or(|tx| tx.recovery_pending(TransactionPhase::PredecessorActivated));
     apply_store_plan(plan, store, defer_commit, activate_release)?;
     if activate_release && !matches!(plan.release, ReleaseFix::None) {
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_POINTER_APPLIED);
@@ -1230,6 +1278,25 @@ fn installed_pending(store: &dyn Store) -> Option<Pending> {
     }
 }
 
+/// The SHA-256 of the archive the committed head was installed from, for the rollout heartbeat.
+/// Read from the store at report time rather than tracked alongside the running version: the
+/// version is a local carried across four separate commit paths, and a digest that drifted out of
+/// step with it would name bytes that are not running — worse than naming none. Empty when nothing
+/// is committed (no install yet, or an unreadable record), reported as "running no known bytes".
+fn installed_archive_sha256(store: &dyn Store) -> String {
+    match store.installed() {
+        Installed::Present(state) => state.archive_sha256,
+        _ => String::new(),
+    }
+}
+
+fn installed_manifest_sha256(store: &dyn Store) -> String {
+    match store.installed() {
+        Installed::Present(state) => state.release.manifest_sha256,
+        _ => String::new(),
+    }
+}
+
 /// The committed release's lifecycle provider.
 fn installed_lifecycle_provider(
     store: &dyn Store,
@@ -1262,13 +1329,8 @@ fn confirm_update(store: &mut dyn Store) -> bool {
 
 // ============================ application updates ============================
 
-fn application_check_due(
-    updates_enabled: bool,
-    pending: bool,
-    now: Instant,
-    next_check: Instant,
-) -> bool {
-    updates_enabled && !pending && now >= next_check
+fn application_check_due(pending: bool, now: Instant, next_check: Instant) -> bool {
+    !pending && now >= next_check
 }
 
 fn log(msg: &str) {

@@ -67,24 +67,39 @@ impl DefaultPolicy {
             }
         }
         let version = field("version")?;
-        // Cross-check the target path's version segment against the signed `custom.version`.
-        // The canonical layout is `products/<product>/<channel>/<version>/<os>-<arch>/<file>`
-        // (see `repo::PublishTarget::application`). Both segments are TUF-authentic, but if
-        // they disagree the target is ambiguous: two authentic targets could then claim the
-        // same `custom.version` while living at different paths, leaving the tie-break to
-        // decorative path bytes. Requiring agreement makes `custom.version` the single
-        // authority and rejects any candidate whose path says otherwise.
+        // Every field above matched, so this target claims to be a runnable release for this
+        // installation. Require it to live at the canonical layout AND for every identity segment
+        // to agree with the signed metadata:
+        //
+        //     products/<product>/<channel>/<version>/<os>-<arch>/<file>
+        //
+        // (the one layout `repo::PublishTarget::application` publishes). Path and custom metadata
+        // are both TUF-authentic, but if they can disagree the target is ambiguous: two authentic
+        // targets could claim the same `custom.version` at different paths, leaving the tie-break
+        // to decorative path bytes — exactly the ordering the selector treats as authoritative.
+        // Checking only *some* segments, or only when the path happens to begin with `products`,
+        // leaves that ambiguity open; requiring the whole layout closes it.
         let segments: Vec<&str> = candidate.path.split('/').collect();
-        if segments.first().copied() == Some("products") {
-            let path_version = segments.get(3).copied().ok_or_else(|| {
-                PolicyError(format!(
-                    "product target path `{}` omits its version segment",
-                    candidate.path
-                ))
-            })?;
-            if path_version != version {
+        let expected = [
+            ("products", "products"),
+            (self.product.as_str(), "product"),
+            (self.channel.as_str(), "channel"),
+            (version, "version"),
+            (&format!("{}-{}", self.os, self.arch), "os-arch"),
+        ];
+        if segments.len() != expected.len() + 1 {
+            return Err(PolicyError(format!(
+                "runnable target path `{}` is not the canonical \
+                 products/<product>/<channel>/<version>/<os>-<arch>/<file> layout",
+                candidate.path
+            )));
+        }
+        for (index, (want, what)) in expected.iter().enumerate() {
+            let got = segments[index];
+            if got != *want {
                 return Err(PolicyError(format!(
-                    "path version segment `{path_version}` disagrees with signed version `{version}`"
+                    "path {what} segment `{got}` disagrees with signed `{want}` in `{}`",
+                    candidate.path
                 )));
             }
         }
@@ -163,5 +178,30 @@ mod tests {
             "2.0.0",
         );
         assert!(policy().candidate_version(&mismatched).is_err());
+    }
+
+    #[test]
+    fn every_identity_segment_of_the_canonical_layout_must_agree() {
+        // A candidate whose signed metadata fully matches this installation must ALSO sit at the
+        // canonical path with every identity segment agreeing. Otherwise two authentic targets
+        // could claim one version at different paths and the selector's ordering would break the
+        // tie on decorative bytes.
+        for path in [
+            // Not the canonical layout at all — the escape hatch that used to skip the check.
+            "elsewhere/app-2.0.0".to_string(),
+            format!("mirror/products/app/stable/2.0.0/{OS}-{ARCH}/app"),
+            // Canonical shape, but an identity segment disagrees with the signed metadata.
+            format!("products/other/stable/2.0.0/{OS}-{ARCH}/app"),
+            format!("products/app/beta/2.0.0/{OS}-{ARCH}/app"),
+            format!("products/app/stable/2.0.0/{OS}-someotherarch/app"),
+            // Right prefix, wrong depth.
+            format!("products/app/stable/2.0.0/{OS}-{ARCH}/nested/app"),
+            "products/app/stable/2.0.0".to_string(),
+        ] {
+            assert!(
+                policy().candidate_version(&target(&path, "2.0.0")).is_err(),
+                "{path} must be rejected as ambiguous"
+            );
+        }
     }
 }

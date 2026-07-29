@@ -1,17 +1,25 @@
 # Node reconciler protocol
 
-Every release has exactly one signed node reconciler. The reconciler is privileged executable
-policy: anyone authorized to sign it is authorized to modify the node with the privileges of
-`updated`.
+Every release carries one signed node reconciler. It may be a Bash or PowerShell script, a native
+binary, or any other executable. Updatedc authenticates and invokes it but deliberately does not
+interpret application or infrastructure semantics.
 
-The agent owns artifact authentication and delivery, process containment, deadlines, retries,
-scheduling, durable transaction state, and crash replay. The reconciler owns application-specific
-machine state and the operations required to move it between releases.
+## Operations
+
+The public interface has exactly four operations:
+
+- `apply` — idempotently converge machine state to the candidate. `--reason` distinguishes
+  `install`, `update`, and `restart`/repair.
+- `healthcheck` — make one bounded readiness observation. Exit zero means healthy.
+- `rollback` — idempotently restore or compensate toward the predecessor.
+- `inspect` — make one bounded steady-state observation. Non-empty stdout is opaque fingerprint
+  material; typed dependency outputs are written to `--output-file`.
+
+Updatedc owns artifact verification, placement, draining, managed-process stop/start, retry cadence,
+timeouts, durable transaction state, crash replay, and rollout reporting. Those are intentionally
+not provider operations.
 
 ## Invocation
-
-The bundle declares one executable entrypoint. The agent invokes that same entrypoint for every
-operation:
 
 ```text
 reconciler OPERATION
@@ -22,60 +30,43 @@ reconciler OPERATION
   --state-dir PATH
   --candidate PATH
   --candidate-version VERSION
+  --input-file PATH
+  --output-file PATH
   --predecessor PATH
   --predecessor-version VERSION
   [--managed-pid PID]
   [-- PUBLISHER_ARGUMENTS...]
 ```
 
-Arguments are passed directly as argv, never as shell text. Paths containing spaces remain one
-argument. Lifecycle context is not exported through environment variables.
+Arguments are passed directly as argv, never shell text. The input file is a JSON object containing
+typed values resolved from prerequisite groups. The output path is partitioned by the immutable
+candidate identity, so a failed candidate's values cannot be attributed to a restored predecessor.
 
-`--state-dir` is a durable, reconciler-specific directory created by the agent. A reconciler may
-store SQLite databases or ordinary files there. Prefer observing the machine directly and persist
-only facts that cannot be reconstructed.
+An output manifest is atomically written as:
 
-`--managed-pid` is present only when the agent currently owns a managed application process and
-that process exists during the operation. A reconciler must not require it in `provider-managed`
-mode.
+```json
+{
+  "schema": 1,
+  "values": {
+    "endpoint": {"type": "string", "value": "https://service.internal:8200"},
+    "join-token": {
+      "type": "secret_ref",
+      "secret": "service-bootstrap",
+      "key": "join-token"
+    }
+  }
+}
+```
 
-Arguments after `--` are immutable publisher-configured arguments from the signed provider set.
+Secret values must never appear in the manifest or diagnostic streams. Only references are
+transported. Updatedc validates names, types, counts, per-value sizes, and total file size before
+including outputs in a healthy signed node report.
 
-Exit status `0` means success. Any other status means the operation failed. For `verify` and
-`periodic`, a non-zero status means the current workload observation is unhealthy. The agent owns
-retry and recovery policy; providers do not encode special retry exit codes.
+Exit status zero means success; any other status means failure. Updatedc can enforce ordering,
+bounds, identity, and result handling, but cannot prove that scripts are idempotent, read-only, safe,
+or semantically correct.
 
-Stdout and stderr are diagnostic output. Do not place secrets in them.
-
-## Operations
-
-- `preflight`: reject an incompatible candidate before changing machine state.
-- `prepare`: perform idempotent preparation and create rollback material.
-- `pre-drain`: begin application-level quiescence while the workload may still serve traffic.
-- `drain`: remove readiness and finish draining external work.
-- `stop`: perform application-specific work immediately before the managed process is stopped, or
-  stop the workload in `provider-managed` mode.
-- `pre-start`: prepare per-boot machine state before a workload starts.
-- `activate`: reconcile installed files and machine configuration to the candidate release.
-- `start`: perform post-launch work in managed mode, or start the workload in
-  `provider-managed` mode.
-- `verify`: make one bounded activation/boot verification observation.
-- `periodic`: make one bounded steady-state readiness/liveness observation.
-- `finalize`: commit external state that should change only after verification.
-- `rollback`: idempotently restore the predecessor after a failed activation.
-
-Every operation listed above is invoked by the agent state machine. There are no phase-specific
-entrypoints and no optional compatibility hooks.
-
-## Runtime ownership
-
-- `managed` is the default. The guardian owns the application process. The agent stop-starts it
-  during activation and may pass `--managed-pid` while it exists.
-- `provider-managed` means the reconciler owns workload/process state. The agent never launches,
-  signals, probes, or stops an application process. `verify` and `periodic` still drive agent
-  readiness and rollout telemetry.
-
-## Bash template
+## Minimal Bash reconciler
 
 ```bash
 #!/usr/bin/env bash
@@ -84,54 +75,36 @@ set -euo pipefail
 operation=${1:?missing operation}
 shift
 
-protocol=
-attempt_id=
-reason=
-install_root=
-state_dir=
-candidate=
-candidate_version=
-predecessor=
-predecessor_version=
-managed_pid=
-
+protocol= reason= candidate= predecessor= input_file= output_file=
 while (($#)); do
   case "$1" in
     --protocol) protocol=$2; shift 2 ;;
-    --attempt-id) attempt_id=$2; shift 2 ;;
     --reason) reason=$2; shift 2 ;;
-    --install-root) install_root=$2; shift 2 ;;
-    --state-dir) state_dir=$2; shift 2 ;;
     --candidate) candidate=$2; shift 2 ;;
-    --candidate-version) candidate_version=$2; shift 2 ;;
     --predecessor) predecessor=$2; shift 2 ;;
-    --predecessor-version) predecessor_version=$2; shift 2 ;;
-    --managed-pid) managed_pid=$2; shift 2 ;;
+    --input-file) input_file=$2; shift 2 ;;
+    --output-file) output_file=$2; shift 2 ;;
+    --attempt-id|--install-root|--state-dir|--candidate-version|--predecessor-version|--managed-pid)
+      shift 2 ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-
-[[ $protocol == 1 ]] || { echo "unsupported protocol" >&2; exit 2; }
+[[ $protocol == 1 ]] || exit 2
 
 case "$operation" in
-  preflight)
-    test -x "$candidate/bin/my-app"
+  apply)
+    ./existing-installer --source "$candidate" --inputs "$input_file"
     ;;
-  activate)
-    install -m 0644 "$candidate/config/my-app.conf" /etc/my-app.conf
-    ;;
-  start)
-    systemctl start my-app
-    ;;
-  verify|periodic)
-    systemctl is-active --quiet my-app
+  healthcheck)
+    ./existing-status-command
     ;;
   rollback)
-    install -m 0644 "$predecessor/config/my-app.conf" /etc/my-app.conf
-    systemctl restart my-app
+    ./existing-restore-command --source "$predecessor"
     ;;
-  prepare|pre-drain|drain|stop|pre-start|finalize)
+  inspect)
+    ./existing-status-command
+    printf 'state=ready\n'
     ;;
   *)
     echo "unknown operation: $operation" >&2
@@ -140,47 +113,9 @@ case "$operation" in
 esac
 ```
 
-## PowerShell template
+## Runtime ownership
 
-```powershell
-$ErrorActionPreference = 'Stop'
-
-if ($args.Count -lt 1) { throw 'missing operation' }
-$Operation = $args[0]
-$Values = @{}
-
-for ($i = 1; $i -lt $args.Count; ) {
-    if ($args[$i] -eq '--') { break }
-    if ($i + 1 -ge $args.Count) { throw "missing value for $($args[$i])" }
-    $Values[$args[$i]] = $args[$i + 1]
-    $i += 2
-}
-
-if ($Values['--protocol'] -ne '1') { throw 'unsupported protocol' }
-
-switch ($Operation) {
-    'preflight' {
-        if (-not (Test-Path "$($Values['--candidate'])\my-app.exe")) { exit 1 }
-    }
-    'activate' {
-        Copy-Item "$($Values['--candidate'])\my-app.conf" 'C:\ProgramData\MyApp\my-app.conf'
-    }
-    'start' { Start-Service 'MyApp' }
-    { $_ -in 'verify', 'periodic' } {
-        if ((Get-Service 'MyApp').Status -ne 'Running') { exit 1 }
-    }
-    'rollback' {
-        Copy-Item "$($Values['--predecessor'])\my-app.conf" 'C:\ProgramData\MyApp\my-app.conf'
-        Restart-Service 'MyApp'
-    }
-    { $_ -in 'prepare', 'pre-drain', 'drain', 'stop', 'pre-start', 'finalize' } {}
-    default { throw "unknown operation: $Operation" }
-}
-```
-
-## Replay requirements
-
-The agent may crash after a reconciler succeeds but before phase completion is durably recorded.
-It will then invoke the same operation again with the same attempt ID. Each operation must
-therefore converge when replayed. Use atomic replacement, compare-before-write, idempotent service
-commands, and attempt-scoped state rather than assuming exactly-once execution.
+In `managed` mode updatedc owns the application process and performs its internal drain/stop/start
+around `apply` or `rollback`. In `provider-managed` mode the reconciler owns workload processes;
+`apply` and `rollback` must converge them as part of their domain behavior. Both modes use the same
+four-operation interface.

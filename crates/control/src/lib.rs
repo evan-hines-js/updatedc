@@ -19,11 +19,28 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 /// Identifies an `updated` guardian control channel. Fixed forever.
 pub const MAGIC: [u8; 4] = *b"UGRD";
 /// Version of the framing layer itself (length-prefix + preamble rules).
 pub const FRAMING_VERSION: u8 = 1;
+
+/// Where a node's `bootstrap.toml` lives — the one canonical location, defined here rather than
+/// restated by each deployment adapter.
+///
+/// A node's entire local configuration is this single file, so its location is part of the node
+/// contract rather than a per-deployment choice: an installer places it here, a lifecycle owner
+/// needs no argument to find it, and a co-resident process that must learn which fleet node it is
+/// running on has exactly one place to look. `--supervisor-config` still exists for a non-standard
+/// layout, but nothing standard should need it.
+///
+/// Deliberately outside the writable state directory: the config is installer-owned and read-only,
+/// one of the two things that must never be forged.
+#[cfg(not(windows))]
+pub const DEFAULT_BOOTSTRAP_CONFIG: &str = "/etc/updated/bootstrap.toml";
+#[cfg(windows)]
+pub const DEFAULT_BOOTSTRAP_CONFIG: &str = r"C:\Program Files\updated\bootstrap.toml";
 
 /// The inherited control-channel endpoint: a file-descriptor number on Unix, a handle
 /// value on Windows.
@@ -51,6 +68,51 @@ pub const SERVICE_EXITED_MARKER_FILE: &str = "service-exited";
 /// the *rejection* — the guardian keeps no rejection set of its own, only this one dumb
 /// marker; deciding what it means is the supervisor's job.
 pub const REJECTED_SUPERVISOR_FILE: &str = "rejected-supervisor";
+
+/// Filename, under the state directory, holding the path of the COMMITTED supervisor binary — the
+/// one the guardian launches, and the one it rolls back to when a candidate fails its readiness
+/// gate. Shared durable layout, not a wire message: the guardian moves this pointer, and the
+/// supervisor must read it (its staging-cache GC has to know which content-addressed directory is
+/// the guardian's rollback target, or it can delete the binary the guardian is about to need).
+pub const DESIRED_SUPERVISOR_FILE: &str = "desired-supervisor";
+
+/// First line of a supervisor pointer file, naming the frozen format of the rest.
+const SUPERVISOR_POINTER_HEADER: &str = "supervisor-v1";
+
+/// Encode a supervisor pointer file's contents. The path must be valid UTF-8 (state-dir paths are
+/// checked for that at startup), so the record stays plain text.
+pub fn encode_supervisor_pointer(target: &Path) -> io::Result<String> {
+    let target = target
+        .to_str()
+        .ok_or_else(|| io::Error::other("supervisor path is not valid UTF-8"))?;
+    Ok(format!("{SUPERVISOR_POINTER_HEADER}\n{target}\n"))
+}
+
+/// Decode a supervisor pointer file's contents, refusing anything that is not exactly the header
+/// line followed by one non-empty path.
+pub fn decode_supervisor_pointer(text: &str) -> io::Result<PathBuf> {
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_string());
+    let mut lines = text.lines();
+    if lines.next() != Some(SUPERVISOR_POINTER_HEADER) {
+        return Err(invalid("invalid supervisor pointer header"));
+    }
+    let path = lines
+        .next()
+        .ok_or_else(|| invalid("supervisor pointer path is missing"))?;
+    if path.is_empty() || lines.next().is_some() {
+        return Err(invalid("supervisor pointer record is malformed"));
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// Read a supervisor pointer file, or `None` when it does not exist yet.
+pub fn read_supervisor_pointer(path: &Path) -> io::Result<Option<PathBuf>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => decode_supervisor_pointer(&text).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 /// The protocol major this build implements.
 pub const PROTOCOL_MAJOR: u16 = 1;

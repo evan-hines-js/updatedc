@@ -69,7 +69,12 @@ fn select_update_from(
         // A head-version candidate that isn't those bytes is skipped so descent continues
         // to a lower, well-defined version rather than picking an ambiguous sibling.
         if let (Some(ceiling), Some(head_sha)) = (ceiling, head_sha) {
-            if &version == ceiling && target_sha(&target) != head_sha {
+            // Case-insensitively, like `TrustedRepository::exact_target`: `head_sha` is the raw
+            // `application.sha256` from a signed assignment, which validates as hex in any case.
+            // A case-sensitive comparison here would skip the very bytes the control plane
+            // assigned whenever that digest arrived upper- or mixed-case, and ordered fallback
+            // would descend past the head instead of installing it.
+            if &version == ceiling && !target_sha(&target).eq_ignore_ascii_case(head_sha) {
                 note_skip(&format!(
                     "skipping {version}: not the assigned head bytes (sha256 mismatch)"
                 ));
@@ -116,13 +121,15 @@ pub struct SelectedRelease {
     /// The provider set signed *into this app version* — populated only when ordered
     /// fallback descended below the assigned head. `None` at the assigned head, where the
     /// assignment's own `provider_set` governs (so providers stay independently revisable).
-    pub provider_set: Option<updated::config::TargetReference>,
+    pub provider_set: Option<updated_contracts::artifact::TargetReference>,
 }
 
 /// The provider set an application target was published with, read from its signed custom
 /// metadata (see [`crate::repo::PublishTarget::with_provider_set`]). Absent for app targets
 /// published without a bound provider set.
-fn signed_provider_set(target: &VerifiedTarget) -> Option<updated::config::TargetReference> {
+fn signed_provider_set(
+    target: &VerifiedTarget,
+) -> Option<updated_contracts::artifact::TargetReference> {
     serde_json::from_value(target.custom.get("provider_set")?.clone()).ok()
 }
 
@@ -273,21 +280,6 @@ impl TrustedRepository {
         destination: &std::path::Path,
     ) -> Result<(), crate::Error> {
         self.download_target(&selected.target, destination).await
-    }
-
-    pub async fn stage_update(
-        &self,
-        policy: &DefaultPolicy,
-        current: Option<&str>,
-        destination: &std::path::Path,
-        note_skip: impl FnMut(&str),
-        rejected: impl FnMut(&VerifiedTarget, &str) -> bool,
-    ) -> Result<Option<SelectedRelease>, crate::Error> {
-        let Some(selected) = self.select_release(policy, current, note_skip, rejected) else {
-            return Ok(None);
-        };
-        self.stage_release(&selected, destination).await?;
-        Ok(Some(selected))
     }
 }
 
@@ -460,27 +452,28 @@ mod provider_binding {
         format!("products/app/stable/{version}/{OS}-{ARCH}/app")
     }
 
-    fn runtime() -> updated::config::ManagedRuntime {
-        updated::config::ManagedRuntime {
-            mode: updated::config::RuntimeMode::Managed,
+    fn runtime() -> updated_contracts::assignment::ManagedRuntime {
+        updated_contracts::assignment::ManagedRuntime {
+            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
             args: vec![],
             secrets: vec![],
-            repository: updated::config::ManagedRepositoryLimits {
+            inputs: std::collections::BTreeMap::new(),
+            repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,
                 transport_timeout_seconds: 1,
             },
-            storage: updated::config::ManagedStorage {
+            storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
                 inactive_supervisors: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
-            timeouts: updated::config::ManagedTimeouts {
+            timeouts: updated_contracts::assignment::ManagedTimeouts {
                 check_interval_seconds: 1,
                 health_grace_seconds: 1,
                 health_successes: 1,
@@ -548,18 +541,18 @@ mod provider_binding {
             .await
             .unwrap();
         // The assigned head is 2.0.0 + provider set B — both published together.
-        repository.assignment = Some(updated::config::RepositoryAssignment {
-            schema: 2,
+        repository.assignment = Some(updated_contracts::assignment::RepositoryAssignment {
+            schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
             deployment: "deploy".into(),
             metadata_url: source.metadata_url.clone(),
             targets_url: source.targets_url.clone(),
             report_url: None,
-            application: updated::config::TargetReference {
+            application: updated_contracts::artifact::TargetReference {
                 path: app_path("2.0.0"),
                 sha256: head_sha,
             },
             ordered_install_fallback: fallback,
-            provider_set: updated::config::TargetReference {
+            provider_set: updated_contracts::artifact::TargetReference {
                 path: "provider-sets/b.json".into(),
                 sha256: "b".repeat(64),
             },

@@ -102,9 +102,9 @@ fn override_path(path: &Path) -> PathBuf {
 /// candidates use `repository-lineage:digest`, preventing a rejection in one metadata
 /// lineage from poisoning a different lineage that happens to reuse the same bytes.
 fn digest_key(hash: &str) -> Result<String, String> {
-    let valid = crate::hash::is_sha256_hex(hash)
+    let valid = updated_contracts::is_sha256_hex(hash)
         || hash.split_once(':').is_some_and(|(lineage, digest)| {
-            crate::hash::is_sha256_hex(lineage) && crate::hash::is_sha256_hex(digest)
+            updated_contracts::is_sha256_hex(lineage) && updated_contracts::is_sha256_hex(digest)
         });
     if !valid {
         return Err(format!(

@@ -2,9 +2,9 @@
 # URLs, user, and intervals for your deployment, then install as:
 # Ownership terminology is defined canonically in deploy/README.md.
 #
-#   install -m0644 selfupdate-supervisor.service /etc/systemd/system/
+#   install -m0644 updated-supervisor.service /etc/systemd/system/
 #   systemctl daemon-reload
-#   systemctl enable --now selfupdate-supervisor
+#   systemctl enable --now updated-supervisor
 #
 # systemd is the root PROCESS supervisor. It manages the lifecycle of the tiny,
 # installer-owned BOOTSTRAP. The bootstrap launches the committed supervisor pointer and
@@ -38,7 +38,10 @@ Type=simple
 # The bootstrap is installer-owned and read-only; it never updates itself, so it
 # lives outside the writable state directory. The initial supervisor is installer-owned;
 # later verified candidates live content-addressed under the state directory.
-ExecStart=/usr/lib/selfupdate/bootstrap --state-dir /var/lib/selfupdate --supervisor-config /etc/selfupdate/bootstrap.toml --supervisor /usr/lib/selfupdate/supervisor --ready-timeout 60 --confirm-timeout 30 --probe-address 127.0.0.1:9090
+#
+# No --supervisor-config: the bootstrap reads the canonical /etc/updated/bootstrap.toml.
+# Pass it only if this deployment puts the config somewhere else.
+ExecStart=/usr/lib/updated/bootstrap --state-dir /var/lib/updated --supervisor /usr/lib/updated/supervisor --ready-timeout 60 --confirm-timeout 30 --probe-address 127.0.0.1:9090
 
 # Relaunch the bootstrap if it ever crashes. The start-limit defaults stop a
 # crash-looping build after a few tries; each guardian relaunch restores the tower.
@@ -54,14 +57,14 @@ TimeoutStopSec=30
 #     binary self-update, so they live under the writable state directory (which
 #     also holds the commit journal and the TUF metadata cache). The bootstrap and
 #     the pinned TUF root — the two anchors of trust — stay read-only. ---
-User=selfupdate
-Group=selfupdate
-StateDirectory=selfupdate
+User=updated
+Group=updated
+StateDirectory=updated
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/selfupdate
+ReadWritePaths=/var/lib/updated
 
 [Install]
 WantedBy=multi-user.target

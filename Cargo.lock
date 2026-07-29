@@ -732,6 +732,7 @@ dependencies = [
  "libc",
  "serde_json",
  "updated",
+ "updated-contracts",
  "ureq",
  "windows-sys 0.59.0",
 ]
@@ -2791,6 +2792,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "updated",
+ "updated-contracts",
  "updated-tuf",
 ]
 
@@ -2947,9 +2949,11 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "update-client",
  "updated",
+ "updated-contracts",
  "updated-tuf",
  "windows-sys 0.59.0",
 ]
@@ -3420,6 +3424,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
+ "base64",
  "chrono",
  "foundation",
  "futures",
@@ -3436,7 +3441,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -3445,6 +3449,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "updated",
+ "updated-contracts",
  "updated-tuf",
  "x509-parser",
 ]
@@ -3484,6 +3489,7 @@ dependencies = [
  "tough",
  "updatec",
  "updated",
+ "updated-contracts",
  "updated-tuf",
  "url",
 ]
@@ -3494,6 +3500,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "foundation",
+ "futures",
  "hex",
  "rcgen",
  "reqwest 0.13.4",
@@ -3505,8 +3512,22 @@ dependencies = [
  "tar",
  "tempfile",
  "toml",
+ "updated-contracts",
  "url",
+ "x509-parser",
  "zstd",
+]
+
+[[package]]
+name = "updated-contracts"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64",
+ "hex",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -3524,6 +3545,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "updated",
+ "updated-contracts",
 ]
 
 [[package]]
@@ -3543,6 +3565,7 @@ dependencies = [
  "tokio",
  "tough",
  "updated",
+ "updated-contracts",
  "url",
 ]
 

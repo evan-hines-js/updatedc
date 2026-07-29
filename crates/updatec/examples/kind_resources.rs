@@ -49,7 +49,10 @@ fn deployment(
 ) -> DeploymentSpec {
     DeploymentSpec {
         name: name.into(),
-        report_url: "http://updatec.updated-system.svc:8080/v1/telemetry".into(),
+        // `updated_contracts::telemetry::report_url` appends the canonical
+        // `/telemetry/<node>.json` key.
+        // Point at the authenticated gateway base, not a second hand-written telemetry route.
+        report_url: "https://updatec-gateway".into(),
         release_repository: ReleaseRepositorySpec {
             metadata_url: format!("https://release-{name}/metadata/"),
             targets_url: format!("https://release-{name}/targets/"),
@@ -94,6 +97,8 @@ fn main() {
                 selector: LabelSelector {
                     match_labels: BTreeMap::from([("updated.dev/role".into(), "edge".into())]),
                 },
+                depends_on: vec![],
+                inputs: BTreeMap::new(),
                 deployment: deployment(
                     "default",
                     "1.0.0",
@@ -121,6 +126,8 @@ fn main() {
                 selector: LabelSelector {
                     match_labels: BTreeMap::from([("updated.dev/role".into(), name.into())]),
                 },
+                depends_on: vec![],
+                inputs: BTreeMap::new(),
                 deployment: deployment(name, version, &platform, sha, &provider_sha, &root),
                 max_unavailable: None,
             },
@@ -148,7 +155,10 @@ fn main() {
             },
             s3: S3Destination {
                 bucket: "updates".into(),
-                prefix: String::new(),
+                // A real prefix, never the bucket root: the repository's published artifacts must
+                // be scoped to something the delete finalizer can prune without reaching the
+                // release TUF repository that shares this bucket.
+                prefix: "routing".into(),
                 region: "us-east-1".into(),
                 credentials_secret_ref: Some(LocalSecretReference {
                     name: "s3-credentials".into(),

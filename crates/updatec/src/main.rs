@@ -46,17 +46,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert: std::path::Path::new(&tls_dir).join("tls.crt"),
             key: std::path::Path::new(&tls_dir).join("tls.key"),
             client_ca: std::path::Path::new(&tls_dir).join("ca.crt"),
+            enrollment_client_cn: std::env::var("UPDATED_ENROLLMENT_CLIENT_CN")
+                .unwrap_or_else(|_| "updated-agent".into()),
         };
         // The join endpoint signs node CSRs with the fleet CA — the same cert-manager CA the gateway
         // trusts as its client CA, mounted here with its private key so leaves it mints are accepted
         // on the mTLS listener. Standard cert-manager keys are tls.crt / tls.key.
         let ca_dir =
             std::env::var("UPDATED_ISSUING_CA_DIR").unwrap_or_else(|_| "/etc/issuing-ca".into());
-        let ca_cert = std::fs::read_to_string(std::path::Path::new(&ca_dir).join("tls.crt"))
-            .map_err(|error| format!("reading issuing CA certificate: {error}"))?;
-        let ca_key = std::fs::read_to_string(std::path::Path::new(&ca_dir).join("tls.key"))
-            .map_err(|error| format!("reading issuing CA key: {error}"))?;
-        let ca = std::sync::Arc::new(updatec::join::IssuingCa::load(&ca_cert, &ca_key)?);
+        // Paths, not contents: cert-manager rotates these in place and the gateway re-reads them.
+        let issuing_ca = updatec::gateway::IssuingCaPaths {
+            cert: std::path::Path::new(&ca_dir).join("tls.crt"),
+            key: std::path::Path::new(&ca_dir).join("tls.key"),
+        };
         return updatec::gateway::serve(
             updatec::gateway::GatewayAddresses {
                 data: addr,
@@ -65,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store,
             destination.prefix,
             enrollment,
-            ca,
+            issuing_ca,
             tls,
         )
         .await

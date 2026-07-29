@@ -57,20 +57,30 @@ pub async fn generate(dir: &Path, server_sans: &[String]) -> R {
     let mut client_params = CertificateParams::new(Vec::<String>::new())?;
     client_params
         .distinguished_name
-        .push(DnType::CommonName, "updated agent");
+        .push(DnType::CommonName, "updated-agent");
     client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key)?;
 
-    write(dir, "ca.crt", &ca_cert.pem()).await?;
-    write(dir, "server.crt", &server_cert.pem()).await?;
-    write(dir, "server.key", &server_key.serialize_pem()).await?;
-    write(dir, "client.crt", &client_cert.pem()).await?;
-    write(dir, "client.key", &client_key.serialize_pem()).await?;
+    write_public(dir, "ca.crt", &ca_cert.pem()).await?;
+    write_public(dir, "server.crt", &server_cert.pem()).await?;
+    write_private(dir, "server.key", &server_key.serialize_pem())?;
+    write_public(dir, "client.crt", &client_cert.pem()).await?;
+    write_private(dir, "client.key", &client_key.serialize_pem())?;
     Ok(())
 }
 
-async fn write(dir: &Path, name: &str, pem: &str) -> R {
+/// Certificates are public material — anyone who can reach the gateway already sees them.
+async fn write_public(dir: &Path, name: &str, pem: &str) -> R {
     tokio::fs::write(dir.join(name), pem).await?;
+    Ok(())
+}
+
+/// A private key goes through the one durable write, which commits the file owner-only — the same
+/// path the agent's enrollment key and the TUF role keys take. `tokio::fs::write` would leave it at
+/// the process umask (world-readable by default), handing the gateway's server key and the shared
+/// fleet client key to every local account.
+fn write_private(dir: &Path, name: &str, pem: &str) -> R {
+    foundation::durable::atomic_write(&dir.join(name), ".key-", pem.as_bytes())?;
     Ok(())
 }

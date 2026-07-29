@@ -132,7 +132,11 @@ pub(crate) const DEMO_REQUIRED_POD_CAPACITY: usize =
 /// it cannot reduce serving capacity. Must stay `>= 1` for 100% uptime — a compile error here
 /// means the layout would drain a set.
 pub(crate) const DEMO_UPTIME_MARGIN: usize =
-    DEMO_GROUPS_PER_SET * DEMO_COHORT_SIZE - (DEMO_GROUPS_PER_SET - 1) * DEMO_COHORT_SIZE;
+    (DEMO_GROUPS_PER_SET - DEMO_CHAOS_MAX_GROUPS_PER_SET) * DEMO_COHORT_SIZE;
+// Written as "the groups that are NOT rolling", which is what the floor actually is. Subtracting
+// the rolling groups from the total the other way around yields the *rolling* count — a value that
+// is `>= 1` whenever the cohort is non-empty, so the assertion held no matter how the layout was
+// configured, including a one-group-per-set layout that drains a set completely.
 const _: () = assert!(
     DEMO_UPTIME_MARGIN >= 1,
     "demo layout would drain a set below its SLA: increase DEMO_COHORT_SIZE or DEMO_GROUPS_PER_SET"

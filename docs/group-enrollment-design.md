@@ -71,6 +71,13 @@ Node:
   - persist agent.key (0600) + agent.crt to state dir
   - from now on: identity = { state/agent.crt, state/agent.key, bootstrap.ca }
   - proceed as steady state: mTLS gateway, TUF, signed telemetry
+
+Before expiry:
+  - build a CSR with the same durable agent.key
+  - POST /renew { csr } over mTLS, presenting the current per-node certificate
+  - gateway derives the node name only from that verified certificate
+  - gateway requires the UpdateAgent repository and pinned public key to match
+  - persist the replacement leaf and restart the supervisor to rebuild every client
 ```
 
 Group routing is by selector only: the agent carries the repository's enrollment
@@ -104,10 +111,10 @@ is what makes it so.
 - **Rotate the fleet cert** = cert-manager re-issues the enrollment Secret; nodes that
   already hold their own node certs are unaffected (they never use the enrollment cert
   for steady-state traffic).
-- **v0 scope:** **bounded leaf TTL (90-day default, `join::LEAF_CERT_TTL_DAYS`)** so a
-  leaked leaf is time-limited, not permanent — **no renewal endpoint yet** (documented
-  follow-up: `/renew` over mTLS with the current cert, which makes an even shorter TTL
-  sustainable). Enrollments are logged.
+- **Bounded leaf TTL (90-day default, `join::LEAF_CERT_TTL_DAYS`)** limits a leaked leaf.
+  The supervisor checks twice daily and renews during the final 30 days through the authenticated
+  `/renew` path. An already-expired identity fails closed and requires operator re-enrollment.
+  Enrollments and renewals are logged.
 
 ## Future: approval gate
 

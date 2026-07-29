@@ -31,11 +31,31 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(digest(&SHA256, bytes).as_ref())
 }
 
-/// Whether `s` is a syntactically valid SHA-256 digest: exactly 64 ASCII hex
-/// characters. The one definition of that shape, shared by the bundle manifest and
-/// the rejection record.
-pub fn is_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+/// An incremental SHA-256, for the digests computed over several fields rather than one buffer
+/// (a publication plan, a secret bundle). Wraps the same `aws-lc-rs` backend as [`sha256_bytes`]
+/// and [`sha256_file`], so every digest the system produces — one-shot or streamed — still comes
+/// from the one crypto library, with no second implementation to drift against.
+pub struct Sha256Hasher(Context);
+
+impl Sha256Hasher {
+    pub fn new() -> Self {
+        Self(Context::new(&SHA256))
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Consume the hasher and return the lowercase-hex digest.
+    pub fn finish_hex(self) -> String {
+        hex::encode(self.0.finish().as_ref())
+    }
+}
+
+impl Default for Sha256Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Verify the file at `path` hashes to `expected`: propagate a read error, and
@@ -87,14 +107,5 @@ mod tests {
     fn missing_file_is_error_for_verify() {
         let f = tmp("absent");
         assert!(verify_file(&f, &"0".repeat(64)).is_err());
-    }
-
-    #[test]
-    fn is_sha256_hex_accepts_only_64_hex_chars() {
-        assert!(is_sha256_hex(&"a".repeat(64)));
-        assert!(is_sha256_hex(&"A".repeat(64))); // any ASCII hex case
-        assert!(!is_sha256_hex(&"a".repeat(63)), "too short");
-        assert!(!is_sha256_hex(&"a".repeat(65)), "too long");
-        assert!(!is_sha256_hex(&format!("{}z", "a".repeat(63))), "non-hex");
     }
 }

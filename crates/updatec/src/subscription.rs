@@ -31,6 +31,18 @@ pub struct UpdateEvent {
     pub delivered_at: String,
 }
 
+/// How many missed generations one subscription may be caught up on in a single reconcile. Delivery
+/// is synchronous and inline in the reconcile loop, and the catch-up length is unbounded (a new
+/// subscription starts at mark 0 against a repository that may have published tens of thousands of
+/// generations). The mark is persisted from whatever was actually acknowledged, so a longer backlog
+/// simply resumes next pass instead of holding rollout, telemetry, and publication hostage.
+const MAX_EVENTS_PER_PASS: usize = 64;
+
+/// Total time all subscription delivery may consume in one reconcile. Bounds the *aggregate*: many
+/// slow-but-succeeding subscribers must not add up to a stalled control plane the way one long
+/// catch-up must not.
+const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Whether a subscription with the given optional `repositoryRef` covers `repository`. `None` means
 /// every repository in the namespace; `Some(name)` means only that one.
 fn covers(repository_ref: Option<&str>, repository: &str) -> bool {
@@ -41,7 +53,14 @@ fn covers(repository_ref: Option<&str>, repository: &str) -> bool {
 /// `version`: `mark + 1 ..= version`, one event each. Empty when the subscriber is already current
 /// (or somehow ahead, which is treated as current — the mark never moves backward).
 fn pending(mark: u64, version: u64) -> impl Iterator<Item = u64> {
-    (mark + 1)..=version.max(mark)
+    // The `mark < version` guard is what makes `mark + 1` unreachable at `u64::MAX`: `mark` is read
+    // back from the subscription's `.status`, which anyone with patch-status on the CR can set, and
+    // release builds keep `overflow-checks`, so an unguarded increment would panic the reconcile
+    // loop on a hostile mark. A mark at or ahead of `version` is owed nothing either way.
+    (mark < version)
+        .then(|| (mark + 1)..=version)
+        .into_iter()
+        .flatten()
 }
 
 /// HMAC-SHA256 of `body` under `key`, lowercase hex — the value placed in `X-Updated-Signature`
@@ -89,7 +108,15 @@ pub async fn deliver_updates(
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let deadline = std::time::Instant::now() + DELIVERY_BUDGET;
     for sub in subscriptions.list(&ListParams::default()).await? {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                repository,
+                "subscription delivery budget spent; remaining subscribers resume next reconcile"
+            );
+            break;
+        }
         if !covers(
             sub.spec.repository_ref.as_ref().map(|r| r.name.as_str()),
             repository,
@@ -117,15 +144,17 @@ pub async fn deliver_updates(
             mark,
             version,
             now,
+            deadline,
         )
         .await;
     }
     Ok(())
 }
 
-/// Deliver every pending generation to a single subscription, in order, stopping at the first
-/// failure. The high-water mark and status condition are written from whatever was actually
-/// acknowledged — a partial catch-up persists its progress and resumes next reconcile.
+/// Deliver pending generations to a single subscription, in order, stopping at the first failure —
+/// and at [`MAX_EVENTS_PER_PASS`] or `deadline`, whichever comes first. The high-water mark and
+/// status condition are written from whatever was actually acknowledged, so a bounded pass is
+/// simply progress: the remainder resumes next reconcile.
 #[allow(clippy::too_many_arguments)]
 async fn deliver_one(
     subscriptions: &Api<UpdateSubscription>,
@@ -139,6 +168,7 @@ async fn deliver_one(
     mark: u64,
     version: u64,
     now: &str,
+    deadline: std::time::Instant,
 ) {
     let name = sub.name_any();
 
@@ -152,6 +182,7 @@ async fn deliver_one(
                     &name,
                     repository,
                     mark,
+                    now,
                     None,
                     &format!("resolving webhook secret: {error}"),
                 )
@@ -163,7 +194,10 @@ async fn deliver_one(
     };
 
     let mut delivered = mark;
-    for target in pending(mark, version) {
+    for target in pending(mark, version).take(MAX_EVENTS_PER_PASS) {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         let event = UpdateEvent {
             repository: repository.to_string(),
             namespace: namespace.to_string(),
@@ -180,6 +214,7 @@ async fn deliver_one(
                     &name,
                     repository,
                     delivered,
+                    now,
                     None,
                     &format!("encoding event: {error}"),
                 )
@@ -206,6 +241,7 @@ async fn deliver_one(
                     &name,
                     repository,
                     delivered,
+                    now,
                     None,
                     &format!("webhook returned HTTP {}", response.status()),
                 )
@@ -218,6 +254,7 @@ async fn deliver_one(
                     &name,
                     repository,
                     delivered,
+                    now,
                     None,
                     &format!("posting to webhook: {error}"),
                 )
@@ -226,7 +263,16 @@ async fn deliver_one(
             }
         }
     }
-    record(subscriptions, &name, repository, delivered, Some(now), "").await;
+    record(
+        subscriptions,
+        &name,
+        repository,
+        delivered,
+        now,
+        Some(now),
+        "",
+    )
+    .await;
 }
 
 /// Persist a subscription's delivery progress: advance the per-repository mark to `delivered`, set a
@@ -238,6 +284,7 @@ async fn record(
     name: &str,
     repository: &str,
     delivered: u64,
+    now: &str,
     last_delivery: Option<&str>,
     error: &str,
 ) {
@@ -252,7 +299,10 @@ async fn record(
             format!("stalled at generation {delivered}: {error}")
         },
         observed_generation: None,
-        last_transition_time: last_delivery.unwrap_or("").to_string(),
+        // Always stamped, including on the failure paths. An empty transition time is not a
+        // "never" a reader can interpret — `kubectl` renders it as an epoch and any consumer
+        // sorting conditions by age puts a fresh failure at the bottom.
+        last_transition_time: now.to_string(),
     };
     let mut status = serde_json::json!({
         "deliveredVersions": { repository: delivered },
@@ -301,6 +351,11 @@ mod tests {
             pending(7, 5).count(),
             0,
             "a mark ahead of current never rewinds"
+        );
+        assert_eq!(
+            pending(u64::MAX, 5).count(),
+            0,
+            "a saturated mark owes nothing instead of overflowing the reconcile loop"
         );
     }
 
