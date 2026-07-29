@@ -23,7 +23,7 @@ pub(crate) fn tampered_root_fails_closed(ctx: &Ctx) -> R {
     .health_grace("1s")
     .guardian()?;
     let enrollment_path = dir.join("guardian-state/enrollment.json");
-    let mut enrollment: updated::enrollment::EnrollmentBundle =
+    let mut enrollment: updated_contracts::enrollment::EnrollmentBundle =
         serde_json::from_slice(&std::fs::read(&enrollment_path).map_err(str_err)?)
             .map_err(|error| error.to_string())?;
     enrollment.routing_root.push_str("tampered");

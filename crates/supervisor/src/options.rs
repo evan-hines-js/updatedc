@@ -16,7 +16,7 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
     // one-shot updater never re-derive them by hand and drift apart.
     let paths = cfg.resolve_paths()?;
 
-    let supervisor_update = build_supervisor_update(&cfg, state_dir);
+    let supervisor_update = build_supervisor_update(&cfg, state_dir.clone());
     let secrets =
         secrets::SecretManager::initialize(&cfg.routing, &cfg.deployment, &cfg.application.secrets)
             .await?;
@@ -30,6 +30,10 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
         paths,
         supervisor_update,
         secrets,
+        identity_renewal: IdentityRenewal {
+            bootstrap,
+            state_dir,
+        },
     })
 }
 

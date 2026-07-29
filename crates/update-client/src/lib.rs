@@ -26,6 +26,14 @@ pub struct PreparedApplication {
     pub release: ReleaseId,
     pub version: String,
     pub archive_sha256: String,
+    /// The provider set signed into the version actually selected, or `None` at the assigned head
+    /// (where the assignment's own `provider_set` governs).
+    ///
+    /// Carried out rather than discarded because selection here can descend BELOW the version a
+    /// caller staged providers for — ordered fallback skips bundles rejected since — and a caller
+    /// that cannot see which version it really got would pair an application with another
+    /// version's providers.
+    pub provider_set: Option<updated_tuf::TargetReference>,
 }
 
 #[derive(Debug)]
@@ -153,6 +161,7 @@ pub async fn prepare_assigned_application(
         release: id,
         version: selected.version,
         archive_sha256: selected.sha256,
+        provider_set: selected.provider_set,
     }))
 }
 

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use updated::telemetry::{report_object_key, NodeReport};
+use updated_contracts::telemetry::{report_object_key, NodeReport};
 use updated_healthproxy::{resolve_members, FleetNode, LoadBalancer, Member};
 
 static TEST_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| {
@@ -18,6 +18,10 @@ static TEST_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::
     (pkcs8.as_ref().to_vec(), key.public_key().as_ref().to_vec())
 });
 
+/// A well-formed running digest. Membership follows health, never the digest, but a report
+/// needs one to pass the shared trust gate.
+const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
 /// A CDN standing in for the object store: serves each node's report at
 /// `/telemetry/<node>.json`, 404 for anything it was not given.
 async fn spawn_cdn(reports: Vec<(String, bool)>) -> SocketAddr {
@@ -26,9 +30,9 @@ async fn spawn_cdn(reports: Vec<(String, bool)>) -> SocketAddr {
     let bodies: Vec<(String, String)> = reports
         .into_iter()
         .map(|(node, healthy)| {
-            let mut report = NodeReport::new(&node, "deploy-3", "3.0.0", healthy);
-            report.signature = updated::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
-            let body = serde_json::to_string(&report).unwrap();
+            let report = NodeReport::new(&node, "deploy-3", DIGEST, "3.0.0", DIGEST, healthy);
+            let envelope = updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
+            let body = serde_json::to_string(&envelope).unwrap();
             (format!("/{}", report_object_key(&node)), body)
         })
         .collect();

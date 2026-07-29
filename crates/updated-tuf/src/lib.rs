@@ -19,6 +19,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Duration};
 use tough::schema::{Role, Root, Signed, Snapshot, Target, Targets, Timestamp};
 use tough::{ExpirationEnforcement, Limits, Repository, RepositoryLoader, TargetName};
+use updated::config::MaterializeRuntime;
 use url::Url;
 
 pub mod policy;
@@ -27,6 +28,9 @@ pub mod select;
 mod transport;
 
 pub use policy::{DefaultPolicy, PolicyError};
+/// Re-exported so a consumer of a selection result names the reference type through the crate that
+/// produced it, without depending on the wire-contract crate directly.
+pub use updated_contracts::artifact::TargetReference;
 
 /// A TUF client error, classified so callers can tell a *retryable* network
 /// problem from a *fail-closed* trust failure that must never be retried blindly
@@ -74,29 +78,30 @@ fn classify(e: tough::error::Error) -> Error {
 #[cfg(test)]
 mod error_tests {
     use super::{assignment_identity, transport_timeout, validate_release_url, Error};
-    use updated::config::RepositoryAssignment;
+    use updated_contracts::assignment::RepositoryAssignment;
 
-    fn runtime() -> updated::config::ManagedRuntime {
-        updated::config::ManagedRuntime {
-            mode: updated::config::RuntimeMode::Managed,
+    fn runtime() -> updated_contracts::assignment::ManagedRuntime {
+        updated_contracts::assignment::ManagedRuntime {
+            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
             args: vec![],
             secrets: vec![],
-            repository: updated::config::ManagedRepositoryLimits {
+            inputs: std::collections::BTreeMap::new(),
+            repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,
                 transport_timeout_seconds: 1,
             },
-            storage: updated::config::ManagedStorage {
+            storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
                 inactive_supervisors: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
-            timeouts: updated::config::ManagedTimeouts {
+            timeouts: updated_contracts::assignment::ManagedTimeouts {
                 check_interval_seconds: 1,
                 health_grace_seconds: 1,
                 health_successes: 1,
@@ -144,26 +149,27 @@ mod error_tests {
 
     #[test]
     fn assigned_repositories_have_independent_stable_datastores() {
-        let runtime = || updated::config::ManagedRuntime {
-            mode: updated::config::RuntimeMode::Managed,
+        let runtime = || updated_contracts::assignment::ManagedRuntime {
+            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
             args: vec![],
             secrets: vec![],
-            repository: updated::config::ManagedRepositoryLimits {
+            inputs: std::collections::BTreeMap::new(),
+            repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,
                 transport_timeout_seconds: 1,
             },
-            storage: updated::config::ManagedStorage {
+            storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
                 inactive_supervisors: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
-            timeouts: updated::config::ManagedTimeouts {
+            timeouts: updated_contracts::assignment::ManagedTimeouts {
                 check_interval_seconds: 1,
                 health_grace_seconds: 1,
                 health_successes: 1,
@@ -176,17 +182,17 @@ mod error_tests {
             },
         };
         let assignment = |metadata: &str, targets: &str| RepositoryAssignment {
-            schema: 2,
+            schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
             deployment: "deployment".into(),
             metadata_url: metadata.into(),
             targets_url: targets.into(),
             report_url: None,
-            application: updated::config::TargetReference {
+            application: updated_contracts::artifact::TargetReference {
                 path: "app".into(),
                 sha256: "aa".into(),
             },
             ordered_install_fallback: false,
-            provider_set: updated::config::TargetReference {
+            provider_set: updated_contracts::artifact::TargetReference {
                 path: "providers".into(),
                 sha256: "b".repeat(64),
             },
@@ -203,41 +209,42 @@ mod error_tests {
     #[test]
     fn deployment_changes_do_not_reset_the_tuf_rollback_history() {
         let mut first = RepositoryAssignment {
-            schema: 2,
+            schema: RepositoryAssignment::SCHEMA,
             deployment: "deploy-1".into(),
             metadata_url: "https://cdn/group/metadata/".into(),
             targets_url: "https://cdn/group/targets/".into(),
             report_url: None,
-            application: updated::config::TargetReference {
+            application: updated_contracts::artifact::TargetReference {
                 path: "products/app/stable/1/linux-x86_64/app".into(),
                 sha256: "a".repeat(64),
             },
             ordered_install_fallback: false,
-            provider_set: updated::config::TargetReference {
+            provider_set: updated_contracts::artifact::TargetReference {
                 path: "providers".into(),
                 sha256: "b".repeat(64),
             },
             release_root: serde_json::json!({}),
-            runtime: updated::config::ManagedRuntime {
-                mode: updated::config::RuntimeMode::Managed,
+            runtime: updated_contracts::assignment::ManagedRuntime {
+                mode: updated_contracts::assignment::RuntimeMode::Managed,
                 product: "app".into(),
                 channel: "stable".into(),
                 install_root: "/app".into(),
                 args: vec![],
                 secrets: vec![],
-                repository: updated::config::ManagedRepositoryLimits {
+                inputs: std::collections::BTreeMap::new(),
+                repository: updated_contracts::assignment::ManagedRepositoryLimits {
                     metadata_limit: 1,
                     target_limit: 1,
                     transport_timeout_seconds: 1,
                 },
-                storage: updated::config::ManagedStorage {
+                storage: updated_contracts::assignment::ManagedStorage {
                     inactive_releases: 1,
                     inactive_providers: 1,
                     inactive_supervisors: 1,
                     inactive_bytes: 1,
                     inactive_repository_caches: 1,
                 },
-                timeouts: updated::config::ManagedTimeouts {
+                timeouts: updated_contracts::assignment::ManagedTimeouts {
                     check_interval_seconds: 1,
                     health_grace_seconds: 1,
                     health_successes: 1,
@@ -262,17 +269,17 @@ mod error_tests {
         // identity is the one directory that must survive pruning, because it carries tough's
         // anti-rollback floor. A stale inactive assignment's cache is fair game.
         let active = assignment_identity(&RepositoryAssignment {
-            schema: 2,
+            schema: RepositoryAssignment::SCHEMA,
             deployment: "active".into(),
             metadata_url: "https://cdn/active/metadata/".into(),
             targets_url: "https://cdn/active/targets/".into(),
             report_url: None,
-            application: updated::config::TargetReference {
+            application: updated_contracts::artifact::TargetReference {
                 path: "app".into(),
                 sha256: "aa".into(),
             },
             ordered_install_fallback: false,
-            provider_set: updated::config::TargetReference {
+            provider_set: updated_contracts::artifact::TargetReference {
                 path: "providers".into(),
                 sha256: "b".repeat(64),
             },
@@ -280,17 +287,17 @@ mod error_tests {
             runtime: runtime(),
         });
         let stale = assignment_identity(&RepositoryAssignment {
-            schema: 2,
+            schema: RepositoryAssignment::SCHEMA,
             deployment: "stale".into(),
             metadata_url: "https://cdn/stale/metadata/".into(),
             targets_url: "https://cdn/stale/targets/".into(),
             report_url: None,
-            application: updated::config::TargetReference {
+            application: updated_contracts::artifact::TargetReference {
                 path: "app".into(),
                 sha256: "aa".into(),
             },
             ordered_install_fallback: false,
-            provider_set: updated::config::TargetReference {
+            provider_set: updated_contracts::artifact::TargetReference {
                 path: "providers".into(),
                 sha256: "b".repeat(64),
             },
@@ -370,7 +377,8 @@ pub struct VerifiedTarget {
 pub struct TrustedRepository {
     config: updated::config::RepositorySource,
     repo: Repository,
-    assignment: Option<updated::config::RepositoryAssignment>,
+    assignment: Option<updated_contracts::assignment::RepositoryAssignment>,
+    assignment_sha256: Option<String>,
 }
 
 /// Enroll (or load the one-way preplaced enrollment bundle), verify the current
@@ -404,7 +412,6 @@ pub async fn resolve_managed_config(
         root: routing_root,
         base_url: bundle.routing_base_url.clone(),
         assignment: bundle.assignment.clone(),
-        datastore: None,
         metadata_limit: 1024 * 1024,
         transport_timeout: std::time::Duration::from_secs(30),
         mtls,
@@ -417,15 +424,28 @@ pub async fn resolve_managed_config(
     // re-verifies and reconciles the live assignment every cycle, so a stale or tampered persisted
     // file is corrected within one tick. Any read/parse/validate failure falls back to embedded.
     let embedded = verify_embedded_assignment(&bundle)?;
-    let assignment = persisted_assignment(&embedded.runtime.install_root).unwrap_or(embedded);
+    let assignment = persisted_assignment(&embedded.runtime.install_root)
+        .filter(|persisted| {
+            // The persisted file is ordinary local state, not something this boot can verify: it is
+            // read before any network fetch and its signature is not re-checked here. It may
+            // therefore refine the assignment the enrollment bundle authenticated, but it may not
+            // relocate the node — an `install_root` read out of an unverified file would move the
+            // binary, state, journal, and rejection set the guardian and supervisor operate on,
+            // from a file anyone with write access to the state directory controls.
+            let same_root = persisted.runtime.install_root == embedded.runtime.install_root;
+            if !same_root {
+                foundation::log::warn(
+                    "updated",
+                    "the persisted assignment moves install_root; ignoring it and booting on the \
+                     enrollment-verified assignment",
+                );
+            }
+            same_root
+        })
+        .unwrap_or(embedded);
     assignment
         .runtime
-        .materialize(
-            &assignment.deployment,
-            routing,
-            &assignment.release_root,
-            enrollment_state,
-        )
+        .materialize(&assignment.deployment, routing)
         .map_err(Error::Trust)
 }
 
@@ -433,13 +453,16 @@ pub async fn resolve_managed_config(
 /// `<install_root>/state/repository-assignment.json` (see [`updated::config::Paths::resolve_paths`],
 /// which derives the same path). Returned only when it parses and structurally validates, so any
 /// failure leaves the caller on the enrollment-embedded assignment.
-fn persisted_assignment(install_root: &Path) -> Option<updated::config::RepositoryAssignment> {
+fn persisted_assignment(
+    install_root: &Path,
+) -> Option<updated_contracts::assignment::RepositoryAssignment> {
     // Mirrors `resolve_paths`: state_dir = <install_root>/state, assignment = state_dir/…json.
     let path = install_root
         .join("state")
         .join("repository-assignment.json");
     let bytes = std::fs::read(path).ok()?;
-    let assignment: updated::config::RepositoryAssignment = serde_json::from_slice(&bytes).ok()?;
+    let assignment: updated_contracts::assignment::RepositoryAssignment =
+        serde_json::from_slice(&bytes).ok()?;
     assignment.validate().ok()?;
     Some(assignment)
 }
@@ -448,8 +471,8 @@ fn persisted_assignment(install_root: &Path) -> Option<updated::config::Reposito
 /// the exact managed assignment it authenticates. This is the offline installer path:
 /// no network operation is permitted or required.
 fn verify_embedded_assignment(
-    bundle: &updated::enrollment::EnrollmentBundle,
-) -> Result<updated::config::RepositoryAssignment, Error> {
+    bundle: &updated_contracts::enrollment::EnrollmentBundle,
+) -> Result<updated_contracts::assignment::RepositoryAssignment, Error> {
     let root_bytes = bundle.routing_root.as_bytes();
     let timestamp_bytes = bundle.initial.timestamp.as_bytes();
     let snapshot_bytes = bundle.initial.snapshot.as_bytes();
@@ -512,7 +535,8 @@ fn verify_embedded_assignment(
         ));
     }
     verify_embedded_target(&targets, &bundle.assignment, agent_bytes, "agent document")?;
-    let agent: updated::config::AgentDocument = parse_embedded(agent_bytes, "agent document")?;
+    let agent: updated_contracts::artifact::AgentDocument =
+        parse_embedded(agent_bytes, "agent document")?;
     agent.validate().map_err(Error::Trust)?;
     verify_embedded_target(
         &targets,
@@ -526,7 +550,7 @@ fn verify_embedded_assignment(
             "embedded managed configuration digest does not match agent document".into(),
         ));
     }
-    let assignment: updated::config::RepositoryAssignment =
+    let assignment: updated_contracts::assignment::RepositoryAssignment =
         parse_embedded(config_bytes, "managed configuration")?;
     assignment.validate().map_err(Error::Trust)?;
     Ok(assignment)
@@ -576,6 +600,14 @@ fn verify_embedded_target(
     Ok(())
 }
 
+/// A verified routing assignment together with the digest of the exact document it came from.
+pub struct ResolvedAssignment {
+    pub assignment: updated_contracts::assignment::RepositoryAssignment,
+    /// SHA-256 (hex) of the signed assignment bytes — the content identity the node reports so the
+    /// control plane can distinguish two revisions of one deployment name.
+    pub sha256: String,
+}
+
 impl TrustedRepository {
     /// Resolve only the signed routing document. This deliberately does not touch the
     /// selected release repository: callers can use the verified managed runtime to
@@ -583,8 +615,8 @@ impl TrustedRepository {
     pub async fn resolve_assignment(
         routing_config: &updated::config::Routing,
         routing_datastore: &Path,
-        assignment_staging: &Path,
-    ) -> Result<updated::config::RepositoryAssignment, Error> {
+        assignment_path: &Path,
+    ) -> Result<ResolvedAssignment, Error> {
         if !routing_config.base_url.ends_with('/') {
             return Err(Error::Local(
                 "routing.base_url must end with '/' so metadata/ and targets/ are children".into(),
@@ -618,22 +650,38 @@ impl TrustedRepository {
                     routing_config.assignment
                 ))
             })?;
-        routing.download_target(&target, assignment_staging).await?;
-        let bytes = tokio::fs::read(assignment_staging)
+        // Download into scratch, never over the live assignment file. That file IS this node's
+        // persisted managed configuration: writing the intermediate agent document into it, or
+        // failing between the two downloads, would leave the node's own config replaced by a
+        // half-resolved document — and the next boot would silently fall back to the
+        // enrollment-frozen assignment instead of the one it is actually running.
+        let staging = updated::config::with_suffix(assignment_path, ".resolving");
+        routing.download_target(&target, &staging).await?;
+        let bytes = tokio::fs::read(&staging)
             .await
             .map_err(|e| Error::Local(format!("reading verified agent document: {e}")))?;
-        let agent: updated::config::AgentDocument = serde_json::from_slice(&bytes)
+        let agent: updated_contracts::artifact::AgentDocument = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Trust(format!("invalid agent document: {e}")))?;
         agent.validate().map_err(Error::Trust)?;
         let config = routing.exact_target(&agent.config)?;
-        routing.download_target(&config, assignment_staging).await?;
-        let bytes = tokio::fs::read(assignment_staging)
+        routing.download_target(&config, &staging).await?;
+        let bytes = tokio::fs::read(&staging)
             .await
             .map_err(|e| Error::Local(format!("reading verified config bundle: {e}")))?;
-        let assignment: updated::config::RepositoryAssignment = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
+        let assignment: updated_contracts::assignment::RepositoryAssignment =
+            serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
         assignment.validate().map_err(Error::Trust)?;
-        Ok(assignment)
+        // Only a complete, verified, validated assignment is committed as the live one.
+        foundation::durable::atomic_write(assignment_path, ".assignment-", &bytes)
+            .map_err(|e| Error::Local(format!("persisting the resolved assignment: {e}")))?;
+        let _ = std::fs::remove_file(&staging);
+        Ok(ResolvedAssignment {
+            // The digest TUF just verified these exact bytes against — the same value the control
+            // plane published this configuration under, and the node's content identity for it.
+            sha256: hex::encode(digest(&SHA256, &bytes).as_ref()),
+            assignment,
+        })
     }
 
     /// Resolve the agent's exact, TUF-verified document and then load the
@@ -645,9 +693,13 @@ impl TrustedRepository {
         storage: &updated::config::Storage,
         paths: &updated::config::Paths,
     ) -> Result<Self, Error> {
-        let assignment =
+        let resolved =
             Self::resolve_assignment(routing_config, &paths.routing_datastore, &paths.assignment)
                 .await?;
+        let ResolvedAssignment {
+            assignment,
+            sha256: assignment_sha256,
+        } = resolved;
         let assignment_key = assignment_identity(&assignment);
         let assignment_store = paths.datastore.join(&assignment_key);
         std::fs::create_dir_all(&assignment_store).map_err(|error| {
@@ -675,6 +727,7 @@ impl TrustedRepository {
         validate_release_url("targets_url", &source.targets_url)?;
         let mut repository = Self::load(&source, &assignment_store).await?;
         repository.assignment = Some(assignment);
+        repository.assignment_sha256 = Some(assignment_sha256);
         // The active assignment's datastore holds tough's version-monotonicity floor
         // (the highest timestamp/snapshot version this node has ever accepted). Pruning it
         // would let the next load restart with no floor and accept an older validly-signed,
@@ -709,6 +762,7 @@ impl TrustedRepository {
             config: config.clone(),
             repo,
             assignment: None,
+            assignment_sha256: None,
         })
     }
 
@@ -754,14 +808,20 @@ impl TrustedRepository {
     }
 
     /// The exact desired deployment authenticated by the routing repository.
-    pub fn assignment(&self) -> Option<&updated::config::RepositoryAssignment> {
+    pub fn assignment(&self) -> Option<&updated_contracts::assignment::RepositoryAssignment> {
         self.assignment.as_ref()
+    }
+
+    /// The content digest of the assignment document this repository was resolved from — what the
+    /// node reports so the control plane can tell which exact configuration it is acting on.
+    pub fn assignment_sha256(&self) -> Option<&str> {
+        self.assignment_sha256.as_deref()
     }
 
     /// Resolve an exact target reference without version or "latest" selection.
     pub fn exact_target(
         &self,
-        reference: &updated::config::TargetReference,
+        reference: &updated_contracts::artifact::TargetReference,
     ) -> Result<VerifiedTarget, Error> {
         let target = self
             .all_targets()
@@ -878,7 +938,7 @@ impl TrustedRepository {
     }
 }
 
-fn assignment_identity(assignment: &updated::config::RepositoryAssignment) -> String {
+fn assignment_identity(assignment: &updated_contracts::assignment::RepositoryAssignment) -> String {
     // Metadata rollback history belongs to a repository endpoint, not a deployment.
     // Changing exact desired targets must reuse the same datastore or every rollout
     // would accidentally reset TUF's remembered version floor.

@@ -71,38 +71,33 @@ fn run_lifecycle_fixture() -> R {
         .map(PathBuf::from)
         .ok_or("missing fixture state directory")?;
     let mode = provider_args.get(fixture + 2).cloned().unwrap_or_default();
+
+    // Inspect is a steady-state observation, not a deployment transaction. The fixture emits
+    // deterministic, non-empty state without touching transaction logs or modeled side effects.
+    if phase == "inspect" {
+        println!("candidate-version={candidate_version}");
+        return Ok(());
+    }
+
     let magnolia_mode = mode.starts_with("magnolia-shaped");
     // The same signed provider now belongs to the installed release from the beginning; there is
     // no provider-less seed path. Magnolia's transactional checks apply only once the
     // Magnolia-shaped candidate is active. The ordinary 1.0.0 predecessor therefore has no
     // Magnolia state to inspect, while periodic checks after the 2.0.0 commit require the
     // migration receipt produced by finalize.
-    if magnolia_mode
-        && candidate_version == "1.0.0"
-        && matches!(phase.as_str(), "verify" | "periodic")
-    {
+    if magnolia_mode && candidate_version == "1.0.0" && phase == "healthcheck" {
         return Ok(());
     }
-    if magnolia_mode && phase == "periodic" {
+    if magnolia_mode && phase == "healthcheck" {
         if root.join("magnolia-state/migration-finalized").is_file() {
             return Ok(());
         }
-        return fail("Magnolia periodic health ran before migration finalized");
+        return fail("Magnolia healthcheck ran before migration finalized");
     }
-    // `pre-start` is a per-boot environment hook with no fixture behavior of its own.
-    if phase == "pre-start" {
-        return Ok(());
-    }
-    // The attempts.log + effects dir model the TRANSACTION phase sequence that the recovery and
-    // attempt-id scenarios assert (they require one attempt id and the exact preflight..rollback
-    // order). Per-boot launch hooks (the first-boot `start`) and the boot health gate (`verify`),
-    // both at attempt id "boot", plus the steady-state `periodic` signal, are NOT transaction
-    // phases, so they must not pollute those records. Only the recording is gated — the health/fail
-    // behavior below still runs for every phase, so an `http-health` periodic probe still detects a
-    // degraded app.
-    let is_transaction_phase =
-        !(id == "boot" && matches!(phase.as_str(), "start" | "verify")) && phase != "periodic";
-    if is_transaction_phase {
+    // Record only deployment operations. Boot and periodic observations use reserved IDs and must
+    // not pollute the transaction history; candidate healthchecks retain the deployment attempt ID.
+    let is_deployment_operation = id != "boot" && id != "periodic";
+    if is_deployment_operation {
         std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
         let mut attempts = std::fs::OpenOptions::new()
             .create(true)
@@ -135,8 +130,8 @@ fn run_lifecycle_fixture() -> R {
         return fail(format!("injected one-shot {phase} failure"));
     }
     let fail_phase = mode.strip_prefix("fail-");
-    let fail_start_and_rollback = mode == "fail-start-and-rollback"
-        && (phase == "rollback" || (phase == "start" && candidate_version == "2.0.0"));
+    let fail_start_and_rollback = mode == "fail-apply-and-rollback"
+        && (phase == "rollback" || (phase == "apply" && candidate_version == "2.0.0"));
     // Ordinary failure modes target the forward candidate only. Rollback reverses the
     // candidate/predecessor variables, and must be allowed to start and verify the restored
     // predecessor. The dedicated rollback mode is the exception used to prove that failed
@@ -154,7 +149,7 @@ fn run_lifecycle_fixture() -> R {
         std::thread::sleep(Duration::from_secs(30));
     }
     if let Some(url) = mode.strip_prefix("http-health=") {
-        if matches!(phase.as_str(), "verify" | "periodic") && http_text(url).is_none() {
+        if phase == "healthcheck" && http_text(url).is_none() {
             return fail(format!("{phase} could not verify {url}"));
         }
         return Ok(());
@@ -164,14 +159,8 @@ fn run_lifecycle_fixture() -> R {
         // fixture deliberately has no additional application policy.
         return Ok(());
     }
-    // A post-drain grace: hold briefly on the post-drain phase (which runs after the
-    // guardian has already flipped readyz to unready) so a readiness-aware load balancer
-    // observes the failed probe and stops routing before the old release is stopped. Every
-    // other phase is a no-op — the point is how little a real drain integration needs.
+    // Draining is entirely agent-owned now; the provider has no drain operation.
     if mode == "drain-grace" {
-        if phase == "drain" {
-            std::thread::sleep(Duration::from_secs(2));
-        }
         return Ok(());
     }
     // The mixed-artifact scenario uses the Magnolia adapter only while the
@@ -192,92 +181,40 @@ fn run_lifecycle_fixture() -> R {
         // and migration. Keep CI deterministic while making timeout and ordering behavior
         // observable instead of accidentally testing a zero-latency wrapper.
         std::thread::sleep(std::time::Duration::from_millis(250));
-        let require = |name: &str| -> R {
-            if state.join(name).is_file() {
-                Ok(())
-            } else {
-                fail(format!("Magnolia phase {phase} ran before {name}"))
+        if phase == "apply" {
+            if candidate_version == "1.0.0" {
+                return Ok(());
             }
-        };
-        let marker = match phase.as_str() {
-            "preflight" => {
-                if std::fs::read_to_string(live.join("content.db")).map_err(str_err)?
-                    != "baseline-content\n"
-                    || std::fs::read_to_string(live.join("app.war")).map_err(str_err)? != "1.0.0\n"
-                {
-                    return fail("Magnolia preflight found an invalid baseline");
-                }
-                "preflight-checked"
+            if std::fs::read_to_string(live.join("content.db")).map_err(str_err)?
+                != "baseline-content\n"
+                || std::fs::read_to_string(live.join("app.war")).map_err(str_err)? != "1.0.0\n"
+            {
+                return fail("Magnolia apply found an invalid baseline");
             }
-            "prepare" => {
-                require("preflight-checked")?;
-                std::fs::create_dir_all(&backup).map_err(str_err)?;
-                std::fs::copy(live.join("content.db"), backup.join("content.db"))
-                    .map_err(str_err)?;
-                std::fs::copy(live.join("app.war"), backup.join("app.war")).map_err(str_err)?;
-                "backup-created"
-            }
-            "pre-drain" => {
-                require("backup-created")?;
-                // The pre-drain hook runs a script while the node is still IN rotation —
-                // before drain withdraws it from traffic. Prove that ordering: the drain
-                // flag must not be set yet.
-                if live.join("draining").exists() {
-                    return fail("Magnolia pre-drain ran after the node was out of rotation");
-                }
-                "pre-drain-script-ran"
-            }
-            "drain" => {
-                require("pre-drain-script-ran")?;
-                std::fs::write(live.join("draining"), b"true\n").map_err(str_err)?;
-                "authors-drained"
-            }
-            "stop" => {
-                require("authors-drained")?;
-                "tomcat-stopped"
-            }
-            "activate" => {
-                require("tomcat-stopped")?;
-                std::fs::write(live.join("app.war"), format!("{candidate_version}\n"))
-                    .map_err(str_err)?;
-                "war-activated"
-            }
-            "start" => {
-                require("war-activated")?;
-                if std::fs::read_to_string(live.join("app.war")).map_err(str_err)?
-                    != format!("{candidate_version}\n")
-                {
-                    return fail("Magnolia started with the wrong WAR");
-                }
-                "tomcat-started"
-            }
-            "verify" => {
-                require("tomcat-started")?;
-                "cms-health-verified"
-            }
-            "finalize" => {
-                require("cms-health-verified")?;
-                std::fs::write(
-                    live.join("content.db"),
-                    format!("migrated-{candidate_version}\n"),
-                )
+            std::fs::create_dir_all(&backup).map_err(str_err)?;
+            std::fs::copy(live.join("content.db"), backup.join("content.db")).map_err(str_err)?;
+            std::fs::copy(live.join("app.war"), backup.join("app.war")).map_err(str_err)?;
+            std::fs::write(live.join("app.war"), format!("{candidate_version}\n"))
                 .map_err(str_err)?;
-                if mode == "magnolia-shaped-fail-finalize" && candidate_version == "2.0.0" {
-                    return fail("injected Magnolia migration finalization failure");
-                }
-                let _ = std::fs::remove_file(live.join("draining"));
-                "migration-finalized"
+            std::fs::write(
+                live.join("content.db"),
+                format!("migrated-{candidate_version}\n"),
+            )
+            .map_err(str_err)?;
+            if mode == "magnolia-shaped-fail-apply" && candidate_version == "2.0.0" {
+                return fail("injected Magnolia apply failure");
             }
-            "rollback" => {
-                std::fs::copy(backup.join("content.db"), live.join("content.db"))
-                    .map_err(str_err)?;
-                std::fs::copy(backup.join("app.war"), live.join("app.war")).map_err(str_err)?;
-                let _ = std::fs::remove_file(live.join("draining"));
-                "rollback-completed"
-            }
-            _ => return fail(format!("unknown Magnolia lifecycle phase {phase}")),
-        };
-        std::fs::write(state.join(marker), id.as_bytes()).map_err(str_err)?;
+            std::fs::write(state.join("migration-finalized"), id.as_bytes()).map_err(str_err)?;
+            return Ok(());
+        }
+        if phase == "rollback" {
+            std::fs::copy(backup.join("content.db"), live.join("content.db")).map_err(str_err)?;
+            std::fs::copy(backup.join("app.war"), live.join("app.war")).map_err(str_err)?;
+            let _ = std::fs::remove_file(live.join("draining"));
+            std::fs::write(state.join("rollback-completed"), id.as_bytes()).map_err(str_err)?;
+            return Ok(());
+        }
+        return fail(format!("unknown Magnolia lifecycle operation {phase}"));
     }
     Ok(())
 }
@@ -348,17 +285,10 @@ fn scenarios() -> Vec<Scenario> {
             "a health-check-failed release stays rejected across a restart",
             persisted_rejection,
         ),
-        ("custom provider preflight failure is contained", provider_preflight_failure),
-        ("custom provider prepare failure is contained", provider_prepare_failure),
-        ("custom provider pre-drain failure is contained", provider_pre_drain_failure),
-        ("custom provider drain failure is contained", provider_drain_failure),
-        ("custom provider stop failure is contained", provider_stop_failure),
-        ("custom provider activate failure rolls back", provider_activate_failure),
-        ("custom provider start failure rolls back", provider_start_failure),
-        ("custom provider verify failure rolls back", provider_verify_failure),
-        ("custom provider finalize failure rolls back", provider_finalize_failure),
-            ("custom provider rollback failure remains recoverable", provider_rollback_failure),
-            ("a wedged (hanging) provider hook is bounded by the timeout at every phase", provider_hook_hangs_are_bounded),
+        ("custom provider apply failure rolls back", provider_apply_failure),
+        ("custom provider healthcheck failure rolls back", provider_healthcheck_failure),
+        ("custom provider rollback failure remains recoverable", provider_rollback_failure),
+        ("a wedged provider operation is bounded by its timeout", provider_hook_hangs_are_bounded),
             ("a Magnolia-shaped Java upgrade wrapper completes every lifecycle step", magnolia_shaped_upgrade),
             ("an install switches sample app -> Magnolia-shaped -> sample app", sample_magnolia_sample_transition),
             ("a failed Magnolia migration restores its WAR and content backup", magnolia_shaped_failed_migration_rolls_back),
@@ -388,7 +318,7 @@ fn scenarios() -> Vec<Scenario> {
     {
         s.push(("the TUF role keys are owner-only (0600)", key_perms));
         s.push((
-            "lifecycle verify gates first install and upgrade",
+            "lifecycle healthcheck gates first install and upgrade",
             lifecycle_verify_gates_readiness,
         ));
         s.push((
@@ -409,14 +339,6 @@ fn scenarios() -> Vec<Scenario> {
     s.push((
         "crash before and after every rollback boundary; recovery remains resumable",
         rollback_chaos_recovery,
-    ));
-    s.push((
-        "crash after an aborted drain does not replay completed lifecycle scripts",
-        aborted_transition_chaos_recovery,
-    ));
-    s.push((
-        "recovery keeps an attempt ID while a later retry receives a fresh one",
-        transition_attempt_ids_are_scoped,
     ));
     s
 }

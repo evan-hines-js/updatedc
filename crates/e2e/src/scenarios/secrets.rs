@@ -105,7 +105,7 @@ pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
     }
 
     let runtime_path = dir.join("assignment-runtime.json");
-    let mut runtime: updated::config::ManagedRuntime =
+    let mut runtime: updated_contracts::assignment::ManagedRuntime =
         serde_json::from_slice(&std::fs::read(&runtime_path).map_err(str_err)?)
             .map_err(|error| error.to_string())?;
     runtime.secrets.clear();

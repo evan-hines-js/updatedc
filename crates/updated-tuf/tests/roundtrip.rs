@@ -69,26 +69,27 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
 
     let root_text = std::fs::read_to_string(repo_dir.join("metadata/root.json")).unwrap();
     let root: serde_json::Value = serde_json::from_str(&root_text).unwrap();
-    let runtime = updated::config::ManagedRuntime {
-        mode: updated::config::RuntimeMode::Managed,
+    let runtime = updated_contracts::assignment::ManagedRuntime {
+        mode: updated_contracts::assignment::RuntimeMode::Managed,
         product: "offline-app".into(),
         channel: "stable".into(),
         install_root: tmp.join("install"),
         args: vec!["serve".into()],
         secrets: vec![],
-        repository: updated::config::ManagedRepositoryLimits {
+        inputs: std::collections::BTreeMap::new(),
+        repository: updated_contracts::assignment::ManagedRepositoryLimits {
             metadata_limit: 1024 * 1024,
             target_limit: 1024 * 1024,
             transport_timeout_seconds: 5,
         },
-        storage: updated::config::ManagedStorage {
+        storage: updated_contracts::assignment::ManagedStorage {
             inactive_releases: 2,
             inactive_providers: 2,
             inactive_supervisors: 2,
             inactive_bytes: 1024 * 1024,
             inactive_repository_caches: 2,
         },
-        timeouts: updated::config::ManagedTimeouts {
+        timeouts: updated_contracts::assignment::ManagedTimeouts {
             check_interval_seconds: 5,
             health_grace_seconds: 5,
             health_successes: 1,
@@ -100,18 +101,18 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             drain_hold_seconds: Some(0),
         },
     };
-    let assignment = updated::config::RepositoryAssignment {
-        schema: 2,
+    let assignment = updated_contracts::assignment::RepositoryAssignment {
+        schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
         deployment: "offline".into(),
         metadata_url: "http://127.0.0.1:9/release/metadata/".into(),
         targets_url: "http://127.0.0.1:9/release/targets/".into(),
         report_url: None,
-        application: updated::config::TargetReference {
+        application: updated_contracts::artifact::TargetReference {
             path: "products/offline-app/stable/1/linux-x86_64/app".into(),
             sha256: "a".repeat(64),
         },
         ordered_install_fallback: false,
-        provider_set: updated::config::TargetReference {
+        provider_set: updated_contracts::artifact::TargetReference {
             path: "provider-sets/default.json".into(),
             sha256: "b".repeat(64),
         },
@@ -121,9 +122,9 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let config_bytes = serde_json::to_vec(&assignment).unwrap();
     let config_sha = updated::hash::sha256_bytes(&config_bytes);
     let config_path = format!("assignments/configs/{config_sha}.json");
-    let agent = updated::config::AgentDocument {
+    let agent = updated_contracts::artifact::AgentDocument {
         schema: 1,
-        config: updated::config::TargetReference {
+        config: updated_contracts::artifact::TargetReference {
             path: config_path.clone(),
             sha256: config_sha,
         },
@@ -169,13 +170,13 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let targets =
         std::fs::read_to_string(repo_dir.join(format!("metadata/{targets_version}.targets.json")))
             .unwrap();
-    let bundle = updated::enrollment::EnrollmentBundle {
+    let bundle = updated_contracts::enrollment::EnrollmentBundle {
         schema: 1,
         agent_id: "offline".into(),
         routing_base_url: "http://127.0.0.1:9/routing/".into(),
         assignment: agent_path.into(),
         routing_root: root_text,
-        initial: updated::enrollment::InitialSignedConfiguration {
+        initial: updated_contracts::enrollment::InitialSignedConfiguration {
             timestamp,
             snapshot,
             targets,
@@ -305,12 +306,7 @@ async fn publish_then_verify_and_download() {
     assert_eq!(selected.version, "1.0.0");
 
     let staged_path = tmp.join("staged");
-    let staged = repo
-        .stage_update(&policy, None, &staged_path, |_| {}, |_, _| false)
-        .await
-        .unwrap()
-        .expect("stages the sole release");
-    assert_eq!(staged.version, "1.0.0");
+    repo.stage_release(&selected, &staged_path).await.unwrap();
     assert_eq!(std::fs::read(&staged_path).unwrap(), b"hello-app-1.0.0");
 
     let out = tmp.join("downloaded");

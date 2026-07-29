@@ -12,7 +12,7 @@ use std::ffi::OsString;
 pub(crate) struct App {
     pub(crate) guardian: Guardian,
     pid: Option<u32>,
-    mode: updated::config::RuntimeMode,
+    mode: updated_contracts::assignment::RuntimeMode,
 }
 
 impl App {
@@ -33,7 +33,7 @@ impl App {
     /// Ask the guardian to (re)launch the application, updating our PID.
     pub(crate) fn launch(&mut self, opts: &Options) -> io::Result<()> {
         self.mode = opts.application.mode;
-        if self.mode == updated::config::RuntimeMode::ProviderManaged {
+        if self.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged {
             self.pid = None;
             return Ok(());
         }
@@ -48,7 +48,7 @@ impl App {
 
 /// Adopt the application the guardian is already running (no restart).
 pub(crate) fn adopt(mut guardian: Guardian, opts: &Options, pid: u32) -> io::Result<App> {
-    if opts.application.mode == updated::config::RuntimeMode::ProviderManaged {
+    if opts.application.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged {
         // The guardian can only offer a PID for a process from the previous managed contract.
         // Retire that owned child exactly once before entering provider-managed mode; after this
         // agent never manipulates an application process.
@@ -137,7 +137,7 @@ pub(crate) fn stop(guardian: &mut Guardian) -> io::Result<()> {
 /// Stop the runtime only when the guardian owns it. In provider-managed mode the signed node
 /// reconciler is the sole authority for application effects.
 pub(crate) fn stop_runtime(app: &mut App) -> io::Result<()> {
-    if app.mode == updated::config::RuntimeMode::ProviderManaged {
+    if app.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged {
         return Ok(());
     }
     stop(&mut app.guardian)

@@ -59,7 +59,7 @@ impl InstallTransaction {
                 "install transaction id must not be empty",
             ));
         }
-        if !crate::hash::is_sha256_hex(self.repository_lineage.as_str()) {
+        if !updated_contracts::is_sha256_hex(self.repository_lineage.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "install transaction repository lineage is invalid",
@@ -141,23 +141,7 @@ pub fn clear(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn provider() -> Box<ProviderRelease> {
-        Box::new(ProviderRelease {
-            product: "reconciler".into(),
-            release: release("1.0.0", "reconciler-manifest"),
-            archive_sha256: "reconciler-archive".into(),
-            args: Vec::new(),
-            timeout_millis: 1_000,
-        })
-    }
-
-    fn release(version: &str, digest: &str) -> ReleaseId {
-        ReleaseId {
-            version: version.into(),
-            manifest_sha256: digest.into(),
-        }
-    }
+    use crate::testing::{provider, release};
 
     fn tx() -> InstallTransaction {
         InstallTransaction {

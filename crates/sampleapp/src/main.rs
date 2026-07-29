@@ -143,9 +143,17 @@ pub fn run_artifact(artifact: &'static str) {
     }
 }
 
-/// Bind a fresh listening socket with SO_REUSEADDR.
+/// Bind a fresh listening socket, reusing a lingering TIME_WAIT address on Unix.
+///
+/// `SO_REUSEADDR` means two different things. On Unix it only lets a new listener take an address
+/// left in `TIME_WAIT` — what a fast restart needs. On Windows it lets a SECOND process bind an
+/// address another process is actively listening on, and the newer bind silently steals traffic:
+/// exactly the confusion a restart test is trying to detect, converted into a passing run. So it is
+/// set on Unix only; on Windows the default (exclusive) bind is the correct behaviour, and a real
+/// conflict surfaces as the bind error it is.
 fn acquire_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    #[cfg(unix)]
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;

@@ -8,12 +8,10 @@ use std::collections::BTreeMap;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
-pub use updated::config::{
-    RepositoryAssignment as DesiredDeployment, TargetReference as ExactTarget,
-};
-pub use updated::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
+use updated_contracts::artifact::TargetReference as ExactTarget;
+use updated_contracts::assignment::RepositoryAssignment as DesiredDeployment;
+use updated_contracts::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
 
 pub(crate) mod domain;
 pub mod gateway;
@@ -43,6 +41,13 @@ pub use window::{CalendarEntry, RolloutWindow, Weekday};
 pub struct UpdateGroupSpec {
     pub repository_ref: LocalObjectReference,
     pub selector: LabelSelector,
+    /// Namespace-local prerequisite groups which must be settled before this group can roll.
+    /// These are opaque ordering edges; updatedc never interprets deployment semantics.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Named lifecycle inputs sourced from signed outputs of prerequisite groups.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, GroupOutputReference>,
     pub deployment: DeploymentSpec,
     /// Maximum unavailable agents while this group changes deployment. This is group rollout
     /// policy, deliberately outside `deployment` so changing it does not change the signed
@@ -54,12 +59,30 @@ pub struct UpdateGroupSpec {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct GroupOutputReference {
+    pub group: String,
+    pub output: String,
+    /// Selection is explicit so updatedc never guesses how to combine several producers.
+    #[serde(default)]
+    pub aggregation: OutputAggregation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputAggregation {
+    /// The producing group must select exactly one node.
+    #[default]
+    One,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct DeploymentSpec {
     pub name: String,
     pub release_repository: ReleaseRepositorySpec,
     pub application: TargetSpec,
     /// Signed opt-in to first-install ordered fallback (see
-    /// [`updated::config::RepositoryAssignment::ordered_install_fallback`]). Defaults
+    /// [`updated_contracts::assignment::RepositoryAssignment::ordered_install_fallback`]). Defaults
     /// off so a group only descends versions when the publisher explicitly allows it.
     #[serde(default)]
     pub ordered_install_fallback: bool,
@@ -142,7 +165,7 @@ pub struct TimeoutsSpec {
     pub supervisor_check_interval_seconds: u64,
     /// Upper bound (seconds) on the managed drain hold; `None` or `0` = no hold (stop immediately),
     /// `Some(n)` = wait up to `n`. Never an indefinite wait. See
-    /// [`updated::config::ManagedTimeouts::drain_hold_seconds`].
+    /// [`updated_contracts::assignment::ManagedTimeouts::drain_hold_seconds`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_hold_seconds: Option<u64>,
 }
@@ -160,7 +183,7 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
         let release_root = serde_json::from_str(&value.release_repository.root_json)
             .map_err(|error| format!("releaseRepository.rootJson is invalid JSON: {error}"))?;
         let desired = Self {
-            schema: 2,
+            schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
             deployment: value.name,
             metadata_url: value.release_repository.metadata_url,
             targets_url: value.release_repository.targets_url,
@@ -175,11 +198,11 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                 sha256: value.provider_set.sha256,
             },
             release_root,
-            runtime: updated::config::ManagedRuntime {
+            runtime: updated_contracts::assignment::ManagedRuntime {
                 mode: match value.runtime.mode {
-                    RuntimeModeSpec::Managed => updated::config::RuntimeMode::Managed,
+                    RuntimeModeSpec::Managed => updated_contracts::assignment::RuntimeMode::Managed,
                     RuntimeModeSpec::ProviderManaged => {
-                        updated::config::RuntimeMode::ProviderManaged
+                        updated_contracts::assignment::RuntimeMode::ProviderManaged
                     }
                 },
                 product: value.runtime.product,
@@ -190,25 +213,26 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                     .runtime
                     .secrets
                     .into_iter()
-                    .map(|reference| updated::config::SecretReference {
+                    .map(|reference| updated_contracts::assignment::SecretReference {
                         environment: reference.environment,
                         secret: reference.secret,
                         key: reference.key,
                     })
                     .collect(),
-                repository: updated::config::ManagedRepositoryLimits {
+                inputs: BTreeMap::new(),
+                repository: updated_contracts::assignment::ManagedRepositoryLimits {
                     metadata_limit: value.runtime.repository.metadata_limit,
                     target_limit: value.runtime.repository.target_limit,
                     transport_timeout_seconds: value.runtime.repository.transport_timeout_seconds,
                 },
-                storage: updated::config::ManagedStorage {
+                storage: updated_contracts::assignment::ManagedStorage {
                     inactive_releases: value.runtime.storage.inactive_releases,
                     inactive_providers: value.runtime.storage.inactive_providers,
                     inactive_supervisors: value.runtime.storage.inactive_supervisors,
                     inactive_bytes: value.runtime.storage.inactive_bytes,
                     inactive_repository_caches: value.runtime.storage.inactive_repository_caches,
                 },
-                timeouts: updated::config::ManagedTimeouts {
+                timeouts: updated_contracts::assignment::ManagedTimeouts {
                     check_interval_seconds: value.runtime.timeouts.check_interval_seconds,
                     health_grace_seconds: value.runtime.timeouts.health_grace_seconds,
                     health_successes: value.runtime.timeouts.health_successes,
@@ -378,7 +402,18 @@ pub struct AgentIdentity {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentIdentityKind {
+    /// Offline provisioning: the operator declares the agent and exports its immutable enrollment
+    /// Secret out of band. The machine never talks to `/enroll`, so this identity is NEVER
+    /// completable over the shared fleet bootstrap certificate.
     Manual,
+    /// The operator reserved this exact name for a machine that will enroll dynamically, and
+    /// deferred the identity to the node's own CSR. This is the ONLY shape `/enroll` may complete
+    /// in place, because the enrollment credential is the fleet-wide bootstrap certificate every
+    /// node already holds: whoever presents it first claims the name and the labels attached to it.
+    /// Reserving is therefore an explicit statement that any fleet member may claim this name —
+    /// never something a plain declared agent falls into by default.
+    Reserved,
+    /// A node that has enrolled: its CSR public key is pinned and its registration digest is set.
     Enrolled,
 }
 
@@ -566,6 +601,10 @@ pub struct PublicationPlan {
 pub struct ResolvedGroup {
     pub name: String,
     pub match_labels: BTreeMap<String, String>,
+    pub depends_on: Vec<String>,
+    pub inputs: BTreeMap<String, GroupOutputReference>,
+    /// Computed each reconcile after authentic producer reports are resolved.
+    pub inputs_ready: bool,
     pub deployment: DesiredDeployment,
     pub max_unavailable: usize,
 }
@@ -580,14 +619,91 @@ pub struct ResolvedNode {
 pub enum PlanError {
     EmptySelector(String),
     DuplicateGroup(String),
+    ReservedGroupName,
+    /// The planned generation would publish no assignment for a node that already has one.
+    RoutingLoss(Vec<String>),
     DuplicateNode(String),
-    AmbiguousNode { node: String, groups: Vec<String> },
+    MissingDependency {
+        group: String,
+        dependency: String,
+    },
+    DependencyCycle(Vec<String>),
+    InvalidDependencyInput {
+        group: String,
+        input: String,
+    },
+    AmbiguousNode {
+        node: String,
+        groups: Vec<String>,
+    },
     InvalidNodeName,
     InvalidPrefix,
     InvalidDeployment(String),
     NodeDeploymentMismatch,
     Serialize(String),
 }
+
+/// Validate the group dependency graph before planning a new publication. Invalid desired state
+/// fails the whole generation closed, preserving the last published assignments.
+pub(crate) fn validate_dependency_graph(
+    groups: &BTreeMap<String, ResolvedGroup>,
+) -> Result<(), PlanError> {
+    fn visit(
+        name: &str,
+        groups: &BTreeMap<String, ResolvedGroup>,
+        state: &mut BTreeMap<String, u8>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), PlanError> {
+        match state.get(name).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                let start = stack.iter().position(|entry| entry == name).unwrap_or(0);
+                let mut cycle = stack[start..].to_vec();
+                cycle.push(name.to_string());
+                return Err(PlanError::DependencyCycle(cycle));
+            }
+            _ => {}
+        }
+        state.insert(name.to_string(), 1);
+        stack.push(name.to_string());
+        for dependency in &groups[name].depends_on {
+            if !groups.contains_key(dependency) {
+                return Err(PlanError::MissingDependency {
+                    group: name.to_string(),
+                    dependency: dependency.clone(),
+                });
+            }
+            visit(dependency, groups, state, stack)?;
+        }
+        for (input, reference) in &groups[name].inputs {
+            if !updated_contracts::path::is_safe_component(input)
+                || !updated_contracts::path::is_safe_component(&reference.output)
+                || !groups[name].depends_on.contains(&reference.group)
+            {
+                return Err(PlanError::InvalidDependencyInput {
+                    group: name.to_string(),
+                    input: input.clone(),
+                });
+            }
+        }
+        stack.pop();
+        state.insert(name.to_string(), 2);
+        Ok(())
+    }
+
+    let mut state = BTreeMap::new();
+    let mut stack = Vec::new();
+    for name in groups.keys() {
+        visit(name, groups, &mut state, &mut stack)?;
+    }
+    Ok(())
+}
+
+/// The pseudo-group a node that matched no `UpdateGroup` routes to; it receives the repository's
+/// `default_deployment` directly and is never throttled. Reserved: a real `UpdateGroup` claiming
+/// this name would have its own throttled, gated rollout silently replaced by that fleet-wide
+/// switch, so [`resolve_node_groups`] refuses it outright.
+pub const DEFAULT_GROUP: &str = "default";
 
 /// Resolve selectors before rollout admission without constructing a throwaway publication.
 pub(crate) fn resolve_node_groups(
@@ -600,6 +716,9 @@ pub(crate) fn resolve_node_groups(
         if group.match_labels.is_empty() {
             return Err(PlanError::EmptySelector(name));
         }
+        if name == DEFAULT_GROUP {
+            return Err(PlanError::ReservedGroupName);
+        }
         if indexed.insert(name.clone(), group).is_some() {
             return Err(PlanError::DuplicateGroup(name));
         }
@@ -607,7 +726,7 @@ pub(crate) fn resolve_node_groups(
     let mut node_groups = BTreeMap::new();
     for node in nodes {
         let name = node.name;
-        if !updated::path::is_safe_component(&name) || node_groups.contains_key(&name) {
+        if !updated_contracts::path::is_safe_component(&name) || node_groups.contains_key(&name) {
             return if node_groups.contains_key(&name) {
                 Err(PlanError::DuplicateNode(name))
             } else {
@@ -620,7 +739,7 @@ pub(crate) fn resolve_node_groups(
             .map(|(name, _)| name.clone())
             .collect();
         let selected = match matches.as_slice() {
-            [] => "default".to_string(),
+            [] => DEFAULT_GROUP.to_string(),
             [only] => only.clone(),
             _ => {
                 return Err(PlanError::AmbiguousNode {
@@ -651,13 +770,10 @@ pub(crate) fn build_publication_plan(
     node_deployments: BTreeMap<String, DesiredDeployment>,
 ) -> Result<PublicationPlan, PlanError> {
     let prefix = repository.assignment_prefix.trim_matches('/');
-    if prefix.is_empty()
-        || prefix
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || prefix.contains(['\\', ':'])
-        || prefix.chars().any(char::is_control)
-    {
+    // The object-key prefix must be a confined relative path — the one shared traversal guard, so a
+    // prefix can never climb out of the repository key space (`is_confined_relative` also rejects an
+    // empty prefix).
+    if !updated_contracts::path::is_confined_relative(prefix) {
         return Err(PlanError::InvalidPrefix);
     }
     if node_groups.keys().ne(node_deployments.keys()) {
@@ -667,7 +783,7 @@ pub(crate) fn build_publication_plan(
     let mut references = BTreeMap::new();
     for deployment in node_deployments.values() {
         let bytes = canonical_json(deployment)?;
-        let id = hex_digest(&bytes);
+        let id = updated::hash::sha256_bytes(&bytes);
         if references.contains_key(&id) {
             continue;
         }
@@ -682,8 +798,8 @@ pub(crate) fn build_publication_plan(
         targets.push(config);
     }
     for (node, deployment) in &node_deployments {
-        let id = hex_digest(&canonical_json(deployment)?);
-        let assignment = updated::config::AgentDocument {
+        let id = updated::hash::sha256_bytes(&canonical_json(deployment)?);
+        let assignment = updated_contracts::artifact::AgentDocument {
             schema: 1,
             config: references[&id].clone(),
         };
@@ -709,13 +825,29 @@ pub(crate) fn selector_matches(
         .all(|(key, value)| labels.get(key) == Some(value))
 }
 
+/// The content identity of a deployment: the SHA-256 of the exact bytes published as its
+/// `configs/<id>.json` target, which is the digest a node reports back once it is acting on it.
+///
+/// This, not the operator-chosen `deployment` NAME, is what "settled on the desired deployment"
+/// means. An operator can change a deployment's archive, arguments, or secrets without renaming it,
+/// and the control plane rewrites resolved dependency inputs under an unchanged name by itself;
+/// comparing names would call every one of those changes "already settled" and roll them to the
+/// whole group at once, with no `maxUnavailable` staging at all.
+///
+/// An invalid deployment has no identity — `None` — and can never match a report.
+pub(crate) fn deployment_identity(value: &DesiredDeployment) -> Option<String> {
+    canonical_json(value)
+        .ok()
+        .map(|bytes| updated::hash::sha256_bytes(&bytes))
+}
+
 fn canonical_json(value: &DesiredDeployment) -> Result<Vec<u8>, PlanError> {
     value.validate().map_err(PlanError::InvalidDeployment)?;
     serde_json::to_vec(value).map_err(|error| PlanError::Serialize(error.to_string()))
 }
 
 fn target(path: String, bytes: Vec<u8>) -> PublicationTarget {
-    let sha256 = hex_digest(&bytes);
+    let sha256 = updated::hash::sha256_bytes(&bytes);
     PublicationTarget {
         path,
         bytes,
@@ -724,18 +856,14 @@ fn target(path: String, bytes: Vec<u8>) -> PublicationTarget {
 }
 
 fn publication_digest(targets: &[PublicationTarget]) -> String {
-    let mut digest = Sha256::new();
+    let mut digest = updated::hash::Sha256Hasher::new();
     for target in targets {
         digest.update(target.path.as_bytes());
-        digest.update([0]);
+        digest.update(&[0]);
         digest.update(&target.bytes);
-        digest.update([0]);
+        digest.update(&[0]);
     }
-    format!("{:x}", digest.finalize())
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    digest.finish_hex()
 }
 
 /// Join a store `prefix` with a `relative` object path into a normalized object key, dropping any
@@ -750,6 +878,36 @@ pub(crate) fn object_key(prefix: &str, relative: &str) -> object_store::path::Pa
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+/// Upper bound on any single repository object the control plane reads back into memory: a signed
+/// metadata document, an assignment, a managed configuration, or a node report. All are small, and
+/// all are bounded at *write* time (the gateway caps request bodies) — but the bucket is not
+/// exclusively ours, so a direct writer must not be able to make a reconcile or an `/enroll`
+/// response allocate without limit. Generous relative to any legitimate document.
+pub(crate) const OBJECT_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Read one object fully into memory, refusing anything larger than [`OBJECT_BYTES_LIMIT`]. The
+/// size is checked from the store's own metadata before a byte is buffered, so an oversized object
+/// costs a `head`-equivalent rather than the allocation. The single bounded read every
+/// control-plane object load goes through, so the `/enroll` resolution path and the rollout
+/// telemetry read cannot drift apart on it.
+pub(crate) async fn read_object_bounded(
+    store: &dyn object_store::ObjectStore,
+    key: &object_store::path::Path,
+) -> Result<Vec<u8>, object_store::Error> {
+    let result = store.get(key).await?;
+    if result.meta.size > OBJECT_BYTES_LIMIT {
+        return Err(object_store::Error::Generic {
+            store: "updatec",
+            source: format!(
+                "object {key} is {} bytes, over the {OBJECT_BYTES_LIMIT}-byte limit",
+                result.meta.size
+            )
+            .into(),
+        });
+    }
+    Ok(result.bytes().await?.to_vec())
 }
 
 #[cfg(test)]
@@ -785,7 +943,7 @@ mod tests {
 
     fn deployment(id: &str) -> DesiredDeployment {
         DesiredDeployment {
-            schema: 2,
+            schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
             deployment: id.into(),
             metadata_url: "https://cdn.example/tuf/metadata/".into(),
             targets_url: "https://cdn.example/tuf/targets/".into(),
@@ -804,27 +962,28 @@ mod tests {
         }
     }
 
-    pub(crate) fn managed_runtime() -> updated::config::ManagedRuntime {
-        updated::config::ManagedRuntime {
-            mode: updated::config::RuntimeMode::Managed,
+    pub(crate) fn managed_runtime() -> updated_contracts::assignment::ManagedRuntime {
+        updated_contracts::assignment::ManagedRuntime {
+            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
             args: vec![],
             secrets: vec![],
-            repository: updated::config::ManagedRepositoryLimits {
+            inputs: BTreeMap::new(),
+            repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 metadata_limit: 1_048_576,
                 target_limit: 536_870_912,
                 transport_timeout_seconds: 30,
             },
-            storage: updated::config::ManagedStorage {
+            storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 2,
                 inactive_providers: 2,
                 inactive_supervisors: 2,
                 inactive_bytes: 1_073_741_824,
                 inactive_repository_caches: 2,
             },
-            timeouts: updated::config::ManagedTimeouts {
+            timeouts: updated_contracts::assignment::ManagedTimeouts {
                 check_interval_seconds: 60,
                 health_grace_seconds: 30,
                 health_successes: 2,
@@ -838,7 +997,7 @@ mod tests {
         }
     }
 
-    fn runtime_spec() -> RuntimeSpec {
+    pub(crate) fn runtime_spec() -> RuntimeSpec {
         RuntimeSpec {
             mode: RuntimeModeSpec::Managed,
             product: "app".into(),
@@ -901,6 +1060,9 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
+            depends_on: vec![],
+            inputs: BTreeMap::new(),
+            inputs_ready: true,
             deployment: deployment(name),
             max_unavailable: 1,
         }
@@ -952,7 +1114,7 @@ mod tests {
             .iter()
             .find(|t| t.path == "assignments/agents/a.json")
             .unwrap();
-        let assignment: updated::config::AgentDocument =
+        let assignment: updated_contracts::artifact::AgentDocument =
             serde_json::from_slice(&node.bytes).unwrap();
         let config = plan
             .targets
@@ -961,6 +1123,19 @@ mod tests {
             .unwrap();
         assert_eq!(assignment.config.sha256, config.sha256);
         assert_ne!(node.bytes, config.bytes);
+    }
+
+    #[test]
+    fn a_group_may_not_claim_the_reserved_default_name() {
+        // `default` is the sentinel for "matched no group", and the domain planner overwrites every
+        // node routed to it with the repository's unthrottled default deployment. A real group
+        // wearing that name would have its throttled, health-gated rollout silently replaced.
+        let error = resolve_node_groups(
+            [group("default", &[("tier", "default")])],
+            [node("node", &[("tier", "default")])],
+        )
+        .unwrap_err();
+        assert_eq!(error, PlanError::ReservedGroupName);
     }
 
     #[test]
@@ -979,6 +1154,51 @@ mod tests {
                 node: "node".into(),
                 groups: vec!["a".into(), "b".into()]
             }
+        );
+    }
+
+    #[test]
+    fn dependency_graph_rejects_missing_groups_and_cycles() {
+        let mut groups = BTreeMap::from([
+            ("a".into(), group("a", &[("role", "a")])),
+            ("b".into(), group("b", &[("role", "b")])),
+        ]);
+        groups.get_mut("b").unwrap().depends_on = vec!["missing".into()];
+        assert_eq!(
+            validate_dependency_graph(&groups),
+            Err(PlanError::MissingDependency {
+                group: "b".into(),
+                dependency: "missing".into(),
+            })
+        );
+
+        groups.get_mut("a").unwrap().depends_on = vec!["b".into()];
+        groups.get_mut("b").unwrap().depends_on = vec!["a".into()];
+        assert_eq!(
+            validate_dependency_graph(&groups),
+            Err(PlanError::DependencyCycle(vec![
+                "a".into(),
+                "b".into(),
+                "a".into(),
+            ]))
+        );
+
+        groups.get_mut("a").unwrap().depends_on.clear();
+        groups.get_mut("b").unwrap().depends_on.clear();
+        groups.get_mut("b").unwrap().inputs.insert(
+            "leader".into(),
+            GroupOutputReference {
+                group: "a".into(),
+                output: "endpoint".into(),
+                aggregation: OutputAggregation::One,
+            },
+        );
+        assert_eq!(
+            validate_dependency_graph(&groups),
+            Err(PlanError::InvalidDependencyInput {
+                group: "b".into(),
+                input: "leader".into(),
+            })
         );
     }
 
@@ -1012,5 +1232,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn thousand_nodes_share_one_content_addressed_config() {
+        let mappings: BTreeMap<String, String> = (0..1_000)
+            .map(|index| (format!("node-{index:04}"), "edge".into()))
+            .collect();
+        let deployments = mappings
+            .keys()
+            .map(|node| (node.clone(), deployment("edge")))
+            .collect();
+
+        let first = build_publication_plan(&repository(), mappings.clone(), deployments).unwrap();
+        let second = build_publication_plan(
+            &repository(),
+            mappings.into_iter().rev().collect(),
+            first
+                .node_groups
+                .keys()
+                .rev()
+                .map(|node| (node.clone(), deployment("edge")))
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.node_groups.len(), 1_000);
+        assert_eq!(first.targets.len(), 1_001);
+        assert_eq!(
+            first
+                .targets
+                .iter()
+                .filter(|target| target.path.contains("/configs/"))
+                .count(),
+            1
+        );
     }
 }

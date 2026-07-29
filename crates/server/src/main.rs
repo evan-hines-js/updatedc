@@ -80,16 +80,16 @@ fn export_enrollment(args: &[String]) -> R {
         std::fs::read_to_string(metadata.join(format!("{targets_version}.targets.json")))?;
     let targets_value: serde_json::Value = serde_json::from_str(&targets)?;
     let agent_document = repository_target_text(&repo, &targets_value, &assignment)?;
-    let agent: updated::config::AgentDocument = serde_json::from_str(&agent_document)?;
+    let agent: updated_contracts::artifact::AgentDocument = serde_json::from_str(&agent_document)?;
     agent.validate()?;
     let managed_configuration = repository_target_text(&repo, &targets_value, &agent.config.path)?;
-    let bundle = updated::enrollment::EnrollmentBundle {
+    let bundle = updated_contracts::enrollment::EnrollmentBundle {
         schema: 1,
         agent_id,
         routing_base_url: ensure_base_location(routing_base_url),
         assignment,
         routing_root: root,
-        initial: updated::enrollment::InitialSignedConfiguration {
+        initial: updated_contracts::enrollment::InitialSignedConfiguration {
             timestamp,
             snapshot,
             targets,
@@ -157,8 +157,8 @@ async fn publish_assignment(args: &[String]) -> R {
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
     let config_source = repo_dir.join(".config-build.json");
     let node_source = repo_dir.join(".node-build.json");
-    let assignment = updated::config::RepositoryAssignment {
-        schema: 2,
+    let assignment = updated_contracts::assignment::RepositoryAssignment {
+        schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
         deployment,
         metadata_url,
         targets_url,
@@ -177,9 +177,9 @@ async fn publish_assignment(args: &[String]) -> R {
         .filter(|(prefix, node)| !prefix.is_empty() && !node.is_empty())
         .ok_or("--name must use <prefix>/agents/<agent>.json")?;
     let config_name = format!("{prefix}/configs/{config_sha256}.json");
-    let node = updated::config::AgentDocument {
+    let node = updated_contracts::artifact::AgentDocument {
         schema: 1,
-        config: updated::config::TargetReference {
+        config: updated_contracts::artifact::TargetReference {
             path: config_name.clone(),
             sha256: config_sha256,
         },
@@ -217,14 +217,14 @@ async fn publish_provider_set(args: &[String]) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let keys_dir = PathBuf::from(flag(args, "--keys").ok_or("--keys <dir> is required")?);
     let id = flag(args, "--id").ok_or("--id <provider-set-id> is required")?;
-    let reconciler = updated::config::Reconciler {
+    let reconciler = updated_contracts::artifact::Reconciler {
         artifact: target_reference(args, "provider")?,
         args: flags_all(args, "--provider-arg"),
         timeout_millis: flag(args, "--provider-timeout-ms")
             .unwrap_or_else(|| "300000".into())
             .parse()?,
     };
-    let set = updated::config::ProviderSet {
+    let set = updated_contracts::artifact::ProviderSet {
         schema: 1,
         id: id.clone(),
         reconciler,
@@ -253,15 +253,15 @@ async fn publish_provider_set(args: &[String]) -> R {
 fn target_reference(
     args: &[String],
     prefix: &str,
-) -> Result<updated::config::TargetReference, Box<dyn std::error::Error>> {
+) -> Result<updated_contracts::artifact::TargetReference, Box<dyn std::error::Error>> {
     let path = flag(args, &format!("--{prefix}-path"))
         .ok_or_else(|| format!("--{prefix}-path <target> is required"))?;
     let sha256 = flag(args, &format!("--{prefix}-sha256"))
         .ok_or_else(|| format!("--{prefix}-sha256 <hex> is required"))?;
-    if !updated::hash::is_sha256_hex(&sha256) {
+    if !updated_contracts::is_sha256_hex(&sha256) {
         return Err(format!("--{prefix}-sha256 must be 64 hexadecimal characters").into());
     }
-    Ok(updated::config::TargetReference {
+    Ok(updated_contracts::artifact::TargetReference {
         path,
         sha256: sha256.to_ascii_lowercase(),
     })
@@ -409,11 +409,11 @@ fn lock_publisher(repo_dir: &Path) -> std::io::Result<File> {
 /// is a name the gateway is reached by (repeatable). The local counterpart of cert-manager.
 async fn gen_certs(args: &[String]) -> R {
     let dir = PathBuf::from(flag(args, "--dir").ok_or("--dir <dir> is required")?);
-    let sans: Vec<String> = args
-        .windows(2)
-        .filter(|pair| pair[0] == "--san")
-        .map(|pair| pair[1].clone())
-        .collect();
+    // Through the same repeatable-flag reader as `--target`/`--bundle`, so `--san name` and
+    // `--san=name` both work. Recognizing only the space-separated form silently dropped the
+    // equals form: certificates minted without a name the gateway is actually reached by, and no
+    // error until every agent's handshake fails.
+    let sans = flags_all(args, "--san");
     if sans.is_empty() {
         return Err("at least one --san <name> is required for the server certificate".into());
     }
@@ -443,19 +443,37 @@ async fn serve(args: &[String]) -> R {
     let connections = Arc::new(Semaphore::new(128));
     println!("serving {} on https://{addr} (mTLS)", root.display());
     loop {
-        let (stream, _) = listener.accept().await?;
+        // An accept error is recoverable and must never take the server down: ECONNABORTED (a peer
+        // that reset between SYN and accept) and EMFILE/ENFILE (the fd ceiling, reachable at 128
+        // concurrent connections each also holding an open repository file) would otherwise exit
+        // the process and cut every agent off from its metadata and targets.
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                eprintln!("server: accept failed ({error}); continuing");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let permit = connections.clone().acquire_owned().await?;
         let root = root.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            // The handshake is bounded like every other phase. Without it a client that opens a
+            // connection and sends nothing holds its permit forever; 128 of those exhaust the
+            // semaphore, the accept loop blocks on `acquire_owned`, and the server stops serving
+            // entirely — no error, no recovery.
             // A client that fails the mTLS handshake is dropped without ever reaching the repo.
-            if let Ok(stream) = acceptor.accept(stream).await {
+            if let Ok(Ok(stream)) = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 let _ = serve_conn(stream, &root).await;
             }
         });
     }
 }
+
+/// How long a client has to complete the TLS handshake while holding a connection permit.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn serve_conn<S>(mut stream: S, root: &Path) -> std::io::Result<()>
 where
@@ -571,7 +589,7 @@ where
 
 /// Accept a node rollout report and persist it beside the repository at
 /// `<root>/telemetry/<node>.json`. Mirrors the k8s gateway's telemetry contract: the
-/// body must be a well-formed [`updated::telemetry::NodeReport`] naming the same node as
+/// body must be a well-formed [`updated_contracts::telemetry::NodeReport`] naming the same node as
 /// the path, so a malformed or misattributed report is rejected rather than stored.
 ///
 /// Unlike the production k8s gateway (`updatec::gateway::telemetry_put`), this dev/mock CDN does
@@ -591,7 +609,7 @@ async fn serve_telemetry_put<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Some(node) = updated::telemetry::node_from_path(path) else {
+    let Some(node) = updated_contracts::telemetry::node_from_path(path) else {
         respond_status(stream, 404, b"not found").await;
         return Ok(());
     };
@@ -630,22 +648,45 @@ where
         return Ok(());
     }
     body.truncate(content_length);
-    let Ok(report) = serde_json::from_slice::<updated::telemetry::NodeReport>(&body) else {
+    // A report travels as a signed DSSE envelope, exactly as the k8s gateway stores it — that is
+    // what a consumer verifies against the node's pinned key. Parsing the body as a bare report
+    // rejected every genuine agent write with "malformed report" and left this handler storing
+    // nothing at all.
+    let Ok(envelope) = serde_json::from_slice::<updated_contracts::telemetry::Envelope>(&body)
+    else {
+        respond_status(stream, 400, b"malformed report envelope").await;
+        return Ok(());
+    };
+    if envelope.payload_type != updated_contracts::telemetry::REPORT_PAYLOAD_TYPE
+        || envelope.signatures.len() > updated_contracts::telemetry::Envelope::MAX_SIGNATURES
+    {
+        respond_status(stream, 400, b"malformed report envelope").await;
+        return Ok(());
+    }
+    let Some(report) = updated_contracts::telemetry::report_payload_unverified(&envelope) else {
         respond_status(stream, 400, b"malformed report").await;
         return Ok(());
     };
-    if report.node != node {
+    if report.node != node || !report.is_wellformed() {
         respond_status(stream, 400, b"report node mismatch").await;
         return Ok(());
     }
-    let dest = root.join(updated::telemetry::report_object_key(node));
+    let dest = root.join(updated_contracts::telemetry::report_object_key(node));
     if let Some(parent) = dest.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             respond_status(stream, 500, error.to_string().as_bytes()).await;
             return Ok(());
         }
     }
-    match foundation::durable::atomic_write(&dest, ".telemetry-", &body) {
+    // `atomic_write` fsyncs the file and its directory — hundreds of milliseconds on a busy disk,
+    // on a runtime worker that is also serving every other agent's metadata fetch. Hand it to the
+    // blocking pool.
+    let written = tokio::task::spawn_blocking(move || {
+        foundation::durable::atomic_write(&dest, ".telemetry-", &body)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    match written {
         Ok(()) => respond_status(stream, 200, b"ok").await,
         Err(error) => respond_status(stream, 500, error.to_string().as_bytes()).await,
     }
@@ -667,7 +708,9 @@ fn open_repository_file(root: &Path, path: &str) -> Option<std::fs::File> {
     }
     out.push(namespace);
     for part in parts {
-        if part == ".." || part.contains('\\') || part.starts_with('.') {
+        // Confined path safety is the one shared guard; a served repository file additionally
+        // rejects any dot-leading segment (no `.`/`..` climb and no hidden files).
+        if !updated_contracts::path::is_safe_component(part) || part.starts_with('.') {
             return None;
         }
         out.push(part);

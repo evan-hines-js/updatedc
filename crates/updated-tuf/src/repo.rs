@@ -227,7 +227,26 @@ fn validate_key_file(path: &Path) -> Result<()> {
 
 /// Initialize an empty TUF repository under `repo_dir`: mint and sign `root.json`,
 /// then sign empty targets/snapshot/timestamp. Creates `metadata/` and `targets/`.
+/// Build a fresh signed repository whose metadata starts at version 1.
 pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> {
+    init_from_version(repo_dir, keys, expiry_days, 1).await
+}
+
+/// Build a fresh signed repository whose root, targets, snapshot, and timestamp all start at
+/// `start_version`.
+///
+/// Starting above 1 is what makes REPLACING a live repository usable. TUF clients remember the
+/// highest metadata version they have accepted and refuse anything lower — correctly, that is
+/// rollback protection — so a replacement republished at version 1 over a repository that has
+/// reached version 40 is rejected by every node that ever saw the old one, forever, with no error
+/// the operator would recognize as "the repository was re-initialized".
+pub async fn init_from_version(
+    repo_dir: &Path,
+    keys: &Keys,
+    expiry_days: i64,
+    start_version: u64,
+) -> Result<()> {
+    let start = nz(start_version.max(1));
     let metadata_dir = repo_dir.join("metadata");
     let targets_dir = repo_dir.join("targets");
     tokio::fs::create_dir_all(&metadata_dir)
@@ -277,7 +296,7 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
         // an old client may otherwise fetch newly replaced bytes and fail their hash.
         // Consistent snapshots make every client-visible target content-addressed.
         consistent_snapshot: true,
-        version: nz(1),
+        version: start,
         expires,
         keys: root_keys,
         roles,
@@ -292,22 +311,25 @@ pub async fn init(repo_dir: &Path, keys: &Keys, expiry_days: i64) -> Result<()> 
     tokio::fs::write(metadata_dir.join("root.json"), signed_root.buffer())
         .await
         .map_err(|e| err("writing root.json", e))?;
-    tokio::fs::write(metadata_dir.join("1.root.json"), signed_root.buffer())
-        .await
-        .map_err(|e| err("writing 1.root.json", e))?;
+    tokio::fs::write(
+        metadata_dir.join(format!("{start}.root.json")),
+        signed_root.buffer(),
+    )
+    .await
+    .map_err(|e| err("writing versioned root.json", e))?;
 
-    // Sign empty targets/snapshot/timestamp (version 1).
+    // Sign empty targets/snapshot/timestamp at the starting version.
     let mut editor = RepositoryEditor::new(metadata_dir.join("root.json"))
         .await
         .map_err(|e| err("creating editor", e))?;
     editor
-        .targets_version(nz(1))
+        .targets_version(start)
         .map_err(|e| err("targets version", e))?
         .targets_expires(expires)
         .map_err(|e| err("targets expiry", e))?
-        .snapshot_version(nz(1))
+        .snapshot_version(start)
         .snapshot_expires(expires)
-        .timestamp_version(nz(1))
+        .timestamp_version(start)
         .timestamp_expires(expires);
     let signed = editor
         .sign(&[
@@ -695,20 +717,19 @@ fn nz(n: u64) -> NonZeroU64 {
 
 fn validate_target_name(name: &str) -> Result<()> {
     let parts: Vec<_> = name.split('/').collect();
-    let safe = |part: &str| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && !part.contains(['\\', ':'])
-            && !part.chars().any(char::is_control)
-    };
     let known_layout = (parts.len() == 6 && parts[0] == "products")
         || (parts.len() == 2 && parts[0] == "provider-sets" && parts[1].ends_with(".json"))
         || (parts.len() == 3
             && parts[0] == "assignments"
             && matches!(parts[1], "agents" | "configs")
             && parts[2].ends_with(".json"));
-    if !known_layout || !parts.iter().all(|p| safe(p)) {
+    // Every segment must be a confined path component — the one shared traversal guard, so a target
+    // name can never escape the repository key space regardless of this layout check.
+    if !known_layout
+        || !parts
+            .iter()
+            .all(|p| updated_contracts::path::is_safe_component(p))
+    {
         return Err(RepoError(format!("unsafe target path {name:?}")));
     }
     Ok(())

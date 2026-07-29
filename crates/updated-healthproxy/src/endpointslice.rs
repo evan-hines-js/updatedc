@@ -54,7 +54,8 @@ impl EndpointSliceLb {
 impl LoadBalancer for EndpointSliceLb {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String> {
         let name = self.slice_name();
-        let slice = build_slice(&self.service, &name, &self.port_name, self.port, members);
+        let members = resolve_addresses(members).await;
+        let slice = build_slice(&self.service, &name, &self.port_name, self.port, &members);
         // A single slice is one address family; any member of another family was dropped from
         // it (fail closed). Surface that misconfiguration rather than silently under-routing.
         let kept = slice.endpoints.len();
@@ -66,27 +67,100 @@ impl LoadBalancer for EndpointSliceLb {
                 members.len() - kept
             );
         }
+        match self.apply(&name, &slice).await {
+            Ok(()) => Ok(()),
+            // `addressType` is immutable, and `force()` resolves field-manager conflicts, not
+            // validation: once the inventory's family flips (IPv4 → IPv6), every future apply is
+            // rejected with a 422 that no retry can clear, and membership silently freezes at
+            // whatever was last programmed. Replacing the slice is the only way through. It is
+            // ours (we own the name and the field manager), so deleting it costs one reconcile
+            // interval of the endpoints it held.
+            Err(error) if is_immutable_rejection(&error) => {
+                eprintln!(
+                    "healthproxy: {} slice must change address type to {}; replacing it",
+                    self.service, slice.address_type
+                );
+                if let Err(delete_error) = self.api.delete(&name, &Default::default()).await {
+                    return Err(format!(
+                        "replacing the {} slice for a new address type: {delete_error}",
+                        self.service
+                    ));
+                }
+                self.apply(&name, &slice)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+impl EndpointSliceLb {
+    async fn apply(&self, name: &str, slice: &EndpointSlice) -> Result<(), kube::Error> {
         self.api
             .patch(
-                &name,
+                name,
                 &PatchParams::apply(MANAGED_BY).force(),
-                &Patch::Apply(&slice),
+                &Patch::Apply(slice),
             )
             .await
             .map(|_| ())
-            .map_err(|error| error.to_string())
     }
+}
+
+/// Whether the apiserver refused an apply because a field on the existing object cannot change.
+/// Only 422 (Invalid) qualifies; a conflict, a permission error, or a transport failure must keep
+/// retrying against the existing object rather than deleting it.
+fn is_immutable_rejection(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 422)
+}
+
+/// Replace every hostname member with a resolved IP literal, dropping any that does not resolve.
+///
+/// Kubernetes accepts an `FQDN` EndpointSlice but **kube-proxy does not implement that address
+/// type**, so a hostname slice programs zero working endpoints while every apply succeeds and
+/// every log line looks healthy — the worst failure shape there is. Members are documented as
+/// bare hostnames for out-of-cluster VMs, so the names are resolved here, each cycle, and the
+/// slice only ever carries addresses kube-proxy can actually route.
+async fn resolve_addresses(members: &[Member]) -> Vec<Member> {
+    let mut resolved = Vec::with_capacity(members.len());
+    for member in members {
+        if AddressType::of(&member.address) != AddressType::Fqdn {
+            resolved.push(member.clone());
+            continue;
+        }
+        // The port is irrelevant to the lookup; the Service owns it.
+        match tokio::net::lookup_host((member.address.as_str(), 0)).await {
+            Ok(mut addresses) => match addresses.next() {
+                Some(address) => resolved.push(Member {
+                    address: address.ip().to_string(),
+                    ..member.clone()
+                }),
+                None => eprintln!(
+                    "healthproxy: {} ({}) resolved to no address; leaving it out of rotation",
+                    member.node, member.address
+                ),
+            },
+            Err(error) => eprintln!(
+                "healthproxy: resolving {} ({}) failed ({error}); leaving it out of rotation",
+                member.node, member.address
+            ),
+        }
+    }
+    resolved
 }
 
 /// Build the desired EndpointSlice for a set of members. Pure, so the mapping from health to
 /// endpoints (addresses, ready conditions, the service-name label kube-proxy keys on) is
 /// tested without a cluster.
 ///
-/// An EndpointSlice is single-address-typed, so a mixed inventory (say IP-addressed pods plus a
-/// hostname-addressed VM) cannot go in one slice. Rather than emit a raw IP into an `FQDN` slice
-/// — which Kubernetes rejects — the slice is partitioned to one family ([`slice_address_type`])
-/// and any member of another family is dropped, i.e. left out of rotation (fail closed). Such a
-/// mix is a misconfiguration; the reconcile loop logs the drop.
+/// An EndpointSlice is single-address-typed, so a mixed inventory (IPv4 plus IPv6 members) cannot
+/// go in one slice: it is partitioned to one family ([`slice_address_type`]) and any member of
+/// another family is dropped, i.e. left out of rotation (fail closed). Such a mix is a
+/// misconfiguration; the reconcile loop logs the drop.
+///
+/// Members reach here as IP literals — [`resolve_addresses`] has already turned any hostname into
+/// one — because kube-proxy does not route `FQDN` slices.
 pub fn build_slice(
     service: &str,
     slice_name: &str,
@@ -168,25 +242,23 @@ impl AddressType {
     }
 }
 
-/// The one family the slice is typed as: the family the most members share, so a mixed
-/// inventory keeps its largest partition and drops the rest rather than emitting a mismatched
-/// endpoint. Ties break IPv4 → IPv6 → FQDN for a deterministic slice. An empty inventory types
-/// as IPv4 (an empty slice, draining everything — fail closed).
+/// The one family the slice is typed as: the family the most members share, so a mixed inventory
+/// keeps its largest partition and drops the rest rather than emitting a mismatched endpoint. Ties
+/// break IPv4 → IPv6 for a deterministic slice. An empty inventory types as IPv4 (an empty slice,
+/// draining everything — fail closed).
+///
+/// Only the two IP families are candidates: `resolve_addresses` has already turned every hostname
+/// into a literal (kube-proxy does not route `FQDN` slices) or dropped it, so typing a slice FQDN
+/// would produce a slice that is accepted and then silently routes nothing.
 fn slice_address_type(members: &[Member]) -> AddressType {
-    let mut counts = [0usize; 3];
-    for member in members {
-        match AddressType::of(&member.address) {
-            AddressType::Ipv4 => counts[0] += 1,
-            AddressType::Ipv6 => counts[1] += 1,
-            AddressType::Fqdn => counts[2] += 1,
-        }
-    }
-    if counts[0] >= counts[1] && counts[0] >= counts[2] {
-        AddressType::Ipv4
-    } else if counts[1] >= counts[2] {
+    let ipv6 = members
+        .iter()
+        .filter(|member| AddressType::of(&member.address) == AddressType::Ipv6)
+        .count();
+    if ipv6 * 2 > members.len() {
         AddressType::Ipv6
     } else {
-        AddressType::Fqdn
+        AddressType::Ipv4
     }
 }
 
@@ -237,11 +309,22 @@ mod tests {
     }
 
     #[test]
-    fn hostname_members_use_the_fqdn_address_type() {
-        let members = vec![member("db", "vm-db.internal", true)];
-        assert_eq!(
-            build_slice("s", "s-updated", "http", 80, &members).address_type,
-            "FQDN"
-        );
+    fn a_hostname_never_reaches_a_slice_as_an_fqdn_endpoint() {
+        // kube-proxy does not route `FQDN` slices, so an unresolvable hostname must leave the
+        // member OUT of rotation rather than produce a slice that is accepted and routes nothing.
+        let members = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(resolve_addresses(&[member(
+                "db",
+                "vm-db.invalid.example",
+                true,
+            )]));
+        assert!(members.is_empty(), "an unresolvable member is dropped");
+
+        let slice = build_slice("s", "s-updated", "http", 80, &members);
+        assert_eq!(slice.address_type, "IPv4");
+        assert!(slice.endpoints.is_empty());
     }
 }

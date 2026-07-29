@@ -8,7 +8,7 @@ on:
       rounds:
         description: Fleet fuzz generations
         required: false
-        default: "5"
+        default: "20"
 
 jobs:
   updatec-fleet:
@@ -24,7 +24,7 @@ jobs:
       - name: Run the extended deterministic fleet soak
         env:
           UPDATEC_FUZZ_SEED: "20260718"
-          FUZZ_ROUNDS: ${{ inputs.rounds || '5' }}
+          FUZZ_ROUNDS: ${{ inputs.rounds || '20' }}
         run: ./scripts/kind-updatec-e2e.sh --fuzz-rounds "$FUZZ_ROUNDS"
       - name: Preserve diagnostics
         if: failure()

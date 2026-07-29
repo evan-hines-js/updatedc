@@ -9,11 +9,12 @@
 //! disk — so the signed generation pins them until a slot frees, and a leader change or a
 //! cold PVC can never re-seed a fresh baseline and mass-admit an entire set at once.
 //!
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{DesiredDeployment, ResolvedGroup, UpdateGroupSet};
 use serde::{Deserialize, Serialize};
-use updated::telemetry::NodeReport;
+use updated_contracts::telemetry::{Envelope, NodeReport};
 
 /// Durable group rollout state. `previous` remains present until every selected node has settled
 /// on `current`; this also prevents a second retarget from discarding the deployment held by nodes
@@ -64,13 +65,105 @@ pub struct RolloutInputs<'a> {
     /// Node → selected group name, from the publication plan's routing.
     pub node_groups: &'a BTreeMap<String, String>,
     /// Node → its latest self-reported running state.
-    pub reports: &'a HashMap<String, NodeReport>,
+    pub reports: &'a HashMap<String, Envelope>,
     /// Node → its pinned public key (raw EC point), set at enrollment from the node's CSR. A report
     /// is trusted only if its signature verifies against this key, so rollout decisions act on
     /// end-to-end evidence (node → planner), not gateway write-hop authentication. A node with no
     /// pinned key is unverifiable and can never be seen as settled — it
     /// fails closed.
     pub public_keys: &'a HashMap<String, Vec<u8>>,
+}
+
+struct Observations<'a> {
+    node_groups: &'a BTreeMap<String, String>,
+    reports: &'a HashMap<String, Envelope>,
+    public_keys: &'a HashMap<String, Vec<u8>>,
+    now_ms: u64,
+    /// One verification per node per planning pass. `settled` walks every node of a group and is
+    /// itself called from admission, set planning, and status building, so an uncached gate costs a
+    /// full ECDSA verify per node per call — work an untrusted writer chooses the size of.
+    verified: RefCell<HashMap<String, Option<NodeReport>>>,
+}
+
+impl<'a> Observations<'a> {
+    fn new(
+        node_groups: &'a BTreeMap<String, String>,
+        reports: &'a HashMap<String, Envelope>,
+        public_keys: &'a HashMap<String, Vec<u8>>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            node_groups,
+            reports,
+            public_keys,
+            now_ms,
+            verified: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// This node's report, or `None` when there is nothing trustworthy to read. The gate returns the
+    /// report itself, so an unverified envelope yields no value to inspect rather than a value a caller
+    /// might use before checking it. The verdict is memoized for the pass; the inputs cannot change
+    /// mid-pass, so a repeat lookup is the same answer at no cryptographic cost.
+    fn report(&self, node: &str) -> Option<NodeReport> {
+        if let Some(cached) = self.verified.borrow().get(node) {
+            return cached.clone();
+        }
+        let verdict = self.verify(node);
+        self.verified
+            .borrow_mut()
+            .insert(node.to_string(), verdict.clone());
+        verdict
+    }
+
+    fn verify(&self, node: &str) -> Option<NodeReport> {
+        let envelope = self.reports.get(node)?;
+        let public_key = self.public_keys.get(node)?;
+        updated_contracts::telemetry::report_is_authentic_and_fresh(
+            envelope,
+            node,
+            public_key,
+            self.now_ms,
+        )
+    }
+
+    /// Whether this node is acting on the exact assignment `identity` names — the digest of the
+    /// published configuration document, not the deployment's name. A name says nothing about
+    /// which revision of that deployment the node actually has.
+    fn on(&self, node: &str, identity: &str) -> bool {
+        self.report(node)
+            .is_some_and(|report| report.assignment_sha256 == identity)
+    }
+
+    fn healthy(&self, node: &str, identity: &str) -> bool {
+        self.report(node)
+            .is_some_and(|report| report.assignment_sha256 == identity && report.healthy)
+    }
+
+    /// Whether every node this group selects reports `deployment` healthy — and that there IS at
+    /// least one such node. Settlement is evidence, and a group nobody runs produces none: an empty
+    /// `all()` is vacuously true, which would let a group with no agents satisfy a dependency gate,
+    /// clear a rollout predecessor, and free a concurrency slot without a single report behind it.
+    ///
+    /// A deployment that cannot be encoded has no identity and can never be settled on.
+    fn settled(&self, group: &str, deployment: &DesiredDeployment) -> bool {
+        let Some(identity) = crate::deployment_identity(deployment) else {
+            return false;
+        };
+        let mut nodes = self
+            .node_groups
+            .iter()
+            .filter(|(_, selected)| selected.as_str() == group)
+            .peekable();
+        nodes.peek().is_some() && nodes.all(|(node, _)| self.healthy(node, &identity))
+    }
+}
+
+struct SetPlan {
+    members: Vec<String>,
+    max_concurrent: usize,
+    slots: usize,
+    frozen: bool,
 }
 
 /// Plan group-set admission and exact node assignments. Desired inventory remains immutable;
@@ -83,6 +176,12 @@ pub struct RolloutInputs<'a> {
 /// seeded exactly once in a group's lifetime and then survives every leader change and PVC
 /// loss, so a fresh leader can never re-baseline every member to the current desired and
 /// admit them all at once — the breach of `max_concurrent` that node-local state allowed.
+///
+/// A group's FIRST admission runs through the same gates as every later one (`admit_pending`):
+/// resolved inputs and settled prerequisites. It is exempt only from a set's concurrency slots and
+/// schedule, because there is no predecessor to stage away from and nothing yet published to
+/// protect. A group that has not been admitted at all publishes nothing for its nodes, and
+/// `domain::plan_reconcile` leaves them out of the generation entirely.
 pub(crate) fn plan_rollouts(
     sets: &[UpdateGroupSet],
     inputs: RolloutInputs<'_>,
@@ -97,77 +196,69 @@ pub(crate) fn plan_rollouts(
         public_keys,
     } = inputs;
 
-    // The deployment each group desires this generation.
     let desired: BTreeMap<String, DesiredDeployment> = groups
         .iter()
         .map(|(name, group)| (name.clone(), group.deployment.clone()))
         .collect();
-    // Seed any group we have never admitted before to its desired deployment — bringing a
-    // group to its initial baseline is not a throttled rollout. This runs against the durable
-    // admitted set, so "the first time we see it" is genuinely once per group across the whole
-    // fleet lifetime, NOT once per leader/PVC. Groups that no longer exist are pruned so the
-    // durable state stays bounded.
-    for (name, desired_deployment) in &desired {
-        admitted
-            .entry(name.clone())
-            .or_insert_with(|| AdmittedDeployment {
-                current: desired_deployment.clone(),
-                previous: None,
-            });
-    }
+    // Only pruning happens outside admission. A group is never *seeded* here: first admission runs
+    // through `admit_pending` like every later one, so a group's very first published deployment is
+    // gated on the same things a retarget is — resolved inputs and settled prerequisites. Seeding
+    // here instead would publish a cold cluster's consumer group with empty `runtime.inputs`.
     admitted.retain(|name, _| desired.contains_key(name));
+    let observations = Observations::new(
+        node_groups,
+        reports,
+        public_keys,
+        now.timestamp_millis().max(0) as u64,
+    );
+    finish_settled_rollouts(admitted, &observations);
+    let (mut plans, group_plans) =
+        build_set_plans(sets, &desired, group_labels, admitted, &observations, now);
+    admit_pending(
+        groups,
+        &desired,
+        &group_plans,
+        &mut plans,
+        admitted,
+        &observations,
+    );
+    let statuses = build_statuses(
+        sets,
+        &plans,
+        &group_plans,
+        &desired,
+        admitted,
+        &observations,
+        now,
+    );
+    let node_deployments = assign_nodes(groups, admitted, &observations);
+    RolloutPlan {
+        sets: statuses,
+        node_deployments,
+    }
+}
 
-    // The wall-clock the throttle ages reports against — the same `now` the windows/calendar use,
-    // so a stale report and a closed window are judged against one clock.
-    let now_ms = now.timestamp_millis().max(0) as u64;
-    let fresh_report = |node: &str| -> Option<&NodeReport> {
-        let report = reports.get(node)?;
-        // No pinned key ⇒ the report is unverifiable ⇒ never settled (fail closed).
-        let public_key = public_keys.get(node)?;
-        updated::telemetry::report_is_authentic_and_fresh(report, node, public_key, now_ms)
-            .then_some(report)
-    };
-    let fresh_healthy = |node: &str, published_id: &str| -> bool {
-        fresh_report(node).is_some_and(|report| report.deployment == published_id && report.healthy)
-    };
-    let settled = |group: &str, published_id: &str| -> bool {
-        node_groups
-            .iter()
-            .filter(|(_, selected)| selected.as_str() == group)
-            .all(|(node, _)| fresh_healthy(node, published_id))
-    };
-
-    // A member is *rolling* — occupying one of its sets' concurrency slots — whenever its published
-    // (admitted) deployment has not settled yet, regardless of what its *current* desired deployment
-    // is. Keying off "admitted not settled" (rather than the old "admitted == desired && !settled")
-    // matters when a group is re-targeted mid-rollout: its admitted deployment is still physically
-    // rolling out to nodes, so it must keep holding its slot rather than freeing it (and letting a
-    // second group start) the instant desired changes — which would transiently breach max_concurrent.
-    // Finish rolls before considering a new desired target. This is load-bearing for groups that
-    // are not members of a set: without it a rapid C -> D retarget could replace `previous` while
-    // some nodes still physically run P.
+fn finish_settled_rollouts(
+    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+    observations: &Observations<'_>,
+) {
     for (name, state) in admitted.iter_mut() {
         if state.previous.is_some()
-            && (state.current.report_url.is_none() || settled(name, &state.current.deployment))
+            && (state.current.report_url.is_none() || observations.settled(name, &state.current))
         {
             state.previous = None;
         }
     }
-    let is_rolling = |name: &str, admitted: &BTreeMap<String, AdmittedDeployment>| {
-        admitted[name].previous.is_some() || !settled(name, &admitted[name].current.deployment)
-    };
+}
 
-    // Resolve every set to its members and remaining admission slots. One plan per set,
-    // in `sets` order, so a plan index is the set index. A group records which set plans
-    // govern it, so admission can require *every* one of them to have a slot — that is
-    // what preserves the "no more than N rolling" guarantee for groups shared by
-    // overlapping sets (the tightest set wins), instead of each set admitting blindly.
-    struct SetPlan {
-        members: Vec<String>,
-        max_concurrent: usize,
-        slots: usize,
-        frozen: bool,
-    }
+fn build_set_plans(
+    sets: &[UpdateGroupSet],
+    desired: &BTreeMap<String, DesiredDeployment>,
+    group_labels: &BTreeMap<String, BTreeMap<String, String>>,
+    admitted: &BTreeMap<String, AdmittedDeployment>,
+    observations: &Observations<'_>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<SetPlan>, BTreeMap<String, Vec<usize>>) {
     let mut plans: Vec<SetPlan> = Vec::with_capacity(sets.len());
     let mut group_plans: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for set in sets {
@@ -186,7 +277,15 @@ pub(crate) fn plan_rollouts(
         } else {
             set.spec.effective_max_concurrent(members.len())
         };
-        let rolling_now = members.iter().filter(|n| is_rolling(n, admitted)).count();
+        // A member with no admitted entry has never been published, so it is not occupying a slot.
+        let rolling_now = members
+            .iter()
+            .filter(|name| {
+                admitted.get(*name).is_some_and(|state| {
+                    state.previous.is_some() || !observations.settled(name, &state.current)
+                })
+            })
+            .count();
         // A set is open only inside its schedule: both its recurring rollout windows and its
         // one-off dated calendar must admit `now` (each is "always open" when unset, so a set
         // using only one mechanism is gated by only that one). Outside the schedule it is
@@ -215,24 +314,29 @@ pub(crate) fn plan_rollouts(
             frozen: !open,
         });
     }
+    (plans, group_plans)
+}
 
-    // A group in more than one set is "shared": the control plane rolls it up safely,
-    // admitting it only when every set it belongs to has a slot — the tightest set governs.
-    // Surfaced on status so the UI can show shared members as spanning sets, not as plain
-    // members of one.
-    let shared: BTreeSet<String> = group_plans
-        .iter()
-        .filter(|(_, plans)| plans.len() > 1)
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    // Admit pending groups, most-constrained (in the most sets) first so a shared group is
-    // never starved behind single-set members. A group in no set rolls freely; a group in
-    // one or more sets is admitted only while every one of them has a slot, consuming one
-    // in each.
+fn admit_pending(
+    groups: &BTreeMap<String, ResolvedGroup>,
+    desired: &BTreeMap<String, DesiredDeployment>,
+    group_plans: &BTreeMap<String, Vec<usize>>,
+    plans: &mut [SetPlan],
+    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+    observations: &Observations<'_>,
+) {
+    // Pending is decided on the whole desired deployment, not its identity string. `assign_nodes`
+    // publishes the stored `current`, so a body change that keeps the same `deployment` name —
+    // a corrected digest, changed args, or dependency inputs that only resolved once the producer
+    // came up — is a real change nodes must receive. Comparing names alone dropped those silently
+    // and forever, and no operator can name-bump a change the control plane itself resolved.
     let mut pending: Vec<String> = desired
         .keys()
-        .filter(|name| admitted[*name].current.deployment != desired[*name].deployment)
+        .filter(|name| {
+            admitted
+                .get(*name)
+                .is_none_or(|state| state.current != desired[*name])
+        })
         .cloned()
         .collect();
     pending.sort_by(|a, b| {
@@ -240,22 +344,54 @@ pub(crate) fn plan_rollouts(
         count(b).cmp(&count(a)).then_with(|| a.cmp(b))
     });
     for name in pending {
-        // Never overwrite the predecessor of an unfinished rollout, even when this group belongs
-        // to no set. The latest desired value remains pending and will be admitted after settling.
-        let telemetry_gated = desired[&name].report_url.is_some();
-        if telemetry_gated
-            && (admitted[&name].previous.is_some()
-                || !settled(&name, &admitted[&name].current.deployment))
-        {
+        if !groups[&name].inputs_ready {
             continue;
         }
-        let admit = |admitted: &mut BTreeMap<String, AdmittedDeployment>| {
-            let previous = admitted[&name].current.clone();
+        // A prerequisite opens only once its desired deployment is admitted and every selected
+        // node reports that exact deployment healthy. The graph itself is validated by the domain
+        // planner before reaching this function. A dependency with no admitted entry at all has
+        // not been published even once, so it cannot have settled.
+        if !groups[&name].depends_on.iter().all(|dependency| {
+            admitted.get(dependency).is_some_and(|state| {
+                state.current == desired[dependency] && state.previous.is_none()
+            }) && observations.settled(dependency, &desired[dependency])
+        }) {
+            continue;
+        }
+        let telemetry_gated = desired[&name].report_url.is_some();
+        // First admission. There is no predecessor to stage away from and nothing for a
+        // `maxUnavailable` or a concurrency slot to protect — the group has never been published —
+        // so a baseline is admitted outside the set's slots and schedule, but only after the
+        // ordering gates above.
+        let Some(state) = admitted.get(&name) else {
             admitted.insert(
                 name.clone(),
                 AdmittedDeployment {
                     current: desired[&name].clone(),
-                    previous: telemetry_gated.then_some(previous),
+                    previous: None,
+                },
+            );
+            continue;
+        };
+        // Never overwrite the predecessor of an unfinished rollout, even when this group belongs
+        // to no set. The latest desired value remains pending and will be admitted after settling.
+        if telemetry_gated
+            && (state.previous.is_some() || !observations.settled(&name, &state.current))
+        {
+            continue;
+        }
+        // Every telemetry-gated change is staged, including one that keeps the deployment's name:
+        // "who has advanced" is decided on the published configuration's digest, so a changed
+        // archive, argument, secret, or resolved input is as stageable as a rename. Recording no
+        // predecessor for those would hand the new configuration to every node in the group at
+        // once — `maxUnavailable` bypassed by an edit that happens not to rename anything.
+        let previous = telemetry_gated.then(|| state.current.clone());
+        let admit = |admitted: &mut BTreeMap<String, AdmittedDeployment>| {
+            admitted.insert(
+                name.clone(),
+                AdmittedDeployment {
+                    current: desired[&name].clone(),
+                    previous: previous.clone(),
                 },
             );
         };
@@ -273,10 +409,25 @@ pub(crate) fn plan_rollouts(
             }
         }
     }
+}
 
-    let statuses = sets
+fn build_statuses(
+    sets: &[UpdateGroupSet],
+    plans: &[SetPlan],
+    group_plans: &BTreeMap<String, Vec<usize>>,
+    desired: &BTreeMap<String, DesiredDeployment>,
+    admitted: &BTreeMap<String, AdmittedDeployment>,
+    observations: &Observations<'_>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<SetStatus> {
+    let shared: BTreeSet<String> = group_plans
         .iter()
-        .zip(&plans)
+        .filter(|(_, plans)| plans.len() > 1)
+        .map(|(name, _)| name.clone())
+        .collect();
+    sets
+        .iter()
+        .zip(plans)
         .map(|(set, plan)| {
             let mut rolling = Vec::new();
             let mut settled_members = Vec::new();
@@ -285,10 +436,12 @@ pub(crate) fn plan_rollouts(
                 if shared.contains(name) {
                     shared_members.push(name.clone());
                 }
-                if admitted[name].current.deployment != desired[name].deployment {
-                    continue; // held back — neither rolling nor settled on its desire
-                }
-                if settled(name, &admitted[name].current.deployment) {
+                // Held back — neither rolling nor settled on its desire. A member with no admitted
+                // entry has not been published at all, which is the same story for a reader.
+                let Some(state) = admitted.get(name).filter(|s| s.current == desired[name]) else {
+                    continue;
+                };
+                if observations.settled(name, &state.current) {
                     settled_members.push(name.clone());
                 } else {
                     rolling.push(name.clone());
@@ -313,15 +466,24 @@ pub(crate) fn plan_rollouts(
                 calendar_exhausted,
             }
         })
-        .collect();
+        .collect()
+}
 
-    // Turn group-level admission into exact per-node assignments. Already-observed current nodes
-    // are retained across membership/order changes. Existing unavailable nodes consume the same
-    // budget as newly advanced nodes, so this enforces maxUnavailable rather than merely maxInFlight.
+fn assign_nodes(
+    groups: &BTreeMap<String, ResolvedGroup>,
+    admitted: &BTreeMap<String, AdmittedDeployment>,
+    observations: &Observations<'_>,
+) -> BTreeMap<String, DesiredDeployment> {
     let mut node_deployments = BTreeMap::new();
     for (name, group) in groups.iter() {
-        let state = &admitted[name];
-        let mut nodes: Vec<&String> = node_groups
+        // A group awaiting its first admission publishes nothing. Its nodes are left out of the
+        // generation entirely (see `domain::plan_reconcile`) so they hold their last known
+        // assignment rather than being handed something ungated.
+        let Some(state) = admitted.get(name) else {
+            continue;
+        };
+        let mut nodes: Vec<&String> = observations
+            .node_groups
             .iter()
             .filter_map(|(node, selected)| (selected == name).then_some(node))
             .collect();
@@ -332,18 +494,29 @@ pub(crate) fn plan_rollouts(
             }
             continue;
         };
+        // Advancement is judged on the exact configuration each node reports acting on, so a
+        // change that keeps the deployment's name still stages one batch at a time.
+        let (Some(current_id), Some(previous_id)) = (
+            crate::deployment_identity(&state.current),
+            crate::deployment_identity(previous),
+        ) else {
+            // Nothing can be shown to have advanced, so hold every node on the predecessor rather
+            // than guess.
+            for node in nodes {
+                node_deployments.insert(node.clone(), previous.clone());
+            }
+            continue;
+        };
         let mut unavailable = 0usize;
         let mut held = Vec::new();
         for node in nodes {
-            let observed_current = fresh_report(node)
-                .is_some_and(|report| report.deployment == state.current.deployment);
-            if observed_current {
-                if !fresh_healthy(node, &state.current.deployment) {
+            if observations.on(node, &current_id) {
+                if !observations.healthy(node, &current_id) {
                     unavailable += 1;
                 }
                 node_deployments.insert(node.clone(), state.current.clone());
             } else {
-                if !fresh_healthy(node, &previous.deployment) {
+                if !observations.healthy(node, &previous_id) {
                     unavailable += 1;
                 }
                 held.push(node);
@@ -361,15 +534,16 @@ pub(crate) fn plan_rollouts(
             );
         }
     }
-    RolloutPlan {
-        sets: statuses,
-        node_deployments,
-    }
+    node_deployments
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A well-formed running digest for report fixtures. Nothing in this module reads it; a report
+    /// simply needs one to be well formed.
+    const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     // A fixed instant for tests whose sets carry no rollout windows (always open, so the
     // exact value is irrelevant). Window behaviour is unit-tested in `crate::window`.
@@ -379,9 +553,15 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 
+    /// Every fixture group uses a telemetry-gated deployment, so the identity a report carries is
+    /// derived from the same shape the planner holds.
+    fn deployment_named(id: &str) -> DesiredDeployment {
+        deployment(id, true)
+    }
+
     fn deployment(id: &str, with_report: bool) -> DesiredDeployment {
         DesiredDeployment {
-            schema: 2,
+            schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
             deployment: id.into(),
             metadata_url: "https://cdn/m/".into(),
             targets_url: "https://cdn/t/".into(),
@@ -400,27 +580,28 @@ mod tests {
         }
     }
 
-    fn runtime() -> updated::config::ManagedRuntime {
-        updated::config::ManagedRuntime {
-            mode: updated::config::RuntimeMode::Managed,
+    fn runtime() -> updated_contracts::assignment::ManagedRuntime {
+        updated_contracts::assignment::ManagedRuntime {
+            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
             args: vec![],
             secrets: vec![],
-            repository: updated::config::ManagedRepositoryLimits {
+            inputs: BTreeMap::new(),
+            repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 metadata_limit: 1,
                 target_limit: 1,
                 transport_timeout_seconds: 1,
             },
-            storage: updated::config::ManagedStorage {
+            storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
                 inactive_supervisors: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
-            timeouts: updated::config::ManagedTimeouts {
+            timeouts: updated_contracts::assignment::ManagedTimeouts {
                 check_interval_seconds: 1,
                 health_grace_seconds: 1,
                 health_successes: 1,
@@ -438,6 +619,9 @@ mod tests {
         ResolvedGroup {
             name: name.into(),
             match_labels: BTreeMap::from([("group".into(), name.into())]),
+            depends_on: vec![],
+            inputs: BTreeMap::new(),
+            inputs_ready: true,
             deployment,
             max_unavailable: 1,
         }
@@ -484,25 +668,39 @@ mod tests {
             .collect()
     }
 
-    fn report(node: &str, deployment: &str, healthy: bool) -> (String, NodeReport) {
-        // Throttling keys off (deployment, healthy); the running version is irrelevant here.
-        // Stamp "always fresh" (a future timestamp ages to 0) so the concurrency tests exercise
-        // admission logic against a node reporting on every tick — the freshness bound has its own
-        // dedicated test (`a_stale_report_is_treated_as_not_settled`) rather than perturbing these.
-        let mut report = NodeReport::new(node, deployment, deployment, healthy);
-        report.reported_at_ms = u64::MAX;
-        report.signature = updated::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
-        (node.into(), report)
+    /// A freshly-stamped report as of `now`. Throttling keys off (deployment, healthy); the running
+    /// version is irrelevant here. Stamping against the same instant the pass is planned at is what
+    /// a node reporting on every tick looks like — the freshness bound is exercised by its own
+    /// tests (`a_stale_report_is_treated_as_not_settled` and the contract's gate tests) rather than
+    /// by perturbing these.
+    fn report_at(
+        now: chrono::DateTime<chrono::Utc>,
+        node: &str,
+        deployment: &str,
+        healthy: bool,
+    ) -> (String, Envelope) {
+        // A node reports the digest of the configuration it is acting on, so fixtures name the
+        // deployment and derive the identity the planner will compare against.
+        let identity = crate::deployment_identity(&deployment_named(deployment)).unwrap();
+        let mut report = NodeReport::new(node, deployment, identity, deployment, DIGEST, healthy);
+        report.reported_at_ms = now.timestamp_millis() as u64;
+        let envelope = updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
+        (node.into(), envelope)
     }
 
-    /// A healthy report older than [`updated::telemetry::REPORT_FRESHNESS`], stamped relative to
+    fn report(node: &str, deployment: &str, healthy: bool) -> (String, Envelope) {
+        report_at(test_now(), node, deployment, healthy)
+    }
+
+    /// A healthy report older than [`updated_contracts::telemetry::REPORT_FRESHNESS`], stamped relative to
     /// `test_now`.
-    fn stale_report(node: &str, deployment: &str) -> (String, NodeReport) {
-        let mut report = NodeReport::new(node, deployment, deployment, true);
-        let stale_ms = updated::telemetry::REPORT_FRESHNESS.as_millis() as u64 + 60_000;
+    fn stale_report(node: &str, deployment: &str) -> (String, Envelope) {
+        let identity = crate::deployment_identity(&deployment_named(deployment)).unwrap();
+        let mut report = NodeReport::new(node, deployment, identity, deployment, DIGEST, true);
+        let stale_ms = updated_contracts::telemetry::REPORT_FRESHNESS.as_millis() as u64 + 60_000;
         report.reported_at_ms = (test_now().timestamp_millis() as u64).saturating_sub(stale_ms);
-        report.signature = updated::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
-        (node.into(), report)
+        let envelope = updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
+        (node.into(), envelope)
     }
 
     /// Group labels for a plain two-member `pair-00` set.
@@ -600,6 +798,82 @@ mod tests {
         assert_eq!(second.node_deployments["n0"].deployment, "v1");
         assert_eq!(second.node_deployments["n1"].deployment, "v1");
         assert_eq!(second.node_deployments["n2"].deployment, "v0");
+    }
+
+    #[test]
+    fn thousand_node_rollout_never_exceeds_the_group_budget_and_converges() {
+        let mut groups = BTreeMap::from([("g".into(), group("g", deployment("v0", true)))]);
+        groups.get_mut("g").unwrap().max_unavailable = 100;
+        let node_groups: BTreeMap<String, String> = (0..1_000)
+            .map(|index| (format!("node-{index:04}"), "g".into()))
+            .collect();
+        let keys = pubkeys(&node_groups);
+        let mut reports: HashMap<String, Envelope> = node_groups
+            .keys()
+            .map(|node| report(node, "v0", true))
+            .collect();
+        let mut admitted = BTreeMap::new();
+        let labels = BTreeMap::new();
+
+        plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &keys,
+            },
+            &mut admitted,
+            test_now(),
+        );
+        groups.get_mut("g").unwrap().deployment = deployment("v1", true);
+
+        for batch in 0..10 {
+            let plan = plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports: &reports,
+                    public_keys: &keys,
+                },
+                &mut admitted,
+                test_now(),
+            );
+            let selected: Vec<_> = plan
+                .node_deployments
+                .iter()
+                .filter(|(_, deployment)| deployment.deployment == "v1")
+                .map(|(node, _)| node.clone())
+                .collect();
+            assert_eq!(selected.len(), (batch + 1) * 100);
+            // Each admitted member now reports itself settled on v1. Re-signing unconditionally is
+            // idempotent — the report's contents are what matter, not how many times it was written —
+            // and the envelope keeps its payload opaque, so there is no field to peek at first.
+            for advancing in selected {
+                reports.insert(advancing.clone(), report(&advancing, "v1", true).1);
+            }
+        }
+
+        let converged = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &keys,
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert!(converged
+            .node_deployments
+            .values()
+            .all(|deployment| deployment.deployment == "v1"));
+        assert_eq!(admitted["g"].previous, None);
     }
 
     #[test]
@@ -1041,11 +1315,14 @@ mod tests {
             ("n-a".to_string(), "a".to_string()),
             ("n-b".to_string(), "b".to_string()),
         ]);
-        let mut forged = NodeReport::new("n-a", "v1", "v1", true);
-        forged.reported_at_ms = u64::MAX;
+        let identity = crate::deployment_identity(&deployment_named("v1")).unwrap();
+        let mut report_a = NodeReport::new("n-a", "v1", identity, "v1", DIGEST, true);
+        report_a.reported_at_ms = test_now().timestamp_millis() as u64;
+        // Genuinely signed, but by a key the control plane never pinned for this node — the forgery a
+        // bucket writer could mount without the node's own key.
         let wrong_key =
             updated::csr::key_pem_to_pkcs8_der(&updated::csr::generate_key().unwrap()).unwrap();
-        forged.signature = updated::telemetry::sign_report(&forged, &wrong_key).unwrap();
+        let forged = updated_contracts::telemetry::sign_report(&report_a, &wrong_key).unwrap();
         let reports = HashMap::from([("n-a".to_string(), forged), report("n-b", "v1", true)]);
         let mut admitted = BTreeMap::from([
             ("a".to_string(), admitted(deployment("v1", true))),
@@ -1105,7 +1382,14 @@ mod tests {
         ]);
         let group_labels = pair_labels();
         let node_groups = pair_node_groups();
-        let reports_v0 = HashMap::from([report("n-a", "v0", true), report("n-b", "v0", true)]);
+        // Reports are stamped against the instant each pass is planned at, so a member is settled
+        // on v0 whichever day the pass runs.
+        let reports_v0 = |now| {
+            HashMap::from([
+                report_at(now, "n-a", "v0", true),
+                report_at(now, "n-b", "v0", true),
+            ])
+        };
         // "Every Sunday" — closed on a Monday, open on the Sunday.
         let sets = [windowed_set(vec![crate::window::RolloutWindow {
             weekdays: vec![crate::window::Weekday::Sunday],
@@ -1115,6 +1399,7 @@ mod tests {
 
         // Seed baseline at v0 while closed (Monday). Baseline is never a throttled rollout,
         // so both seed regardless of the window.
+        let monday = at("2026-07-20T12:00:00Z");
         plan_rollouts(
             &sets,
             RolloutInputs {
@@ -1122,10 +1407,10 @@ mod tests {
                 group_labels: &group_labels,
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
-                reports: &reports_v0,
+                reports: &reports_v0(monday),
             },
             &mut admitted,
-            at("2026-07-20T12:00:00Z"), // Monday: closed
+            monday, // closed
         );
 
         // Both want v1 while closed: nothing new is admitted — the set is frozen.
@@ -1138,10 +1423,10 @@ mod tests {
                 group_labels: &group_labels,
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
-                reports: &reports_v0,
+                reports: &reports_v0(monday),
             },
             &mut admitted,
-            at("2026-07-20T12:00:00Z"), // Monday: closed
+            monday, // closed
         );
         assert_eq!(
             admitted["a"].current.deployment, "v0",
@@ -1157,6 +1442,7 @@ mod tests {
         // Sunday arrives: the window opens and the set admits up to max_concurrent (1 here).
         groups.get_mut("a").unwrap().deployment = deployment("v1", true);
         groups.get_mut("b").unwrap().deployment = deployment("v1", true);
+        let sunday = at("2026-07-26T12:00:00Z");
         let statuses = plan_rollouts(
             &sets,
             RolloutInputs {
@@ -1164,10 +1450,10 @@ mod tests {
                 group_labels: &group_labels,
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
-                reports: &reports_v0,
+                reports: &reports_v0(sunday),
             },
             &mut admitted,
-            at("2026-07-26T12:00:00Z"), // Sunday: open
+            sunday, // open
         );
         assert_eq!(
             admitted["a"].current.deployment, "v1",
@@ -1203,7 +1489,6 @@ mod tests {
         ]);
         let group_labels = pair_labels();
         let node_groups = pair_node_groups();
-        let reports_v0 = HashMap::from([report("n-a", "v0", true), report("n-b", "v0", true)]);
         // The only approved window is 2026-08-25 06:00–09:00 UTC.
         let sets = [calendared_set(vec![crate::window::CalendarEntry {
             date: "2026-08-25".into(),
@@ -1214,6 +1499,11 @@ mod tests {
         let seed = |groups: &mut BTreeMap<String, ResolvedGroup>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
                     now| {
+            // Both members report themselves settled on v0 as of this pass.
+            let reports_v0 = HashMap::from([
+                report_at(now, "n-a", "v0", true),
+                report_at(now, "n-b", "v0", true),
+            ]);
             plan_rollouts(
                 &sets,
                 RolloutInputs {
@@ -1260,7 +1550,11 @@ mod tests {
         groups.get_mut("a").unwrap().deployment = deployment("v1", true);
         groups.get_mut("b").unwrap().deployment = deployment("v1", true);
         // "a" settled on v1 so its slot is free; "b" now rolls because the calendar ran out.
-        let reports_a_done = HashMap::from([report("n-a", "v1", true), report("n-b", "v0", true)]);
+        let later = at("2026-09-15T12:00:00Z");
+        let reports_a_done = HashMap::from([
+            report_at(later, "n-a", "v1", true),
+            report_at(later, "n-b", "v0", true),
+        ]);
         let statuses = plan_rollouts(
             &sets,
             RolloutInputs {
@@ -1271,7 +1565,7 @@ mod tests {
                 reports: &reports_a_done,
             },
             &mut admitted,
-            at("2026-09-15T12:00:00Z"),
+            later,
         );
         assert_eq!(
             admitted["b"].current.deployment, "v1",
@@ -1293,17 +1587,22 @@ mod tests {
     /// Two members of one set, baseline v0, one agent each. Returns everything an
     /// `plan_rollouts` call needs plus the reports showing both settled on v0.
     #[allow(clippy::type_complexity)]
-    fn two_member_pair() -> (
+    fn two_member_pair(
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (
         BTreeMap<String, ResolvedGroup>,
         BTreeMap<String, BTreeMap<String, String>>,
         BTreeMap<String, String>,
-        HashMap<String, NodeReport>,
+        HashMap<String, Envelope>,
     ) {
         let groups = BTreeMap::from([
             ("a".to_string(), group("a", deployment("v0", true))),
             ("b".to_string(), group("b", deployment("v0", true))),
         ]);
-        let reports = HashMap::from([report("n-a", "v0", true), report("n-b", "v0", true)]);
+        let reports = HashMap::from([
+            report_at(now, "n-a", "v0", true),
+            report_at(now, "n-b", "v0", true),
+        ]);
         (groups, pair_labels(), pair_node_groups(), reports)
     }
 
@@ -1318,7 +1617,7 @@ mod tests {
         let now = chrono::Utc::now();
         // The only approved window is the whole of today (UTC), so `now` is inside it.
         let sets = [calendared_set(vec![full_day(now.date_naive())])];
-        let (mut groups, group_labels, node_groups, reports) = two_member_pair();
+        let (mut groups, group_labels, node_groups, reports) = two_member_pair(now);
         let mut admitted = BTreeMap::new();
         let mut run = |groups: &mut BTreeMap<String, ResolvedGroup>| {
             plan_rollouts(
@@ -1359,7 +1658,7 @@ mod tests {
         // frozen now (it has not run out; it has not yet begun).
         let next_year = now.date_naive() + chrono::Duration::days(365);
         let sets = [calendared_set(vec![full_day(next_year)])];
-        let (mut groups, group_labels, node_groups, reports) = two_member_pair();
+        let (mut groups, group_labels, node_groups, reports) = two_member_pair(now);
         let mut admitted = BTreeMap::new();
         let mut run = |groups: &mut BTreeMap<String, ResolvedGroup>| {
             plan_rollouts(
@@ -1394,5 +1693,182 @@ mod tests {
             "held: outside the calendar"
         );
         assert!(statuses.sets[0].rolling.is_empty());
+    }
+
+    #[test]
+    fn dependency_edges_wait_for_authentic_prerequisite_settlement() {
+        let mut groups = BTreeMap::from([
+            (
+                "initialize".into(),
+                group("initialize", deployment("v0", true)),
+            ),
+            ("join".into(), group("join", deployment("v0", true))),
+        ]);
+        groups.get_mut("join").unwrap().depends_on = vec!["initialize".into()];
+        let node_groups = BTreeMap::from([
+            ("node-init".into(), "initialize".into()),
+            ("node-join".into(), "join".into()),
+        ]);
+        let keys = pubkeys(&node_groups);
+        let labels = BTreeMap::new();
+        let mut reports = HashMap::from([
+            report("node-init", "v0", true),
+            report("node-join", "v0", true),
+        ]);
+        let mut admitted = BTreeMap::new();
+        let run = |groups: &BTreeMap<String, ResolvedGroup>,
+                   reports: &HashMap<String, Envelope>,
+                   admitted: &mut BTreeMap<String, AdmittedDeployment>| {
+            plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports,
+                    public_keys: &keys,
+                },
+                admitted,
+                test_now(),
+            )
+        };
+
+        run(&groups, &reports, &mut admitted);
+        groups.get_mut("initialize").unwrap().deployment = deployment("v1", true);
+        groups.get_mut("join").unwrap().deployment = deployment("v1", true);
+        run(&groups, &reports, &mut admitted);
+        assert_eq!(admitted["initialize"].current.deployment, "v1");
+        assert_eq!(admitted["join"].current.deployment, "v0");
+
+        reports.insert("node-init".into(), report("node-init", "v1", true).1);
+        run(&groups, &reports, &mut admitted);
+        assert_eq!(admitted["join"].current.deployment, "v1");
+    }
+
+    #[test]
+    fn a_first_sighting_is_gated_like_every_later_admission() {
+        // Cold cluster: nothing admitted, no telemetry yet. A consumer group must NOT be published
+        // on first sight just because it has no admitted entry — its prerequisite has not settled
+        // and its inputs are unresolved, so it would ship with an empty `runtime.inputs`. Its nodes
+        // get no assignment at all this generation and hold whatever they already have.
+        let mut groups = BTreeMap::from([
+            (
+                "initialize".into(),
+                group("initialize", deployment("init-v1", true)),
+            ),
+            ("join".into(), group("join", deployment("join-v1", true))),
+        ]);
+        groups.get_mut("join").unwrap().depends_on = vec!["initialize".into()];
+        groups.get_mut("join").unwrap().inputs_ready = false;
+        let node_groups = BTreeMap::from([
+            ("node-init".into(), "initialize".into()),
+            ("node-join".into(), "join".into()),
+        ]);
+        let keys = pubkeys(&node_groups);
+        let labels = BTreeMap::new();
+        let mut admitted = BTreeMap::new();
+        let plan = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &HashMap::new(),
+                public_keys: &keys,
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(admitted["initialize"].current.deployment, "init-v1");
+        assert!(
+            !admitted.contains_key("join"),
+            "a consumer whose inputs are unresolved is not admitted on first sight"
+        );
+        assert!(
+            !plan.node_deployments.contains_key("node-join"),
+            "an unadmitted group publishes nothing for its nodes"
+        );
+
+        // The producer settles and the consumer's inputs resolve: now it is admitted.
+        groups.get_mut("join").unwrap().inputs_ready = true;
+        let reports = HashMap::from([report("node-init", "init-v1", true)]);
+        let plan = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &keys,
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(admitted["join"].current.deployment, "join-v1");
+        assert_eq!(plan.node_deployments["node-join"].deployment, "join-v1");
+    }
+
+    #[test]
+    fn a_same_name_deployment_change_is_still_re_admitted_and_published() {
+        // Dependency inputs resolve inside the control plane, so the deployment body changes with
+        // no name to bump. Admission that compared only the name dropped this forever while
+        // reporting the group Published.
+        let (mut groups, node_groups, labels) = three_node_group();
+        let keys = pubkeys(&node_groups);
+        let reports = HashMap::from([
+            report("n0", "v0", true),
+            report("n1", "v0", true),
+            report("n2", "v0", true),
+        ]);
+        let mut admitted = BTreeMap::new();
+        let run = |groups: &BTreeMap<String, ResolvedGroup>,
+                   admitted: &mut BTreeMap<String, AdmittedDeployment>| {
+            plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports: &reports,
+                    public_keys: &keys,
+                },
+                admitted,
+                test_now(),
+            )
+        };
+        run(&groups, &mut admitted);
+
+        // Same `deployment` identity, different body.
+        let resolved = updated_contracts::telemetry::OutputValue::String {
+            value: "https://leader-0:8200".into(),
+        };
+        groups
+            .get_mut("g")
+            .unwrap()
+            .deployment
+            .runtime
+            .inputs
+            .insert("leader".into(), resolved.clone());
+        let plan = run(&groups, &mut admitted);
+
+        assert_eq!(
+            admitted["g"].current.runtime.inputs["leader"], resolved,
+            "a body change under an unchanged name must be re-admitted"
+        );
+        assert!(
+            admitted["g"].previous.is_some(),
+            "and it must be STAGED: the predecessor is retained so the group rolls in batches"
+        );
+        // `max_unavailable` is 1 for this fixture, so exactly one of the three nodes receives the
+        // new body this pass and the other two hold the old one.
+        let advanced = plan
+            .node_deployments
+            .values()
+            .filter(|deployment| deployment.runtime.inputs.get("leader") == Some(&resolved))
+            .count();
+        assert_eq!(
+            advanced, 1,
+            "an edit that renames nothing must still respect maxUnavailable"
+        );
     }
 }

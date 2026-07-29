@@ -1,7 +1,8 @@
 //! Native Windows SCM host for the installer-owned bootstrap.
 //!
-//! The service owns only the bootstrap process. It restarts a crashed bootstrap
-//! and translates SERVICE_CONTROL_STOP into CTRL_BREAK for the bootstrap's process
+//! The service owns only the bootstrap process. It reports a bootstrap that exits on its own to
+//! the SCM as a service failure — restarts are the SCM's recovery actions, not a second loop in
+//! here — and translates SERVICE_CONTROL_STOP into CTRL_BREAK for the bootstrap's process
 //! group. The supervisor puts the managed application in a different process
 //! group, so service maintenance never sends the application a console event.
 
@@ -33,7 +34,9 @@ mod windows {
 
     const SERVICE_NAME: &str = "SelfUpdateSupervisor";
     const STOP_GRACE: Duration = Duration::from_secs(20);
-    const RESTART_DELAY: Duration = Duration::from_secs(2);
+    /// Extra time reported to the SCM beyond [`STOP_GRACE`], covering the hard kill and reap that
+    /// follow an expired grace.
+    const STOP_KILL_HEADROOM: Duration = Duration::from_secs(10);
     static STOP: AtomicBool = AtomicBool::new(false);
     static STATUS: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
     static ARGS: OnceLock<Args> = OnceLock::new();
@@ -42,7 +45,9 @@ mod windows {
     struct Args {
         bootstrap: OsString,
         state_dir: OsString,
-        supervisor_config: OsString,
+        /// Forwarded only when given: the bootstrap owns the canonical default, so this
+        /// wrapper never needs to know where a node's config lives.
+        supervisor_config: Option<OsString>,
         supervisor: OsString,
         probe_address: Option<OsString>,
     }
@@ -97,7 +102,7 @@ mod windows {
         Ok(Args {
             bootstrap: bootstrap.ok_or("--bootstrap <path> is required")?,
             state_dir: state_dir.ok_or("--state-dir <path> is required")?,
-            supervisor_config: supervisor_config.ok_or("--supervisor-config <path> is required")?,
+            supervisor_config,
             supervisor: supervisor.ok_or("--supervisor <path> is required")?,
             probe_address,
         })
@@ -113,7 +118,15 @@ mod windows {
         }
         STATUS.store(handle, Ordering::SeqCst);
         report(SERVICE_START_PENDING, 0, 5_000, NO_ERROR);
-        report(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0, NO_ERROR);
+        // Accept SHUTDOWN as well as STOP. Without it the SCM sends nothing on an OS restart: the
+        // tower is killed outright, skipping the drain and the clean application stop that a
+        // requested stop performs — the one moment a graceful shutdown matters most.
+        report(
+            SERVICE_RUNNING,
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+            0,
+            NO_ERROR,
+        );
         // Report the outcome to the SCM, not just to stderr: `sc failure`/`sc failureflag`
         // recovery actions (see deploy/windows/install-selfupdate-supervisor.bat) fire only
         // on a STOPPED report carrying a non-zero exit code. Reporting a clean stop after a
@@ -140,12 +153,16 @@ mod windows {
         _event_data: *mut c_void,
         _context: *mut c_void,
     ) -> u32 {
-        if control == SERVICE_CONTROL_STOP {
+        // An OS shutdown is handled exactly like a stop: drain and stop the tower cleanly.
+        if control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN {
             STOP.store(true, Ordering::SeqCst);
+            // The hint must cover the FULL stop: the grace period AND the hard kill and reap that
+            // follow it. Reporting exactly the grace tells the SCM the service is late at the very
+            // moment it is doing the right thing, and it kills the tower mid-drain.
             report(
                 SERVICE_STOP_PENDING,
                 0,
-                STOP_GRACE.as_millis() as u32,
+                (STOP_GRACE + STOP_KILL_HEADROOM).as_millis() as u32,
                 NO_ERROR,
             );
         }
@@ -157,18 +174,26 @@ mod windows {
     /// configures, which retry with escalating backoff and give up cleanly. Retrying in
     /// here as well would be a second restart path that reports success while looping.
     fn run_service() -> Result<(), String> {
-        while !STOP.load(Ordering::SeqCst) {
-            let mut child = spawn_bootstrap()?;
-            if monitor(&mut child)? {
-                break;
-            }
-            std::thread::sleep(RESTART_DELAY);
+        let mut child = spawn_bootstrap()?;
+        if monitor(&mut child)? {
+            return Ok(());
         }
-        Ok(())
+        // The bootstrap exited on its own. Report it as a service failure instead of restarting
+        // here: the SCM's recovery actions retry with escalating backoff and eventually give up
+        // visibly, whereas an in-process retry loop restarts a bootstrap that fails immediately —
+        // forever, on a fixed delay — while the SCM is told the service is running fine.
+        let status = child
+            .try_wait()
+            .map_err(|e| e.to_string())?
+            .and_then(|status| status.code());
+        Err(match status {
+            Some(code) => format!("the bootstrap exited with code {code}"),
+            None => "the bootstrap exited".to_string(),
+        })
     }
 
-    /// Returns true when service shutdown was requested, false when the bootstrap
-    /// exited and should be restarted.
+    /// Returns true when service shutdown was requested, false when the bootstrap exited on its
+    /// own (which the caller reports to the SCM as a failure).
     fn monitor(child: &mut Child) -> Result<bool, String> {
         loop {
             if STOP.load(Ordering::SeqCst) {
@@ -177,14 +202,31 @@ mod windows {
                 // SCM services have no console of their own. Attach briefly to the
                 // bootstrap's private console, ignore the event in this wrapper,
                 // target the bootstrap's group, then detach again.
-                unsafe {
+                // If the console cannot be attached the break event is never delivered, so the
+                // graceful path did not happen: waiting out the full grace only delays the kill
+                // by 20 seconds and makes an operator-visible clean stop look like a hang. Say so,
+                // and go straight to the kill.
+                let signalled = unsafe {
                     if AttachConsole(child.id()) != 0 {
                         SetConsoleCtrlHandler(None, 1);
                         GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id());
                         FreeConsole();
+                        true
+                    } else {
+                        eprintln!(
+                            "selfupdate-service: could not attach the bootstrap's console ({}); \
+                             stopping it without the graceful break",
+                            std::io::Error::last_os_error()
+                        );
+                        false
                     }
-                }
-                let deadline = Instant::now() + STOP_GRACE;
+                };
+                let deadline = Instant::now()
+                    + if signalled {
+                        STOP_GRACE
+                    } else {
+                        Duration::ZERO
+                    };
                 while Instant::now() < deadline {
                     if child.try_wait().map_err(|e| e.to_string())?.is_some() {
                         return Ok(true);
@@ -210,10 +252,11 @@ mod windows {
         command
             .arg("--state-dir")
             .arg(&args.state_dir)
-            .arg("--supervisor-config")
-            .arg(&args.supervisor_config)
             .arg("--supervisor")
             .arg(&args.supervisor);
+        if let Some(config) = &args.supervisor_config {
+            command.arg("--supervisor-config").arg(config);
+        }
         if let Some(address) = &args.probe_address {
             command.arg("--probe-address").arg(address);
         }

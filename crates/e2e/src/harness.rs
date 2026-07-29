@@ -19,6 +19,11 @@ pub type R<T = ()> = Result<T, String>;
 /// this only prevents a resource-starved CI runner from turning latency into a flake.
 pub const EVENT_TIMEOUT: u64 = 600;
 
+/// How long a NEGATIVE readiness expectation must hold. Unlike a positive event, "still not ready"
+/// cannot be proven by one observation — it has to be watched for a while, long enough to cover the
+/// health grace the scenario configured plus a launch.
+pub const READINESS_SETTLE: u64 = 15;
+
 pub fn fail<T>(msg: impl Into<String>) -> R<T> {
     Err(msg.into())
 }
@@ -303,10 +308,6 @@ impl Ctx {
         self.list_chaos_boundaries("--list-rollback-chaos-boundaries")
     }
 
-    pub fn abort_chaos_boundaries(&self) -> R<Vec<String>> {
-        self.list_chaos_boundaries("--list-abort-chaos-boundaries")
-    }
-
     pub fn install_chaos_boundaries(&self) -> R<Vec<String>> {
         self.list_chaos_boundaries("--list-install-chaos-boundaries")
     }
@@ -516,6 +517,33 @@ pub fn wait_for_version(addr: &str, want: &str, secs: u64) -> bool {
     wait_until(secs, || {
         http_text(&format!("http://{addr}/version")).as_deref() == Some(want)
     })
+}
+
+/// Trigger the sampleapp's committed test crash, tolerating the brief window where a freshly
+/// relaunched process is not yet serving: poll `GET /crash` until it answers `crashing` (the app
+/// then exits). A single-shot GET fired the instant `upgraded to <v>` is logged races the
+/// post-upgrade relaunch — the new process may not be listening yet, so the GET hits
+/// connection-refused and the crash never triggers — which is exactly the contended-runner flake
+/// this replaces. Returns on the first successful trigger, so it never over-polls into the
+/// rolled-back predecessor.
+pub fn wait_for_crash(addr: &str, secs: u64) -> bool {
+    wait_until(secs, || {
+        http_text(&format!("http://{addr}/crash")).as_deref() == Some("crashing")
+    })
+}
+
+/// Whether `cond` holds continuously for `secs`, polling throughout. Use this where a single
+/// observation would be trivially satisfied by "the thing has not started yet" — a probe endpoint
+/// that is not listening answers exactly like one answering "not ready".
+pub fn stays_true(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if !cond() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    cond()
 }
 
 pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
@@ -795,8 +823,18 @@ impl Grouped {
             windows_sys::Win32::Foundation::CloseHandle(self.job);
         }
     }
-    /// Release the OS handle for an already-exited child without killing anything.
+    /// Release the OS resources of an already-exited child, taking any surviving descendants with
+    /// it — what a service manager does when the unit's main process exits (systemd's default
+    /// `KillMode=control-group`, and a Windows job object closing).
+    ///
+    /// Windows got this for free (closing a kill-on-close job terminates what is left); Unix did
+    /// not, so the same restart scenario left the managed application running on one platform and
+    /// not the other, and the two were quietly testing different things.
     fn close(&self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
+        }
         #[cfg(windows)]
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.job);

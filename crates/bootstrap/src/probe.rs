@@ -31,9 +31,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Bound on how long a single probe connection may take to send its request or receive its
-/// response. The endpoint is served serially on one thread, so without this a single stalled
-/// client would wedge every subsequent liveness/readiness probe and get the whole tower reaped.
+/// response. Even with each connection handled off the accept loop, an unbounded one would tie up
+/// a slot indefinitely.
 const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How many probe connections may be in flight at once. Each is handled on its own short-lived
+/// thread so one stalled client cannot delay a liveness or readiness probe behind it — which an
+/// orchestrator reads as a failed probe and reaps the whole tower for. The cap is what keeps that
+/// from becoming an unbounded thread spawn: beyond it, connections are closed immediately, which a
+/// prober retries, rather than queued behind a stall.
+const MAX_CONCURRENT_PROBES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -100,16 +107,33 @@ impl Machine {
 pub fn serve(address: SocketAddr, machine: Machine) -> Result<(), String> {
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("binding guardian probe endpoint at {address}: {error}"))?;
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("guardian-probes".into())
         .spawn(move || {
             for stream in listener.incoming() {
-                match stream {
-                    Ok(mut stream) => respond(&mut stream, &machine),
+                let Ok(mut stream) = stream else {
                     // A transient accept error (e.g. fd exhaustion) must not permanently kill the
                     // probe endpoint — that would fail every future probe closed and reap the
                     // tower. Skip this connection and keep listening.
-                    Err(_) => continue,
+                    continue;
+                };
+                // Answer off the accept loop: a client that connects and then says nothing must
+                // not sit in front of the orchestrator's next liveness probe.
+                if in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_PROBES {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    continue; // dropping `stream` closes it
+                }
+                let machine = machine.clone();
+                let done = in_flight.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("guardian-probe".into())
+                    .spawn(move || {
+                        respond(&mut stream, &machine);
+                        done.fetch_sub(1, Ordering::SeqCst);
+                    });
+                if spawned.is_err() {
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
                 }
             }
         })

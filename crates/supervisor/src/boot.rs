@@ -18,7 +18,6 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
             return plan;
         }
     };
-    plan.updates_enabled = true;
     plan.current = Some(state.release.version.clone());
 
     let pending_revert_in_progress = state

@@ -49,6 +49,19 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // `Sup::new` signs the current test executable in as its default lifecycle provider.
+    // The e2e binary dispatches this marker to its fixture implementation, but killfuzz is a
+    // separate consumer of the shared harness. Without this dispatch, every lifecycle hook
+    // recursively starts another complete killfuzz run; the supervisor then kills or times out
+    // that nested run and can never complete pre-start on the final convergence boot.
+    //
+    // Killfuzz uses the harness's `accept-managed` mode, whose lifecycle contract is deliberately
+    // a no-op: the guardian already proves the managed process is alive. Returning success here is
+    // therefore the complete provider implementation needed by this binary.
+    if is_lifecycle_fixture(std::env::args_os()) {
+        return;
+    }
+
     match run() {
         Ok(()) => println!("\n\x1b[1;32mkillfuzz: OK\x1b[0m"),
         Err(e) => {
@@ -56,6 +69,11 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn is_lifecycle_fixture(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> bool {
+    args.into_iter()
+        .any(|arg| arg.as_ref() == "--lifecycle-fixture")
 }
 
 /// A tiny deterministic PRNG so a failing run is reproducible from its seed.
@@ -276,7 +294,17 @@ fn run() -> R {
         let log = tower.captured_log();
         drop(tower);
         reap(&install, &ctx.supervisor);
-        wait_until(20, || http_text(&ver_url).is_none());
+        // The next phase rebinds the same port, so the wait for the old listener to disappear is a
+        // precondition, not a diagnostic: discarding its result meant the phase could start against
+        // a port the previous tower still held and fail for an unrelated reason.
+        if !wait_until(20, || http_text(&ver_url).is_none()) {
+            drop(server);
+            return fail(
+                "round 2: the previous tower never released its listener, so the next phase would \
+                 race it for the port"
+                    .to_string(),
+            );
+        }
         if !started {
             drop(server);
             return fail(format!(
@@ -462,4 +490,20 @@ fn run() -> R {
          broken-transaction kills each reconciled against an already-moved head (climbed 3→5→7→9)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_fixture_dispatch_cannot_reenter_the_fuzzer() {
+        assert!(is_lifecycle_fixture([
+            "killfuzz",
+            "pre-start",
+            "--",
+            "--lifecycle-fixture",
+        ]));
+        assert!(!is_lifecycle_fixture(["killfuzz"]));
+    }
 }

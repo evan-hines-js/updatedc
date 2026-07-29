@@ -45,7 +45,9 @@ pub struct Sup {
     health_successes: u32,
     confirmation_window: Option<String>,
     retry_after: Option<String>,
-    lifecycle_command: Option<Vec<String>>,
+    /// The signed lifecycle reconciler every fixture runs. Not optional: `new` always installs
+    /// the default `accept-managed` fixture, and a scenario only ever swaps in its own.
+    lifecycle_command: Vec<String>,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
     probe_address: Option<String>,
@@ -56,7 +58,7 @@ pub struct Sup {
     /// Sign `ordered_install_fallback` into the assignment: a cold node whose exact assigned
     /// bytes prove unusable may descend to the newest healthy target at or below it.
     ordered_install_fallback: bool,
-    secrets: Vec<updated::config::SecretReference>,
+    secrets: Vec<updated_contracts::assignment::SecretReference>,
 }
 impl Sup {
     /// The tower managing `command` (the app binary + args) against the repo under
@@ -89,7 +91,7 @@ impl Sup {
             health_successes: 1,
             confirmation_window: None,
             retry_after: None,
-            lifecycle_command: Some(lifecycle_command),
+            lifecycle_command,
             supervisor_check_interval: None,
             ready_timeout: None,
             probe_address: None,
@@ -100,11 +102,12 @@ impl Sup {
         }
     }
     pub fn secret(mut self, environment: &str, secret: &str, key: &str) -> Self {
-        self.secrets.push(updated::config::SecretReference {
-            environment: environment.into(),
-            secret: secret.into(),
-            key: key.into(),
-        });
+        self.secrets
+            .push(updated_contracts::assignment::SecretReference {
+                environment: environment.into(),
+                secret: secret.into(),
+                key: key.into(),
+            });
         self
     }
     /// Sign ordered-install fallback into the assignment (see the struct field).
@@ -154,7 +157,7 @@ impl Sup {
         self
     }
     pub fn lifecycle(mut self, command: Vec<String>) -> Self {
-        self.lifecycle_command = Some(command);
+        self.lifecycle_command = command;
         self
     }
     pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
@@ -333,7 +336,7 @@ impl Sup {
         if self.seed_application {
             self.seed_install()?;
         }
-        if self.lifecycle_command.is_some() {
+        {
             let mut provider_set = Command::new(&self.server_bin);
             provider_set
                 .arg("publish-provider-set")
@@ -342,15 +345,14 @@ impl Sup {
                 .arg("--keys")
                 .arg(self.dir.join("keys"))
                 .args(["--id", "default"]);
-            if let Some(c) = self.lifecycle_command.clone() {
-                let (path, sha, signed_args) = self.publish_provider("lifecycle", &c)?;
-                provider_set
-                    .args(["--provider-path", &path])
-                    .args(["--provider-sha256", &sha])
-                    .args(["--provider-timeout-ms", "5000"]);
-                for arg in &signed_args {
-                    provider_set.args(["--provider-arg", arg]);
-                }
+            let (path, sha, signed_args) =
+                self.publish_provider("lifecycle", &self.lifecycle_command.clone())?;
+            provider_set
+                .args(["--provider-path", &path])
+                .args(["--provider-sha256", &sha])
+                .args(["--provider-timeout-ms", "5000"]);
+            for arg in &signed_args {
+                provider_set.args(["--provider-arg", arg]);
             }
             crate::harness::run(&mut provider_set)?;
         }
@@ -365,26 +367,27 @@ impl Sup {
                 .parse::<u64>()
                 .map_err(|error| error.to_string())
         };
-        let runtime = updated::config::ManagedRuntime {
-            mode: updated::config::RuntimeMode::Managed,
+        let runtime = updated_contracts::assignment::ManagedRuntime {
+            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: self.product.clone(),
             channel: "stable".into(),
             install_root: self.install_root.clone(),
             args: self.args.clone(),
             secrets: self.secrets.clone(),
-            repository: updated::config::ManagedRepositoryLimits {
+            inputs: std::collections::BTreeMap::new(),
+            repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 metadata_limit: 1 << 20,
                 target_limit: 512 << 20,
                 transport_timeout_seconds: 5,
             },
-            storage: updated::config::ManagedStorage {
+            storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 2,
                 inactive_providers: 2,
                 inactive_supervisors: 1,
                 inactive_bytes: 1024 * 1024 * 1024,
                 inactive_repository_caches: 2,
             },
-            timeouts: updated::config::ManagedTimeouts {
+            timeouts: updated_contracts::assignment::ManagedTimeouts {
                 check_interval_seconds: seconds(self.check_interval.as_ref(), 15)?,
                 health_grace_seconds: seconds(self.health_grace.as_ref(), 10)?,
                 health_successes: self.health_successes,
@@ -408,21 +411,6 @@ impl Sup {
         // publisher, which signs it into every republished assignment doc.
         if self.ordered_install_fallback {
             std::fs::write(self.dir.join("ordered-install-fallback"), []).map_err(str_err)?;
-        }
-        // Every test agent now starts from the same signed enrollment artifact as a
-        // production installer. Ensure a (possibly empty) `default` provider set exists even
-        // when the repository is intentionally never served (the offline one-shot scenario).
-        // Only when no provider was published above — otherwise this would overwrite that set.
-        if self.lifecycle_command.is_none() {
-            crate::harness::run(
-                Command::new(&self.server_bin)
-                    .arg("publish-provider-set")
-                    .arg("--repo")
-                    .arg(self.dir.join("repo"))
-                    .arg("--keys")
-                    .arg(self.dir.join("keys"))
-                    .args(["--id", "default"]),
-            )?;
         }
         republish_assignment(self, "configured")?;
         let state_dir = self.state_dir();
@@ -533,10 +521,7 @@ impl Sup {
         // Carry the same signed provider set the published assignment references, so the seeded
         // predecessor is faithful to a cold-installed node (install stages its providers). Without
         // this the first update's rollback restores a predecessor with no providers to replay.
-        let command = self
-            .lifecycle_command
-            .clone()
-            .ok_or_else(|| "a lifecycle reconciler is required".to_string())?;
+        let command = self.lifecycle_command.clone();
         let installed = updated::state::InstalledState::confirmed(
             lineage,
             staged.id,

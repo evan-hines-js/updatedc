@@ -16,6 +16,8 @@ pub(crate) const RELEASE_SERVER_EXEC: [&str; 6] = [
     "release-server",
 ];
 
+const DEMO_LIFECYCLE_STATE: &str = "/var/lib/updated/providers/state/demo-enterprise-lifecycle";
+
 pub(crate) async fn start_demo(
     automated: bool,
     exit_after: bool,
@@ -297,7 +299,7 @@ pub(crate) async fn exercise_demo(
         "agent",
         "--",
         "cat",
-        "/var/lib/updated/demo-enterprise-deployment/legacy-java-home/change-ticket.receipt",
+        &format!("{DEMO_LIFECYCLE_STATE}/legacy-java-home/change-ticket.receipt"),
     ]))?;
     if !receipt.contains("green release 22.0.0") {
         return Err(format!("missing lifecycle audit receipt: {receipt:?}").into());
@@ -587,7 +589,7 @@ pub(crate) fn lifecycle_audit() -> Result<String, Box<dyn std::error::Error>> {
         "agent",
         "--",
         "cat",
-        "/var/lib/updated/demo-enterprise-deployment/audit/lifecycle.tsv",
+        &format!("{DEMO_LIFECYCLE_STATE}/audit/lifecycle.tsv"),
     ]))
 }
 
@@ -1139,6 +1141,21 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
         format!("[updated_agents]\n{host} ansible_user={user}\n"),
     )?;
 
+    // The external VM presents the same fleet client certificate as the in-cluster agents, read
+    // from the cert-manager-issued secret (base64; Ansible b64decodes it onto the VM). These go in
+    // an owner-only vars FILE, never on the command line: `-e key=<private key>` puts the fleet
+    // client key in every process listing on this machine for as long as the playbook runs.
+    let vars = dir.join("enrollment-vars.json");
+    write_owner_only(
+        &vars,
+        serde_json::to_vec(&serde_json::json!({
+            "updated_enrollment_client_cert": secret_value("agent-tls", "tls.crt")?,
+            "updated_enrollment_client_key": secret_value("agent-tls", "tls.key")?,
+            "updated_enrollment_ca": secret_value("agent-tls", "ca.crt")?,
+        }))?
+        .as_slice(),
+    )?;
+
     run(Command::new("ansible-playbook")
         .env("ANSIBLE_HOST_KEY_CHECKING", "False")
         .arg("-i")
@@ -1146,29 +1163,7 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
         .arg(root.join("deploy/ansible/install-agent.yml"))
         .args(["-e", &format!("updatedc_source={}", root.display())])
         .args(["-e", "updated_enrollment_url=https://updatec-gateway"])
-        // The external VM presents the same fleet client certificate as the in-cluster agents,
-        // read from the cert-manager-issued secret (base64; Ansible b64decodes it onto the VM).
-        .args([
-            "-e",
-            &format!(
-                "updated_enrollment_client_cert={}",
-                secret_value("agent-tls", "tls.crt")?
-            ),
-        ])
-        .args([
-            "-e",
-            &format!(
-                "updated_enrollment_client_key={}",
-                secret_value("agent-tls", "tls.key")?
-            ),
-        ])
-        .args([
-            "-e",
-            &format!(
-                "updated_enrollment_ca={}",
-                secret_value("agent-tls", "ca.crt")?
-            ),
-        ])
+        .args(["-e", &format!("@{}", vars.display())])
         .args([
             "-e",
             &format!("updated_hostname={DEMO_EXTERNAL_VM_HOSTNAME}"),
@@ -1187,6 +1182,24 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
             "-e",
             &format!("updated_demo_shim_port={DEMO_EXTERNAL_VM_GATEWAY_PORT}"),
         ]))
+}
+
+/// Write `bytes` to `path` readable only by this user — the demo's one place secret material
+/// lands on local disk.
+fn write_owner_only(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    Ok(())
 }
 
 /// Label the enrolled VM's UpdateAgent into the `external-vm` cohort the Magnolia group selects.

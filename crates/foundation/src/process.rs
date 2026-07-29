@@ -38,8 +38,20 @@ impl ContainedChild {
             command.process_group(0);
         }
         let child = command.spawn()?;
+        // The child is ALREADY RUNNING by the time containment is established. Letting an assign
+        // failure propagate would drop `child` here, and `std::process::Child`'s Drop neither kills
+        // nor reaps — leaving an uncontained process running with no handle to it while the caller
+        // is told the launch failed. Kill it before reporting.
         #[cfg(windows)]
-        let job = windows::Job::assign(&child)?;
+        let job = match windows::Job::assign(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let mut orphan = child;
+                let _ = orphan.kill();
+                let _ = orphan.wait();
+                return Err(error);
+            }
+        };
         Ok(ContainedChild {
             child,
             #[cfg(windows)]
@@ -87,6 +99,24 @@ impl ContainedChild {
         #[cfg(not(any(unix, windows)))]
         {
             self.child.kill()
+        }
+    }
+
+    /// Kill descendants that may remain after the tree leader has already been observed exiting.
+    /// Unlike [`Self::kill_tree`], the Unix implementation deliberately does not signal the
+    /// positive leader PID: `try_wait` may already have reaped it, making that PID reusable.
+    pub fn kill_descendants_after_exit(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            unix::kill_group_only(&self.child)
+        }
+        #[cfg(windows)]
+        {
+            self.job.terminate()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(())
         }
     }
 }
@@ -163,6 +193,13 @@ mod unix {
         let leader_err = io::Error::last_os_error();
         accept_kill(group, group_err)?;
         accept_kill(leader, leader_err)
+    }
+
+    pub(super) fn kill_group_only(child: &Child) -> io::Result<()> {
+        let pid = i32::try_from(child.id())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "child PID exceeds pid_t"))?;
+        let group = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        accept_kill(group, io::Error::last_os_error())
     }
 
     /// A `kill(2)` outcome is success when the signal was delivered (`rc == 0`) or the
@@ -255,6 +292,7 @@ mod windows {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -291,5 +329,24 @@ mod tests {
         let _ = contained.wait().unwrap();
         // ESRCH is swallowed: killing a group that already exited is success.
         contained.kill_tree().unwrap();
+    }
+
+    #[test]
+    fn descendants_are_killed_after_the_leader_exits_and_release_its_pipes() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & exit 0"])
+            .stdout(std::process::Stdio::piped());
+        let mut contained = ContainedChild::spawn(command).unwrap();
+        let mut stdout = contained.take_stdout().unwrap();
+        assert!(contained.wait().unwrap().success());
+        contained.kill_descendants_after_exit().unwrap();
+        let started = Instant::now();
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an inherited pipe remained open after descendant cleanup"
+        );
     }
 }

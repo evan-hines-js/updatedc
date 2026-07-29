@@ -66,8 +66,8 @@ jobs:
       - run: cargo fmt --all --check
       # Compile and run the test artifacts first. Clippy then reuses Cargo's
       # dependency artifacts and analyzes only this workspace's code.
-      - run: cargo test --workspace
-      - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+      - run: cargo test --workspace --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings
       # Portable updater scenarios run identically on every OS. The arbitrary-kill fuzzer
       # (killfuzz) runs concurrently with the suite on Unix: it SIGKILLs whole process trees at
       # random instants (its reaper shells out to `pkill`, so it is Unix-only). The two coexist by

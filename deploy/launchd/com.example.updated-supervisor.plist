@@ -5,8 +5,8 @@
   URLs, and intervals, then install as a system daemon:
   Ownership terminology is defined canonically in deploy/README.md.
 
-      sudo cp com.example.selfupdate-supervisor.plist /Library/LaunchDaemons/
-      sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.selfupdate-supervisor.plist
+      sudo cp com.example.updated-supervisor.plist /Library/LaunchDaemons/
+      sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.updated-supervisor.plist
 
   launchd is the root PROCESS supervisor: it manages the lifecycle of the tiny,
   installer-owned BOOTSTRAP. The bootstrap launches the committed supervisor pointer and
@@ -27,32 +27,31 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.example.selfupdate-supervisor</string>
+  <string>com.example.updated-supervisor</string>
 
   <!-- Run as a dedicated unprivileged account, NEVER root. Without UserName a
        system LaunchDaemon runs as root, so a misused or leaked release signing
-       key would become root code execution on the client. Create `_selfupdate`
-       and grant it write access to the state dir under /usr/local/var/selfupdate
+       key would become root code execution on the client. Create `_updated`
+       and grant it write access to the state dir under /usr/local/var/updated
        (which holds content-addressed supervisor candidates, the application
        binary, version state, and the TUF metadata cache); keep the installer-owned
-       bootstrap and the pinned TUF root in /etc/selfupdate root-owned and
+       bootstrap and the pinned TUF root in /etc/updated root-owned and
        read-only. -->
   <key>UserName</key>
-  <string>_selfupdate</string>
+  <string>_updated</string>
   <key>GroupName</key>
-  <string>_selfupdate</string>
+  <string>_updated</string>
 
   <!-- The bootstrap is installer-owned and read-only. Its arguments name the state
-       directory, supervisor config, initial supervisor, and readiness timeout. -->
+       directory, initial supervisor, and readiness timeout. The config is NOT named:
+       the bootstrap reads the canonical /etc/updated/bootstrap.toml. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/etc/selfupdate/bootstrap</string>
+    <string>/etc/updated/bootstrap</string>
     <string>--state-dir</string>
-    <string>/usr/local/var/selfupdate</string>
-    <string>--supervisor-config</string>
-    <string>/etc/selfupdate/bootstrap.toml</string>
+    <string>/usr/local/var/updated</string>
     <string>--supervisor</string>
-    <string>/etc/selfupdate/supervisor</string>
+    <string>/etc/updated/supervisor</string>
     <string>--ready-timeout</string>
     <string>60</string>
     <string>--confirm-timeout</string>

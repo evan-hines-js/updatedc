@@ -158,8 +158,8 @@ and telemetry requests use the minted per-node identity. See the
 **Throttled rollouts.** An `UpdateGroupSet` never advances more than
 `maxConcurrent` members at once (default `members − 1`), holding the rest until the
 in-flight ones settle. Settlement is proven by the node itself: each agent writes a small
-signed `NodeReport` to shared storage stating the version it is *actually* running and
-whether it is healthy. The control plane reads those back — it never probes the app — so a
+signed `NodeReport` to shared storage stating the version it is *actually* running, the
+digest of the archive that version was installed from, and whether it is healthy. The control plane reads those back — it never probes the app — so a
 rollout completes only on real, node-attested health, and a missing or stale report fails
 closed (keeps the slot). Rollout windows and dated calendars gate *when* a set may admit
 new rollouts; members already rolling always finish.
@@ -216,20 +216,33 @@ Every deployment carries an immutable, signed node-reconciler bundle. The agent 
 delivery, verification of bytes, durable ordering, retries, deadlines, containment,
 cancellation, rollback journaling, scheduling, and telemetry. The bundle supplies all
 application-specific behavior through one executable accepting `preflight`, `prepare`, `pre-drain`, `drain`, `stop`,
-`pre-start`, `activate`, `start`, `verify`, `periodic`, `finalize`, and `rollback`.
+`pre-start`, `activate`, `start`, `verify`, `periodic`, `fingerprint`, `finalize`, and `rollback`.
 
 `verify` performs one observation and exits zero only when the candidate is acceptable. The
 agent retries it to the signed success threshold within the signed grace window. `periodic`
 performs one steady-state observation on the signed cadence. Managed child exit remains an
 immediate reliability event independent of either reconciler observation.
 
+`fingerprint` is the bounded steady-state measurement operation. It runs after each deploy or
+rollback once `periodic` reports healthy, then hourly with stable per-node ±10% jitter. This
+cadence is agent policy rather than deployment configuration, so expensive collection can never
+drift into every health check. Fingerprinting runs in its own worker; the single deployment
+boundary cancels and reaps its complete process tree before any rollout hook begins, then schedules
+a fresh post-deployment measurement. On exit zero, the agent SHA-256 hashes the exact non-empty
+stdout bytes (without trimming, decoding, or canonicalizing them) and places that digest plus the
+signed reconciler artifact digest in the node's DSSE report. The reconciler owns the meaning and
+stability of those bytes; stdout is fingerprint data and diagnostics belong on stderr. Empty
+output, non-zero exit, cancellation, exceeding the five-minute agent ceiling, or output beyond 64
+KiB omits the fingerprint rather than attesting incomplete state.
+
 See [LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md) for copyable Bash and PowerShell templates.
 
 ## Bootstrap and enrollment
 
-A node's entire local configuration is one `bootstrap.toml`. It carries the gateway URL,
-the fleet CA, the shared fleet enrollment credential, and the node's unique configured
-name:
+A node's entire local configuration is one `bootstrap.toml`, at one canonical path —
+`/etc/updated/bootstrap.toml` (`C:\Program Files\updated\bootstrap.toml` on Windows). It
+carries the gateway URL, the fleet CA, the shared fleet enrollment credential, and the
+node's unique configured name:
 
 ```toml
 [enrollment]
@@ -254,12 +267,15 @@ Run the bootstrap — not the supervisor — under the chosen lifecycle owner:
 ```sh
 target/release/bootstrap \
   --state-dir /var/lib/example-app/guardian-state \
-  --supervisor-config /etc/example-app/bootstrap.toml \
   --supervisor /usr/lib/example-app/supervisor \
   --ready-timeout 60 \
   --confirm-timeout 30 \
   --probe-address 127.0.0.1:9090
 ```
+
+The config is not named on the command line: the bootstrap reads the canonical path above.
+`--supervisor-config` overrides it for a deployment that deliberately keeps the file
+elsewhere.
 
 ### Guardian health state machine
 

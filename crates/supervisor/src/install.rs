@@ -6,9 +6,8 @@
 //! next boot instead of leaving the node wedged (enrollment consumed, nothing installed).
 //!
 //! Placement is uniform across every mode: the versioned active pointer places the release, and
-//! the app is launched fresh. Any first-install setup a deployment needs (seed a directory, start
-//! a systemd unit) runs in the lifecycle `pre-start` hook with `reason=install` on the first
-//! launch — there is no separate install-time provider seam.
+//! the app is launched fresh. The public `apply --reason install` operation performs any
+//! application-specific first-install convergence before launch.
 
 use super::*;
 
@@ -218,8 +217,8 @@ async fn apply_install(
                 // uninstallable: reject the app version so ordered fallback descends to one whose
                 // provider set is good, rather than crash-looping on a version we can never bring up.
                 match stage_providers(opts, &repo, store, None).await {
-                    Ok(providers) => break (prepared, providers),
-                    Err(error) => {
+                    Ok((providers, _)) => break (prepared, providers),
+                    Err(crate::selection::ProviderStagingError::Unusable(error)) => {
                         warn(&format!(
                             "first-install provider set for {} is unusable ({error}); rejecting \
                              this version so ordered fallback descends to one with a good set",
@@ -227,6 +226,17 @@ async fn apply_install(
                         ));
                         store.reject(&lineage, &prepared.archive_sha256)?;
                         continue;
+                    }
+                    // A network or disk failure says nothing about this release. Rejection is
+                    // durable and never expires, so rejecting here would let one CDN blip walk the
+                    // ordered-fallback descent to the bottom and permanently exclude every version
+                    // on the node. Fail the cold install instead and retry it on the next boot.
+                    Err(error @ crate::selection::ProviderStagingError::Transient(_)) => {
+                        return Err(format!(
+                            "staging the provider set for {} failed transiently: {error}",
+                            prepared.version
+                        )
+                        .into());
                     }
                 }
             }

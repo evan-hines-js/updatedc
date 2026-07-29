@@ -1,6 +1,6 @@
 //! Health-driven load-balancer membership for the fleet.
 //!
-//! A node's `updated` agent publishes a signed [`NodeReport`] to shared storage (the CDN);
+//! A node's `updated` agent publishes a signed [`updated_contracts::telemetry::NodeReport`] to shared storage (the CDN);
 //! the control plane can never reach the node, but anything that *can* read that storage can
 //! learn which nodes are healthy. This component reads those reports for a configured set of
 //! nodes and programs a load balancer's backend set so traffic reaches only the healthy,
@@ -17,7 +17,7 @@
 //! default is to pull the backend out of rotation. The one refinement is a transient *fetch*
 //! error (the CDN itself blinking): rather than instantly draining every node — a checker-side
 //! outage is not evidence a node is down — the last successfully fetched report is reused, still
-//! bound by [`REPORT_FRESHNESS`]. So a brief CDN outage does not mass-evict a healthy fleet, yet
+//! bound by [`updated_contracts::telemetry::REPORT_FRESHNESS`]. So a brief CDN outage does not mass-evict a healthy fleet, yet
 //! data older than the freshness window is still not-ready.
 
 pub mod endpointslice;
@@ -27,12 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use updated::telemetry::{now_ms, report_is_authentic_and_fresh, report_url, NodeReport};
-
-/// A healthy report older than this is treated as not-ready — the one freshness bound, defined once
-/// in [`updated::telemetry`] and shared with the control plane so a reader and the throttle can
-/// never disagree on when a report has gone stale.
-pub use updated::telemetry::REPORT_FRESHNESS;
+use updated_contracts::telemetry::{now_ms, report_is_authentic_and_fresh, report_url, Envelope};
 
 /// One node the load balancer may route to: its identity, a routable address, and whether it
 /// is currently in service (from health).
@@ -66,26 +61,37 @@ pub trait LoadBalancer {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String>;
 }
 
-/// Interpret a fetched health document. Ready only when the body is an *authentic* [`NodeReport`]
+/// Interpret a fetched health document. Ready only when the body is an *authentic* [`updated_contracts::telemetry::NodeReport`]
 /// *for this node* — its signature verifies against the node's pinned `public_key` — whose node has
-/// settled healthy *and whose timestamp is within [`REPORT_FRESHNESS`]*. Anything else — a report
+/// settled healthy *and whose timestamp is within
+/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]*. Anything else — a report
 /// for a different node, an unsigned or forged report (a compromised gateway or a direct bucket
 /// write cannot forge one without the node's key), malformed JSON, an empty body, or a stale report
 /// from a node that stopped heartbeating — is not-ready. An empty `public_key` (no pin) makes every
 /// report unverifiable, so the node can never be ready: the fail-closed default.
 pub fn report_is_ready(node: &str, public_key: &[u8], body: &[u8]) -> bool {
-    serde_json::from_slice::<NodeReport>(body)
-        .map(|report| {
-            report.healthy && report_is_authentic_and_fresh(&report, node, public_key, now_ms())
-        })
-        .unwrap_or(false)
+    // The gate hands back the report only when the envelope is authentic and usable, so `healthy` here
+    // is necessarily read from bytes this node signed — there is no path that reads a report first and
+    // remembers to check it second.
+    serde_json::from_slice::<Envelope>(body)
+        .ok()
+        .and_then(|envelope| report_is_authentic_and_fresh(&envelope, node, public_key, now_ms()))
+        .is_some_and(|report| report.healthy)
 }
 
-/// Fetch one node's raw health document from the CDN. `Some(body)` only on a 2xx with a readable
-/// body; any transport error, non-success status, or unreadable body is `None` — "could not
-/// determine right now", which the caller resolves against the node's last known report rather
-/// than by instantly draining it. (Whether that body actually marks the node ready is a separate
-/// judgment, [`report_is_ready`], so a genuine not-ready report still drains the node.)
+/// Upper bound on one fetched health document. A [`updated_contracts::telemetry::NodeReport`] is a few hundred bytes; this only
+/// bounds a hostile or broken CDN. The reports live in storage this component reads but does not
+/// control, so — exactly as on the agent side — a declared length is only a claim and the running
+/// total is what actually caps the read. Enforced through the one shared bounded-read helper so
+/// this path cannot drift from the agent's.
+const REPORT_BYTES_LIMIT: usize = 64 * 1024;
+
+/// Fetch one node's raw health document from the CDN. `Some(body)` only on a 2xx with a readable,
+/// bounded body; any transport error, non-success status, unreadable body, or a body exceeding
+/// [`REPORT_BYTES_LIMIT`] is `None` — "could not determine right now", which the caller resolves
+/// against the node's last known report rather than by instantly draining it. (Whether that body
+/// actually marks the node ready is a separate judgment, [`report_is_ready`], so a genuine
+/// not-ready report still drains the node.)
 pub async fn fetch_report(
     client: &reqwest::Client,
     health_base: &str,
@@ -93,14 +99,14 @@ pub async fn fetch_report(
 ) -> Option<Vec<u8>> {
     let url = report_url(health_base, node);
     let response = client.get(&url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    response.bytes().await.ok().map(|body| body.to_vec())
+    updated::http::read_bounded(response, "node health report", REPORT_BYTES_LIMIT)
+        .await
+        .ok()
 }
 
 /// The number of nodes polled concurrently per cycle. Bounded so a large fleet neither serializes
-/// (one hung node stalling the rest, risking a reconcile longer than [`REPORT_FRESHNESS`]) nor
+/// (one hung node stalling the rest, risking a reconcile longer than
+/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]) nor
 /// fans out an unbounded burst of simultaneous CDN fetches.
 const POLL_CONCURRENCY: usize = 32;
 
@@ -109,7 +115,8 @@ const POLL_CONCURRENCY: usize = 32;
 /// per-fetch timeout must not serialize onto the others.
 ///
 /// A node whose report cannot be *fetched* this cycle (a transient CDN/transport error) falls back
-/// to its last successfully fetched report, still bound by [`REPORT_FRESHNESS`]. This is what keeps
+/// to its last successfully fetched report, still bound by
+/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]. This is what keeps
 /// a brief CDN outage from draining the whole healthy fleet at once: the checker's own dependency
 /// blinking is not evidence a node is down. It remains fail-closed — a report that is genuinely
 /// not-ready still drains the node, and a cached report older than the freshness window is
@@ -452,6 +459,7 @@ mod tests {
     use super::*;
     use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
     use std::collections::HashMap;
+    use updated_contracts::telemetry::NodeReport;
 
     static TEST_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| {
         let rng = aws_lc_rs::rand::SystemRandom::new();
@@ -469,10 +477,21 @@ mod tests {
         move |key: &str| map.get(key).cloned()
     }
 
+    /// A well-formed running digest. The proxy never reads it — membership follows health — but it
+    /// must be present and well-formed for a report to pass the shared trust gate at all.
+    const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// A report the node signs *after* `mutate` runs, so a fixture can be authentically signed and
+    /// still be one the trust gate must refuse.
+    fn report_with(node: &str, healthy: bool, mutate: impl FnOnce(&mut NodeReport)) -> Vec<u8> {
+        let mut report = NodeReport::new(node, "deploy-3", DIGEST, "3.0.0", DIGEST, healthy);
+        mutate(&mut report);
+        let envelope = updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
     fn report(node: &str, healthy: bool) -> Vec<u8> {
-        let mut report = NodeReport::new(node, "deploy-3", "3.0.0", healthy);
-        report.signature = updated::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
-        serde_json::to_vec(&report).unwrap()
+        report_with(node, healthy, |_| {})
     }
 
     /// The distinct outcomes a single health fetch can produce for a node in one cycle. Every one
@@ -485,14 +504,20 @@ mod tests {
         Malformed,
         Stale,
         Missing,
+        /// Authentically signed and healthy, but carrying a running digest no reader can join on.
+        MalformedDigest,
+        /// Authentically signed and healthy, but labelled with a schema this build does not know.
+        WrongSchema,
     }
-    const OUTCOMES: [Outcome; 6] = [
+    const OUTCOMES: [Outcome; 8] = [
         Outcome::HealthyFresh,
         Outcome::Unhealthy,
         Outcome::WrongNode,
         Outcome::Malformed,
         Outcome::Stale,
         Outcome::Missing,
+        Outcome::MalformedDigest,
+        Outcome::WrongSchema,
     ];
 
     /// The fetched body an outcome produces for `node` (`None` = the fetch failed this cycle).
@@ -503,13 +528,19 @@ mod tests {
             // A healthy report, but for a *different* node — must never mark this one ready.
             Outcome::WrongNode => Some(report("someone-else", true)),
             Outcome::Malformed => Some(b"{ not valid json".to_vec()),
-            Outcome::Stale => {
-                let mut old = NodeReport::new(node, "deploy-3", "3.0.0", true);
-                old.reported_at_ms =
-                    now_ms().saturating_sub(REPORT_FRESHNESS.as_millis() as u64 + 10_000);
-                old.signature = updated::telemetry::sign_report(&old, &TEST_KEY.0).unwrap();
-                Some(serde_json::to_vec(&old).unwrap())
-            }
+            // Healthy and genuinely signed, but refused by the shared trust gate — a node whose
+            // report this build cannot interpret must drain, not linger in rotation.
+            Outcome::MalformedDigest => Some(report_with(node, true, |report| {
+                report.archive_sha256 = "not-a-digest".into()
+            })),
+            Outcome::WrongSchema => Some(report_with(node, true, |report| {
+                report.schema = NodeReport::SCHEMA + 1
+            })),
+            Outcome::Stale => Some(report_with(node, true, |report| {
+                report.reported_at_ms = now_ms().saturating_sub(
+                    updated_contracts::telemetry::REPORT_FRESHNESS.as_millis() as u64 + 10_000,
+                );
+            })),
             Outcome::Missing => None,
         }
     }
@@ -543,7 +574,9 @@ mod tests {
 
     /// Deterministic seeded fuzz over the healthproxy's readiness resolution and transition
     /// classification. Across many seeds it drives every node through a random walk of fetch
-    /// outcomes (healthy, unhealthy, wrong-node, malformed, stale, and CDN-failure), and at every
+    /// outcomes (healthy, unhealthy, wrong-node, malformed, stale, CDN-failure, and the two
+    /// authentically-signed-but-ungated shapes: an unusable running digest and an unknown schema),
+    /// and at every
     /// step asserts (a) `resolve_readiness` matches an independent model of the fail-closed /
     /// fail-operational contract, and (b) `classify_transition` reports exactly the edge implied by
     /// the previous and current readiness. It then asserts *coverage*: every fetch outcome and every

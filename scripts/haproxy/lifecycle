@@ -27,6 +27,7 @@ while (($#)); do
     --state-dir) state_dir=$2; shift 2 ;;
     --candidate) candidate=$2; shift 2 ;;
     --candidate-version) shift 2 ;;
+    --input-file | --output-file) shift 2 ;;
     --predecessor) predecessor=$2; shift 2 ;;
     --predecessor-version) shift 2 ;;
     --managed-pid) shift 2 ;;
@@ -43,29 +44,24 @@ runtime="$root/runtime"
 audit "$root" "$operation" "$attempt" started
 
 case "$operation" in
-  preflight)
+  apply)
     [[ -x "$candidate/bin/haproxy" ]] || die "candidate $candidate has no executable bin/haproxy"
     "$candidate/bin/haproxy" -c -f "$candidate/config/haproxy.cfg" >/dev/null \
       || die "candidate HAProxy configuration failed validation"
-    ;;
-  activate)
     stage_runtime "$candidate" "$runtime"
     ;;
   rollback)
     stage_runtime "$predecessor" "$runtime"
     ;;
-  verify | periodic)
+  healthcheck)
     [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"
     [[ -f "$runtime/haproxy.pid" ]] || die "master pid file is missing"
     master=$(<"$runtime/haproxy.pid")
     kill -0 "$master"
     ;;
-  finalize)
-    audit "$root" "$operation" "$attempt" receipt
-    ;;
-  prepare | pre-drain | drain | stop | pre-start | start)
-    # These operations need no HAProxy-specific mutation in guardian-managed stop/start mode.
-    :
+  inspect)
+    [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"
+    printf 'runtime-config=%s\n' "$(cksum <"$runtime/haproxy.cfg")"
     ;;
   *)
     die "unknown reconciler operation '$operation'"

@@ -97,7 +97,9 @@ fn parse_args() -> Result<guardian::Config, String> {
     if state_dir.to_str().is_none() {
         return Err("--state-dir must be a valid UTF-8 path".into());
     }
-    let supervisor_config = supervisor_config.ok_or("--supervisor-config is required")?;
+    // The config has one canonical location; passing it is for a non-standard layout only.
+    let supervisor_config =
+        supervisor_config.unwrap_or_else(|| PathBuf::from(control::DEFAULT_BOOTSTRAP_CONFIG));
 
     Ok(guardian::Config {
         state_dir,
@@ -132,12 +134,14 @@ fn next_seconds(
 fn usage() {
     eprintln!(
         "bootstrap — the update tower's root and the application's permanent guardian\n\n\
-         usage: bootstrap --state-dir <dir> --supervisor-config <path.toml> \\\n\
+         usage: bootstrap --state-dir <dir> [--supervisor-config <path.toml>] \\\n\
          \x20                [--supervisor <path>] [--ready-timeout <secs>]\n\
          \x20                [--confirm-timeout <secs>] [--stop-grace <secs>]\n\
          \x20                [--probe-address <IP:port>]\n\n\
          --state-dir          where the guardian keeps ownership + supervisor pointers\n\
-         --supervisor-config  operator config, passed verbatim to each supervisor\n\
+         --supervisor-config  operator config, passed verbatim to each supervisor;\n\
+         \x20                    defaults to the canonical bootstrap.toml location, so\n\
+         \x20                    pass it only for a non-standard layout\n\
          --supervisor         initial supervisor binary (first boot only; seeds the pointer)\n\
          --ready-timeout      how long a replacement supervisor has to prove ready (default 45s)\n\
          --confirm-timeout    stability window before committing a replacement (default 30s)\n\

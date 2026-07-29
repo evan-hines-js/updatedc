@@ -302,11 +302,17 @@ stateDiagram-v2
 
 ## 9. Telemetry (the feedback signal)
 
-The supervisor heartbeats a `NodeReport { node, deployment, version, healthy, reported_at_ms }` by
+The supervisor heartbeats a
+`NodeReport { node, deployment, version, archive_sha256, healthy, reported_at_ms }` by
 PUT to its assignment's `report_url` (the gateway persists it to the object store). `healthy` means
 *settled*: installed, confirmed, and the app's health gate passing — `false` while an update is
-in-flight. The control plane reads these back to drive the throttle's `settled` (§2). A report
-older than `REPORT_FRESHNESS` (60s) reads not-ready (fail-closed).
+in-flight. `archive_sha256` is the digest of the archive the *running* release was installed from
+(read from the node's own committed install record, so it names the predecessor after a rollback);
+it lets a reader join a node straight to the exact bytes executing on it rather than to a version
+string. Both it and `version` are empty until the first install completes. The control plane reads
+these back to drive the throttle's `settled` (§2). A report older than `REPORT_FRESHNESS` (60s)
+reads not-ready (fail-closed), as does one whose `schema` this build does not know or whose
+`archive_sha256` is neither empty nor a SHA-256 hex digest.
 
 The **healthproxy** consumes the same reports to program a load balancer's membership
 (EndpointSlice `ready`): `report_is_ready` requires a fresh, healthy report *for that node*, else the
@@ -439,5 +445,6 @@ sequenceDiagram
 | Guardian loop | `bootstrap/src/guardian.rs` (`Cycle`, `ActivationState`) |
 | Supervisor self-update | `supervisor/src/self_update.rs`; `bootstrap/src/supervisor.rs` |
 
-Related design docs: `docs/crash-safety-review.md` (provisional/confirmed deep-dive),
-`docs/group-enrollment-design.md` (enrollment), `docs/fleet-rollout-endpoints.md`.
+The implementation and tests are the executable specification for crash recovery. See
+`docs/group-enrollment-design.md` for enrollment and `docs/fleet-rollout-endpoints.md` for the
+fleet data plane.

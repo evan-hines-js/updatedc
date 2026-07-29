@@ -20,8 +20,7 @@ use crate::{
     UpdateGroupSet, UpdateGroupSetStatus, UpdateGroupStatus, UpdateRepository,
     UpdateRepositoryStatus, UpdateSubscription,
 };
-use sha2::{Digest, Sha256};
-use updated::telemetry::NodeReport;
+use updated_contracts::telemetry::Envelope;
 
 const LEASE_SECONDS: i32 = 15;
 
@@ -138,11 +137,26 @@ impl std::fmt::Display for StorageError {
 }
 impl std::error::Error for StorageError {}
 
+/// Static S3 credentials, or all-`None` to fall back to the environment's workload identity.
+#[derive(Default)]
+pub struct S3Credentials<'a> {
+    pub access_key: Option<&'a str>,
+    pub secret_key: Option<&'a str>,
+    /// Required by every temporary credential — STS `AssumeRole`, IRSA, an SSO session. Dropping
+    /// it turns a valid temporary key pair into one S3 rejects, so an operator publishing with
+    /// assumed-role credentials gets an authorization failure with nothing obviously wrong.
+    pub session_token: Option<&'a str>,
+}
+
 pub fn s3_store(
     destination: &S3Destination,
-    access_key: Option<&str>,
-    secret_key: Option<&str>,
+    credentials: S3Credentials<'_>,
 ) -> Result<Arc<dyn ObjectStore>, StorageError> {
+    let S3Credentials {
+        access_key,
+        secret_key,
+        session_token,
+    } = credentials;
     validate_object_prefix(&destination.prefix)?;
     if destination.bucket.trim().is_empty() || destination.region.trim().is_empty() {
         return Err(StorageError(
@@ -162,6 +176,9 @@ pub fn s3_store(
         builder = builder
             .with_access_key_id(access)
             .with_secret_access_key(secret);
+        if let Some(token) = session_token {
+            builder = builder.with_token(token);
+        }
     }
     builder
         .build()
@@ -171,15 +188,11 @@ pub fn s3_store(
 
 fn validate_object_prefix(prefix: &str) -> Result<(), StorageError> {
     let trimmed = prefix.trim_matches('/');
+    // Empty = bucket root. Otherwise the prefix must already be normalized (no surrounding slashes)
+    // and a confined relative path — the one shared traversal guard, so it can never climb out of
+    // the bucket's key space.
     if prefix != trimmed
-        || (!trimmed.is_empty()
-            && trimmed.split('/').any(|part| {
-                part.is_empty()
-                    || part == "."
-                    || part == ".."
-                    || part.contains(['\\', ':'])
-                    || part.chars().any(char::is_control)
-            }))
+        || (!trimmed.is_empty() && !updated_contracts::path::is_confined_relative(trimmed))
     {
         return Err(StorageError(
             "S3 prefix must be a relative, normalized object-key prefix".into(),
@@ -216,7 +229,16 @@ async fn build_store(
     };
     let access = secret_string(credentials.as_ref(), "AWS_ACCESS_KEY_ID")?;
     let secret = secret_string(credentials.as_ref(), "AWS_SECRET_ACCESS_KEY")?;
-    Ok(s3_store(destination, access.as_deref(), secret.as_deref())?)
+    // A session token is present only for temporary credentials, so absence is normal.
+    let token = optional_secret_string(credentials.as_ref(), "AWS_SESSION_TOKEN")?;
+    Ok(s3_store(
+        destination,
+        S3Credentials {
+            access_key: access.as_deref(),
+            secret_key: secret.as_deref(),
+            session_token: token.as_deref(),
+        },
+    )?)
 }
 
 /// Mirror a fully signed repository. `timestamp.json` is uploaded last, making it the
@@ -266,7 +288,7 @@ async fn store_has_published_metadata(
 /// object-storage prefix has been pruned. The signed TUF metadata and bundles under that prefix are
 /// durable, external state Kubernetes garbage collection cannot reach, so without this a deleted
 /// repository would orphan signed artifacts in the bucket/CDN indefinitely. In-cluster children
-/// (enrollment/join Secrets, the admitted-state ConfigMap) instead carry owner references and are
+/// (enrollment Secrets and the admitted-state ConfigMap) instead carry owner references and are
 /// reclaimed by ordinary Kubernetes GC — the finalizer is reserved for what GC cannot see.
 const REPOSITORY_FINALIZER: &str = "updated.dev/published-artifacts";
 
@@ -325,14 +347,27 @@ async fn finalize_repository(
         // A prior pass already pruned and released the finalizer; nothing left but to let GC finish.
         return Ok(());
     }
-    let store = build_store(secrets, &repository.spec.s3).await?;
-    let pruned = prune_prefix(store.as_ref(), &repository.spec.s3.prefix).await?;
-    tracing::info!(
-        repository = %repository.name_any(),
-        prefix = %repository.spec.s3.prefix,
-        pruned,
-        "pruned a deleted repository's published artifacts",
-    );
+    // An empty prefix is not a scope, it is the whole bucket — which routinely also holds the
+    // release TUF repository and every published bundle. Deleting a repository must never be able
+    // to delete artifacts it does not own, so an unscoped repository is released WITHOUT pruning:
+    // leaving objects behind is recoverable, deleting the bucket is not.
+    if repository.spec.s3.prefix.trim_matches('/').is_empty() {
+        tracing::warn!(
+            repository = %repository.name_any(),
+            "deleted repository has an empty s3 prefix, which is not a scope this finalizer can \
+             safely prune (it would list and delete the entire bucket); releasing the finalizer \
+             and leaving its published artifacts in place — remove them by hand",
+        );
+    } else {
+        let store = build_store(secrets, &repository.spec.s3).await?;
+        let pruned = prune_prefix(store.as_ref(), &repository.spec.s3.prefix).await?;
+        tracing::info!(
+            repository = %repository.name_any(),
+            prefix = %repository.spec.s3.prefix,
+            pruned,
+            "pruned a deleted repository's published artifacts",
+        );
+    }
     repositories
         .patch(
             &repository.name_any(),
@@ -347,12 +382,19 @@ async fn finalize_repository(
 
 /// Delete every object under `prefix` in `store`, returning the count removed. Locations are collected
 /// before deletion so the list connection is not held open across the deletes; a TUF repository's
-/// object count is modest (metadata plus a bounded set of bundles), so this stays bounded. An empty
-/// prefix scopes to the whole bucket — the repository's contract is that its prefix namespaces exactly
-/// its own artifacts.
+/// object count is modest (metadata plus a bounded set of bundles), so this stays bounded.
+///
+/// An empty prefix is refused rather than treated as "the whole bucket": callers reach this from a
+/// delete path, and an unscoped delete would take out every other tenant of the same bucket.
 async fn prune_prefix(store: &dyn ObjectStore, prefix: &str) -> Result<usize, StorageError> {
     let trimmed = prefix.trim_matches('/');
-    let scope = (!trimmed.is_empty()).then(|| object_store::path::Path::from(trimmed));
+    if trimmed.is_empty() {
+        return Err(StorageError(
+            "refusing to prune an empty prefix: that is the whole bucket, not this repository"
+                .into(),
+        ));
+    }
+    let scope = Some(object_store::path::Path::from(trimmed));
     let mut listing = store.list(scope.as_ref());
     let mut locations = Vec::new();
     while let Some(entry) = listing.next().await {
@@ -396,6 +438,21 @@ pub async fn reconcile_once(
     }
     ensure_repository_finalizer(&repositories, &repository).await?;
 
+    // The rollout state (each group's currently-pinned deployment, and the routing the last
+    // generation published) lives durably in-cluster — a ConfigMap — NOT on the node-local PVC.
+    // That is what survives an HA leader change or a cold/rescheduled PVC: a fresh leader loads the
+    // real admitted baseline from etcd instead of re-seeding every group to the current desired and
+    // admitting a whole set at once (the `max_concurrent` breach that node-local state allowed).
+    // The single publisher lease keeps this a single writer; the write below is a resourceVersion
+    // compare-and-swap as a second guard. It is loaded here, before groups are validated, because
+    // quarantining a group needs the deployment that group is still pinned to.
+    let admitted_name = admitted_configmap_name(repository_name);
+    let (durable, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
+    let DurableRolloutState {
+        mut admitted,
+        routing,
+    } = durable;
+
     let mut group_resources = groups_api.list(&ListParams::default()).await?;
     group_resources
         .items
@@ -407,8 +464,31 @@ pub async fn reconcile_once(
     let mut groups = BTreeMap::new();
     let mut group_labels = BTreeMap::new();
     let mut quarantined_groups: HashSet<String> = HashSet::new();
+    // What each quarantined group is still pinned to. Its nodes must keep exactly that: routing
+    // them to the unmatched-node pseudo-group would turn a typo'd digest or a bad `maxUnavailable`
+    // into a fleet-wide, unthrottled, ungated deployment swap, and leaving them out of the
+    // generation would delete their assignments outright (publication replaces every target).
+    let mut held_groups: BTreeMap<String, crate::rollout::AdmittedDeployment> = BTreeMap::new();
+    let hold_group =
+        |name: &str, held: &mut BTreeMap<String, crate::rollout::AdmittedDeployment>| {
+            if let Some(state) = admitted.get(name) {
+                held.insert(name.to_string(), state.clone());
+            }
+        };
     for group in group_resources.iter() {
         let name = group.name_any();
+        if name == crate::DEFAULT_GROUP {
+            quarantine_group(
+                &groups_api,
+                group,
+                "ReservedName",
+                "`default` is reserved for agents that match no group; rename this UpdateGroup.",
+            )
+            .await?;
+            hold_group(&name, &mut held_groups);
+            quarantined_groups.insert(name);
+            continue;
+        }
         if group.spec.selector.match_labels.is_empty() {
             quarantine_group(
                 &groups_api,
@@ -417,6 +497,7 @@ pub async fn reconcile_once(
                 "This group's selector has no matchLabels; an empty selector would match every agent and is refused.",
             )
             .await?;
+            hold_group(&name, &mut held_groups);
             quarantined_groups.insert(name);
             continue;
         }
@@ -430,6 +511,7 @@ pub async fn reconcile_once(
                     &format!("This group's deployment is invalid: {error}"),
                 )
                 .await?;
+                hold_group(&name, &mut held_groups);
                 quarantined_groups.insert(name);
                 continue;
             }
@@ -439,6 +521,9 @@ pub async fn reconcile_once(
             ResolvedGroup {
                 name: name.clone(),
                 match_labels: group.spec.selector.match_labels.clone(),
+                depends_on: group.spec.depends_on.clone(),
+                inputs: group.spec.inputs.clone(),
+                inputs_ready: group.spec.inputs.is_empty(),
                 deployment,
                 max_unavailable: match group.spec.max_unavailable {
                     Some(0) => {
@@ -449,6 +534,7 @@ pub async fn reconcile_once(
                             "maxUnavailable must be at least one",
                         )
                         .await?;
+                        hold_group(&name, &mut held_groups);
                         quarantined_groups.insert(name);
                         continue;
                     }
@@ -476,11 +562,13 @@ pub async fn reconcile_once(
     for agent in &agent_resources.items {
         let identity = &agent.spec.identity;
         let valid = match identity.kind {
-            crate::AgentIdentityKind::Manual => identity.registration_sha256.is_none(),
+            crate::AgentIdentityKind::Manual | crate::AgentIdentityKind::Reserved => {
+                identity.registration_sha256.is_none()
+            }
             crate::AgentIdentityKind::Enrolled => identity
                 .registration_sha256
                 .as_deref()
-                .is_some_and(updated::hash::is_sha256_hex),
+                .is_some_and(updated_contracts::is_sha256_hex),
         };
         if !valid {
             quarantine_agent(
@@ -497,6 +585,9 @@ pub async fn reconcile_once(
         .items
         .retain(|agent| !quarantined_agents.contains(&agent.name_any()));
 
+    // Every agent stays in the plan. Nodes whose group is quarantined are held on that group's
+    // pinned deployment by the planner (`DesiredState::held`) — they are neither re-routed to the
+    // ungated default nor dropped from the signed generation.
     let resolved_nodes: Vec<ResolvedNode> = agent_resources
         .iter()
         .map(|node| ResolvedNode {
@@ -548,14 +639,6 @@ pub async fn reconcile_once(
             }
         }
     }
-    // The admitted set (each group's currently-pinned deployment) lives durably in-cluster — a
-    // ConfigMap keyed by group — NOT on the node-local PVC. That is what survives an HA leader
-    // change or a cold/rescheduled PVC: a fresh leader loads the real admitted baseline from etcd
-    // instead of re-seeding every group to the current desired and admitting a whole set at once
-    // (the `max_concurrent` breach that node-local state allowed). The single publisher lease keeps
-    // this a single writer; the write below is a resourceVersion compare-and-swap as a second guard.
-    let admitted_name = admitted_configmap_name(repository_name);
-    let (mut admitted, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
     let reconcile_now = chrono::Utc::now();
     let outcome = crate::domain::plan_reconcile(
         crate::domain::DesiredState {
@@ -564,71 +647,77 @@ pub async fn reconcile_once(
             group_labels: &group_labels,
             sets: &set_resources.items,
             nodes: &resolved_nodes,
+            held: &held_groups,
         },
         crate::domain::ObservedState {
             reports: &reports,
             public_keys: &public_keys,
             admitted: &admitted,
+            routing: &routing,
             now: reconcile_now,
         },
     )?;
     let crate::domain::ReconcilePlan {
         publication: plan,
         admitted: planned_admitted,
+        routing: planned_routing,
         set_statuses,
     } = outcome;
-    // Reconcile runs every second; only write when the admitted set actually changed so a steady
+    // Reconcile runs every second; only write when the durable state actually changed so a steady
     // generation makes no apiserver writes.
-    if admitted != planned_admitted {
-        admitted = planned_admitted;
+    let planned = DurableRolloutState {
+        admitted: planned_admitted,
+        routing: planned_routing,
+    };
+    if admitted != planned.admitted || routing != planned.routing {
         store_admitted_state(
             &configmaps,
             &admitted_name,
             namespace,
-            &admitted,
+            &planned,
             admitted_version,
             repository.controller_owner_ref(&()),
         )
         .await?;
     }
+    admitted = planned.admitted;
 
     let desired_digest = desired_publication_digest(&repository.spec, &plan.digest)?;
     let published_digest = state_dir.join("published-plan.sha256");
+    let projection = ReconcileProjection {
+        client: &client,
+        namespace,
+        state_dir,
+        public_url,
+        secrets: &secrets,
+        repository: &repository,
+        store: store.as_ref(),
+        apis: ResourceApis {
+            repositories: &repositories,
+            groups: &groups_api,
+            agents: &nodes_api,
+        },
+        snapshot: StatusSnapshot {
+            repository: &repository,
+            groups: &group_resources.items,
+            agents: &agent_resources.items,
+            plan: &plan,
+            reports: &reports,
+            admitted: &admitted,
+            public_keys: &public_keys,
+            now: reconcile_now,
+        },
+        sets: &sets_api,
+        set_resources: &set_resources.items,
+        set_statuses: &set_statuses,
+    };
     if tokio::fs::read_to_string(&published_digest)
         .await
         .ok()
         .as_deref()
         == Some(desired_digest.as_str())
     {
-        publish_enrollment_secrets(
-            &secrets,
-            &repository,
-            &agent_resources.items,
-            store.as_ref(),
-            &repository.spec.s3.prefix,
-            public_url,
-        )
-        .await?;
-        publish_resource_statuses(
-            ResourceApis {
-                repositories: &repositories,
-                groups: &groups_api,
-                agents: &nodes_api,
-            },
-            StatusSnapshot {
-                repository: &repository,
-                groups: &group_resources.items,
-                agents: &agent_resources.items,
-                plan: &plan,
-                reports: &reports,
-                admitted: &admitted,
-                public_keys: &public_keys,
-                now: reconcile_now,
-            },
-        )
-        .await?;
-        publish_group_set_statuses(&sets_api, &set_resources.items, &set_statuses).await?;
-        deliver_subscriptions(&client, namespace, &repository, state_dir, public_url).await;
+        projection.publish().await?;
         return Ok(plan.digest);
     }
 
@@ -668,36 +757,8 @@ pub async fn reconcile_once(
     }
 
     publish_repository(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
-    publish_enrollment_secrets(
-        &secrets,
-        &repository,
-        &agent_resources.items,
-        store.as_ref(),
-        &repository.spec.s3.prefix,
-        public_url,
-    )
-    .await?;
     foundation::durable::atomic_write(&published_digest, ".published-", desired_digest.as_bytes())?;
-    publish_resource_statuses(
-        ResourceApis {
-            repositories: &repositories,
-            groups: &groups_api,
-            agents: &nodes_api,
-        },
-        StatusSnapshot {
-            repository: &repository,
-            groups: &group_resources.items,
-            agents: &agent_resources.items,
-            plan: &plan,
-            reports: &reports,
-            admitted: &admitted,
-            public_keys: &public_keys,
-            now: reconcile_now,
-        },
-    )
-    .await?;
-    publish_group_set_statuses(&sets_api, &set_resources.items, &set_statuses).await?;
-    deliver_subscriptions(&client, namespace, &repository, state_dir, public_url).await;
+    projection.publish().await?;
     Ok(plan.digest)
 }
 
@@ -749,13 +810,18 @@ async fn read_node_reports(
     store: &dyn ObjectStore,
     prefix: &str,
     agents: &[String],
-) -> HashMap<String, NodeReport> {
+) -> HashMap<String, Envelope> {
     let prefix = prefix.trim_matches('/');
     let fetches = agents.iter().map(|node| async move {
-        let key = crate::object_key(prefix, &updated::telemetry::report_object_key(node));
-        let bytes = store.get(&key).await.ok()?.bytes().await.ok()?;
-        let report = serde_json::from_slice::<NodeReport>(&bytes).ok()?;
-        Some((node.clone(), report))
+        let key = crate::object_key(
+            prefix,
+            &updated_contracts::telemetry::report_object_key(node),
+        );
+        let bytes = crate::read_object_bounded(store, &key).await.ok()?;
+        // The envelope is stored verbatim; it is verified per consumer, not here, so this stays a
+        // transport read and the trust gate has exactly one home.
+        let envelope = serde_json::from_slice::<Envelope>(&bytes).ok()?;
+        Some((node.clone(), envelope))
     });
     futures::stream::iter(fetches)
         .buffer_unordered(16)
@@ -778,25 +844,39 @@ fn admitted_configmap_name(repository_name: &str) -> String {
 async fn load_admitted_state(
     configmaps: &Api<ConfigMap>,
     name: &str,
-) -> Result<
-    (
-        BTreeMap<String, crate::rollout::AdmittedDeployment>,
-        Option<String>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(DurableRolloutState, Option<String>), Box<dyn std::error::Error>> {
     let Some(configmap) = configmaps.get_opt(name).await? else {
-        return Ok((BTreeMap::new(), None));
+        return Ok((DurableRolloutState::default(), None));
     };
     let resource_version = configmap.metadata.resource_version.clone();
-    let encoded = configmap
-        .data
-        .as_ref()
+    let data = configmap.data.as_ref();
+    let encoded = data
         .and_then(|data| data.get("state.json"))
         .ok_or_else(|| StorageError("admitted-state ConfigMap has no state.json".into()))?;
     let admitted = serde_json::from_str(encoded)
         .map_err(|error| StorageError(format!("invalid admitted state: {error}")))?;
-    Ok((admitted, resource_version))
+    // The published routing (node → group) is a second key rather than a field of the first, so a
+    // repository that has only ever written the admitted set reads back as "no routing recorded"
+    // instead of failing its whole document closed.
+    let routing = match data.and_then(|data| data.get("routing.json")) {
+        Some(encoded) => serde_json::from_str(encoded)
+            .map_err(|error| StorageError(format!("invalid published routing: {error}")))?,
+        None => BTreeMap::new(),
+    };
+    Ok((DurableRolloutState { admitted, routing }, resource_version))
+}
+
+/// The control plane's durable rollout state: what each group is pinned to, and which group each
+/// node was routed to in the last published generation.
+///
+/// The routing half exists because publication REPLACES the whole target set: a node left out of a
+/// generation does not keep its old assignment, its `agents/<node>.json` target simply stops
+/// existing. Knowing what a node was last published under is what lets a group that cannot be
+/// planned this pass (quarantined, or waiting on its inputs) leave that node exactly where it was.
+#[derive(Default)]
+pub(crate) struct DurableRolloutState {
+    pub admitted: BTreeMap<String, crate::rollout::AdmittedDeployment>,
+    pub routing: BTreeMap<String, String>,
 }
 
 /// Persist the admitted set back to its ConfigMap. `resource_version` is `Some` when the ConfigMap
@@ -808,11 +888,17 @@ async fn store_admitted_state(
     configmaps: &Api<ConfigMap>,
     name: &str,
     namespace: &str,
-    admitted: &BTreeMap<String, crate::rollout::AdmittedDeployment>,
+    state: &DurableRolloutState,
     resource_version: Option<String>,
     owner: Option<OwnerReference>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let data = BTreeMap::from([("state.json".into(), serde_json::to_string(admitted)?)]);
+    let data = BTreeMap::from([
+        ("state.json".into(), serde_json::to_string(&state.admitted)?),
+        (
+            "routing.json".into(),
+            serde_json::to_string(&state.routing)?,
+        ),
+    ]);
     // Own the ConfigMap by its repository so deleting the repository reclaims this admitted-state
     // through ordinary Kubernetes GC — no finalizer needed for an in-cluster child.
     let configmap = ConfigMap {
@@ -902,12 +988,20 @@ async fn publish_enrollment_secrets(
         let secret_name = format!("{name}-enrollment");
         let assignment =
             crate::gateway::agent_assignment(&repository.spec.assignment_prefix, &name);
+        // An existing Secret is final: it is immutable, so nothing below could rewrite it anyway.
+        // Check that first, with one apiserver read. Resolving the signed bundle costs a metadata
+        // walk plus several object-store reads PER AGENT, and this runs on every reconcile — for a
+        // steady fleet of manual agents that is a continuous stream of requests producing a 409.
+        if let Some(existing) = secrets.get_opt(&secret_name).await? {
+            check_enrollment_secret(&existing, &name, &assignment, &secret_name)?;
+            continue;
+        }
         // Resolve the exact signed documents this agent pins straight from the published
         // consistent snapshot, through the one walk the gateway's `/enroll` also uses.
         let signed = crate::gateway::resolve_signed_enrollment(store, prefix, &assignment)
             .await
             .map_err(|error| format!("resolving enrollment bundle for {name}: {error}"))?;
-        let bundle = signed.into_bundle(name.clone(), public_url, assignment);
+        let bundle = signed.into_bundle(name.clone(), public_url, assignment.clone());
         let mut data = std::collections::BTreeMap::new();
         data.insert(
             "enrollment.json".into(),
@@ -927,30 +1021,38 @@ async fn publish_enrollment_secrets(
         };
         match secrets.create(&PostParams::default(), &desired).await {
             Ok(_) => {}
+            // Lost a race with another writer (or our own earlier pass): re-read and validate.
             Err(kube::Error::Api(error)) if error.code == 409 => {
                 let existing = secrets.get(&secret_name).await?;
-                let existing_bundle = existing
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("enrollment.json"))
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<crate::EnrollmentBundle>(&bytes.0).ok()
-                    });
-                if existing_bundle.as_ref().is_none_or(|bundle| {
-                    bundle.agent_id != name
-                        || bundle.assignment
-                            != crate::gateway::agent_assignment(
-                                &repository.spec.assignment_prefix,
-                                &name,
-                            )
-                }) {
-                    return Err(format!(
-                        "immutable enrollment Secret {secret_name} is invalid or belongs to another agent"
-                    ).into());
-                }
+                check_enrollment_secret(&existing, &name, &assignment, &secret_name)?;
             }
             Err(error) => return Err(error.into()),
         }
+    }
+    Ok(())
+}
+
+/// Confirm an existing immutable enrollment Secret really is this agent's, for this assignment.
+/// A name collision with another agent's bundle must be an error, never silently accepted.
+fn check_enrollment_secret(
+    existing: &Secret,
+    agent: &str,
+    assignment: &str,
+    secret_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bundle = existing
+        .data
+        .as_ref()
+        .and_then(|data| data.get("enrollment.json"))
+        .and_then(|bytes| serde_json::from_slice::<crate::EnrollmentBundle>(&bytes.0).ok());
+    if bundle
+        .as_ref()
+        .is_none_or(|bundle| bundle.agent_id != agent || bundle.assignment != assignment)
+    {
+        return Err(format!(
+            "immutable enrollment Secret {secret_name} is invalid or belongs to another agent"
+        )
+        .into());
     }
     Ok(())
 }
@@ -1075,10 +1177,70 @@ struct StatusSnapshot<'a> {
     groups: &'a [UpdateGroup],
     agents: &'a [UpdateAgent],
     plan: &'a crate::PublicationPlan,
-    reports: &'a HashMap<String, NodeReport>,
+    reports: &'a HashMap<String, Envelope>,
     admitted: &'a BTreeMap<String, crate::rollout::AdmittedDeployment>,
     public_keys: &'a HashMap<String, Vec<u8>>,
     now: chrono::DateTime<chrono::Utc>,
+}
+
+/// The one post-publication projection path. A reconcile that reuses an unchanged signed
+/// generation and one that publishes a new generation must expose exactly the same enrollment,
+/// status, and subscription state; keeping that sequence here prevents the two paths drifting.
+struct ReconcileProjection<'a> {
+    client: &'a Client,
+    namespace: &'a str,
+    state_dir: &'a Path,
+    public_url: &'a str,
+    secrets: &'a Api<Secret>,
+    repository: &'a UpdateRepository,
+    store: &'a dyn ObjectStore,
+    apis: ResourceApis<'a>,
+    snapshot: StatusSnapshot<'a>,
+    sets: &'a Api<UpdateGroupSet>,
+    set_resources: &'a [UpdateGroupSet],
+    set_statuses: &'a [SetStatus],
+}
+
+impl ReconcileProjection<'_> {
+    async fn publish(&self) -> Result<(), Box<dyn std::error::Error>> {
+        publish_enrollment_secrets(
+            self.secrets,
+            self.repository,
+            self.snapshot.agents,
+            self.store,
+            &self.repository.spec.s3.prefix,
+            self.public_url,
+        )
+        .await?;
+        publish_resource_statuses(
+            ResourceApis {
+                repositories: self.apis.repositories,
+                groups: self.apis.groups,
+                agents: self.apis.agents,
+            },
+            StatusSnapshot {
+                repository: self.snapshot.repository,
+                groups: self.snapshot.groups,
+                agents: self.snapshot.agents,
+                plan: self.snapshot.plan,
+                reports: self.snapshot.reports,
+                admitted: self.snapshot.admitted,
+                public_keys: self.snapshot.public_keys,
+                now: self.snapshot.now,
+            },
+        )
+        .await?;
+        publish_group_set_statuses(self.sets, self.set_resources, self.set_statuses).await?;
+        deliver_subscriptions(
+            self.client,
+            self.namespace,
+            self.repository,
+            self.state_dir,
+            self.public_url,
+        )
+        .await;
+        Ok(())
+    }
 }
 
 async fn publish_resource_statuses(
@@ -1130,9 +1292,10 @@ async fn publish_resource_statuses(
         let rolling = admitted
             .get(&name)
             .is_some_and(|state| state.previous.is_some());
+        // A group with no admitted entry has never been published — held, not ready.
         let held = admitted
             .get(&name)
-            .is_some_and(|state| state.current.deployment != group.spec.deployment.name);
+            .is_none_or(|state| state.current.deployment != group.spec.deployment.name);
         let status = group_generation_status(
             group.metadata.generation,
             Some(matched as u32),
@@ -1169,25 +1332,32 @@ async fn publish_resource_statuses(
 
     for agent in agent_resources {
         let name = agent.name_any();
-        let selected = plan.node_groups[&name].clone();
-        let report = reports.get(&name).filter(|report| {
+        // A node withheld from this generation (its group is quarantined, or awaiting its first
+        // admission) has no routing to report; its status keeps whatever it last held.
+        let selected = plan.node_groups.get(&name).cloned();
+        // The gate returns the report only when it is authentic, so a status can never be written from
+        // an unverified envelope: there is no report value to read unless verification succeeded.
+        let report = public_keys.get(&name).and_then(|key| {
             let now_ms = now.timestamp_millis().max(0) as u64;
-            public_keys.get(&name).is_some_and(|key| {
-                updated::telemetry::report_is_authentic_and_fresh(report, &name, key, now_ms)
+            reports.get(&name).and_then(|envelope| {
+                updated_contracts::telemetry::report_is_authentic_and_fresh(
+                    envelope, &name, key, now_ms,
+                )
             })
         });
         let status = UpdateAgentStatus {
             observed_generation: agent.metadata.generation,
-            selected_group: Some(selected),
+            selected_group: selected,
             assignment_path: Some(crate::gateway::agent_assignment(
                 &repository.spec.assignment_prefix,
                 &name,
             )),
             published_digest: Some(plan.digest.clone()),
             reported_version: report
+                .as_ref()
                 .map(|report| report.version.clone())
                 .filter(|version| !version.is_empty()),
-            reported_ready: report.map(|report| report.healthy),
+            reported_ready: report.as_ref().map(|report| report.healthy),
             enrollment_secret_ref: (agent.spec.identity.kind == crate::AgentIdentityKind::Manual)
                 .then(|| crate::LocalSecretReference {
                     name: format!("{name}-enrollment"),
@@ -1263,11 +1433,11 @@ fn desired_publication_digest(
     repository: &crate::UpdateRepositorySpec,
     plan_digest: &str,
 ) -> Result<String, serde_json::Error> {
-    let mut digest = Sha256::new();
-    digest.update(serde_json::to_vec(repository)?);
-    digest.update([0]);
+    let mut digest = updated::hash::Sha256Hasher::new();
+    digest.update(&serde_json::to_vec(repository)?);
+    digest.update(&[0]);
     digest.update(plan_digest.as_bytes());
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(digest.finish_hex())
 }
 
 async fn materialize_signing_keys(
@@ -1290,6 +1460,20 @@ async fn materialize_signing_keys(
         }
     }
     Ok(())
+}
+
+/// A Secret entry that may legitimately be absent, unlike [`secret_string`] which requires it.
+fn optional_secret_string(
+    secret: Option<&Secret>,
+    key: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(bytes) = secret
+        .and_then(|secret| secret.data.as_ref())
+        .and_then(|data| data.get(key))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(String::from_utf8(bytes.0.clone())?))
 }
 
 fn secret_string(

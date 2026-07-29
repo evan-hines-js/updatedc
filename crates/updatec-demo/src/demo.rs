@@ -1199,10 +1199,14 @@ impl Demo {
         };
         // Draining (out-of-pool) pods, grouped by set and then by cohort group, so we can cap
         // disruption to one group per set. Chaos never touches an in-pool (serving) pod.
-        let mut draining: std::collections::HashMap<
+        //
+        // Ordered maps, deliberately: victim selection indexes into these keys with the seeded
+        // RNG, and `HashMap` iteration order varies per process — so the same seed would pick
+        // different victims on every run and a reported failure could not be replayed.
+        let mut draining: std::collections::BTreeMap<
             usize,
-            std::collections::HashMap<usize, Vec<String>>,
-        > = std::collections::HashMap::new();
+            std::collections::BTreeMap<usize, Vec<String>>,
+        > = std::collections::BTreeMap::new();
         for node in &fleet {
             if node.in_load_balancer {
                 continue;

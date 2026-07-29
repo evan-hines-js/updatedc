@@ -13,7 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
-const DESIRED_FILE: &str = "desired-supervisor";
+/// The committed-supervisor pointer's filename and text format live in `control`: the supervisor
+/// reads the same file (its staging GC must not delete the guardian's rollback target), so the
+/// layout is a cross-process contract rather than guardian-private state.
+const DESIRED_FILE: &str = control::DESIRED_SUPERVISOR_FILE;
 const SEEDED_FILE: &str = "seeded-supervisor";
 
 /// The committed supervisor binary path. `None` on first boot (the installer or the
@@ -40,38 +43,11 @@ pub fn set_seeded_supervisor(state_dir: &Path, path: &Path) -> std::io::Result<(
 }
 
 fn read_pointer(path: &Path) -> std::io::Result<Option<PathBuf>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut lines = text.lines();
-    if lines.next() != Some("supervisor-v1") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid desired-supervisor header",
-        ));
-    }
-    let p = lines.next().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "desired-supervisor path is missing",
-        )
-    })?;
-    if p.is_empty() || lines.next().is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "desired-supervisor record is malformed",
-        ));
-    }
-    Ok(Some(PathBuf::from(p)))
+    control::read_supervisor_pointer(path)
 }
 
 fn write_pointer(path: &Path, target: &Path) -> std::io::Result<()> {
-    let target = target
-        .to_str()
-        .ok_or_else(|| std::io::Error::other("supervisor path is not valid UTF-8"))?;
-    let body = format!("supervisor-v1\n{target}\n");
+    let body = control::encode_supervisor_pointer(target)?;
     foundation::durable::atomic_write(path, ".guardian-", body.as_bytes())
 }
 

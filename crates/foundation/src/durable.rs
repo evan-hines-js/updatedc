@@ -62,6 +62,11 @@ pub fn parent_dir(path: &Path) -> &Path {
     }
 }
 
+/// Durably replace `path` with `data`: write a fresh sibling temp, fsync it, rename it into
+/// place, then fsync the directory. The committed file inherits the temp's mode, so on unix it
+/// is **owner-only** (`create_temp` opens at `0o600`) — this is the one durable write, and it is
+/// the write secrets go through (an enrollment key, a minted TLS private key) as well as ordinary
+/// state. Callers therefore never need to chmod afterwards.
 pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
     let dir = parent_dir(path);
     let (mut tmp, tmp_path) = create_temp(dir, prefix)?;
@@ -109,7 +114,15 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
     }
-    sync_dir(dir)
+    sync_dir(dir)?;
+    // Also persist the directory entry OF `dir` itself. Executables are installed into a freshly
+    // created content-addressed directory, and syncing only that directory leaves its own name
+    // unpersisted in the parent: after a power loss the file is durable but the path to it is not,
+    // so a committed pointer resolves to nothing. One extra fsync per install closes that.
+    match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
+        _ => Ok(()),
+    }
 }
 
 /// Best-effort removal of stale temp files left behind when a crash or power loss struck
@@ -176,7 +189,7 @@ pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-pub fn is_transient_lock(error: &io::Error) -> bool {
+fn is_transient_lock(error: &io::Error) -> bool {
     match error.raw_os_error() {
         #[cfg(windows)]
         Some(5) | Some(32) | Some(33) => true,

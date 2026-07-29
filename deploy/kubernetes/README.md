@@ -229,10 +229,29 @@ Enrollment is authenticated by mutual TLS: the agent presents the shared fleet e
 certificate the fleet CA signed, and trusts that CA for the gateway. cert-manager (or any issuer)
 mints the material; the config holds only a self-asserted `name` and paths, so it stays secretless.
 The node names itself; the gateway mints a per-node certificate at `/enroll` under that name.
+The bootstrap certificate Common Name defaults to `updated-agent`; set
+`UPDATED_ENROLLMENT_CLIENT_CN` on the gateway when an external issuer uses a different value.
+Per-node certificates are rejected from `/enroll` even though the same fleet CA signs them.
 
 The gateway registers a stable generated `UpdateAgent`; operators then select it through
 CRDs. Manual provisioning instead creates a manual `UpdateAgent` and exports the immutable
 enrollment Secret shown above. Agents never receive Kubernetes credentials or edit CRDs.
+
+To pre-create a name that a dynamically-enrolling machine will claim — so its labels (and
+therefore its group and deployment) exist before it first calls `/enroll` — reserve it
+explicitly:
+
+```yaml
+spec:
+  repositoryRef: {name: default}
+  identity: {kind: reserved}
+  labels: {updated.dev/role: edge}
+```
+
+`/enroll` completes a `reserved` name in place, stamping the node's CSR key onto the object
+and leaving the operator's labels untouched. It never completes a `manual` one. Reserve
+deliberately: enrollment is authenticated by the fleet-wide bootstrap certificate every node
+holds, so a reserved name is claimed by whichever machine presents it first.
 
 ## Verify operation
 

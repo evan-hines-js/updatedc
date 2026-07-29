@@ -1,0 +1,433 @@
+//! Signed desired-state contract delivered through the routing repository.
+
+use std::{collections::BTreeMap, path::PathBuf};
+
+use serde::{Deserialize, Serialize};
+use url::{Host, Url};
+
+use crate::artifact::TargetReference;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryAssignment {
+    pub schema: u32,
+    pub deployment: String,
+    pub metadata_url: String,
+    pub targets_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_url: Option<String>,
+    pub application: TargetReference,
+    pub ordered_install_fallback: bool,
+    pub provider_set: TargetReference,
+    pub release_root: serde_json::Value,
+    pub runtime: ManagedRuntime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRuntime {
+    #[serde(default)]
+    pub mode: RuntimeMode,
+    pub product: String,
+    pub channel: String,
+    pub install_root: PathBuf,
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretReference>,
+    /// Typed values resolved from prerequisite group outputs. Secret values remain references.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, crate::telemetry::OutputValue>,
+    pub repository: ManagedRepositoryLimits,
+    pub storage: ManagedStorage,
+    pub timeouts: ManagedTimeouts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretReference {
+    pub environment: String,
+    pub secret: String,
+    pub key: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeMode {
+    #[default]
+    Managed,
+    ProviderManaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRepositoryLimits {
+    pub metadata_limit: u64,
+    pub target_limit: u64,
+    pub transport_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStorage {
+    pub inactive_releases: usize,
+    pub inactive_providers: usize,
+    pub inactive_supervisors: usize,
+    pub inactive_bytes: u64,
+    pub inactive_repository_caches: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTimeouts {
+    pub check_interval_seconds: u64,
+    pub health_grace_seconds: u64,
+    pub health_successes: u32,
+    pub health_interval_seconds: u64,
+    pub retry_after_seconds: u64,
+    pub refresh_retry_seconds: u64,
+    pub confirmation_window_seconds: u64,
+    pub supervisor_check_interval_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_hold_seconds: Option<u64>,
+}
+
+impl RepositoryAssignment {
+    pub const SCHEMA: u32 = 3;
+
+    /// Validate the complete signed contract before a publisher signs it or a node acts on it.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != Self::SCHEMA {
+            return Err(format!(
+                "unsupported repository assignment schema {}",
+                self.schema
+            ));
+        }
+        if self.deployment.is_empty() {
+            return Err("repository assignment deployment must not be empty".into());
+        }
+        for (name, reference) in [
+            ("application", &self.application),
+            ("provider_set", &self.provider_set),
+        ] {
+            if !reference.is_valid() {
+                return Err(format!("repository assignment {name} reference is invalid"));
+            }
+        }
+        if !self.release_root.is_object() {
+            return Err("repository assignment release_root must be a JSON object".into());
+        }
+        if let Some(report_url) = &self.report_url {
+            validate_report_url(report_url)?;
+        }
+        self.runtime.validate()
+    }
+}
+
+impl ManagedRuntime {
+    /// Validate signed runtime policy without consulting node-local state.
+    pub fn validate(&self) -> Result<(), String> {
+        if !crate::path::is_safe_component(&self.product)
+            || self.channel.is_empty()
+            || !self.install_root.is_absolute()
+        {
+            return Err("managed runtime product/channel/install_root is invalid".into());
+        }
+        if self.repository.metadata_limit == 0
+            || self.repository.target_limit == 0
+            || self.repository.transport_timeout_seconds == 0
+            || self.storage.inactive_bytes == 0
+            || self.timeouts.check_interval_seconds == 0
+            || self.timeouts.health_grace_seconds == 0
+            || self.timeouts.health_successes == 0
+            || self.timeouts.health_interval_seconds == 0
+            || self.timeouts.retry_after_seconds == 0
+            || self.timeouts.refresh_retry_seconds == 0
+            || self.timeouts.confirmation_window_seconds == 0
+            || self.timeouts.supervisor_check_interval_seconds == 0
+        {
+            return Err("managed runtime limits and timeouts must be non-zero".into());
+        }
+        if self.secrets.len() > 64 {
+            return Err("managed runtime may declare at most 64 secret references".into());
+        }
+        crate::telemetry::OutputManifest {
+            schema: crate::telemetry::OutputManifest::SCHEMA,
+            values: self.inputs.clone(),
+        }
+        .validate()
+        .map_err(|error| format!("managed runtime inputs: {error}"))?;
+        if self.mode == RuntimeMode::ProviderManaged && !self.secrets.is_empty() {
+            return Err("provider-managed runtime cannot declare application secrets".into());
+        }
+        let mut environments = std::collections::BTreeSet::new();
+        for reference in &self.secrets {
+            let valid_environment = !reference.environment.is_empty()
+                && reference.environment.len() <= 128
+                && reference
+                    .environment
+                    .bytes()
+                    .enumerate()
+                    .all(|(index, byte)| {
+                        byte == b'_'
+                            || byte.is_ascii_uppercase()
+                            || (index > 0 && byte.is_ascii_digit())
+                    })
+                && !is_code_injection_variable(&reference.environment);
+            if !valid_environment
+                || reference.secret.is_empty()
+                || reference.secret.len() > 253
+                || reference.key.is_empty()
+                || reference.key.len() > 253
+                || !environments.insert(&reference.environment)
+            {
+                return Err("managed runtime secret references are invalid or duplicated".into());
+            }
+        }
+        let min_grace = u64::from(self.timeouts.health_successes.saturating_sub(1))
+            .saturating_mul(self.timeouts.health_interval_seconds);
+        if self.timeouts.health_grace_seconds < min_grace {
+            return Err(format!(
+                "health_grace_seconds ({}) must be >= (health_successes-1)*health_interval_seconds ({min_grace}); otherwise the health streak can never complete within the grace window",
+                self.timeouts.health_grace_seconds
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_report_url(raw: &str) -> Result<(), String> {
+    let url =
+        Url::parse(raw).map_err(|error| format!("repository assignment report_url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.cannot_be_a_base()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "repository assignment report_url must be an absolute HTTP(S) URL without credentials, a query, or a fragment"
+                .into(),
+        );
+    }
+    match url.host() {
+        Some(Host::Domain(domain)) if !domain.is_empty() => Ok(()),
+        Some(Host::Ipv4(_)) | Some(Host::Ipv6(_)) => Ok(()),
+        _ => Err("repository assignment report_url must have a host".into()),
+    }
+}
+
+fn is_code_injection_variable(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "GLIBC_TUNABLES",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "RUBYOPT",
+        "RUBYLIB",
+        "PERL5LIB",
+        "PERL5OPT",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "CLASSPATH",
+        "PATH",
+        "SHELL",
+        "BASH_ENV",
+        "ENV",
+        "IFS",
+    ];
+    name.starts_with("LD_") || name.starts_with("DYLD_") || EXACT.contains(&name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact::TargetReference;
+
+    fn runtime() -> ManagedRuntime {
+        ManagedRuntime {
+            mode: RuntimeMode::Managed,
+            product: "app".into(),
+            channel: "stable".into(),
+            install_root: "/app".into(),
+            args: vec![],
+            secrets: vec![],
+            inputs: BTreeMap::new(),
+            repository: ManagedRepositoryLimits {
+                metadata_limit: 1 << 20,
+                target_limit: 512 << 20,
+                transport_timeout_seconds: 30,
+            },
+            storage: ManagedStorage {
+                inactive_releases: 2,
+                inactive_providers: 2,
+                inactive_supervisors: 2,
+                inactive_bytes: 1 << 30,
+                inactive_repository_caches: 2,
+            },
+            timeouts: ManagedTimeouts {
+                check_interval_seconds: 60,
+                health_grace_seconds: 30,
+                health_successes: 2,
+                health_interval_seconds: 1,
+                retry_after_seconds: 60,
+                refresh_retry_seconds: 5,
+                confirmation_window_seconds: 120,
+                supervisor_check_interval_seconds: 3600,
+                drain_hold_seconds: Some(0),
+            },
+        }
+    }
+
+    fn assignment() -> RepositoryAssignment {
+        RepositoryAssignment {
+            schema: RepositoryAssignment::SCHEMA,
+            deployment: "d1".into(),
+            metadata_url: "https://cdn/m/".into(),
+            targets_url: "https://cdn/t/".into(),
+            report_url: None,
+            application: TargetReference {
+                path: "app".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: TargetReference {
+                path: "providers".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({"signed": {}, "signatures": []}),
+            runtime: runtime(),
+        }
+    }
+
+    #[test]
+    fn runtime_mode_defaults_to_managed() {
+        let value = serde_json::to_value(runtime()).unwrap();
+        let mut object = value.as_object().unwrap().clone();
+        object.remove("mode");
+        let parsed: ManagedRuntime =
+            serde_json::from_value(serde_json::Value::Object(object)).unwrap();
+        assert_eq!(parsed.mode, RuntimeMode::Managed);
+        assert_eq!(
+            serde_json::from_str::<RuntimeMode>("\"provider-managed\"").unwrap(),
+            RuntimeMode::ProviderManaged
+        );
+    }
+
+    #[test]
+    fn secret_references_are_strict_and_never_carry_values() {
+        let mut value = runtime();
+        value.secrets.push(SecretReference {
+            environment: "DATABASE_PASSWORD".into(),
+            secret: "production-database".into(),
+            key: "password".into(),
+        });
+        value.validate().unwrap();
+        let json = serde_json::to_string(&value).unwrap();
+        assert!(json.contains("production-database"));
+        assert!(!json.contains("secretValue"));
+
+        value.secrets.push(SecretReference {
+            environment: "DATABASE_PASSWORD".into(),
+            secret: "other".into(),
+            key: "password".into(),
+        });
+        assert!(value.validate().is_err());
+        value.secrets[1].environment = "lowercase".into();
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn every_code_injection_environment_is_rejected() {
+        for hostile in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "GLIBC_TUNABLES",
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "RUBYOPT",
+            "PERL5OPT",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "CLASSPATH",
+            "PATH",
+            "BASH_ENV",
+            "IFS",
+        ] {
+            let mut value = runtime();
+            value.secrets.push(SecretReference {
+                environment: hostile.into(),
+                secret: "attacker".into(),
+                key: "payload".into(),
+            });
+            assert!(value.validate().is_err(), "{hostile}");
+        }
+        let mut value = runtime();
+        value.secrets.push(SecretReference {
+            environment: "PATH_TO_LICENSE".into(),
+            secret: "licensing".into(),
+            key: "path".into(),
+        });
+        value.validate().unwrap();
+    }
+
+    #[test]
+    fn assignment_is_strict_and_validates_report_endpoints() {
+        let value = assignment();
+        value.validate().unwrap();
+
+        let mut offline = value.clone();
+        offline.metadata_url = "/opt/update/metadata/".into();
+        offline.targets_url = "file:///opt/update/targets/".into();
+        offline.validate().unwrap();
+
+        for invalid in [
+            "",
+            "not-a-url",
+            "/relative/only",
+            "ftp://cdn/m/",
+            "https://",
+            "https://user:pass@cdn/report",
+        ] {
+            let mut candidate = value.clone();
+            candidate.report_url = Some(invalid.into());
+            assert!(candidate.validate().is_err(), "{invalid:?}");
+        }
+
+        assert!(serde_json::from_str::<RepositoryAssignment>(
+            r#"{"schema":3,"deployment":"d1","unexpected":true}"#
+        )
+        .is_err());
+        let mut obsolete = value;
+        obsolete.schema -= 1;
+        assert!(obsolete.validate().is_err());
+    }
+
+    #[test]
+    fn code_injection_environment_names_are_centrally_rejected() {
+        for name in [
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "PATH",
+            "NODE_OPTIONS",
+        ] {
+            assert!(is_code_injection_variable(name), "{name}");
+        }
+        assert!(!is_code_injection_variable("DATABASE_PASSWORD"));
+    }
+
+    #[test]
+    fn report_urls_are_bounded_absolute_network_locations() {
+        assert!(validate_report_url("https://reports.example.test/base").is_ok());
+        for invalid in [
+            "file:///tmp/reports",
+            "https://user@example.test/",
+            "https://example.test/?query",
+            "relative/path",
+        ] {
+            assert!(validate_report_url(invalid).is_err(), "{invalid}");
+        }
+    }
+}

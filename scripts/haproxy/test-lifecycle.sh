@@ -40,30 +40,25 @@ invoke() {
     --predecessor-version 1.0.0
 }
 
-invoke preflight "$WORK/v2" "$WORK/v1" preflight
-if invoke preflight "$WORK/bad" "$WORK/v1" bad-preflight 2>/dev/null; then
-  echo "preflight accepted an invalid candidate" >&2
+invoke apply "$WORK/v2" "$WORK/v1" apply
+if invoke apply "$WORK/bad" "$WORK/v1" bad-apply 2>/dev/null; then
+  echo "apply accepted an invalid candidate" >&2
   exit 1
 fi
 
-invoke activate "$WORK/v2" "$WORK/v1" update
 test -f "$INSTALL/runtime/haproxy.cfg"
 
 # Replaying the same mutation must converge.
-invoke activate "$WORK/v2" "$WORK/v1" update
+invoke apply "$WORK/v2" "$WORK/v1" update
 
 sleep 60 &
 master=$!
 printf '%s\n' "$master" >"$INSTALL/runtime/haproxy.pid"
-invoke verify "$WORK/v2" "$WORK/v1" update
-invoke periodic "$WORK/v2" "$WORK/v1" periodic
+invoke healthcheck "$WORK/v2" "$WORK/v1" update
+test -n "$(invoke inspect "$WORK/v2" "$WORK/v1" inspect)"
 
 invoke rollback "$WORK/v2" "$WORK/v1" rollback
 test -f "$INSTALL/runtime/haproxy.cfg"
-
-for operation in prepare pre-drain drain stop pre-start start finalize; do
-  invoke "$operation" "$WORK/v2" "$WORK/v1" "noop-$operation"
-done
 
 if "$LIFECYCLE" nonsense --protocol 1 --attempt-id x --reason update \
   --install-root "$INSTALL" --state-dir "$STATE" --candidate "$WORK/v2" \

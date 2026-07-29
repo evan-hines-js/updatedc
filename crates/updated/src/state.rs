@@ -4,7 +4,7 @@
 //! the on-disk format, location, or the crucial distinction between *absent* (a
 //! first install) and *corrupt* (which must fail closed, never silently reinstall).
 
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ impl RepositoryLineage {
     }
 
     fn validate(&self) -> bool {
-        crate::hash::is_sha256_hex(&self.0)
+        updated_contracts::is_sha256_hex(&self.0)
     }
 }
 
@@ -245,15 +245,20 @@ pub fn enroll(installed_path: &Path, lineage: RepositoryLineage) -> io::Result<(
         initial_repository_lineage: lineage,
     })
     .map_err(io::Error::other)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    foundation::durable::sync_dir(path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "enrollment path has no parent")
-    })?)
+    // Once-only: this record is what makes bootstrap eligibility unrepeatable, so an existing one
+    // is never overwritten. The single install lock makes this check sufficient — it is the same
+    // owner that would have written it.
+    if !matches!(read_enrollment(installed_path), EnrollmentState::Missing) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "this installation has already consumed its bootstrap enrollment",
+        ));
+    }
+    // Atomically, via a temp file and rename. Writing in place would leave a truncated record if
+    // the process died mid-write — and a record that is present but unparseable is worse than
+    // either state it sits between: the node is refused a cold install (bootstrap is spent) and
+    // refused a normal boot (the record is invalid), with nothing on disk able to resolve it.
+    foundation::durable::atomic_write(&path, ".enrollment-", &bytes)
 }
 
 pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
@@ -294,19 +299,7 @@ pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn provider() -> Box<ProviderRelease> {
-        Box::new(ProviderRelease {
-            product: "reconciler".into(),
-            release: ReleaseId {
-                version: "1.0.0".into(),
-                manifest_sha256: "reconciler-manifest".into(),
-            },
-            archive_sha256: "reconciler-archive".into(),
-            args: Vec::new(),
-            timeout_millis: 1_000,
-        })
-    }
+    use crate::testing::provider;
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("state-{}-{name}", std::process::id()));

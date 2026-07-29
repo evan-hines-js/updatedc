@@ -8,6 +8,7 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -73,14 +74,49 @@ impl Identity {
             .map_err(|error| invalid(&format!("loading the client identity failed: {error}")))
     }
 
-    /// A reqwest client that presents this identity — used for enrollment and any direct HTTP
-    /// to the gateway.
+    /// A reqwest client that presents this identity — used for enrollment, the secrets fetch, and
+    /// every TUF metadata and **target** download.
+    ///
+    /// The bounds here are on *progress*, deliberately not on total elapsed time. `timeout()` in
+    /// reqwest covers the whole response body, so a total deadline is a hard ceiling on artifact
+    /// size × link speed: a release archive that takes longer than it to stream is cancelled
+    /// mid-body, its partial file deleted, and retried forever — the node can never install it, and
+    /// no amount of waiting helps. A stalled transfer is still caught, by the read timeout. Callers
+    /// that genuinely need a total deadline (a small control-plane request that must not hang a
+    /// boot) impose their own around the call.
     pub fn reqwest_client(&self) -> io::Result<reqwest::Client> {
         reqwest::Client::builder()
             .use_preconfigured_tls(self.client_config()?)
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
             .build()
             .map_err(io::Error::other)
     }
+}
+
+/// Verify a newly issued client chain against the same pinned CA and client-auth policy the
+/// gateway uses before it is allowed onto durable storage.
+pub fn verify_client_chain(
+    leaf: CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    ca: &Path,
+) -> io::Result<()> {
+    use rustls::pki_types::UnixTime;
+    let roots = load_roots(ca, "enrollment CA")?;
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(crypto_provider()),
+    )
+    .build()
+    .map_err(|error| invalid(&format!("building issued-certificate verifier: {error}")))?;
+    verifier
+        .verify_client_cert(&leaf, intermediates, UnixTime::now())
+        .map_err(|error| {
+            invalid(&format!(
+                "issued client certificate is not trusted: {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 /// Build an aws-lc-rs rustls server config for an externally-exposed listener: it presents

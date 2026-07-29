@@ -32,21 +32,23 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 updated = { path = "../updated" }
+updated-contracts = { path = "../updated-contracts" }
 updated-tuf = { path = "../updated-tuf" }
 # The join endpoint parses and signs agent CSRs with the fleet CA (aws-lc-rs backend, one crypto
-# library); x509-parser lets it read the CSR's public key for proof-of-possession.
+# library). Its CSR parse verifies the self-signature, so reading the key to pin it and signing it
+# share one proof-of-possession check.
 rcgen = { workspace = true, features = ["x509-parser"] }
 tempfile = "3"
 # The mTLS data listener reads the verified leaf's Common Name to authorize per-node telemetry
 # writes (the trusted identity, vs the node's self-claimed path); join tests also introspect leaves.
-x509-parser = "0.16"
+x509-parser = { workspace = true }
 
 [dev-dependencies]
+base64.workspace = true
 # Drive Axum routers directly in gateway tests via `ServiceExt::oneshot`, no socket needed.
 tower = { version = "0.5", features = ["util"] }
 

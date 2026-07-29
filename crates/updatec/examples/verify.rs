@@ -29,14 +29,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     repository
         .download_target(&verified, &state.path().join("assignment.json"))
         .await?;
-    let node: updated::config::AgentDocument =
+    let node: updated_contracts::artifact::AgentDocument =
         serde_json::from_slice(&std::fs::read(state.path().join("assignment.json"))?)?;
     node.validate()?;
     let config = repository.exact_target(&node.config)?;
     repository
         .download_target(&config, &state.path().join("config.json"))
         .await?;
-    let config: updated::config::RepositoryAssignment =
+    let config: updated_contracts::assignment::RepositoryAssignment =
         serde_json::from_slice(&std::fs::read(state.path().join("config.json"))?)?;
     config.validate()?;
     println!("{}", config.deployment);
