@@ -256,20 +256,6 @@ unsafe extern "system" fn handle_ctrl(_ctrl_type: u32) -> windows_sys::Win32::Fo
     1
 }
 
-/// Ask a supervisor process to stop gracefully; the caller hard-kills it if the grace
-/// expires. The supervisor is spawned `CREATE_NEW_PROCESS_GROUP` (see
-/// `supervisor::Supervisor::launch`), so its process-group id equals its PID and
-/// `CTRL_BREAK` reaches it — the Windows analogue of the Unix `SIGTERM`, giving the
-/// supervisor a chance to shut down cleanly instead of only ever being job-terminated.
-///
-/// NOTE: needs Windows CI validation — this host cannot exercise the console-event path.
-pub fn terminate_gracefully(pid: u32) {
-    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
-    unsafe {
-        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-    }
-}
-
 // ------------------------------ the control channel ------------------------------
 
 /// The guardian's end of the inherited control channel: a duplex pair of anonymous pipes
@@ -505,10 +491,9 @@ fn bounded_pipe_write(handle: HANDLE, buf: &[u8], timeout: Duration) -> io::Resu
             io::ErrorKind::TimedOut,
             "control channel write timed out",
         )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
-            io::ErrorKind::Other,
-            "control channel write thread vanished",
-        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("control channel write thread vanished"))
+        }
     }
 }
 

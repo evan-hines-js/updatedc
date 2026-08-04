@@ -23,6 +23,47 @@ const TRUST_DOMAIN: &str = "updated.fleet";
 /// supervisors renew through the authenticated `/renew` endpoint during the final 30 days.
 const LEAF_CERT_TTL_DAYS: i64 = 90;
 
+/// The full identity a minted node leaf carries in its URI SAN: which repository the node enrolled
+/// into, and which node it is. Both segments are authorization inputs — the fleet CA is shared
+/// across every repository in a namespace, so a leaf minted for one repository is a perfectly valid
+/// certificate on another repository's gateway and only the `repository` segment distinguishes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeSpiffeId {
+    pub repository: String,
+    pub node: String,
+}
+
+impl NodeSpiffeId {
+    /// The SAN URI this identity is encoded as. Minting and parsing share this one shape so the
+    /// certificate a gateway issues and the identity another gateway reads back can never drift.
+    pub fn uri(&self) -> String {
+        format!(
+            "spiffe://{TRUST_DOMAIN}/scope/{}/node/{}",
+            self.repository, self.node
+        )
+    }
+
+    /// Parse a URI SAN back into the identity it names, or `None` when it is not a node identity
+    /// this control plane minted. Both segments must be present and non-empty: a URI that carries
+    /// only the trust-domain prefix names no repository and no node, and must never be reduced to
+    /// "some node, somewhere".
+    pub fn parse(uri: &str) -> Option<Self> {
+        let rest = uri.strip_prefix(&format!("spiffe://{TRUST_DOMAIN}/scope/"))?;
+        let (repository, node) = rest.split_once("/node/")?;
+        if repository.is_empty()
+            || node.is_empty()
+            || repository.contains('/')
+            || node.contains('/')
+        {
+            return None;
+        }
+        Some(Self {
+            repository: repository.to_string(),
+            node: node.to_string(),
+        })
+    }
+}
+
 /// The node's public key (uncompressed EC point) from its PEM CSR — the value the control plane
 /// pins on the `UpdateAgent` so it can later verify the node's *signed* telemetry against the same
 /// key that certifies its mTLS leaf. This is the exact bytes `aws-lc-rs` `ECDSA_P256_SHA256`
@@ -75,7 +116,11 @@ impl IssuingCa {
         csr.params.is_ca = IsCa::NoCa;
         csr.params.distinguished_name = rcgen::DistinguishedName::new();
         csr.params.distinguished_name.push(DnType::CommonName, name);
-        let uri = format!("spiffe://{TRUST_DOMAIN}/scope/{scope}/node/{name}");
+        let uri = NodeSpiffeId {
+            repository: scope.to_string(),
+            node: name.to_string(),
+        }
+        .uri();
         csr.params.subject_alt_names =
             vec![SanType::URI(uri.clone().try_into().map_err(|error| {
                 io::Error::other(format!("encoding node URI SAN {uri}: {error}"))

@@ -5,11 +5,15 @@ pub(crate) enum AppOutcome {
         version: String,
     },
     Unchanged,
+    /// The update cannot proceed and cannot be recovered from in this process. The supervisor
+    /// exits non-zero with its durable evidence intact; the guardian relaunches it (throttled by
+    /// its backoff) and boot recovery re-derives the recovery from that evidence.
     Fatal(String),
     /// A post-activation update failure: the candidate is rejected and its rollback journal is
-    /// durable. This disposable supervisor must terminate cleanly so the guardian relaunches it and
-    /// boot recovery performs the (single) rollback. Distinct from `Fatal`, which *holds* the
-    /// process alive for an unrecoverable/non-idempotent condition.
+    /// durable. This disposable supervisor terminates *cleanly* so the guardian relaunches it and
+    /// boot recovery performs the (single) rollback. Distinct from `Fatal` only in that it is an
+    /// expected, planned restart rather than a failure — the exit code is the difference an
+    /// operator sees.
     RestartForRecovery,
 }
 
@@ -27,9 +31,19 @@ fn is_self_version(installed: &updated::state::Installed, candidate: &str) -> bo
 /// rejection of every release it walks past — the node then has nothing installable even once the
 /// network is back. Only a verdict about the *content* may reject.
 pub(crate) enum ProviderStagingError {
-    /// This version's provider set is genuinely unusable: malformed, invalid, or naming a
-    /// reconciler already rejected. Another version may still be good.
-    Unusable(String),
+    /// The provider set is genuinely unusable: malformed, invalid, or naming a reconciler already
+    /// rejected.
+    ///
+    /// `version_bound` says whether descending could possibly help. A set resolved from an
+    /// application version's own signed metadata is that version's problem, so rejecting it and
+    /// descending finds a version whose set is good. A set that came from the ASSIGNMENT is
+    /// version-independent: every version fails on it identically, so rejecting them one by one
+    /// walks a fresh node to the bottom of the descent and permanently excludes every release it
+    /// has — for a cause that has nothing to do with any of them.
+    Unusable {
+        message: String,
+        version_bound: bool,
+    },
     /// An I/O, network, or storage failure. It says nothing about the release; retry later.
     Transient(String),
 }
@@ -37,7 +51,7 @@ pub(crate) enum ProviderStagingError {
 impl std::fmt::Display for ProviderStagingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unusable(message) | Self::Transient(message) => f.write_str(message),
+            Self::Unusable { message, .. } | Self::Transient(message) => f.write_str(message),
         }
     }
 }
@@ -54,10 +68,15 @@ pub(crate) async fn stage_providers(
     ),
     ProviderStagingError,
 > {
-    use ProviderStagingError::{Transient, Unusable};
+    use ProviderStagingError::Transient;
+    // Until the provider set's origin is known, no failure can be blamed on an application version.
+    let unusable = |message: String| ProviderStagingError::Unusable {
+        message,
+        version_bound: false,
+    };
     let assignment = repo
         .assignment()
-        .ok_or_else(|| Unusable("release repository has no desired deployment".into()))?;
+        .ok_or_else(|| unusable("release repository has no desired deployment".into()))?;
     let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
     std::fs::create_dir_all(&opts.paths.provider_staging).map_err(|e| {
         Transient(format!(
@@ -80,7 +99,7 @@ pub(crate) async fn stage_providers(
             |target, _version| store.is_rejected(&lineage, &target_sha(target)),
         )
         .map_err(|e| {
-            Unusable(format!(
+            unusable(format!(
                 "selecting application to resolve its provider set failed: {e}"
             ))
         })?
@@ -88,9 +107,16 @@ pub(crate) async fn stage_providers(
     let provider_ref = selected_provider_ref
         .clone()
         .unwrap_or_else(|| assignment.provider_set.clone());
+    // From here the set's origin is known: a version's own signed metadata (descending can help)
+    // or the assignment (it cannot).
+    let version_bound = selected_provider_ref.is_some();
+    let unusable = |message: String| ProviderStagingError::Unusable {
+        message,
+        version_bound,
+    };
     let set_target = repo
         .exact_target(&provider_ref)
-        .map_err(|e| Unusable(format!("resolving desired provider set failed: {e}")))?;
+        .map_err(|e| unusable(format!("resolving desired provider set failed: {e}")))?;
     // A failed fetch or read is about the link and the disk, never about the release.
     repo.download_target(&set_target, &opts.paths.provider_download)
         .await
@@ -98,16 +124,16 @@ pub(crate) async fn stage_providers(
     let bytes = std::fs::read(&opts.paths.provider_download)
         .map_err(|e| Transient(format!("reading desired provider set failed: {e}")))?;
     let set: updated_contracts::artifact::ProviderSet = serde_json::from_slice(&bytes)
-        .map_err(|e| Unusable(format!("desired provider set is invalid: {e}")))?;
+        .map_err(|e| unusable(format!("desired provider set is invalid: {e}")))?;
     set.validate()
-        .map_err(|error| Unusable(format!("desired provider set is invalid: {error}")))?;
+        .map_err(|error| unusable(format!("desired provider set is invalid: {error}")))?;
     let provider = set.reconciler;
     let target = repo
         .exact_target(&provider.artifact)
-        .map_err(|e| Unusable(format!("resolving node reconciler failed: {e}")))?;
+        .map_err(|e| unusable(format!("resolving node reconciler failed: {e}")))?;
     let sha = target_sha(&target);
     if store.is_rejected(&lineage, &sha) {
-        return Err(Unusable(
+        return Err(unusable(
             "desired node reconciler was previously rejected".into(),
         ));
     }
@@ -115,12 +141,12 @@ pub(crate) async fn stage_providers(
         .custom
         .get("product")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Unusable("node reconciler metadata has no product".into()))?;
+        .ok_or_else(|| unusable("node reconciler metadata has no product".into()))?;
     // The reconciler product becomes a directory name under the install root (per-product state),
     // so it is confined by the same shared traversal guard as every other joined path component —
     // a signed-but-hostile `../…` product must not escape.
     if !updated_contracts::path::is_safe_component(product) {
-        return Err(Unusable(
+        return Err(unusable(
             "node reconciler metadata product is not a safe path component".into(),
         ));
     }
@@ -128,7 +154,7 @@ pub(crate) async fn stage_providers(
         .custom
         .get("version")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| Unusable("node reconciler metadata has no version".into()))?;
+        .ok_or_else(|| unusable("node reconciler metadata has no version".into()))?;
     let platform = foundation::platform::platform_key();
     let provider_store = updated::provider::BundleStore::for_lifecycle(&opts.paths)
         .with_target_limit(opts.repository.target_limit);
@@ -148,9 +174,9 @@ pub(crate) async fn stage_providers(
             // Only invalid *content* is a verdict on the bundle; a failed acquisition is transient.
             if matches!(&error, update_client::AcquireBundleError::Invalid { .. }) {
                 if let Err(reject_error) = store.reject(&lineage, &sha) {
-                    return Unusable(format!("staging node reconciler failed: {error}; recording its rejection also failed: {reject_error}"));
+                    return unusable(format!("staging node reconciler failed: {error}; recording its rejection also failed: {reject_error}"));
                 }
-                return Unusable(format!("staging node reconciler failed: {error}"));
+                return unusable(format!("staging node reconciler failed: {error}"));
             }
             Transient(format!("acquiring node reconciler failed: {error}"))
         })?;

@@ -14,20 +14,25 @@
 //!
 //! Every judgment **fails closed**: only an authentic, settled, healthy report for the right
 //! node marks it ready. A missing, stale, or malformed report reads as not-ready, so the safe
-//! default is to pull the backend out of rotation. The one refinement is a transient *fetch*
-//! error (the CDN itself blinking): rather than instantly draining every node — a checker-side
-//! outage is not evidence a node is down — the last successfully fetched report is reused, still
-//! bound by [`updated_contracts::telemetry::REPORT_FRESHNESS`]. So a brief CDN outage does not mass-evict a healthy fleet, yet
-//! data older than the freshness window is still not-ready.
+//! default is to pull the backend out of rotation. The one refinement is a failure of this
+//! component's *own* dependencies — the CDN blinking, or the resolver failing to answer for a
+//! member's hostname. A checker-side outage is not evidence a node is down, so every such
+//! observation resolves through [`LastKnownGood`]: the last value actually observed is reused,
+//! bounded by [`updated_contracts::telemetry::REPORT_FRESHNESS`]. So neither a brief CDN outage
+//! nor a DNS hiccup mass-evicts a healthy fleet, yet anything older than that window is still
+//! not-ready.
 
 pub mod endpointslice;
 pub mod haproxy;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use updated_contracts::telemetry::{now_ms, report_is_authentic_and_fresh, report_url, Envelope};
+use updated_contracts::telemetry::{
+    is_uncompressed_p256_point, now_ms, report_is_authentic_and_fresh, report_url, Envelope,
+    REPORT_FRESHNESS,
+};
 
 /// One node the load balancer may route to: its identity, a routable address, and whether it
 /// is currently in service (from health).
@@ -48,8 +53,36 @@ pub struct Member {
 pub struct FleetNode {
     pub node: String,
     pub address: String,
-    /// Raw EC point (uncompressed) the node's report signature is verified against.
-    pub public_key: Vec<u8>,
+    pub public_key: PinnedKey,
+}
+
+/// A pinned report-verification key whose shape has already been checked.
+///
+/// Only [`PinnedKey::parse`] constructs one, so a key of the wrong length or encoding cannot
+/// reach the verifier: there it would fail every signature check and drain a perfectly healthy
+/// node forever, logged identically to a genuinely unhealthy one. Pasting a certificate digest or
+/// a PEM-derived blob into the inventory is therefore a startup error, which is what the operator
+/// can act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedKey(Vec<u8>);
+
+impl PinnedKey {
+    /// Parse a hex-encoded uncompressed EC point, rejecting anything the report verifier could
+    /// not use.
+    pub fn parse(hex_point: &str) -> Result<Self, String> {
+        let point = hex::decode(hex_point).map_err(|_| "is not hex".to_string())?;
+        if !is_uncompressed_p256_point(&point) {
+            return Err(format!(
+                "is not an uncompressed P-256 point (65 bytes starting 0x04), got {} byte(s)",
+                point.len()
+            ));
+        }
+        Ok(Self(point))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 /// A load balancer whose backend membership is reconciled from health. An implementation maps
@@ -67,15 +100,18 @@ pub trait LoadBalancer {
 /// [`updated_contracts::telemetry::REPORT_FRESHNESS`]*. Anything else — a report
 /// for a different node, an unsigned or forged report (a compromised gateway or a direct bucket
 /// write cannot forge one without the node's key), malformed JSON, an empty body, or a stale report
-/// from a node that stopped heartbeating — is not-ready. An empty `public_key` (no pin) makes every
-/// report unverifiable, so the node can never be ready: the fail-closed default.
-pub fn report_is_ready(node: &str, public_key: &[u8], body: &[u8]) -> bool {
+/// from a node that stopped heartbeating — is not-ready. The pin's shape is guaranteed by
+/// [`PinnedKey`], so an unverifiable report here always means the *report* is wrong, never that
+/// the configuration is.
+pub fn report_is_ready(node: &str, public_key: &PinnedKey, body: &[u8]) -> bool {
     // The gate hands back the report only when the envelope is authentic and usable, so `healthy` here
     // is necessarily read from bytes this node signed — there is no path that reads a report first and
     // remembers to check it second.
     serde_json::from_slice::<Envelope>(body)
         .ok()
-        .and_then(|envelope| report_is_authentic_and_fresh(&envelope, node, public_key, now_ms()))
+        .and_then(|envelope| {
+            report_is_authentic_and_fresh(&envelope, node, public_key.as_bytes(), now_ms())
+        })
         .is_some_and(|report| report.healthy)
 }
 
@@ -128,7 +164,7 @@ pub async fn resolve_members(
     client: &reqwest::Client,
     health_base: &str,
     inventory: &[FleetNode],
-    cache: &mut std::collections::HashMap<String, Vec<u8>>,
+    cache: &mut LastKnownGood<Vec<u8>>,
 ) -> Vec<Member> {
     use futures::stream::StreamExt;
     // Concurrent, cache-free fetch pass: gather this cycle's fresh bodies in parallel (the shared
@@ -164,26 +200,63 @@ pub async fn resolve_members(
 
 /// Resolve one node's readiness from this cycle's fetch outcome and the cross-cycle cache. A fresh
 /// body (`Some`) becomes the node's last known report and is judged now; a failed fetch (`None`)
-/// falls back to the last known report. Either way readiness passes through the freshness bound in
-/// [`report_is_ready`], so a cached report keeps a node ready only until it ages out. The one place
-/// the fail-closed / fail-operational readiness rule lives, so it can be fuzzed without any I/O.
+/// falls back to the last known report through [`LastKnownGood`]. Either way readiness passes
+/// through the freshness bound in [`report_is_ready`], so a cached report keeps a node ready only
+/// until it ages out. The one place the fail-closed / fail-operational readiness rule lives, so it
+/// can be fuzzed without any I/O.
 pub fn resolve_readiness(
     node: &str,
-    public_key: &[u8],
+    public_key: &PinnedKey,
     fresh: Option<Vec<u8>>,
-    cache: &mut std::collections::HashMap<String, Vec<u8>>,
+    cache: &mut LastKnownGood<Vec<u8>>,
 ) -> bool {
-    let effective = match fresh {
-        Some(body) => {
-            cache.insert(node.to_string(), body.clone());
-            Some(body)
+    cache
+        .resolve(node, fresh, Instant::now())
+        .is_some_and(|body| report_is_ready(node, public_key, &body))
+}
+
+/// The last value a checker successfully observed for each node, and how long a failure to
+/// observe may keep using it.
+///
+/// The whole component rests on one rule: *a checker-side outage is not evidence a node is down*.
+/// A failed report fetch and a failed DNS lookup are the same event — this checker could not
+/// determine something right now — and both must fall back to what was last known rather than
+/// evict a healthy node. This type is that rule, so the two paths cannot drift into separate
+/// policies. It stays fail-closed: an entry older than [`STALENESS`](Self::STALENESS) is dropped
+/// and resolves to `None`, so a checker that never recovers still ages every node out in bounded
+/// time.
+#[derive(Debug, Default)]
+pub struct LastKnownGood<T> {
+    entries: std::collections::HashMap<String, (T, Instant)>,
+}
+
+impl<T: Clone> LastKnownGood<T> {
+    /// How long a value survives without being re-observed. The same window a report itself is
+    /// judged fresh against, so a node goes out of rotation in one bounded time regardless of
+    /// which observation failed.
+    pub const STALENESS: Duration = REPORT_FRESHNESS;
+
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
         }
-        None => cache.get(node).cloned(),
-    };
-    effective
-        .as_deref()
-        .map(|body| report_is_ready(node, public_key, body))
-        .unwrap_or(false)
+    }
+
+    /// Fold this cycle's observation into the cache and return the value to act on: a fresh
+    /// observation is stored and returned; a failed one falls back to the stored value while it
+    /// is within [`STALENESS`](Self::STALENESS), and is otherwise forgotten.
+    pub fn resolve(&mut self, key: &str, fresh: Option<T>, now: Instant) -> Option<T> {
+        if let Some(value) = fresh {
+            self.entries.insert(key.to_string(), (value.clone(), now));
+            return Some(value);
+        }
+        let (value, observed) = self.entries.get(key)?;
+        if now.duration_since(*observed) > Self::STALENESS {
+            self.entries.remove(key);
+            return None;
+        }
+        Some(value.clone())
+    }
 }
 
 /// A single reconcile of the load balancer is bounded by this. The health fetches already carry
@@ -236,7 +309,7 @@ pub async fn run(
     let mut previous: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     // Last good health body per node, so a transient CDN outage falls back to the last known report
     // (still freshness-bounded) instead of draining every healthy node at once.
-    let mut cache: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
     loop {
         let members =
             resolve_members(&client, &config.health_base, &config.inventory, &mut cache).await;
@@ -406,8 +479,9 @@ fn parse_secs(
 /// Parse `node=address=pubkeyhex,node=address=pubkeyhex,…` into [`FleetNode`]s. The address must
 /// parse as a host — an `ip:port` or bare host — but the port is carried by the Service, so only the
 /// host portion is kept. The pinned public key is the node's enrollment EC point in hex; it is
-/// required because a report is trusted only when it verifies against it (a keyless member could
-/// never be ready, so a missing key is a configuration error, not a silently-drained node).
+/// required, and required to be a usable [`PinnedKey`]: a key that is missing, or present but of a
+/// shape no report could ever verify against, is a configuration error rather than a node that is
+/// silently drained forever with the same log line as an unhealthy one.
 fn parse_inventory(raw: &str) -> Result<Vec<FleetNode>, String> {
     let mut inventory = Vec::new();
     for entry in raw
@@ -424,8 +498,8 @@ fn parse_inventory(raw: &str) -> Result<Vec<FleetNode>, String> {
                 "HEALTHPROXY_MEMBERS entry {entry:?} must be node=address=pubkeyhex"
             ));
         }
-        let public_key = hex::decode(key_hex).map_err(|_| {
-            format!("HEALTHPROXY_MEMBERS entry {entry:?} has a non-hex pinned public key")
+        let public_key = PinnedKey::parse(key_hex).map_err(|reason| {
+            format!("HEALTHPROXY_MEMBERS entry {entry:?} has a pinned public key that {reason}")
         })?;
         // Keep only the host: the Service owns the port. A bare IP literal (v4 *or* v6) is kept
         // verbatim — an unbracketed IPv6 like `::1` has no port to strip and must not be split on
@@ -461,13 +535,24 @@ mod tests {
     use std::collections::HashMap;
     use updated_contracts::telemetry::NodeReport;
 
-    static TEST_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| {
+    static TEST_KEY: std::sync::LazyLock<(Vec<u8>, PinnedKey)> = std::sync::LazyLock::new(|| {
         let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
         let key =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
-        (pkcs8.as_ref().to_vec(), key.public_key().as_ref().to_vec())
+        (
+            pkcs8.as_ref().to_vec(),
+            PinnedKey::parse(&hex::encode(key.public_key().as_ref())).unwrap(),
+        )
     });
+
+    /// A hex pin of the exact shape the report verifier requires. Config fixtures must use a
+    /// usable pin: the parser refuses anything else, which is the whole point of [`PinnedKey`].
+    fn pin(seed: u8) -> String {
+        let mut point = vec![4u8; 65];
+        point[64] = seed;
+        hex::encode(point)
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
@@ -597,7 +682,7 @@ mod tests {
             let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
             // Per-node cross-cycle state: the real cache under test, the model's view of what body is
             // cached, and the previous readiness the transition classifier saw.
-            let mut cache: HashMap<String, Vec<u8>> = HashMap::new();
+            let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
             let mut cached_kind: HashMap<String, Outcome> = HashMap::new();
             let mut previous: HashMap<String, bool> = HashMap::new();
 
@@ -694,13 +779,15 @@ mod tests {
 
     #[test]
     fn config_requires_base_service_and_members() {
+        let members = format!(
+            "agent-0=10.0.0.1:8080={}, agent-1=10.0.0.2={}",
+            pin(1),
+            pin(2)
+        );
         let ok = Config::build(env(&[
             ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
             ("HEALTHPROXY_SERVICE", "vm-db"),
-            (
-                "HEALTHPROXY_MEMBERS",
-                "agent-0=10.0.0.1:8080=aa01, agent-1=10.0.0.2=bb02",
-            ),
+            ("HEALTHPROXY_MEMBERS", &members),
         ]))
         .unwrap();
         assert_eq!(ok.namespace, "default");
@@ -711,24 +798,24 @@ mod tests {
                 FleetNode {
                     node: "agent-0".into(),
                     address: "10.0.0.1".into(),
-                    public_key: vec![0xaa, 0x01],
+                    public_key: PinnedKey::parse(&pin(1)).unwrap(),
                 },
                 FleetNode {
                     node: "agent-1".into(),
                     address: "10.0.0.2".into(),
-                    public_key: vec![0xbb, 0x02],
+                    public_key: PinnedKey::parse(&pin(2)).unwrap(),
                 },
             ]
         );
 
         assert!(Config::build(env(&[
             ("HEALTHPROXY_SERVICE", "x"),
-            ("HEALTHPROXY_MEMBERS", "a=1=aa")
+            ("HEALTHPROXY_MEMBERS", &members)
         ]))
         .is_err());
         assert!(Config::build(env(&[
             ("HEALTHPROXY_HEALTH_BASE", "x"),
-            ("HEALTHPROXY_MEMBERS", "a=1=aa")
+            ("HEALTHPROXY_MEMBERS", &members)
         ]))
         .is_err());
         assert!(Config::build(env(&[
@@ -741,10 +828,11 @@ mod tests {
     #[test]
     fn haproxy_endpoints_select_the_haproxy_backend() {
         // No HAProxy endpoints ⇒ the EndpointSlice backend.
+        let one = format!("agent-0=10.0.0.1={}", pin(1));
         let slice = Config::build(env(&[
             ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
             ("HEALTHPROXY_SERVICE", "vm-db"),
-            ("HEALTHPROXY_MEMBERS", "agent-0=10.0.0.1=aa01"),
+            ("HEALTHPROXY_MEMBERS", &one),
         ]))
         .unwrap();
         assert_eq!(slice.haproxy, None);
@@ -753,10 +841,7 @@ mod tests {
         let haproxy = Config::build(env(&[
             ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
             ("HEALTHPROXY_SERVICE", "fleet-haproxy"),
-            (
-                "HEALTHPROXY_MEMBERS",
-                "agent-0=10.0.0.1=aa01, agent-1=10.0.0.2=bb02",
-            ),
+            ("HEALTHPROXY_MEMBERS", &one),
             (
                 "HEALTHPROXY_HAPROXY_ENDPOINTS",
                 "10.0.0.9:9999, 10.0.0.10:9999",
@@ -775,7 +860,7 @@ mod tests {
     #[test]
     fn inventory_rejects_malformed_entries() {
         assert!(parse_inventory("agent-0").is_err());
-        assert!(parse_inventory("=10.0.0.1=aa").is_err());
+        assert!(parse_inventory(&format!("=10.0.0.1={}", pin(1))).is_err());
         assert!(parse_inventory("agent-0=").is_err());
         assert!(parse_inventory("").is_err());
         // A member without a pinned key is rejected — a keyless node could never verify, so it is a
@@ -785,11 +870,64 @@ mod tests {
         assert!(parse_inventory("agent-0=10.0.0.1=zz").is_err());
     }
 
+    /// A pin of the wrong shape verifies nothing, so a node carrying one would be drained forever
+    /// while logging exactly like an unhealthy node. It must fail at startup instead.
+    #[test]
+    fn a_pin_the_verifier_could_never_use_is_a_startup_error() {
+        // A certificate digest (32 bytes) and a compressed point are the realistic paste errors.
+        assert!(PinnedKey::parse(&"ab".repeat(32)).is_err());
+        assert!(PinnedKey::parse(&format!("02{}", "ab".repeat(32))).is_err());
+        // 65 bytes, but not an uncompressed point, and the all-zero encoding.
+        assert!(PinnedKey::parse(&format!("03{}", "ab".repeat(64))).is_err());
+        assert!(PinnedKey::parse(&format!("04{}", "00".repeat(64))).is_err());
+        assert!(PinnedKey::parse(&pin(1)).is_ok());
+
+        let error = parse_inventory(&format!("agent-3=10.0.0.1={}", "ab".repeat(32)))
+            .expect_err("a malformed pin is refused at config time");
+        assert!(error.contains("uncompressed P-256 point"), "{error}");
+    }
+
+    /// The last-known-good rule both the report fetch and the DNS lookup resolve through: a
+    /// failed observation reuses what was last seen, and only within the shared staleness bound.
+    #[test]
+    fn a_failed_observation_reuses_the_last_known_value_until_it_ages_out() {
+        let mut known: LastKnownGood<String> = LastKnownGood::new();
+        let start = Instant::now();
+        // Nothing observed yet: a failure has nothing to fall back to (fail closed).
+        assert_eq!(known.resolve("db", None, start), None);
+        assert_eq!(
+            known.resolve("db", Some("10.0.0.1".into()), start),
+            Some("10.0.0.1".to_string())
+        );
+        // A failed observation inside the window keeps the last known value...
+        assert_eq!(
+            known.resolve("db", None, start + LastKnownGood::<String>::STALENESS),
+            Some("10.0.0.1".to_string())
+        );
+        // ...and past it the value is forgotten, so a checker that never recovers still ages
+        // every node out in bounded time.
+        assert_eq!(
+            known.resolve(
+                "db",
+                None,
+                start + LastKnownGood::<String>::STALENESS + Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(
+            known.resolve("db", None, start + Duration::from_secs(1)),
+            None,
+            "the aged-out entry is dropped, not merely hidden"
+        );
+    }
+
     #[test]
     fn inventory_keeps_only_the_host_across_address_forms() {
-        let parsed = parse_inventory(
-            "v4=10.0.0.1=aa, v4p=10.0.0.2:8080=bb, v6=::1=cc, v6p=[fe80::1]:8080=dd, h=vm-db.internal=ee, hp=vm-db.internal:5432=ff",
-        )
+        let key = pin(1);
+        let parsed = parse_inventory(&format!(
+            "v4=10.0.0.1={key}, v4p=10.0.0.2:8080={key}, v6=::1={key}, v6p=[fe80::1]:8080={key}, \
+             h=vm-db.internal={key}, hp=vm-db.internal:5432={key}"
+        ))
         .unwrap();
         let hosts: Vec<(String, String)> = parsed
             .into_iter()

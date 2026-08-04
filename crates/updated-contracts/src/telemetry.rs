@@ -38,10 +38,15 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The namespace, under a report base, that every node report lives in. A store that accepts
+/// report writes must serve this namespace back: the writer and every reader derive their path
+/// from this one name, so a store that knows only its write half returns 404 to every consumer.
+pub const REPORT_NAMESPACE: &str = "telemetry";
+
 /// The relative object key, under a report base, a node writes its report to. Keyed by
 /// node identity so the control plane can attribute a report to the agent it selected.
 pub fn report_object_key(node: &str) -> String {
-    format!("telemetry/{node}.json")
+    format!("{REPORT_NAMESPACE}/{node}.json")
 }
 
 /// The absolute URL of a node's report under a base location: `<base>/telemetry/<node>.json`,
@@ -54,6 +59,11 @@ pub fn report_url(base: &str, node: &str) -> String {
 
 /// The request path a node `PUT`s its report to, relative to the report base.
 pub const REPORT_PATH_PREFIX: &str = "/telemetry/";
+
+#[test]
+fn the_report_path_prefix_is_the_report_namespace() {
+    assert_eq!(REPORT_PATH_PREFIX, format!("/{REPORT_NAMESPACE}/"));
+}
 
 /// Recover the node identity from a report request path (`/telemetry/<node>.json`),
 /// rejecting traversal or unsafe characters. Shared by every control plane so the write
@@ -382,7 +392,12 @@ pub fn report_payload_unverified(envelope: &Envelope) -> Option<NodeReport> {
 /// coordinates, and not the all-zero encoding. Shape only — proving a point is on the curve is the
 /// verifier's job; this exists so a malformed *pin* is refused as a configuration error rather than
 /// silently behaving like a node whose every report is forged.
-fn is_uncompressed_p256_point(point: &[u8]) -> bool {
+///
+/// Public because the shape must be enforced where a pin is *configured*, not only where it is
+/// used: a pin that reaches [`report_is_authentic_and_fresh`] malformed drains its node forever
+/// with a log line indistinguishable from a genuinely unhealthy one. Every consumer validates
+/// against this one rule, so the boundary check and the verification check cannot drift.
+pub fn is_uncompressed_p256_point(point: &[u8]) -> bool {
     point.len() == 65 && point[0] == 4 && point[1..].iter().any(|byte| *byte != 0)
 }
 

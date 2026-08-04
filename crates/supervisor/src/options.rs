@@ -14,9 +14,14 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
     // One shared resolver derives every on-disk path (binary, state, datastore, and the
     // staging/journal/rejected siblings) so the supervisor and the
     // one-shot updater never re-derive them by hand and drift apart.
-    let paths = cfg.resolve_paths()?;
+    let paths = cfg.resolve_paths();
 
-    let supervisor_update = build_supervisor_update(&cfg, state_dir.clone());
+    let timeouts = BoundedTimeouts::new(cfg.timeouts);
+    let supervisor_update = SupervisorUpdate {
+        channel: cfg.application.channel.clone(),
+        state_dir: state_dir.clone(),
+        check_interval: timeouts.supervisor_check_interval,
+    };
     let secrets =
         secrets::SecretManager::initialize(&cfg.routing, &cfg.deployment, &cfg.application.secrets)
             .await?;
@@ -25,7 +30,7 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
         routing: cfg.routing,
         repository: cfg.repository,
         application: cfg.application,
-        timeouts: cfg.timeouts,
+        timeouts,
         storage: cfg.storage,
         paths,
         supervisor_update,
@@ -48,12 +53,4 @@ fn supervisor_state_dir() -> Result<PathBuf, String> {
         );
     };
     Ok(PathBuf::from(state_dir))
-}
-
-fn build_supervisor_update(cfg: &updated::config::Config, state_dir: PathBuf) -> SupervisorUpdate {
-    SupervisorUpdate {
-        channel: cfg.application.channel.clone(),
-        state_dir,
-        check_interval: cfg.timeouts.supervisor_check_interval,
-    }
 }

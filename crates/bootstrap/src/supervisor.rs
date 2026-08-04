@@ -62,15 +62,9 @@ impl Supervisor {
         // the guardian's disposable child, exactly the "churning tower" case `ContainedChild`
         // exists for. On Linux `arrange_parent_death_signal` adds `PR_SET_PDEATHSIG`; on
         // Windows the kill-on-close job `ContainedChild` assigns ties the supervisor to the
-        // guardian's handle. `CREATE_NEW_PROCESS_GROUP` (Windows) additionally puts it in its
-        // own process group so the guardian can signal it with `CTRL_BREAK` for a graceful
-        // stop, mirroring the Unix `SIGTERM` path (see `sys::terminate_gracefully`).
+        // guardian's handle. The process group a graceful `CTRL_BREAK`/`SIGTERM` needs is
+        // `ContainedChild`'s own doing on both platforms — see `ContainedChild::request_stop`.
         foundation::process::arrange_parent_death_signal(&mut cmd);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
-        }
         let child = ContainedChild::spawn(cmd)?;
         // The supervisor inherited the child end; the guardian drops its copy so it is
         // the sole holder of the guardian end (and the channel closes when the
@@ -95,8 +89,13 @@ impl Supervisor {
 
     /// Ask the supervisor to stop and reap it (kill on grace expiry). Never touches the
     /// application — the guardian owns that separately.
+    ///
+    /// Both the graceful request and the hard kill go through [`ContainedChild`], which knows
+    /// whether the leader has already been reaped. A raw `kill(pid, …)` here would be the same
+    /// recycled-PID hazard `kill_tree` was built to remove, one layer up: a caller that observed
+    /// the exit and then stopped us would signal whatever the kernel handed that number to next.
     pub fn stop(&mut self) {
-        crate::sys::terminate_gracefully(self.child.id());
+        let _ = self.child.request_stop();
         let deadline = Instant::now() + self.stop_grace;
         while Instant::now() < deadline {
             match self.child.try_wait() {
@@ -108,6 +107,68 @@ impl Supervisor {
         // Grace expired: hard-kill the whole supervisor tree, not just the root child.
         let _ = self.child.kill_tree();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A supervisor stand-in that catches the graceful stop and exits on it.
+    fn graceful_binary(name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("guardian-stop-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("supervisor");
+        std::fs::write(&path, "#!/bin/sh\ntrap 'exit 7' TERM\nsleep 60 &\nwait\n").unwrap();
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn stop_asks_gracefully_before_the_grace_expires() {
+        // The graceful request goes through `ContainedChild`, the same reap-aware abstraction as
+        // the hard kill, so no raw PID is ever signalled from here. If it were lost, this would
+        // fall through to the grace expiry and hard-kill instead.
+        let binary = graceful_binary("graceful");
+        let dir = binary.parent().unwrap();
+        let mut sup = Supervisor::launch(
+            &binary,
+            &dir.join("config.toml"),
+            dir,
+            None,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let started = Instant::now();
+        sup.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stop waited out the grace instead of asking the supervisor to exit"
+        );
+        assert!(sup.exited());
+    }
+
+    #[test]
+    fn stopping_an_already_reaped_supervisor_signals_nothing() {
+        // Once `exited()` has reaped the leader its PID is the kernel's to reassign; a stop after
+        // that must be a no-op, not a signal aimed at whatever now holds that number.
+        let binary = graceful_binary("reaped");
+        let dir = binary.parent().unwrap();
+        let mut sup = Supervisor::launch(
+            &binary,
+            &dir.join("config.toml"),
+            dir,
+            None,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        sup.stop();
+        assert!(sup.exited());
+        let started = Instant::now();
+        sup.stop();
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
 

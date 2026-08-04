@@ -259,32 +259,57 @@ pub struct Paths {
     pub provider_download: PathBuf,
 }
 
-impl Config {
-    /// Resolve the canonical bundle layout. The installer creates `install_root` and
-    /// seeds its first active release before starting the service.
-    pub fn resolve_paths(&self) -> Result<Paths, String> {
-        let install_root = self.application.install_root.clone();
+/// Where the last live routing assignment is kept: beside the enrollment material in the
+/// guardian's state directory, never under `install_root`.
+///
+/// This file is read *before any network fetch* to decide what the managed application is
+/// launched with — its args, which secret populates which environment variable, which product and
+/// channel are acceptable. Nothing local can re-verify it at that moment, so it may only live
+/// where every other boot input already lives: the enrollment directory that also holds the
+/// bootstrap config, the enrollment bundle, and the node's private key. Kept under `install_root`
+/// it would let write access to a directory full of otherwise-recoverable state choose the
+/// managed process's arguments and secrets.
+pub fn persisted_assignment_path(enrollment_state: &Path) -> PathBuf {
+    enrollment_state.join("repository-assignment.json")
+}
+
+impl Paths {
+    /// The canonical layout, derived from the only two roots it depends on: the install root that
+    /// holds every replaceable artifact, and the enrollment state directory that holds every
+    /// boot-time input. This is the single definition — production, tooling and tests all call it,
+    /// so no second copy of the layout can drift from it.
+    pub fn resolve(install_root: &Path, enrollment_state: &Path) -> Paths {
         let state_dir = install_root.join("state");
-        let state = state_dir.join("installed.json");
-        let datastore = state_dir.join("tuf");
-        let routing_datastore = state_dir.join("routing-tuf");
-        Ok(Paths {
+        Paths {
+            install_root: install_root.to_path_buf(),
             versions: install_root.join("versions"),
             staging: install_root.join("staging"),
             active_release: install_root.join("active-release"),
             download: install_root.join("staging/bundle.download"),
+            state: state_dir.join("installed.json"),
+            datastore: state_dir.join("tuf"),
+            routing_datastore: state_dir.join("routing-tuf"),
+            assignment: persisted_assignment_path(enrollment_state),
             journal: state_dir.join("transaction.json"),
             install_journal: state_dir.join("install.json"),
             rejected: state_dir.join("rejected"),
             provider_versions: install_root.join("providers/versions"),
             provider_staging: install_root.join("providers/staging"),
             provider_download: install_root.join("providers/staging/bundle.download"),
-            datastore,
-            routing_datastore,
-            assignment: state_dir.join("repository-assignment.json"),
-            state,
-            install_root,
-        })
+        }
+    }
+}
+
+impl Config {
+    /// Resolve the canonical bundle layout. The installer creates `install_root` and
+    /// seeds its first active release before starting the service.
+    pub fn resolve_paths(&self) -> Paths {
+        // `routing.root` is the routing anchor materialized into the enrollment state directory,
+        // so its parent is that directory — the one place boot-time inputs may come from.
+        Paths::resolve(
+            &self.application.install_root,
+            foundation::durable::parent_dir(&self.routing.root),
+        )
     }
 }
 

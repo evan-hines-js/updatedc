@@ -108,6 +108,7 @@ fn main() {
                     &root,
                 ),
                 max_unavailable: None,
+                emergency_correction: false,
             },
         );
         group.metadata.namespace = Some("updated-system".into());
@@ -130,6 +131,7 @@ fn main() {
                 inputs: BTreeMap::new(),
                 deployment: deployment(name, version, &platform, sha, &provider_sha, &root),
                 max_unavailable: None,
+                emergency_correction: false,
             },
         );
         group.metadata.namespace = Some("updated-system".into());

@@ -1,6 +1,6 @@
 //! Crash-safe sibling-file replacement and removal.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,17 +13,143 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// be called at any time without racing an in-flight [`atomic_write`].
 const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 
-pub fn create_temp(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
-    create_temp_with(dir, prefix, |path| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
+/// Who may read a durable file once it is committed. Every file this module creates commits to
+/// exactly one of these at `open(2)`/`CreateFileW` time — permissions are never widened and then
+/// narrowed, and no caller ever chmods (or `icacls`es) afterwards, which is the property that
+/// makes "write it durably" a single operation rather than a write plus a repair.
+///
+/// The ladder is *who*, not *how much*: the writer alone, the principals the deployment's own
+/// ACL names, or everybody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Visibility {
+    /// The writing account only. Secrets: an enrollment key, a minted TLS private key.
+    Private,
+    /// Whoever the containing directory's ACL grants — the node's state directory is granted to
+    /// the service account by the installer, and that grant works purely by inheritance.
+    Managed,
+    /// Everybody. A signed repository artifact served to the whole fleet.
+    Published,
+}
+
+/// Create a fresh, uniquely named temp file in `dir` that keeps the access its directory
+/// confers: on Windows the directory's inheritable ACEs apply (the installer's
+/// `icacls %STATEDIR% /grant "NT SERVICE\…:(OI)(CI)M"` grant reaches it), on unix it is `0o600`.
+/// Every file under the node state directory that is not a secret goes through here: with a
+/// protected DACL, a state file written by an elevated operator CLI or an installer step would
+/// commit with no ACE for the service account, which could then neither read nor replace it, and
+/// no `icacls` grant could repair it.
+///
+/// There is deliberately no owner-only counterpart to this: a secret is never streamed here — it
+/// is always one in-memory buffer — so [`atomic_write`] is the single door to
+/// [`Visibility::Private`], and there is no second one to keep in step with it.
+pub fn create_temp_managed(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
+    create_temp_with(dir, prefix, |path| create(path, Visibility::Managed))
+}
+
+/// [`create_temp_managed`], but world-readable (`0o644` on unix; the directory's ACL on Windows) at
+/// creation — for a signed repository object that the whole fleet fetches. The mode is set when
+/// the file is created rather than repaired before the rename, so it is identical on the platform
+/// where `set_permissions` is a no-op.
+pub fn create_temp_published(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
+    create_temp_with(dir, prefix, |path| create(path, Visibility::Published))
+}
+
+#[cfg(unix)]
+fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mode = match visibility {
+        // The state directory's own ACL is a Windows concept; on unix a managed file is as
+        // private as a secret, because only the service account is ever inside that tree.
+        Visibility::Private | Visibility::Managed => 0o600,
+        Visibility::Published => 0o644,
+    };
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+}
+
+/// Windows has no `mode`, and a file created without an explicit security descriptor INHERITS
+/// its directory's ACL — the standard install location (`%ProgramData%\updated`) grants
+/// `BUILTIN\Users` read, and `icacls /grant` in the installer only adds to that. Setting the
+/// DACL after the fact would still leave a window in which any local user could open a handle
+/// and read whatever is written through it afterwards, so for a [`Visibility::Private`] file the
+/// descriptor is supplied at creation: it is never, at any instant, readable by anyone else.
+/// `Managed` and `Published` files deliberately take the inherited ACL — that inheritance is how
+/// the deployment grants the service account access to its own state directory.
+#[cfg(windows)]
+fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
+    if visibility != Visibility::Private {
+        return fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
+    }
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    // Full access to the file's owner, to SYSTEM and to the local Administrators group; to
+    // nobody else. `P` marks the DACL protected, so the parent directory's inheritable entries
+    // — the `BUILTIN\Users` read this exists to exclude — do not apply, and `fs::rename` keeps
+    // it that way when the temp is committed.
+    const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
+    let sddl: Vec<u16> = OWNER_ONLY_SDDL.encode_utf16().chain(Some(0)).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both wide buffers are live and NUL-terminated for the duration of the calls, the
+    // converted descriptor is freed on every path, and the returned handle is either
+    // INVALID_HANDLE_VALUE or handed to a `File` that owns and closes it.
+    unsafe {
+        let mut descriptor = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        ) == 0
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            return Err(io::Error::last_os_error());
         }
-        options.open(path)
-    })
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        // Capture the failure reason before LocalFree can overwrite it: `create_temp_with`
+        // distinguishes an ALREADY_EXISTS collision (retry) from a real error (give up).
+        let error = io::Error::last_os_error();
+        LocalFree(descriptor as _);
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(error);
+        }
+        Ok(File::from_raw_handle(handle as _))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create(path: &Path, _visibility: Visibility) -> io::Result<File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn create_temp_with(
@@ -62,14 +188,30 @@ pub fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-/// Durably replace `path` with `data`: write a fresh sibling temp, fsync it, rename it into
-/// place, then fsync the directory. The committed file inherits the temp's mode, so on unix it
-/// is **owner-only** (`create_temp` opens at `0o600`) — this is the one durable write, and it is
-/// the write secrets go through (an enrollment key, a minted TLS private key) as well as ordinary
-/// state. Callers therefore never need to chmod afterwards.
+/// Durably replace `path` with `data`, readable by **the writing account alone** on every
+/// platform (`0o600` at `open(2)` on unix, an explicit protected DACL passed to `CreateFileW` on
+/// Windows): write a fresh sibling temp, fsync it, rename it into place,
+/// then fsync the directory. The committed file inherits the temp's permissions, so callers never
+/// chmod afterwards. This is the write secrets go through — an enrollment key, a minted TLS
+/// private key.
+///
+/// Use [`atomic_write_managed`] for a non-secret file under the node's state directory.
 pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
+    durable_write(path, prefix, data, Visibility::Private)
+}
+
+/// [`atomic_write`] for a non-secret file under the node's state directory: identical durability,
+/// but the committed file keeps whatever access its directory confers (on Windows the deployment's
+/// inheritable grant to the service account; on unix still `0o600`). A supervisor pointer, a
+/// guardian marker, a journal — anything a differently-privileged principal may legitimately have
+/// to read or replace later.
+pub fn atomic_write_managed(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
+    durable_write(path, prefix, data, Visibility::Managed)
+}
+
+fn durable_write(path: &Path, prefix: &str, data: &[u8], visibility: Visibility) -> io::Result<()> {
     let dir = parent_dir(path);
-    let (mut tmp, tmp_path) = create_temp(dir, prefix)?;
+    let (mut tmp, tmp_path) = create_temp_with(dir, prefix, |p| create(p, visibility))?;
     if let Err(e) = tmp.write_all(data).and_then(|_| tmp.sync_all()) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
@@ -82,11 +224,13 @@ pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
     sync_dir(dir)
 }
 
-/// Copy a verified executable into a fresh sibling file, persist its final mode,
-/// and atomically install it at `target`.
+/// Copy a verified executable into a fresh sibling file, persist its final mode, and atomically
+/// install it at `target`. A staged binary is not a secret: it is [`Visibility::Managed`], so on
+/// Windows the state directory's grant to the service account still reaches it and a candidate
+/// staged by an elevated installer step remains launchable by the service.
 pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
     let dir = parent_dir(target);
-    let (mut tmp, tmp_path) = create_temp(dir, ".executable-")?;
+    let (mut tmp, tmp_path) = create_temp_managed(dir, ".executable-")?;
     let staged = File::open(source)
         .and_then(|mut source| io::copy(&mut source, &mut tmp))
         .and_then(|_| tmp.sync_all());
@@ -126,7 +270,7 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
 }
 
 /// Best-effort removal of stale temp files left behind when a crash or power loss struck
-/// between an [`atomic_write`]/[`install_executable`]/[`create_temp`] and its rename —
+/// between an [`atomic_write`]/[`install_executable`]/[`create_temp_managed`] and its rename —
 /// the `<prefix>…-….tmp` sibling is then an orphan no one will ever finish. Sweeps `dir`
 /// for files whose name starts with `prefix` and ends with `.tmp`, skipping any modified
 /// within [`STALE_TEMP_AGE`] so a temp an in-flight writer still owns is never yanked.
@@ -162,9 +306,31 @@ pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
     removed
 }
 
+/// Durably unlink a file this tower wrote: the removal is persisted (the parent directory is
+/// synced) before this returns, so a power loss cannot resurrect it. Removing something that is
+/// already gone is success. The path must be a file — use [`remove_path`] for a path whose shape
+/// is not ours to assume.
 pub fn remove_file(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    sync_dir(parent_dir(path))
+}
+
+/// Durably remove *whatever* is at `path` — a file, a symlink, or a whole directory tree — for
+/// the one situation [`remove_file`] cannot serve: clearing garbage at a path this tower expects
+/// to own but did not write, where anything at all may be sitting (an operator's stray `mkdir`,
+/// a half-restored backup). `remove_file` would fail on a directory on every platform, which
+/// turns "discard the garbage and carry on" into a warning repeated on every boot forever.
+///
+/// A symlink is removed as the link, never followed, so this can never delete a tree the link
+/// merely pointed at. Removing something that is already gone is success.
+pub fn remove_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => return remove_file(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     }
@@ -268,6 +434,49 @@ mod tests {
     }
 
     #[test]
+    fn remove_path_clears_whatever_is_at_the_path() {
+        // The point of `remove_path` is that the caller does not get to assume the shape of what
+        // it is clearing: a plain unlink fails on a directory on every platform, which would turn
+        // "discard this garbage and carry on" into a failure repeated on every attempt forever.
+        let d = dir("remove-path");
+
+        let file = d.join("garbage");
+        fs::write(&file, b"not evidence").unwrap();
+        remove_path(&file).unwrap();
+        assert!(!file.exists());
+
+        let nested = d.join("dir-garbage");
+        fs::create_dir_all(nested.join("inner")).unwrap();
+        fs::write(nested.join("inner").join("leaf"), b"deep").unwrap();
+        remove_path(&nested).unwrap();
+        assert!(!nested.exists(), "a non-empty directory is removed whole");
+
+        // Idempotent: nothing there is the state the caller wanted.
+        remove_path(&nested).unwrap();
+        remove_path(&d.join("never-existed")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_path_unlinks_a_symlink_without_touching_its_target() {
+        // Following the link would delete a tree that merely happened to be pointed at — the
+        // garbage is the link itself.
+        let d = dir("remove-symlink");
+        let target = d.join("real");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"precious").unwrap();
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        remove_path(&link).unwrap();
+        assert!(!link.exists());
+        assert!(
+            target.join("keep").exists(),
+            "the symlink's target must survive"
+        );
+    }
+
+    #[test]
     fn parent_dir_resolves_a_bare_filename_to_the_current_directory() {
         // Path::parent yields Some("") for a bare filename, so a naive
         // `parent().unwrap_or(".")` hands sync_dir an unopenable empty path and reports
@@ -342,7 +551,10 @@ mod tests {
             if attempts == 1 {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
-            OpenOptions::new().write(true).create_new(true).open(path)
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
         })
         .unwrap();
         assert_eq!(attempts, 2);
@@ -362,13 +574,127 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn temporary_files_are_owner_only_from_creation() {
+    fn each_visibility_commits_its_mode_at_creation() {
+        // A published artifact is world-readable the instant it exists; nothing repairs a mode
+        // after the fact, so the unix and Windows paths agree on who may read what.
         use std::os::unix::fs::PermissionsExt;
-        let d = dir("private");
-        let (_file, path) = create_temp(&d, ".secret-").unwrap();
-        assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
-            0o600
+        let d = dir("visibility");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let (_f, managed) = create_temp_managed(&d, ".state-").unwrap();
+        assert_eq!(mode(&managed), 0o600);
+        let (_f, published) = create_temp_published(&d, ".publish-").unwrap();
+        assert_eq!(mode(&published), 0o644);
+
+        let secret = d.join("secret");
+        atomic_write(&secret, ".key-", b"k").unwrap();
+        assert_eq!(mode(&secret), 0o600);
+        let state = d.join("state");
+        atomic_write_managed(&state, ".guardian-", b"s").unwrap();
+        assert_eq!(mode(&state), 0o600, "state stays owner-only on unix");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_managed_file_keeps_its_directorys_inheritable_grant() {
+        // The state directory is granted to the service account by an installer `icacls` that
+        // works purely by inheritance. A protected (`D:P`) DACL discards inherited ACEs, so a
+        // state file written by an elevated operator CLI would be unreadable and unreplaceable
+        // by the service, with no grant able to repair it. Only secrets are protected.
+        let d = dir("managed");
+        let (_file, path) = create_temp_managed(&d, ".state-").unwrap();
+        assert!(
+            !dacl_sddl(&path).starts_with("D:P"),
+            "a managed file must inherit the state directory's ACL"
         );
+        let (_file, published) = create_temp_published(&d, ".publish-").unwrap();
+        assert!(!dacl_sddl(&published).starts_with("D:P"));
+        let state = d.join("state");
+        atomic_write_managed(&state, ".guardian-", b"s").unwrap();
+        assert!(!dacl_sddl(&state).starts_with("D:P"));
+        let secret = d.join("secret");
+        atomic_write(&secret, ".key-", b"k").unwrap();
+        assert!(
+            dacl_sddl(&secret).starts_with("D:P"),
+            "a secret is still protected against directory inheritance"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_secret_is_owner_only_from_creation() {
+        // The unix side gets this from `0o600`. On Windows the guarantee is a protected DACL
+        // supplied at creation — to the temp, before any byte is written, and preserved by the
+        // rename; without it the file inherits `%ProgramData%`'s `BUILTIN\Users: Read` and every
+        // local user can read a node's private key.
+        let d = dir("private");
+        let path = d.join("secret");
+        atomic_write(&path, ".key-", b"k").unwrap();
+        let sddl = dacl_sddl(&path);
+        assert!(
+            sddl.starts_with("D:P"),
+            "the DACL must be protected against directory inheritance: {sddl}"
+        );
+        for unprivileged in [";BU)", ";WD)", ";AU)", ";IU)"] {
+            assert!(
+                !sddl.contains(unprivileged),
+                "{unprivileged} must not be granted access: {sddl}"
+            );
+        }
+    }
+
+    /// `path`'s DACL rendered back as SDDL, for asserting on what it grants.
+    #[cfg(windows)]
+    fn dacl_sddl(path: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{GetFileSecurityW, DACL_SECURITY_INFORMATION};
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            let mut needed = 0u32;
+            GetFileSecurityW(
+                wide.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            let mut buffer = vec![0u8; needed as usize];
+            assert_ne!(
+                GetFileSecurityW(
+                    wide.as_ptr(),
+                    DACL_SECURITY_INFORMATION,
+                    buffer.as_mut_ptr() as _,
+                    needed,
+                    &mut needed,
+                ),
+                0,
+                "reading the temp file's security descriptor: {}",
+                io::Error::last_os_error()
+            );
+            let mut text = std::ptr::null_mut();
+            assert_ne!(
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    buffer.as_ptr() as _,
+                    SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    std::ptr::null_mut(),
+                ),
+                0,
+                "rendering the DACL as SDDL: {}",
+                io::Error::last_os_error()
+            );
+            let mut len = 0;
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text as _);
+            sddl
+        }
     }
 }

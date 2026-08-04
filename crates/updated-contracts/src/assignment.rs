@@ -123,6 +123,22 @@ impl RepositoryAssignment {
     }
 }
 
+/// The largest wall-clock interval a signed assignment may carry, and the ceiling every consumer
+/// clamps its own waits to.
+///
+/// Every `*_seconds` field becomes a `Duration` that a consumer adds to an `Instant` or hands to a
+/// sleep, and both of those PANIC on overflow, so an unbounded value is a remote crash of every
+/// node the assignment reaches — not a merely eccentric policy. Thirty days is far past any
+/// legitimate check interval, health grace, drain hold, or retry backoff.
+///
+/// This is the single definition of that ceiling, on the contract every publisher signs and every
+/// consumer ingests: validation here refuses anything above it, and a consumer that additionally
+/// clamps (because local state, not just the signed document, can reach its timers) clamps to this
+/// same constant rather than to a private copy that could drift from it. It is stated in the unit
+/// the wire contract uses — seconds — so there is exactly one spelling of the ceiling and no
+/// derived `Duration` twin for a consumer to pick instead.
+pub const MAX_INTERVAL_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 impl ManagedRuntime {
     /// Validate signed runtime policy without consulting node-local state.
     pub fn validate(&self) -> Result<(), String> {
@@ -146,6 +162,52 @@ impl ManagedRuntime {
             || self.timeouts.supervisor_check_interval_seconds == 0
         {
             return Err("managed runtime limits and timeouts must be non-zero".into());
+        }
+        for (field, seconds) in [
+            (
+                "repository.transport_timeout_seconds",
+                self.repository.transport_timeout_seconds,
+            ),
+            (
+                "timeouts.check_interval_seconds",
+                self.timeouts.check_interval_seconds,
+            ),
+            (
+                "timeouts.health_grace_seconds",
+                self.timeouts.health_grace_seconds,
+            ),
+            (
+                "timeouts.health_interval_seconds",
+                self.timeouts.health_interval_seconds,
+            ),
+            (
+                "timeouts.retry_after_seconds",
+                self.timeouts.retry_after_seconds,
+            ),
+            (
+                "timeouts.refresh_retry_seconds",
+                self.timeouts.refresh_retry_seconds,
+            ),
+            (
+                "timeouts.confirmation_window_seconds",
+                self.timeouts.confirmation_window_seconds,
+            ),
+            (
+                "timeouts.supervisor_check_interval_seconds",
+                self.timeouts.supervisor_check_interval_seconds,
+            ),
+        ]
+        .into_iter()
+        .chain(
+            self.timeouts
+                .drain_hold_seconds
+                .map(|hold| ("timeouts.drain_hold_seconds", hold)),
+        ) {
+            if seconds > MAX_INTERVAL_SECONDS {
+                return Err(format!(
+                    "{field} ({seconds}) exceeds the {MAX_INTERVAL_SECONDS}s maximum"
+                ));
+            }
         }
         if self.secrets.len() > 64 {
             return Err("managed runtime may declare at most 64 secret references".into());
@@ -297,6 +359,63 @@ mod tests {
             },
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: runtime(),
+        }
+    }
+
+    /// Every `*_seconds` field becomes a `Duration` that a consumer adds to an `Instant` or sleeps
+    /// on, and both panic on overflow. A publisher must not be able to emit one that crashes the
+    /// fleet, and the bound belongs here — at the contract boundary every consumer already goes
+    /// through — rather than as a clamp repeated in each consumer.
+    #[test]
+    fn every_timeout_is_bounded_from_above() {
+        type SetSeconds = fn(&mut ManagedRuntime, u64);
+        let fields: [(&str, SetSeconds); 9] = [
+            ("transport_timeout", |r, v| {
+                r.repository.transport_timeout_seconds = v
+            }),
+            ("check_interval", |r, v| {
+                r.timeouts.check_interval_seconds = v
+            }),
+            ("health_grace", |r, v| r.timeouts.health_grace_seconds = v),
+            ("health_interval", |r, v| {
+                // Keep the lower bound (grace >= (successes-1)*interval) satisfiable so the
+                // upper bound is what rejects this, not the pre-existing floor.
+                r.timeouts.health_successes = 1;
+                r.timeouts.health_interval_seconds = v;
+            }),
+            ("retry_after", |r, v| r.timeouts.retry_after_seconds = v),
+            ("refresh_retry", |r, v| r.timeouts.refresh_retry_seconds = v),
+            ("confirmation_window", |r, v| {
+                r.timeouts.confirmation_window_seconds = v
+            }),
+            ("supervisor_check_interval", |r, v| {
+                r.timeouts.supervisor_check_interval_seconds = v
+            }),
+            ("drain_hold", |r, v| r.timeouts.drain_hold_seconds = Some(v)),
+        ];
+        for (name, set) in fields {
+            let mut at_maximum = runtime();
+            set(&mut at_maximum, MAX_INTERVAL_SECONDS);
+            assert!(
+                at_maximum.validate().is_ok(),
+                "{name} at the maximum must remain valid: {:?}",
+                at_maximum.validate()
+            );
+            for hostile in [MAX_INTERVAL_SECONDS + 1, u64::MAX] {
+                let mut value = runtime();
+                set(&mut value, hostile);
+                assert!(
+                    value.validate().is_err(),
+                    "{name} = {hostile} must be rejected"
+                );
+                // …and rejected through the whole signed document, not just the runtime.
+                let mut signed = assignment();
+                set(&mut signed.runtime, hostile);
+                assert!(
+                    signed.validate().is_err(),
+                    "{name} = {hostile} must be rejected by the assignment too"
+                );
+            }
         }
     }
 

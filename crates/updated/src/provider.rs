@@ -7,7 +7,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::bundle::{self, BundleLimits, ExpectedBundle, ReleaseId, StagedRelease};
+use crate::bundle::{self, BundleLimits, ExpectedBundle, InstallError, ReleaseId, StagedRelease};
 use crate::config::Paths;
 
 /// A release store rooted at `versions/` plus its `staging/` scratch. The tower keeps
@@ -62,11 +62,14 @@ impl BundleStore {
     /// This is the one ingest-time verification gate: the store expands the
     /// signed bundle and re-hashes the fresh tree against its manifest before publishing
     /// it; a committed store is trusted forever after.
+    ///
+    /// The error is [`InstallError`], not `io::Error`, because callers persist a durable,
+    /// never-expiring rejection from one of its two cases and must retry the other.
     pub fn install(
         &self,
         archive: &Path,
         expected: &ExpectedBundle<'_>,
-    ) -> io::Result<StagedRelease> {
+    ) -> Result<StagedRelease, InstallError> {
         bundle::stage_bundle(
             archive,
             &self.staging,

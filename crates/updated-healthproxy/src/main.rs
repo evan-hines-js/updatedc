@@ -9,8 +9,9 @@
 //!   `<base>/telemetry/<node>.json`.
 //! - `HEALTHPROXY_SERVICE`             (required) selectorless Service to program.
 //! - `HEALTHPROXY_MEMBERS`             (required) `node=address=pubkeyhex,…` fleet inventory; the
-//!   pinned public key (the node's enrollment EC point in hex) is what its health report is
-//!   verified against, so a report the node did not sign can never place it in rotation.
+//!   pinned public key (the node's enrollment EC point in hex — 65 bytes, `04`-prefixed) is what
+//!   its health report is verified against, so a report the node did not sign can never place it
+//!   in rotation. A key of any other shape is refused at startup rather than draining that node.
 //! - `HEALTHPROXY_NAMESPACE`           Service namespace (default `default`).
 //! - `HEALTHPROXY_PORT` / `_PORT_NAME` endpoint port and name (default `8080` / `http`).
 //! - `HEALTHPROXY_INTERVAL_SECS`       reconcile cadence (default `2`).

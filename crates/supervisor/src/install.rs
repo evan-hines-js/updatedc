@@ -218,14 +218,32 @@ async fn apply_install(
                 // provider set is good, rather than crash-looping on a version we can never bring up.
                 match stage_providers(opts, &repo, store, None).await {
                     Ok((providers, _)) => break (prepared, providers),
-                    Err(crate::selection::ProviderStagingError::Unusable(error)) => {
+                    Err(crate::selection::ProviderStagingError::Unusable {
+                        message,
+                        version_bound: true,
+                    }) => {
                         warn(&format!(
-                            "first-install provider set for {} is unusable ({error}); rejecting \
+                            "first-install provider set for {} is unusable ({message}); rejecting \
                              this version so ordered fallback descends to one with a good set",
                             prepared.version
                         ));
                         store.reject(&lineage, &prepared.archive_sha256)?;
                         continue;
+                    }
+                    // The set came from the ASSIGNMENT, not from this version — every version
+                    // fails on it identically. Rejecting them one at a time would walk the descent
+                    // to the bottom and permanently exclude every release this node has, for a
+                    // cause none of them owns. Fail the install and let the operator fix the
+                    // assignment; the next boot retries with nothing thrown away.
+                    Err(crate::selection::ProviderStagingError::Unusable {
+                        message,
+                        version_bound: false,
+                    }) => {
+                        return Err(format!(
+                            "the assignment's lifecycle provider set is unusable ({message}); no \
+                             application version can install until it is corrected"
+                        )
+                        .into());
                     }
                     // A network or disk failure says nothing about this release. Rejection is
                     // durable and never expires, so rejecting here would let one CDN blip walk the

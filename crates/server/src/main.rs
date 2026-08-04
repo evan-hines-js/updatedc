@@ -693,6 +693,15 @@ where
     Ok(())
 }
 
+/// The namespaces this server serves. The two TUF halves, plus the report namespace it also
+/// accepts writes into — a namespace this server can write but never read back would 404 every
+/// consumer's fetch while each `PUT` reported success.
+const SERVED_NAMESPACES: [&str; 3] = [
+    "metadata",
+    "targets",
+    updated_contracts::telemetry::REPORT_NAMESPACE,
+];
+
 /// Map a request path to a file inside `root`, rejecting traversal. Slashes are
 /// allowed (TUF target paths are nested); `..` components and absolute escapes
 /// are not.
@@ -703,7 +712,7 @@ fn open_repository_file(root: &Path, path: &str) -> Option<std::fs::File> {
         .split('/')
         .filter(|part| !part.is_empty() && *part != ".");
     let namespace = parts.next()?;
-    if !matches!(namespace, "metadata" | "targets") {
+    if !SERVED_NAMESPACES.contains(&namespace) {
         return None;
     }
     out.push(namespace);
@@ -1014,6 +1023,49 @@ mod tests {
         );
         let response = get(&root, &request).await;
         assert!(response.starts_with("HTTP/1.1 431"), "got: {response:?}");
+    }
+
+    /// The server accepts report writes, so it must serve them back: a store that knows only the
+    /// write half answers 404 to every consumer fetch, and a health proxy pointed at it programs
+    /// an empty backend set forever while each `PUT` reports success.
+    #[tokio::test]
+    async fn a_stored_report_is_served_back_to_the_reader_that_fetches_it() {
+        use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        use updated_contracts::telemetry::{
+            report_is_authentic_and_fresh, report_object_key, sign_report, NodeReport,
+        };
+
+        let root = serve_root("telemetry-roundtrip");
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let report = NodeReport::new("agent-7", "deploy-3", digest, "3.0.0", digest, true);
+        let body = serde_json::to_vec(&sign_report(&report, pkcs8.as_ref()).unwrap()).unwrap();
+
+        let key_path = report_object_key("agent-7");
+        let put = format!(
+            "PUT /{key_path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body.clone()).unwrap()
+        );
+        let stored = get(&root, &put).await;
+        assert!(stored.starts_with("HTTP/1.1 200"), "got: {stored:?}");
+
+        let fetched = get(&root, &format!("GET /{key_path} HTTP/1.1\r\n\r\n")).await;
+        assert!(fetched.starts_with("HTTP/1.1 200"), "got: {fetched:?}");
+        let (_, served) = fetched.split_once("\r\n\r\n").unwrap();
+        assert_eq!(served.as_bytes(), body);
+        // The served bytes are still the ones the node signed, not a re-encoding.
+        let envelope = serde_json::from_slice(served.as_bytes()).unwrap();
+        assert!(report_is_authentic_and_fresh(
+            &envelope,
+            "agent-7",
+            key.public_key().as_ref(),
+            updated_contracts::telemetry::now_ms(),
+        )
+        .is_some());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use updated_contracts::telemetry::Envelope;
 
-use crate::rollout::{plan_rollouts, AdmittedDeployment, RolloutInputs, SetStatus};
+use crate::rollout::{plan_rollouts, AdmittedDeployment, GroupProgress, RolloutInputs, SetStatus};
 use crate::{
     build_publication_plan, resolve_node_groups, DesiredDeployment, PlanError, PublicationPlan,
     ResolvedGroup, ResolvedNode, UpdateGroupSet, UpdateRepositorySpec,
@@ -38,6 +38,10 @@ pub struct ObservedState<'a> {
     /// set, so this is what a node's existing assignment is derived from when its own group cannot
     /// be planned this pass.
     pub routing: &'a BTreeMap<String, String>,
+    /// Node → the deployment identity the LAST published generation handed it. Lets a staged
+    /// rollout tell an already-advanced node from one that has not moved, without depending on
+    /// telemetry that ages out while the node reboots into the update.
+    pub assignments: &'a BTreeMap<String, String>,
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -47,7 +51,14 @@ pub struct ReconcilePlan {
     pub admitted: BTreeMap<String, AdmittedDeployment>,
     /// The routing this generation publishes, to be persisted alongside `admitted`.
     pub routing: BTreeMap<String, String>,
+    /// The node → deployment identity this generation publishes, persisted alongside `routing`.
+    pub assignments: BTreeMap<String, String>,
     pub set_statuses: Vec<SetStatus>,
+    /// Each planned group's verdict for this generation, decided once by the rollout planner. The
+    /// group's own Kubernetes status is a projection of this and nothing else — a status path that
+    /// re-derived "rolling" and "held" from a deployment-NAME comparison reported a group `Ready`
+    /// while a body change to it was still unadmitted.
+    pub groups: BTreeMap<String, GroupProgress>,
 }
 
 pub fn plan_reconcile(
@@ -76,6 +87,7 @@ pub fn plan_reconcile(
             node_groups: &node_groups,
             reports: observed.reports,
             public_keys: observed.public_keys,
+            published: observed.assignments,
         },
         &mut admitted,
         observed.now,
@@ -115,12 +127,20 @@ pub fn plan_reconcile(
     // never been published anywhere is left out, and there is nothing there to lose.
     let mut published_nodes = BTreeMap::new();
     for (node, group) in &node_groups {
-        // Carry the node's last routing forward in exactly two situations: the group it was
-        // published under is quarantined (it is absent from the plan, so this node resolved to
-        // `default` and would otherwise be swapped onto it), or its selected group has produced no
-        // deployment at all this pass (never admitted — waiting on inputs or prerequisites).
+        // Carry the node's last routing forward only when the group it selects NOW cannot be
+        // planned: either that group produced no deployment at all this pass (never admitted —
+        // waiting on inputs or prerequisites), or the node fell through to `default` because its
+        // group is quarantined and absent from the plan.
+        //
+        // The quarantine arm must key on where the node resolves NOW, not on where it was last
+        // published. Keying on the last group pinned a node that had since been RELABELLED into a
+        // healthy group back onto the quarantined group's deployment — and republished it under
+        // that group, so the durable routing kept saying so and the node could never be moved
+        // until the broken group was fixed. Relabelling is the ordinary remediation for a
+        // quarantined group; it must work.
         let last = observed.routing.get(node).filter(|last| {
-            desired.held.contains_key(*last) || !rollout.node_deployments.contains_key(node)
+            !rollout.node_deployments.contains_key(node)
+                || (group == crate::DEFAULT_GROUP && desired.held.contains_key(*last))
         });
         let carried = last.and_then(|last| {
             if last == crate::DEFAULT_GROUP {
@@ -177,11 +197,14 @@ pub fn plan_reconcile(
         rollout.node_deployments,
     )?;
     let routing = publication.node_groups.clone();
+    let assignments = publication.node_assignments.clone();
     Ok(ReconcilePlan {
         publication,
         admitted,
         routing,
+        assignments,
         set_statuses: rollout.sets,
+        groups: rollout.groups,
     })
 }
 
@@ -192,51 +215,110 @@ fn resolve_group_inputs(
     public_keys: &HashMap<String, Vec<u8>>,
     now_ms: u64,
 ) {
-    let snapshot = groups.clone();
-    for group in groups.values_mut() {
-        if group.inputs.is_empty() {
-            group.inputs_ready = true;
-            continue;
-        }
-        let mut values = BTreeMap::new();
-        let ready = group.inputs.iter().all(|(input, reference)| {
-            let producers: Vec<&String> = node_groups
-                .iter()
-                .filter_map(|(node, selected)| (selected == &reference.group).then_some(node))
-                .collect();
-            let [node] = producers.as_slice() else {
-                return false;
-            };
-            let (Some(envelope), Some(key)) = (reports.get(*node), public_keys.get(*node)) else {
-                return false;
-            };
-            let Some(report) = updated_contracts::telemetry::report_is_authentic_and_fresh(
-                envelope, node, key, now_ms,
-            ) else {
-                return false;
-            };
-            // The producer must be healthy on the EXACT configuration desired for it, not merely
-            // on something sharing its deployment name: an output read off an older revision of
-            // that deployment would be wired into the consumer as if it were current.
-            let producer = &snapshot[&reference.group];
-            let identity = crate::deployment_identity(&producer.deployment);
-            if !report.healthy || Some(&report.assignment_sha256) != identity.as_ref() {
-                return false;
+    // Resolve in dependency order, and read producers from the map being BUILT rather than from a
+    // snapshot taken before any resolution. A producer that consumes inputs of its own has its
+    // `runtime.inputs` filled in during this pass, which changes the configuration digest it is
+    // published under — so comparing a report against the pre-resolution copy would never match,
+    // and any chain longer than two groups (A → B → C) could never satisfy its consumer.
+    let mut resolved: BTreeMap<String, ResolvedGroup> = BTreeMap::new();
+    for name in dependency_order(groups) {
+        let mut group = groups[&name].clone();
+        resolve_one(
+            &mut group,
+            &resolved,
+            node_groups,
+            reports,
+            public_keys,
+            now_ms,
+        );
+        resolved.insert(name, group);
+    }
+    *groups = resolved;
+}
+
+/// Group names ordered so every group follows the ones it depends on. The graph is already
+/// validated acyclic by `validate_dependency_graph`; a name whose dependencies are missing simply
+/// comes last, and its unresolved inputs keep it un-admitted.
+fn dependency_order(groups: &BTreeMap<String, ResolvedGroup>) -> Vec<String> {
+    let mut ordered: Vec<String> = Vec::with_capacity(groups.len());
+    let mut placed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Bounded by the group count: each pass places at least one group unless none can be placed.
+    for _ in 0..groups.len() {
+        for (name, group) in groups {
+            if placed.contains(name) {
+                continue;
             }
-            let Some(value) = report
-                .outputs
-                .as_ref()
-                .and_then(|outputs| outputs.values.get(&reference.output))
-            else {
-                return false;
-            };
-            values.insert(input.clone(), value.clone());
-            true
-        });
-        group.inputs_ready = ready;
-        if ready {
-            group.deployment.runtime.inputs = values;
+            if group
+                .depends_on
+                .iter()
+                .all(|dependency| placed.contains(dependency) || !groups.contains_key(dependency))
+            {
+                ordered.push(name.clone());
+                placed.insert(name.clone());
+            }
         }
+    }
+    for name in groups.keys() {
+        if !placed.contains(name) {
+            ordered.push(name.clone());
+        }
+    }
+    ordered
+}
+
+fn resolve_one(
+    group: &mut ResolvedGroup,
+    resolved: &BTreeMap<String, ResolvedGroup>,
+    node_groups: &BTreeMap<String, String>,
+    reports: &HashMap<String, Envelope>,
+    public_keys: &HashMap<String, Vec<u8>>,
+    now_ms: u64,
+) {
+    if group.inputs.is_empty() {
+        group.inputs_ready = true;
+        return;
+    }
+    let mut values = BTreeMap::new();
+    let ready = group.inputs.iter().all(|(input, reference)| {
+        let producers: Vec<&String> = node_groups
+            .iter()
+            .filter_map(|(node, selected)| (selected == &reference.group).then_some(node))
+            .collect();
+        let [node] = producers.as_slice() else {
+            return false;
+        };
+        let (Some(envelope), Some(key)) = (reports.get(*node), public_keys.get(*node)) else {
+            return false;
+        };
+        let Some(report) = updated_contracts::telemetry::report_is_authentic_and_fresh(
+            envelope, node, key, now_ms,
+        ) else {
+            return false;
+        };
+        // The producer must be healthy on the EXACT configuration desired for it, not merely
+        // on something sharing its deployment name: an output read off an older revision of
+        // that deployment would be wired into the consumer as if it were current.
+        // The producer as RESOLVED this pass — inputs of its own already filled in.
+        let Some(producer) = resolved.get(&reference.group) else {
+            return false;
+        };
+        let identity = crate::deployment_identity(&producer.deployment);
+        if !report.healthy || Some(&report.assignment_sha256) != identity.as_ref() {
+            return false;
+        }
+        let Some(value) = report
+            .outputs
+            .as_ref()
+            .and_then(|outputs| outputs.values.get(&reference.output))
+        else {
+            return false;
+        };
+        values.insert(input.clone(), value.clone());
+        true
+    });
+    group.inputs_ready = ready;
+    if ready {
+        group.deployment.runtime.inputs = values;
     }
 }
 
@@ -309,6 +391,7 @@ mod tests {
                     inputs_ready: true,
                     deployment: deployment("init-v1"),
                     max_unavailable: 1,
+                    emergency_correction: false,
                 },
             ),
             (
@@ -328,6 +411,7 @@ mod tests {
                     inputs_ready: false,
                     deployment: deployment("join-v1"),
                     max_unavailable: 1,
+                    emergency_correction: false,
                 },
             ),
         ]);
@@ -409,6 +493,7 @@ mod tests {
                 public_keys: &HashMap::new(),
                 admitted,
                 routing,
+                assignments: &BTreeMap::new(),
                 now: chrono::Utc::now(),
             },
         )
@@ -423,6 +508,7 @@ mod tests {
             inputs_ready: true,
             deployment: deployment(&format!("{name}-v1")),
             max_unavailable: 1,
+            emergency_correction: false,
         }
     }
 
@@ -471,6 +557,35 @@ mod tests {
             planned.admitted.contains_key("edge"),
             "the quarantined group stays pinned; its admitted entry is not collected"
         );
+    }
+
+    /// Relabelling a node out of a quarantined group is the ordinary remediation for a broken
+    /// group, and it must take effect. Keying the carry-forward on the node's LAST published group
+    /// instead of the group it selects now pinned the node to the quarantined group's deployment
+    /// and republished it under that group, so the durable routing kept saying so on every
+    /// subsequent pass — only fixing or deleting the broken group could ever release it.
+    #[test]
+    fn a_node_relabelled_out_of_a_quarantined_group_moves_to_its_new_group() {
+        let pinned = AdmittedDeployment {
+            current: deployment("edge-v1"),
+            previous: None,
+        };
+        // `edge` is quarantined (absent from the planned groups, present in `held`); the node now
+        // carries `role: core` and selects the healthy, fully-admitted `core`.
+        let held = BTreeMap::from([("edge".to_string(), pinned)]);
+        let groups = BTreeMap::from([("core".to_string(), resolved("core", "edge", vec![]))]);
+        let admitted = BTreeMap::from([(
+            "core".to_string(),
+            AdmittedDeployment {
+                current: deployment("core-v1"),
+                previous: None,
+            },
+        )]);
+        let routing = BTreeMap::from([("n1".to_string(), "edge".to_string())]);
+
+        let planned = plan(&groups, &held, &admitted, &routing).expect("the relabel is plannable");
+        assert_eq!(planned.publication.node_groups["n1"], "core");
+        assert_eq!(planned.routing["n1"], "core");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use updated::config::{
-    with_suffix, Application, MaterializeRuntime, Paths, Repository, Routing, Storage, Timeouts,
+    with_suffix, Application, MaterializeRuntime, Paths, Repository, Routing, Storage,
 };
 use updated::env;
 mod app;
@@ -52,7 +52,7 @@ struct Options {
     routing: Routing,
     repository: Repository,
     application: Application,
-    timeouts: Timeouts,
+    timeouts: BoundedTimeouts,
     storage: Storage,
     /// Canonical bundle installation layout.
     paths: Paths,
@@ -98,7 +98,7 @@ impl Options {
             ));
             self.application.install_root = boot_install_root;
         }
-        self.timeouts = runtime.timeouts();
+        self.timeouts = BoundedTimeouts::new(runtime.timeouts());
         self.storage = runtime.storage();
         relaunch
     }
@@ -198,7 +198,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut guardian =
         Guardian::connect().map_err(|e| format!("connecting to the guardian: {e}"))?;
-    let guardian_state = guardian::state_dir();
 
     let mut store = FileStore::open(opts.paths.clone())?;
 
@@ -227,10 +226,13 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Gather the whole world into a Situation and let the pure boot planner decide
-    // everything: recovery, drift enforcement, crash rejection, pending confirm/revert,
-    // and whether to adopt the running application or launch a fresh one.
-    let situation = gather_situation(&opts, &store, guardian_state.as_deref(), first_install)?;
+    // Claim the guardian's markers once, up front, then gather the whole world into a Situation
+    // and let the pure boot planner decide everything: recovery, drift enforcement, crash
+    // rejection, pending confirm/revert, and whether to adopt the running application or launch a
+    // fresh one. Each claim is surrendered — and only then is its file erased — at the point the
+    // durable consequence it implies has landed.
+    let mut evidence = guardian::Evidence::read(guardian::state_dir().as_deref())?;
+    let situation = gather_situation(&opts, &store, &evidence, first_install)?;
     let mut recovery_transaction = recovery_transaction(&situation);
     // A *provisional* committed head (`confirmed == false`, never health-proven) that crashed (the
     // guardian recorded a service exit) with no pending update to revert is a broken assigned head
@@ -249,6 +251,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if situation.service_exited && recovery_transaction.is_none() && !situation.first_install {
         if let Installed::Present(state) = &situation.installed {
             if reject_provisional_head(&mut store, state, "crashed with no pending update")? {
+                // The rejection is durable now, so the claim that drove it can go.
+                evidence.clear_service_exit()?;
                 return Err("provisional head crashed; descending on the next boot".into());
             }
         }
@@ -299,35 +303,32 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     // Perform the plan's durable reconciliation (binary, rejections, commit), yielding the
     // still-unconfirmed update (if any) for the loop to confirm once its window passes.
-    let mut pending = match execute_boot_plan(
+    // A failure here leaves the journal and every unspent marker claim intact and EXITS (see
+    // `exit_for_relaunch`), so the guardian relaunches this supervisor and boot recovery re-derives
+    // the identical, idempotent reconciliation from that durable evidence.
+    let mut pending = execute_boot_plan(
         &plan,
         &mut store,
         &mut guardian,
         &mut self_update,
         defer_recovery_commit,
         recovery_transaction.as_mut(),
-    ) {
-        Ok(pending) => pending,
-        Err(error) => {
-            return hold_recovery_after_provider_failure(
-                &shutdown,
-                format!("boot/update recovery hook failed: {error}"),
-            )
-            .await;
-        }
-    };
+        &mut evidence,
+    )
+    .map_err(|error| exit_for_relaunch("boot/update recovery", &error))?;
+    // The service exit's durable consequence — the synthesized rollback journal above, or the
+    // reconciliation `execute_boot_plan` just committed — has landed, so this boot's claim on it
+    // is spent. (The rejected-supervisor claim is surrendered inside `execute_boot_plan`, at the
+    // instant the candidate's hash becomes durably rejected.) Consuming evidence earlier, as part
+    // of merely *reading* the situation, meant a crash in the gap erased the only record that the
+    // application died inside its confirmation window: the next boot would confirm the bad update
+    // instead of reverting it. Commit first, then consume — and consume only what was read.
+    evidence.clear_service_exit()?;
     // Restore the predecessor's activation before relaunching it (rollback recovery). A restart
     // deployment has no live process here (it was stopped); a reload deployment kept it and reloads
     // it in place — `complete_recovery_activation` resolves that itself.
-    if let Err(error) =
-        complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut())
-    {
-        return hold_recovery_after_provider_failure(
-            &shutdown,
-            format!("predecessor activation recovery hook failed: {error}"),
-        )
-        .await;
-    }
+    complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut())
+        .map_err(|cause| exit_for_relaunch("predecessor activation recovery", &cause))?;
     if let Some(tx) = recovery_transaction.as_mut() {
         if tx.recovery_pending(TransactionPhase::RollbackStartStarted) {
             advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
@@ -416,11 +417,10 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         Installed::Present(installed) => installed,
         _ => return Err("cannot verify a boot without an installed release".into()),
     };
-    let installed = installed_state.release.clone();
-    let installed_lifecycle = match recovery_transaction.as_ref() {
-        Some(tx) if tx.is_rollback() => tx.lifecycle.clone(),
-        _ => installed_state.lifecycle,
-    };
+    // Identity and providers are resolved together, from one source, so the gate can never observe
+    // one release with another's hooks.
+    let (installed, installed_lifecycle) =
+        boot_gate_target(recovery_transaction.as_ref(), &installed_state);
     let mut tower = DefaultProvider::new(&mut app, &opts, installed_lifecycle.as_ref());
     let boot_healthy = update::became_steady(&mut tower, &installed).await;
     if !boot_healthy {
@@ -519,11 +519,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     predecessor: &tx.candidate_release,
                 },
             ) {
-                return hold_recovery_after_provider_failure(
-                    &shutdown,
-                    format!("rollback recovery hook failed: {error}"),
-                )
-                .await;
+                return Err(exit_for_relaunch("rollback recovery hook", &error));
             }
             Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
         }
@@ -871,11 +867,10 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     return Ok(());
                 }
                 AppOutcome::Fatal(message) => {
-                    return hold_recovery_after_provider_failure(
-                        &shutdown,
-                        format!("update transaction requires boot recovery: {message}"),
-                    )
-                    .await;
+                    return Err(exit_for_relaunch(
+                        "the update transaction requires boot recovery",
+                        &message,
+                    ));
                 }
             }
         }
@@ -964,21 +959,29 @@ async fn repair_from_local_assignment(
     Ok(())
 }
 
-/// A recovery hook is operator code. If it fails, keep the existing application and
-/// durable transaction evidence in place, but do not let the guardian repeatedly restart
-/// this supervisor and replay the same non-idempotent boundary forever. The process stays
-/// alive until the service manager stops it (or the guardian rejects a not-ready candidate).
-async fn hold_recovery_after_provider_failure(
-    shutdown: &Arc<AtomicBool>,
-    reason: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    error(&format!(
-        "{reason}; recovery is held with its journal intact"
-    ));
-    while !shutdown.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Ok(())
+/// End this supervisor because it cannot make progress, leaving every piece of durable evidence
+/// (the transaction journal, the unspent marker claims, the rejection records) exactly as it is.
+///
+/// This is the ONLY response to an unrecoverable boot or update step, and it is deliberately an
+/// exit rather than a wait: the supervisor is disposable, and the guardian — which still owns the
+/// application — relaunches it, so the next boot re-derives the identical, idempotent recovery from
+/// the same evidence. Holding the process alive instead (the shape this replaced) meant a single
+/// failed durable write could pin the node down forever: no exit, so no relaunch, so no next boot,
+/// so the recovery that was supposed to happen "next boot" never did. Replaying an operator hook in
+/// a tight loop is not the alternative hazard it looks like either: the guardian throttles every
+/// relaunch through one exponential backoff capped at five minutes, and that backoff is rate-
+/// limited precisely so THIS path cannot escape it. An exit from here typically comes after a long
+/// boot — situation gathering, quiesce, activation, an operator hook with an operator-chosen
+/// timeout — so the guardian's "it ran a while, this was a transient crash" reset would otherwise
+/// fire on every cycle; it stops resetting past a bounded number of relaunches per hour, and the
+/// loop settles at one replay per five minutes.
+fn exit_for_relaunch(what: &str, cause: &dyn std::fmt::Display) -> Box<dyn std::error::Error> {
+    let reason = format!(
+        "{what} failed: {cause}; exiting with the recovery journal intact so the guardian \
+         relaunches boot recovery"
+    );
+    error(&reason);
+    reason.into()
 }
 
 fn garbage_collect(opts: &Options, store: &dyn Store) {
@@ -1168,12 +1171,13 @@ fn complete_recovery_activation(
 // ============================== boot: gather + execute ==============================
 
 /// Read the whole world the boot planner needs — durable state via the [`Store`] and the
-/// guardian's recovery markers — into one [`Situation`]. The shell's single point of input
-/// gathering; the marker reads also consume the markers.
+/// guardian's recovery markers, already claimed into [`guardian::Evidence`] — into one
+/// [`Situation`]. The shell's single point of input gathering. Reading evidence leaves it on disk;
+/// the boot path clears a claim only once the intent it implies is durable.
 fn gather_situation(
     opts: &Options,
     store: &dyn Store,
-    guardian_state: Option<&Path>,
+    evidence: &guardian::Evidence,
     first_install: bool,
 ) -> io::Result<Situation> {
     let active = store.active_release()?;
@@ -1183,16 +1187,10 @@ fn gather_situation(
         installed,
         active,
         journal,
-        service_exited: match guardian_state {
-            Some(state) => guardian::take_service_exit_marker(state)?,
-            None => false,
-        },
+        service_exited: evidence.service_exited(),
         app_running: guardian::adopted_app_pid(),
         first_install,
-        bad_supervisor: match guardian_state {
-            Some(state) => guardian::take_rejected_supervisor(state)?,
-            None => None,
-        },
+        bad_supervisor: evidence.rejected_supervisor().map(PathBuf::from),
         confirm_window: opts.timeouts.confirmation_window,
         now: now_unix(),
     })
@@ -1207,6 +1205,7 @@ fn execute_boot_plan(
     self_update: &mut SelfUpdateState,
     defer_commit: bool,
     mut recovery: Option<&mut Transaction>,
+    evidence: &mut guardian::Evidence,
 ) -> io::Result<Option<Pending>> {
     if let Some(tx) = recovery.as_mut() {
         if tx.recovery_pending(TransactionPhase::RollbackStopStarted) {
@@ -1239,7 +1238,11 @@ fn execute_boot_plan(
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_POINTER_APPLIED);
     }
     if let Some(path) = &plan.reject_supervisor {
-        self_update.reject_candidate(path);
+        // Fallible on purpose, and cleared only here: a rejection that failed to reach disk must
+        // not be mistaken for a durable one. If the write fails this boot fails with the marker
+        // intact, so the next boot rejects the same candidate instead of re-staging it forever.
+        self_update.reject_candidate(path)?;
+        evidence.clear_rejected_supervisor()?;
     }
     Ok(installed_pending(store))
 }
@@ -1434,6 +1437,24 @@ mod tests {
             args: Vec::new(),
             timeout_millis: 1_000,
         })
+    }
+
+    #[test]
+    fn an_unrecoverable_boot_step_ends_the_process_instead_of_holding_the_node_down() {
+        // Regression: every one of these used to route into an infinite `while !shutdown { sleep }`
+        // hold. A single failed durable write — ENOSPC recording a rejection, a read-only remount —
+        // then meant the supervisor never exited, so the guardian never relaunched it, so the "next
+        // boot" that was supposed to redo the recovery never happened, with the node serving
+        // nothing. The only correct answer is to end the process and let the guardian (which
+        // throttles relaunches through one capped backoff) start the next boot.
+        let cause = io::Error::new(io::ErrorKind::StorageFull, "no space left on device");
+        let error = exit_for_relaunch("recording the candidate's rejection", &cause);
+        let message = error.to_string();
+        assert!(message.contains("no space left on device"), "{message}");
+        assert!(
+            message.contains("relaunches boot recovery"),
+            "the operator is told what happens next: {message}"
+        );
     }
 
     #[test]

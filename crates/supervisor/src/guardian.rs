@@ -179,47 +179,237 @@ pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// Read and clear the guardian's service-exit marker. Any spontaneous exit, including
-/// zero, invalidates an unconfirmed service release and requires boot reconciliation.
-pub(crate) fn take_service_exit_marker(state_dir: &Path) -> std::io::Result<bool> {
-    let path = state_dir.join(control::SERVICE_EXITED_MARKER_FILE);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            foundation::durable::remove_file(&path)?;
-            Ok(true)
+/// One marker file the guardian writes for the supervisor: evidence about the launch that just
+/// ended, which the supervisor turns into a rollback or a rejection.
+///
+/// A marker is only ever obtained as a [`Claim`] — a specific *instance* of the file, pinned to
+/// the bytes that were read — and a claim is the only thing that can erase one. Three hazards are
+/// unrepresentable as a result:
+///
+/// * Consuming evidence by reading it. A crash or ENOSPC between the unlink and the durable write
+///   the marker implies would erase the only record that the application died inside its
+///   confirmation window, and the next boot would confirm the bad update instead of reverting it.
+///   Re-deriving evidence after a crash is idempotent; re-creating deleted evidence is impossible.
+/// * Erasing evidence nobody read. Boot reconciliation runs while the guardian still owns the live
+///   application, so the guardian can write a *fresh* marker at any point during it. Clearing "the
+///   marker file" would silently swallow that one; clearing a claim touches only the instance
+///   whose contents drove this boot's decisions, and leaves a newer instance for the next boot.
+/// * Being wedged by garbage. A marker whose bytes are not evidence — a truncated write from
+///   outside this tower, an operator's stray `echo`, a directory at the path — is DISCARDED with a
+///   warning rather than failing the boot: failing would repeat identically on every subsequent
+///   boot, and a node must never be permanently unbootable because of a corrupt marker file.
+struct Marker {
+    path: std::path::PathBuf,
+}
+
+/// A marker instance that has been read, pinned to the exact bytes it held. Holding one is the
+/// proof of reading that [`Claim::clear`] requires; consuming one is what makes clearing happen at
+/// most once, for at most that instance.
+///
+/// The *contents* are the instance identity, and nothing else: the guardian writes markers through
+/// `foundation::durable::atomic_write_managed`, but filesystem metadata cannot tell two writes
+/// apart portably (on Windows NTFS tunneling restores the creation time across the temp+rename,
+/// modification time has ~15 ms granularity, and the length of a fixed-shape marker never varies).
+/// So each marker's content is made self-identifying at the writer instead: the service-exit marker
+/// carries a fresh per-exit stamp, and the rejected-supervisor marker carries the candidate's path
+/// — which is precisely the evidence, so two instances with identical bytes say the same thing and
+/// have the same durable consequence.
+pub(crate) struct Claim {
+    path: std::path::PathBuf,
+    content: String,
+}
+
+fn warn_unusable(path: &Path, why: &str) {
+    crate::warn(&format!(
+        "guardian marker {} {why}; discarding it — it carries no evidence",
+        path.display()
+    ));
+}
+
+/// Report that whatever is at `path` cannot be evidence at all — a directory, a symlink, bytes
+/// that are not text — and get rid of it, so the same garbage cannot fail every future boot.
+/// Always best-effort: if the removal fails the node still boots, having simply learned nothing.
+///
+/// The removal is `remove_path`, not `remove_file`, precisely because the garbage may be a
+/// *directory*: unlinking one fails on every platform, so a file-only removal would leave the
+/// directory in place and repeat this same warning pair on every boot for the life of the node.
+fn discard(path: &Path, why: &str) -> Option<Claim> {
+    warn_unusable(path, why);
+    if let Err(error) = foundation::durable::remove_path(path) {
+        crate::warn(&format!(
+            "could not remove the unusable guardian marker {}: {error}",
+            path.display()
+        ));
+    }
+    None
+}
+
+impl Marker {
+    /// The managed service exited spontaneously. Any exit, including zero, invalidates an
+    /// unconfirmed release and requires boot reconciliation.
+    fn service_exit(state_dir: &Path) -> Marker {
+        Marker {
+            path: state_dir.join(control::SERVICE_EXITED_MARKER_FILE),
         }
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "service-exit marker {} is not a regular file",
-                path.display()
-            ),
-        )),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
+    }
+
+    /// A candidate supervisor failed its readiness gate; its staged path is the marker's content,
+    /// and this supervisor records the rejection so the candidate is never staged again.
+    fn rejected_supervisor(state_dir: &Path) -> Marker {
+        Marker {
+            path: state_dir.join(control::REJECTED_SUPERVISOR_FILE),
+        }
+    }
+
+    /// Claim the marker as it is right now, without disturbing it. A genuine I/O failure (EIO, a
+    /// permission problem) is propagated — the environment is broken, not the file — while
+    /// anything at the path that cannot *be* evidence is discarded and read as "no marker".
+    fn claim(self) -> std::io::Result<Option<Claim>> {
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(discard(&self.path, "is not a regular file"));
+        }
+        match std::fs::read_to_string(&self.path) {
+            Ok(content) => Ok(Some(Claim {
+                path: self.path,
+                content,
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                Ok(discard(&self.path, "is not valid UTF-8"))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
-/// Read and clear the guardian's rejected-supervisor marker: the path of a candidate
-/// supervisor that failed its readiness gate, so this supervisor records the rejection.
-pub(crate) fn take_rejected_supervisor(
-    state_dir: &Path,
-) -> std::io::Result<Option<std::path::PathBuf>> {
-    let path = state_dir.join(control::REJECTED_SUPERVISOR_FILE);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    foundation::durable::remove_file(&path)?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() || content.lines().count() != 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "rejected-supervisor marker is malformed",
-        ));
+impl Claim {
+    /// The claim's single line of content, for a marker that carries a value. `None` for a marker
+    /// of any other shape: it is corrupt, so it is not interpreted.
+    fn single_line(&self) -> Option<&str> {
+        let trimmed = self.content.trim();
+        if trimmed.is_empty() || self.content.lines().count() != 1 {
+            return None;
+        }
+        Some(trimmed)
     }
-    Ok(Some(std::path::PathBuf::from(trimmed)))
+
+    /// Erase exactly the instance that was claimed. Call only AFTER the durable consequence
+    /// derived from it — a synthesized rollback journal, a recorded rejection — has been
+    /// committed; the claim is consumed, so it cannot be cleared twice.
+    ///
+    /// If the bytes on disk are no longer the ones that were read, the guardian wrote a new marker
+    /// while this boot was reconciling: that instance's evidence has been read by nobody, so it
+    /// is left for the next boot.
+    fn clear(self) -> std::io::Result<()> {
+        let rewritten = |path: &Path| {
+            crate::log(&format!(
+                "guardian marker {} was rewritten during boot reconciliation; leaving the new one \
+                 for the next boot",
+                path.display()
+            ));
+            Ok(())
+        };
+        match std::fs::read_to_string(&self.path) {
+            Ok(content) if content == self.content => foundation::durable::remove_file(&self.path),
+            // Different bytes — or bytes that are no longer text at all — are a different instance
+            // than the one that was read, and nobody has read that one.
+            Ok(_) => rewritten(&self.path),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => rewritten(&self.path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Throw away a marker whose content is not evidence, without touching a newer instance that
+    /// landed mid-boot (the same rule [`Claim::clear`] follows). Best-effort: a failure to remove
+    /// it only means the warning repeats next boot, which is the point — it must never stop one.
+    fn discard_corrupt(self, why: &str) {
+        warn_unusable(&self.path, why);
+        if let Err(error) = self.clear() {
+            crate::warn(&format!(
+                "could not remove the unusable guardian marker: {error}"
+            ));
+        }
+    }
+}
+
+/// Everything the guardian left behind for this boot, read once, up front, and cleared one claim
+/// at a time as each implied intent becomes durable.
+///
+/// There is no way to reach a marker except through here, and no way to clear one except by
+/// surrendering the claim that read it — so "cleared a marker whose consequence never committed"
+/// and "cleared a marker nobody read" are both off the table by construction rather than by call
+/// ordering.
+pub(crate) struct Evidence {
+    service_exit: Option<Claim>,
+    rejected_supervisor: Option<(Claim, std::path::PathBuf)>,
+}
+
+impl Evidence {
+    /// Read both markers. `state_dir` is `None` when this supervisor was not launched by a
+    /// guardian, in which case there is never any evidence.
+    pub(crate) fn read(state_dir: Option<&Path>) -> std::io::Result<Evidence> {
+        let Some(state_dir) = state_dir else {
+            return Ok(Evidence {
+                service_exit: None,
+                rejected_supervisor: None,
+            });
+        };
+        let rejected_supervisor = match Marker::rejected_supervisor(state_dir).claim()? {
+            Some(claim) => {
+                let candidate = claim.single_line().map(std::path::PathBuf::from);
+                match candidate {
+                    Some(path) => Some((claim, path)),
+                    // A rejected-supervisor marker that does not name exactly one candidate path
+                    // cannot reject anything. Discarding it costs at most one re-staging of a
+                    // candidate the guardian will reject again (and record again, legibly);
+                    // failing the boot on it would fail every boot after it, forever.
+                    None => {
+                        claim.discard_corrupt("does not name exactly one candidate path");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        Ok(Evidence {
+            service_exit: Marker::service_exit(state_dir).claim()?,
+            rejected_supervisor,
+        })
+    }
+
+    /// Whether the managed service exited spontaneously under the previous supervisor.
+    pub(crate) fn service_exited(&self) -> bool {
+        self.service_exit.is_some()
+    }
+
+    /// The staged path of a candidate supervisor the guardian rejected at its readiness gate.
+    pub(crate) fn rejected_supervisor(&self) -> Option<&Path> {
+        self.rejected_supervisor
+            .as_ref()
+            .map(|(_, path)| path.as_path())
+    }
+
+    /// Drop the service-exit evidence, now that the rollback or rejection it implied is durable.
+    pub(crate) fn clear_service_exit(&mut self) -> std::io::Result<()> {
+        match self.service_exit.take() {
+            Some(claim) => claim.clear(),
+            None => Ok(()),
+        }
+    }
+
+    /// Drop the rejected-supervisor evidence, now that the candidate's hash is durably rejected.
+    pub(crate) fn clear_rejected_supervisor(&mut self) -> std::io::Result<()> {
+        match self.rejected_supervisor.take() {
+            Some((claim, _)) => claim.clear(),
+            None => Ok(()),
+        }
+    }
 }
 
 fn read_ready_nonce() -> Result<Nonce, String> {
@@ -341,20 +531,165 @@ mod marker_tests {
         path
     }
 
-    #[test]
-    fn service_exit_marker_is_consumed_once() {
-        let state = dir("service-exit");
-        std::fs::write(state.join(control::SERVICE_EXITED_MARKER_FILE), b"exited\n").unwrap();
-        assert!(take_service_exit_marker(&state).unwrap());
-        assert!(!take_service_exit_marker(&state).unwrap());
+    /// Stand in for the guardian's writes (`bootstrap::record`): a self-identifying service-exit
+    /// stamp — the exit code plus a per-exit nonce — and the candidate path.
+    fn write_markers(state: &Path, candidate: &str) {
+        static EXIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let stamp = format!(
+            "1 {:032x}",
+            EXIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        foundation::durable::atomic_write_managed(
+            &state.join(control::SERVICE_EXITED_MARKER_FILE),
+            ".guardian-",
+            stamp.as_bytes(),
+        )
+        .unwrap();
+        foundation::durable::atomic_write_managed(
+            &state.join(control::REJECTED_SUPERVISOR_FILE),
+            ".guardian-",
+            candidate.as_bytes(),
+        )
+        .unwrap();
+    }
+
+    fn exists(state: &Path, file: &str) -> bool {
+        state.join(file).exists()
     }
 
     #[test]
-    fn malformed_markers_fail_closed() {
+    fn a_marker_survives_until_its_claim_is_explicitly_cleared() {
+        // Reading must NOT consume: the evidence has to outlive the boot's durable writes, so a
+        // crash between them re-derives the same recovery rather than losing it.
+        let state = dir("service-exit");
+        write_markers(&state, "/state/supervisors/abc/supervisor");
+
+        let mut evidence = Evidence::read(Some(&state)).unwrap();
+        assert!(evidence.service_exited());
+        assert_eq!(
+            evidence.rejected_supervisor(),
+            Some(Path::new("/state/supervisors/abc/supervisor"))
+        );
+        assert!(
+            Evidence::read(Some(&state)).unwrap().service_exited(),
+            "a re-read still sees the marker"
+        );
+
+        evidence.clear_service_exit().unwrap();
+        evidence.clear_rejected_supervisor().unwrap();
+        assert!(!exists(&state, control::SERVICE_EXITED_MARKER_FILE));
+        assert!(!exists(&state, control::REJECTED_SUPERVISOR_FILE));
+        // Consumed: a second clear is a no-op, not a second unlink of whatever is there now.
+        evidence.clear_service_exit().unwrap();
+        evidence.clear_rejected_supervisor().unwrap();
+    }
+
+    #[test]
+    fn a_marker_written_during_reconciliation_is_never_cleared_unread() {
+        // The guardian still owns the live application while the supervisor reconciles its boot,
+        // so it can record a fresh spontaneous exit at any point in that window. Clearing must
+        // erase only the instance this boot actually read; the new one is the next boot's
+        // evidence, and losing it would let a crashed candidate be confirmed.
+        let state = dir("rewritten");
+        write_markers(&state, "/state/supervisors/abc/supervisor");
+        let mut evidence = Evidence::read(Some(&state)).unwrap();
+
+        // The guardian writes new markers mid-boot (a fresh file renamed into place).
+        write_markers(&state, "/state/supervisors/def/supervisor");
+
+        evidence.clear_service_exit().unwrap();
+        evidence.clear_rejected_supervisor().unwrap();
+        assert!(
+            exists(&state, control::SERVICE_EXITED_MARKER_FILE),
+            "the marker written during reconciliation must survive"
+        );
+        let next = Evidence::read(Some(&state)).unwrap();
+        assert!(next.service_exited());
+        assert_eq!(
+            next.rejected_supervisor(),
+            Some(Path::new("/state/supervisors/def/supervisor")),
+            "the next boot sees the newer candidate, not the one already handled"
+        );
+    }
+
+    #[test]
+    fn no_guardian_state_dir_means_no_evidence() {
+        let mut evidence = Evidence::read(None).unwrap();
+        assert!(!evidence.service_exited());
+        assert!(evidence.rejected_supervisor().is_none());
+        evidence.clear_service_exit().unwrap();
+        evidence.clear_rejected_supervisor().unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_marker_is_discarded_rather_than_wedging_every_boot() {
+        // A marker whose bytes are not evidence must never be able to fail a boot: reading it
+        // would fail identically on every subsequent boot and the node could not start at all
+        // without a human deleting the file. Unparseable evidence is no evidence — warn, drop it,
+        // and boot.
         let state = dir("malformed");
-        std::fs::create_dir(state.join(control::SERVICE_EXITED_MARKER_FILE)).unwrap();
-        assert!(take_service_exit_marker(&state).is_err());
-        std::fs::write(state.join(control::REJECTED_SUPERVISOR_FILE), b"one\ntwo\n").unwrap();
-        assert!(take_rejected_supervisor(&state).is_err());
+        for garbage in [&b"one\ntwo\n"[..], b"", b"   \n", &[0xff, 0xfe][..]] {
+            std::fs::write(state.join(control::REJECTED_SUPERVISOR_FILE), garbage).unwrap();
+            let evidence = Evidence::read(Some(&state)).unwrap();
+            assert!(evidence.rejected_supervisor().is_none());
+            assert!(
+                !exists(&state, control::REJECTED_SUPERVISOR_FILE),
+                "the unusable marker is gone, so the next boot is not stuck on it"
+            );
+        }
+
+        // Not even a regular file: same rule, and the boot still proceeds. A non-empty directory
+        // is the hard case — unlinking one fails on every platform — and it must be REMOVED, not
+        // merely tolerated, or every future boot repeats the same discard warning forever.
+        let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::write(marker.join("stray"), b"not evidence").unwrap();
+        let evidence = Evidence::read(Some(&state)).unwrap();
+        assert!(!evidence.service_exited());
+        assert!(
+            !marker.exists(),
+            "a directory at the marker path must be discarded like any other garbage, so the \
+             next boot is not stuck on it"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_marker_rewritten_mid_boot_is_left_for_the_next_boot() {
+        // Discarding garbage follows the same instance rule as clearing evidence: only the exact
+        // bytes that were read are removed, so a real marker the guardian wrote in the meantime
+        // survives to be acted on.
+        let state = dir("malformed-rewritten");
+        let path = state.join(control::REJECTED_SUPERVISOR_FILE);
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        let claim = Marker::rejected_supervisor(&state)
+            .claim()
+            .unwrap()
+            .unwrap();
+        std::fs::write(&path, b"/state/supervisors/def/supervisor").unwrap();
+        claim.discard_corrupt("is a test fixture");
+        assert_eq!(
+            Evidence::read(Some(&state)).unwrap().rejected_supervisor(),
+            Some(Path::new("/state/supervisors/def/supervisor"))
+        );
+    }
+
+    #[test]
+    fn two_service_exits_with_the_same_shape_are_distinct_instances() {
+        // The guardian stamps each exit uniquely, so the mid-boot rewrite check cannot be defeated
+        // by two markers that happen to have the same length and land in the same clock tick —
+        // which was every pair of them when the marker's content was empty.
+        let state = dir("distinct-exits");
+        write_markers(&state, "/state/supervisors/abc/supervisor");
+        let first = Marker::service_exit(&state).claim().unwrap().unwrap();
+        write_markers(&state, "/state/supervisors/abc/supervisor");
+        let second = Marker::service_exit(&state).claim().unwrap().unwrap();
+        assert_ne!(first.content, second.content);
+        first.clear().unwrap();
+        assert!(
+            exists(&state, control::SERVICE_EXITED_MARKER_FILE),
+            "clearing the instance that was read must not erase the newer exit"
+        );
+        second.clear().unwrap();
+        assert!(!exists(&state, control::SERVICE_EXITED_MARKER_FILE));
     }
 }

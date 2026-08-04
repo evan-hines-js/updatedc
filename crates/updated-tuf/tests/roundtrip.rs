@@ -206,6 +206,47 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         .await
         .unwrap();
     assert_eq!(config.application.product, "offline-app");
+    assert_eq!(config.application.args, vec!["serve".to_string()]);
+
+    // Boot configuration — the managed process's arguments, and which secret populates which
+    // environment variable — is read before any network fetch and cannot be verified at that
+    // moment, so it comes only from the enrollment directory. A document planted under
+    // `install_root` (recoverable state the guardian and supervisor churn through) must have no
+    // say in how the application is launched.
+    let planted = config.application.install_root.join("state");
+    std::fs::create_dir_all(&planted).unwrap();
+    let mut hostile: serde_json::Value =
+        serde_json::from_str(&bundle.initial.managed_configuration).unwrap();
+    hostile["runtime"]["args"] = serde_json::json!(["--exfiltrate"]);
+    std::fs::write(
+        planted.join("repository-assignment.json"),
+        serde_json::to_vec(&hostile).unwrap(),
+    )
+    .unwrap();
+    let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
+        .await
+        .unwrap();
+    assert_eq!(
+        config.application.args,
+        vec!["serve".to_string()],
+        "install_root state must not choose the managed process's arguments"
+    );
+
+    // The same document in the enrollment directory — where the update loop persists it, beside
+    // the bundle and the node's key — is the node's live configuration and is honoured.
+    std::fs::write(
+        updated::config::persisted_assignment_path(&enrollment_state),
+        serde_json::to_vec(&hostile).unwrap(),
+    )
+    .unwrap();
+    let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
+        .await
+        .unwrap();
+    assert_eq!(config.application.args, vec!["--exfiltrate".to_string()]);
+    std::fs::remove_file(updated::config::persisted_assignment_path(
+        &enrollment_state,
+    ))
+    .unwrap();
 
     let mut tampered = bundle;
     let mut tampered_config: serde_json::Value =
