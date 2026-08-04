@@ -211,6 +211,17 @@ struct DeployArgs {
     #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
     expiry_days: i64,
 
+    /// Declare this publish an EMERGENCY CORRECTION: the operator admits it immediately, without
+    /// waiting for the governing `UpdateGroupSet`'s rollout schedule. Nothing else is bypassed —
+    /// concurrency slots, `maxUnavailable` staging, inputs, and prerequisites all still apply.
+    ///
+    /// Use it to escape a release the fleet cannot report on at all (one that bricks the agent),
+    /// which is precisely the case no health signal could ever detect. The flag is written into
+    /// `spec.emergencyCorrection` on every deploy, set or cleared, so an ordinary deploy of this
+    /// group afterwards turns it back off — an override can never be silently permanent.
+    #[arg(long, env = "UPDATECTL_EMERGENCY")]
+    emergency: bool,
+
     /// Result format written to stdout. Diagnostics always go to stderr, so `json` yields a
     /// single clean object a pipeline can capture and parse.
     #[arg(long, value_enum, env = "UPDATECTL_OUTPUT", default_value_t = OutputFormat::Text)]
@@ -547,9 +558,11 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
 
     // Roll the group. A JSON merge patch touches only the application reference, leaving
     // the rest of the deployment spec intact; the operator republishes assignments.
-    let patch = serde_json::json!({
-        "spec": { "deployment": { "application": { "path": target_name, "sha256": sha256 } } }
-    });
+    //
+    // `emergencyCorrection` is written on EVERY deploy, true or false. A merge patch that omitted
+    // it would leave a previous `true` in place, so a one-off emergency would silently keep every
+    // later release of this group exempt from its set's rollout schedule.
+    let patch = group_patch(&target_name, &sha256, args.emergency);
     groups
         .patch(&args.group, &PatchParams::default(), &Patch::Merge(&patch))
         .await?;
@@ -557,8 +570,28 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
         "rolled UpdateGroup {} in {} to {} {}",
         args.group, args.namespace, args.product, args.version
     );
+    if args.emergency {
+        eprintln!(
+            "declared an emergency correction: this deployment is admitted without waiting for \
+             the governing UpdateGroupSet's rollout schedule"
+        );
+    }
 
     report_deploy(&args, &platform, &target_name, &sha256)
+}
+
+/// The merge patch that rolls an `UpdateGroup` onto a freshly published target.
+///
+/// `emergencyCorrection` is always written, true or false. A merge patch that omitted it would
+/// leave a previous `true` in place, so a one-off emergency would silently keep every later release
+/// of this group exempt from its `UpdateGroupSet`'s rollout schedule.
+fn group_patch(target: &str, sha256: &str, emergency: bool) -> serde_json::Value {
+    serde_json::json!({
+        "spec": {
+            "deployment": { "application": { "path": target, "sha256": sha256 } },
+            "emergencyCorrection": emergency,
+        }
+    })
 }
 
 /// Check out the release repository's current signed metadata into a throwaway temp dir, ready
@@ -730,6 +763,7 @@ fn report_deploy(
                 "platform": platform,
                 "target": target,
                 "sha256": sha256,
+                "emergency": args.emergency,
             });
             println!("{}", serde_json::to_string(&document)?);
         }
@@ -911,6 +945,34 @@ mod tests {
         );
         // An empty sub-path must not leave a trailing slash.
         assert_eq!(object_key("a/b", ""), "a/b");
+    }
+
+    /// An emergency override must be self-clearing. The deploy patch therefore states
+    /// `emergencyCorrection` on every publish rather than only when it is set — a merge patch that
+    /// omitted the field would leave a previous `true` in place, exempting every later release of
+    /// the group from its set's rollout schedule forever.
+    #[test]
+    fn the_deploy_patch_always_states_whether_this_is_an_emergency_correction() {
+        let ordinary = group_patch("products/app/stable/1.0.0/linux-x86_64/app", "ab", false);
+        assert_eq!(
+            ordinary["spec"]["emergencyCorrection"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            ordinary["spec"]["deployment"]["application"]["path"],
+            "products/app/stable/1.0.0/linux-x86_64/app"
+        );
+        let emergency = group_patch("products/app/stable/0.9.0/linux-x86_64/app", "cd", true);
+        assert_eq!(
+            emergency["spec"]["emergencyCorrection"],
+            serde_json::json!(true)
+        );
+        // Nothing else in the deployment spec is touched by either patch.
+        assert_eq!(
+            ordinary["spec"]["deployment"].as_object().unwrap().len(),
+            1,
+            "the patch names only the application reference"
+        );
     }
 
     #[tokio::test]

@@ -89,6 +89,12 @@ windows-sys = { version = "0.59", features = [
     # CreateJobObjectW (e2e harness) takes a SECURITY_ATTRIBUTES pointer, so its
     # signature — hence the whole function — lives behind Win32_Security.
     "Win32_Security",
+    # The durable writer builds an owner-only DACL from SDDL so a private key written on
+    # Windows is not readable by every local user (the unix side gets this from 0o600).
+    "Win32_Security_Authorization",
+    # CreateFileW: the durable writer creates its temp WITH that DACL, never widened-then-
+    # narrowed, so no other user can be holding a handle when the secret is written.
+    "Win32_Storage_FileSystem",
     # SetConsoleCtrlHandler: the bootstrap's stop-signal handling.
     "Win32_System_Console",
     "Win32_System_JobObjects",

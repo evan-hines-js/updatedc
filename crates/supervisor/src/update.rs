@@ -613,9 +613,9 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
         // A journal in a terminal phase is SPENT — its transaction already reached its end state
         // and everything durable is written. The only reason one is still here is that the delete
         // after commit failed (a read-only remount, an EIO). Retrying that delete is not recovery:
-        // there is nothing left to reconcile, and treating it as fatal instead wedges the node
-        // forever on a transient filesystem error, since the fatal path holds the process alive so
-        // no restart ever runs boot recovery.
+        // there is nothing left to reconcile, and treating it as fatal instead ends every boot on
+        // a transient filesystem error — a relaunch loop that re-derives the same spent journal
+        // and gets no further.
         Some(journal)
             if matches!(
                 journal.phase,
@@ -677,7 +677,47 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     // is the go-ahead. We never stop the running binary until it returns, so the node is
     // out of readiness before switchover.
     tower.traffic_ready(false)?;
-    advance_transaction(store, &mut tx, TransactionPhase::DrainStarted)?;
+    // Readiness is withdrawn: this node is out of rotation and its running release is about to be
+    // stopped, so no failure past this point may surface as `Err`. `Err` maps to
+    // `AppOutcome::Fatal`, which abandons the update mid-drain and ends the process; the node then
+    // serves nothing until the guardian's backoff relaunches this supervisor and boot recovery
+    // restarts a release from the journal. Recovering in place is strictly better, so
+    // `switch_over` returns [`Outcome`] rather than `io::Result<Outcome>` — a type error instead of
+    // a rule every future call site has to remember.
+    Ok(switch_over(tower, store, tx, lifecycle).await)
+}
+
+/// The post-drain half of an update: readiness is already withdrawn, so every failure from here on
+/// is answered by restarting into boot recovery, which restores and starts a release from the
+/// journal's last durable phase (always a valid checkpoint). The infallible return type is the
+/// enforcement: there is no way to propagate an error out of the drained window.
+async fn switch_over<T: DeploymentProvider>(
+    tower: &mut T,
+    store: &mut dyn Store,
+    mut tx: Transaction,
+    lifecycle: updated::state::ProviderRelease,
+) -> Outcome {
+    let chaos = Chaos::from_env();
+    let candidate = tx.candidate_release.clone();
+    macro_rules! recover_on_error {
+        ($what:expr, $result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    warn(&format!(
+                        "{} failed after the application was drained ({error}); restarting for \
+                         boot recovery",
+                        $what
+                    ));
+                    return Outcome::RollbackPending;
+                }
+            }
+        };
+    }
+    recover_on_error!(
+        "recording the drain checkpoint",
+        advance_transaction(store, &mut tx, TransactionPhase::DrainStarted)
+    );
 
     // Built-in drain hold: having withdrawn readiness, wait for the load balancer to actually
     // remove this node before we stop the running release — otherwise an in-flight request lands
@@ -693,30 +733,14 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     // for the orchestrator to observe the failed probe and stop routing, or for in-flight
     // connections to finish. Must run to completion before the predecessor is stopped.
     chaos.crossing(boundary::DRAIN_APPLIED);
-    advance_transaction(store, &mut tx, TransactionPhase::Drained)?;
-
-    advance_transaction(store, &mut tx, TransactionPhase::StopStarted)?;
-    // From here the running application is being stopped, so this function must never return `Err`
-    // again. `Err` maps to `AppOutcome::Fatal`, which HOLDS this process alive with the application
-    // down and no recovery attempt — an unwritable state directory or one EIO on a journal
-    // checkpoint would take the node's service down until a human intervened. Every failure past
-    // this point instead restarts for boot recovery, which restores and starts a release. The
-    // journal's last durable phase is a valid checkpoint, so recovery resolves correctly from it.
-    macro_rules! recover_on_error {
-        ($what:expr, $result:expr) => {
-            match $result {
-                Ok(value) => value,
-                Err(error) => {
-                    warn(&format!(
-                        "{} failed after the application was drained ({error}); restarting for \
-                         boot recovery",
-                        $what
-                    ));
-                    return Ok(Outcome::RollbackPending);
-                }
-            }
-        };
-    }
+    recover_on_error!(
+        "recording the drained checkpoint",
+        advance_transaction(store, &mut tx, TransactionPhase::Drained)
+    );
+    recover_on_error!(
+        "recording the stop checkpoint",
+        advance_transaction(store, &mut tx, TransactionPhase::StopStarted)
+    );
     recover_on_error!("stopping the running release", tower.stop());
     chaos.crossing(boundary::STOP_APPLIED);
     recover_on_error!(
@@ -733,21 +757,21 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     // failure is pure infrastructure (ENOSPC, transient I/O), never the candidate's fault: restart
     // for boot recovery WITHOUT rejecting, so the healthy release is retried instead of stranded a
     // version behind (same fail-safe class as the guardian-channel case below).
-    if let Err(e) = store.verify_release(candidate) {
+    if let Err(e) = store.verify_release(&candidate) {
         warn(&format!(
             "release re-verification failed before commit ({e})"
         ));
         return reject_then_recover(store, &mut tx);
     }
-    if let Err(e) = store.point_active(candidate) {
+    if let Err(e) = store.point_active(&candidate) {
         warn(&format!(
             "writing the active-release pointer failed ({e}); restarting for boot recovery"
         ));
-        return Ok(Outcome::RollbackPending);
+        return Outcome::RollbackPending;
     }
     chaos.crossing(boundary::CANDIDATE_POINTER_APPLIED);
 
-    if let Err(e) = tower.activate(&tx.id, candidate, &tx.previous_release) {
+    if let Err(e) = tower.activate(&tx.id, &candidate, &tx.previous_release) {
         warn(&format!("activating the new version failed ({e})"));
         return reject_then_recover(store, &mut tx);
     }
@@ -767,15 +791,15 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
         // restores the predecessor and rejects the candidate only if it actually ran and exited
         // (`boot::recover`'s service-exit check), so a healthy release is retried rather than
         // stranded a version behind. Return `RollbackPending` — the clean-exit-for-recovery path
-        // (`AppOutcome::RestartForRecovery`) — NOT `Err`, which maps to the hold-forever `Fatal`
-        // branch and would leave the node with no application running until shutdown. Only a
+        // (`AppOutcome::RestartForRecovery`) — NOT `Err`, whose `Fatal` branch abandons the update
+        // and leaves the node with nothing running until a relaunch recovers it. Only a
         // genuine start failure (the guardian answered but refused) rejects. See
         // `GuardianError::Channel`.
         if e.kind() == io::ErrorKind::ConnectionReset {
             warn(&format!(
                 "starting the new version could not reach the guardian ({e}); restarting for boot recovery"
             ));
-            return Ok(Outcome::RollbackPending);
+            return Outcome::RollbackPending;
         }
         warn(&format!("starting the new version failed ({e})"));
         return reject_then_recover(store, &mut tx);
@@ -790,7 +814,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
         "recording the health checkpoint",
         advance_transaction(store, &mut tx, TransactionPhase::HealthStarted)
     );
-    if !became_verified(tower, &tx.id, candidate, &installed.release).await {
+    if !became_verified(tower, &tx.id, &candidate, &tx.previous_release).await {
         return reject_then_recover(store, &mut tx);
     }
     chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
@@ -813,17 +837,21 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     // it survives its window. Folding the rollback intent into one write means there is no
     // separate "arm" step to be interrupted — if a crash lands after this, the pending
     // record is already durable; if before, the journal reactivates the predecessor.
+    //
+    // The predecessor identity comes from the transaction, the same record boot recovery reads, so
+    // the pending-driven rollback and the journal-driven one cannot describe different predecessors.
+    // That includes the providers: the rollback restores the *predecessor*, so it must carry the
+    // *predecessor's own* signed providers (app + providers are one signed unit), not the
+    // candidate's. At the assigned head these are the same set; across a provider-set revision in
+    // this update they differ, and reverting the old release with the new providers would
+    // gate/watch it with the wrong hooks.
     let pending = Some(Pending {
         lifecycle_attempt_id: tx.id.clone(),
-        previous_release: installed.release,
-        previous_archive_sha256: installed.archive_sha256,
-        previous_repository_lineage: installed.repository_lineage,
+        previous_release: tx.previous_release.clone(),
+        previous_archive_sha256: tx.previous_archive_sha256.clone(),
+        previous_repository_lineage: tx.previous_repository_lineage.clone(),
         committed_at: now_unix(),
-        // The rollback restores the *predecessor*, so it must carry the *predecessor's own* signed
-        // providers (app + providers are one signed unit), not the candidate's. At the assigned head
-        // these are the same set; across a provider-set revision in this update they differ, and
-        // reverting the old release with the new providers would gate/watch it with the wrong hooks.
-        lifecycle: installed.lifecycle,
+        lifecycle: tx.lifecycle.clone(),
     });
     recover_on_error!(
         "recording the commit checkpoint",
@@ -832,9 +860,9 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     recover_on_error!(
         "committing the installed release",
         store.commit_installed(&InstalledState {
-            repository_lineage: candidate_repository_lineage,
+            repository_lineage: tx.candidate_repository_lineage.clone(),
             release: candidate.clone(),
-            archive_sha256: candidate_archive_sha256.to_string(),
+            archive_sha256: tx.candidate_archive_sha256.clone(),
             // The candidate's own providers are now the installed release's providers; persist them so
             // pre-start and verification can run them on the next boot. (This is the
             // candidate provider passed in — `tx.lifecycle` holds the *predecessor's*
@@ -871,7 +899,7 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
              committed and the next probe cycle re-establishes it"
         ));
     }
-    Ok(Outcome::Committed)
+    Outcome::Committed
 }
 
 /// Persist the rejection decision before applying it. If the process dies in the gap,
@@ -898,9 +926,20 @@ fn require_candidate_rejection(store: &mut dyn Store, tx: &mut Transaction) -> i
 /// path to keep in lockstep with boot recovery — and, because a live supervisor runs the candidate's
 /// tower, it would gate the restored predecessor with the *candidate's* reconciler. One path,
 /// one set of providers, no divergence.
-fn reject_then_recover(store: &mut dyn Store, tx: &mut Transaction) -> io::Result<Outcome> {
-    require_candidate_rejection(store, tx)?;
-    Ok(Outcome::RollbackPending)
+///
+/// Recording the rejection is itself a durable write and can fail (ENOSPC, a read-only remount).
+/// That failure must not escape: this runs with the application already drained, where an error
+/// would hold the process alive with nothing serving. Boot recovery still restores the predecessor
+/// from the journal — it only loses the rejection, which costs one more futile attempt at the same
+/// candidate, not the node.
+fn reject_then_recover(store: &mut dyn Store, tx: &mut Transaction) -> Outcome {
+    if let Err(error) = require_candidate_rejection(store, tx) {
+        warn(&format!(
+            "recording the failed candidate's rejection after the application was drained \
+             ({error}); restarting for boot recovery"
+        ));
+    }
+    Outcome::RollbackPending
 }
 
 pub(crate) fn advance_transaction(
@@ -993,7 +1032,10 @@ fn prepare_lifecycle_command(
         std::fs::create_dir_all(parent)?;
     }
     let input_file = state_dir.join("inputs.json");
-    foundation::durable::atomic_write(
+    // Managed, not private: these are the deployment's own signed inputs, and the reconciler that
+    // reads them may legitimately run as a different principal than the writer. A protected
+    // owner-only DACL here would hand the operator's hook a file it cannot open.
+    foundation::durable::atomic_write_managed(
         &input_file,
         ".inputs-",
         &serde_json::to_vec(&opts.application.inputs)
@@ -1126,7 +1168,7 @@ fn run_prepared_lifecycle_command_blocking(
             // A wrapper may exit successfully while a background descendant retains the captured
             // pipes. Tear down the remainder of this disposable hook tree before joining the
             // readers; otherwise inherited stdout/stderr can bypass the lifecycle deadline.
-            child.kill_descendants_after_exit()?;
+            child.kill_tree()?;
             let output = report_reconciler_output(phase, stdout, stderr)?;
             return if status.success() {
                 Ok(output)
@@ -1432,6 +1474,8 @@ mod tests {
         journal: Option<Transaction>,
         active: updated::bundle::ReleaseId,
         rejected: Vec<String>,
+        /// Simulate a state directory that has gone unwritable (ENOSPC, a read-only remount).
+        fail_reject: bool,
     }
 
     impl MemoryStore {
@@ -1446,6 +1490,7 @@ mod tests {
                 journal: None,
                 active: previous,
                 rejected: Vec::new(),
+                fail_reject: false,
             }
         }
     }
@@ -1496,6 +1541,9 @@ mod tests {
             _: &updated::state::RepositoryLineage,
             digest: &str,
         ) -> io::Result<()> {
+            if self.fail_reject {
+                return Err(io::Error::other("injected rejection write failure"));
+            }
             self.rejected.push(digest.into());
             Ok(())
         }
@@ -1616,7 +1664,7 @@ mod tests {
         .await
         .expect("a post-drain failure restarts for recovery rather than holding the node down");
 
-        // Never `Err`: that maps to the fatal branch, which holds this process alive with the
+        // Never `Err`: that maps to the fatal branch, which abandons the update with the
         // application drained. The single recovery path is a clean restart.
         assert!(matches!(outcome, Outcome::RollbackPending));
         assert_eq!(store.active, previous);
@@ -1684,6 +1732,45 @@ mod tests {
                 .as_ref()
                 .is_some_and(|tx| tx.candidate_rejection_required),
             "rollback evidence must retain the rejection decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_rejection_after_the_drain_still_restarts_for_recovery() {
+        // The state directory goes unwritable exactly when the failed candidate's rejection is
+        // recorded. The application is already stopped, so an `Err` here would map to
+        // `AppOutcome::Fatal` and abandon the drained update instead of recovering in place —
+        // the one outcome the post-drain half must be incapable of producing.
+        let previous = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = MemoryStore::new(previous.clone());
+        store.fail_reject = true;
+        let mut tower = FakeTower {
+            fail_first_activation: true,
+            ..Default::default()
+        };
+
+        let outcome = apply_update(
+            &mut tower,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            reconciler_release(),
+        )
+        .await
+        .expect(
+            "a failed durable write after the drain restarts rather than holding the node down",
+        );
+
+        assert!(matches!(outcome, Outcome::RollbackPending));
+        assert!(store.rejected.is_empty());
+        assert!(
+            store
+                .journal
+                .as_ref()
+                .is_some_and(|tx| tx.candidate_rejection_required),
+            "the journal still carries the rollback and the rejection to replay"
         );
     }
 

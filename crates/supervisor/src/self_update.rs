@@ -37,18 +37,35 @@ impl SelfUpdateState {
     /// Reject the candidate supervisor at `path` (which the guardian just rolled back).
     /// The path is content-addressed — `supervisors/<hash>/supervisor` — so its parent
     /// directory names the hash to suppress, terminating a bad-release loop.
-    pub(crate) fn reject_candidate(&mut self, path: &Path) {
-        if let Some(hash) = path
+    ///
+    /// Every way of failing is an error, never a warning: the caller clears the guardian's marker
+    /// on the strength of this returning `Ok`, and the marker is the only other record that the
+    /// candidate was ever rejected. A swallowed failure — an unwritable rejections file, or a path
+    /// with no hash component to key on — would lose the hash and let `check` re-select, re-stage
+    /// and re-trial the identical bad release on the next cycle, forever.
+    pub(crate) fn reject_candidate(&mut self, path: &Path) -> io::Result<()> {
+        let hash = path
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|h| h.to_str())
-        {
-            if let Err(e) = self.rejected.reject(hash) {
-                warn(&format!("could not record rejected supervisor {hash}: {e}"));
-            } else {
-                log(&format!("recorded rejected supervisor candidate {hash}"));
-            }
-        }
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "rejected supervisor {} is not a content-addressed \
+                         supervisors/<hash>/<binary> path",
+                        path.display()
+                    ),
+                )
+            })?;
+        self.rejected.reject(hash).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not record rejected supervisor {hash}: {e}"),
+            )
+        })?;
+        log(&format!("recorded rejected supervisor candidate {hash}"));
+        Ok(())
     }
 
     /// Select the newest signed, non-rejected supervisor release. If its bytes differ
@@ -184,4 +201,57 @@ fn running_supervisor_is(sha: &str) -> bool {
 /// cannot drift.
 fn supervisor_filename() -> &'static str {
     foundation::platform::supervisor_binary_name()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("self-update-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn state(dir: &Path) -> SelfUpdateState {
+        SelfUpdateState {
+            next_check: Instant::now(),
+            rejected: Rejections::load(&dir.join("supervisor-rejected")).unwrap(),
+        }
+    }
+
+    const HASH: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
+
+    #[test]
+    fn a_recorded_rejection_suppresses_the_candidate() {
+        let d = dir("recorded");
+        let mut state = state(&d);
+        state
+            .reject_candidate(&d.join("supervisors").join(HASH).join("supervisor"))
+            .unwrap();
+        assert!(state.rejected.is_rejected(HASH));
+        assert!(
+            Rejections::load(&d.join("supervisor-rejected"))
+                .unwrap()
+                .is_rejected(HASH),
+            "the rejection is durable, not just in memory"
+        );
+    }
+
+    #[test]
+    fn a_rejection_that_cannot_be_recorded_is_an_error_not_a_warning() {
+        // The caller clears the guardian's marker on the strength of `Ok`. A swallowed failure
+        // would lose the only two records of the bad candidate at once, and `check` would
+        // re-select, re-stage and re-trial the identical release forever.
+        let d = dir("unrecordable");
+        let mut state = state(&d);
+        // A path with no content-addressed hash component: nothing to key the rejection on.
+        assert!(state.reject_candidate(Path::new("supervisor")).is_err());
+        // The rejections file can no longer be written.
+        std::fs::remove_dir_all(&d).unwrap();
+        assert!(state
+            .reject_candidate(&d.join("supervisors").join(HASH).join("supervisor"))
+            .is_err());
+    }
 }

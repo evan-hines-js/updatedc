@@ -67,7 +67,7 @@ impl Rejections {
             out.push_str(hash);
             out.push('\n');
         }
-        foundation::durable::atomic_write(&self.path, ".rejections-", out.as_bytes())
+        foundation::durable::atomic_write_managed(&self.path, ".rejections-", out.as_bytes())
     }
 }
 

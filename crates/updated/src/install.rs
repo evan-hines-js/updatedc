@@ -127,7 +127,7 @@ pub fn read(path: &Path) -> io::Result<Option<InstallTransaction>> {
 
 pub fn write(path: &Path, tx: &InstallTransaction) -> io::Result<()> {
     tx.validate()?;
-    foundation::durable::atomic_write(
+    foundation::durable::atomic_write_managed(
         path,
         ".install-",
         &serde_json::to_vec(tx).map_err(io::Error::other)?,

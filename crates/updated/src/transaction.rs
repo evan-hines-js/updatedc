@@ -263,7 +263,7 @@ pub fn read(path: &Path) -> io::Result<Option<Transaction>> {
 
 pub fn write(path: &Path, tx: &Transaction) -> io::Result<()> {
     tx.validate()?;
-    foundation::durable::atomic_write(
+    foundation::durable::atomic_write_managed(
         path,
         ".transaction-",
         &serde_json::to_vec(tx).map_err(io::Error::other)?,

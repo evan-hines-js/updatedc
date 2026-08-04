@@ -50,9 +50,21 @@ pub struct Config {
 /// even start, or that fails closed and cannot roll back — backs off toward the cap and
 /// loops there forever, waiting for its binary to be fixed. The guardian NEVER gives up
 /// and NEVER takes the application down: the app keeps running the entire time.
+///
+/// The reset is rate-limited, and that is what makes the relaunch loop bounded for the case a
+/// duration test alone cannot see: a supervisor that fails *late*. Boot reconciliation can spend
+/// well past [`SETTLED`](Self::SETTLED) on an operator lifecycle hook whose timeout the operator
+/// chooses, and then exit for relaunch — so "it ran a while" is true on every cycle of a loop
+/// that is replaying that hook forever. Counting relaunches per [`WINDOW`](Self::WINDOW) closes
+/// it: past [`BURST`](Self::BURST) relaunches in one window nothing resets the backoff, so the
+/// delay climbs to the cap however long each attempt takes, and the loop's cost falls to one
+/// replay per five minutes.
 struct Backoff {
     consecutive: u32,
     base: Duration,
+    /// Start of the rate-limit window the relaunches in `in_window` were counted against.
+    window_start: Instant,
+    relaunches_in_window: u32,
 }
 
 impl Backoff {
@@ -60,11 +72,19 @@ impl Backoff {
     const CAP: Duration = Duration::from_secs(5 * 60);
     /// A supervisor that ran at least this long before exiting was not a start-loop.
     const SETTLED: Duration = Duration::from_secs(30);
+    /// The span over which relaunches are counted for the reset rate limit.
+    const WINDOW: Duration = Duration::from_secs(60 * 60);
+    /// How many relaunches within one [`WINDOW`](Self::WINDOW) still count as occasional
+    /// transient crashes. Beyond this the backoff stops resetting, whatever the run durations
+    /// were, and escalates to the cap.
+    const BURST: u32 = 10;
 
     fn new() -> Self {
         Backoff {
             consecutive: 0,
             base: Self::base(),
+            window_start: Instant::now(),
+            relaunches_in_window: 0,
         }
     }
 
@@ -73,8 +93,8 @@ impl Backoff {
     #[cfg(test)]
     fn with_base(base: Duration) -> Self {
         Backoff {
-            consecutive: 0,
             base,
+            ..Backoff::new()
         }
     }
 
@@ -89,10 +109,25 @@ impl Backoff {
             .unwrap_or(Self::BASE)
     }
 
-    /// The delay before the next relaunch, given how long the last supervisor ran. A run
-    /// that lasted longer than [`SETTLED`](Self::SETTLED) resets the backoff to the base.
+    /// The delay before the next relaunch, given how long the last supervisor ran. A run that
+    /// lasted longer than [`SETTLED`](Self::SETTLED) resets the backoff to the base — unless this
+    /// is already the [`BURST`](Self::BURST)+1st relaunch of the current
+    /// [`WINDOW`](Self::WINDOW), in which case nothing resets it and the delay keeps climbing to
+    /// the cap. That is the guardian's whole bound on relaunch rate; nothing else throttles a
+    /// supervisor that exits to be relaunched.
     fn next(&mut self, ran_for: Duration) -> Duration {
-        if ran_for >= Self::SETTLED {
+        self.next_at(ran_for, Instant::now())
+    }
+
+    /// [`next`](Self::next) against an explicit clock, so the window can be crossed in a test
+    /// without an hour of wall clock.
+    fn next_at(&mut self, ran_for: Duration, now: Instant) -> Duration {
+        if now.duration_since(self.window_start) >= Self::WINDOW {
+            self.window_start = now;
+            self.relaunches_in_window = 0;
+        }
+        self.relaunches_in_window = self.relaunches_in_window.saturating_add(1);
+        if ran_for >= Self::SETTLED && self.relaunches_in_window <= Self::BURST {
             self.consecutive = 0;
         }
         let delay =
@@ -195,7 +230,7 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
 /// weakening the service contract: every spontaneous exit is durable and unhealthy,
 /// and its exact code—including zero—is returned to the outer lifecycle owner.
 fn roll_up_service_exit(state_dir: &Path, code: i32) -> Result<i32, String> {
-    record::mark_service_exited(state_dir)
+    record::mark_service_exited(state_dir, code)
         .map_err(|error| format!("recording service exit before restart: {error}"))?;
     warn(&format!(
         "application exited (code {code}); rolling it up and letting the init system restart"
@@ -294,20 +329,7 @@ fn serve_service<L: Link>(
 
     if sup.send_hello().is_err() {
         sup.stop();
-        // If this was a candidate (a staged replacement), reject its bytes. A hello that
-        // deterministically fails — e.g. an ABI/protocol mismatch surfacing at the handshake —
-        // would otherwise be re-selected, re-staged (idempotent slot), and re-handed-off forever
-        // (a livelock), because every other candidate-failure exit rejects the hash but this one
-        // did not. A committed supervisor is never rejected; it just backs off and retries.
-        if let Some(path) = activation.candidate.as_ref() {
-            record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
-                format!(
-                    "recording hello-failed supervisor {} rejection: {e}",
-                    path.display()
-                )
-            })?;
-        }
-        return Ok(Cycle::Backoff);
+        return conclude(cfg, &mut activation, "failed the control handshake");
     }
 
     loop {
@@ -316,22 +338,8 @@ fn serve_service<L: Link>(
             return Ok(Cycle::Stop);
         }
         if !activation.committed && activation.ready_since.is_none() && Instant::now() >= deadline {
-            let path = activation
-                .candidate
-                .as_ref()
-                .expect("activation has a candidate");
-            warn(&format!(
-                "candidate {} did not signal ready in time; rolling back and rejecting it",
-                path.display()
-            ));
             sup.stop();
-            record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
-                format!(
-                    "recording timed-out supervisor {} rejection: {e}",
-                    path.display()
-                )
-            })?;
-            return Ok(Cycle::Continue);
+            return conclude(cfg, &mut activation, "did not signal ready in time");
         }
 
         if sup.poll_readable(SERVE_POLL_MS) {
@@ -344,33 +352,37 @@ fn serve_service<L: Link>(
                         // Windows an abandoned write thread could interleave bytes). Stop the
                         // supervisor and relaunch it on a fresh channel rather than trusting the
                         // peer to eventually exit on its own.
-                        warn("control-channel write to the supervisor failed; restarting it on a fresh channel");
                         sup.stop();
-                        return Ok(Cycle::Backoff);
+                        return conclude(cfg, &mut activation, "could not be written to");
                     }
                 }
+                // Forward compatibility, not a fault: a newer supervisor may send a tag this
+                // guardian has never heard of. Answer `Unsupported` and keep serving.
                 Err(control::Error::UnknownTag(_)) => {
                     let _ = sup.send_response(&Response::Unsupported);
                 }
-                // The peer's end of the channel is gone (or unreadable). This is NOT a quiet
-                // condition to swallow: a closed socketpair reports readable-and-hung-up forever,
-                // so `poll_readable` returns immediately on every iteration and this loop pins a
-                // core at 100% for as long as the supervisor keeps running without its channel.
-                // Treat it like any other unusable channel — stop the supervisor and relaunch it
-                // on a fresh one.
-                Err(error @ (control::Error::Closed | control::Error::Io(_))) => {
-                    warn(&format!(
-                        "the supervisor's control channel is unusable ({error}); restarting it on a fresh channel"
-                    ));
-                    sup.stop();
-                    return Ok(Cycle::Backoff);
-                }
-                Err(e) => {
-                    warn(&format!(
-                        "supervisor sent a malformed control frame ({e}); restarting it"
-                    ));
-                    sup.stop();
-                    return Ok(Cycle::Backoff);
+                // Any other read failure ends this supervisor's usefulness, so it ends its
+                // lifetime — through the same `conclude` every other ending goes through.
+                //
+                // The common cause is the ordinary one: the supervisor EXITED, and on Unix its
+                // closed socketpair reports readable-with-hangup forever, so the read fails on
+                // the very poll that would otherwise observe the exit. That is not a channel
+                // fault and must not be logged or reported as one.
+                //
+                // A supervisor still RUNNING without a usable channel is the real fault, and it
+                // must not be left running: `poll_readable` would return immediately on every
+                // iteration and pin a core at 100% for as long as it lives.
+                Err(error) => {
+                    let reason = if sup.exited() {
+                        "exited"
+                    } else {
+                        warn(&format!(
+                            "the supervisor's control channel is unusable ({error}); stopping it"
+                        ));
+                        sup.stop();
+                        "lost its control channel"
+                    };
+                    return conclude(cfg, &mut activation, reason);
                 }
             }
         }
@@ -382,31 +394,7 @@ fn serve_service<L: Link>(
         }
 
         if sup.exited() {
-            if !activation.committed {
-                let path = activation
-                    .candidate
-                    .as_ref()
-                    .expect("activation has a candidate");
-                warn(&format!(
-                    "candidate {} exited before confirmation; rejecting it",
-                    path.display()
-                ));
-                record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
-                    format!(
-                        "recording exited supervisor {} rejection: {e}",
-                        path.display()
-                    )
-                })?;
-                return Ok(Cycle::Continue);
-            }
-            if let Some(path) = activation.pending_replace.take() {
-                info("supervisor staged a replacement and exited; activating it");
-                return Ok(Cycle::Activate(path));
-            }
-            // The supervisor crashed but the application is fine — the guardian relaunches
-            // the supervisor (with backoff) over the still-running app.
-            warn("supervisor exited (the application keeps running)");
-            return Ok(Cycle::Backoff);
+            return conclude(cfg, &mut activation, "exited");
         }
 
         // Commit only after proving the candidate is still alive in this iteration.
@@ -426,19 +414,7 @@ fn serve_service<L: Link>(
                     path.display()
                 ));
                 sup.stop();
-                // Reject it as well. The candidate reached readiness and survived its window, so
-                // nothing about it will change on a retry — but the commit that would end the
-                // handoff failed. Without a rejection the supervisor re-selects the same bytes,
-                // re-stages them into the same content-addressed slot, and hands them off again,
-                // forever. Recording the rejection is what makes this terminate; a corrected
-                // republish (new bytes, new hash) is unaffected.
-                record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
-                    format!(
-                        "recording uncommittable supervisor {} rejection: {e}",
-                        path.display()
-                    )
-                })?;
-                return Ok(Cycle::Continue);
+                return conclude(cfg, &mut activation, "could not be committed");
             }
             info(&format!(
                 "candidate {} survived its confirmation window; committed as the supervisor",
@@ -454,6 +430,55 @@ struct ActivationState {
     committed: bool,
     ready_since: Option<Instant>,
     pending_replace: Option<PathBuf>,
+}
+
+/// End one supervisor's lifetime and decide what the guardian does next. `reason` completes the
+/// sentence "the supervisor/candidate …" in the log line.
+///
+/// EVERY way of leaving [`serve_service`] short of a stop signal or a service exit funnels
+/// through here — the process exited, its channel died, it never signalled ready, its commit
+/// failed — because two obligations must not depend on which of those happened:
+///
+///  * An uncommitted candidate is ALWAYS recorded rejected. Its bytes live in a
+///    content-addressed slot, so a supervisor that is not told the hash failed re-selects it,
+///    re-stages it into the same slot, and hands it off again, forever.
+///  * A staged replacement is ALWAYS activated. Dropping it means self-update silently never
+///    completes: the committed supervisor comes back, re-stages the same candidate, and the
+///    same handoff repeats every cycle.
+///
+/// Rejection is checked first: a candidate that staged a replacement before proving itself is
+/// still an unconfirmed candidate, and rolling back to its predecessor is what must happen.
+fn conclude(cfg: &Config, activation: &mut ActivationState, reason: &str) -> Result<Cycle, String> {
+    if !activation.committed {
+        let path = activation
+            .candidate
+            .as_ref()
+            .expect("an uncommitted activation always has a candidate");
+        warn(&format!(
+            "candidate {} {reason}; rolling back and rejecting it",
+            path.display()
+        ));
+        record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
+            format!(
+                "recording rejection of supervisor {} ({reason}): {e}",
+                path.display()
+            )
+        })?;
+        return Ok(Cycle::Continue);
+    }
+    if let Some(path) = activation.pending_replace.take() {
+        info(&format!(
+            "supervisor {reason} after staging a replacement; activating {}",
+            path.display()
+        ));
+        return Ok(Cycle::Activate(path));
+    }
+    // The supervisor is gone but the application is fine — the guardian relaunches the
+    // supervisor (with backoff) over the still-running app.
+    warn(&format!(
+        "supervisor {reason} (the application keeps running)"
+    ));
+    Ok(Cycle::Backoff)
 }
 
 /// Handle one control request, replying on the channel.
@@ -708,6 +733,45 @@ mod tests {
                          // A supervisor that ran past the settle threshold before exiting is a transient
                          // crash, not a start-loop: the next relaunch is prompt again.
         assert_eq!(b.next(Backoff::SETTLED), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_supervisor_that_fails_late_on_every_cycle_still_backs_off() {
+        // The path this bound exists for: the supervisor exits for relaunch AFTER a long boot —
+        // boot reconciliation replaying an operator lifecycle hook whose timeout the operator
+        // chooses can easily outlast SETTLED. "It ran a while" is then true on every cycle, so a
+        // duration-only reset would hold the delay at the 2s base forever and the node would
+        // replay that hook roughly once per boot, indefinitely. Counting relaunches per window
+        // makes the loop bounded regardless of how long each attempt takes.
+        let long_boot = Backoff::SETTLED * 2;
+        let mut b = Backoff::with_base(Backoff::BASE);
+        let start = Instant::now();
+        for _ in 0..Backoff::BURST {
+            assert_eq!(
+                b.next_at(long_boot, start),
+                Duration::from_secs(2),
+                "an occasional late failure still relaunches promptly"
+            );
+        }
+        // Past the burst allowance the run duration stops earning a reset, so the delay climbs.
+        assert_eq!(b.next_at(long_boot, start), Duration::from_secs(4));
+        assert_eq!(b.next_at(long_boot, start), Duration::from_secs(8));
+        assert_eq!(b.next_at(long_boot, start), Duration::from_secs(16));
+        for _ in 0..20 {
+            b.next_at(long_boot, start);
+        }
+        assert_eq!(
+            b.next_at(long_boot, start),
+            Backoff::CAP,
+            "a late-failing relaunch loop reaches the same five-minute cap as a start-loop"
+        );
+
+        // A new window starts fresh: a node whose supervisor fails once an hour is not a loop,
+        // and must not be left waiting five minutes to recover.
+        assert_eq!(
+            b.next_at(long_boot, start + Backoff::WINDOW),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
@@ -1028,6 +1092,102 @@ mod tests {
             record::desired_supervisor(&c.state_dir).unwrap().is_none(),
             "an already-committed serve never re-commits"
         );
+    }
+
+    #[test]
+    fn an_exited_supervisors_closed_channel_still_activates_its_staged_replacement() {
+        // On Unix an exited supervisor leaves its socketpair readable-with-hangup, so the read
+        // fails with `Closed` on the very poll that would otherwise observe the exit. Treating
+        // that as a channel fault discarded the staged replacement — self-update silently never
+        // activated, and the old supervisor came back every time.
+        let c = cfg(temp_dir("closed-after-replace"), None);
+        let staged = staged_candidate(&c, 0x22);
+        let mut sup = FakeLink::new();
+        sup.readable.borrow_mut().push_back(true); // ReplaceSupervisor arrives
+        sup.readable.borrow_mut().push_back(true); // then the channel reads as closed
+        sup.requests
+            .push_back(Request::ReplaceSupervisor(staged.clone().into_os_string()));
+        sup.exited.push_back(false); // still running when it staged the replacement
+        let mut app = Service::with_process(App::none());
+
+        let cycle = serve_service(&c, &mut sup, &mut app, None).unwrap();
+        assert!(
+            matches!(cycle, Cycle::Activate(path) if path == staged),
+            "the staged replacement must still be activated"
+        );
+    }
+
+    #[test]
+    fn an_exited_candidates_closed_channel_still_rejects_it() {
+        // Same Unix readable-with-hangup read failure, seen while gating a candidate: the
+        // rejection marker is what stops the supervisor re-selecting and re-staging the same
+        // content-addressed bytes forever, so it must be written on this path too.
+        let c = cfg(temp_dir("closed-candidate"), None);
+        let cand = PathBuf::from("/state/supervisors/dead/supervisor");
+        let mut sup = FakeLink::new();
+        sup.readable.borrow_mut().push_back(true); // readable-with-hangup, nothing to read
+        let mut app = Service::with_process(App::none());
+
+        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        assert!(matches!(cycle, Cycle::Continue));
+        assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
+    }
+
+    #[test]
+    fn a_running_supervisor_that_loses_its_channel_is_stopped() {
+        // A live supervisor without a usable channel would spin `poll_readable` at 100% forever.
+        // It is stopped and relaunched on a fresh one; the application is untouched.
+        let c = cfg(temp_dir("channel-lost"), None);
+        let mut sup = FakeLink::new();
+        sup.readable.borrow_mut().push_back(true);
+        sup.exited.push_back(false); // still running when the read fails
+        let mut app = Service::with_process(App::none());
+
+        let cycle = serve_service(&c, &mut sup, &mut app, None).unwrap();
+        assert!(matches!(cycle, Cycle::Backoff));
+        assert_eq!(sup.stops, 1, "the supervisor is stopped, not left spinning");
+        assert!(rejected_marker(&c).is_none(), "nothing to reject");
+    }
+
+    #[test]
+    fn a_candidate_that_loses_its_channel_while_running_is_rejected() {
+        let c = cfg(temp_dir("channel-lost-candidate"), None);
+        let cand = PathBuf::from("/state/supervisors/mute/supervisor");
+        let mut sup = FakeLink::new();
+        sup.readable.borrow_mut().push_back(true);
+        sup.exited.push_back(false);
+        let mut app = Service::with_process(App::none());
+
+        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        assert!(matches!(cycle, Cycle::Continue));
+        assert_eq!(
+            rejected_marker(&c).as_deref(),
+            cand.to_str(),
+            "a candidate that cannot be talked to is rejected, not retried forever"
+        );
+    }
+
+    #[test]
+    fn a_hello_that_fails_rejects_a_candidate_and_only_backs_off_a_committed_supervisor() {
+        let c = cfg(temp_dir("hello-candidate"), None);
+        let cand = PathBuf::from("/state/supervisors/mismatch/supervisor");
+        let mut sup = FakeLink::new();
+        sup.hello_ok = false;
+        let mut app = Service::with_process(App::none());
+        assert!(matches!(
+            serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap(),
+            Cycle::Continue
+        ));
+        assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
+
+        let c = cfg(temp_dir("hello-committed"), None);
+        let mut sup = FakeLink::new();
+        sup.hello_ok = false;
+        assert!(matches!(
+            serve_service(&c, &mut sup, &mut app, None).unwrap(),
+            Cycle::Backoff
+        ));
+        assert!(rejected_marker(&c).is_none());
     }
 
     #[test]

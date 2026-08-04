@@ -169,7 +169,11 @@ pub fn load_or_enroll(
             // which is permanently fatal ("missing after bootstrap eligibility was consumed"). The
             // marker's guarantee still holds: once both exist, deleting the bundle can never
             // re-enable enrollment.
-            foundation::durable::atomic_write(bundle_path, ".enrollment-", &bytes)?;
+            //
+            // The bundle is signed public metadata (routing, assignment, the initial signed
+            // configuration), not a secret, so it commits through the managed door and keeps the
+            // state directory's grant rather than an owner-only DACL no `icacls` could repair.
+            foundation::durable::atomic_write_managed(bundle_path, ".enrollment-", &bytes)?;
             consume_if_needed(&consumed)?;
             Ok(bundle)
         }
@@ -461,6 +465,9 @@ fn durable_key_pem(state_dir: &Path) -> io::Result<String> {
 
 /// Durably write the minted leaf (+ any issuer chain below the trusted CA). The key was persisted
 /// earlier by [`durable_key_pem`]; the root/CA itself stays the bootstrap-pinned `ca`.
+///
+/// A certificate is public — only the key beside it is a secret — so this takes the managed door
+/// and keeps the state directory's own grant, leaving the chain replaceable by an operator step.
 fn persist_leaf(state_dir: &Path, leaf_pem: &str, chain_pem: &str) -> io::Result<()> {
     let mut cert = leaf_pem.to_string();
     if !chain_pem.trim().is_empty() {
@@ -469,7 +476,11 @@ fn persist_leaf(state_dir: &Path, leaf_pem: &str, chain_pem: &str) -> io::Result
         }
         cert.push_str(chain_pem);
     }
-    foundation::durable::atomic_write(&joined_cert_path(state_dir), ".agent-crt-", cert.as_bytes())
+    foundation::durable::atomic_write_managed(
+        &joined_cert_path(state_dir),
+        ".agent-crt-",
+        cert.as_bytes(),
+    )
 }
 
 fn decode(bytes: &[u8]) -> io::Result<EnrollmentBundle> {

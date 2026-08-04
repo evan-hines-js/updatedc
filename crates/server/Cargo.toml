@@ -22,5 +22,10 @@ same-file = { workspace = true }
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
 
+[dev-dependencies]
+# Sign a node report the way an agent does, so the telemetry write/read round trip is
+# exercised end to end rather than by hand-placing a file.
+aws-lc-rs = { workspace = true }
+
 [features]
 fips = ["updated/fips"]

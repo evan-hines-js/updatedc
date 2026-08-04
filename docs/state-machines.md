@@ -100,20 +100,28 @@ stateDiagram-v2
         so they keep serving the old version.
     end note
     note right of Rolling
-        Frozen set (outside its window) → slots = 0,
-        no new admissions; in-flight members keep settling.
+        Frozen set (outside its schedule) → no new
+        admissions; in-flight members keep settling.
     end note
 ```
 
 - **`max_concurrent`** defaults to `members - 1` (always keep one group known-good), clamped
   `1..=members-1`. Admission is most-constrained-first; a group in several sets is admitted only if
-  **every** governing set has a free slot (tightest set wins).
-- **`settled`** is derived purely from telemetry: a group is settled iff *all* its nodes have a
-  fresh `NodeReport` with `deployment == published && healthy`. A missing/stale report ⇒ not settled
-  ⇒ the slot stays held (fail-safe). This is the loop that lets the next group start the instant one
-  finishes.
-- **Degrade:** a group whose deployment has no `report_url` can't be gated, so the set rolls
-  unthrottled (and logs it).
+  **every** governing set has a free slot (tightest set wins). A group whose rollout is already in
+  flight holds the slot it claimed, so retargeting it needs no new one.
+- **`settled`** is derived from what was published and from telemetry, in that order. While the
+  group still has a predecessor — some selected node has not yet been *handed* the new deployment —
+  it is `Rolling` whatever telemetry says. Once staging is finished, the group is settled iff every
+  node it can observe has a fresh, signature-verified `NodeReport` whose `assignment_sha256` is the
+  published assignment and whose `healthy` is true. A missing, stale, or unhealthy report ⇒ not
+  settled ⇒ the slot stays held (fail-safe). This is the loop that lets the next group start the
+  instant one finishes.
+- **Unobservable:** a node with no pinned public key is *blind* and is excluded from the verdict in
+  both directions — never counted healthy, never counted as holding the group back. A group whose
+  nodes are all blind (or which selects none) is `Unobservable` and holds no slot, so one
+  pre-enrolment or decommissioned group can never starve its siblings. There is no
+  ungated/unthrottled rollout mode: `report_url` is required on every `DeploymentSpec`, so every
+  group is telemetry-gated.
 
 ## 3. Rollout windows / calendar (open ↔ frozen)
 
@@ -125,10 +133,15 @@ stateDiagram-v2
     Open --> Frozen: outside every rollout window, OR a future calendar entry is pending
     Frozen --> Open: inside a window AND (calendar clear or exhausted)
     note right of Frozen
-        Frozen only blocks NEW admissions (slots=0);
+        Frozen only blocks NEW admissions;
         already-rolling members keep settling.
     end note
 ```
+
+- **Frozen and full are separate gates.** A set's schedule (`frozen`) and its concurrency limit
+  (free slots) are two independent conditions, each represented once. A group with
+  `spec.emergencyCorrection: true` waives the schedule — and only the schedule: it still waits for
+  a free slot, so an emergency never becomes a fleet-wide simultaneous change.
 
 - **Recurring windows** (UTC `HH:MM` spans, weekday/biweekly/N-weekly, may wrap past midnight):
   empty ⇒ always open; open if *any* window is active. Unparseable ⇒ closed (fail-safe).

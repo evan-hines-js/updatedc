@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
-use tough::editor::signed::{PathExists, SignedRepository, SignedRole};
+use tough::editor::signed::{SignedRepository, SignedRole};
 use tough::editor::RepositoryEditor;
 use tough::key_source::{KeySource, LocalKeySource};
 use tough::schema::decoded::{Decoded, Hex};
@@ -126,6 +126,179 @@ impl PublishTarget {
         );
         self
     }
+}
+
+/// Where every byte destined for the published repository is staged: `<repo>/.publish/`.
+///
+/// Deliberately NOT inside `metadata/` or `targets/`. Those two directories *are* the published
+/// repository: a mirror walks them whole and uploads every file below them verbatim (see
+/// `updatec::publisher::upload_order`), with no notion of which names are internal. A staging
+/// temp orphaned there by a crash would therefore be uploaded as a repository object and stay
+/// one forever. Staging one level up, in a directory no mirror walks, makes that unrepresentable
+/// rather than something a filter has to keep catching.
+///
+/// `.publish/` and the published directories share a filesystem, so committing a staged file is
+/// still a rename, never a copy.
+#[derive(Clone)]
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// Open (creating if needed) the scratch for one repository, sweeping leftovers that no
+    /// in-flight publish can still own.
+    async fn open(repo_dir: &Path) -> Result<Self> {
+        let dir = repo_dir.join(".publish");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| err("creating publish staging directory", e))?;
+        let swept = dir.clone();
+        tokio::task::spawn_blocking(move || sweep_stale_staging(&swept))
+            .await
+            .map_err(|e| err("sweeping publish staging", e))?;
+        Ok(Self(dir))
+    }
+
+    fn dir(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// The one prefix every publish staging temp carries, so the sweep can recognize its own.
+const STAGE_PREFIX: &str = ".publish-";
+
+/// A staging entry untouched for at least this long is an abandoned crash leftover, not one a
+/// publish is mid-way through — [`sweep_stale_staging`] spares anything newer, so it can run at
+/// the start of a publish without racing one already in flight.
+const STALE_STAGE_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Discard every `<STAGE_PREFIX>*.tmp` leftover in `.publish/` that no live publish can still own.
+///
+/// This is the only sweep `.publish/` gets, and it must handle both entry kinds a publish stages:
+/// individual files (one per repository object) and the whole signed metadata *generation*, which
+/// is staged as a directory. `foundation::durable::sweep_stale_temps` only unlinks files, so a
+/// crashed publish's generation directory would survive it forever and accumulate one per crash.
+///
+/// Purely hygiene, like the sweep it replaces: every failure is ignored, since the unique naming
+/// means a stray staging entry can never collide with a published path.
+fn sweep_stale_staging(dir: &Path) {
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(STAGE_PREFIX) || !name.ends_with(".tmp") {
+            continue;
+        }
+        // A directory's mtime advances as roles are written into it, so an in-flight generation
+        // reads as fresh for exactly as long as it is being filled.
+        let recently_written = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age < STALE_STAGE_AGE);
+        if recently_written {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Stage a file that is destined for the published repository.
+///
+/// Every file this module commits is a signed, world-readable artifact served to the whole fleet,
+/// which is the opposite of what `foundation::durable::create_temp_managed` exists for — that door
+/// is for a node's own private state. The access a published object grants is therefore decided in
+/// exactly one place — here, at creation, by
+/// `create_temp_published` — and never repaired afterwards. A `set_permissions` fix-up would be a
+/// unix-only half-measure: on Windows it is a no-op, so a protected DACL stamped at creation would
+/// survive the rename and every metadata file and target object would commit unreadable to the
+/// account that serves the repository.
+fn stage_published(scratch: &Scratch) -> Result<(std::fs::File, PathBuf)> {
+    foundation::durable::create_temp_published(scratch.dir(), STAGE_PREFIX)
+        .map_err(|e| err("creating publish staging file", e))
+}
+
+/// Commit a file staged by [`stage_published`] to its published path.
+///
+/// The bytes are fsynced *before* the rename: a rename publishes the directory entry atomically
+/// but flushes none of the file's data, so without this a power loss commits a name that resolves
+/// to unwritten blocks — and neither metadata nor a content-addressed target object is ever
+/// rewritten afterwards, so the damage is permanent. Callers fsync the destination directory once
+/// they have committed every file of a generation.
+///
+/// Blocking: run it under [`blocking`], never directly on a runtime worker.
+fn commit_published(staged: &Path, destination: &Path) -> Result<()> {
+    std::fs::File::open(staged)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| err("syncing published file", e))?;
+    foundation::durable::replace(staged, destination)
+        .map_err(|e| err("committing published file", e))
+}
+
+/// Run the filesystem work of a publish step off the runtime.
+///
+/// Publication is fsync-heavy — a metadata generation is one `sync_all` per role plus the
+/// directory, and a release adds one per multi-hundred-megabyte target object. On a cold page
+/// cache each of those parks the calling thread in the kernel for as long as the device takes,
+/// and in `updatec` the publisher shares its runtime with the gateway listener, so doing it
+/// inline stalls unrelated request handling. Every blocking publish step goes through here.
+async fn blocking<T, F>(work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| err("publish task", e))?
+}
+
+/// Durably place `data` at `destination`, including the fsync of the destination directory.
+///
+/// This is the one way bytes this process produced enter the published repository: signed roots,
+/// and every role of a metadata generation. (Target objects take the other door — they are
+/// already staged as whole files and are committed by rename rather than re-written.)
+async fn publish_file(scratch: &Scratch, destination: &Path, data: Vec<u8>) -> Result<()> {
+    let destination = destination.to_path_buf();
+    let scratch = scratch.clone();
+    blocking(move || publish_file_blocking(&scratch, &destination, &data)).await
+}
+
+fn publish_file_blocking(scratch: &Scratch, destination: &Path, data: &[u8]) -> Result<()> {
+    let (mut file, staged) = stage_published(scratch)?;
+    let written = file.write_all(data);
+    drop(file);
+    let result = written
+        .map_err(|e| err("writing published file", e))
+        .and_then(|()| commit_published(&staged, destination));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+        return result;
+    }
+    foundation::durable::sync_dir(foundation::durable::parent_dir(destination))
+        .map_err(|e| err("syncing published directory", e))
+}
+
+/// fsync `leaf` and every directory between it and `root` inclusive, deepest first. A
+/// consistent-snapshot target name is path-like, so its object lands in a freshly created
+/// nested directory whose own dirent is otherwise never persisted.
+fn sync_published_dirs(root: &Path, leaf: &Path) -> Result<()> {
+    let mut dir = Some(leaf);
+    while let Some(current) = dir {
+        foundation::durable::sync_dir(current)
+            .map_err(|e| err("syncing published directory", e))?;
+        if current == root {
+            break;
+        }
+        dir = current.parent();
+    }
+    Ok(())
 }
 
 /// Generate the four ed25519 role keys under `keys_dir` if they are not present.
@@ -255,6 +428,7 @@ pub async fn init_from_version(
     tokio::fs::create_dir_all(&targets_dir)
         .await
         .map_err(|e| err("creating targets dir", e))?;
+    let scratch = Scratch::open(repo_dir).await?;
 
     let expires = expiry(expiry_days)?;
 
@@ -307,16 +481,20 @@ pub async fn init_from_version(
     let signed_root = SignedRole::new(root.clone(), &KeyHolder::Root(root), &root_sources, &rng)
         .await
         .map_err(|e| err("signing root", e))?;
-    // The pinned root and the versioned root the client fetches for rotation.
-    tokio::fs::write(metadata_dir.join("root.json"), signed_root.buffer())
-        .await
-        .map_err(|e| err("writing root.json", e))?;
-    tokio::fs::write(
-        metadata_dir.join(format!("{start}.root.json")),
-        signed_root.buffer(),
+    // The versioned root the client fetches to walk the rotation chain, then the pinned
+    // anchor that points at it.
+    publish_file(
+        &scratch,
+        &metadata_dir.join(format!("{start}.root.json")),
+        signed_root.buffer().to_vec(),
     )
-    .await
-    .map_err(|e| err("writing versioned root.json", e))?;
+    .await?;
+    publish_file(
+        &scratch,
+        &metadata_dir.join("root.json"),
+        signed_root.buffer().to_vec(),
+    )
+    .await?;
 
     // Sign empty targets/snapshot/timestamp at the starting version.
     let mut editor = RepositoryEditor::new(metadata_dir.join("root.json"))
@@ -339,7 +517,7 @@ pub async fn init_from_version(
         ])
         .await
         .map_err(|e| err("signing initial metadata", e))?;
-    publish_metadata(&signed, &metadata_dir).await?;
+    publish_metadata(&scratch, &signed, &metadata_dir).await?;
     Ok(())
 }
 
@@ -366,6 +544,7 @@ pub async fn rotate_root(
     }
     let metadata_dir = repo_dir.join("metadata");
     let root_path = metadata_dir.join("root.json");
+    let scratch = Scratch::open(repo_dir).await?;
     let bytes = tokio::fs::read(&root_path)
         .await
         .map_err(|e| err("reading root.json", e))?;
@@ -447,18 +626,15 @@ pub async fn rotate_root(
         .await
         .map_err(|e| err("signing rotated root", e))?;
     // The versioned root is what clients fetch to walk the rotation chain; the unversioned
-    // pointer is the anchor for new enrollments.
-    tokio::fs::write(
-        metadata_dir.join(format!("{next_version}.root.json")),
-        signed_root.buffer(),
+    // pointer is the anchor for new enrollments, so it is committed second — a crash between
+    // the two leaves the anchor on a root whose successor is already durable.
+    publish_file(
+        &scratch,
+        &metadata_dir.join(format!("{next_version}.root.json")),
+        signed_root.buffer().to_vec(),
     )
-    .await
-    .map_err(|e| err("writing versioned root.json", e))?;
-    tokio::fs::write(&root_path, signed_root.buffer())
-        .await
-        .map_err(|e| err("writing root.json", e))?;
-    foundation::durable::sync_dir(&metadata_dir).map_err(|e| err("syncing metadata dir", e))?;
-    Ok(())
+    .await?;
+    publish_file(&scratch, &root_path, signed_root.buffer().to_vec()).await
 }
 
 /// Publish a release: register `targets`, bump targets/snapshot/timestamp, and
@@ -494,6 +670,7 @@ async fn publish_release(
     let metadata_dir = repo_dir.join("metadata");
     let targets_dir = repo_dir.join("targets");
     let root_path = metadata_dir.join("root.json");
+    let scratch = Scratch::open(repo_dir).await?;
 
     // Validate every filesystem-bound name before hashing, signing, or copying anything.
     for pt in &targets {
@@ -506,8 +683,9 @@ async fn publish_release(
     // and publication.
     let mut staged = StagedArtifacts::default();
     for pt in &targets {
-        let (file, path) = foundation::durable::create_temp(&targets_dir, ".publish-")
-            .map_err(|e| err("creating artifact staging file", e))?;
+        // Staged with the access the *published* object needs, because this staging copy is the
+        // object: it is committed by rename, never re-created at its final path.
+        let (file, path) = stage_published(&scratch)?;
         let mut dst = tokio::fs::File::from_std(file);
         let mut src = tokio::fs::File::open(&pt.source)
             .await
@@ -556,10 +734,15 @@ async fn publish_release(
             .map_err(|e| err("clearing previous targets", e))?;
     }
 
+    // The digest signed into metadata is also the object's published name, so both are taken
+    // from this one hash of the staged bytes — the published path can never disagree with what
+    // the metadata says the bytes hash to.
+    let mut digests = Vec::with_capacity(targets.len());
     for (pt, staged_path) in targets.iter().zip(&staged.0) {
         let mut target = Target::from_path(staged_path)
             .await
             .map_err(|e| err("hashing target", e))?;
+        digests.push(hex::encode(&target.hashes.sha256));
         for (k, v) in &pt.custom {
             target.custom.insert(k.clone(), v.clone());
         }
@@ -580,32 +763,61 @@ async fn publish_release(
     // Publish immutable, digest-prefixed target objects before metadata can reference
     // them. An old metadata snapshot continues fetching its old digest while a new one
     // fetches the new digest, so concurrent readers never observe mixed generations.
-    for (pt, staged_path) in targets.iter().zip(&staged.0) {
+    //
+    // The staged copy IS the published object: its bytes were fsynced when it was staged and
+    // hashed into the metadata just signed, so committing it is a rename, never a second copy
+    // that could be interrupted half-written. The commit is unconditional — a destination left
+    // truncated by an earlier kill is repaired rather than skipped, and rewriting a
+    // content-addressed path with identical bytes is invisible to a concurrent reader.
+    let mut commits = Vec::with_capacity(targets.len());
+    for ((pt, staged_path), digest) in targets.iter().zip(&staged.0).zip(&digests) {
         let name = TargetName::new(&pt.name).map_err(|e| err("parsing target name", e))?;
-        signed
-            .copy_target(staged_path, &targets_dir, PathExists::Skip, Some(&name))
-            .await
-            .map_err(|e| err("publishing consistent target artifact", e))?;
+        commits.push((
+            staged_path.clone(),
+            targets_dir.join(format!("{digest}.{}", name.resolved())),
+        ));
     }
-    foundation::durable::sync_dir(&targets_dir)
-        .map_err(|e| err("syncing consistent target directory", e))?;
+    let objects_dir = targets_dir.clone();
+    blocking(move || {
+        for (staged_path, destination) in &commits {
+            let parent = foundation::durable::parent_dir(destination);
+            std::fs::create_dir_all(parent)
+                .map_err(|e| err("creating target object directory", e))?;
+            commit_published(staged_path, destination)?;
+            sync_published_dirs(&objects_dir, parent)?;
+        }
+        Ok(())
+    })
+    .await?;
 
-    publish_metadata(&signed, &metadata_dir).await?;
+    publish_metadata(&scratch, &signed, &metadata_dir).await?;
     Ok(())
+}
+
+/// A name no other publish can ever pick, for one publish's staged signed metadata generation.
+///
+/// Keyed on fresh randomness rather than the process id: two publishes inside one process would
+/// otherwise stage into the same directory, and each would delete and republish the other's signed
+/// generation. It carries [`STAGE_PREFIX`] and the `.tmp` suffix so [`sweep_stale_staging`]
+/// reclaims it if this process dies before it can be removed.
+fn generation_stage(scratch: &Scratch) -> Result<PathBuf> {
+    let token = updated::rand::token().map_err(|e| err("naming metadata staging", e))?;
+    Ok(scratch
+        .dir()
+        .join(format!("{STAGE_PREFIX}generation-{token}.tmp")))
 }
 
 /// Stage a complete signed metadata generation, publish immutable/versioned roles first,
 /// and atomically replace `timestamp.json` last as the sole visibility commit.
-async fn publish_metadata(signed: &SignedRepository, metadata_dir: &Path) -> Result<()> {
-    let parent = metadata_dir
-        .parent()
-        .ok_or_else(|| RepoError("metadata directory has no parent".into()))?;
-    let stage = parent.join(format!(".metadata-publish-{}", std::process::id()));
-    match tokio::fs::remove_dir_all(&stage).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(err("removing stale metadata staging", error)),
-    }
+async fn publish_metadata(
+    scratch: &Scratch,
+    signed: &SignedRepository,
+    metadata_dir: &Path,
+) -> Result<()> {
+    let stage = generation_stage(scratch)?;
+    // `create_dir`, not `create_dir_all`: the directory is this publish's by construction, so a
+    // name that somehow already exists is a failure rather than something to clear out from under
+    // whoever owns it.
     tokio::fs::create_dir(&stage)
         .await
         .map_err(|e| err("creating metadata staging", e))?;
@@ -614,26 +826,36 @@ async fn publish_metadata(signed: &SignedRepository, metadata_dir: &Path) -> Res
         return Err(err("staging signed metadata", error));
     }
 
-    let result = (|| -> Result<()> {
-        let mut files = std::fs::read_dir(&stage)
+    let staged_dir = stage.clone();
+    let metadata_dir = metadata_dir.to_path_buf();
+    let scratch = scratch.clone();
+    let result = blocking(move || {
+        let mut files = std::fs::read_dir(&staged_dir)
             .map_err(|e| err("reading metadata staging", e))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| err("reading staged metadata entry", e))?;
         files.sort_by_key(|entry| entry.file_name());
+        // The signer wrote these staged files with neither the access a published object needs
+        // nor a flush, so each is re-staged and committed through `publish_file_blocking` —
+        // `timestamp.json` last, as the sole visibility commit for the generation.
+        let publish = |entry: &std::fs::DirEntry| -> Result<()> {
+            let bytes =
+                std::fs::read(entry.path()).map_err(|e| err("reading staged metadata role", e))?;
+            publish_file_blocking(&scratch, &metadata_dir.join(entry.file_name()), &bytes)
+        };
         for entry in files
             .iter()
             .filter(|entry| entry.file_name() != "timestamp.json")
         {
-            foundation::durable::replace(&entry.path(), &metadata_dir.join(entry.file_name()))
-                .map_err(|e| err("publishing immutable metadata", e))?;
+            publish(entry)?;
         }
-        let timestamp = stage.join("timestamp.json");
-        foundation::durable::replace(&timestamp, &metadata_dir.join("timestamp.json"))
-            .map_err(|e| err("committing metadata timestamp", e))?;
-        foundation::durable::sync_dir(metadata_dir)
-            .map_err(|e| err("syncing metadata directory", e))?;
-        Ok(())
-    })();
+        let timestamp = files
+            .iter()
+            .find(|entry| entry.file_name() == "timestamp.json")
+            .ok_or_else(|| RepoError("signed generation has no timestamp.json".into()))?;
+        publish(timestamp)
+    })
+    .await;
     let _ = tokio::fs::remove_dir_all(&stage).await;
     result
 }
@@ -801,6 +1023,286 @@ mod tests {
         assert!(validate_target_name("products/../../outside/stable/1.0/app").is_err());
         assert!(validate_target_name("products/app/stable/1.0/linux/app/extra").is_err());
         assert!(validate_target_name("products/app/stable/1.0/linux/app\\evil").is_err());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "updated-tuf-{name}-{}-{}",
+            std::process::id(),
+            updated::rand::token().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_published_file_is_world_readable_and_leaves_no_staging_behind() {
+        let repo = scratch("publish-file");
+        let dir = repo.join("metadata");
+        std::fs::create_dir_all(&dir).unwrap();
+        let staging = Scratch::open(&repo).await.unwrap();
+        let destination = dir.join("root.json");
+        publish_file(&staging, &destination, b"first".to_vec())
+            .await
+            .unwrap();
+        publish_file(&staging, &destination, b"second-and-longer".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"second-and-longer");
+        // Nothing but the published object is left in the published tree, and the staging
+        // area it went through is outside that tree entirely.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(staging.dir()).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644,
+                "a published artifact is world-readable"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: nothing a publish stages may ever appear inside the published tree.
+    ///
+    /// A mirror uploads every file below `metadata/` and `targets/` verbatim, so a `.publish-*.tmp`
+    /// orphaned there by a crash would become a permanent repository object. Staging happens in
+    /// `<repo>/.publish/`, which no mirror walks — and a leftover there, planted here as a crash
+    /// would leave it, is swept by the next publish instead of being published.
+    #[tokio::test]
+    async fn publish_staging_never_lands_inside_the_published_tree() {
+        let root = scratch("publish-staging-outside");
+        let repo_dir = root.join("repo");
+        let keys = generate_keys(&root.join("keys")).await.unwrap();
+        init(&repo_dir, &keys, 365).await.unwrap();
+
+        // A crash leftover, aged past the sweep's in-flight guard.
+        let orphan = repo_dir.join(".publish").join(".publish-999-1-1.tmp");
+        std::fs::write(&orphan, b"interrupted publish").unwrap();
+        let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+
+        let artifact = root.join("app-bin");
+        std::fs::write(&artifact, b"release bytes").unwrap();
+        add_release(
+            &repo_dir,
+            &keys,
+            vec![PublishTarget::application(
+                "app", "stable", "1.0.0", "linux", "x86_64", "app", artifact,
+            )],
+            365,
+        )
+        .await
+        .unwrap();
+
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        for published in ["metadata", "targets"] {
+            let mut files = Vec::new();
+            walk(&repo_dir.join(published), &mut files);
+            for file in files {
+                let name = file.file_name().unwrap().to_string_lossy().into_owned();
+                assert!(
+                    !name.starts_with('.') && !name.ends_with(".tmp"),
+                    "{name} is staging state inside the published tree"
+                );
+            }
+        }
+        assert!(!orphan.exists(), "an abandoned staging temp must be swept");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two publishes in one process must not share a staging directory. Keyed on the process id
+    /// they did: the second's `create_dir` would land on the first's staged generation, and
+    /// whichever finished first would delete the other's roles out from under it.
+    #[tokio::test]
+    async fn each_publish_stages_its_generation_under_a_name_no_other_can_pick() {
+        let root = scratch("generation-stage-name");
+        let scratch_dir = Scratch::open(&root).await.unwrap();
+        let first = generation_stage(&scratch_dir).unwrap();
+        let second = generation_stage(&scratch_dir).unwrap();
+        assert_ne!(first, second);
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            !name.contains(&std::process::id().to_string()),
+            "the name must not be process-keyed: {name}"
+        );
+        assert!(name.starts_with(STAGE_PREFIX) && name.ends_with(".tmp"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A publish stages individual objects as files *and* a whole signed generation as a
+    /// directory. `foundation::durable::sweep_stale_temps` only unlinks files, so the crash
+    /// leftover the sweep exists for — an abandoned generation — would otherwise survive every
+    /// later publish and accumulate one copy per crash.
+    #[test]
+    fn the_publish_sweep_reclaims_abandoned_generations_as_well_as_files() {
+        let root = scratch("publish-sweep-kinds");
+        let dir = root.join(".publish");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let aged =
+            std::time::SystemTime::now() - (STALE_STAGE_AGE + std::time::Duration::from_secs(60));
+        let backdate = |path: &Path| {
+            // A directory cannot be opened for writing; `set_times` works on a read handle.
+            let file = if path.is_dir() {
+                std::fs::File::open(path).unwrap()
+            } else {
+                std::fs::File::options().write(true).open(path).unwrap()
+            };
+            file.set_times(std::fs::FileTimes::new().set_modified(aged))
+                .unwrap();
+        };
+
+        // Abandoned: a staged object and a whole staged generation.
+        let stale_file = dir.join(format!("{STAGE_PREFIX}1-2-3.tmp"));
+        std::fs::write(&stale_file, b"orphan").unwrap();
+        backdate(&stale_file);
+        let stale_generation = dir.join(format!("{STAGE_PREFIX}generation-dead.tmp"));
+        std::fs::create_dir(&stale_generation).unwrap();
+        std::fs::write(stale_generation.join("timestamp.json"), b"{}").unwrap();
+        backdate(&stale_generation);
+
+        // In flight (fresh), and not ours (wrong prefix) — both must survive.
+        let live_generation = dir.join(format!("{STAGE_PREFIX}generation-live.tmp"));
+        std::fs::create_dir(&live_generation).unwrap();
+        let unrelated = dir.join("keys-9-9-9.tmp");
+        std::fs::write(&unrelated, b"not ours").unwrap();
+        backdate(&unrelated);
+
+        sweep_stale_staging(&dir);
+
+        assert!(!stale_file.exists(), "an abandoned staged object survived");
+        assert!(
+            !stale_generation.exists(),
+            "an abandoned staged generation survived the sweep"
+        );
+        assert!(
+            live_generation.exists(),
+            "an in-flight generation was yanked"
+        );
+        assert!(unrelated.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression: a published object's access is decided once, by the staging primitive it is
+    /// created through, and never repaired afterwards — a repair would be a unix-only half of the
+    /// rule and would leave every Windows publisher committing metadata and target objects that
+    /// the account serving the repository cannot open. Every file of a real generation must be
+    /// world-readable: the roots this module writes itself, the roles the signer writes into
+    /// staging, and the content-addressed target objects.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_published_metadata_role_and_target_object_is_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("published-modes");
+        let repo_dir = root.join("repo");
+        let keys = generate_keys(&root.join("keys")).await.unwrap();
+        init(&repo_dir, &keys, 365).await.unwrap();
+        let artifact = root.join("app-bin");
+        std::fs::write(&artifact, b"release bytes").unwrap();
+        add_release(
+            &repo_dir,
+            &keys,
+            vec![PublishTarget::application(
+                "app", "stable", "1.0.0", "linux", "x86_64", "app", artifact,
+            )],
+            365,
+        )
+        .await
+        .unwrap();
+
+        // A consistent-snapshot target name is path-like, so objects sit in nested directories.
+        fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        for dir in ["metadata", "targets"] {
+            let dir = repo_dir.join(dir);
+            let mut published = Vec::new();
+            files(&dir, &mut published);
+            assert!(!published.is_empty(), "{} published nothing", dir.display());
+            for path in published {
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o644,
+                    "{} must be readable by whoever serves the repository",
+                    path.display()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A kill during publication can leave a target object truncated at its content-addressed
+    /// path. Republishing the same release must rewrite it: skipping an existing path would
+    /// make the damaged bytes permanent, since the path is derived from the digest the metadata
+    /// signs and every retry lands on it again.
+    #[tokio::test]
+    async fn republishing_repairs_a_truncated_target_object() {
+        let root = scratch("truncated-target");
+        let repo_dir = root.join("repo");
+        let keys = generate_keys(&root.join("keys")).await.unwrap();
+        init(&repo_dir, &keys, 365).await.unwrap();
+
+        let artifact = root.join("app-bin");
+        std::fs::write(&artifact, b"complete release bytes").unwrap();
+        let target = || {
+            PublishTarget::application(
+                "app",
+                "stable",
+                "1.0.0",
+                "linux",
+                "x86_64",
+                "app",
+                artifact.clone(),
+            )
+        };
+        add_release(&repo_dir, &keys, vec![target()], 365)
+            .await
+            .unwrap();
+
+        let name = target().name;
+        let digest = target_sha256(&repo_dir, &name).await.unwrap();
+        let object = repo_dir.join("targets").join(format!("{digest}.{name}"));
+        assert_eq!(
+            std::fs::read(&object).unwrap(),
+            b"complete release bytes",
+            "the published object is the staged artifact"
+        );
+
+        std::fs::write(&object, b"trunc").unwrap();
+        add_release(&repo_dir, &keys, vec![target()], 365)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&object).unwrap(), b"complete release bytes");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

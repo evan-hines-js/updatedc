@@ -459,23 +459,9 @@ impl Sup {
     }
 
     fn seed_install(&self) -> R {
-        let paths = updated::config::Paths {
-            install_root: self.install_root.clone(),
-            versions: self.install_root.join("versions"),
-            staging: self.install_root.join("staging"),
-            active_release: self.install_root.join("active-release"),
-            download: self.install_root.join("staging/bundle.download"),
-            state: self.install_root.join("state/installed.json"),
-            datastore: self.install_root.join("state/tuf"),
-            routing_datastore: self.install_root.join("state/routing-tuf"),
-            assignment: self.install_root.join("state/repository-assignment.json"),
-            journal: self.install_root.join("state/transaction.json"),
-            install_journal: self.install_root.join("state/install.json"),
-            rejected: self.install_root.join("state/rejected"),
-            provider_versions: self.install_root.join("providers/versions"),
-            provider_staging: self.install_root.join("providers/staging"),
-            provider_download: self.install_root.join("providers/staging/bundle.download"),
-        };
+        // The layout production resolves, not a copy of it: a scenario that plants or reads a
+        // file through these paths must exercise the same locations the agent under test uses.
+        let paths = updated::config::Paths::resolve(&self.install_root, &self.state_dir());
         if matches!(
             updated::state::read_installed(&paths.state),
             updated::state::Installed::Present(_)

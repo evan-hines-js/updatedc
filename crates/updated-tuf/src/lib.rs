@@ -115,6 +115,92 @@ mod error_tests {
         }
     }
 
+    /// Every way of not having a usable live assignment costs the node one launch of the managed
+    /// application on enrollment-frozen configuration, so each must be distinguishable — an
+    /// `Option` here would collapse "first boot" and "someone planted a document that would move
+    /// install_root" into the same silence.
+    #[test]
+    fn each_way_of_lacking_a_live_assignment_is_reported_distinctly() {
+        use super::{persisted_assignment, LiveAssignment};
+
+        let dir = std::env::temp_dir().join(format!(
+            "updated-tuf-live-assignment-{}-{}",
+            std::process::id(),
+            updated::rand::token().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let install_root = std::path::Path::new("/app");
+        let path = updated::config::persisted_assignment_path(&dir);
+        let usable = || RepositoryAssignment {
+            schema: RepositoryAssignment::SCHEMA,
+            deployment: "deployment".into(),
+            metadata_url: "https://cdn/metadata/".into(),
+            targets_url: "https://cdn/targets/".into(),
+            report_url: None,
+            application: updated_contracts::artifact::TargetReference {
+                path: "app".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: updated_contracts::artifact::TargetReference {
+                path: "providers".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({}),
+            runtime: runtime(),
+        };
+        let plant = |value: serde_json::Value| {
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        };
+
+        // Absent — the ordinary first boot, and the only case that is not a fault.
+        assert!(matches!(
+            persisted_assignment(&dir, install_root),
+            LiveAssignment::Absent
+        ));
+
+        plant(serde_json::to_value(usable()).unwrap());
+        assert!(matches!(
+            persisted_assignment(&dir, install_root),
+            LiveAssignment::Usable(_)
+        ));
+
+        type Corrupt = fn(&mut serde_json::Value);
+        let cases: [(&str, Corrupt); 3] = [
+            ("would move install_root", |v| {
+                v["runtime"]["install_root"] = serde_json::json!("/elsewhere");
+            }),
+            ("has a bad metadata_url", |v| {
+                v["metadata_url"] = serde_json::json!("ftp://cdn/metadata/");
+            }),
+            ("is invalid", |v| {
+                v["deployment"] = serde_json::json!("");
+            }),
+        ];
+        for (expected, mutate) in cases {
+            let mut value = serde_json::to_value(usable()).unwrap();
+            mutate(&mut value);
+            plant(value);
+            let reason = persisted_assignment(&dir, install_root)
+                .usable()
+                .err()
+                .unwrap_or_else(|| panic!("{expected} must not be usable as a boot config"))
+                .to_string();
+            assert!(
+                reason.contains(expected),
+                "the reason must name the fault, got: {reason}"
+            );
+        }
+
+        std::fs::write(&path, b"{not json").unwrap();
+        let reason = persisted_assignment(&dir, install_root)
+            .usable()
+            .expect_err("malformed JSON is never usable")
+            .to_string();
+        assert!(reason.contains("is malformed"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn only_transport_is_retryable() {
         // The fail-closed contract: a transport blip may be retried, but a trust
@@ -395,7 +481,7 @@ pub async fn resolve_managed_config(
         .await
         .map_err(|error| Error::Local(format!("loading enrollment bundle: {error}")))?;
     let routing_root = enrollment_state.join("routing-root.json");
-    foundation::durable::atomic_write(
+    foundation::durable::atomic_write_managed(
         &routing_root,
         ".routing-root-",
         bundle.routing_root.as_bytes(),
@@ -424,53 +510,149 @@ pub async fn resolve_managed_config(
     // re-verifies and reconciles the live assignment every cycle, so a stale or tampered persisted
     // file is corrected within one tick. Any read/parse/validate failure falls back to embedded.
     let embedded = verify_embedded_assignment(&bundle)?;
-    let assignment = persisted_assignment(&embedded.runtime.install_root)
-        .filter(|persisted| {
-            // The persisted file is ordinary local state, not something this boot can verify: it is
-            // read before any network fetch and its signature is not re-checked here. It may
-            // therefore refine the assignment the enrollment bundle authenticated, but it may not
-            // relocate the node — an `install_root` read out of an unverified file would move the
-            // binary, state, journal, and rejection set the guardian and supervisor operate on,
-            // from a file anyone with write access to the state directory controls.
-            let same_root = persisted.runtime.install_root == embedded.runtime.install_root;
-            if !same_root {
+    let assignment =
+        match persisted_assignment(enrollment_state, &embedded.runtime.install_root).usable() {
+            Ok(live) => *live,
+            // Booting on the enrollment-frozen assignment is normal exactly once, on a node's first
+            // ever boot. Any later occurrence means THIS launch of the managed application uses the
+            // product, channel, arguments and secret mapping as of enrollment rather than whatever the
+            // control plane has since assigned — one launch on stale configuration, which the update
+            // loop then corrects a tick later. That correction is invisible, so the boot that needed
+            // it is stated outright, with the reason the live assignment was not usable.
+            Err(reason) => {
                 foundation::log::warn(
                     "updated",
-                    "the persisted assignment moves install_root; ignoring it and booting on the \
-                     enrollment-verified assignment",
+                    &format!(
+                        "{reason}; this boot launches the managed application on the \
+                     enrollment-frozen assignment until the update loop resolves the current one"
+                    ),
                 );
+                embedded
             }
-            same_root
-        })
-        .unwrap_or(embedded);
+        };
     assignment
         .runtime
         .materialize(&assignment.deployment, routing)
         .map_err(Error::Trust)
 }
 
-/// The last live routing assignment this node resolved, which the update loop persists to
-/// `<install_root>/state/repository-assignment.json` (see [`updated::config::Paths::resolve_paths`],
-/// which derives the same path). Returned only when it parses and structurally validates, so any
-/// failure leaves the caller on the enrollment-embedded assignment.
-fn persisted_assignment(
-    install_root: &Path,
-) -> Option<updated_contracts::assignment::RepositoryAssignment> {
-    // Mirrors `resolve_paths`: state_dir = <install_root>/state, assignment = state_dir/…json.
-    let path = install_root
-        .join("state")
-        .join("repository-assignment.json");
-    let bytes = std::fs::read(path).ok()?;
+/// What the node-local copy of the live routing assignment turned out to be.
+///
+/// Not an `Option`: every way of not having one is a distinct operator situation — a first boot,
+/// an unreachable state directory, a corrupted file, a document that would relocate the node — and
+/// the caller must be able to say which, because the only symptom otherwise is one silent launch
+/// on enrollment-frozen configuration.
+enum LiveAssignment {
+    // Boxed: the assignment dwarfs the two failure variants, and this is constructed once per
+    // boot, so the indirection costs nothing and keeps the enum a pointer wide.
+    Usable(Box<updated_contracts::assignment::RepositoryAssignment>),
+    /// No file yet: the ordinary state of a node that has not completed its first update cycle.
+    Absent,
+    /// Present but not usable as a boot config, for the stated reason.
+    Rejected(String),
+}
+
+/// Why a boot fell back to the enrollment-frozen assignment. Its own type rather than a method on
+/// [`LiveAssignment`]: only the two non-usable cases have a reason, and narrowing them out of the
+/// enum is what makes "the live assignment is usable" impossible to print as a fallback reason.
+enum NoLiveAssignment {
+    Absent,
+    Rejected(String),
+}
+
+impl std::fmt::Display for NoLiveAssignment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("no live routing assignment has been persisted yet"),
+            Self::Rejected(reason) => {
+                write!(f, "ignoring the persisted routing assignment: {reason}")
+            }
+        }
+    }
+}
+
+impl LiveAssignment {
+    /// The assignment if it can be booted on, or the reason it cannot.
+    fn usable(
+        self,
+    ) -> Result<Box<updated_contracts::assignment::RepositoryAssignment>, NoLiveAssignment> {
+        match self {
+            LiveAssignment::Usable(assignment) => Ok(assignment),
+            LiveAssignment::Absent => Err(NoLiveAssignment::Absent),
+            LiveAssignment::Rejected(reason) => Err(NoLiveAssignment::Rejected(reason)),
+        }
+    }
+}
+
+/// The last live routing assignment this node resolved, which the update loop persists beside the
+/// enrollment material through [`updated::config::persisted_assignment_path`] — the same helper
+/// [`updated::config::Paths::resolve`] derives the writer's `assignment` path from, so reader and
+/// writer cannot drift.
+///
+/// Usable only when it parses, structurally validates, carries repository URLs this build can
+/// actually fetch from, and leaves the node where the enrollment bundle put it. The persisted file
+/// is local state this boot cannot re-verify, so it may refine the assignment the enrollment
+/// bundle authenticated but never relocate the node: an `install_root` read out of it would move
+/// the binary, state, journal, and rejection set the guardian and supervisor operate on.
+fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAssignment {
+    let path = updated::config::persisted_assignment_path(enrollment_state);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LiveAssignment::Absent
+        }
+        Err(error) => {
+            return LiveAssignment::Rejected(format!("{} is unreadable ({error})", path.display()))
+        }
+    };
     let assignment: updated_contracts::assignment::RepositoryAssignment =
-        serde_json::from_slice(&bytes).ok()?;
-    assignment.validate().ok()?;
-    Some(assignment)
+        match serde_json::from_slice(&bytes) {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                return LiveAssignment::Rejected(format!(
+                    "{} is malformed ({error})",
+                    path.display()
+                ))
+            }
+        };
+    if let Err(error) = assignment.validate() {
+        return LiveAssignment::Rejected(format!("{} is invalid ({error})", path.display()));
+    }
+    // `validate` covers the signed contract's shape but not its endpoints; they are otherwise
+    // first checked deep inside `assigned`, long after this document has become the boot config.
+    for (field, url) in [
+        ("metadata_url", &assignment.metadata_url),
+        ("targets_url", &assignment.targets_url),
+    ] {
+        if let Err(error) = validate_release_url(field, url) {
+            return LiveAssignment::Rejected(format!(
+                "{} has a bad {field}: {error}",
+                path.display()
+            ));
+        }
+    }
+    if assignment.runtime.install_root != install_root {
+        return LiveAssignment::Rejected(format!(
+            "{} would move install_root away from the enrollment-verified {}",
+            path.display(),
+            install_root.display()
+        ));
+    }
+    LiveAssignment::Usable(Box::new(assignment))
 }
 
 /// Verify the complete initial TUF chain carried by an enrollment bundle and return
-/// the exact managed assignment it authenticates. This is the offline installer path:
-/// no network operation is permitted or required.
-fn verify_embedded_assignment(
+/// the exact managed assignment it authenticates: every role signature and threshold against the
+/// bundle's own root, every expiry, each metafile digest, and each target digest.
+///
+/// Self-consistency only — it proves the documents belong together under THAT root. A verifier
+/// that did not obtain the root from a trusted source must additionally pin it (see the gateway,
+/// which compares it against the digest the controller recorded in etcd); otherwise a substituted
+/// root and a matching chain verify perfectly.
+///
+/// No network operation is permitted or required, so the offline installer path and the gateway's
+/// live `/enroll` response are checked by exactly the same code.
+pub fn verify_embedded_assignment(
     bundle: &updated_contracts::enrollment::EnrollmentBundle,
 ) -> Result<updated_contracts::assignment::RepositoryAssignment, Error> {
     let root_bytes = bundle.routing_root.as_bytes();
@@ -673,7 +855,7 @@ impl TrustedRepository {
                 .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
         assignment.validate().map_err(Error::Trust)?;
         // Only a complete, verified, validated assignment is committed as the live one.
-        foundation::durable::atomic_write(assignment_path, ".assignment-", &bytes)
+        foundation::durable::atomic_write_managed(assignment_path, ".assignment-", &bytes)
             .map_err(|e| Error::Local(format!("persisting the resolved assignment: {e}")))?;
         let _ = std::fs::remove_file(&staging);
         Ok(ResolvedAssignment {
@@ -706,7 +888,7 @@ impl TrustedRepository {
             Error::Local(format!("creating assigned repository state: {error}"))
         })?;
         let release_root = assignment_store.join("release-root.json");
-        foundation::durable::atomic_write(
+        foundation::durable::atomic_write_managed(
             &release_root,
             ".release-root-",
             &serde_json::to_vec(&assignment.release_root)
@@ -878,7 +1060,12 @@ impl TrustedRepository {
             )));
         }
         let dir = foundation::durable::parent_dir(destination);
-        let (file, temporary) = foundation::durable::create_temp(dir, ".target-")
+        // A downloaded target is node-local state, not a secret and not something this node
+        // serves: it lands in the install root's staging area and is read back by this service
+        // only. `create_temp_managed` keeps the deployment's own grant on that tree governing it,
+        // rather than committing a protected DACL that an operator CLI or installer step running
+        // as a different principal could then neither read nor replace.
+        let (file, temporary) = foundation::durable::create_temp_managed(dir, ".target-")
             .map_err(|e| Error::Local(format!("creating target staging file: {e}")))?;
         let mut file = tokio::fs::File::from_std(file);
         let mut written = 0u64;

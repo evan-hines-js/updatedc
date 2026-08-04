@@ -2784,6 +2784,7 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "foundation",
  "rcgen",
  "same-file",
@@ -3824,6 +3825,7 @@ dependencies = [
 name = "windows-service"
 version = "0.1.0"
 dependencies = [
+ "foundation",
  "windows-sys 0.59.0",
 ]
 

@@ -7,13 +7,14 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Instant;
 
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
 
-use crate::{LoadBalancer, Member};
+use crate::{LastKnownGood, LoadBalancer, Member};
 
 /// Value we stamp as the EndpointSlice manager, and the field-manager for server-side apply.
 pub const MANAGED_BY: &str = "updated-healthproxy";
@@ -25,6 +26,9 @@ pub struct EndpointSliceLb {
     service: String,
     port_name: String,
     port: u16,
+    /// The address each hostname member last resolved to, so a DNS blip on this side does not
+    /// evict a healthy node (see [`resolve_addresses`]).
+    resolved: tokio::sync::Mutex<LastKnownGood<String>>,
 }
 
 impl EndpointSliceLb {
@@ -40,6 +44,7 @@ impl EndpointSliceLb {
             service,
             port_name,
             port,
+            resolved: tokio::sync::Mutex::new(LastKnownGood::new()),
         }
     }
 
@@ -54,7 +59,7 @@ impl EndpointSliceLb {
 impl LoadBalancer for EndpointSliceLb {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String> {
         let name = self.slice_name();
-        let members = resolve_addresses(members).await;
+        let members = resolve_addresses(members, &mut *self.resolved.lock().await).await;
         let slice = build_slice(&self.service, &name, &self.port_name, self.port, &members);
         // A single slice is one address family; any member of another family was dropped from
         // it (fail closed). Surface that misconfiguration rather than silently under-routing.
@@ -115,14 +120,22 @@ fn is_immutable_rejection(error: &kube::Error) -> bool {
     matches!(error, kube::Error::Api(response) if response.code == 422)
 }
 
-/// Replace every hostname member with a resolved IP literal, dropping any that does not resolve.
+/// Replace every hostname member with a resolved IP literal, dropping any for which no address is
+/// known.
 ///
 /// Kubernetes accepts an `FQDN` EndpointSlice but **kube-proxy does not implement that address
 /// type**, so a hostname slice programs zero working endpoints while every apply succeeds and
 /// every log line looks healthy — the worst failure shape there is. Members are documented as
 /// bare hostnames for out-of-cluster VMs, so the names are resolved here, each cycle, and the
 /// slice only ever carries addresses kube-proxy can actually route.
-async fn resolve_addresses(members: &[Member]) -> Vec<Member> {
+///
+/// A lookup that fails falls back to the address the name last resolved to, through the same
+/// [`LastKnownGood`] policy the report fetch uses: a resolver hiccup on this side is not evidence
+/// the node moved or went down, and without the fallback one SERVFAIL cycle empties the Service's
+/// backend set entirely. It stays fail-closed — a name that has not resolved within
+/// [`LastKnownGood::STALENESS`] leaves its member out of rotation.
+async fn resolve_addresses(members: &[Member], known: &mut LastKnownGood<String>) -> Vec<Member> {
+    let now = Instant::now();
     let mut resolved = Vec::with_capacity(members.len());
     for member in members {
         if AddressType::of(&member.address) != AddressType::Fqdn {
@@ -130,19 +143,23 @@ async fn resolve_addresses(members: &[Member]) -> Vec<Member> {
             continue;
         }
         // The port is irrelevant to the lookup; the Service owns it.
-        match tokio::net::lookup_host((member.address.as_str(), 0)).await {
-            Ok(mut addresses) => match addresses.next() {
-                Some(address) => resolved.push(Member {
-                    address: address.ip().to_string(),
-                    ..member.clone()
-                }),
-                None => eprintln!(
-                    "healthproxy: {} ({}) resolved to no address; leaving it out of rotation",
+        let fresh = match tokio::net::lookup_host((member.address.as_str(), 0)).await {
+            Ok(mut addresses) => addresses.next().map(|address| address.ip().to_string()),
+            Err(error) => {
+                eprintln!(
+                    "healthproxy: resolving {} ({}) failed ({error}); using its last known address",
                     member.node, member.address
-                ),
-            },
-            Err(error) => eprintln!(
-                "healthproxy: resolving {} ({}) failed ({error}); leaving it out of rotation",
+                );
+                None
+            }
+        };
+        match known.resolve(&member.address, fresh, now) {
+            Some(address) => resolved.push(Member {
+                address,
+                ..member.clone()
+            }),
+            None => eprintln!(
+                "healthproxy: {} ({}) has no known address; leaving it out of rotation",
                 member.node, member.address
             ),
         }
@@ -308,23 +325,56 @@ mod tests {
         assert_eq!(ports[0].name.as_deref(), Some("http"));
     }
 
-    #[test]
-    fn a_hostname_never_reaches_a_slice_as_an_fqdn_endpoint() {
-        // kube-proxy does not route `FQDN` slices, so an unresolvable hostname must leave the
-        // member OUT of rotation rather than produce a slice that is accepted and routes nothing.
-        let members = tokio::runtime::Builder::new_current_thread()
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(resolve_addresses(&[member(
-                "db",
-                "vm-db.invalid.example",
-                true,
-            )]));
-        assert!(members.is_empty(), "an unresolvable member is dropped");
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_hostname_never_reaches_a_slice_as_an_fqdn_endpoint() {
+        // kube-proxy does not route `FQDN` slices, so a hostname with no known address must leave
+        // the member OUT of rotation rather than produce a slice that is accepted and routes
+        // nothing.
+        let mut known = LastKnownGood::new();
+        let members = block_on(resolve_addresses(
+            &[member("db", "vm-db.invalid.example", true)],
+            &mut known,
+        ));
+        assert!(members.is_empty(), "a never-resolved member is dropped");
 
         let slice = build_slice("s", "s-updated", "http", 80, &members);
         assert_eq!(slice.address_type, "IPv4");
         assert!(slice.endpoints.is_empty());
+    }
+
+    /// A resolver hiccup on this side is not evidence a node moved or went down. Without the
+    /// last-known-good fallback, one SERVFAIL cycle empties the Service's backend set entirely
+    /// while every node is still publishing fresh, healthy, signed reports.
+    #[test]
+    fn a_dns_failure_keeps_the_last_known_address_in_rotation() {
+        let members = [member("db", "vm-db.invalid.example", true)];
+        let mut known = LastKnownGood::new();
+        // Seed what a successful cycle would have recorded for this name.
+        assert_eq!(
+            known.resolve(
+                "vm-db.invalid.example",
+                Some("10.0.0.7".into()),
+                Instant::now()
+            ),
+            Some("10.0.0.7".to_string())
+        );
+
+        // This lookup genuinely fails (`.invalid` never resolves) — the member must survive it.
+        let resolved = block_on(resolve_addresses(&members, &mut known));
+        assert_eq!(
+            resolved,
+            vec![member("db", "10.0.0.7", true)],
+            "a checker-side DNS failure must not drain a healthy node"
+        );
+        let slice = build_slice("s", "s-updated", "http", 80, &resolved);
+        assert_eq!(slice.endpoints.len(), 1);
     }
 }

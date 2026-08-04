@@ -1106,10 +1106,10 @@ pub fn reap_workdir(work: &Path) {
     let _ = work;
 }
 
-/// Map an I/O error to the crate's `String` error type. Shared by the harness and
+/// Map any error to the crate's `String` error type. Shared by the harness and
 /// the scenarios (which reach it through the crate-root glob), so there is one such
 /// converter, not one per module.
-pub fn str_err(e: std::io::Error) -> String {
+pub fn str_err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 

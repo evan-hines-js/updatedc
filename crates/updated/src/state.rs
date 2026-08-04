@@ -258,7 +258,7 @@ pub fn enroll(installed_path: &Path, lineage: RepositoryLineage) -> io::Result<(
     // the process died mid-write — and a record that is present but unparseable is worse than
     // either state it sits between: the node is refused a cold install (bootstrap is spent) and
     // refused a normal boot (the record is invalid), with nothing on disk able to resolve it.
-    foundation::durable::atomic_write(&path, ".enrollment-", &bytes)
+    foundation::durable::atomic_write_managed(&path, ".enrollment-", &bytes)
 }
 
 pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
@@ -289,7 +289,7 @@ pub fn read_installed(path: &Path) -> Installed {
 /// Atomically and durably write the committed record.
 pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
     state.validate()?;
-    foundation::durable::atomic_write(
+    foundation::durable::atomic_write_managed(
         path,
         ".state-",
         &serde_json::to_vec(state).map_err(io::Error::other)?,

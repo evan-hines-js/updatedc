@@ -1,8 +1,8 @@
 //! Cryptographically-random identifiers used across the tower.
 //!
-//! Unique, unguessable names for ephemeral artifacts — content-addressed staging directories
-//! and per-attempt lifecycle IDs — so two concurrent operations never collide and a stale one
-//! can't be mistaken for a fresh one. They are not a sandbox boundary against code running as the
+//! Unique, unguessable names for ephemeral artifacts — per-attempt lifecycle IDs and scratch
+//! paths — so two concurrent operations never collide and a stale one can't be mistaken for a
+//! fresh one. They are not a sandbox boundary against code running as the
 //! same OS identity. The deliberately dependency-free bootstrap has its own freshness nonce.
 
 use std::io;

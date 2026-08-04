@@ -448,10 +448,6 @@ pub async fn reconcile_once(
     // quarantining a group needs the deployment that group is still pinned to.
     let admitted_name = admitted_configmap_name(repository_name);
     let (durable, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
-    let DurableRolloutState {
-        mut admitted,
-        routing,
-    } = durable;
 
     let mut group_resources = groups_api.list(&ListParams::default()).await?;
     group_resources
@@ -471,7 +467,7 @@ pub async fn reconcile_once(
     let mut held_groups: BTreeMap<String, crate::rollout::AdmittedDeployment> = BTreeMap::new();
     let hold_group =
         |name: &str, held: &mut BTreeMap<String, crate::rollout::AdmittedDeployment>| {
-            if let Some(state) = admitted.get(name) {
+            if let Some(state) = durable.admitted.get(name) {
                 held.insert(name.to_string(), state.clone());
             }
         };
@@ -540,6 +536,7 @@ pub async fn reconcile_once(
                     }
                     value => value.unwrap_or(1),
                 },
+                emergency_correction: group.spec.emergency_correction,
             },
         );
         group_labels.insert(name, group.labels().clone());
@@ -600,6 +597,24 @@ pub async fn reconcile_once(
     // node telemetry that drives rollout planning — so build it up front.
     let store = build_store(&secrets, &repository.spec.s3).await?;
 
+    // An ABSENT admitted-state ConfigMap reads as "no group has ever been admitted", and every
+    // group then takes the first-admission branch — which is deliberately exempt from
+    // `maxConcurrent`, `maxUnavailable`, and rollout windows, because a group with nothing
+    // published has nothing to stage. On a fleet that HAS published, that is the entire inventory
+    // re-admitted ungated in one generation. Deleting (or failing to restore) one ConfigMap must
+    // not be a fleet-wide unthrottled rollout, so this fails closed exactly like the analogous
+    // "local publisher state is empty but the store has a generation" guard.
+    if admitted_version.is_none()
+        && durable.admitted.is_empty()
+        && store_has_published_metadata(store.as_ref(), &repository.spec.s3).await?
+    {
+        return Err(Box::new(StorageError(format!(
+            "the durable admitted-state ConfigMap {admitted_name} is missing while a published \
+             generation exists; refusing to re-admit every group ungated (restore it, or delete \
+             the published generation to start over)"
+        ))));
+    }
+
     let agent_names: Vec<String> = resolved_nodes
         .iter()
         .map(|node| node.name.clone())
@@ -652,8 +667,9 @@ pub async fn reconcile_once(
         crate::domain::ObservedState {
             reports: &reports,
             public_keys: &public_keys,
-            admitted: &admitted,
-            routing: &routing,
+            admitted: &durable.admitted,
+            routing: &durable.routing,
+            assignments: &durable.assignments,
             now: reconcile_now,
         },
     )?;
@@ -661,15 +677,80 @@ pub async fn reconcile_once(
         publication: plan,
         admitted: planned_admitted,
         routing: planned_routing,
+        assignments: planned_assignments,
         set_statuses,
+        groups: group_progress,
     } = outcome;
-    // Reconcile runs every second; only write when the durable state actually changed so a steady
-    // generation makes no apiserver writes.
     let planned = DurableRolloutState {
         admitted: planned_admitted,
         routing: planned_routing,
+        assignments: planned_assignments,
     };
-    if admitted != planned.admitted || routing != planned.routing {
+
+    let desired_digest = desired_publication_digest(&repository.spec, &plan.digest)?;
+    let published_digest = state_dir.join("published-plan.sha256");
+    let up_to_date = tokio::fs::read_to_string(&published_digest)
+        .await
+        .ok()
+        .as_deref()
+        == Some(desired_digest.as_str());
+    if !up_to_date {
+        let signing = secrets
+            .get(&repository.spec.signing_secret_ref.name)
+            .await?;
+        let keys_dir = state_dir.join("keys");
+        materialize_signing_keys(&signing, &keys_dir).await?;
+        let repo_dir = state_dir.join("repository");
+        if !repo_dir.join("metadata/root.json").exists() {
+            // A fresh local state_dir (a lost PVC or a replica that never held the lease) must NOT
+            // re-init a v1 TUF repo when the object store already holds a published generation: clients
+            // enforce a rollback floor, so a v1 (< their current) would be rejected and the fleet would
+            // stop converging until numbering caught back up. Fail closed — refuse rather than roll back.
+            if store_has_published_metadata(store.as_ref(), &repository.spec.s3).await? {
+                return Err(Box::new(StorageError(
+                    "local publisher state is empty but the object store already holds a published \
+                     generation; refusing to re-initialize a v1 TUF repo (restore the state volume)"
+                        .into(),
+                )));
+            }
+            updated_tuf::repo::init(&repo_dir, &updated_tuf::repo::Keys::in_dir(&keys_dir), 365)
+                .await?;
+        }
+        crate::publisher::sign_plan(&repo_dir, &keys_dir, &plan, 365).await?;
+
+        // Re-verify leadership right before the irreversible S3 publish. The CPU-bound signing above can
+        // starve the main loop's 5s lease renewal past the 15s deadline; without this a former leader
+        // whose lease already expired (and was taken over by another replica) would still upload here,
+        // double-writing the generation. This closes the largest window (post-signing); the residual
+        // check→PUT gap is one request wide. Fail closed — skip the publish rather than split-brain write.
+        if !holds_lease(&client, namespace, "updatec-publisher", identity).await? {
+            return Err(Box::new(StorageError(
+                "publisher lease lost during reconcile; skipping publish to avoid a split-brain write"
+                    .into(),
+            )));
+        }
+
+        publish_repository(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
+        foundation::durable::atomic_write(
+            &published_digest,
+            ".published-",
+            desired_digest.as_bytes(),
+        )?;
+    }
+
+    // The durable state records what WAS published, so it is written only once the generation
+    // above is signed and uploaded. Every field of it is a claim about the live generation —
+    // notably `assignments`, the node → deployment identity map that is the ONLY staging signal a
+    // blind node has — and writing it first turned any failed publish (an object-store error, or
+    // the fail-closed lease and rollback guards above) into a durable record that nodes had been
+    // handed a deployment nobody ever served. A failed publish now leaves the record untouched and
+    // the next pass replans from the same baseline. The reverse gap is harmless and self-healing:
+    // if this write fails after a successful publish, the next pass replans the same generation,
+    // finds it already published, and records it again.
+    //
+    // Reconcile runs every second; only write when the state actually changed, so a steady
+    // generation makes no apiserver writes.
+    if durable != planned {
         store_admitted_state(
             &configmaps,
             &admitted_name,
@@ -680,10 +761,15 @@ pub async fn reconcile_once(
         )
         .await?;
     }
-    admitted = planned.admitted;
 
-    let desired_digest = desired_publication_digest(&repository.spec, &plan.digest)?;
-    let published_digest = state_dir.join("published-plan.sha256");
+    // ONE projection path for both outcomes — a reconcile that reused an unchanged generation and
+    // one that just signed a new one expose identical enrollment, status, and subscription state.
+    //
+    // The trust anchor is read HERE, after any repository init or re-sign in this same pass, and
+    // never before: it is the digest that `/enroll` and `/v1/node/secrets` pin the store-served
+    // root against, and by this point the store already serves the new root. Reading it earlier
+    // recorded the pre-rewrite digest, so every enrollment failed for a full reconcile tick after
+    // the initial publish or a root re-sign.
     let projection = ReconcileProjection {
         client: &client,
         namespace,
@@ -699,11 +785,12 @@ pub async fn reconcile_once(
         },
         snapshot: StatusSnapshot {
             repository: &repository,
+            routing_root_sha256: local_routing_root_sha256(state_dir).await,
             groups: &group_resources.items,
             agents: &agent_resources.items,
             plan: &plan,
             reports: &reports,
-            admitted: &admitted,
+            group_progress: &group_progress,
             public_keys: &public_keys,
             now: reconcile_now,
         },
@@ -711,53 +798,6 @@ pub async fn reconcile_once(
         set_resources: &set_resources.items,
         set_statuses: &set_statuses,
     };
-    if tokio::fs::read_to_string(&published_digest)
-        .await
-        .ok()
-        .as_deref()
-        == Some(desired_digest.as_str())
-    {
-        projection.publish().await?;
-        return Ok(plan.digest);
-    }
-
-    let signing = secrets
-        .get(&repository.spec.signing_secret_ref.name)
-        .await?;
-    let keys_dir = state_dir.join("keys");
-    materialize_signing_keys(&signing, &keys_dir).await?;
-    let repo_dir = state_dir.join("repository");
-    if !repo_dir.join("metadata/root.json").exists() {
-        // A fresh local state_dir (a lost PVC or a replica that never held the lease) must NOT
-        // re-init a v1 TUF repo when the object store already holds a published generation: clients
-        // enforce a rollback floor, so a v1 (< their current) would be rejected and the fleet would
-        // stop converging until numbering caught back up. Fail closed — refuse rather than roll back.
-        if store_has_published_metadata(store.as_ref(), &repository.spec.s3).await? {
-            return Err(Box::new(StorageError(
-                "local publisher state is empty but the object store already holds a published \
-                 generation; refusing to re-initialize a v1 TUF repo (restore the state volume)"
-                    .into(),
-            )));
-        }
-        updated_tuf::repo::init(&repo_dir, &updated_tuf::repo::Keys::in_dir(&keys_dir), 365)
-            .await?;
-    }
-    crate::publisher::sign_plan(&repo_dir, &keys_dir, &plan, 365).await?;
-
-    // Re-verify leadership right before the irreversible S3 publish. The CPU-bound signing above can
-    // starve the main loop's 5s lease renewal past the 15s deadline; without this a former leader
-    // whose lease already expired (and was taken over by another replica) would still upload here,
-    // double-writing the generation. This closes the largest window (post-signing); the residual
-    // check→PUT gap is one request wide. Fail closed — skip the publish rather than split-brain write.
-    if !holds_lease(&client, namespace, "updatec-publisher", identity).await? {
-        return Err(Box::new(StorageError(
-            "publisher lease lost during reconcile; skipping publish to avoid a split-brain write"
-                .into(),
-        )));
-    }
-
-    publish_repository(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
-    foundation::durable::atomic_write(&published_digest, ".published-", desired_digest.as_bytes())?;
     projection.publish().await?;
     Ok(plan.digest)
 }
@@ -830,6 +870,18 @@ async fn read_node_reports(
         .await
 }
 
+/// The digest of the `root.json` this publisher signs with, from its own local repository state.
+///
+/// Read from disk rather than from the object store: this is the value enrollment pins the
+/// store-served root AGAINST, so taking it from the store would compare a document with itself.
+/// `None` before this replica has ever signed a generation.
+async fn local_routing_root_sha256(state_dir: &Path) -> Option<String> {
+    let root = tokio::fs::read(state_dir.join("repository/metadata/root.json"))
+        .await
+        .ok()?;
+    Some(updated::hash::sha256_bytes(&root))
+}
+
 /// The ConfigMap name that durably holds this repository's admitted set (group → pinned
 /// deployment). Named from the repository so two repositories in one namespace never collide;
 /// the repository name is itself a valid Kubernetes resource name, so this always is too.
@@ -855,28 +907,78 @@ async fn load_admitted_state(
         .ok_or_else(|| StorageError("admitted-state ConfigMap has no state.json".into()))?;
     let admitted = serde_json::from_str(encoded)
         .map_err(|error| StorageError(format!("invalid admitted state: {error}")))?;
-    // The published routing (node → group) is a second key rather than a field of the first, so a
-    // repository that has only ever written the admitted set reads back as "no routing recorded"
-    // instead of failing its whole document closed.
+    // The published routing (node → group) and assignments (node → deployment identity) are their
+    // own keys rather than fields of the first, so a repository that has only ever written the
+    // admitted set reads back as "nothing recorded" instead of failing its whole document closed.
     let routing = match data.and_then(|data| data.get("routing.json")) {
         Some(encoded) => serde_json::from_str(encoded)
             .map_err(|error| StorageError(format!("invalid published routing: {error}")))?,
         None => BTreeMap::new(),
     };
-    Ok((DurableRolloutState { admitted, routing }, resource_version))
+    let assignments = match data.and_then(|data| data.get("assignments.json")) {
+        Some(encoded) => decode_assignments(
+            serde_json::from_str(encoded)
+                .map_err(|error| StorageError(format!("invalid published assignments: {error}")))?,
+        ),
+        None => BTreeMap::new(),
+    };
+    Ok((
+        DurableRolloutState {
+            admitted,
+            routing,
+            assignments,
+        },
+        resource_version,
+    ))
 }
 
 /// The control plane's durable rollout state: what each group is pinned to, and which group each
 /// node was routed to in the last published generation.
 ///
+/// Every field is a claim about a generation that WAS published, so it is written only after the
+/// signing and upload of that generation succeed (see `reconcile_once`). Recording it first left a
+/// record saying nodes had been handed a deployment that a failed publish never served — and for a
+/// blind node, `assignments` is the only staging signal there is.
+///
 /// The routing half exists because publication REPLACES the whole target set: a node left out of a
 /// generation does not keep its old assignment, its `agents/<node>.json` target simply stops
 /// existing. Knowing what a node was last published under is what lets a group that cannot be
 /// planned this pass (quarantined, or waiting on its inputs) leave that node exactly where it was.
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub(crate) struct DurableRolloutState {
     pub admitted: BTreeMap<String, crate::rollout::AdmittedDeployment>,
     pub routing: BTreeMap<String, String>,
+    /// Node → the deployment identity the last generation published for it. A staged rollout reads
+    /// it to tell a node it has already advanced from one it has not, so a node that goes quiet
+    /// while rebooting into its update is never republished under the predecessor.
+    ///
+    /// Rebuilt from each publication, so it holds exactly the nodes of the current generation and
+    /// never accumulates. It is stored INVERTED (see [`encode_assignments`]) because the document
+    /// shares a ConfigMap's single 1 MiB object budget with `routing`.
+    pub assignments: BTreeMap<String, String>,
+}
+
+/// The stored form of the published assignments: deployment identity → the nodes it was published
+/// to. Inverted from the in-memory node → identity map deliberately. Identities are per-GROUP — a
+/// fleet has at most two live ones per group — so writing a 64-character digest against every node
+/// name doubled the per-node cost of a document that must fit, together with the routing map, in
+/// one ConfigMap.
+fn encode_assignments(assignments: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
+    let mut inverted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (node, identity) in assignments {
+        inverted
+            .entry(identity.clone())
+            .or_default()
+            .push(node.clone());
+    }
+    inverted
+}
+
+fn decode_assignments(stored: BTreeMap<String, Vec<String>>) -> BTreeMap<String, String> {
+    stored
+        .into_iter()
+        .flat_map(|(identity, nodes)| nodes.into_iter().map(move |node| (node, identity.clone())))
+        .collect()
 }
 
 /// Persist the admitted set back to its ConfigMap. `resource_version` is `Some` when the ConfigMap
@@ -898,7 +1000,24 @@ async fn store_admitted_state(
             "routing.json".into(),
             serde_json::to_string(&state.routing)?,
         ),
+        (
+            "assignments.json".into(),
+            serde_json::to_string(&encode_assignments(&state.assignments))?,
+        ),
     ]);
+    // A ConfigMap is one etcd object with a hard 1 MiB ceiling, and every per-node map here grows
+    // with the fleet. Past the ceiling the apiserver rejects EVERY write, so the control plane can
+    // neither record an admission nor advance a rollout — and it does so with an error that says
+    // nothing about fleet size. Refuse early, well under the limit, with the remedy.
+    const STATE_BYTES_LIMIT: usize = 768 * 1024;
+    let bytes: usize = data.values().map(String::len).sum();
+    if bytes > STATE_BYTES_LIMIT {
+        return Err(Box::new(StorageError(format!(
+            "the durable rollout state for this repository is {bytes} bytes, past the \
+             {STATE_BYTES_LIMIT}-byte ceiling a ConfigMap can hold; split this fleet across \
+             UpdateRepositories (the state is proportional to the number of published agents)"
+        ))));
+    }
     // Own the ConfigMap by its repository so deleting the repository reclaims this admitted-state
     // through ordinary Kubernetes GC — no finalizer needed for an in-cluster child.
     let configmap = ConfigMap {
@@ -940,6 +1059,38 @@ async fn publish_group_set_statuses(
         let Some(status) = by_name.get(name.as_str()) else {
             continue;
         };
+        // Edge-triggered logging, from the ONE place that knows both the value just computed and
+        // the one last published. Freezing and calendar exhaustion are steady states that last for
+        // days; logged from the planner they emitted a line per reconcile (one second) per set.
+        let last = set.status.as_ref();
+        if last.and_then(|status| status.frozen) != Some(status.frozen) {
+            tracing::info!(
+                set = %name,
+                frozen = status.frozen,
+                "UpdateGroupSet crossed its rollout schedule boundary (windows/calendar)"
+            );
+        }
+        if status.calendar_exhausted
+            && last.and_then(|status| status.calendar_exhausted) != Some(true)
+        {
+            tracing::warn!(
+                set = %name,
+                "UpdateGroupSet calendar has run out; it is now UNGATED and will roll at any hour \
+                 — add a future approved window (or a rollout window) to re-gate it"
+            );
+        }
+        if status.emergency
+            != last
+                .map(|status| status.emergency.clone())
+                .unwrap_or_default()
+        {
+            tracing::warn!(
+                set = %name,
+                emergency = ?status.emergency,
+                "members declaring spec.emergencyCorrection changed; these members bypass this \
+                 set's rollout schedule until the flag is cleared"
+            );
+        }
         let published = UpdateGroupSetStatus {
             observed_generation: set.metadata.generation,
             member_count: Some(status.member_count as u32),
@@ -947,7 +1098,9 @@ async fn publish_group_set_statuses(
             rolling_count: Some(status.rolling.len() as u32),
             rolling: status.rolling.clone(),
             settled: status.settled.clone(),
+            unobservable: status.unobservable.clone(),
             shared: status.shared.clone(),
+            emergency: status.emergency.clone(),
             // Emit the explicit bool, never `None`: the status is applied as a JSON *merge*
             // patch, and a merge that omits `frozen` leaves the previous value in place — so a
             // set that unfreezes (its calendar cleared or window reopened) would keep a stale
@@ -979,11 +1132,16 @@ async fn publish_enrollment_secrets(
     store: &dyn ObjectStore,
     prefix: &str,
     public_url: &str,
+    trust_anchor: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for agent in agents {
-        if agent.spec.identity.kind != crate::AgentIdentityKind::Manual {
-            continue;
-        }
+    let offline: Vec<&UpdateAgent> = agents
+        .iter()
+        .filter(|agent| agent.spec.identity.kind == crate::AgentIdentityKind::Manual)
+        .collect();
+    let Some(trust_anchor) = offline_enrollment_anchor(offline.len(), trust_anchor)? else {
+        return Ok(());
+    };
+    for agent in offline {
         let name = agent.name_any();
         let secret_name = format!("{name}-enrollment");
         let assignment =
@@ -998,9 +1156,10 @@ async fn publish_enrollment_secrets(
         }
         // Resolve the exact signed documents this agent pins straight from the published
         // consistent snapshot, through the one walk the gateway's `/enroll` also uses.
-        let signed = crate::gateway::resolve_signed_enrollment(store, prefix, &assignment)
-            .await
-            .map_err(|error| format!("resolving enrollment bundle for {name}: {error}"))?;
+        let signed =
+            crate::gateway::resolve_signed_enrollment(store, prefix, &assignment, trust_anchor)
+                .await
+                .map_err(|error| format!("resolving enrollment bundle for {name}: {error}"))?;
         let bundle = signed.into_bundle(name.clone(), public_url, assignment.clone());
         let mut data = std::collections::BTreeMap::new();
         data.insert(
@@ -1030,6 +1189,30 @@ async fn publish_enrollment_secrets(
         }
     }
     Ok(())
+}
+
+/// The trust anchor offline enrollment must use, or the reason there is nothing to do.
+///
+/// `Ok(None)` — no offline-provisioned agent needs a bundle, so the anchor is irrelevant.
+/// `Ok(Some(anchor))` — issue bundles pinned against this anchor.
+/// `Err` — bundles are needed and cannot be issued. Without an anchor there is nothing to verify a
+/// store-served root against, and an unverifiable bundle must never be handed out; but that also
+/// means offline provisioning has STOPPED, so it is reported as the failure it is. Returning `Ok`
+/// there left an operator watching for a Secret that would never appear, with nothing logged to
+/// say why.
+fn offline_enrollment_anchor(
+    offline_agents: usize,
+    trust_anchor: Option<&str>,
+) -> Result<Option<&str>, StorageError> {
+    match (offline_agents, trust_anchor) {
+        (0, _) => Ok(None),
+        (_, Some(anchor)) => Ok(Some(anchor)),
+        (waiting, None) => Err(StorageError(format!(
+            "{waiting} offline-provisioned agent(s) need an enrollment bundle, but this \
+             repository's status carries no routingRootSha256 to pin the published root against; \
+             no bundle can be issued until a generation is signed and its anchor recorded"
+        ))),
+    }
 }
 
 /// Confirm an existing immutable enrollment Secret really is this agent's, for this assignment.
@@ -1174,11 +1357,16 @@ struct ResourceApis<'a> {
 
 struct StatusSnapshot<'a> {
     repository: &'a UpdateRepository,
+    /// SHA-256 of the `root.json` this publisher signs with, recorded into the repository's status
+    /// so enrollment can pin the store-served root against a value only the control plane writes.
+    routing_root_sha256: Option<String>,
     groups: &'a [UpdateGroup],
     agents: &'a [UpdateAgent],
     plan: &'a crate::PublicationPlan,
     reports: &'a HashMap<String, Envelope>,
-    admitted: &'a BTreeMap<String, crate::rollout::AdmittedDeployment>,
+    /// Each group's verdict for this generation as the rollout planner decided it — the single
+    /// source for whether a group is held, rolling, settled, or unobservable.
+    group_progress: &'a BTreeMap<String, crate::rollout::GroupProgress>,
     public_keys: &'a HashMap<String, Vec<u8>>,
     now: chrono::DateTime<chrono::Utc>,
 }
@@ -1202,16 +1390,22 @@ struct ReconcileProjection<'a> {
 }
 
 impl ReconcileProjection<'_> {
+    /// The trust anchor this generation publishes under: the freshly recorded one when this pass
+    /// signed, else whatever the repository's status already carries.
+    fn published_root_sha256(&self) -> Option<String> {
+        self.snapshot.routing_root_sha256.clone().or_else(|| {
+            self.repository
+                .status
+                .as_ref()
+                .and_then(|status| status.routing_root_sha256.clone())
+        })
+    }
+
     async fn publish(&self) -> Result<(), Box<dyn std::error::Error>> {
-        publish_enrollment_secrets(
-            self.secrets,
-            self.repository,
-            self.snapshot.agents,
-            self.store,
-            &self.repository.spec.s3.prefix,
-            self.public_url,
-        )
-        .await?;
+        // Statuses first, enrollment Secrets second. The repository status is where the trust
+        // anchor this pass signed with is recorded, and a missing anchor makes offline enrollment
+        // fail loudly below — so the anchor must be written before anything is allowed to fail on
+        // its absence.
         publish_resource_statuses(
             ResourceApis {
                 repositories: self.apis.repositories,
@@ -1220,14 +1414,25 @@ impl ReconcileProjection<'_> {
             },
             StatusSnapshot {
                 repository: self.snapshot.repository,
+                routing_root_sha256: self.snapshot.routing_root_sha256.clone(),
                 groups: self.snapshot.groups,
                 agents: self.snapshot.agents,
                 plan: self.snapshot.plan,
                 reports: self.snapshot.reports,
-                admitted: self.snapshot.admitted,
+                group_progress: self.snapshot.group_progress,
                 public_keys: self.snapshot.public_keys,
                 now: self.snapshot.now,
             },
+        )
+        .await?;
+        publish_enrollment_secrets(
+            self.secrets,
+            self.repository,
+            self.snapshot.agents,
+            self.store,
+            &self.repository.spec.s3.prefix,
+            self.public_url,
+            self.published_root_sha256().as_deref(),
         )
         .await?;
         publish_group_set_statuses(self.sets, self.set_resources, self.set_statuses).await?;
@@ -1254,11 +1459,12 @@ async fn publish_resource_statuses(
     } = apis;
     let StatusSnapshot {
         repository,
+        routing_root_sha256,
         groups: group_resources,
         agents: agent_resources,
         plan,
         reports,
-        admitted,
+        group_progress,
         public_keys,
         now,
     } = snapshot;
@@ -1268,6 +1474,12 @@ async fn publish_resource_statuses(
         observed_generation: repository_generation,
         published_digest: Some(plan.digest.clone()),
         agent_count: Some(agent_resources.len() as u32),
+        routing_root_sha256: routing_root_sha256.clone().or_else(|| {
+            repository
+                .status
+                .as_ref()
+                .and_then(|status| status.routing_root_sha256.clone())
+        }),
         conditions: vec![ready_condition(
             repository_generation,
             "Published",
@@ -1289,37 +1501,48 @@ async fn publish_resource_statuses(
             .values()
             .filter(|selected| *selected == &name)
             .count();
-        let rolling = admitted
+        // The verdict is the planner's, never re-derived here. Deciding it locally — `previous` for
+        // "rolling" and a deployment-NAME comparison for "held" — reported a group Ready while a
+        // change to its digest, arguments, or resolved inputs was still unadmitted, because the
+        // planner deliberately compares the whole desired deployment and this did not.
+        let condition = match group_progress
             .get(&name)
-            .is_some_and(|state| state.previous.is_some());
-        // A group with no admitted entry has never been published — held, not ready.
-        let held = admitted
-            .get(&name)
-            .is_none_or(|state| state.current.deployment != group.spec.deployment.name);
+            .copied()
+            // A group the planner did not decide has no admitted deployment at all: it is waiting
+            // on its inputs or a prerequisite, so nothing of it is published.
+            .unwrap_or(crate::rollout::GroupProgress::Held)
+        {
+            crate::rollout::GroupProgress::Held => failed_condition(
+                group.metadata.generation,
+                "Held",
+                "This group's desired deployment is waiting for rollout capacity, a rollout \
+                 window, its inputs, or a prerequisite group.",
+            ),
+            crate::rollout::GroupProgress::Rolling => failed_condition(
+                group.metadata.generation,
+                "Rolling",
+                "This group is incrementally advancing to its admitted deployment.",
+            ),
+            crate::rollout::GroupProgress::Settled => ready_condition(
+                group.metadata.generation,
+                "Published",
+                "This group's deployment is fully admitted in the published routing generation.",
+            ),
+            // Published in full, but nothing can confirm it: every agent this group selects was
+            // provisioned offline (no pinned key) or it selects none at all. Ready — it is not
+            // waiting on anything — but the reason says what the claim rests on.
+            crate::rollout::GroupProgress::Unobservable => ready_condition(
+                group.metadata.generation,
+                "PublishedUnobservable",
+                "This group's deployment is published to every agent it selects, but none of them \
+                 can report telemetry, so its health is unconfirmed.",
+            ),
+        };
         let status = group_generation_status(
             group.metadata.generation,
             Some(matched as u32),
             Some(plan.digest.clone()),
-            if held || rolling {
-                let (reason, message) = if held {
-                    (
-                        "Held",
-                        "This group's desired deployment is waiting for rollout capacity.",
-                    )
-                } else {
-                    (
-                        "Rolling",
-                        "This group is incrementally advancing to its admitted deployment.",
-                    )
-                };
-                failed_condition(group.metadata.generation, reason, message)
-            } else {
-                ready_condition(
-                    group.metadata.generation,
-                    "Published",
-                    "This group's deployment is fully admitted in the published routing generation.",
-                )
-            },
+            condition,
         );
         groups
             .patch_status(
@@ -1411,8 +1634,15 @@ pub async fn record_repository_failure(
     let generation = repository.metadata.generation;
     let status = UpdateRepositoryStatus {
         observed_generation: generation,
-        published_digest: repository.status.and_then(|status| status.published_digest),
+        published_digest: repository
+            .status
+            .as_ref()
+            .and_then(|status| status.published_digest.clone()),
         agent_count: None,
+        // A failure never withdraws the trust anchor; enrollment must keep working.
+        routing_root_sha256: repository
+            .status
+            .and_then(|status| status.routing_root_sha256),
         conditions: vec![failed_condition(
             generation,
             "ReconciliationFailed",
@@ -1659,5 +1889,41 @@ mod lease_tests {
 
         // Re-pruning an already-clean prefix is a no-op — the resumability the finalizer relies on.
         assert_eq!(prune_prefix(&store, "tenant/routing").await.unwrap(), 0);
+    }
+
+    #[test]
+    fn offline_enrollment_without_a_trust_anchor_is_an_error_not_a_silent_skip() {
+        assert_eq!(offline_enrollment_anchor(0, None).unwrap(), None);
+        assert_eq!(offline_enrollment_anchor(0, Some("anchor")).unwrap(), None);
+        assert_eq!(
+            offline_enrollment_anchor(3, Some("anchor")).unwrap(),
+            Some("anchor")
+        );
+        let error = offline_enrollment_anchor(3, None).unwrap_err();
+        assert!(
+            error.0.contains("routingRootSha256"),
+            "the operator must be told exactly what is missing: {error}"
+        );
+    }
+
+    /// The durable state shares ONE ConfigMap object budget across every per-node map, so the
+    /// published assignments are stored inverted: a 64-character digest is written once per
+    /// deployment instead of once per node.
+    #[test]
+    fn published_assignments_round_trip_and_intern_their_digests() {
+        let identity = "a".repeat(64);
+        let assignments: BTreeMap<String, String> = (0..50)
+            .map(|index| (format!("node-{index:03}"), identity.clone()))
+            .collect();
+        let encoded = encode_assignments(&assignments);
+        assert_eq!(encoded.len(), 1);
+        assert_eq!(decode_assignments(encoded.clone()), assignments);
+        let inverted = serde_json::to_string(&encoded).unwrap().len();
+        let flat = serde_json::to_string(&assignments).unwrap().len();
+        assert!(
+            inverted * 2 < flat,
+            "storing one digest per deployment must be far smaller than one per node \
+             ({inverted} vs {flat} bytes)"
+        );
     }
 }

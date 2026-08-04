@@ -216,14 +216,6 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
     super::request_shutdown();
 }
 
-/// Ask a supervisor process to stop gracefully (the guardian hard-kills it if the grace
-/// expires). On Unix that is a `SIGTERM`.
-pub fn terminate_gracefully(pid: u32) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
-}
-
 /// Wait up to `timeout_ms` for `fd` to become readable, so the single-threaded guardian
 /// can watch the control channel while still periodically checking the app and supervisor.
 fn poll_readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {

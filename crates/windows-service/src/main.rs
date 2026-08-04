@@ -1,10 +1,16 @@
 //! Native Windows SCM host for the installer-owned bootstrap.
 //!
-//! The service owns only the bootstrap process. It reports a bootstrap that exits on its own to
-//! the SCM as a service failure — restarts are the SCM's recovery actions, not a second loop in
-//! here — and translates SERVICE_CONTROL_STOP into CTRL_BREAK for the bootstrap's process
-//! group. The supervisor puts the managed application in a different process
-//! group, so service maintenance never sends the application a console event.
+//! The service owns only the bootstrap, and owns it as a contained tree: it is spawned into a
+//! kill-on-close job object, so a bootstrap can never outlive the service process that reports
+//! its state to the SCM. That is what keeps the single-guardian invariant true across the SCM's
+//! recovery restarts — a second service process would otherwise launch a second guardian over
+//! the same state directory.
+//!
+//! It reports a bootstrap that exits on its own to the SCM as a service failure — restarts are
+//! the SCM's recovery actions, not a second loop in here — and translates SERVICE_CONTROL_STOP
+//! into CTRL_BREAK for the bootstrap's process group. The supervisor puts the managed
+//! application in a different process group, so service maintenance never sends the application
+//! a console event.
 
 #[cfg(not(windows))]
 fn main() {
@@ -15,8 +21,7 @@ fn main() {
 mod windows {
     use std::ffi::{c_void, OsString};
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::process::CommandExt;
-    use std::process::{Child, Command};
+    use std::process::Command;
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::OnceLock;
@@ -25,18 +30,17 @@ mod windows {
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, NO_ERROR,
     };
-    use windows_sys::Win32::System::Console::{
-        AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
-        CTRL_BREAK_EVENT,
-    };
     use windows_sys::Win32::System::Services::*;
-    use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
+
+    use foundation::process::ContainedChild;
 
     const SERVICE_NAME: &str = "SelfUpdateSupervisor";
     const STOP_GRACE: Duration = Duration::from_secs(20);
     /// Extra time reported to the SCM beyond [`STOP_GRACE`], covering the hard kill and reap that
     /// follow an expired grace.
     const STOP_KILL_HEADROOM: Duration = Duration::from_secs(10);
+    /// How often the bootstrap is re-checked while watching it and while stopping it.
+    const POLL: Duration = Duration::from_millis(100);
     static STOP: AtomicBool = AtomicBool::new(false);
     static STATUS: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
     static ARGS: OnceLock<Args> = OnceLock::new();
@@ -175,78 +179,106 @@ mod windows {
     /// here as well would be a second restart path that reports success while looping.
     fn run_service() -> Result<(), String> {
         let mut child = spawn_bootstrap()?;
-        if monitor(&mut child)? {
+        if monitor(&mut child) {
             return Ok(());
         }
         // The bootstrap exited on its own. Report it as a service failure instead of restarting
         // here: the SCM's recovery actions retry with escalating backoff and eventually give up
         // visibly, whereas an in-process retry loop restarts a bootstrap that fails immediately —
         // forever, on a fixed delay — while the SCM is told the service is running fine.
-        let status = child
-            .try_wait()
-            .map_err(|e| e.to_string())?
-            .and_then(|status| status.code());
+        let status = child.try_wait().ok().flatten().and_then(|s| s.code());
         Err(match status {
             Some(code) => format!("the bootstrap exited with code {code}"),
             None => "the bootstrap exited".to_string(),
         })
     }
 
-    /// Returns true when service shutdown was requested, false when the bootstrap exited on its
-    /// own (which the caller reports to the SCM as a failure).
-    fn monitor(child: &mut Child) -> Result<bool, String> {
+    /// Watch the bootstrap until a stop is requested or it exits on its own. Returns true for the
+    /// requested stop (the caller reports a clean STOPPED) and false when it exited by itself
+    /// (reported to the SCM as a failure).
+    ///
+    /// It never returns while the bootstrap is still running, and no failure inside it is
+    /// propagated: a STOPPED report — clean or failed — is the moment the SCM may start another
+    /// service process, and the configured recovery action does exactly that on a failure. A
+    /// bootstrap that outlived this wrapper would then meet a second guardian over the same
+    /// `--state-dir`, both owning `desired-supervisor` and `rejected-supervisor`.
+    fn monitor(child: &mut ContainedChild) -> bool {
         loop {
             if STOP.load(Ordering::SeqCst) {
-                // CREATE_NEW_PROCESS_GROUP makes the bootstrap PID its console group
-                // id. The application is in another group and does not receive this.
-                // SCM services have no console of their own. Attach briefly to the
-                // bootstrap's private console, ignore the event in this wrapper,
-                // target the bootstrap's group, then detach again.
-                // If the console cannot be attached the break event is never delivered, so the
-                // graceful path did not happen: waiting out the full grace only delays the kill
-                // by 20 seconds and makes an operator-visible clean stop look like a hang. Say so,
-                // and go straight to the kill.
-                let signalled = unsafe {
-                    if AttachConsole(child.id()) != 0 {
-                        SetConsoleCtrlHandler(None, 1);
-                        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id());
-                        FreeConsole();
-                        true
-                    } else {
-                        eprintln!(
-                            "selfupdate-service: could not attach the bootstrap's console ({}); \
-                             stopping it without the graceful break",
-                            std::io::Error::last_os_error()
-                        );
-                        false
-                    }
-                };
-                let deadline = Instant::now()
-                    + if signalled {
-                        STOP_GRACE
-                    } else {
-                        Duration::ZERO
-                    };
-                while Instant::now() < deadline {
-                    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-                        return Ok(true);
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+                stop_bootstrap(child);
+                return true;
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => return false,
+                Ok(None) => std::thread::sleep(POLL),
+                Err(error) => {
+                    // The handle is unusable, so the bootstrap can no longer be observed — it may
+                    // well still be running. Take the tree down before reporting anything.
+                    eprintln!("selfupdate-service: watching the bootstrap failed ({error})");
+                    stop_bootstrap(child);
+                    return false;
                 }
-                child
-                    .kill()
-                    .map_err(|e| format!("killing bootstrap: {e}"))?;
-                let _ = child.wait();
-                return Ok(true);
             }
-            if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-                return Ok(false);
-            }
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    fn spawn_bootstrap() -> Result<Child, String> {
+    /// Stop the bootstrap tree: a graceful console break first, then a hard kill of the whole
+    /// job. Returns only once it is gone, or once the kill has been issued and the wait for it
+    /// has been given [`STOP_KILL_HEADROOM`] — the same budget the SCM was told to expect.
+    ///
+    /// Failures are logged, never propagated, and the last resort is structural rather than
+    /// reported: the tree lives in a kill-on-close job object, so dropping `child` when this
+    /// wrapper exits takes down anything that survived. There is no path on which a bootstrap
+    /// outlives the service process that owns it.
+    fn stop_bootstrap(child: &mut ContainedChild) {
+        // The graceful stop is `ContainedChild`'s: it owns the process group the break event
+        // addresses and the console borrowing a console-less service needs, so this wrapper holds
+        // no Windows console code of its own.
+        //
+        // If the event could not be delivered the graceful path did not happen: waiting out the
+        // full grace only delays the kill by 20 seconds and makes an operator-visible clean stop
+        // look like a hang. Say so, and go straight to the kill.
+        let grace = match child.request_stop() {
+            Ok(()) => STOP_GRACE,
+            Err(error) => {
+                eprintln!(
+                    "selfupdate-service: could not ask the bootstrap to stop gracefully \
+                     ({error}); stopping it without the graceful break"
+                );
+                Duration::ZERO
+            }
+        };
+        if reaped_within(child, grace) {
+            return;
+        }
+        // The grace expired: terminate the job, which takes the bootstrap and everything it
+        // spawned, not just the root process.
+        if let Err(error) = child.kill_tree() {
+            eprintln!("selfupdate-service: killing the bootstrap tree failed ({error})");
+        }
+        if !reaped_within(child, STOP_KILL_HEADROOM) {
+            eprintln!(
+                "selfupdate-service: the bootstrap did not exit after being killed; its \
+                 kill-on-close job takes it down as this process exits"
+            );
+        }
+    }
+
+    /// Poll for the bootstrap's exit for up to `budget`. An unusable handle ends the wait at
+    /// once — it can never start reporting an exit again.
+    fn reaped_within(child: &mut ContainedChild, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => std::thread::sleep(POLL),
+                Err(_) => return false,
+            }
+        }
+        matches!(child.try_wait(), Ok(Some(_)))
+    }
+
+    fn spawn_bootstrap() -> Result<ContainedChild, String> {
         let args = ARGS.get().ok_or("service arguments unavailable")?;
         let mut command = Command::new(&args.bootstrap);
         command
@@ -260,9 +292,11 @@ mod windows {
         if let Some(address) = &args.probe_address {
             command.arg("--probe-address").arg(address);
         }
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE);
-        command
-            .spawn()
+        // Contained: the bootstrap and everything below it belong to a kill-on-close job object
+        // this process owns, so the tower can never survive the service process that reports its
+        // state to the SCM. A service has no console, so the bootstrap is given one — that is what
+        // makes `request_stop`'s graceful break addressable at all.
+        ContainedChild::spawn_in_new_console(command)
             .map_err(|e| format!("launching bootstrap {:?}: {e}", args.bootstrap))
     }
 

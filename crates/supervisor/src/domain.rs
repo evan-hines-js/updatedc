@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use updated::bundle::ReleaseId;
+use updated::config::Timeouts;
 pub(crate) use updated::state::{Installed, InstalledState, Pending};
 pub(crate) use updated::transaction::{Phase as TransactionPhase, Transaction};
 
@@ -29,6 +30,72 @@ pub(crate) fn window_remaining(pending: &Pending, window: Duration, now: u64) ->
     // return a near-`u64::MAX` duration that panics `Instant + Duration` in the loop's sleep,
     // turning a bad timestamp into a diagnostic-free crash loop on every boot.
     Duration::from_secs(ends_at.saturating_sub(now)).min(window)
+}
+
+/// The longest wall-clock wait the supervisor will ever schedule. Every timeout it holds is a
+/// deadline (`Instant + Duration`) or a sleep, and both PANIC on overflow — a near-`u64::MAX`
+/// duration turns into a diagnostic-free crash on every boot, before any rejection or rollback can
+/// be recorded.
+///
+/// The ceiling itself is not this crate's to pick: it is the same rule
+/// [`MAX_INTERVAL_SECONDS`](updated_contracts::assignment::MAX_INTERVAL_SECONDS) applies when a
+/// signed assignment is ingested, so it is *referenced* here rather than restated. A second
+/// literal could drift from the one publishers are validated against, and then a value that
+/// passed ingest would be silently rewritten here (or, worse, a value this crate accepted would
+/// exceed what the fleet contract promised).
+const MAX_WAIT: Duration = Duration::from_secs(updated_contracts::assignment::MAX_INTERVAL_SECONDS);
+
+/// The supervisor's timeouts, with every wall-clock wait clamped to [`MAX_WAIT`].
+///
+/// Ingest already rejects anything above the ceiling, so this clamp is the belt to that
+/// suspenders: it also covers the durations that reach a supervisor without passing
+/// `ManagedRuntime::validate` — the node-local bootstrap config and this crate's own defaults —
+/// and it is structural, since `new` is the only constructor and a `Timeouts` cannot reach a
+/// deadline or a sleep any other way. `Deref` keeps every read site unchanged.
+#[derive(Clone)]
+pub(crate) struct BoundedTimeouts(Timeouts);
+
+impl BoundedTimeouts {
+    pub(crate) fn new(timeouts: Timeouts) -> Self {
+        BoundedTimeouts(Timeouts {
+            check_interval: timeouts.check_interval.min(MAX_WAIT),
+            health_grace: timeouts.health_grace.min(MAX_WAIT),
+            health_successes: timeouts.health_successes,
+            health_interval: timeouts.health_interval.min(MAX_WAIT),
+            retry_after: timeouts.retry_after.min(MAX_WAIT),
+            refresh_retry: timeouts.refresh_retry.min(MAX_WAIT),
+            confirmation_window: timeouts.confirmation_window.min(MAX_WAIT),
+            supervisor_check_interval: timeouts.supervisor_check_interval.min(MAX_WAIT),
+            drain_hold: timeouts.drain_hold.map(|hold| hold.min(MAX_WAIT)),
+        })
+    }
+}
+
+impl std::ops::Deref for BoundedTimeouts {
+    type Target = Timeouts;
+
+    fn deref(&self) -> &Timeouts {
+        &self.0
+    }
+}
+
+/// The release the boot health gate must observe, and the providers it must observe it with.
+///
+/// These are one signed unit and must always be resolved together. During a crash-recovered
+/// rollback the predecessor's commit is deferred until *after* the gate, so the installed record
+/// still names the CANDIDATE while the restored PREDECESSOR is the process that is running: taking
+/// the providers from the transaction but the identity from the record would gate 1.0.0 with
+/// `--candidate 2.0.0`, and a reconciler that honours the documented argv contract reports
+/// unhealthy — eventually rejecting a perfectly good release and writing its outputs under the
+/// candidate's hash, where telemetry never looks.
+pub(crate) fn boot_gate_target(
+    recovery: Option<&Transaction>,
+    installed: &InstalledState,
+) -> (ReleaseId, Box<updated::state::ProviderRelease>) {
+    match recovery {
+        Some(tx) if tx.is_rollback() => (tx.previous_release.clone(), tx.lifecycle.clone()),
+        _ => (installed.release.clone(), installed.lifecycle.clone()),
+    }
 }
 
 // ============================== boot state machine ==============================
@@ -190,6 +257,106 @@ mod tests {
         assert_eq!(window_remaining(&pending(), window, 1120), Duration::ZERO);
         assert_eq!(window_remaining(&pending(), window, 5000), Duration::ZERO);
         assert!(window_passed(&pending(), window, 1120));
+    }
+
+    fn release(version: &str) -> ReleaseId {
+        ReleaseId {
+            version: version.into(),
+            manifest_sha256: format!("{version}-manifest"),
+        }
+    }
+
+    fn lineage() -> updated::state::RepositoryLineage {
+        updated::state::RepositoryLineage::from_metadata_url("https://repo/metadata/")
+    }
+
+    /// The installed record as it looks mid-rollback: the CANDIDATE, because its predecessor's
+    /// commit is deferred until after the boot health gate.
+    fn deferred_candidate_record() -> InstalledState {
+        InstalledState::confirmed(
+            lineage(),
+            release("2.0.0"),
+            "archive-two".into(),
+            provider(),
+        )
+    }
+
+    fn rollback_of(predecessor: ReleaseId) -> Transaction {
+        let mut predecessor_provider = provider();
+        predecessor_provider.release = release("0.9.0");
+        Transaction {
+            id: "attempt".into(),
+            previous_release: predecessor,
+            previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
+            candidate_release: release("2.0.0"),
+            candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
+            candidate_rejection_required: true,
+            lifecycle: predecessor_provider,
+            rollback_health_failures: 0,
+            phase: TransactionPhase::RollbackStarted,
+        }
+    }
+
+    #[test]
+    fn the_boot_gate_targets_the_release_that_is_actually_running() {
+        // A crash-recovered rollback restored 1.0.0 but the installed record still names the
+        // candidate. Both the identity AND the providers must come from the transaction: gating
+        // 1.0.0 with `--candidate 2.0.0` makes a conforming reconciler report unhealthy.
+        let predecessor = release("1.0.0");
+        let tx = rollback_of(predecessor.clone());
+        let record = deferred_candidate_record();
+
+        let (target, lifecycle) = boot_gate_target(Some(&tx), &record);
+        assert_eq!(target, predecessor);
+        assert_eq!(lifecycle, tx.lifecycle);
+
+        // An ordinary boot has no rollback, so the committed record is the running release.
+        let (target, lifecycle) = boot_gate_target(None, &record);
+        assert_eq!(target, record.release);
+        assert_eq!(lifecycle, record.lifecycle);
+
+        // A forward transaction is not a rollback: nothing was restored, the record still governs.
+        let mut forward = rollback_of(release("1.0.0"));
+        forward.phase = TransactionPhase::CandidateStarted;
+        let (target, _) = boot_gate_target(Some(&forward), &record);
+        assert_eq!(target, record.release);
+    }
+
+    #[test]
+    fn timeouts_from_a_signed_assignment_can_never_overflow_a_deadline() {
+        // The assignment bounds these from below only, so an absurd (or hostile) value must not
+        // reach `Instant + Duration`, which panics on overflow — a crash loop no rollback can break.
+        let bounded = BoundedTimeouts::new(Timeouts {
+            check_interval: Duration::MAX,
+            health_grace: Duration::from_secs(u64::MAX),
+            health_interval: Duration::MAX,
+            retry_after: Duration::MAX,
+            refresh_retry: Duration::MAX,
+            confirmation_window: Duration::MAX,
+            supervisor_check_interval: Duration::MAX,
+            drain_hold: Some(Duration::MAX),
+            ..Timeouts::default()
+        });
+        let now = std::time::Instant::now();
+        for wait in [
+            bounded.check_interval,
+            bounded.health_grace,
+            bounded.health_interval,
+            bounded.retry_after,
+            bounded.refresh_retry,
+            bounded.confirmation_window,
+            bounded.supervisor_check_interval,
+            bounded.drain_hold.unwrap(),
+        ] {
+            assert_eq!(wait, MAX_WAIT);
+            let _ = now + wait;
+        }
+        // Ordinary values pass through untouched.
+        let sane = BoundedTimeouts::new(Timeouts::default());
+        assert_eq!(sane.health_grace, Timeouts::default().health_grace);
+        assert_eq!(sane.drain_hold, Timeouts::default().drain_hold);
     }
 
     #[test]

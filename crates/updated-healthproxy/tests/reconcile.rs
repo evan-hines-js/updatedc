@@ -9,13 +9,16 @@ use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use updated_contracts::telemetry::{report_object_key, NodeReport};
-use updated_healthproxy::{resolve_members, FleetNode, LoadBalancer, Member};
+use updated_healthproxy::{resolve_members, FleetNode, LoadBalancer, Member, PinnedKey};
 
-static TEST_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| {
+static TEST_KEY: std::sync::LazyLock<(Vec<u8>, PinnedKey)> = std::sync::LazyLock::new(|| {
     let rng = aws_lc_rs::rand::SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
     let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
-    (pkcs8.as_ref().to_vec(), key.public_key().as_ref().to_vec())
+    (
+        pkcs8.as_ref().to_vec(),
+        PinnedKey::parse(&hex::encode(key.public_key().as_ref())).unwrap(),
+    )
 });
 
 /// A well-formed running digest. Membership follows health, never the digest, but a report
@@ -104,7 +107,7 @@ async fn membership_reflects_each_node_health_and_drives_the_balancer() {
     ]);
     let client = reqwest::Client::new();
 
-    let mut cache = std::collections::HashMap::new();
+    let mut cache = updated_healthproxy::LastKnownGood::new();
     let members = resolve_members(&client, &base, &inventory, &mut cache).await;
     assert_eq!(
         members,
@@ -158,7 +161,7 @@ async fn a_transient_cdn_outage_does_not_drain_a_freshly_healthy_node() {
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .unwrap();
-    let mut cache = std::collections::HashMap::new();
+    let mut cache = updated_healthproxy::LastKnownGood::new();
 
     // Cycle 1: the live CDN reports the node healthy; the cache is populated.
     let live_members = resolve_members(&client, &live, &inventory, &mut cache).await;

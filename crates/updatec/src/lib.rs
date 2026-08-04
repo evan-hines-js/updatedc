@@ -55,6 +55,32 @@ pub struct UpdateGroupSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_unavailable: Option<usize>,
+    /// The operator's explicit statement that [`deployment`](Self::deployment) is an EMERGENCY
+    /// CORRECTION: admit it now, without waiting for the governing
+    /// [`UpdateGroupSet`]'s rollout schedule (its windows and its calendar).
+    ///
+    /// The schedule, and ONLY the schedule, is bypassed. The set's concurrency limit still applies:
+    /// an emergency correction to a settled group waits for one of the set's `maxConcurrent` slots
+    /// exactly as an ordinary retarget does, so declaring an emergency across many groups at once
+    /// still rolls them `maxConcurrent` at a time rather than changing the whole fleet
+    /// simultaneously. (A group whose rollout is already in flight holds the slot it claimed, so
+    /// retargeting it needs no new one — that is true of any retarget, emergency or not.) This
+    /// group's `maxUnavailable` staging, its resolved inputs, and its prerequisites all still apply
+    /// too.
+    ///
+    /// Intent is STATED here rather than inferred from telemetry, and that is the whole point. The
+    /// control plane cannot tell an emergency rollback from an ordinary forward change by looking at
+    /// node health: a group carrying one chronically unhealthy node (a failing downstream
+    /// dependency, an expired licence) would be permanently window-exempt, while the failure an
+    /// operator most needs to escape a window for — a release that bricks the agent itself — emits
+    /// no telemetry at all and so looks like nothing is wrong. Both cases are answered by the
+    /// operator saying so.
+    ///
+    /// It stays in force until it is cleared, and it is loudly visible while it is: the governing
+    /// set lists the group in `status.emergency`, and `updatectl deploy` writes this field
+    /// explicitly on every publish, so the next ordinary deploy of this group clears it.
+    #[serde(default)]
+    pub emergency_correction: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -349,13 +375,28 @@ pub struct UpdateGroupSetStatus {
     /// Member groups currently admitted to roll (desired != settled).
     #[serde(default)]
     pub rolling: Vec<String>,
-    /// Member groups settled on their desired deployment (all agents report it, healthy).
+    /// Member groups settled on their desired deployment: every agent whose reports can be
+    /// verified reports it, healthy. Agents with no pinned public key are excluded from the
+    /// judgement rather than assumed healthy — a group carrying any of them is listed here only as
+    /// "settled as far as anything can be observed".
     #[serde(default)]
     pub settled: Vec<String>,
+    /// Member groups no evidence can ever come from: they select no agent, or EVERY agent they
+    /// select has no pinned public key (offline-provisioned, never enrolled). They hold no
+    /// concurrency slot and will never settle, so anything gated on them waits forever — which is
+    /// why they are surfaced rather than folded into `rolling`.
+    #[serde(default)]
+    pub unobservable: Vec<String>,
     /// Member groups also claimed by another set, safely rolled up (admitted only when
     /// every governing set has a slot).
     #[serde(default)]
     pub shared: Vec<String>,
+    /// Member groups whose spec declares
+    /// [`emergency_correction`](UpdateGroupSpec::emergency_correction): their desired deployment is
+    /// admitted without waiting for this set's schedule. Listed for as long as the flag is set, so
+    /// an emergency override is never silently permanent.
+    #[serde(default)]
+    pub emergency: Vec<String>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
 }
@@ -394,7 +435,10 @@ pub struct AgentIdentity {
     /// the same key that certifies its mTLS leaf. Rollout planning verifies the node's *signed*
     /// telemetry against this, so a report is attributable end-to-end (node → planner), not merely
     /// authenticated on the write hop. `None` for a manual or pre-signing agent, whose reports then
-    /// fail verification and so fail closed.
+    /// fail verification and so fail closed: the planner treats such a node as BLIND (see
+    /// `rollout::NodeEvidence`) — never counted healthy, never counted as holding its group back —
+    /// and stages it on what was published to it, so its group stays throttled and stays
+    /// updatable without any unverifiable report ever being believed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
 }
@@ -488,6 +532,15 @@ pub struct UpdateRepositoryStatus {
     pub observed_generation: Option<i64>,
     pub published_digest: Option<String>,
     pub agent_count: Option<u32>,
+    /// SHA-256 of the `root.json` this control plane publishes — the fleet's trust anchor, recorded
+    /// in etcd where only the control plane can write it.
+    ///
+    /// The object store is a distribution channel, not a trust boundary: anyone able to write its
+    /// prefix can replace `root.json`. Enrollment therefore pins the root it hands a node against
+    /// THIS value before verifying anything else. `None` until the first publish, and enrollment
+    /// refuses to serve a bundle until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_root_sha256: Option<String>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
 }
@@ -593,6 +646,10 @@ pub struct PublicationPlan {
     /// target references.
     pub targets: Vec<PublicationTarget>,
     pub node_groups: BTreeMap<String, String>,
+    /// Node → the identity of the deployment this generation publishes for it. Recorded here, by
+    /// the one function that decides what a node is handed, so the next generation can tell which
+    /// nodes have already been advanced without asking telemetry that ages out mid-update.
+    pub node_assignments: BTreeMap<String, String>,
     pub digest: String,
 }
 
@@ -607,6 +664,9 @@ pub struct ResolvedGroup {
     pub inputs_ready: bool,
     pub deployment: DesiredDeployment,
     pub max_unavailable: usize,
+    /// [`UpdateGroupSpec::emergency_correction`] — the operator's stated intent that `deployment`
+    /// is an emergency correction, which exempts its admission from the governing set's schedule.
+    pub emergency_correction: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -797,6 +857,7 @@ pub(crate) fn build_publication_plan(
         );
         targets.push(config);
     }
+    let mut node_assignments = BTreeMap::new();
     for (node, deployment) in &node_deployments {
         let id = updated::hash::sha256_bytes(&canonical_json(deployment)?);
         let assignment = updated_contracts::artifact::AgentDocument {
@@ -806,12 +867,14 @@ pub(crate) fn build_publication_plan(
         let bytes = serde_json::to_vec(&assignment)
             .map_err(|error| PlanError::Serialize(error.to_string()))?;
         targets.push(target(format!("{prefix}/agents/{node}.json"), bytes));
+        node_assignments.insert(node.clone(), id);
     }
     targets.sort_by(|a, b| a.path.cmp(&b.path));
     let digest = publication_digest(&targets);
     Ok(PublicationPlan {
         targets,
         node_groups,
+        node_assignments,
         digest,
     })
 }
@@ -1065,6 +1128,7 @@ mod tests {
             inputs_ready: true,
             deployment: deployment(name),
             max_unavailable: 1,
+            emergency_correction: false,
         }
     }
 

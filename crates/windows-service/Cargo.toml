@@ -10,3 +10,7 @@ path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+# The bootstrap is spawned as a contained tree: the kill-on-close job object is what makes it
+# impossible for a bootstrap to outlive this wrapper and have the SCM start a second guardian
+# over the same state directory.
+foundation = { path = "../foundation" }
