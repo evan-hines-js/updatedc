@@ -60,20 +60,27 @@ pub struct Sup {
     ordered_install_fallback: bool,
     secrets: Vec<updated_contracts::assignment::SecretReference>,
 }
+/// The reconciler every fixture starts with: the shared cross-platform fixture in `accept-managed`
+/// mode. There is one reconciler implementation in this harness, so a scenario can never assert
+/// against an operation vocabulary the supervisor does not speak.
+fn default_lifecycle_command(dir: &Path) -> Vec<String> {
+    vec![
+        std::env::current_exe()
+            .expect("the e2e lifecycle fixture must have a current executable")
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        dir.join("default-lifecycle-state").display().to_string(),
+        "accept-managed".into(),
+    ]
+}
+
 impl Sup {
     /// The tower managing `command` (the app binary + args) against the repo under
     /// `dir` served at `srv`, for `product`.
     pub fn new(ctx: &Ctx, dir: &Path, srv: &str, product: &str, command: Vec<String>) -> Self {
         let seed_binary = PathBuf::from(command.first().expect("app command requires binary"));
-        let lifecycle_command = vec![
-            std::env::current_exe()
-                .expect("the e2e lifecycle fixture must have a current executable")
-                .display()
-                .to_string(),
-            "--lifecycle-fixture".into(),
-            dir.join("default-lifecycle-state").display().to_string(),
-            "accept-managed".into(),
-        ];
+        let lifecycle_command = default_lifecycle_command(dir);
         Sup {
             repository_base_url: format!("https://{srv}/"),
             supervisor_bin: ctx.supervisor.clone(),
@@ -156,7 +163,15 @@ impl Sup {
         self.retry_after = Some(s.into());
         self
     }
+    /// Install this fixture's reconciler. A fixture configures its reconciler exactly once: two
+    /// reconciler-selecting calls in one builder chain would leave the last one silently winning
+    /// and the earlier one's intent unmet.
     pub fn lifecycle(mut self, command: Vec<String>) -> Self {
+        assert_eq!(
+            self.lifecycle_command,
+            default_lifecycle_command(&self.dir),
+            "a fixture selects its node reconciler exactly once"
+        );
         self.lifecycle_command = command;
         self
     }

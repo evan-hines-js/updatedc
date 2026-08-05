@@ -4,6 +4,9 @@ use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+/// The reconciler protocol vocabulary is defined once, in the contracts crate; the demo driver
+/// reads the audit log in exactly those terms rather than re-spelling operations locally.
+use updated_contracts::reconciler::{attempt, Operation};
 
 /// `kubectl` argument prefix that execs into the in-cluster release-server container. Every
 /// release-repository query and mutation runs through it, so it lives in one place.
@@ -17,6 +20,20 @@ pub(crate) const RELEASE_SERVER_EXEC: [&str; 6] = [
 ];
 
 const DEMO_LIFECYCLE_STATE: &str = "/var/lib/updated/providers/state/demo-enterprise-lifecycle";
+
+/// The enterprise sub-phases the demo reconciler runs, in order, inside one `apply`. Each one
+/// requires its predecessor's completion marker, so finding every marker in an attempt's effects
+/// directory is proof the whole sequence ran in this order.
+const LIFECYCLE_SUB_PHASES: [&str; 8] = [
+    "preflight",
+    "prepare",
+    "pre-drain",
+    "drain",
+    "stop",
+    "activate",
+    "start",
+    "verify",
+];
 
 pub(crate) async fn start_demo(
     automated: bool,
@@ -264,31 +281,30 @@ pub(crate) async fn exercise_demo(
     wait_for_fleet_convergence(&client, url, "22.0.0", 240).await?;
     assert_set_isolation().await?;
     assert_external_endpoints_reconciled().await?;
-    let expected = [
-        "preflight",
-        "prepare",
-        "pre-drain",
-        "drain",
-        "stop",
-        "activate",
-        "start",
-        "verify",
-        "finalize",
-    ];
-    let mut completed = false;
+    // The reconciler protocol has four operations, so one update transaction is exactly one
+    // `apply` invocation: the audit proves the transaction ran to completion, and the ordered
+    // sub-phases inside it are proven by the completion markers the reconciler leaves in the
+    // attempt's effects directory. Each sub-phase requires its predecessor's marker, so the
+    // full marker set is the ordering evidence.
+    let mut transaction = None;
     for _ in 0..60 {
         if let Ok(lifecycle) = lifecycle_audit() {
-            if let Some(phases) = latest_completed_lifecycle(&lifecycle) {
-                if phases == expected {
-                    completed = true;
-                    break;
-                }
+            if let Some(attempt) = latest_completed_transaction(&lifecycle) {
+                transaction = Some(attempt);
+                break;
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    if !completed {
-        return Err("the latest lifecycle transaction did not finalize in order".into());
+    let Some(attempt) = transaction else {
+        return Err("no lifecycle update transaction completed its apply operation".into());
+    };
+    let missing = missing_sub_phase_markers(&lifecycle_attempt_markers(&attempt)?);
+    if !missing.is_empty() {
+        return Err(format!(
+            "lifecycle transaction {attempt} completed without its ordered sub-phases: missing {missing:?}"
+        )
+        .into());
     }
     let receipt = output(Command::new("kubectl").args([
         "-n",
@@ -593,23 +609,55 @@ pub(crate) fn lifecycle_audit() -> Result<String, Box<dyn std::error::Error>> {
     ]))
 }
 
-pub(crate) fn latest_completed_lifecycle(audit: &str) -> Option<Vec<String>> {
-    let rows = audit
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            Some((fields.next()?, fields.next()?, fields.next()?))
+/// The attempt id of the newest completed update transaction in the reconciler's audit log.
+///
+/// The reconciler appends one `<operation>\t<attempt>\t<event>` row per invocation. An update
+/// transaction is exactly one [`Operation::Apply`] under a deployment attempt id; the reserved
+/// ids (`boot`, `periodic`, `fingerprint`) name observations that belong to no transaction and
+/// must never be mistaken for one.
+pub(crate) fn latest_completed_transaction(audit: &str) -> Option<String> {
+    audit.lines().rev().find_map(|line| {
+        let mut fields = line.split('\t');
+        let (operation, attempt, event) = (fields.next()?, fields.next()?, fields.next()?);
+        (operation == Operation::Apply.as_str()
+            && event == "completed"
+            && !attempt::is_reserved(attempt))
+        .then(|| attempt.to_owned())
+    })
+}
+
+/// The ordered sub-phases whose completion markers are absent from one attempt's effects
+/// directory — an empty result is proof the whole enterprise sequence ran.
+pub(crate) fn missing_sub_phase_markers(markers: &[String]) -> Vec<&'static str> {
+    LIFECYCLE_SUB_PHASES
+        .into_iter()
+        .filter(|phase| {
+            let marker = format!("{phase}.done");
+            !markers.contains(&marker)
         })
-        .collect::<Vec<_>>();
-    let latest_attempt = rows.iter().rev().find_map(|(phase, attempt, status)| {
-        (*phase == "finalize" && *status == "completed").then_some(*attempt)
-    })?;
-    Some(
-        rows.iter()
-            .filter(|(_, attempt, status)| *attempt == latest_attempt && *status == "completed")
-            .map(|(phase, _, _)| (*phase).to_owned())
-            .collect(),
-    )
+        .collect()
+}
+
+/// The completion markers the reconciler left in one attempt's effects directory.
+pub(crate) fn lifecycle_attempt_markers(
+    attempt: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(output(Command::new("kubectl").args([
+        "-n",
+        "updated-system",
+        "exec",
+        "agent-4",
+        "-c",
+        "agent",
+        "--",
+        "ls",
+        "-1",
+        &format!("{DEMO_LIFECYCLE_STATE}/attempts/{attempt}"),
+    ]))?
+    .lines()
+    .map(|name| name.trim().to_owned())
+    .filter(|name| !name.is_empty())
+    .collect())
 }
 
 pub(crate) fn demo_cluster_pod_capacity(cluster: &str) -> usize {
@@ -1752,4 +1800,69 @@ pub(crate) fn open_browser(url: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The audit log mixes transactions with the reserved observation identities. Only a
+    /// completed `apply` under a deployment attempt is a transaction; a green `healthcheck`
+    /// under `periodic` or `boot` must never be mistaken for one.
+    #[test]
+    fn only_a_completed_apply_under_a_deployment_attempt_counts_as_a_transaction() {
+        let audit = "\
+healthcheck\tboot\tstarted
+healthcheck\tboot\tcompleted
+apply\ta-1\tstarted
+apply\ta-1\tcompleted
+healthcheck\tperiodic\tcompleted
+inspect\tfingerprint\tcompleted
+apply\ta-2\tstarted
+";
+        assert_eq!(latest_completed_transaction(audit).as_deref(), Some("a-1"));
+    }
+
+    #[test]
+    fn the_newest_completed_transaction_wins() {
+        let audit = "\
+apply\ta-1\tcompleted
+rollback\ta-1\tcompleted
+apply\ta-2\tcompleted
+healthcheck\tperiodic\tcompleted
+";
+        assert_eq!(latest_completed_transaction(audit).as_deref(), Some("a-2"));
+    }
+
+    /// Without a completed transaction there is nothing to assert against, and the driver must
+    /// keep waiting rather than accept an unfinished or observation-only audit.
+    #[test]
+    fn an_audit_without_a_completed_transaction_yields_nothing() {
+        let audit = "\
+apply\ta-1\tstarted
+healthcheck\tperiodic\tcompleted
+inspect\tfingerprint\tcompleted
+";
+        assert_eq!(latest_completed_transaction(audit), None);
+    }
+
+    /// A transaction that reported success while skipping sub-phases is the failure this check
+    /// exists to catch; unrelated files in the effects directory must not mask a missing marker.
+    #[test]
+    fn a_skipped_sub_phase_is_reported_as_a_missing_marker() {
+        let mut markers = LIFECYCLE_SUB_PHASES
+            .iter()
+            .map(|phase| format!("{phase}.done"))
+            .collect::<Vec<_>>();
+        markers.push("generated-install.properties".to_owned());
+        markers.push("stopped-process.pid".to_owned());
+        assert!(missing_sub_phase_markers(&markers).is_empty());
+
+        markers.retain(|marker| marker != "verify.done" && marker != "drain.done");
+        assert_eq!(
+            missing_sub_phase_markers(&markers),
+            vec!["drain", "verify"],
+            "the check must name every skipped sub-phase"
+        );
+    }
 }

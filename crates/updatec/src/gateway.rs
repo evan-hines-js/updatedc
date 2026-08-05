@@ -157,15 +157,17 @@ pub struct IssuingCaPaths {
     pub key: std::path::PathBuf,
 }
 
-/// How often the gateway re-reads its mounted certificate material.
+/// How often the gateway rebuilds the configuration it was started with: its mounted certificate
+/// material and its object store.
 ///
 /// Every one of these files is a cert-manager Secret that is rotated IN PLACE, on the issuer's
 /// schedule, with no restart of this process. Loading them once means the gateway keeps presenting
 /// a certificate that eventually expires — at which point every agent's handshake fails and the
-/// whole fleet loses metadata, telemetry, and enrollment at the same moment.
+/// whole fleet loses metadata, telemetry, and enrollment at the same moment. Object-store
+/// credentials rotate the same way and expire far faster when they are temporary.
 const MATERIAL_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A value rebuilt from files on disk while the gateway runs. Readers take the current value; a
+/// A value rebuilt from its source while the gateway runs. Readers take the current value; a
 /// reload that fails to parse leaves the last good one in place, so a half-written rotation is a
 /// logged warning rather than an outage.
 struct Reloadable<T> {
@@ -200,12 +202,25 @@ pub struct GatewayAddresses {
     pub health: String,
 }
 
+/// Where this gateway reads and writes: the configured object store and the key prefix below which
+/// this repository's objects live. The two travel together because they are one configuration —
+/// serving objects from a rebuilt store under the previous prefix would read another repository's
+/// key space — so a handler snapshots the pair once and uses that snapshot for the whole request.
+struct Destination {
+    store: Arc<dyn ObjectStore>,
+    prefix: Arc<str>,
+}
+
 /// Store + prefix — everything the repository and telemetry handlers need. The data router derives
 /// it (via [`FromRef`]), so those handlers require no Kubernetes context and stay trivially testable.
 #[derive(Clone)]
 struct ContentState {
-    store: Arc<dyn ObjectStore>,
-    prefix: Arc<str>,
+    /// Rebuilt on a timer from the `UpdateRepository` and its credentials Secret, exactly as the
+    /// controller rebuilds it every reconcile. The credentials are baked into the `ObjectStore` at
+    /// construction, so a store built once at start-up serves a rotated key — or an STS session
+    /// token — until it expires and then answers every request with a 502 while the repository
+    /// still reports Ready.
+    destination: Arc<Reloadable<Destination>>,
     /// The repository this gateway serves. Carried here because it is an AUTHORIZATION input, not
     /// merely configuration: a client leaf is scoped to the repository that minted it, and a
     /// handler must compare that scope against this before it acts on the caller's node name.
@@ -213,11 +228,8 @@ struct ContentState {
 }
 
 impl ContentState {
-    fn store(&self) -> &dyn ObjectStore {
-        self.store.as_ref()
-    }
-    fn prefix(&self) -> &str {
-        &self.prefix
+    fn destination(&self) -> Arc<Destination> {
+        self.destination.get()
     }
     fn repository(&self) -> &str {
         &self.repository
@@ -234,30 +246,133 @@ struct DataState {
     ca: Arc<Reloadable<crate::join::IssuingCa>>,
 }
 
+/// The label a Secret must carry, set to exactly `"true"`, before this gateway will hand any of it
+/// to a node.
+///
+/// Deny by default, and deliberately an opt-in on the SECRET rather than a naming convention on the
+/// reference: an assignment names its Secrets from `deployment.runtime.secrets`, which anyone with
+/// `create`/`update` on `updategroups.updated.dev` writes — a verb that does not imply `get` on
+/// Secrets. A rule those callers can satisfy on their own is not a gate. Labelling the Secret
+/// requires Secret access, so marking one distributable is a decision only someone who could
+/// already read it can make.
+const DISTRIBUTABLE_LABEL: &str = "updated.dev/fleet-distributable";
+
+/// The annotation cert-manager stamps on every Secret it issues. The fleet CA (whose key mints
+/// every node leaf) and this gateway's own serving key are cert-manager Secrets in this very
+/// namespace, so they are refused whatever labels they carry — a label is copyable from a
+/// `Certificate` template, and no key that authenticates the fleet may ever be fleet-distributable.
+const CERT_MANAGER_ANNOTATION: &str = "cert-manager.io/certificate-name";
+
+/// This API group. Secrets the control plane publishes for its own use — the per-agent enrollment
+/// bundles — are owned by an `updated.dev` object, so ownership is the marker that refuses them.
+const CONTROL_PLANE_API_GROUP: &str = "updated.dev/";
+
+#[derive(Debug, PartialEq, Eq)]
+enum SecretError {
+    /// The Secret (or the key within it) could not be read. Transient from the node's point of
+    /// view: the operator may not have created it yet.
+    Unavailable,
+    /// The Secret was found but this control plane must not distribute it. A misconfiguration, not
+    /// a race — retrying changes nothing until an operator marks the Secret distributable.
+    Forbidden,
+}
+
 #[async_trait::async_trait]
 trait SecretStore: Send + Sync {
-    async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, ()>;
+    async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, SecretError>;
 }
 
 #[derive(Clone)]
 struct KubernetesSecretStore {
     client: Client,
     namespace: String,
+    /// The Secrets this repository's own trust depends on: its TUF signing keys and its object-store
+    /// credentials. Named from the `UpdateRepository` rather than guessed, and refused before the
+    /// read, so the control plane's own key material can never satisfy the predicate even if
+    /// someone labels it.
+    reserved: Vec<String>,
+}
+
+impl KubernetesSecretStore {
+    /// The store a node's secret bundle is resolved through. The only constructor, so the reserved
+    /// list can never be omitted at a call site: an empty one would make the repository's own
+    /// signing keys and object-store credentials readable by any node whose assignment names them.
+    fn for_repository(
+        client: Client,
+        namespace: String,
+        repository: &crate::UpdateRepository,
+    ) -> Self {
+        Self {
+            client,
+            namespace,
+            reserved: reserved_secrets(repository),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl SecretStore for KubernetesSecretStore {
-    async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, ()> {
+    async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, SecretError> {
+        if self.reserved.iter().any(|reserved| reserved == name) {
+            return Err(SecretError::Forbidden);
+        }
         let secret = Api::<Secret>::namespaced(self.client.clone(), &self.namespace)
             .get(name)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| SecretError::Unavailable)?;
+        if !is_fleet_distributable(&secret) {
+            return Err(SecretError::Forbidden);
+        }
         secret
             .data
             .and_then(|data| data.get(key).cloned())
             .map(|value| value.0)
-            .ok_or(())
+            .ok_or(SecretError::Unavailable)
     }
+}
+
+/// Whether this Secret has been explicitly published to the fleet.
+///
+/// Every clause is a refusal; there is no path that serves a Secret nobody opted in. The opt-in
+/// label is the gate, and the two exclusions below cover the material the control plane's own
+/// identity rests on — key material that must not become distributable by mislabelling.
+fn is_fleet_distributable(secret: &Secret) -> bool {
+    let labelled = secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(DISTRIBUTABLE_LABEL))
+        .is_some_and(|value| value == "true");
+    let cert_manager_issued = secret
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|annotations| annotations.contains_key(CERT_MANAGER_ANNOTATION));
+    let control_plane_owned = secret
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners
+                .iter()
+                .any(|owner| owner.api_version.starts_with(CONTROL_PLANE_API_GROUP))
+        });
+    labelled && !cert_manager_issued && !control_plane_owned
+}
+
+/// The Secrets that hold this repository's own signing keys and object-store credentials, refused
+/// by name before any read.
+fn reserved_secrets(repository: &crate::UpdateRepository) -> Vec<String> {
+    let mut names = vec![repository.spec.signing_secret_ref.name.clone()];
+    names.extend(
+        repository
+            .spec
+            .s3
+            .credentials_secret_ref
+            .iter()
+            .map(|reference| reference.name.clone()),
+    );
+    names
 }
 
 impl FromRef<DataState> for ContentState {
@@ -271,6 +386,7 @@ fn data_router(state: DataState) -> Router {
         .route("/healthz", get(healthz))
         .route("/enroll", post(enroll))
         .route("/renew", post(renew))
+        .route("/bundle", post(bundle))
         .route("/telemetry/{file}", put(telemetry_put))
         .route("/v1/node/secrets", get(node_secrets))
         .route("/metadata/{*rest}", get(repo_get).head(repo_get))
@@ -298,6 +414,9 @@ struct SecretBundle {
 enum SecretBundleError {
     Unavailable,
     Invalid,
+    /// The assignment names a Secret this control plane will not distribute. Answered separately
+    /// from `Unavailable` so the refusal is not read as "not created yet" and retried forever.
+    Forbidden,
 }
 
 async fn resolve_secret_bundle(
@@ -312,10 +431,26 @@ async fn resolve_secret_bundle(
     let mut total = 0usize;
     digest.update(assignment.deployment.as_bytes());
     for reference in &assignment.runtime.secrets {
+        // The whole bundle fails on a refused reference rather than dropping that entry: a node
+        // handed a bundle silently missing one value starts its application with the environment
+        // half-configured, and the operator sees a healthy rollout.
         let bytes = store
             .value(&reference.secret, &reference.key)
             .await
-            .map_err(|()| SecretBundleError::Unavailable)?;
+            .map_err(|error| match error {
+                SecretError::Unavailable => SecretBundleError::Unavailable,
+                SecretError::Forbidden => {
+                    tracing::warn!(
+                        deployment = %assignment.deployment,
+                        secret = %reference.secret,
+                        environment = %reference.environment,
+                        "refusing to distribute a Secret this deployment references: it is not \
+                         labelled {DISTRIBUTABLE_LABEL}=true, or it is control-plane key material. \
+                         Label the Secret to publish it to the fleet."
+                    );
+                    SecretBundleError::Forbidden
+                }
+            })?;
         total = total.saturating_add(bytes.len());
         if bytes.len() > MAX_SECRET_BYTES || total > MAX_BUNDLE_BYTES {
             return Err(SecretBundleError::Invalid);
@@ -356,9 +491,10 @@ async fn node_secrets(
     let Some(trust_anchor) = published_root_sha256(&repository) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let destination = state.content.destination();
     let signed = match resolve_signed_enrollment(
-        state.content.store(),
-        state.content.prefix(),
+        destination.store.as_ref(),
+        &destination.prefix,
         &assignment,
         &trust_anchor,
     )
@@ -375,16 +511,18 @@ async fn node_secrets(
     if assignment.validate().is_err() {
         return StatusCode::BAD_GATEWAY.into_response();
     }
-    let store = KubernetesSecretStore {
-        client: state.enrollment.client.clone(),
-        namespace: state.enrollment.namespace.clone(),
-    };
+    let store = KubernetesSecretStore::for_repository(
+        state.enrollment.client.clone(),
+        state.enrollment.namespace.clone(),
+        &repository,
+    );
     let bundle = match resolve_secret_bundle(&assignment, &store).await {
         Ok(bundle) => bundle,
         Err(SecretBundleError::Unavailable) => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(SecretBundleError::Invalid) => return StatusCode::BAD_GATEWAY.into_response(),
+        Err(SecretBundleError::Forbidden) => return StatusCode::FORBIDDEN.into_response(),
     };
     let mut response = Json(bundle).into_response();
     response.headers_mut().insert(
@@ -444,9 +582,18 @@ pub async fn serve(
         "repository gateway listening (mTLS data + plaintext health)"
     );
 
-    let content = ContentState {
+    let destination = Arc::new(Reloadable::new(Destination {
         store,
         prefix: Arc::from(prefix),
+    }));
+    tokio::spawn(reload_destination(
+        enrollment.client.clone(),
+        enrollment.namespace.clone(),
+        enrollment.repository.clone(),
+        destination.clone(),
+    ));
+    let content = ContentState {
+        destination,
         repository: Arc::from(enrollment.repository.as_str()),
     };
     // Enrollment is a route on the one mTLS data listener now: the shared fleet enrollment cert
@@ -512,6 +659,49 @@ async fn reload_materials(
             Err(error) => {
                 tracing::warn!(%error, "reloading the issuing CA failed; keeping the loaded one")
             }
+        }
+    }
+}
+
+/// Rebuild the object store forever, on the same timer and with the same fail-safe rule as the
+/// certificate material: a build that fails leaves the working store live.
+///
+/// Object-store credentials are baked in at construction — deliberately, since
+/// `runtime::repository_store` is also the credential-resolution path the controller uses — so
+/// nothing about a live store follows a rotated key or a renewed STS session token. The controller
+/// rebuilt per reconcile and the gateway never did, which is the whole asymmetry: with one-hour
+/// temporary credentials the entire data plane began answering 502 after an hour while the
+/// `UpdateRepository` still reported Ready. Rebuilding unconditionally (rather than diffing the
+/// spec) keeps this to one code path, and it picks up a changed `destination.prefix` with it. The
+/// hot path is untouched: handlers read one `Arc` clone per request.
+async fn reload_destination(
+    client: Client,
+    namespace: String,
+    repository: String,
+    destination: Arc<Reloadable<Destination>>,
+) {
+    loop {
+        tokio::time::sleep(MATERIAL_RELOAD_INTERVAL).await;
+        rebuild_destination(&client, &namespace, &repository, &destination).await;
+    }
+}
+
+/// One rebuild, with the fail-safe: a store that cannot be built leaves the live one serving.
+/// Separate from the timer above so the rule is testable — a rebuild that swapped in nothing on
+/// failure would take the data plane down for a transient apiserver blip.
+async fn rebuild_destination(
+    client: &Client,
+    namespace: &str,
+    repository: &str,
+    destination: &Reloadable<Destination>,
+) {
+    match crate::runtime::repository_store(client.clone(), namespace, repository).await {
+        Ok((configured, store)) => destination.set(Destination {
+            store,
+            prefix: Arc::from(configured.prefix),
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "rebuilding the repository object store failed; keeping the loaded one")
         }
     }
 }
@@ -747,9 +937,37 @@ async fn renew(
 /// cannot drift apart on — a gap on either would let a shared-fleet-cert holder mint a valid
 /// `CN=<name>` leaf for another node's name with an attacker key.
 fn is_pinned_identity(agent: &crate::UpdateAgent, repository: &str, public_key: &str) -> bool {
+    is_enrolled_member(agent, repository)
+        && agent.spec.identity.public_key.as_deref() == Some(public_key)
+}
+
+/// Whether `agent` is still an enrolled member of `repository`.
+///
+/// The membership half of [`is_pinned_identity`], on its own for the routes that authenticate by
+/// certificate rather than by a presented key: a leaf outlives the object that justified it, so a
+/// decommissioned, re-homed or manually-declared agent must stop being served the moment the object
+/// says so, not when its certificate finally expires.
+fn is_enrolled_member(agent: &crate::UpdateAgent, repository: &str) -> bool {
     agent.spec.identity.kind == crate::AgentIdentityKind::Enrolled
         && agent.spec.repository_ref.name == repository
-        && agent.spec.identity.public_key.as_deref() == Some(public_key)
+}
+
+/// Whether this repository already holds as many agents as it will enrol, read from the count the
+/// controller publishes on its status every successful reconcile.
+///
+/// A repository whose status has not been written yet has published nothing, so it holds no agents
+/// and enrollment proceeds. While reconciles succeed the count is at most one of them (a second)
+/// stale, which bounds the overshoot at whatever a second of enrollments can add — orders of
+/// magnitude below the headroom the ceiling leaves. While they FAIL it freezes at the last
+/// successful count rather than disappearing: a failed pass omits what it cannot know instead of
+/// nulling it (see [`crate::UpdateRepositoryStatus`]), because an S3 outage or a lost lease is
+/// exactly when an uncapped `/enroll` does the most damage.
+fn at_enrollment_capacity(repository: &crate::UpdateRepository) -> bool {
+    repository
+        .status
+        .as_ref()
+        .and_then(|status| status.agent_count)
+        .is_some_and(|count| count >= crate::runtime::MAX_ENROLLED_AGENTS)
 }
 
 /// The single enrollment transaction: create the exact enrolled identity idempotently, then mint
@@ -801,6 +1019,28 @@ async fn register_enrollment(
             && existing.spec.identity.registration_sha256.as_deref()
                 == Some(registration_sha256.as_str())
     };
+    // Growth is bounded here because this is the only place a caller can create agents, and the
+    // fleet-wide bootstrap certificate is all it takes to reach it. The count comes from the
+    // repository status the controller already publishes each reconcile, so the check costs
+    // nothing on the ordinary path; the extra read happens only at the ceiling, and only to let an
+    // ALREADY-enrolled node through — a full fleet must still be able to re-enrol and renew.
+    if at_enrollment_capacity(&repository) {
+        let existing = agents.get_opt(name).await;
+        match existing {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(
+                    node = %name,
+                    repository = %context.repository,
+                    limit = crate::runtime::MAX_ENROLLED_AGENTS,
+                    "refusing enrollment: this repository is at its agent ceiling. Split the fleet \
+                     across UpdateRepositories, or remove decommissioned UpdateAgents."
+                );
+                return Err(StatusCode::TOO_MANY_REQUESTS.into_response());
+            }
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        }
+    }
     if let Err(status) = create_agent_idempotent(&agents, name, &desired, matches).await {
         return Err(status.into_response());
     }
@@ -809,16 +1049,33 @@ async fn register_enrollment(
         .get()
         .sign_client_csr(&context.repository, name, csr)
         .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+    let bundle = current_bundle(state, &repository, name).await?;
+    Ok((bundle, leaf))
+}
+
+/// Resolve the enrollment bundle for `name` as of NOW: the repository's currently published signed
+/// metadata chain, the agent's routing assignment, and the managed configuration it signs.
+///
+/// Enrollment and [`bundle`] share it, so a node that re-fetches its bundle receives exactly what a
+/// node enrolling this instant would — there is no second, drifting notion of "the initial signed
+/// configuration", and no way for the refresh path to hand out material the enrollment path would
+/// refuse to.
+async fn current_bundle(
+    state: &DataState,
+    repository: &crate::UpdateRepository,
+    name: &str,
+) -> Result<crate::EnrollmentBundle, Response> {
     let assignment = agent_assignment(&repository.spec.assignment_prefix, name);
     // The consistent-snapshot metadata walk is shared with the operator's enrollment-Secret
     // publisher so this security-sensitive resolution lives in exactly one place. A newly
     // registered agent can legitimately race publication: an object that is not there yet is
     // `Unavailable` (503, retry), while a present-but-malformed document is `Malformed` (502).
-    let trust_anchor = published_root_sha256(&repository)
+    let trust_anchor = published_root_sha256(repository)
         .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    let destination = state.content.destination();
     let signed = match resolve_signed_enrollment(
-        state.content.store(),
-        state.content.prefix(),
+        destination.store.as_ref(),
+        &destination.prefix,
         &assignment,
         &trust_anchor,
     )
@@ -827,8 +1084,51 @@ async fn register_enrollment(
         Ok(signed) => signed,
         Err(error) => return Err(error.status_code().into_response()),
     };
-    let bundle = signed.into_bundle(name.to_string(), &context.public_url, assignment);
-    Ok((bundle, leaf))
+    Ok(signed.into_bundle(name.to_string(), &state.enrollment.public_url, assignment))
+}
+
+/// Re-issue an already-enrolled node's enrollment bundle.
+///
+/// Authorization is the same steady-state rule `/renew` applies: the connection must present a
+/// per-node leaf scoped to THIS repository, and the `UpdateAgent` it names must still be an enrolled
+/// member of it. The shared fleet bootstrap certificate carries no node identity, so it cannot reach
+/// here — it mints leaves at `/enroll` and nothing else.
+///
+/// Nothing is minted, created or mutated: this is a read of the material the node is already
+/// entitled to, under the name its own certificate proves. That is why it needs no CSR and no
+/// public-key pin check — the mTLS handshake already proved possession of the pinned key that leaf
+/// certifies, and re-issuing a bundle to the node it belongs to grants no authority the node does
+/// not already hold.
+async fn bundle(
+    State(state): State<DataState>,
+    Extension(identity): Extension<ClientIdentity>,
+) -> Response {
+    let Some(name) = identity
+        .node_in(state.content.repository())
+        .map(str::to_owned)
+    else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let context = &state.enrollment;
+    let agents: Api<crate::UpdateAgent> =
+        Api::namespaced(context.client.clone(), &context.namespace);
+    let Ok(agent) = agents.get(&name).await else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    // A decommissioned (deleted) or re-homed agent stops receiving bundles the moment the object
+    // says so, even while its unexpired leaf still authenticates.
+    if !is_enrolled_member(&agent, &context.repository) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let repositories: Api<crate::UpdateRepository> =
+        Api::namespaced(context.client.clone(), &context.namespace);
+    let Ok(repository) = repositories.get(&context.repository).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match current_bundle(&state, &repository, &name).await {
+        Ok(bundle) => Json(bundle).into_response(),
+        Err(response) => response,
+    }
 }
 
 /// Create `desired` (named `name`), treating a 409 as success iff the existing agent `matches`
@@ -973,14 +1273,15 @@ async fn telemetry_put(
     if report.node != node {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let destination = state.destination();
     let key = crate::object_key(
-        state.prefix(),
+        &destination.prefix,
         &updated_contracts::telemetry::report_object_key(node),
     );
     match timeout(
         IO_TIMEOUT,
-        state
-            .store()
+        destination
+            .store
             .put(&key, PutPayload::from_bytes(body.to_vec().into())),
     )
     .await
@@ -1003,7 +1304,8 @@ async fn repo_get(
     if uri.query().is_some() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(key) = repository_key(state.prefix(), uri.path()) else {
+    let destination = state.destination();
+    let Some(key) = repository_key(&destination.prefix, uri.path()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let range = match parse_range(&headers) {
@@ -1011,7 +1313,7 @@ async fn repo_get(
         Err(()) => return StatusCode::BAD_REQUEST.into_response(),
     };
     if let Some(range) = &range {
-        let metadata = match timeout(IO_TIMEOUT, state.store().head(&key)).await {
+        let metadata = match timeout(IO_TIMEOUT, destination.store.head(&key)).await {
             Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
             Ok(Err(object_store::Error::NotFound { .. })) => {
                 return StatusCode::NOT_FOUND.into_response()
@@ -1031,7 +1333,7 @@ async fn repo_get(
         head: method == Method::HEAD,
         ..Default::default()
     };
-    let result = match timeout(IO_TIMEOUT, state.store().get_opts(&key, options)).await {
+    let result = match timeout(IO_TIMEOUT, destination.store.get_opts(&key, options)).await {
         Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
         Ok(Err(object_store::Error::NotFound { .. })) => {
             return StatusCode::NOT_FOUND.into_response()
@@ -1640,6 +1942,31 @@ mod tests {
         ));
     }
 
+    /// Re-issuing a bundle presents no key, so membership is the whole gate: it must refuse exactly
+    /// what renewal refuses minus the key, and never merely trust that the connection authenticated.
+    #[test]
+    fn re_issuing_a_bundle_requires_current_enrolled_membership() {
+        assert!(is_enrolled_member(
+            &renewal_agent(crate::AgentIdentityKind::Enrolled, "repo", Some("key")),
+            "repo"
+        ));
+        // The fleet CA is shared across repositories, so a leaf minted by another repository's
+        // `/enroll` authenticates here and must still be refused this repository's material.
+        assert!(!is_enrolled_member(
+            &renewal_agent(crate::AgentIdentityKind::Enrolled, "other", Some("key")),
+            "repo"
+        ));
+        // An operator-declared node never enrolled, so nothing here was ever issued to it.
+        assert!(!is_enrolled_member(
+            &renewal_agent(crate::AgentIdentityKind::Manual, "repo", Some("key")),
+            "repo"
+        ));
+        assert!(!is_enrolled_member(
+            &renewal_agent(crate::AgentIdentityKind::Reserved, "repo", None),
+            "repo"
+        ));
+    }
+
     #[test]
     fn only_an_explicitly_reserved_name_may_be_completed_by_enrollment() {
         // `/enroll` authenticates with the fleet-wide bootstrap certificate, so any agent this
@@ -1675,22 +2002,28 @@ mod tests {
         assert!(!adopts_preapproval(&established, &desired));
     }
 
+    /// The distribution gate stands in front of this store, so what it holds is by definition
+    /// already fleet-distributable; `forbidden` names the Secrets that gate refused.
     struct MemorySecrets {
         values: std::collections::BTreeMap<(String, String), Vec<u8>>,
+        forbidden: std::collections::BTreeSet<String>,
         calls: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait::async_trait]
     impl SecretStore for MemorySecrets {
-        async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, ()> {
+        async fn value(&self, name: &str, key: &str) -> Result<Vec<u8>, SecretError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((name.to_owned(), key.to_owned()));
+            if self.forbidden.contains(name) {
+                return Err(SecretError::Forbidden);
+            }
             self.values
                 .get(&(name.to_owned(), key.to_owned()))
                 .cloned()
-                .ok_or(())
+                .ok_or(SecretError::Unavailable)
         }
     }
 
@@ -1740,6 +2073,7 @@ mod tests {
                     b"must-not-be-read".to_vec(),
                 ),
             ]),
+            forbidden: Default::default(),
             calls: std::sync::Mutex::new(Vec::new()),
         };
         let bundle = resolve_secret_bundle(&assignment, &store).await.unwrap();
@@ -1772,10 +2106,233 @@ mod tests {
                         std::collections::BTreeMap::from([(("secret".into(), "key".into()), value)])
                     })
                     .unwrap_or_default(),
+                forbidden: Default::default(),
                 calls: std::sync::Mutex::new(Vec::new()),
             };
             assert!(resolve_secret_bundle(&assignment, &store).await.is_err());
         }
+    }
+
+    fn labelled_secret(name: &str) -> Secret {
+        Secret {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.into()),
+                labels: Some(std::collections::BTreeMap::from([(
+                    DISTRIBUTABLE_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_a_secret_explicitly_published_to_the_fleet_is_distributable() {
+        // The threat this closes: `deployment.runtime.secrets` is written by anyone with
+        // create/update on updategroups.updated.dev, which does NOT imply get on Secrets. Without
+        // an opt-in only a Secret holder can set, such a caller could point an assignment at the
+        // fleet CA key, the TUF signing keys, or the object-store credentials — all of which live
+        // in this same namespace — and read them out with an ordinary node certificate.
+        assert!(is_fleet_distributable(&labelled_secret("app-config")));
+
+        let mut unlabelled = labelled_secret("fleet-ca");
+        unlabelled.metadata.labels = None;
+        assert!(
+            !is_fleet_distributable(&unlabelled),
+            "deny by default: an unlabelled Secret is never served"
+        );
+
+        let mut other_value = labelled_secret("app-config");
+        other_value.metadata.labels = Some(std::collections::BTreeMap::from([(
+            DISTRIBUTABLE_LABEL.to_string(),
+            "yes".to_string(),
+        )]));
+        assert!(
+            !is_fleet_distributable(&other_value),
+            "the opt-in is the exact value \"true\", not merely the label's presence"
+        );
+
+        // The fleet CA whose key mints every node leaf is a cert-manager Secret in this namespace.
+        // A label is copyable from a Certificate's secretTemplate, so issuance is disqualifying on
+        // its own.
+        let mut issued = labelled_secret("fleet-ca");
+        issued.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            CERT_MANAGER_ANNOTATION.to_string(),
+            "fleet-ca".to_string(),
+        )]));
+        assert!(!is_fleet_distributable(&issued));
+
+        // The per-agent enrollment Secrets the control plane publishes are owned by an updated.dev
+        // object; one node must not be able to read another's bundle through its own assignment.
+        let mut owned = labelled_secret("node-a-enrollment");
+        owned.metadata.owner_references = Some(vec![
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "updated.dev/v1alpha1".into(),
+                kind: "UpdateRepository".into(),
+                name: "fleet".into(),
+                ..Default::default()
+            },
+        ]);
+        assert!(!is_fleet_distributable(&owned));
+    }
+
+    #[test]
+    fn the_repositorys_own_signing_and_storage_secrets_are_reserved() {
+        let mut spec = crate::tests::repository();
+        spec.s3.credentials_secret_ref = Some(crate::LocalSecretReference {
+            name: "s3-credentials".into(),
+        });
+        let repository = crate::UpdateRepository::new("fleet", spec);
+        assert_eq!(
+            reserved_secrets(&repository),
+            vec!["tuf-signing-keys".to_string(), "s3-credentials".to_string()],
+            "the keys that sign the fleet's metadata and the credentials that write its objects \
+             are refused before they are even read, whatever they are labelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_a_node_reads_through_applies_both_refusals() {
+        // The predicates are unit-tested above; this is the wiring that applies them — the only
+        // place a node's read of a Secret actually happens. Without it, deleting either refusal
+        // from `value` left every other test in this file green while reopening an arbitrary
+        // Secret read to anyone holding a node certificate.
+        let read: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let client = crate::tests::apiserver({
+            let read = read.clone();
+            move |_method: &axum::http::Method, path: &str, _body: Vec<u8>| {
+                let name = path.rsplit('/').next().expect("a named Secret").to_string();
+                read.lock().unwrap().push(name.clone());
+                let mut secret = labelled_secret(&name);
+                secret.data = Some(std::collections::BTreeMap::from([(
+                    "token".to_string(),
+                    k8s_openapi::ByteString(b"value".to_vec()),
+                )]));
+                match name.as_str() {
+                    "plain" => secret.metadata.labels = None,
+                    "fleet-ca" => {
+                        secret.metadata.annotations = Some(std::collections::BTreeMap::from([(
+                            CERT_MANAGER_ANNOTATION.to_string(),
+                            "fleet-ca".to_string(),
+                        )]))
+                    }
+                    "missing" => {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            serde_json::json!({"kind": "Status", "code": 404}),
+                        )
+                    }
+                    _ => {}
+                }
+                (StatusCode::OK, serde_json::to_value(secret).unwrap())
+            }
+        });
+        let mut spec = crate::tests::repository();
+        spec.s3.credentials_secret_ref = Some(crate::LocalSecretReference {
+            name: "s3-credentials".into(),
+        });
+        let store = KubernetesSecretStore::for_repository(
+            client,
+            "fleet-system".into(),
+            &crate::UpdateRepository::new("fleet", spec),
+        );
+
+        assert_eq!(
+            store.value("app-config", "token").await,
+            Ok(b"value".into())
+        );
+        assert_eq!(
+            store.value("app-config", "absent").await,
+            Err(SecretError::Unavailable)
+        );
+        assert_eq!(
+            store.value("plain", "token").await,
+            Err(SecretError::Forbidden),
+            "deny by default: the opt-in label is the gate"
+        );
+        assert_eq!(
+            store.value("fleet-ca", "token").await,
+            Err(SecretError::Forbidden),
+            "a cert-manager Secret is refused however it is labelled"
+        );
+        assert_eq!(
+            store.value("missing", "token").await,
+            Err(SecretError::Unavailable)
+        );
+
+        // Reserved names are refused BEFORE the read — the control plane's own key material is
+        // never even fetched, so no code path exists on which it could be returned.
+        for reserved in ["tuf-signing-keys", "s3-credentials"] {
+            assert_eq!(
+                store.value(reserved, "token").await,
+                Err(SecretError::Forbidden)
+            );
+        }
+        assert_eq!(
+            *read.lock().unwrap(),
+            vec!["app-config", "app-config", "plain", "fleet-ca", "missing"],
+        );
+    }
+
+    #[test]
+    fn enrollment_stops_at_the_repositorys_agent_ceiling() {
+        // `/enroll` is authorized by the fleet-wide bootstrap certificate and the node names
+        // itself, so unbounded creation let one caller grow the durable rollout state past the
+        // apiserver's object limit — after which NO generation publishes again, for any node.
+        let with_agents = |count: Option<u32>| {
+            let mut repository = crate::UpdateRepository::new("fleet", crate::tests::repository());
+            repository.status = Some(crate::UpdateRepositoryStatus {
+                agent_count: count,
+                ..Default::default()
+            });
+            repository
+        };
+        assert!(!at_enrollment_capacity(&with_agents(Some(
+            crate::runtime::MAX_ENROLLED_AGENTS - 1
+        ))));
+        assert!(at_enrollment_capacity(&with_agents(Some(
+            crate::runtime::MAX_ENROLLED_AGENTS
+        ))));
+        assert!(at_enrollment_capacity(&with_agents(Some(
+            crate::runtime::MAX_ENROLLED_AGENTS + 1
+        ))));
+        assert!(
+            !at_enrollment_capacity(&with_agents(None)),
+            "a repository that has never published holds no agents"
+        );
+        let mut unpublished = crate::UpdateRepository::new("fleet", crate::tests::repository());
+        unpublished.status = None;
+        assert!(!at_enrollment_capacity(&unpublished));
+    }
+
+    #[tokio::test]
+    async fn a_refused_secret_fails_the_whole_bundle_rather_than_arriving_empty() {
+        let mut assignment = secret_assignment();
+        assignment.runtime.secrets = vec![
+            updated_contracts::assignment::SecretReference {
+                environment: "TOKEN".into(),
+                secret: "app-config".into(),
+                key: "token".into(),
+            },
+            updated_contracts::assignment::SecretReference {
+                environment: "CA_KEY".into(),
+                secret: "fleet-ca".into(),
+                key: "tls.key".into(),
+            },
+        ];
+        let store = MemorySecrets {
+            values: std::collections::BTreeMap::from([
+                (("app-config".into(), "token".into()), b"value".to_vec()),
+                (("fleet-ca".into(), "tls.key".into()), b"private".to_vec()),
+            ]),
+            forbidden: std::collections::BTreeSet::from(["fleet-ca".to_string()]),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        assert!(matches!(
+            resolve_secret_bundle(&assignment, &store).await,
+            Err(SecretBundleError::Forbidden)
+        ));
     }
 
     /// A content-only router (repository + telemetry) over an in-memory store at prefix `routing`.
@@ -1795,10 +2352,102 @@ mod tests {
             )
             .layer(DefaultBodyLimit::max(BODY_LIMIT))
             .with_state(ContentState {
-                store,
-                prefix: Arc::from("routing"),
+                destination: Arc::new(Reloadable::new(Destination {
+                    store,
+                    prefix: Arc::from("routing"),
+                })),
                 repository: Arc::from(TEST_REPOSITORY),
             })
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_object_store_takes_effect_without_a_restart() {
+        // Credentials are baked into an `ObjectStore` at construction, so a handler that captured
+        // one at start-up serves a rotated key — or a one-hour STS session token — until it
+        // expires and then answers 502 for the life of the process. The live router must read
+        // through the reloadable, prefix included.
+        let destination = Arc::new(Reloadable::new(Destination {
+            store: seeded().await,
+            prefix: Arc::from("routing"),
+        }));
+        let app = Router::new()
+            .route("/targets/{*rest}", axum::routing::get(repo_get))
+            .with_state(ContentState {
+                destination: destination.clone(),
+                repository: Arc::from(TEST_REPOSITORY),
+            });
+        let read = |app: Router| async move {
+            let response = app.oneshot(get("/targets/nested/app", None)).await.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        };
+        assert_eq!(read(app.clone()).await, (StatusCode::OK, b"hello".to_vec()));
+
+        let rotated = Arc::new(InMemory::new());
+        rotated
+            .put(
+                &ObjectPath::from("rotated/targets/nested/app"),
+                PutPayload::from_static(b"rotated"),
+            )
+            .await
+            .unwrap();
+        destination.set(Destination {
+            store: rotated,
+            prefix: Arc::from("rotated"),
+        });
+        assert_eq!(
+            read(app).await,
+            (StatusCode::OK, b"rotated".to_vec()),
+            "the same running router serves from the rebuilt store, under the rebuilt prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_store_rebuild_keeps_the_working_store_serving() {
+        let destination = Reloadable::new(Destination {
+            store: seeded().await,
+            prefix: Arc::from("routing"),
+        });
+
+        // The apiserver cannot answer: a rebuild is best-effort, so the store built from the last
+        // good answer keeps serving. Swapping in nothing (or a store built from a partial read)
+        // would turn a transient blip into a data-plane outage — the very failure this timer is
+        // here to prevent.
+        let unavailable = crate::tests::apiserver(|_, _, _| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"kind": "Status", "code": 500}),
+            )
+        });
+        rebuild_destination(&unavailable, "fleet-system", TEST_REPOSITORY, &destination).await;
+        let live = destination.get();
+        assert_eq!(&*live.prefix, "routing");
+        assert_eq!(
+            live.store
+                .get(&ObjectPath::from("routing/targets/nested/app"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .to_vec(),
+            b"hello".to_vec(),
+        );
+
+        // And a rebuild that succeeds replaces both halves of the destination, so a repository
+        // whose prefix moved is not served out of the previous key space.
+        let mut spec = crate::tests::repository();
+        spec.s3.prefix = "rotated".into();
+        let repository = crate::UpdateRepository::new(TEST_REPOSITORY, spec);
+        let available = crate::tests::apiserver(move |_, _, _| {
+            (StatusCode::OK, serde_json::to_value(&repository).unwrap())
+        });
+        rebuild_destination(&available, "fleet-system", TEST_REPOSITORY, &destination).await;
+        assert_eq!(&*destination.get().prefix, "rotated");
     }
 
     async fn seeded() -> Arc<InMemory> {

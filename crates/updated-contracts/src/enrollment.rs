@@ -8,6 +8,16 @@ use serde::{Deserialize, Serialize};
 pub const ENROLL_PATH: &str = "/enroll";
 /// The per-node certificate-renewal endpoint.
 pub const RENEW_PATH: &str = "/renew";
+/// Where an already-enrolled node re-fetches its enrollment bundle, authenticated by the per-node
+/// certificate it minted at [`ENROLL_PATH`].
+///
+/// The bundle carries signed TUF metadata, and signed metadata expires. Written once at enrollment
+/// and never replaced, it eventually holds nothing a node can take for the repository's current
+/// state — so this endpoint exists to replace it, and only that: it mints nothing, registers
+/// nothing, and returns the same bundle `/enroll` would issue for a node that enrolled today. The
+/// node keeps its enrollment-time root of trust across the swap by requiring the returned
+/// `routingRoot` to be the pinned root or a rotation signed by it.
+pub const BUNDLE_PATH: &str = "/bundle";
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

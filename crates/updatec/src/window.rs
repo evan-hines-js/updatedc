@@ -168,36 +168,55 @@ impl CalendarEntry {
 
 /// Whether a `calendar` of dated entries admits rollouts at `now` (UTC).
 ///
-/// - No (valid) entries → open: the calendar does not gate.
-/// - `now` falls inside one entry's span → open.
-/// - Every entry is in the past → open. This is the "runs out, falls back" rule: once the
-///   whole calendar has expired it stops gating, so a stale calendar never wedges the set.
+/// - No entries at all → open: the set declares no calendar, so the calendar does not gate.
+/// - `now` falls inside one usable entry's span → open.
+/// - The calendar has [run out](ran_out) → open. This is the "runs out, falls back" rule: once
+///   the whole calendar has expired it stops gating, so a stale calendar never wedges the set.
 /// - Otherwise (entries remain in the future, none active now) → closed: the set waits,
 ///   frozen, for its next approved window.
+///
+/// A calendar that was WRITTEN but yields no usable span therefore fails CLOSED, the same
+/// direction [`RolloutWindow::is_active`] fails: an entry nobody can evaluate is not permission
+/// to roll at every instant. The set reports it as `frozen`, and `validate` names the entry.
 pub fn calendar_open(calendar: &[CalendarEntry], now: DateTime<Utc>) -> bool {
-    let now = now.naive_utc();
-    let spans: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> =
-        calendar.iter().filter_map(CalendarEntry::span).collect();
-    if spans.is_empty() {
+    if calendar.is_empty() {
         return true;
     }
-    if spans.iter().any(|(start, end)| *start <= now && now < *end) {
-        return true;
-    }
-    // Open only once the calendar has run out entirely; a single future entry keeps it shut.
-    spans.iter().all(|(_, end)| now >= *end)
+    let spans = usable_spans(calendar);
+    let instant = now.naive_utc();
+    spans
+        .iter()
+        .any(|(start, end)| *start <= instant && instant < *end)
+        || ran_out(calendar, &spans, instant)
 }
 
-/// Whether a `calendar` that *had* dated entries has now run out — every valid entry is in the past.
-/// This is the moment `calendar_open` flips from gating to always-open (fail-open): the set silently
-/// stops being approval-gated. An empty/all-invalid calendar is NOT "exhausted" (it never gated), so
-/// this returns false for it — letting the control plane surface only the genuine "your approval
-/// window expired and this set is now ungated at any hour" case on status.
+/// Whether a `calendar` that *had* dated entries has now run out — it has at least one entry,
+/// every entry is usable, and every one of them is in the past. This is the moment
+/// [`calendar_open`] flips from gating to always-open (fail-open): the set silently stops being
+/// approval-gated.
+///
+/// Requiring EVERY entry to be usable is what keeps the fail-open rule honest. An entry that
+/// cannot be parsed is not a window in the past — it is a gate the operator wrote and this code
+/// cannot evaluate — so a calendar holding one keeps gating rather than quietly becoming ungated
+/// at every hour. An entirely unusable calendar is never "exhausted" either, so it stays closed
+/// instead of opening.
+fn ran_out(
+    calendar: &[CalendarEntry],
+    spans: &[(chrono::NaiveDateTime, chrono::NaiveDateTime)],
+    now: chrono::NaiveDateTime,
+) -> bool {
+    spans.len() == calendar.len() && !spans.is_empty() && spans.iter().all(|(_, end)| now >= *end)
+}
+
+fn usable_spans(calendar: &[CalendarEntry]) -> Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    calendar.iter().filter_map(CalendarEntry::span).collect()
+}
+
+/// Whether `calendar` has [run out](ran_out), for the status field that tells an operator their
+/// approval window expired and this set is now ungated at any hour. The single predicate
+/// [`calendar_open`] opens on, so status and gate can never disagree about it.
 pub fn calendar_exhausted(calendar: &[CalendarEntry], now: DateTime<Utc>) -> bool {
-    let now = now.naive_utc();
-    let spans: Vec<(chrono::NaiveDateTime, chrono::NaiveDateTime)> =
-        calendar.iter().filter_map(CalendarEntry::span).collect();
-    !spans.is_empty() && spans.iter().all(|(_, end)| now >= *end)
+    ran_out(calendar, &usable_spans(calendar), now.naive_utc())
 }
 
 impl RolloutWindow {
@@ -220,7 +239,10 @@ impl RolloutWindow {
                 return self.is_active_day(today);
             }
             (minute >= start && self.is_active_day(today))
-                || (minute < end && self.is_active_day(today - Duration::days(1)))
+                || (minute < end
+                    && today
+                        .checked_sub_signed(Duration::days(1))
+                        .is_some_and(|yesterday| self.is_active_day(yesterday)))
         }
     }
 
@@ -248,7 +270,8 @@ impl RolloutWindow {
             Some(interval) => match self.anchor_week.as_deref().and_then(parse_date) {
                 // N-weekly with no valid anchor never opens (fail-safe; caught by `validate`).
                 None => false,
-                Some(anchor) => weeks_between(anchor, date).rem_euclid(interval as i64) == 0,
+                Some(anchor) => weeks_between(anchor, date)
+                    .is_some_and(|weeks| weeks.rem_euclid(interval as i64) == 0),
             },
         }
     }
@@ -271,10 +294,17 @@ impl RolloutWindow {
         if matches!(self.interval_weeks, Some(n) if n > 1) {
             match self.anchor_week.as_deref() {
                 None => return Err("intervalWeeks > 1 requires anchorWeek".into()),
-                Some(raw) if parse_date(raw).is_none() => {
-                    return Err(format!("anchorWeek {raw:?} is not a UTC YYYY-MM-DD date"));
-                }
-                Some(_) => {}
+                Some(raw) => match parse_date(raw) {
+                    None => {
+                        return Err(format!("anchorWeek {raw:?} is not a UTC YYYY-MM-DD date"));
+                    }
+                    // The interval is counted from the anchor's Monday, which does not exist for a
+                    // date within six days of the start of the representable range.
+                    Some(anchor) if monday_of_week(anchor).is_none() => {
+                        return Err(format!("anchorWeek {raw:?} is not in a representable week"));
+                    }
+                    Some(_) => {}
+                },
             }
         }
         Ok(())
@@ -285,12 +315,18 @@ impl RolloutWindow {
 /// are normalised to their week's Monday first, so the difference is always a multiple of 7
 /// and the parity holds regardless of which weekday the anchor was given as, or which side
 /// of the anchor `date` falls on.
-fn weeks_between(anchor: NaiveDate, date: NaiveDate) -> i64 {
-    (monday_of_week(date) - monday_of_week(anchor)).num_days() / 7
+///
+/// `None` when either week's Monday falls outside the representable date range — an anchor within
+/// six days of `NaiveDate::MIN`. The arithmetic panics rather than saturating, and this is
+/// evaluated on the reconcile task for every set on every pass, so it is checked here and the
+/// window fails closed like any other schedule it cannot evaluate. `validate` rejects such an
+/// anchor so the operator sees why.
+fn weeks_between(anchor: NaiveDate, date: NaiveDate) -> Option<i64> {
+    Some((monday_of_week(date)? - monday_of_week(anchor)?).num_days() / 7)
 }
 
-fn monday_of_week(date: NaiveDate) -> NaiveDate {
-    date - Duration::days(date.weekday().num_days_from_monday() as i64)
+fn monday_of_week(date: NaiveDate) -> Option<NaiveDate> {
+    date.checked_sub_signed(Duration::days(date.weekday().num_days_from_monday() as i64))
 }
 
 /// Parse `HH:MM` into minutes-since-midnight (`0..=1440`). `24:00` is the end-of-day
@@ -520,6 +556,29 @@ mod tests {
         assert!(!w.is_active(at("2026-07-19T12:00:00Z")));
     }
 
+    #[test]
+    fn an_anchor_with_no_representable_week_is_rejected_and_never_opens() {
+        // Normalising a date to its week's Monday PANICS below `NaiveDate::MIN + 6 days` rather
+        // than saturating, and `is_active` runs on the reconcile task for every set on every pass:
+        // the panic killed the controller, which restarted, re-read the same UpdateGroupSet and
+        // died again, stopping publication for the whole repository.
+        let w = RolloutWindow {
+            weekdays: every_weekday(),
+            interval_weeks: Some(2),
+            anchor_week: Some("-262143-01-01".into()),
+            ..window()
+        };
+        assert!(w.validate().is_err());
+        assert!(!w.is_active(at("2026-07-19T12:00:00Z")));
+        // Six days later the week IS representable, so the ordinary rule applies and nothing is
+        // rejected — the bound is exactly where the arithmetic stops working.
+        let usable = RolloutWindow {
+            anchor_week: Some("-262143-01-05".into()),
+            ..w
+        };
+        assert!(usable.validate().is_ok());
+    }
+
     fn every_weekday() -> Vec<Weekday> {
         vec![
             Weekday::Monday,
@@ -713,15 +772,40 @@ mod tests {
     }
 
     #[test]
-    fn invalid_calendar_entries_are_ignored_and_validated() {
-        // A bad entry does not gate (it is skipped for activity) and, being the only entry,
-        // leaves the calendar effectively empty → open. validate() still flags it.
-        let bad = entry("not-a-date", "06:00", "09:00");
-        assert!(bad.validate().is_err());
-        assert!(calendar_open(
-            std::slice::from_ref(&bad),
-            at("2026-08-25T07:00:00Z")
-        ));
+    fn a_calendar_no_entry_of_which_is_usable_fails_closed() {
+        // An entry nobody can evaluate is not permission to roll at every instant. A calendar was
+        // written, so it gates; none of it can be honoured, so it never opens — the direction
+        // `RolloutWindow::is_active` already fails, and the set reports it as `frozen`.
+        let unparseable = entry("not-a-date", "06:00", "09:00");
+        // `span` also rejects end <= start, so an overnight entry is unusable the same way: this
+        // one used to leave the gate wide open at every instant of every day.
+        let overnight = entry("2026-08-25", "22:00", "06:00");
+        for bad in [&unparseable, &overnight] {
+            assert!(bad.validate().is_err());
+            let calendar = std::slice::from_ref(bad);
+            assert!(
+                !calendar_open(calendar, at("2026-08-25T07:00:00Z")),
+                "an unusable calendar never opens"
+            );
+            assert!(
+                !calendar_exhausted(calendar, at("2030-01-01T00:00:00Z")),
+                "it never gated on a date, so it can never have run out either"
+            );
+        }
+
+        // One unusable entry alongside a real one keeps the calendar gating: the typo may have
+        // been the operator's next approval window, so the set stays frozen past the good entry
+        // instead of falling back to ungated.
+        let mixed = [entry("2026-08-25", "06:00", "09:00"), unparseable.clone()];
+        assert!(
+            calendar_open(&mixed, at("2026-08-25T07:00:00Z")),
+            "inside the usable window"
+        );
+        assert!(
+            !calendar_open(&mixed, at("2026-08-26T07:00:00Z")),
+            "past the usable window, but the calendar has not run out"
+        );
+        assert!(!calendar_exhausted(&mixed, at("2026-08-26T07:00:00Z")));
 
         // end must be after start; dated entries do not wrap past midnight.
         assert!(entry("2026-08-25", "09:00", "06:00").validate().is_err());

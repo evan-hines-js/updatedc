@@ -150,6 +150,13 @@ pub struct RuntimeSpec {
 #[serde(rename_all = "camelCase")]
 pub struct SecretReferenceSpec {
     pub environment: String,
+    /// Secret in the control-plane namespace, which the gateway serves to the assigned node at
+    /// `/v1/node/secrets` ONLY if it carries the label `updated.dev/fleet-distributable: "true"`.
+    /// Writing this field needs `update` on `updategroups.updated.dev`, which does not imply `get`
+    /// on Secrets, so the opt-in deliberately lives on the Secret: naming one here is a request,
+    /// never a grant. The control plane's own key material (signing keys, object-store credentials,
+    /// cert-manager-issued certificates, and the enrollment Secrets it owns) is refused whatever it
+    /// is labelled.
     pub secret: String,
     pub key: String,
 }
@@ -526,11 +533,19 @@ pub struct LocalObjectReference {
     pub name: String,
 }
 
+/// This status is always written as a JSON MERGE PATCH, where an explicit `null` DELETES the field
+/// instead of leaving it alone. A writer that has nothing to say about a field must therefore OMIT
+/// it, which is what `skip_serializing_if` is doing on every optional field a later reader depends
+/// on: the failure path knows neither the agent count nor the published digest, and serializing its
+/// `None` erased the count `gateway::at_enrollment_capacity` reads — uncapping `/enroll` from the
+/// first failed reconcile until the next successful one.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateRepositoryStatus {
     pub observed_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_count: Option<u32>,
     /// SHA-256 of the `root.json` this control plane publishes — the fleet's trust anchor, recorded
     /// in etcd where only the control plane can write it.
@@ -612,6 +627,13 @@ pub struct UpdateSubscriptionStatus {
     /// RFC 3339 time of the most recent successful delivery, for operator visibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_delivery_time: Option<String>,
+    /// RFC 3339 time this subscription was last ATTEMPTED — success or failure alike, and never
+    /// stamped by a deferral. It is the delivery cursor: each pass serves the least recently
+    /// attempted subscriptions first, so a slow subscriber early in name order can no longer
+    /// consume the whole budget every pass and starve the ones behind it. Persisted here rather
+    /// than in the controller so it survives a leader change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_time: Option<String>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
 }
@@ -703,6 +725,30 @@ pub enum PlanError {
     Serialize(String),
 }
 
+/// Whether a name may be a key of a signed output manifest — the grammar dependency inputs must
+/// satisfy, asked of the contract itself rather than restated here.
+///
+/// A dependency input name becomes a key of `deployment.runtime.inputs`, which
+/// `RepositoryAssignment::validate` runs through `OutputManifest::validate` at publication time.
+/// Admitting an input name against the weaker traversal rule alone let an over-long one (the
+/// manifest bounds names at 128 bytes) through admission and detonate later: nothing is written
+/// into `runtime.inputs` until the producer reports healthy, and from that moment every reconcile
+/// for the whole repository failed to build a publication at all — no group ever got another
+/// generation, and no new agent could enroll. One grammar, checked where the name is accepted.
+fn is_output_name(name: &str) -> bool {
+    updated_contracts::telemetry::OutputManifest {
+        schema: updated_contracts::telemetry::OutputManifest::SCHEMA,
+        values: BTreeMap::from([(
+            name.to_string(),
+            updated_contracts::telemetry::OutputValue::String {
+                value: String::new(),
+            },
+        )]),
+    }
+    .validate()
+    .is_ok()
+}
+
 /// Validate the group dependency graph before planning a new publication. Invalid desired state
 /// fails the whole generation closed, preserving the last published assignments.
 pub(crate) fn validate_dependency_graph(
@@ -736,8 +782,8 @@ pub(crate) fn validate_dependency_graph(
             visit(dependency, groups, state, stack)?;
         }
         for (input, reference) in &groups[name].inputs {
-            if !updated_contracts::path::is_safe_component(input)
-                || !updated_contracts::path::is_safe_component(&reference.output)
+            if !is_output_name(input)
+                || !is_output_name(&reference.output)
                 || !groups[name].depends_on.contains(&reference.group)
             {
                 return Err(PlanError::InvalidDependencyInput {
@@ -764,6 +810,23 @@ pub(crate) fn validate_dependency_graph(
 /// this name would have its own throttled, gated rollout silently replaced by that fleet-wide
 /// switch, so [`resolve_node_groups`] refuses it outright.
 pub const DEFAULT_GROUP: &str = "default";
+
+/// Whether this node could ever report — i.e. whether its name survives a round trip through the
+/// telemetry path grammar, which is stricter than the traversal rule placement gates on: a report
+/// is a URL segment, so it additionally forbids `.`, `%`, `?` and `#`.
+///
+/// Asked of the grammar itself rather than restated, so the name a node is admitted under and the
+/// name the gateway recovers from `/telemetry/<node>.json` can never drift apart. A node admitted
+/// under a name only one of the two accepts is placed, published, and enrolled, and then has every
+/// report it ever sends refused with a 404 — permanently Silent, spending its group's
+/// `maxUnavailable` forever.
+pub(crate) fn node_name_is_reportable(name: &str) -> bool {
+    let path = format!(
+        "{}{name}.json",
+        updated_contracts::telemetry::REPORT_PATH_PREFIX
+    );
+    updated_contracts::telemetry::node_from_path(&path) == Some(name)
+}
 
 /// Resolve selectors before rollout admission without constructing a throwaway publication.
 pub(crate) fn resolve_node_groups(
@@ -1047,7 +1110,7 @@ mod tests {
                 inactive_repository_caches: 2,
             },
             timeouts: updated_contracts::assignment::ManagedTimeouts {
-                check_interval_seconds: 60,
+                check_interval_seconds: 15,
                 health_grace_seconds: 30,
                 health_successes: 2,
                 health_interval_seconds: 1,
@@ -1081,7 +1144,7 @@ mod tests {
                 inactive_repository_caches: 2,
             },
             timeouts: TimeoutsSpec {
-                check_interval_seconds: 60,
+                check_interval_seconds: 15,
                 health_grace_seconds: 30,
                 health_successes: 2,
                 health_interval_seconds: 1,
@@ -1142,7 +1205,45 @@ mod tests {
         }
     }
 
-    fn repository() -> UpdateRepositorySpec {
+    /// A `kube::Client` answered by `handler` instead of by a socket: request method, path and body
+    /// in, response status and body out.
+    ///
+    /// Everything this crate does to the cluster goes through a `kube::Api`, so the gates that
+    /// matter most — which Secret may be served to a node, which subscription gets told it was
+    /// deferred, whether a failed store rebuild keeps the working one — are only reachable in a
+    /// test through a client. This is that client, and it records nothing itself: a handler that
+    /// wants to assert on the traffic closes over its own log.
+    pub(crate) fn apiserver<H>(handler: H) -> kube::Client
+    where
+        H: Fn(&axum::http::Method, &str, Vec<u8>) -> (axum::http::StatusCode, serde_json::Value)
+            + Send
+            + Sync
+            + 'static,
+    {
+        use http_body_util::BodyExt;
+        let handler = std::sync::Arc::new(handler);
+        kube::Client::new(
+            tower::service_fn(move |request: axum::http::Request<kube::client::Body>| {
+                let handler = handler.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = body.collect().await.expect("request body").to_bytes();
+                    let (status, response) =
+                        handler(&parts.method, parts.uri.path(), bytes.to_vec());
+                    Ok::<_, std::convert::Infallible>(
+                        axum::http::Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(kube::client::Body::from(response.to_string().into_bytes()))
+                            .expect("well-formed response"),
+                    )
+                }
+            }),
+            "default",
+        )
+    }
+
+    pub(crate) fn repository() -> UpdateRepositorySpec {
         UpdateRepositorySpec {
             default_deployment: deployment_spec("default"),
             signing_secret_ref: LocalSecretReference {
@@ -1264,6 +1365,58 @@ mod tests {
                 input: "leader".into(),
             })
         );
+    }
+
+    /// An input name is a key of the SIGNED output manifest, which bounds names at 128 bytes.
+    /// Admitting one against the traversal rule alone accepted an over-long name here and detonated
+    /// hours later: `resolve_one` writes it into `runtime.inputs` the moment the producer reports
+    /// healthy, and from then on every reconcile for the whole repository failed to build a
+    /// publication at all — no group got another generation and no agent could enroll.
+    #[test]
+    fn a_dependency_input_name_the_signed_contract_refuses_is_rejected_at_admission() {
+        let mut groups = BTreeMap::from([
+            ("a".into(), group("a", &[("role", "a")])),
+            ("b".into(), group("b", &[("role", "b")])),
+        ]);
+        groups.get_mut("b").unwrap().depends_on = vec!["a".into()];
+        let over_long = "x".repeat(129);
+        groups.get_mut("b").unwrap().inputs.insert(
+            over_long.clone(),
+            GroupOutputReference {
+                group: "a".into(),
+                output: "endpoint".into(),
+                aggregation: OutputAggregation::One,
+            },
+        );
+        assert_eq!(
+            validate_dependency_graph(&groups),
+            Err(PlanError::InvalidDependencyInput {
+                group: "b".into(),
+                input: over_long.clone(),
+            })
+        );
+        assert!(!is_output_name(&over_long));
+        assert!(is_output_name(&"x".repeat(128)));
+        assert!(is_output_name("endpoint"));
+        assert!(!is_output_name(""));
+        assert!(!is_output_name("a/b"));
+    }
+
+    /// Placement and telemetry must agree on what a node may be called. A dot is a legal Kubernetes
+    /// name and passes the traversal rule, but the gateway recovers the node from
+    /// `/telemetry/<node>.json` and refuses one — so such an agent would be placed, published and
+    /// enrolled, and then 404 on every report for the life of the machine: permanently Silent,
+    /// spending its group's `maxUnavailable` and blocking every dependent group.
+    #[test]
+    fn a_node_name_the_telemetry_path_refuses_is_not_reportable() {
+        assert!(node_name_is_reportable("web-prod-01"));
+        assert!(node_name_is_reportable("v1_2_3"));
+        assert!(!node_name_is_reportable("web.prod"));
+        assert!(!node_name_is_reportable("web%prod"));
+        assert!(!node_name_is_reportable("web?prod"));
+        assert!(!node_name_is_reportable("web#prod"));
+        assert!(!node_name_is_reportable("../escape"));
+        assert!(!node_name_is_reportable(""));
     }
 
     #[test]

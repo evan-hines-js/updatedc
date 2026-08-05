@@ -19,6 +19,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+/// The reconciler protocol vocabulary, shared with the supervisor that invokes it, so a scenario
+/// cannot be written against an operation name the product no longer speaks.
+use updated_contracts::reconciler::Operation;
 
 fn main() {
     if std::env::args().any(|arg| arg == "--lifecycle-fixture") {
@@ -35,14 +38,21 @@ fn main() {
     println!("\n\x1b[1;32mSUCCESS: all scenarios passed\x1b[0m");
 }
 
-/// Cross-platform operator-lifecycle fixture. Every call is recorded, while a create-new
-/// marker models an idempotent side effect that may happen only once per (transaction,
-/// phase), even when crash recovery necessarily replays the command.
+/// Cross-platform node reconciler fixture: the one reconciler every scenario runs. It speaks the
+/// published protocol vocabulary ([`Operation`]), so an operation this workspace no longer invokes
+/// — or a scenario written against a retired spelling — fails loudly here instead of silently
+/// answering nothing.
+///
+/// Every invocation is recorded at one chokepoint before any mode-specific behaviour, so no mode
+/// can answer an operation without that operation appearing in the recorded history.
 fn run_lifecycle_fixture() -> R {
-    use std::io::Write;
-
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let phase = args.first().ok_or("missing reconciler operation")?.clone();
+    let operation: Operation = args
+        .first()
+        .ok_or("missing reconciler operation")?
+        .parse()
+        .map_err(|error: updated_contracts::reconciler::UnknownOperation| error.to_string())?;
+    let phase = operation.as_str();
     let separator = args
         .iter()
         .position(|arg| arg == "--")
@@ -72,9 +82,13 @@ fn run_lifecycle_fixture() -> R {
         .ok_or("missing fixture state directory")?;
     let mode = provider_args.get(fixture + 2).cloned().unwrap_or_default();
 
+    // The one recording chokepoint, ahead of every mode: nothing below may answer an operation
+    // that this did not observe.
+    record_invocation(&root, operation, &id)?;
+
     // Inspect is a steady-state observation, not a deployment transaction. The fixture emits
-    // deterministic, non-empty state without touching transaction logs or modeled side effects.
-    if phase == "inspect" {
+    // deterministic, non-empty state without touching modeled side effects.
+    if operation == Operation::Inspect {
         println!("candidate-version={candidate_version}");
         return Ok(());
     }
@@ -83,44 +97,17 @@ fn run_lifecycle_fixture() -> R {
     // The same signed provider now belongs to the installed release from the beginning; there is
     // no provider-less seed path. Magnolia's transactional checks apply only once the
     // Magnolia-shaped candidate is active. The ordinary 1.0.0 predecessor therefore has no
-    // Magnolia state to inspect, while periodic checks after the 2.0.0 commit require the
-    // migration receipt produced by finalize.
-    if magnolia_mode && candidate_version == "1.0.0" && phase == "healthcheck" {
-        return Ok(());
-    }
-    if magnolia_mode && phase == "healthcheck" {
-        if root.join("magnolia-state/migration-finalized").is_file() {
+    // Magnolia state to inspect, while checks after the 2.0.0 apply require the migration receipt
+    // that apply produced.
+    if magnolia_mode && operation == Operation::Healthcheck {
+        if candidate_version == "1.0.0" || root.join("magnolia-state/migration-finalized").is_file()
+        {
             return Ok(());
         }
         return fail("Magnolia healthcheck ran before migration finalized");
     }
-    // Record only deployment operations. Boot and periodic observations use reserved IDs and must
-    // not pollute the transaction history; candidate healthchecks retain the deployment attempt ID.
-    let is_deployment_operation = id != "boot" && id != "periodic";
-    if is_deployment_operation {
-        std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
-        let mut attempts = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(root.join("attempts.log"))
-            .map_err(str_err)?;
-        writeln!(attempts, "{phase}\t{id}").map_err(str_err)?;
-
-        let marker = root.join("effects").join(format!("{id}-{phase}"));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(marker)
-        {
-            Ok(mut file) => {
-                writeln!(file, "{id}").map_err(str_err)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(str_err(error)),
-        }
-    }
     let fail_once_phase = mode.strip_prefix("fail-first-");
-    let fail_once = fail_once_phase == Some(phase.as_str())
+    let fail_once = fail_once_phase == Some(phase)
         && std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -136,7 +123,7 @@ fn run_lifecycle_fixture() -> R {
     // candidate/predecessor variables, and must be allowed to start and verify the restored
     // predecessor. The dedicated rollback mode is the exception used to prove that failed
     // recovery remains durably held.
-    let fail_forward_candidate = candidate_version == "2.0.0" && fail_phase == Some(phase.as_str());
+    let fail_forward_candidate = candidate_version == "2.0.0" && fail_phase == Some(phase);
     if fail_forward_candidate || fail_start_and_rollback {
         return fail(format!("injected {phase} failure"));
     }
@@ -145,7 +132,7 @@ fn run_lifecycle_fixture() -> R {
     // indefinitely. Hang only the forward candidate's target phase, well past the 5s provider
     // timeout, so the supervisor kills us; the rollback (which reverses candidate/predecessor,
     // so this guard no longer matches) then runs normally.
-    if mode.strip_prefix("hang-") == Some(phase.as_str()) && candidate_version == "2.0.0" {
+    if mode.strip_prefix("hang-") == Some(phase) && candidate_version == "2.0.0" {
         std::thread::sleep(Duration::from_secs(30));
     }
     if let Some(url) = mode.strip_prefix("http-health=") {
@@ -217,6 +204,53 @@ fn run_lifecycle_fixture() -> R {
         return fail(format!("unknown Magnolia lifecycle operation {phase}"));
     }
     Ok(())
+}
+
+/// Record one reconciler invocation. This is the fixture's only writer of observation history, so
+/// a mode cannot answer an operation the history does not show.
+///
+/// `operations.log` holds *every* invocation, including the reserved observation identities, and
+/// is what a scenario reads to prove the supervisor invoked an operation at all — the readiness
+/// gate above all. `attempts.log` and the create-new effect markers hold only deployment
+/// operations: they model the transaction history and an idempotent side effect that may happen
+/// at most once per (attempt, operation) even when crash recovery replays the command, and the
+/// reserved boot/periodic/fingerprint observations must not pollute either.
+fn record_invocation(root: &Path, operation: Operation, id: &str) -> R {
+    use std::io::Write;
+
+    let append = |path: PathBuf, line: &str| -> R {
+        std::fs::create_dir_all(root).map_err(str_err)?;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(str_err)?;
+        writeln!(log, "{line}").map_err(str_err)
+    };
+    append(
+        root.join("operations.log"),
+        &format!("{}\t{id}", operation.as_str()),
+    )?;
+    if updated_contracts::reconciler::attempt::is_reserved(id) {
+        return Ok(());
+    }
+    append(
+        root.join("attempts.log"),
+        &format!("{}\t{id}", operation.as_str()),
+    )?;
+    std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
+    let marker = root
+        .join("effects")
+        .join(format!("{id}-{}", operation.as_str()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(mut file) => writeln!(file, "{id}").map_err(str_err),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(str_err(error)),
+    }
 }
 
 /// A named scenario. To add one: write an `fn(&Ctx) -> R` that asserts its own
@@ -319,7 +353,7 @@ fn scenarios() -> Vec<Scenario> {
         s.push(("the TUF role keys are owner-only (0600)", key_perms));
         s.push((
             "lifecycle healthcheck gates first install and upgrade",
-            lifecycle_verify_gates_readiness,
+            lifecycle_healthcheck_gates_readiness,
         ));
         s.push((
             "a stateless cold node descends past wedged (alive-but-unhealthy) assigned heads to the newest healthy release",

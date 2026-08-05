@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::hash::{sha256_bytes, sha256_file};
+use crate::hash::{digests_match, sha256_bytes, sha256_file};
 use updated_contracts::is_sha256_hex;
 
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
@@ -280,7 +280,7 @@ pub(crate) fn read_manifest(root: &Path, id: &ReleaseId) -> io::Result<(BundleMa
     manifest.validate_shape()?;
     if manifest.schema != MANIFEST_SCHEMA
         || manifest.version != id.version
-        || !sha256_bytes(&bytes).eq_ignore_ascii_case(&id.manifest_sha256)
+        || !digests_match(&sha256_bytes(&bytes), &id.manifest_sha256)
     {
         return Err(invalid("release identity does not match its manifest"));
     }
@@ -466,6 +466,16 @@ const STAGE_PREFIX: &str = "stage-";
 /// inside it so the directory can be renamed into `versions/` whole.
 const OWNER_SUFFIX: &str = ".owner";
 
+/// `.<attempt>.owner`: an owner file that has been created and locked but not yet published under
+/// its final name. No attempt directory is ever created under a dot-prefixed name, so a claim
+/// guards nothing and reclaiming one is just unlinking the file.
+const CLAIM_PREFIX: &str = ".";
+
+/// How many tokens `Stage::create` will burn when a concurrent sweep reclaims the claim it is
+/// still locking. Losing once already needs a sweep to land inside a two-syscall window; losing
+/// four times in a row with four independent tokens does not happen.
+const CLAIM_ATTEMPTS: usize = 4;
+
 /// One staging attempt's private extraction directory.
 ///
 /// Isolation is by construction, not by exclusion: the directory is named with a fresh random
@@ -482,8 +492,9 @@ const OWNER_SUFFIX: &str = ".owner";
 /// the kernel releases that lock when the owning process exits, however it exits. A directory
 /// whose owner lock can be taken has, by definition, no live owner.
 ///
-/// The owner file is created *before* the directory it guards and removed *after* it, so a
-/// sweeper that can see an attempt directory can always see (and fail to lock) its live owner.
+/// An owner file appears under its final name only once its lock is already held, and it is
+/// removed *after* the directory it guards, so a sweeper that can see any part of a live attempt
+/// can always see — and fail to lock — its live owner.
 struct Stage {
     dir: PathBuf,
     owner_path: PathBuf,
@@ -497,16 +508,38 @@ impl Stage {
         // Sweep before claiming: leftovers are reclaimed even when this attempt goes on to fail,
         // and nothing this attempt owns exists yet, so the sweep cannot see it.
         sweep_abandoned(staging_root);
-        let name = format!("{STAGE_PREFIX}{}", crate::rand::token()?);
-        let owner_path = staging_root.join(format!("{name}{OWNER_SUFFIX}"));
-        let owner = crate::lock::InstanceLock::acquire(&owner_path)?;
-        let dir = staging_root.join(name);
-        fs::create_dir(&dir)?;
-        Ok(Stage {
-            dir,
-            owner_path,
-            owner: Some(owner),
-        })
+        // Publishing an owner file and locking it are not one step: `InstanceLock::acquire` opens
+        // the file and only then locks it. An owner file created directly at its final name is
+        // therefore visible — and lockable — to a concurrent sweep in between, which would take
+        // the lock, unlink the file, and leave this attempt extracting into a directory with no
+        // owner beside it: the one state the sweep reads as an interrupted sweep and deletes. So
+        // the file is created and locked under a claim name no sweep can mistake for a live
+        // attempt, then renamed into place with its lock already held.
+        for _ in 0..CLAIM_ATTEMPTS {
+            let name = format!("{STAGE_PREFIX}{}", crate::rand::token()?);
+            let claim_path = staging_root.join(format!("{CLAIM_PREFIX}{name}{OWNER_SUFFIX}"));
+            let owner_path = staging_root.join(format!("{name}{OWNER_SUFFIX}"));
+            let owner = crate::lock::InstanceLock::acquire(&claim_path)?;
+            if let Err(error) = fs::rename(&claim_path, &owner_path) {
+                if error.kind() == io::ErrorKind::NotFound {
+                    // A sweep reclaimed the claim before it was locked. Nothing of this attempt
+                    // exists on disk any more, so start over under a fresh token.
+                    continue;
+                }
+                return Err(error);
+            }
+            let dir = staging_root.join(name);
+            fs::create_dir(&dir)?;
+            return Ok(Stage {
+                dir,
+                owner_path,
+                owner: Some(owner),
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "staging claims were reclaimed by concurrent sweeps",
+        ))
     }
 
     fn path(&self) -> &Path {
@@ -530,7 +563,8 @@ impl Drop for Stage {
 /// and a live attempt's lock is never available to either. Attempt names are one-shot random
 /// tokens that are never reused, so nothing can claim a name between the moment it is found
 /// abandoned and the moment it is removed. Anything that cannot be locked or removed is simply
-/// left for the next sweep.
+/// left for the next sweep. Unpublished claims are reclaimed on the same test, so an attempt
+/// killed before it published still costs nothing on disk.
 fn sweep_abandoned(staging_root: &Path) {
     let Ok(entries) = fs::read_dir(staging_root) else {
         return;
@@ -538,17 +572,27 @@ fn sweep_abandoned(staging_root: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
+        // A claim is an owner file that was never published: its attempt died between creating the
+        // file and renaming it into place. It guards no directory, so it is reclaimed on its own.
+        let (name, claim) = match name.strip_prefix(CLAIM_PREFIX) {
+            Some(stem) => (stem, true),
+            None => (name, false),
+        };
         if !name.starts_with(STAGE_PREFIX) {
             continue;
         }
         let path = entry.path();
         let Some(attempt) = name.strip_suffix(OWNER_SUFFIX) else {
             // A directory with no owner file beside it: a previous sweep was interrupted between
-            // unlinking the owner and removing the tree. A live attempt is never in this state.
-            if !staging_root
-                .join(format!("{name}{OWNER_SUFFIX}"))
-                .try_exists()
-                .unwrap_or(true)
+            // unlinking the owner and removing the tree. A live attempt is never in this state,
+            // because its owner file is already locked when it first appears under that name.
+            // Nothing is ever created under a claim name but the claim file itself, so a
+            // dot-prefixed directory belongs to someone else and is left alone.
+            if !claim
+                && !staging_root
+                    .join(format!("{name}{OWNER_SUFFIX}"))
+                    .try_exists()
+                    .unwrap_or(true)
             {
                 discard(&path);
             }
@@ -565,7 +609,9 @@ fn sweep_abandoned(staging_root: &Path) {
             Ok(lock) => drop(lock),
             Err(_) => continue,
         }
-        discard(&staging_root.join(attempt));
+        if !claim {
+            discard(&staging_root.join(attempt));
+        }
         let _ = fs::remove_file(&path);
     }
 }
@@ -737,7 +783,7 @@ fn extract(
     for declared in &manifest.files {
         match extracted.get(&declared.path) {
             Some((size, digest))
-                if *size == declared.size && digest.eq_ignore_ascii_case(&declared.sha256) => {}
+                if *size == declared.size && digests_match(digest, &declared.sha256) => {}
             _ => return Err(archive_verdict("bundle member does not match its manifest")),
         }
         set_executable(&stage.join(&declared.path), declared.executable)?;
@@ -838,7 +884,7 @@ pub(crate) fn verify_tree(directory: &Path, manifest: &BundleManifest) -> io::Re
         if !metadata.is_file() || metadata.len() != file.size {
             return Err(invalid("release file type or size drifted"));
         }
-        if !sha256_file(&path)?.eq_ignore_ascii_case(&file.sha256) {
+        if !digests_match(&sha256_file(&path)?, &file.sha256) {
             return Err(invalid("release file digest drifted"));
         }
         verify_executable(&metadata, file.executable)?;
@@ -1084,6 +1130,53 @@ mod tests {
         drop(held);
         let staged = stage(&archive, &staging, &versions, "1.0.0");
         assert!(versions.join(staged.id.directory_name()).is_dir());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    /// An owner file is only ever *published* under its final name with its lock already held, so
+    /// no sweep can ever observe a live attempt's owner as lockable and unlink it out from under
+    /// the extraction it guards. The window that used to exist — `InstanceLock::acquire` opens
+    /// before it locks — is spent under a claim name instead, and a claim is left alone while it
+    /// is locked and reclaimed on its own once it is not.
+    #[test]
+    fn an_owner_file_is_published_only_once_it_is_locked() {
+        let root = root("stage-claim");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        // An attempt caught between creating its owner file and publishing it.
+        let claim = staging.join(format!("{CLAIM_PREFIX}{STAGE_PREFIX}aaaa{OWNER_SUFFIX}"));
+        let held = crate::lock::InstanceLock::acquire(&claim).unwrap();
+        drop(Stage::create(&staging).unwrap());
+        assert!(
+            claim.is_file(),
+            "a locked claim must survive another attempt's sweep"
+        );
+
+        // It publishes and extracts as usual, and its live tree survives further sweeps.
+        fs::rename(
+            &claim,
+            staging.join(format!("{STAGE_PREFIX}aaaa{OWNER_SUFFIX}")),
+        )
+        .unwrap();
+        let dir = staging.join(format!("{STAGE_PREFIX}aaaa"));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("in-flight"), b"live extraction").unwrap();
+        drop(Stage::create(&staging).unwrap());
+        assert!(
+            dir.join("in-flight").is_file(),
+            "a published, locked attempt must survive another attempt's sweep"
+        );
+
+        // Once the owner is gone, both the tree and its owner file are reclaimed.
+        drop(held);
+        drop(Stage::create(&staging).unwrap());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+
+        // And a claim nobody holds any more — an attempt killed before it published — is
+        // reclaimed too, rather than accumulating one dirent per killed attempt.
+        fs::write(&claim, b"").unwrap();
+        drop(Stage::create(&staging).unwrap());
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }
 

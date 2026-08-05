@@ -58,12 +58,25 @@ impl Default for Sha256Hasher {
     }
 }
 
+/// Whether two hex digests name the same content.
+///
+/// The two sides never come from the same producer: one is `hex::encode`, which is always
+/// lowercase, and the other is a digest out of a signed document, which the contract
+/// (`updated_contracts::is_sha256_hex`) admits in any case. A bare `==` therefore fails closed on a
+/// perfectly valid uppercase digest — on the paths that boot, install, or execute, where that is
+/// non-retryable. Every digest comparison this crate makes on that path goes through here — the
+/// release-identity check, each extracted bundle member against its manifest, and the on-disk
+/// re-verification — so no one of them can diverge back to `==` on its own.
+pub fn digests_match(got: &str, expected: &str) -> bool {
+    got.eq_ignore_ascii_case(expected)
+}
+
 /// Verify the file at `path` hashes to `expected`: propagate a read error, and
 /// report a mismatch as an error naming both digests. Callers use this on the
 /// commit/execute path where drifted or tampered bytes must fail closed.
 pub fn verify_file(path: &Path, expected: &str) -> io::Result<()> {
     let got = sha256_file(path)?;
-    if got.eq_ignore_ascii_case(expected) {
+    if digests_match(&got, expected) {
         Ok(())
     } else {
         Err(io::Error::other(format!(
@@ -98,6 +111,8 @@ mod tests {
         assert_eq!(sha256_bytes(b"the exact bytes"), want);
         verify_file(&f, &want).unwrap();
         verify_file(&f, &want.to_uppercase()).unwrap(); // case-insensitive
+        assert!(digests_match(&want, &want.to_uppercase()));
+        assert!(!digests_match(&want, &"0".repeat(64)));
 
         assert!(verify_file(&f, &"0".repeat(64)).is_err());
         let _ = std::fs::remove_file(&f);

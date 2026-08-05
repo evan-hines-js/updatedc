@@ -11,19 +11,15 @@ use std::ffi::OsString;
 /// thin handle bundling the control connection and the app's PID.
 pub(crate) struct App {
     pub(crate) guardian: Guardian,
-    pid: Option<u32>,
     mode: updated_contracts::assignment::RuntimeMode,
 }
 
 impl App {
+    /// The running application's PID, read from the guardian connection that launched and stops it
+    /// rather than mirrored here: two copies of the same fact, written from the same call, diverge
+    /// as soon as one launch path skips the other's write.
     pub(crate) fn pid(&self) -> Option<u32> {
-        self.pid
-    }
-
-    /// Prove to the guardian that this supervisor initialized — commits a candidate
-    /// supervisor handoff, and is a harmless no-op for an ordinary launch.
-    pub(crate) fn signal_ready(&mut self) -> Result<(), String> {
-        self.guardian.signal_ready()
+        self.guardian.running_app()
     }
 
     pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), String> {
@@ -31,28 +27,36 @@ impl App {
     }
 
     /// Ask the guardian to (re)launch the application, updating our PID.
+    ///
+    /// Provider-managed mode launches nothing — the signed node reconciler owns every application
+    /// effect. Any process the guardian still holds when this mode is entered belongs to a previous
+    /// managed contract (a supervisor that launched one and handed its PID across exec, or this
+    /// process before an assignment changed the mode), so it is retired here, exactly once. That is
+    /// what makes [`App::pid`] `None` for the whole of provider-managed mode: the agent neither
+    /// exposes nor manipulates an application process, and there is no `--managed-pid` to leak into
+    /// the reconciler's argv.
     pub(crate) fn launch(&mut self, opts: &Options) -> io::Result<()> {
         self.mode = opts.application.mode;
         if self.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged {
-            self.pid = None;
-            return Ok(());
+            return match self.guardian.running_app() {
+                Some(_) => self.guardian.stop().map_err(io::Error::other),
+                None => Ok(()),
+            };
         }
         let spec = app_spec(opts)?;
         // A guardian `Channel` failure becomes `io::ErrorKind::ConnectionReset` (see
         // `GuardianError`); the update path recognizes that and recovers instead of rejecting.
-        let pid = self.guardian.launch(&spec)?;
-        self.pid = Some(pid);
+        self.guardian.launch(&spec)?;
         Ok(())
     }
 }
 
 /// Adopt the application the guardian is already running (no restart).
-pub(crate) fn adopt(mut guardian: Guardian, opts: &Options, pid: u32) -> io::Result<App> {
+pub(crate) fn adopt(guardian: Guardian, opts: &Options, pid: u32) -> io::Result<App> {
     if opts.application.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged {
-        // The guardian can only offer a PID for a process from the previous managed contract.
-        // Retire that owned child exactly once before entering provider-managed mode; after this
-        // agent never manipulates an application process.
-        guardian.stop().map_err(io::Error::other)?;
+        // There is nothing to adopt: the guardian can only offer a PID for a process from the
+        // previous managed contract, and entering provider-managed mode retires that child (see
+        // [`App::launch`]) rather than keeping it.
         return start(guardian, opts);
     }
     log(&format!(
@@ -60,7 +64,6 @@ pub(crate) fn adopt(mut guardian: Guardian, opts: &Options, pid: u32) -> io::Res
     ));
     Ok(App {
         guardian,
-        pid: Some(pid),
         mode: opts.application.mode,
     })
 }
@@ -69,11 +72,10 @@ pub(crate) fn adopt(mut guardian: Guardian, opts: &Options, pid: u32) -> io::Res
 pub(crate) fn start(guardian: Guardian, opts: &Options) -> io::Result<App> {
     let mut app = App {
         guardian,
-        pid: None,
         mode: opts.application.mode,
     };
     app.launch(opts)?;
-    match app.pid {
+    match app.pid() {
         Some(pid) => log(&format!("started managed application pid {pid}")),
         None => log("started provider-managed runtime (no application process is owned)"),
     }
@@ -221,6 +223,85 @@ mod tests {
     use super::{apply_secret_environment, Readiness};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+
+    /// Options in the shape [`crate::options::parse_args`] produces for `mode`, with a local
+    /// routing repository and no secrets so nothing here reaches the network. Only the runtime
+    /// mode is under test; the rest is the layout every other field derives from.
+    #[cfg(unix)]
+    fn options(mode: updated_contracts::assignment::RuntimeMode) -> crate::Options {
+        use updated::config::{Paths, Repository, Routing, Storage, Timeouts};
+        let root = std::path::PathBuf::from("/nonexistent/updated-app-tests");
+        let routing = Routing {
+            root: root.join("enrollment/routing"),
+            base_url: root.join("routing").display().to_string(),
+            assignment: "assignments/agents/agent-test.json".into(),
+            metadata_limit: 1 << 20,
+            transport_timeout: std::time::Duration::from_secs(30),
+            mtls: updated::tls::Identity::new(
+                root.join("client.pem"),
+                root.join("client.key"),
+                root.join("ca.pem"),
+            ),
+        };
+        crate::Options {
+            deployment: "test".into(),
+            secrets: crate::secrets::SecretManager::new(&routing, &[]).expect("a local repository"),
+            paths: Paths::resolve(&root, &root.join("enrollment")),
+            application: updated::config::Application {
+                mode,
+                product: "app".into(),
+                channel: "stable".into(),
+                install_root: root.clone(),
+                args: Vec::new(),
+                secrets: Vec::new(),
+                inputs: BTreeMap::new(),
+            },
+            repository: Repository {
+                metadata_limit: 1 << 20,
+                target_limit: 1 << 20,
+                transport_timeout: std::time::Duration::from_secs(30),
+            },
+            routing,
+            timeouts: crate::BoundedTimeouts::new(Timeouts::default()),
+            storage: Storage::default(),
+            supervisor_update: crate::SupervisorUpdate {
+                channel: "stable".into(),
+                state_dir: root.join("state"),
+                check_interval: std::time::Duration::from_secs(60),
+            },
+            identity_renewal: crate::IdentityRenewal {
+                bootstrap: root.join("bootstrap.toml"),
+                state_dir: root.join("enrollment"),
+            },
+        }
+    }
+
+    /// Entering provider-managed mode retires the application the guardian still owns, so the mode
+    /// whose contract is that the agent never exposes or manipulates an application process has no
+    /// PID to report. A boot that reaches this with a live app is ordinary: a rollback journal at
+    /// `PredecessorStarted` plans `Acquire::Launch` while the recovery guard skips the quiesce, so
+    /// the PID handed across exec is still on the connection. Leaving it there put a
+    /// `--managed-pid` on every reconciler invocation and logged a managed PID for a runtime the
+    /// agent does not own.
+    #[cfg(unix)]
+    #[test]
+    fn entering_provider_managed_mode_retires_the_application_the_guardian_owns() {
+        use updated_contracts::assignment::RuntimeMode;
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let peer = crate::guardian::answering(theirs, control::Response::Ok);
+        let opts = options(RuntimeMode::ProviderManaged);
+        let mut app = super::App {
+            guardian: crate::guardian::Guardian::for_test(ours, Some(4321)),
+            mode: RuntimeMode::Managed,
+        };
+        assert_eq!(app.pid(), Some(4321), "the launch environment seeded one");
+
+        app.launch(&opts).expect("provider-managed launch");
+
+        assert_eq!(app.pid(), None);
+        peer.join().expect("the guardian was asked to stop it");
+    }
 
     #[test]
     fn readiness_needs_consecutive_successes_and_a_failure_resets_the_run() {

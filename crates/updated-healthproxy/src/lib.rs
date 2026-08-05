@@ -140,11 +140,14 @@ pub async fn fetch_report(
         .ok()
 }
 
-/// The number of nodes polled concurrently per cycle. Bounded so a large fleet neither serializes
-/// (one hung node stalling the rest, risking a reconcile longer than
-/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]) nor
-/// fans out an unbounded burst of simultaneous CDN fetches.
-const POLL_CONCURRENCY: usize = 32;
+/// The width of every per-cycle fan-out: the node report poll here, and the load-balancer backend's
+/// own fan-out across its instances. Bounded so a large fleet neither serializes (one hung peer
+/// stalling the rest, risking a cycle longer than
+/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]) nor fans out an unbounded burst of
+/// simultaneous connections. One constant rather than one per fan-out, because the per-request
+/// budgets are derived from it against [`RECONCILE_TIMEOUT`] — two copies that agree today would
+/// silently stop agreeing.
+pub(crate) const FANOUT_CONCURRENCY: usize = 32;
 
 /// Resolve the desired membership: every configured node, with its readiness read from its
 /// current health report. Nodes are polled with bounded concurrency — one slow or hung node's
@@ -177,7 +180,7 @@ pub async fn resolve_members(
                 (index, fetch_report(client, health_base, &member.node).await)
             }),
     )
-    .buffer_unordered(POLL_CONCURRENCY)
+    .buffer_unordered(FANOUT_CONCURRENCY)
     .collect()
     .await;
     let mut fresh: Vec<Option<Vec<u8>>> = vec![None; inventory.len()];
@@ -264,7 +267,7 @@ impl<T: Clone> LastKnownGood<T> {
 /// patch) does not — an unbounded stall there would freeze the whole reconcile loop, silently
 /// stranding the last programmed membership. Bounding it means a hung backend costs one logged,
 /// retried cycle instead of a wedged proxy.
-const RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A node's readiness edge between reconcile cycles — the only thing this component logs, because it
 /// is the one observer of an out-of-cluster node leaving or rejoining the pool (the control plane

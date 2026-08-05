@@ -225,7 +225,12 @@ pub(crate) const DEMO_REPORT_URL: &str = "https://updatec-gateway";
 /// gateway writes reports into, read directly as the CDN. This is the read side of the split:
 /// nodes *write* over mTLS to the gateway ([`DEMO_REPORT_URL`]); readers *read* the resulting
 /// `<base>/telemetry/<node>.json` from the store. Anonymous read is enabled on the bucket.
-pub(crate) const DEMO_HEALTH_CDN: &str = "http://minio:9000/updates";
+///
+/// The path is `<bucket>/<repository s3.prefix>`: the gateway persists each report under the
+/// repository's own object-store prefix (`<prefix>/telemetry/<node>.json`), the same prefix the
+/// controller reads them back through. Pointing this at the bucket root instead would 404 every
+/// report and silently drain the whole fleet, so it must track the demo repository's spec.
+pub(crate) const DEMO_HEALTH_CDN: &str = "http://minio:9000/updates/routing";
 
 /// In-cluster base URL of the ingress the synthetic load test drives. Each set's traffic
 /// enters at `<base>/set-<n>/…`; the ingress routes it to that set's Service, whose selector
@@ -297,5 +302,48 @@ mod tests {
         }
         // ...and it actually varies across the whole band, not stuck on one value.
         assert_eq!(seen.into_iter().collect::<Vec<_>>(), band);
+    }
+
+    /// The one repository spec the demo/e2e cluster applies. The healthproxy reads the reports
+    /// the gateway writes *into that repository's object-store location*, so this test is against
+    /// the spec source rather than a copy of its literals.
+    const REPOSITORY_SPEC: &str = include_str!("../../updatec/examples/kind_resources.rs");
+
+    fn spec_field(field: &str) -> String {
+        let block = REPOSITORY_SPEC
+            .split_once("s3: S3Destination {")
+            .expect("repository spec declares an S3 destination")
+            .1;
+        let value = block
+            .split_once(&format!("{field}: "))
+            .unwrap_or_else(|| panic!("S3 destination declares {field}"))
+            .1;
+        let quoted = value
+            .split_once('"')
+            .expect("field value is a string literal")
+            .1;
+        quoted
+            .split_once('"')
+            .expect("field value is a string literal")
+            .0
+            .to_string()
+    }
+
+    #[test]
+    fn health_cdn_addresses_the_prefix_the_gateway_writes_reports_under() {
+        // The gateway persists a node report at `<s3.prefix>/telemetry/<node>.json` inside the
+        // repository's bucket, and the healthproxy fetches `<health base>/telemetry/<node>.json`.
+        // If the base omits the prefix, every GET 404s, no report is ever cached, and every node
+        // is programmed `ready: false` forever — silently draining the entire external LB path.
+        let endpoint = spec_field("endpoint");
+        let bucket = spec_field("bucket");
+        let prefix = spec_field("prefix");
+        assert_eq!(DEMO_HEALTH_CDN, format!("{endpoint}/{bucket}/{prefix}"));
+
+        let node = "demo-node-01";
+        assert_eq!(
+            format!("{DEMO_HEALTH_CDN}/telemetry/{node}.json"),
+            format!("{endpoint}/{bucket}/{prefix}/telemetry/{node}.json"),
+        );
     }
 }

@@ -169,10 +169,6 @@ impl ManagedRuntime {
                 self.repository.transport_timeout_seconds,
             ),
             (
-                "timeouts.check_interval_seconds",
-                self.timeouts.check_interval_seconds,
-            ),
-            (
                 "timeouts.health_grace_seconds",
                 self.timeouts.health_grace_seconds,
             ),
@@ -183,10 +179,6 @@ impl ManagedRuntime {
             (
                 "timeouts.retry_after_seconds",
                 self.timeouts.retry_after_seconds,
-            ),
-            (
-                "timeouts.refresh_retry_seconds",
-                self.timeouts.refresh_retry_seconds,
             ),
             (
                 "timeouts.confirmation_window_seconds",
@@ -206,6 +198,37 @@ impl ManagedRuntime {
             if seconds > MAX_INTERVAL_SECONDS {
                 return Err(format!(
                     "{field} ({seconds}) exceeds the {MAX_INTERVAL_SECONDS}s maximum"
+                ));
+            }
+        }
+        // The node's report cadence rides on the check loop — it heartbeats at the bottom of it —
+        // so every field the supervisor uses as the BASE of its next-check deadline answers to the
+        // freshness window every reader ages a report against, not to the generic ceiling above.
+        // `check_interval` is that base in steady state and `refresh_retry` is that base after a
+        // retryable repository failure; bounding only the first leaves the identical
+        // stale-by-construction node one field to the left. Beyond the bound a node's own reports
+        // are stale on arrival: drained from the load balancer for part of every cycle, and never
+        // counted as settled by the rollout throttle, while being perfectly healthy.
+        //
+        // What this does NOT cover is the exponential backoff the supervisor multiplies that base
+        // by after repeated failures. A node that cannot refresh its assignment at all cannot show
+        // it is running what the control plane assigned, so aging out of "settled" there is the
+        // fail-closed direction; a publisher choosing a slow cadence for a perfectly healthy fleet
+        // is not.
+        for (field, seconds) in [
+            (
+                "timeouts.check_interval_seconds",
+                self.timeouts.check_interval_seconds,
+            ),
+            (
+                "timeouts.refresh_retry_seconds",
+                self.timeouts.refresh_retry_seconds,
+            ),
+        ] {
+            if seconds > crate::telemetry::MAX_CHECK_INTERVAL_SECONDS {
+                return Err(format!(
+                    "{field} ({seconds}) exceeds the {}s maximum that keeps a node's reports inside the shared freshness window",
+                    crate::telemetry::MAX_CHECK_INTERVAL_SECONDS
                 ));
             }
         }
@@ -328,7 +351,7 @@ mod tests {
                 inactive_repository_caches: 2,
             },
             timeouts: ManagedTimeouts {
-                check_interval_seconds: 60,
+                check_interval_seconds: 15,
                 health_grace_seconds: 30,
                 health_successes: 2,
                 health_interval_seconds: 1,
@@ -369,12 +392,11 @@ mod tests {
     #[test]
     fn every_timeout_is_bounded_from_above() {
         type SetSeconds = fn(&mut ManagedRuntime, u64);
-        let fields: [(&str, SetSeconds); 9] = [
+        // The report-cadence fields are absent deliberately: they answer to the tighter,
+        // freshness-derived ceiling instead (see below).
+        let fields: [(&str, SetSeconds); 7] = [
             ("transport_timeout", |r, v| {
                 r.repository.transport_timeout_seconds = v
-            }),
-            ("check_interval", |r, v| {
-                r.timeouts.check_interval_seconds = v
             }),
             ("health_grace", |r, v| r.timeouts.health_grace_seconds = v),
             ("health_interval", |r, v| {
@@ -384,7 +406,6 @@ mod tests {
                 r.timeouts.health_interval_seconds = v;
             }),
             ("retry_after", |r, v| r.timeouts.retry_after_seconds = v),
-            ("refresh_retry", |r, v| r.timeouts.refresh_retry_seconds = v),
             ("confirmation_window", |r, v| {
                 r.timeouts.confirmation_window_seconds = v
             }),
@@ -414,6 +435,70 @@ mod tests {
                 assert!(
                     signed.validate().is_err(),
                     "{name} = {hostile} must be rejected by the assignment too"
+                );
+            }
+        }
+    }
+
+    /// The node heartbeats at the bottom of its check loop, so whatever the supervisor schedules
+    /// that loop on IS the report cadence and the freshness window every reader enforces is what
+    /// bounds it — not the generic 30-day ceiling, under which the perfectly ordinary 60 was
+    /// accepted and produced a healthy node that drops out of the load balancer for part of every
+    /// single cycle. `refresh_retry` is that schedule after a retryable repository failure, so
+    /// leaving it on the generic ceiling reproduces the identical node one field to the left.
+    #[test]
+    fn every_field_the_report_cadence_rides_on_is_bounded_by_the_freshness_window() {
+        use crate::telemetry::{
+            MAX_CHECK_INTERVAL_SECONDS, REPORT_CADENCE_JITTER_PERCENT, REPORT_FRESHNESS,
+        };
+
+        // Three jittered cadences fit inside the window: two so one lost best-effort report write
+        // still leaves the node fresh, and a third for the upload, the store's propagation, and the
+        // reader's own poll interval — none of which is free.
+        let jittered =
+            MAX_CHECK_INTERVAL_SECONDS * u64::from(100 + REPORT_CADENCE_JITTER_PERCENT) / 100 * 3;
+        assert!(
+            jittered <= REPORT_FRESHNESS.as_secs(),
+            "{jittered}s of cadence does not fit in the {}s freshness window",
+            REPORT_FRESHNESS.as_secs()
+        );
+
+        type SetSeconds = fn(&mut ManagedRuntime, u64);
+        let fields: [(&str, SetSeconds); 2] = [
+            ("check_interval_seconds", |r, v| {
+                r.timeouts.check_interval_seconds = v
+            }),
+            ("refresh_retry_seconds", |r, v| {
+                r.timeouts.refresh_retry_seconds = v
+            }),
+        ];
+        for (name, set) in fields {
+            let mut at_maximum = runtime();
+            set(&mut at_maximum, MAX_CHECK_INTERVAL_SECONDS);
+            at_maximum
+                .validate()
+                .unwrap_or_else(|error| panic!("{name} at the maximum must remain valid: {error}"));
+
+            for stale in [
+                // The value the shipped fixture used to carry: 60s of cadence against a 60s window.
+                60,
+                MAX_CHECK_INTERVAL_SECONDS + 1,
+                MAX_INTERVAL_SECONDS,
+                u64::MAX,
+            ] {
+                let mut value = runtime();
+                set(&mut value, stale);
+                let error = value
+                    .validate()
+                    .expect_err("a cadence the freshness window cannot cover must be refused");
+                assert!(error.contains(name), "{error}");
+
+                // …and refused through the whole signed document, not just the runtime.
+                let mut signed = assignment();
+                set(&mut signed.runtime, stale);
+                assert!(
+                    signed.validate().is_err(),
+                    "{name} = {stale} must be rejected by the assignment too"
                 );
             }
         }

@@ -195,6 +195,9 @@ pub fn parent_dir(path: &Path) -> &Path {
 /// chmod afterwards. This is the write secrets go through — an enrollment key, a minted TLS
 /// private key.
 ///
+/// `Err` means the file at `path` still holds its old content — except for the one failure that
+/// happens after the rename, which says so ([`committed_unsynced`]).
+///
 /// Use [`atomic_write_managed`] for a non-secret file under the node's state directory.
 pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
     durable_write(path, prefix, data, Visibility::Private)
@@ -221,7 +224,52 @@ fn durable_write(path: &Path, prefix: &str, data: &[u8], visibility: Visibility)
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    sync_dir(dir)
+    sync_dir(dir).map_err(unsynced)
+}
+
+/// The failure of the directory fsync that follows an already-visible rename or unlink — the
+/// one failure mode of these primitives where the effect landed anyway.
+///
+/// It is wrapped rather than returned bare so the two facts a caller needs — "the change is
+/// there" and "its survival across a power loss is unproven" — travel in one `io::Result`
+/// instead of forcing a second return type on every durable primitive and every caller of one.
+/// [`committed_unsynced`] is how a caller asks.
+#[derive(Debug)]
+struct Unsynced(io::Error);
+
+impl std::fmt::Display for Unsynced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (the change is already visible, not yet durable)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Unsynced {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Tag a post-commit failure, keeping the underlying `ErrorKind` so a caller that only matches
+/// on the kind (`NotFound`, `PermissionDenied`, …) is unaffected by the wrapping.
+fn unsynced(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), Unsynced(error))
+}
+
+/// Whether `error` reports an operation whose effect ALREADY LANDED and that failed only to
+/// prove that effect durable: the rename or unlink is visible to every reader, and the
+/// directory fsync behind it is what failed (`EMFILE`, an fsync `EIO`).
+///
+/// The distinction exists for callers that undo their own state when a durable write fails.
+/// The guardian rolls its committed-supervisor pointer back to the predecessor and records the
+/// candidate rejected — which, for a pointer that actually moved, would leave a rejection
+/// marker about the very binary the next boot launches as the committed supervisor. Every other
+/// caller is right to treat this as the plain failure it also is.
+pub fn committed_unsynced(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Unsynced>())
 }
 
 /// Copy a verified executable into a fresh sibling file, persist its final mode, and atomically
@@ -258,13 +306,13 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
     }
-    sync_dir(dir)?;
+    sync_dir(dir).map_err(unsynced)?;
     // Also persist the directory entry OF `dir` itself. Executables are installed into a freshly
     // created content-addressed directory, and syncing only that directory leaves its own name
     // unpersisted in the parent: after a power loss the file is durable but the path to it is not,
     // so a committed pointer resolves to nothing. One extra fsync per install closes that.
     match dir.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent).map_err(unsynced),
         _ => Ok(()),
     }
 }
@@ -272,8 +320,9 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
 /// Best-effort removal of stale temp files left behind when a crash or power loss struck
 /// between an [`atomic_write`]/[`install_executable`]/[`create_temp_managed`] and its rename —
 /// the `<prefix>…-….tmp` sibling is then an orphan no one will ever finish. Sweeps `dir`
-/// for files whose name starts with `prefix` and ends with `.tmp`, skipping any modified
-/// within [`STALE_TEMP_AGE`] so a temp an in-flight writer still owns is never yanked.
+/// for files whose name starts with `prefix` and ends with `.tmp`, removing only those whose
+/// age is known to have reached [`STALE_TEMP_AGE`] — anything newer, and anything whose age
+/// cannot be determined, is spared so a temp an in-flight writer still owns is never yanked.
 ///
 /// Purely hygiene: a directory-read or unlink failure is ignored (a stray temp is inert —
 /// the sequence/pid/nanos naming means it can never collide with a real committed file),
@@ -290,13 +339,17 @@ pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
         if !name.starts_with(prefix) || !name.ends_with(".tmp") {
             continue;
         }
-        let recently_written = entry
+        // Only a *known* age past the threshold proves abandonment. An unreadable mtime, or
+        // one in the future because the clock stepped backwards under an in-flight writer,
+        // leaves the age unknown — spare the temp rather than yank a file someone still owns.
+        // A spared orphan is inert and the next sweep, once the clock settles, reaps it.
+        let provably_stale = entry
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age < STALE_TEMP_AGE);
-        if recently_written {
+            .is_some_and(|age| age >= STALE_TEMP_AGE);
+        if !provably_stale {
             continue;
         }
         if fs::remove_file(entry.path()).is_ok() {
@@ -316,7 +369,7 @@ pub fn remove_file(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     }
-    sync_dir(parent_dir(path))
+    sync_dir(parent_dir(path)).map_err(unsynced)
 }
 
 /// Durably remove *whatever* is at `path` — a file, a symlink, or a whole directory tree — for
@@ -334,7 +387,7 @@ pub fn remove_path(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     }
-    sync_dir(parent_dir(path))
+    sync_dir(parent_dir(path)).map_err(unsynced)
 }
 
 /// Replace `to` with `from`, tolerating the short-lived executable/file locks seen
@@ -411,6 +464,44 @@ mod tests {
         atomic_write(&p, ".test-", b"first").unwrap();
         atomic_write(&p, ".test-", b"second-longer").unwrap();
         assert_eq!(fs::read(p).unwrap(), b"second-longer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_after_the_rename_reports_the_write_as_committed() {
+        // The rename is already visible when the directory fsync runs, so reporting that failure
+        // as a plain Err claims the old content is still there while the new content is what
+        // every reader sees. The guardian rolls its supervisor pointer back to the predecessor
+        // on a failed commit; rolling back a pointer that moved rejects the binary the next boot
+        // launches as the committed supervisor.
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("unsynced");
+        let p = d.join("pointer");
+        atomic_write_managed(&p, ".test-", b"old").unwrap();
+        // Write and search but not read: creating and renaming the temp still works, opening the
+        // directory itself — which is all `sync_dir` does — cannot. Root bypasses the check, so
+        // there is nothing to prove there.
+        let root = unsafe { libc::geteuid() } == 0;
+        fs::set_permissions(&d, PermissionsExt::from_mode(0o300)).unwrap();
+        let outcome = atomic_write_managed(&p, ".test-", b"new");
+        fs::set_permissions(&d, PermissionsExt::from_mode(0o700)).unwrap();
+        if root {
+            return;
+        }
+        let error = outcome.expect_err("the directory fsync must fail");
+        assert!(
+            committed_unsynced(&error),
+            "a post-rename failure must not read as a write that did not happen: {error}"
+        );
+        assert_eq!(
+            fs::read(&p).unwrap(),
+            b"new",
+            "the rename is what committed"
+        );
+        assert!(
+            !committed_unsynced(&io::Error::from(io::ErrorKind::PermissionDenied)),
+            "an ordinary failure is still an ordinary failure"
+        );
     }
 
     #[test]
@@ -528,6 +619,21 @@ mod tests {
         assert!(d.join("other-9-9-9.tmp").exists());
         assert!(d.join(".guardian-1-2-3.tmp").exists());
         assert!(!stale.exists());
+    }
+
+    /// A node whose clock steps backwards (RTC ran fast, then NTP corrected it) leaves temps
+    /// with mtimes in the future, so their age cannot be computed. That is not evidence of
+    /// abandonment: sweeping must spare them, or a concurrent download gets its file unlinked
+    /// out from under it and every retry fails the same way.
+    #[test]
+    fn sweep_spares_temps_whose_age_is_unknown() {
+        let d = dir("sweep-future-mtime");
+        let in_flight = d.join(".guardian-7-8-9.tmp");
+        fs::write(&in_flight, b"in flight").unwrap();
+        filetime_set(&in_flight, SystemTime::now() + Duration::from_secs(600));
+
+        assert_eq!(sweep_stale_temps(&d, ".guardian-"), 0);
+        assert!(in_flight.exists());
     }
 
     /// Backdate a file's mtime without pulling in a dependency: reopening and rewriting

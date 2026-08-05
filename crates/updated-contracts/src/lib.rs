@@ -13,6 +13,7 @@ pub mod artifact;
 pub mod assignment;
 pub mod enrollment;
 pub mod path;
+pub mod reconciler;
 pub mod telemetry;
 
 /// Deserialize a nullable value while still requiring the field to be present. Serialized

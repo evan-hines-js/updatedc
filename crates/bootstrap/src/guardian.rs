@@ -26,6 +26,21 @@ use crate::supervisor::{Link, Supervisor};
 
 /// How often the serve loop wakes to re-check the application, the supervisor, and shutdown.
 const SERVE_POLL_MS: i32 = 100;
+
+/// How long a failed control read waits for the peer to become reapable before it is called a
+/// channel fault rather than an ordinary exit. Only ever spent on a supervisor that is already
+/// finished with this channel, so it costs nothing on the healthy path. Generous next to the
+/// window it closes: the kernel marks an exited child reapable as it tears the process down,
+/// microseconds after the descriptor close that produced the read failure.
+const EXIT_OBSERVATION_GRACE: Duration = Duration::from_millis(500);
+
+/// How many times the run loop retries recording a service exit before rolling the exit up
+/// without its marker. The marker is what makes the next boot revert an unconfirmed release
+/// that just crashed, so a transient durable-state failure (ENOSPC, EIO) must not lose it —
+/// but the application is already dead by then, and only the guardian's exit lets the init
+/// system restart the tower, so the retries are bounded rather than endless.
+const EXIT_MARKER_ATTEMPTS: u32 = 5;
+
 /// The guardian's configuration, all from the command line — it parses no config file
 /// (that is the supervisor's job; the path is passed through opaquely).
 pub struct Config {
@@ -174,6 +189,7 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
     let mut service = Service::new(probes.clone());
     let mut next: Option<PathBuf> = None; // Some(path) means "activate this candidate"
     let mut backoff = Backoff::new();
+    let mut marker_failures = 0u32;
     while !crate::sys::shutdown_requested() {
         let launched = Instant::now();
         // A failed supervisor cycle must not take the guardian down with it. By this point the
@@ -182,13 +198,17 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
         // unwritable state dir) would turn one bad write into a service outage. Log it, back off,
         // and try the cycle again; the application keeps serving throughout. Startup failures that
         // genuinely cannot be recovered from happen before this loop, while nothing is running.
-        let cycle = match run_supervisor(cfg, &mut service, next.take()) {
+        let candidate = next.take();
+        let cycle = match run_supervisor(cfg, &mut service, candidate.clone()) {
             Ok(cycle) => cycle,
             Err(error) => {
                 warn(&format!(
                     "supervisor cycle failed ({error}); the application keeps running and the \
                      cycle is retried"
                 ));
+                if let Some(path) = &candidate {
+                    reject_dropped_candidate(cfg, path);
+                }
                 if backoff_pause(&mut backoff, launched.elapsed(), true) {
                     break;
                 }
@@ -215,7 +235,38 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
                 }
             }
             Cycle::Activate(path) => next = Some(path),
-            Cycle::ServiceExited(code) => return roll_up_service_exit(&cfg.state_dir, code),
+            Cycle::ServiceExited(code) => match roll_up_service_exit(&cfg.state_dir, code) {
+                Ok(code) => return Ok(code),
+                // Recording the exit is the one durable write whose loss silently converts a
+                // failed update into a confirmed one, so a transient state-dir failure must not
+                // be fatal here either: retry it through the same backoff as every other cycle.
+                // The exit stays observable on the service, so the retried cycle re-reports it
+                // (`run_supervisor` polls before it launches anything) and the write is tried
+                // again. Bounded, unlike a supervisor cycle: the application is already gone, so
+                // every retry is downtime, and only this process's exit lets the init system
+                // restart the tower.
+                Err(e) if marker_failures + 1 < EXIT_MARKER_ATTEMPTS => {
+                    marker_failures += 1;
+                    warn(&format!(
+                        "recording the application's exit failed ({e}); retrying \
+                         ({marker_failures} of {EXIT_MARKER_ATTEMPTS})"
+                    ));
+                    if backoff_pause(&mut backoff, launched.elapsed(), false) {
+                        // A stop arrived mid-retry: the application is already gone, so roll its
+                        // code up now rather than reporting the clean stop it did not have.
+                        return Ok(code);
+                    }
+                }
+                Err(e) => {
+                    error(&format!(
+                        "the application's exit could not be recorded after \
+                         {EXIT_MARKER_ATTEMPTS} attempts ({e}); rolling it up unrecorded — an \
+                         unconfirmed release that just exited may be confirmed rather than \
+                         reverted"
+                    ));
+                    return Ok(code);
+                }
+            },
         }
     }
 
@@ -245,6 +296,16 @@ fn run_supervisor(
     service: &mut Service,
     candidate: Option<PathBuf>,
 ) -> Result<Cycle, String> {
+    // A service exit that landed while the guardian was between supervisors (the backoff sleep,
+    // a handoff, or a retry of the exit marker) is only visible here — `poll_exit` runs solely
+    // inside serve. Surface it before anything else this cycle does, so no supervisor is
+    // launched over a dead application and no state-dir failure on the way to launching one can
+    // starve the retry of its marker. Dropping it here would silently discard the exit (the next
+    // `app.launch` reaps the dead proc) and relaunch the bad update instead of rolling it up.
+    if let Some(code) = service.poll_exit() {
+        return Ok(Cycle::ServiceExited(code));
+    }
+
     let binary = match &candidate {
         Some(path) => path.clone(),
         None => record::desired_supervisor(&cfg.state_dir)
@@ -254,15 +315,6 @@ fn run_supervisor(
             })?,
     };
     validate_supervisor_path(cfg, &binary, candidate.is_some())?;
-
-    // A service exit that landed while the guardian was between supervisors (the backoff
-    // sleep, or a handoff) is only visible here — `poll_exit` runs solely inside serve.
-    // Surface it before adopting/launching, or the exit would be silently
-    // discarded (the next `app.launch` reaps the dead proc) and the bad update relaunched
-    // instead of rolled up and reverted.
-    if let Some(code) = service.poll_exit() {
-        return Ok(Cycle::ServiceExited(code));
-    }
 
     // If an application is already running (a supervisor crash-relaunch, or a candidate
     // activation over the previous supervisor's app), hand its PID to the new supervisor
@@ -372,8 +424,13 @@ fn serve_service<L: Link>(
                 // A supervisor still RUNNING without a usable channel is the real fault, and it
                 // must not be left running: `poll_readable` would return immediately on every
                 // iteration and pin a core at 100% for as long as it lives.
+                //
+                // Which of the two it is must be decided by `exited_within`, never by sampling
+                // liveness once: EOF arrives when the peer's descriptors close, but the exit is
+                // not reapable until a moment later, so a single sample reports an ordinary exit
+                // as a channel fault at random.
                 Err(error) => {
-                    let reason = if sup.exited() {
+                    let reason = if sup.exited_within(EXIT_OBSERVATION_GRACE) {
                         "exited"
                     } else {
                         warn(&format!(
@@ -408,18 +465,29 @@ fn serve_service<L: Link>(
                 .candidate
                 .as_ref()
                 .expect("activation has a candidate");
-            if let Err(e) = record::set_desired_supervisor(&cfg.state_dir, path) {
-                error(&format!(
-                    "committing stable supervisor {} failed: {e}; reverting to its predecessor",
+            match record::set_desired_supervisor(&cfg.state_dir, path) {
+                Ok(()) => info(&format!(
+                    "candidate {} survived its confirmation window; committed as the supervisor",
                     path.display()
-                ));
-                sup.stop();
-                return conclude(cfg, &mut activation, "could not be committed");
+                )),
+                // The pointer moved and only the fsync proving it durable failed. Rolling back
+                // here would reject a candidate the on-disk pointer already names, so the next
+                // cycle would launch it as the committed supervisor — no readiness gate, no
+                // confirmation window — with a rejection marker about itself on disk.
+                Err(e) if foundation::durable::committed_unsynced(&e) => warn(&format!(
+                    "candidate {} is committed as the supervisor, but the commit could not be \
+                     proved durable: {e}",
+                    path.display()
+                )),
+                Err(e) => {
+                    error(&format!(
+                        "committing stable supervisor {} failed: {e}; reverting to its predecessor",
+                        path.display()
+                    ));
+                    sup.stop();
+                    return conclude(cfg, &mut activation, "could not be committed");
+                }
             }
-            info(&format!(
-                "candidate {} survived its confirmation window; committed as the supervisor",
-                path.display()
-            ));
             activation.committed = true;
         }
     }
@@ -479,6 +547,33 @@ fn conclude(cfg: &Config, activation: &mut ActivationState, reason: &str) -> Res
         "supervisor {reason} (the application keeps running)"
     ));
     Ok(Cycle::Backoff)
+}
+
+/// Record the rejection of a candidate the cycle consumed but never launched — the one ending
+/// that does not pass through [`conclude`].
+///
+/// A cycle that fails (`run_supervisor` returning `Err`) is retried rather than fatal, so the
+/// candidate it took is simply gone; without a marker, the always-reject invariant `conclude`
+/// documents would hold for every ending but this one, and the committed supervisor would come
+/// back, re-select the same release, re-stage the same content-addressed bytes and hand them off
+/// again, forever. `run_supervisor` can only fail before a candidate is committed (every path
+/// after the commit returns `Ok`), so a candidate it dropped is always an uncommitted one.
+///
+/// A failed marker write is logged, never propagated: the guardian may own a healthy running
+/// application here, and taking the tower down over a durable-state failure is the outcome the
+/// retry loop exists to avoid. The next cycle re-stages and re-rejects, and the write is retried
+/// with it.
+fn reject_dropped_candidate(cfg: &Config, path: &Path) {
+    warn(&format!(
+        "candidate {} was dropped by a failed supervisor cycle; rejecting it",
+        path.display()
+    ));
+    if let Err(e) = record::mark_rejected_supervisor(&cfg.state_dir, path) {
+        error(&format!(
+            "recording rejection of dropped candidate {}: {e}",
+            path.display()
+        ));
+    }
 }
 
 /// Handle one control request, replying on the channel.
@@ -804,6 +899,9 @@ mod tests {
         readable: RefCell<VecDeque<bool>>,
         requests: VecDeque<control::Request>,
         exited: VecDeque<bool>,
+        /// This peer never exits, however long it is observed — the "still running without a
+        /// usable channel" case, which the finite `exited` script cannot express.
+        stays_alive: bool,
         responses: Vec<control::Response>,
         stops: u32,
     }
@@ -816,6 +914,7 @@ mod tests {
                 readable: RefCell::new(VecDeque::new()),
                 requests: VecDeque::new(),
                 exited: VecDeque::new(),
+                stays_alive: false,
                 responses: Vec::new(),
                 stops: 0,
             }
@@ -844,6 +943,12 @@ mod tests {
             Ok(())
         }
         fn exited(&mut self) -> bool {
+            // A peer that never exits is a property no finite script can state: `exited_within`
+            // polls until its grace expires, so a scripted `false` would be consumed and fall
+            // through to the exhaustion fallback below.
+            if self.stays_alive {
+                return false;
+            }
             // Script exhaustion is a supervisor exit. This gives every state-machine test
             // a finite fallback: a broken deadline is reported by the assertions instead
             // of hanging the mutation runner forever.
@@ -930,6 +1035,63 @@ mod tests {
         assert!(state_dir
             .join(control::SERVICE_EXITED_MARKER_FILE)
             .is_file());
+    }
+
+    /// A fake application that has already exited with code 9.
+    struct ExitedProc;
+    impl crate::sys::Process for ExitedProc {
+        fn pid(&self) -> u32 {
+            4243
+        }
+        fn poll_exit(&mut self) -> Option<i32> {
+            Some(9)
+        }
+        fn stop(&mut self, _grace: Duration) {}
+    }
+    fn exited_spawn(_spec: &control::CommandSpec) -> std::io::Result<Box<dyn crate::sys::Process>> {
+        Ok(Box::new(ExitedProc))
+    }
+
+    #[test]
+    fn a_service_exit_is_re_reported_by_every_cycle_until_it_is_recorded() {
+        // The run loop retries a failed exit-marker write by running the cycle again, so the
+        // cycle must re-report the exit — and must do so before it reads the supervisor pointer,
+        // because the same failing state directory that lost the marker also fails that read and
+        // would starve the retry forever. A dead application also means nothing may be launched.
+        let c = cfg(temp_dir("pending-exit"), None); // no committed pointer: the read would fail
+        let mut service = Service::with_process(App::with_spawn(exited_spawn));
+        service.launch(&spec(), Duration::ZERO).unwrap();
+
+        for _ in 0..3 {
+            assert!(
+                matches!(
+                    run_supervisor(&c, &mut service, None).unwrap(),
+                    Cycle::ServiceExited(9)
+                ),
+                "the exit stays reportable until a cycle records it"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exit_marker_write_is_reported_rather_than_swallowed() {
+        // The retry only exists because this write can fail. Root bypasses the mode check, so
+        // there is nothing to prove there.
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let state_dir = temp_dir("exit-marker-unwritable");
+        std::fs::set_permissions(&state_dir, PermissionsExt::from_mode(0o500)).unwrap();
+        let rolled = roll_up_service_exit(&state_dir, 9);
+        std::fs::set_permissions(&state_dir, PermissionsExt::from_mode(0o700)).unwrap();
+
+        assert!(
+            rolled.is_err(),
+            "an unrecorded exit is never reported rolled up"
+        );
+        assert!(!state_dir.join(control::SERVICE_EXITED_MARKER_FILE).exists());
     }
 
     #[test]
@@ -1134,13 +1296,38 @@ mod tests {
     }
 
     #[test]
+    fn a_candidate_dropped_by_a_failed_cycle_is_still_rejected() {
+        // The one ending that does not pass through `conclude`: the staged slot vanishes between
+        // the `ReplaceSupervisor` validation and the activation, so `run_supervisor` fails before
+        // it can launch anything and the run loop retries the cycle. The candidate is consumed
+        // either way, so its rejection must be recorded here too — otherwise the committed
+        // supervisor re-selects the same release, re-stages the same content-addressed bytes and
+        // hands them off again, forever, with nothing on disk saying it failed.
+        let c = cfg(temp_dir("dropped-candidate"), None);
+        let cand = staged_candidate(&c, 0xa1);
+        std::fs::remove_file(&cand).unwrap();
+        let mut app = Service::with_process(App::none());
+
+        assert!(
+            run_supervisor(&c, &mut app, Some(cand.clone())).is_err(),
+            "a candidate whose staged slot vanished fails the cycle"
+        );
+        assert!(
+            rejected_marker(&c).is_none(),
+            "the failed cycle itself records nothing — the run loop must"
+        );
+        reject_dropped_candidate(&c, &cand);
+        assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
+    }
+
+    #[test]
     fn a_running_supervisor_that_loses_its_channel_is_stopped() {
         // A live supervisor without a usable channel would spin `poll_readable` at 100% forever.
         // It is stopped and relaunched on a fresh one; the application is untouched.
         let c = cfg(temp_dir("channel-lost"), None);
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true);
-        sup.exited.push_back(false); // still running when the read fails
+        sup.stays_alive = true; // still running when the read fails, and stays that way
         let mut app = Service::with_process(App::none());
 
         let cycle = serve_service(&c, &mut sup, &mut app, None).unwrap();
@@ -1155,7 +1342,7 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/mute/supervisor");
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true);
-        sup.exited.push_back(false);
+        sup.stays_alive = true;
         let mut app = Service::with_process(App::none());
 
         let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
@@ -1268,6 +1455,47 @@ mod tests {
             Some(cand)
         );
         assert!(rejected_marker(&c).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_that_moved_the_pointer_is_never_rolled_back() {
+        // The rollback exists for a commit that did NOT happen. A durable write can also fail
+        // after its rename — the pointer moved, only the fsync proving it durable failed — and
+        // rejecting the candidate then leaves a rejection marker about the exact binary the next
+        // boot launches as the committed supervisor, ungated and unconfirmed.
+        use std::os::unix::fs::PermissionsExt;
+        let cand = PathBuf::from("/state/supervisors/unsynced/supervisor");
+        let mut c = cfg(temp_dir("commit-unsynced"), None);
+        c.confirm_timeout = Duration::ZERO;
+        let mut sup = FakeLink::new();
+        sup.nonce = [7u8; 16];
+        sup.readable.borrow_mut().push_back(true);
+        sup.requests.push_back(Request::Ready([7u8; 16]));
+        sup.exited.push_back(false);
+        sup.exited.push_back(true);
+        let mut app = Service::with_process(App::none());
+        // Write and search but not read: the pointer's temp+rename still commits, the state
+        // directory's own fsync cannot. Root bypasses the check, so there is nothing to prove.
+        let root = unsafe { libc::geteuid() } == 0;
+        std::fs::set_permissions(&c.state_dir, PermissionsExt::from_mode(0o300)).unwrap();
+        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone()));
+        std::fs::set_permissions(&c.state_dir, PermissionsExt::from_mode(0o700)).unwrap();
+        if root {
+            return;
+        }
+        assert!(
+            matches!(cycle.unwrap(), Cycle::Backoff),
+            "a committed supervisor that later exits is relaunched, not rejected"
+        );
+        assert_eq!(
+            record::desired_supervisor(&c.state_dir).unwrap(),
+            Some(cand)
+        );
+        assert!(
+            rejected_marker(&c).is_none(),
+            "the candidate the pointer names must never be recorded rejected"
+        );
     }
 
     #[test]

@@ -172,7 +172,7 @@ fn confirm_or_revert(
             installed.archive_sha256.clone(),
         ));
         // Revert to the predecessor carrying its providers (held in `pending`) so the restored
-        // release keeps its crash-watch, provider health, and pre-start hook — see the confirm
+        // release keeps its crash-watch, readiness gate, and boot converge — see the confirm
         // branch below, which carries the same three for the forward case.
         plan.commit = Some(InstalledState::confirmed(
             pending.previous_repository_lineage.clone(),

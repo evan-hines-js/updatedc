@@ -130,11 +130,25 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         },
     };
     let agent_bytes = serde_json::to_vec(&agent).unwrap();
+    // The same document with the digest published in upper case. The wire contract admits a hex
+    // digest in any case, so this is a document a publisher may legitimately sign; the network path
+    // accepts it, and the enrollment/offline path must not reject it.
+    let uppercase_agent = updated_contracts::artifact::AgentDocument {
+        schema: agent.schema,
+        config: updated_contracts::artifact::TargetReference {
+            path: agent.config.path.clone(),
+            sha256: agent.config.sha256.to_uppercase(),
+        },
+    };
+    let uppercase_agent_bytes = serde_json::to_vec(&uppercase_agent).unwrap();
     let config_source = tmp.join("managed.json");
     let agent_source = tmp.join("agent.json");
+    let uppercase_agent_source = tmp.join("agent-uppercase.json");
     std::fs::write(&config_source, &config_bytes).unwrap();
     std::fs::write(&agent_source, &agent_bytes).unwrap();
+    std::fs::write(&uppercase_agent_source, &uppercase_agent_bytes).unwrap();
     let agent_path = "assignments/agents/offline.json";
+    let uppercase_agent_path = "assignments/agents/offline-uppercase.json";
     repo::add_release(
         &repo_dir,
         &keys,
@@ -147,6 +161,11 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             repo::PublishTarget {
                 name: agent_path.into(),
                 source: agent_source,
+                custom: Default::default(),
+            },
+            repo::PublishTarget {
+                name: uppercase_agent_path.into(),
+                source: uppercase_agent_source,
                 custom: Default::default(),
             },
         ],
@@ -208,6 +227,26 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     assert_eq!(config.application.product, "offline-app");
     assert_eq!(config.application.args, vec!["serve".to_string()]);
 
+    // A signed agent document may carry its configuration digest in any case — the contract admits
+    // it and the network path accepts it — so the enrollment path must resolve the same node on the
+    // same bytes. Rejecting it here would brick exactly the nodes whose publisher upper-cased it.
+    let uppercase_state = tmp.join("uppercase-state");
+    std::fs::create_dir_all(&uppercase_state).unwrap();
+    std::fs::write(uppercase_state.join("agent.crt"), "preplaced leaf").unwrap();
+    std::fs::write(uppercase_state.join("agent.key"), "preplaced key").unwrap();
+    let mut uppercase_bundle = bundle.clone();
+    uppercase_bundle.assignment = uppercase_agent_path.into();
+    uppercase_bundle.initial.agent_document = String::from_utf8(uppercase_agent_bytes).unwrap();
+    std::fs::write(
+        uppercase_state.join("enrollment.json"),
+        serde_json::to_vec(&uppercase_bundle).unwrap(),
+    )
+    .unwrap();
+    let uppercase_config = updated_tuf::resolve_managed_config(&bootstrap, &uppercase_state)
+        .await
+        .unwrap();
+    assert_eq!(uppercase_config.application.product, "offline-app");
+
     // Boot configuration — the managed process's arguments, and which secret populates which
     // environment variable — is read before any network fetch and cannot be verified at that
     // moment, so it comes only from the enrollment directory. A document planted under
@@ -267,6 +306,180 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         .unwrap_err();
     assert!(error.to_string().contains("digest mismatch"), "{error}");
     let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// The file `resolve_assignment` writes IS this node's live boot config: the next boot launches the
+/// managed application from it before any network, and the write destroys the previous one. So a
+/// published document this build could never fetch from — or one that would move the node out of
+/// the install root the enrollment bundle put it in — must be refused BEFORE the write. Refusing it
+/// afterwards (in the caller, or in the reader a boot later) leaves the node with no good
+/// assignment and a failure that is never retryable.
+#[tokio::test]
+async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_config() {
+    let tmp = std::env::temp_dir().join(format!(
+        "updated-tuf-commit-{}-{}",
+        std::process::id(),
+        updated::rand::token().unwrap()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let repo_dir = tmp.join("routing");
+    let keys = repo::generate_keys(&tmp.join("routing-keys"))
+        .await
+        .unwrap();
+    repo::init(&repo_dir, &keys, 365).await.unwrap();
+    let root: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_dir.join("metadata/root.json")).unwrap(),
+    )
+    .unwrap();
+
+    let install_root = tmp.join("install");
+    let enrollment_state = tmp.join("enrollment-state");
+    std::fs::create_dir_all(&enrollment_state).unwrap();
+
+    let assignment = |metadata_url: &str, install: &std::path::Path| {
+        updated_contracts::assignment::RepositoryAssignment {
+            schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
+            deployment: "commit".into(),
+            metadata_url: metadata_url.into(),
+            targets_url: "http://127.0.0.1:9/release/targets/".into(),
+            report_url: None,
+            application: updated_contracts::artifact::TargetReference {
+                path: "products/app/stable/1/linux-x86_64/app".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: updated_contracts::artifact::TargetReference {
+                path: "provider-sets/default.json".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: root.clone(),
+            runtime: updated_contracts::assignment::ManagedRuntime {
+                mode: updated_contracts::assignment::RuntimeMode::Managed,
+                product: "app".into(),
+                channel: "stable".into(),
+                install_root: install.to_path_buf(),
+                args: vec![],
+                secrets: vec![],
+                inputs: std::collections::BTreeMap::new(),
+                repository: updated_contracts::assignment::ManagedRepositoryLimits {
+                    metadata_limit: 1024 * 1024,
+                    target_limit: 1024 * 1024,
+                    transport_timeout_seconds: 5,
+                },
+                storage: updated_contracts::assignment::ManagedStorage {
+                    inactive_releases: 2,
+                    inactive_providers: 2,
+                    inactive_supervisors: 2,
+                    inactive_bytes: 1024 * 1024,
+                    inactive_repository_caches: 2,
+                },
+                timeouts: updated_contracts::assignment::ManagedTimeouts {
+                    check_interval_seconds: 5,
+                    health_grace_seconds: 5,
+                    health_successes: 1,
+                    health_interval_seconds: 1,
+                    retry_after_seconds: 5,
+                    refresh_retry_seconds: 5,
+                    confirmation_window_seconds: 5,
+                    supervisor_check_interval_seconds: 5,
+                    drain_hold_seconds: Some(0),
+                },
+            },
+        }
+    };
+
+    let mut targets = Vec::new();
+    let mut publish =
+        |name: &str, assignment: &updated_contracts::assignment::RepositoryAssignment| -> String {
+            let config_bytes = serde_json::to_vec(assignment).unwrap();
+            let config_sha = updated::hash::sha256_bytes(&config_bytes);
+            let config_path = format!("assignments/configs/{config_sha}.json");
+            let config_source = tmp.join(format!("{name}-config.json"));
+            std::fs::write(&config_source, &config_bytes).unwrap();
+            let agent = updated_contracts::artifact::AgentDocument {
+                schema: 1,
+                config: updated_contracts::artifact::TargetReference {
+                    path: config_path.clone(),
+                    sha256: config_sha,
+                },
+            };
+            let agent_source = tmp.join(format!("{name}-agent.json"));
+            std::fs::write(&agent_source, serde_json::to_vec(&agent).unwrap()).unwrap();
+            let agent_path = format!("assignments/agents/{name}.json");
+            targets.push(repo::PublishTarget {
+                name: config_path,
+                source: config_source,
+                custom: Default::default(),
+            });
+            targets.push(repo::PublishTarget {
+                name: agent_path.clone(),
+                source: agent_source,
+                custom: Default::default(),
+            });
+            agent_path
+        };
+    let good = publish(
+        "good",
+        &assignment("http://127.0.0.1:9/release/metadata/", &install_root),
+    );
+    // A metadata_url without its trailing slash is not a base directory this build can fetch from.
+    let unfetchable = publish(
+        "unfetchable",
+        &assignment("http://127.0.0.1:9/release/metadata", &install_root),
+    );
+    let relocating = publish(
+        "relocating",
+        &assignment("http://127.0.0.1:9/release/metadata/", &tmp.join("moved")),
+    );
+    repo::add_release(&repo_dir, &keys, targets, 365)
+        .await
+        .unwrap();
+
+    let routing = |agent_path: &str| updated::config::Routing {
+        root: repo_dir.join("metadata/root.json"),
+        base_url: url::Url::from_directory_path(std::fs::canonicalize(&repo_dir).unwrap())
+            .unwrap()
+            .to_string(),
+        assignment: agent_path.to_string(),
+        metadata_limit: 1024 * 1024,
+        transport_timeout: std::time::Duration::from_secs(5),
+        mtls: updated::tls::Identity::new(
+            repo_dir.join("client.crt"),
+            repo_dir.join("client.key"),
+            repo_dir.join("ca.crt"),
+        ),
+    };
+    let paths = updated::config::Paths::resolve(&install_root, &enrollment_state);
+
+    TrustedRepository::resolve_assignment(&routing(&good), &paths)
+        .await
+        .expect("a usable document is committed as the live boot config");
+    let committed = std::fs::read(&paths.assignment).unwrap();
+
+    for (agent_path, expected) in [
+        (&unfetchable, "metadata_url"),
+        (&relocating, "install_root"),
+    ] {
+        let Err(error) = TrustedRepository::resolve_assignment(&routing(agent_path), &paths).await
+        else {
+            panic!("an unusable document must never be committed");
+        };
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(
+            std::fs::read(&paths.assignment).unwrap(),
+            committed,
+            "the live boot config must survive a rejected {expected}"
+        );
+        // The download scratch is scratch on the rejection path too. A node re-resolves every
+        // check interval, so a copy left behind here is a copy of an unusable document sitting
+        // beside the live one for as long as the control plane keeps publishing it.
+        assert!(
+            !updated::config::with_suffix(&paths.assignment, ".resolving").exists(),
+            "a rejected {expected} left its staging file behind"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[tokio::test]
@@ -517,6 +730,72 @@ async fn publish_then_verify_and_download() {
     let current = replaced.all_targets();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].path, "assignments/agents/current.json");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A download killed mid-stream — SIGKILL from the guardian, a reboot, power loss — leaves its
+/// full-size staging temp behind, and nothing outside this crate reclaims it: the staging roots
+/// hold fixed destination files rather than per-attempt directories, so the bundle sweep and the
+/// directory pruner never see them. Without the sweep here a crash-looping node accumulates one
+/// bundle-sized orphan per attempt until the install root fills and every update fails.
+#[tokio::test]
+async fn downloading_reclaims_staging_temps_orphaned_by_an_earlier_interrupted_download() {
+    let tmp = std::env::temp_dir().join(format!(
+        "updated-tuf-target-sweep-{}-{}",
+        std::process::id(),
+        updated::rand::token().unwrap()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let (repo_dir, _keys, target_path) = author(&tmp).await;
+    let repo = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds"))
+        .await
+        .unwrap();
+    let found = repo
+        .all_targets()
+        .into_iter()
+        .find(|t| t.path == target_path)
+        .unwrap();
+
+    let staging = tmp.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let orphan = staging.join(".target-1234-5678-9.tmp");
+    std::fs::write(&orphan, vec![0u8; 4096]).unwrap();
+    // Backdate it past the stale-temp age so it reads as an abandoned leftover rather than a
+    // temp some concurrent writer still owns.
+    std::fs::File::options()
+        .write(true)
+        .open(&orphan)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    // A temp written just now belongs to a download in flight beside this one and must survive.
+    let in_flight = staging.join(".target-1234-5678-10.tmp");
+    std::fs::write(&in_flight, b"still being written").unwrap();
+    // Nothing else in the staging root is this sweep's business.
+    let unrelated = staging.join("stage-abcdef");
+    std::fs::create_dir_all(&unrelated).unwrap();
+
+    repo.download_target(&found, &staging.join("app"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(staging.join("app")).unwrap(),
+        b"hello-app-1.0.0"
+    );
+    assert!(
+        !orphan.exists(),
+        "the orphaned staging temp must be reclaimed by the next download"
+    );
+    assert!(
+        in_flight.exists(),
+        "a temp still being written is not ours to yank"
+    );
+    assert!(
+        unrelated.is_dir(),
+        "the sweep touches only its own staging temps"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

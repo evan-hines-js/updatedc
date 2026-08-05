@@ -250,12 +250,13 @@ pub(crate) const PAGE: &str = r#"<!doctype html>
 ├── attempts/&lt;signed-attempt-id&gt;/
 │   ├── preflight.done
 │   ├── prepare.done
+│   ├── pre-drain.done
 │   ├── drain.done
 │   ├── stop.done
 │   ├── activate.done
 │   ├── start.done
 │   ├── verify.done
-│   ├── finalize.done
+│   ├── apply.done
 │   ├── generated-install.properties
 │   └── stopped-process.pid
 ├── backups/&lt;signed-attempt-id&gt;/

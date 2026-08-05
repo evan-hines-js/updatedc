@@ -637,6 +637,82 @@ pub async fn rotate_root(
     publish_file(&scratch, &root_path, signed_root.buffer().to_vec()).await
 }
 
+/// Renew the root role: publish the CURRENT key set again, at the next version and a fresh
+/// expiry, signed by whichever of `root_keys` the current root already trusts.
+///
+/// Renewal, not rotation: nothing about the trust in the repository changes, only how long the
+/// document is valid for. That is what makes it safe to run unattended on a timer — a client
+/// pinned to any earlier root follows the version chain to this one exactly as it would a
+/// rotation, and no key has to be minted, distributed, or persisted anywhere. Root metadata is
+/// the one document `replace_release` never touches, so without this a repository that keeps
+/// publishing still hard-expires at its original root's expiry and every client stops loading it.
+///
+/// Like [`rotate_root`], only `metadata/root.json` and the new versioned `metadata/<n>.root.json`
+/// are written; the online roles are carried forward untouched and their signed metadata stays
+/// valid.
+pub async fn renew_root(repo_dir: &Path, root_keys: &[PathBuf], expiry_days: i64) -> Result<()> {
+    let metadata_dir = repo_dir.join("metadata");
+    let root_path = metadata_dir.join("root.json");
+    let scratch = Scratch::open(repo_dir).await?;
+    let bytes = tokio::fs::read(&root_path)
+        .await
+        .map_err(|e| err("reading root.json", e))?;
+    let current: Signed<Root> =
+        serde_json::from_slice(&bytes).map_err(|e| err("parsing root.json", e))?;
+    let old = &current.signed;
+    let old_root_role = old
+        .roles
+        .get(&RoleType::Root)
+        .ok_or_else(|| RepoError("current root omits the root role".into()))?;
+
+    // Sign with whatever of the supplied set the current root actually lists, and let the role's
+    // own threshold decide whether that is enough. Key-set drift is normal — a rotation retires a
+    // key the operator's directory still holds, and the caller hands the whole directory over — and
+    // refusing the renewal outright for one stray key made every reconcile a hard failure at
+    // exactly the moment the root is closest to expiring.
+    let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
+    for path in root_keys {
+        let key = load_signer(path)?.tuf_key();
+        let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
+        if old_root_role.keyids.contains(&keyid) {
+            sources.push(local(path));
+        }
+    }
+    if (sources.len() as u64) < old_root_role.threshold.get() {
+        return Err(RepoError(format!(
+            "root renewal needs {} of the current root's keys, but only {} of the {} supplied are \
+             in it",
+            old_root_role.threshold,
+            sources.len(),
+            root_keys.len()
+        )));
+    }
+
+    let next_version = nz(old.version.get() + 1);
+    let renewed = Root {
+        spec_version: old.spec_version.clone(),
+        consistent_snapshot: old.consistent_snapshot,
+        version: next_version,
+        expires: expiry(expiry_days)?,
+        keys: old.keys.clone(),
+        roles: old.roles.clone(),
+        _extra: old._extra.clone(),
+    };
+    let rng = SystemRandom::new();
+    let signed_root = SignedRole::new(renewed.clone(), &KeyHolder::Root(renewed), &sources, &rng)
+        .await
+        .map_err(|e| err("signing renewed root", e))?;
+    // Same commit order as a rotation: the versioned document first, so a crash between the two
+    // leaves the anchor pointing at a root whose successor is already durable.
+    publish_file(
+        &scratch,
+        &metadata_dir.join(format!("{next_version}.root.json")),
+        signed_root.buffer().to_vec(),
+    )
+    .await?;
+    publish_file(&scratch, &root_path, signed_root.buffer().to_vec()).await
+}
+
 /// Publish a release: register `targets`, bump targets/snapshot/timestamp, and
 /// re-sign. The target artifacts are copied into `targets/`.
 pub async fn add_release(
@@ -961,11 +1037,14 @@ fn expiry(days: i64) -> Result<jiff::Timestamp> {
     if days <= 0 {
         return Err(RepoError("expiry days must be greater than zero".into()));
     }
-    let hours = days
+    let span = days
         .checked_mul(24)
+        // `try_from_hours` is the only non-panicking constructor: `from_hours` aborts once
+        // hours*3600 overflows i64, which `checked_mul(24)` alone does not catch.
+        .and_then(jiff::SignedDuration::try_from_hours)
         .ok_or_else(|| RepoError("expiry days overflow".into()))?;
     jiff::Timestamp::now()
-        .checked_add(jiff::SignedDuration::from_hours(hours))
+        .checked_add(span)
         .map_err(|e| err("expiry is outside the supported timestamp range", e))
 }
 
@@ -1011,6 +1090,13 @@ mod tests {
         assert!(expiry(0).is_err());
         assert!(expiry(-1).is_err());
         assert!(expiry(i64::MAX).is_err());
+        // days*24 fits in i64 but the resulting hours exceed what a SignedDuration can hold —
+        // this must be an error, not a panic.
+        assert!(expiry(2_562_047_788_015_216).is_err());
+        assert!(expiry(384_307_168_202_282_325).is_err());
+        // The largest hour count a SignedDuration accepts is still far beyond the timestamp range,
+        // so it fails on the add rather than aborting.
+        assert!(expiry(2_562_047_788_015_215 / 24).is_err());
     }
 
     #[test]

@@ -22,9 +22,10 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
         state_dir: state_dir.clone(),
         check_interval: timeouts.supervisor_check_interval,
     };
-    let secrets =
-        secrets::SecretManager::initialize(&cfg.routing, &cfg.deployment, &cfg.application.secrets)
-            .await?;
+    // Only the client is built here. The bundle itself is fetched from `run`, behind the guardian
+    // readiness signal, because that fetch waits out a control-plane outage and nothing that waits
+    // may sit in front of a candidate supervisor's readiness deadline.
+    let secrets = secrets::SecretManager::new(&cfg.routing, &cfg.application.secrets)?;
     Ok(Options {
         deployment: cfg.deployment,
         routing: cfg.routing,

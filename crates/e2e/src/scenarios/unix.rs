@@ -65,9 +65,11 @@ pub(crate) fn cold_install_descends_past_wedged_head(ctx: &Ctx) -> R {
     Ok(())
 }
 
-/// The lifecycle provider owns verification. It records `verify`/`periodic` observations and
-/// passes only while the managed child is alive.
-pub(crate) fn lifecycle_verify_gates_readiness(ctx: &Ctx) -> R {
+/// The signed reconciler owns readiness. Its `healthcheck` operation — the published readiness
+/// gate — must run before a cold-installed release is put in rotation AND before an upgraded
+/// candidate is committed, under the reserved `boot` identity for the former and the transaction's
+/// own attempt id for the latter.
+pub(crate) fn lifecycle_healthcheck_gates_readiness(ctx: &Ctx) -> R {
     let srv = "127.0.0.1:21181";
     let svc = "127.0.0.1:21182";
     let probes = "127.0.0.1:21183";
@@ -79,14 +81,18 @@ pub(crate) fn lifecycle_verify_gates_readiness(ctx: &Ctx) -> R {
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
-    let probe_log = dir.join("health-probe.log");
+    // The one shared reconciler fixture, which speaks the published operation vocabulary and
+    // records every invocation. A scenario-local reconciler would be free to answer a spelling
+    // the supervisor never invokes and quietly assert nothing.
+    let fixture = dir.join("lifecycle-fixture");
     let lifecycle = vec![
-        "sh".into(),
-        "-c".into(),
-        format!(
-            "op=$1; shift; pid=; while [ \"$#\" -gt 0 ]; do case \"$1\" in --managed-pid) pid=$2; shift 2;; --) break;; *) shift 2;; esac; done; case \"$op\" in verify|periodic) echo probe >> {log}; test -n \"$pid\"; exec kill -0 \"$pid\";; *) exit 0;; esac",
-            log = probe_log.display()
-        ),
+        std::env::current_exe()
+            .map_err(str_err)?
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        fixture.display().to_string(),
+        "accept-managed".into(),
     ];
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .cold_install()
@@ -97,21 +103,30 @@ pub(crate) fn lifecycle_verify_gates_readiness(ctx: &Ctx) -> R {
         .guardian()?;
     let _sup = Proc::spawn("supervisor", &mut cmd)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        return fail("lifecycle-verified deployment never came up at v1.0.0");
+        return fail("lifecycle-gated deployment never came up at v1.0.0");
     }
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
     if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
-        return fail("lifecycle-verified deployment never upgraded to v2.0.0");
+        return fail("lifecycle-gated deployment never upgraded to v2.0.0");
     }
-    if !std::fs::read_to_string(&probe_log)
-        .unwrap_or_default()
+    let observations = std::fs::read_to_string(fixture.join("operations.log")).unwrap_or_default();
+    let gates: Vec<&str> = observations
         .lines()
-        .any(|line| line == "probe")
-    {
-        return fail("the lifecycle verify hook was never invoked as the readiness gate");
+        .filter_map(|line| line.split_once('\t'))
+        .filter_map(|(operation, id)| (operation == "healthcheck").then_some(id))
+        .collect();
+    if !gates.contains(&"boot") {
+        return fail(format!(
+            "the reconciler's healthcheck operation never gated the first install:\n{observations}"
+        ));
+    }
+    if !gates.iter().any(|id| *id != "boot" && *id != "periodic") {
+        return fail(format!(
+            "the reconciler's healthcheck operation never gated the upgrade transaction:\n{observations}"
+        ));
     }
     kill_stray(&app);
-    ok("lifecycle verify gated first install and upgrade");
+    ok("the reconciler healthcheck gated both the first install and the upgrade");
     Ok(())
 }
 

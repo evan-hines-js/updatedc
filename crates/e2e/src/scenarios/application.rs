@@ -253,7 +253,6 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .check_interval("1s")
         .health_grace("2s")
-        .readiness_health(svc)
         .guardian_probes(probes)
         .lifecycle(lifecycle)
         .guardian()?;

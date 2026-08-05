@@ -215,16 +215,20 @@ the process, or the reconciler owns the external runtime.
 Every deployment carries an immutable, signed node-reconciler bundle. The agent supplies
 delivery, verification of bytes, durable ordering, retries, deadlines, containment,
 cancellation, rollback journaling, scheduling, and telemetry. The bundle supplies all
-application-specific behavior through one executable accepting `preflight`, `prepare`, `pre-drain`, `drain`, `stop`,
-`pre-start`, `activate`, `start`, `verify`, `periodic`, `fingerprint`, `finalize`, and `rollback`.
+application-specific behavior through one executable accepting exactly four operations:
+`apply`, `healthcheck`, `rollback`, and `inspect` (see
+[LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md)).
 
-`verify` performs one observation and exits zero only when the candidate is acceptable. The
-agent retries it to the signed success threshold within the signed grace window. `periodic`
-performs one steady-state observation on the signed cadence. Managed child exit remains an
-immediate reliability event independent of either reconciler observation.
+`healthcheck` is the one readiness gate. It performs one observation and exits zero only when the
+observed release is acceptable; the agent retries it to the signed success threshold within the
+signed grace window, and runs the same operation on the signed cadence for steady state. Each
+invocation carries `--attempt-id`: a transaction's own token when it gates that transaction's
+candidate, or the reserved `boot`/`periodic` identity for an observation that belongs to no
+transaction. Managed child exit remains an immediate reliability event independent of any
+reconciler observation.
 
-`fingerprint` is the bounded steady-state measurement operation. It runs after each deploy or
-rollback once `periodic` reports healthy, then hourly with stable per-node ±10% jitter. This
+`inspect` is the bounded steady-state measurement operation. It runs after each deploy or
+rollback once the periodic `healthcheck` reports healthy, then hourly with stable per-node ±10% jitter. This
 cadence is agent policy rather than deployment configuration, so expensive collection can never
 drift into every health check. Fingerprinting runs in its own worker; the single deployment
 boundary cancels and reaps its complete process tree before any rollout hook begins, then schedules
@@ -301,8 +305,8 @@ Readiness is withdrawn before stop begins and restored only after the candidate 
 the predecessor is restored. Liveness remains successful throughout an intentional drain.
 Startup is a one-way latch, matching Kubernetes startup-probe semantics. In managed mode a
 child crash is observed directly by the guardian and rolls up the tower immediately. All
-application-specific acceptance and steady-state evidence comes from the signed provider's
-`verify` and `periodic` hooks; the node configuration contains no HTTP health language.
+application-specific acceptance and steady-state evidence comes from the signed reconciler's
+`healthcheck` operation; the node configuration contains no HTTP health language.
 
 Platform templates and permission guidance are in [deploy/README.md](deploy/README.md).
 
@@ -345,8 +349,8 @@ The E2E harness creates a real signed repository and disposable towers under
 `target/e2e-work/`. It covers application upgrade and rollback, a tampered trust root,
 offline launch, rejection persistence, transaction-boundary crashes, locking, supervisor
 adoption/self-update, one-shot launch, and the provider-managed lifecycle (including a
-Magnolia-shaped enterprise upgrade that backs up state, drains, activates a new artifact,
-verifies health, finalizes, and rolls back on failure). Its signed chaotic-application
+Magnolia-shaped enterprise upgrade whose `apply` backs up state and migrates it, whose
+`healthcheck` gates the result, and which rolls back on failure). Its signed chaotic-application
 fixture separately proves fail-closed behavior for an exit before bind, persistent 503, a
 health request held for five minutes, flapping readiness, a crash during probing, and
 health that degrades only after initially becoming ready.
