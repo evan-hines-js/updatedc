@@ -188,7 +188,6 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         ];
 
         let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
-            .readiness_health(&svc)
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
             .confirmation_window("120s")
@@ -319,7 +318,6 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         mode,
     ];
     let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
-        .readiness_health(&svc)
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .lifecycle(fixture_command)
@@ -430,7 +428,6 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         format!("hang-{phase}"),
     ];
     let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
-        .readiness_health(&svc)
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .lifecycle(fixture_command)
@@ -508,7 +505,6 @@ pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
         "magnolia-shaped".into(),
     ];
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .readiness_health(svc)
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
@@ -604,7 +600,6 @@ pub(crate) fn sample_magnolia_sample_transition(ctx: &Ctx) -> R {
         "magnolia-shaped-transition".into(),
     ];
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .readiness_health(svc)
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
@@ -688,7 +683,6 @@ pub(crate) fn magnolia_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
         "magnolia-shaped-fail-apply".into(),
     ];
     let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .readiness_health(svc)
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .lifecycle(command)

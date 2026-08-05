@@ -21,7 +21,7 @@ flowchart TB
         direction LR
         ENR["Enrollment<br/>(one-way)"] --> INST["Cold install<br/>(provisional→confirmed)"]
         INST --> UPD["Update transaction<br/>(upgrade + rollback)"]
-        UPD --> HOOKS["Signed lifecycle hooks<br/>verify + periodic"]
+        UPD --> HOOKS["Signed node reconciler<br/>apply + healthcheck + rollback + inspect"]
         HOOKS --> TEL["Telemetry<br/>(NodeReport)"]
     end
     subgraph GUARD["Process supervision — bootstrap guardian"]
@@ -291,27 +291,30 @@ stateDiagram-v2
 - The `Pending` image (predecessor release + *its* providers) is folded into the single atomic
   commit write — there is no separate "arm rollback" step that a crash could interrupt.
 
-## 8. Provider verification
+## 8. The readiness gate
 
-The lifecycle provider's `verify` phase gates every boot and candidate. Each invocation performs
-one application-specific observation; the agent owns the reliability policy around it.
+The signed reconciler's `healthcheck` operation is the one readiness gate: it gates every boot and
+every candidate, and it is the same operation the agent samples on the steady-state cadence. Each
+invocation performs one application-specific observation; the agent owns the reliability policy
+around it.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Verifying: invoke verify
-    Verifying --> Counting: hook exits successfully
-    Verifying --> Verifying: failure resets streak; retry within deadline
-    Counting --> Verified: required consecutive successes reached
-    Counting --> Verifying: wait configured interval
-    Verifying --> Failed: deadline exceeded
-    Verified --> [*]
+    [*] --> Observing: invoke healthcheck
+    Observing --> Counting: the reconciler exits zero
+    Observing --> Observing: failure resets streak; retry within deadline
+    Counting --> Healthy: required consecutive successes reached
+    Counting --> Observing: wait configured interval
+    Observing --> Failed: deadline exceeded
+    Healthy --> [*]
 ```
 
 - A passing gate flips a **provisional** cold-install head to **confirmed** (§5) and is required
-  before an update can finalize (§6).
-- `periodic` is the same signed provider contract for steady-state readiness/liveness sampling.
-- URL checks, vendor CLIs, PID inspection, and service-manager queries belong inside the provider;
-  the agent has no application-specific probe implementation.
+  before an update can commit (§6).
+- `--attempt-id` says which observation this is: the transaction's own token while gating that
+  transaction's candidate, or the reserved `boot`/`periodic` identity outside a transaction.
+- URL checks, vendor CLIs, PID inspection, and service-manager queries belong inside the
+  reconciler; the agent has no application-specific probe implementation.
 
 ## 9. Telemetry (the feedback signal)
 

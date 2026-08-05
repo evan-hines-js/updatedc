@@ -24,7 +24,7 @@
 //! `Serving` and stays successful across later planned drains, matching Kubernetes'
 //! one-time `startupProbe` semantics.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -41,6 +41,15 @@ const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(3);
 /// from becoming an unbounded thread spawn: beyond it, connections are closed immediately, which a
 /// prober retries, rather than queued behind a stall.
 const MAX_CONCURRENT_PROBES: usize = 16;
+
+/// How long the accept loop waits after an accept failure that is a property of the process, not
+/// of the connection it refused. Descriptor exhaustion (`EMFILE`/`ENFILE`) is the case: `accept`
+/// fails instantly and keeps failing for as long as the pressure lasts, so retrying immediately
+/// pins the `guardian-probes` thread at 100% CPU — on a small node, directly against the
+/// guardian's one serve thread, which owes the orchestrator a readiness deadline, a stop grace,
+/// and the application-exit check. Short enough that probes resume promptly once descriptors free
+/// up, long enough that the loop costs nothing while they do not.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -111,12 +120,19 @@ pub fn serve(address: SocketAddr, machine: Machine) -> Result<(), String> {
     std::thread::Builder::new()
         .name("guardian-probes".into())
         .spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
-                    // A transient accept error (e.g. fd exhaustion) must not permanently kill the
-                    // probe endpoint — that would fail every future probe closed and reap the
-                    // tower. Skip this connection and keep listening.
-                    continue;
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        // An accept error must never kill the probe endpoint — that would fail
+                        // every future probe closed and reap the tower — so the loop always keeps
+                        // listening. What it must not do is keep listening at full speed on an
+                        // error that will repeat: see `pause_after_accept_error`.
+                        if let Some(pause) = pause_after_accept_error(error.kind()) {
+                            std::thread::sleep(pause);
+                        }
+                        continue;
+                    }
                 };
                 // Answer off the accept loop: a client that connects and then says nothing must
                 // not sit in front of the orchestrator's next liveness probe.
@@ -139,6 +155,20 @@ pub fn serve(address: SocketAddr, machine: Machine) -> Result<(), String> {
         })
         .map_err(|error| format!("starting guardian probe endpoint: {error}"))?;
     Ok(())
+}
+
+/// How long to wait before accepting again after an accept failed, or `None` to retry at once.
+///
+/// A failure that belongs to the refused connection alone — the client vanished between its SYN
+/// and our accept, or a signal interrupted the call — says nothing about the next connection, and
+/// the very next accept can succeed: pausing there would delay a real probe. Every other failure
+/// is a property of the process (descriptor exhaustion above all) and will be returned again
+/// immediately, so the retry is paced instead of spun.
+fn pause_after_accept_error(kind: ErrorKind) -> Option<Duration> {
+    match kind {
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock => None,
+        _ => Some(ACCEPT_ERROR_PAUSE),
+    }
 }
 
 fn respond(stream: &mut TcpStream, machine: &Machine) {
@@ -199,5 +229,30 @@ mod tests {
         assert_eq!(machine.response("/startupz").0, 200);
         machine.transition(State::Failed);
         assert_eq!(machine.response("/livez").0, 503);
+    }
+
+    #[test]
+    fn a_repeating_accept_error_is_paced_and_a_per_connection_one_is_not() {
+        // Descriptor exhaustion — the case the accept loop's comment names — fails instantly and
+        // keeps failing, so retrying it must cost a pause; without one the probe thread burns a
+        // core for the whole outage. A client that vanished before we accepted it must not, or
+        // every such connection would delay the next real probe by the pause.
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+        ] {
+            assert_eq!(pause_after_accept_error(kind), None, "{kind:?}");
+        }
+        // `EMFILE`/`ENFILE` have no stable `ErrorKind` on every target, so they arrive here as
+        // `Uncategorized`/`Other` — which is exactly why the pause is the default, not the
+        // exception.
+        for kind in [ErrorKind::Other, ErrorKind::PermissionDenied] {
+            assert_eq!(
+                pause_after_accept_error(kind),
+                Some(ACCEPT_ERROR_PAUSE),
+                "{kind:?}"
+            );
+        }
     }
 }

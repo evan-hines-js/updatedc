@@ -14,10 +14,20 @@ use std::time::{Duration, Instant};
 /// own process group (so the guardian can signal its whole tree) and, on Linux, sets
 /// `PR_SET_PDEATHSIG(SIGKILL)` so the kernel kills it if the guardian dies. There is no
 /// re-adoption across a guardian restart — the app simply does not survive one.
+///
+/// `PR_SET_PDEATHSIG` covers the leader alone, so the workers it forked are reachable only
+/// through the group — and only through this handle. Every way this handle ends
+/// ([`stop`](crate::sys::Process::stop), an observed exit, or a plain drop) therefore takes the
+/// group down with it, which is the same guarantee the Windows adapter gets from its
+/// kill-on-close job object.
 struct Proc {
     child: Child,
     pid: u32,
     exited: Option<i32>,
+    /// Set once the group is over — killed here, or observed empty. The group id IS the leader's
+    /// PID, and the kernel reserves that PID only while the group still has members, so naming it
+    /// again could reach a group some unrelated process built on a recycled PID.
+    group_ended: bool,
 }
 
 /// Launch the contained application process from `spec` (the [`Process`](crate::sys::Process)
@@ -77,16 +87,35 @@ impl Proc {
             child,
             pid,
             exited: None,
+            group_ended: false,
         })
     }
-}
 
-impl crate::sys::Process for Proc {
-    fn pid(&self) -> u32 {
-        self.pid
+    /// `SIGKILL` whatever is left in the application's process group, once.
+    ///
+    /// The kill is hard and immediate by design: the graceful window belongs to
+    /// [`stop`](crate::sys::Process::stop), which quiesces a *live* application, and by the time
+    /// this runs the whole group has either been given that window and spent it, or the leader has
+    /// exited on its own — taking the tower down with it — or this handle is being dropped, after
+    /// which nothing can name the group to stop it gracefully or otherwise.
+    ///
+    /// The group id is never a stranger's: the kernel keeps a group's number allocated while any
+    /// member survives, so `-pid` either reaches the application's own descendants or fails with
+    /// `ESRCH` because the group is already empty. Never naming the group once it is over is what
+    /// keeps that true — the moment it drains, its number is the kernel's to hand out again.
+    fn kill_group(&mut self) {
+        if self.group_ended {
+            return;
+        }
+        self.group_ended = true;
+        unsafe {
+            libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL);
+        }
     }
 
-    fn poll_exit(&mut self) -> Option<i32> {
+    /// Reap the leader if it has exited, recording its code. The rest of the group is left
+    /// alone: who ends it, and when, is the caller's decision.
+    fn reap(&mut self) -> Option<i32> {
         if self.exited.is_none() {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.exited = Some(exit_code(status));
@@ -95,33 +124,124 @@ impl crate::sys::Process for Proc {
         self.exited
     }
 
+    /// Whether any member of the application's process group is still there. An unreaped leader
+    /// counts as a member, so [`Proc::reap`] must run first for this to mean "still working".
+    fn group_alive(&self) -> bool {
+        unsafe { libc::kill(-(self.pid as libc::pid_t), 0) == 0 }
+    }
+
+    /// Whether the leader has exited, observed WITHOUT reaping it (`WNOWAIT`).
+    ///
+    /// Reaping is what frees the leader's PID, and the group id IS that PID: for the common case
+    /// of a leaf application with no surviving workers, the group empties at the reap and its
+    /// number is the kernel's to hand out again the same instant. Anything that must name the
+    /// group after seeing the leader die therefore has to see it die without reaping it — the
+    /// zombie holds the number until we choose to release it.
+    fn leader_exited(&self) -> bool {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // With `WNOHANG` a leader that is still running is reported as success with a zeroed
+        // `si_pid`, so the pid — not the return value — is the observation.
+        ok == 0 && unsafe { siginfo_pid(&info) } == self.pid as libc::pid_t
+    }
+}
+
+/// The pid a `waitid` result reports. libc exposes it as a plain field on the BSDs and behind an
+/// accessor on Linux, where the union is private.
+///
+/// SAFETY: `info` was filled in by a successful `waitid`, so its pid member is initialised.
+#[cfg(target_os = "linux")]
+unsafe fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    unsafe { info.si_pid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    info.si_pid
+}
+
+impl crate::sys::Process for Proc {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn poll_exit(&mut self) -> Option<i32> {
+        if self.exited.is_some() {
+            return self.exited;
+        }
+        // Observe the leader's exit without reaping it. The caller drops this handle the moment it
+        // takes the exit code, and the leader's own exit leaves its workers running in the group,
+        // so they must be taken down here — and the group is only ours to name while the leader's
+        // PID is still held by its zombie. Reaping first would release that number to the kernel
+        // with the group possibly already empty, and the kill could then land on a stranger's
+        // group built on the recycled PID. A *stop* does not come through here: its window belongs
+        // to the whole group, not to the leader.
+        if !self.leader_exited() {
+            return None;
+        }
+        self.kill_group();
+        self.reap()
+    }
+
     /// Stop the process group (SIGTERM, then SIGKILL after `grace`).
+    ///
+    /// The window is the group's, not the leader's. A launcher-style application forwards the
+    /// SIGTERM to its workers and its leader exits immediately, and those workers finishing their
+    /// in-flight work are exactly what the operator configured the grace for — so the wait ends on
+    /// the *group* draining, never on the leader's own exit, which would truncate the drain to
+    /// whatever fraction of the window happened to have elapsed.
     fn stop(&mut self, grace: Duration) {
-        if self.poll_exit().is_some() {
+        if self.group_ended {
+            // The group is over (an observed exit killed it, or an earlier stop did); its number
+            // is the kernel's again, so naming it now could reach an unrelated process.
             return;
         }
-        // PID-reuse is not a hazard in the window between the `poll_exit` check and this
-        // signal: `self.child` is our own descendant and we have not reaped it (`poll_exit`
-        // only `try_wait`s, and only when `exited` is still `None`), so its PID — and the
-        // process group whose id equals that PID — cannot have been recycled to some
-        // unrelated process. The worst case is signalling a group that just went empty,
-        // which is a harmless no-op.
-        let group = -(self.pid as libc::pid_t);
+        // PID-reuse is not a hazard for this signal: `self.child` is our own descendant and, since
+        // the group has not ended, it has not been reaped (the one path that reaps without a stop
+        // — `poll_exit` — ends the group in the same breath), so its PID, and the process group
+        // whose id equals that PID, cannot have been recycled to some unrelated process. The worst
+        // case is signalling a group that just went empty, which is a harmless no-op.
         unsafe {
-            libc::kill(group, libc::SIGTERM);
+            libc::kill(-(self.pid as libc::pid_t), libc::SIGTERM);
         }
         let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if self.poll_exit().is_some() {
-                return;
+        loop {
+            // Reap first, so an unreaped leader is never mistaken for a worker still draining.
+            self.reap();
+            if !self.group_alive() {
+                self.group_ended = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.kill_group();
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        unsafe {
-            libc::kill(group, libc::SIGKILL);
-        }
         let _ = self.child.wait();
         self.exited.get_or_insert(137);
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        // Nothing can name this process group once the handle is gone, so the group dies with
+        // the handle — the Unix counterpart of the Windows adapter's kill-on-close job object.
+        // For a `Proc` dropped while the application is still running this is the only thing
+        // that stops it; after an observed exit or a completed stop the group is already over.
+        self.kill_group();
+        if self.exited.is_none() {
+            // Reap the leader that kill just took down: a `Child` dropped unwaited leaves a
+            // zombie for the rest of the guardian's life.
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -314,6 +434,7 @@ impl Drop for Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys::Process as _;
     use std::io::Write;
     use std::os::unix::process::ExitStatusExt;
 
@@ -387,6 +508,67 @@ mod tests {
         assert_eq!(exit_code(normal), 23);
         let signalled = std::process::ExitStatus::from_raw(libc::SIGTERM);
         assert_eq!(exit_code(signalled), 128 + libc::SIGTERM);
+    }
+
+    fn spec(script: &str) -> CommandSpec {
+        CommandSpec {
+            program: std::ffi::OsString::from("/bin/sh"),
+            args: vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(script),
+            ],
+            env: vec![],
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn an_observed_exit_takes_the_leftover_workers_with_it() {
+        // A launcher-style app: the leader exits while a worker it forked keeps running in the
+        // group. The exit code is the leader's, and the worker must not be left behind — the
+        // caller drops the handle right after taking the code, and nothing else can name the
+        // group once it does.
+        let mut proc = Proc::launch(&spec("sleep 60 &\nexit 7")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let code = loop {
+            if let Some(code) = proc.poll_exit() {
+                break code;
+            }
+            assert!(Instant::now() < deadline, "the leader never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(code, 7);
+        assert_eq!(
+            proc.poll_exit(),
+            Some(7),
+            "the code is remembered, not re-reaped"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while proc.group_alive() {
+            assert!(
+                Instant::now() < deadline,
+                "the leftover worker survived the observed exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn an_exit_is_observed_before_the_leader_is_reaped() {
+        // The group id IS the leader's PID, and reaping releases it. `poll_exit` must therefore
+        // see the exit through a non-reaping wait, so the zombie still holds the number while the
+        // group kill names it; a `try_wait`-first ordering would kill a recycled group.
+        let mut proc = Proc::launch(&spec("exit 3")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !proc.leader_exited() {
+            assert!(Instant::now() < deadline, "the leader never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            proc.exited.is_none(),
+            "observing the exit must not reap it — that would free the group id"
+        );
+        assert_eq!(proc.poll_exit(), Some(3));
     }
 
     #[test]

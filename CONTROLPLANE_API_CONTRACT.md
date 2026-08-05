@@ -43,17 +43,19 @@ phase protocol as an executable provider; it is statically linked only to make t
 case self-contained. Consequently its version is exactly the supervisor version and it
 is never published, pinned, or upgraded independently.
 
-A provider set is an exact TUF target containing typed overrides of the built-in
-provider's capabilities. An empty override set selects the built-in implementation.
-The optional `lifecycle` override is a separately signed executable implementing the
-same protocol for stop/start and reexec activation. A capability may appear at most
-once. Unknown capabilities, duplicate overrides, and malformed unused entries fail the
-entire set closed; agents never download and silently ignore provider entries.
+A provider set is an exact TUF target naming exactly one node reconciler: the
+`reconciler` object binds a separately signed executable by exact target reference,
+its fixed arguments, and the per-operation timeout in milliseconds. The reconciler
+implements the four-operation protocol (`apply`, `healthcheck`, `rollback`,
+`inspect`). A set carries no other capability and no optional entries — a document
+with an unknown field, an unsupported `schema`, an unconfined artifact path, or a
+timeout outside `1..=86400000` fails the entire set closed, and the agent never
+downloads and silently ignores parts of a set it could not fully parse.
 
-The agent authenticates and stages every provider artifact before beginning an
-application lifecycle. Failure to resolve any provider leaves the current
-deployment untouched. A provider-set-only assignment revision may be staged
-without reinstalling the application.
+The agent authenticates and stages the reconciler artifact before beginning an
+application lifecycle. Failure to resolve it leaves the current deployment
+untouched. A provider-set-only assignment revision may be staged without
+reinstalling the application.
 
 ## Static HTTP repository contract
 
@@ -87,12 +89,12 @@ On every check, `updated` must:
 2. Fetch and validate its exact agent document, then its exact config document.
 3. Refresh the selected release TUF repository without discarding rollback state.
 4. Fetch the exact provider set and verify its digest.
-5. Validate capability uniqueness and fetch every exact provider override artifact.
+5. Validate the provider set and fetch its exact reconciler artifact.
 6. Fetch the exact application artifact.
-7. Run `preflight`, `prepare`, and `drain` while the predecessor still serves.
-8. Run the provider's `stop` phase, ask the guardian to stop if required, activate the
-   candidate, ask the guardian to start if required, run `start`, independently prove
-   health, run `verify`, and finally run `finalize`.
+7. Withdraw readiness and hold for the configured drain while the predecessor still serves.
+8. Ask the guardian to stop if required, run the reconciler's `apply` operation, ask the
+   guardian to start if required, and gate the candidate on the reconciler's `healthcheck`
+   operation before committing.
 9. Preserve the previously committed deployment until the candidate commits.
 
 Recovery uses exact identities recorded in durable agent state; it does not

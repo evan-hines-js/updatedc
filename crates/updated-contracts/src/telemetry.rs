@@ -15,9 +15,45 @@ use std::collections::BTreeMap;
 /// How old a healthy report may be before a reader treats it as not-ready / not-settled. Shared by
 /// every consumer (the control-plane rollout throttle AND the healthproxy) so they agree on when a
 /// node that stopped heart-beating drops out — a node that goes silent must age out of "settled" in
-/// the same bounded time it ages out of load-balancer rotation. Generous relative to the node's
-/// report cadence (every check interval, tens of seconds) so a merely-slow re-report never flaps.
+/// the same bounded time it ages out of load-balancer rotation.
+///
+/// The window is a *reader-side* judgment and deliberately not derived from anything the node says:
+/// a node that could widen its own window would, once compromised or dead, hold itself in rotation
+/// for as long as it liked. Instead the writer's cadence is bounded by the window —
+/// [`MAX_CHECK_INTERVAL_SECONDS`] is derived from it, and every assignment is validated against
+/// that — so the two cannot drift apart and a merely-slow re-report never flaps.
 pub const REPORT_FRESHNESS: Duration = Duration::from_secs(60);
+
+/// How much later than its assigned check interval a node's heartbeat can land: the supervisor
+/// spreads each next check by this much, so consecutive reports are up to 1.2x the interval apart.
+/// Public because the supervisor schedules against it — the spread a node actually applies and the
+/// spread [`MAX_CHECK_INTERVAL_SECONDS`] budgets for are then the same number, not two literals
+/// that agree today.
+pub const REPORT_CADENCE_JITTER_PERCENT: u32 = 20;
+
+/// The largest `check_interval_seconds` a signed assignment may carry.
+///
+/// A node writes its report at the bottom of its check loop, so its report cadence *is* its check
+/// interval (plus jitter) — and THREE such gaps must fit inside [`REPORT_FRESHNESS`]. Two of them
+/// because a report write is best-effort and never retried, so one lost write must not drain a
+/// healthy node out of rotation or un-settle it mid-rollout. The third is the allowance for
+/// everything between the write and the read, none of which is free: the upload itself, propagation
+/// through the object store, and the reader's own poll interval — the healthproxy polls on its own
+/// clock, so a report can already be a full poll old before anyone looks at it. Budgeting only the
+/// two gaps makes "one lost write still leaves the node fresh" true solely on a machine where all
+/// of that costs zero, which is to say false.
+///
+/// A slower interval publishes a node that is stale by construction: routinely older than the one
+/// window [`NodeReport::is_fresh`], the healthproxy's last-known-good cache, and the rollout
+/// throttle all judge it against, so it drops out of the load balancer for part of every cycle
+/// while being perfectly healthy.
+///
+/// Derived from the window rather than written beside it, and enforced in
+/// [`crate::assignment::ManagedRuntime::validate`], so the cadence a publisher may assign and the
+/// age every reader enforces cannot diverge. Every other duration in the contract answers to the
+/// generic [`crate::assignment::MAX_INTERVAL_SECONDS`] ceiling instead.
+pub const MAX_CHECK_INTERVAL_SECONDS: u64 =
+    REPORT_FRESHNESS.as_secs() * 100 / (3 * (100 + REPORT_CADENCE_JITTER_PERCENT as u64));
 
 /// How far ahead of the reader's clock a report may be stamped and still be usable. Writer and
 /// reader are different machines, so a small disagreement is normal; anything beyond it is either a

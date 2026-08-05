@@ -648,6 +648,7 @@ name = "demo-lifecycle"
 version = "0.1.0"
 dependencies = [
  "foundation",
+ "updated-contracts",
  "ureq",
 ]
 
@@ -3430,6 +3431,7 @@ dependencies = [
  "foundation",
  "futures",
  "hex",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "k8s-openapi",
@@ -3471,6 +3473,7 @@ dependencies = [
  "tokio",
  "updatec",
  "updated",
+ "updated-contracts",
 ]
 
 [[package]]

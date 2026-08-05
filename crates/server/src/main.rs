@@ -185,10 +185,15 @@ async fn publish_assignment(args: &[String]) -> R {
         },
     };
     node.validate()?;
+    let keys = repo::Keys::in_dir(&keys_dir);
+    // Staging comes AFTER the lock, exactly as in `publish`: these are fixed names in the shared
+    // repository directory, and `add_release` reads them back to hash and sign. Staging outside the
+    // lock lets a second publisher overwrite them in that gap, so each process signs the other's
+    // bytes — an AgentDocument declaring `config.sha256` of one configuration over a target holding
+    // another's — and the cleanup below deletes a concurrent publisher's staging file.
+    let _publish_lock = lock_publisher(&repo_dir)?;
     foundation::durable::atomic_write(&config_source, ".config-", &config_bytes)?;
     foundation::durable::atomic_write(&node_source, ".node-", &serde_json::to_vec(&node)?)?;
-    let keys = repo::Keys::in_dir(&keys_dir);
-    let _publish_lock = lock_publisher(&repo_dir)?;
     repo::add_release(
         &repo_dir,
         &keys,
@@ -230,10 +235,12 @@ async fn publish_provider_set(args: &[String]) -> R {
         reconciler,
     };
     let source = repo_dir.join(".provider-set-build.json");
-    foundation::durable::atomic_write(&source, ".provider-set-", &serde_json::to_vec(&set)?)?;
     let name = format!("provider-sets/{id}.json");
     let keys = repo::Keys::in_dir(&keys_dir);
+    // Under the lock before the staging write, for the same reason as `publish_assignment`: the
+    // staging name is fixed and shared, and `add_release` signs whatever bytes it finds there.
     let _publish_lock = lock_publisher(&repo_dir)?;
+    foundation::durable::atomic_write(&source, ".provider-set-", &serde_json::to_vec(&set)?)?;
     repo::add_release(
         &repo_dir,
         &keys,
@@ -365,10 +372,6 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
         println!("  {}", t.name);
     }
 
-    // `publish` is commonly invoked as many short-lived CLI processes (the
-    // smoke fuzzer does exactly that), so an in-process mutex is insufficient.
-    // Keep the development server's single-writer policy here rather than in
-    // the reusable TUF authoring library.
     repo::add_release(&repo_dir, &keys, targets, expiry_days).await?;
     println!("published {product} {version} on channel {channel}");
     Ok(())
@@ -392,6 +395,14 @@ fn corrupt_archive(archive: &Path, kind: &str, version: &str) -> R {
     Ok(())
 }
 
+/// Take the repository's single-writer lock, held for the rest of the publish.
+///
+/// Every publish subcommand is commonly invoked as many short-lived CLI processes (the smoke fuzzer
+/// does exactly that), so an in-process mutex is insufficient. It is taken before *any* mutable
+/// state in the repository directory is touched — the build/staging files a publish signs from as
+/// much as the metadata `add_release` rewrites — because those are fixed names in a shared
+/// directory: staging outside the lock lets two publishers sign each other's bytes. Keep the
+/// development server's single-writer policy here rather than in the reusable TUF authoring library.
 fn lock_publisher(repo_dir: &Path) -> std::io::Result<File> {
     let lock = OpenOptions::new()
         .create(true)
@@ -475,7 +486,29 @@ async fn serve(args: &[String]) -> R {
 /// How long a client has to complete the TLS handshake while holding a connection permit.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn serve_conn<S>(mut stream: S, root: &Path) -> std::io::Result<()>
+/// How long a handshaken client has to finish its one request while holding a connection permit.
+///
+/// Every individual phase is already bounded — the header read, the telemetry body read, each
+/// `write_all` — but per-operation bounds do not bound the connection: a client that drains one
+/// 64 KiB chunk every ~25s keeps every write inside `write_with_timeout` forever and holds its
+/// permit indefinitely. 128 such connections exhaust the semaphore, the accept loop blocks on
+/// `acquire_owned`, and the server stops serving entirely — the same wedge `HANDSHAKE_TIMEOUT`
+/// exists to prevent, just moved past the handshake. Generous enough that an honest agent pulling
+/// the largest target off this loopback CDN never trips it.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Serve the connection's one request under an overall deadline, so a permit's lifetime is bounded
+/// by `HANDSHAKE_TIMEOUT + CONNECTION_TIMEOUT` no matter how the peer behaves.
+async fn serve_conn<S>(stream: S, root: &Path) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    timeout(CONNECTION_TIMEOUT, serve_request(stream, root))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connection deadline"))?
+}
+
+async fn serve_request<S>(mut stream: S, root: &Path) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1068,6 +1101,45 @@ mod tests {
         .is_some());
     }
 
+    /// A client that keeps every individual write inside `write_with_timeout` — draining one
+    /// chunk just before each 30s write deadline — would otherwise hold its connection permit for
+    /// as long as it likes; 128 of those wedge the accept loop. The overall deadline ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_reader_cannot_hold_a_connection_past_the_overall_deadline() {
+        let root = serve_root("slow-reader");
+        // Larger than a slow reader can drain within the deadline at this rate.
+        std::fs::write(root.join("targets/big"), vec![7u8; 4 << 20]).unwrap();
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn({
+            let root = root.clone();
+            async move { serve_conn(server, &root).await }
+        });
+        client
+            .write_all(b"GET /targets/big HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        // Drain slowly enough to outlive the deadline, fast enough that no single 64 KiB write
+        // ever hits its own 30s timeout.
+        let draining = tokio::spawn(async move {
+            let mut sink = [0u8; 64 * 1024];
+            loop {
+                tokio::time::sleep(Duration::from_secs(25)).await;
+                if client.read(&mut sink).await.unwrap_or(0) == 0 {
+                    return;
+                }
+            }
+        });
+
+        let error = served
+            .await
+            .unwrap()
+            .expect_err("a connection past the overall deadline must be dropped");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "got: {error}");
+        draining.abort();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn flags_all_collects_repeats() {
         let args = vec![
@@ -1115,5 +1187,129 @@ mod tests {
         second.try_lock().unwrap();
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The signed runtime policy an assignment carries. Valid, because `publish-assignment`
+    /// validates it before it stages anything.
+    fn managed_runtime() -> updated_contracts::assignment::ManagedRuntime {
+        use updated_contracts::assignment::*;
+        ManagedRuntime {
+            mode: RuntimeMode::Managed,
+            product: "app".into(),
+            channel: "stable".into(),
+            install_root: "/opt/app".into(),
+            args: vec![],
+            secrets: vec![],
+            inputs: Default::default(),
+            repository: ManagedRepositoryLimits {
+                metadata_limit: 1 << 20,
+                target_limit: 512 << 20,
+                transport_timeout_seconds: 30,
+            },
+            storage: ManagedStorage {
+                inactive_releases: 2,
+                inactive_providers: 2,
+                inactive_supervisors: 2,
+                inactive_bytes: 1 << 30,
+                inactive_repository_caches: 2,
+            },
+            timeouts: ManagedTimeouts {
+                check_interval_seconds: 15,
+                health_grace_seconds: 30,
+                health_successes: 2,
+                health_interval_seconds: 1,
+                retry_after_seconds: 60,
+                refresh_retry_seconds: 5,
+                confirmation_window_seconds: 120,
+                supervisor_check_interval_seconds: 3600,
+                drain_hold_seconds: Some(0),
+            },
+        }
+    }
+
+    /// A publish stages the documents it is about to sign under fixed names in the shared
+    /// repository directory, so the staging write belongs INSIDE the publisher lock. Staged before
+    /// it, a concurrent publisher's bytes land in `.config-build.json` between this process's write
+    /// and `add_release` hashing it — each then signs the other's document, and the cleanup at the
+    /// end deletes the other publisher's staging file out from under it.
+    #[test]
+    fn assignment_staging_waits_for_the_publisher_lock() {
+        let root =
+            std::env::temp_dir().join(format!("server-publish-staging-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo_dir = root.join("repo");
+        let keys_dir = root.join("keys");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let runtime_path = root.join("runtime.json");
+        std::fs::write(
+            &runtime_path,
+            serde_json::to_vec(&managed_runtime()).unwrap(),
+        )
+        .unwrap();
+
+        let runner = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let keys = runner.block_on(repo::generate_keys(&keys_dir)).unwrap();
+        runner.block_on(repo::init(&repo_dir, &keys, 365)).unwrap();
+
+        let digest = "a".repeat(64);
+        let args: Vec<String> = vec![
+            "--repo".into(),
+            repo_dir.display().to_string(),
+            "--keys".into(),
+            keys_dir.display().to_string(),
+            "--name".into(),
+            "assignments/agents/agent-0.json".into(),
+            "--metadata-url".into(),
+            "https://cdn/metadata/".into(),
+            "--targets-url".into(),
+            "https://cdn/targets/".into(),
+            "--deployment".into(),
+            "deploy-1".into(),
+            "--application-path".into(),
+            "products/app".into(),
+            "--application-sha256".into(),
+            digest.clone(),
+            "--provider-set-path".into(),
+            "provider-sets/set.json".into(),
+            "--provider-set-sha256".into(),
+            digest,
+            "--runtime".into(),
+            runtime_path.display().to_string(),
+        ];
+
+        // Stand in for the concurrent publisher: hold the lock while this publish runs.
+        let held = lock_publisher(&repo_dir).unwrap();
+        let staged = repo_dir.join(".config-build.json");
+        let publishing = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    publish_assignment(&args)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+        });
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !staged.exists(),
+            "a publish staged the bytes it signs while another publisher held the lock"
+        );
+
+        drop(held);
+        publishing
+            .join()
+            .unwrap()
+            .expect("the publish completes once the lock is released");
+        assert!(
+            !staged.exists(),
+            "staging is cleaned up once the release is signed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

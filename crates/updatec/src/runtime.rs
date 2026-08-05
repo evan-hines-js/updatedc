@@ -24,6 +24,22 @@ use updated_contracts::telemetry::Envelope;
 
 const LEASE_SECONDS: i32 = 15;
 
+/// The point at which the durable rollout-state ConfigMap is reported as approaching the 1 MiB
+/// object ceiling the apiserver enforces. A warning threshold with headroom, never a refusal —
+/// see [`store_admitted_state`].
+const STATE_BYTES_LIMIT: usize = 768 * 1024;
+
+/// The most `UpdateAgent`s one repository will dynamically enrol.
+///
+/// `/enroll` is authenticated by the fleet-wide bootstrap certificate and the node names itself, so
+/// without a ceiling one caller could create agents until the durable rollout state — which is one
+/// ConfigMap, and grows with every published agent — passed the apiserver's 1 MiB object limit. At
+/// that point NO generation can ever be published again, for any node, and nothing releases it.
+/// This cap sits well below that wall (the per-agent cost of the routing and assignment maps is
+/// tens of bytes), so the failure is a refused enrolment naming the limit instead of a repository
+/// that can no longer publish.
+pub(crate) const MAX_ENROLLED_AGENTS: u32 = 10_000;
+
 /// Acquire or renew the Kubernetes single-writer lease. Conflicts are ordinary follower
 /// outcomes, not reconciliation failures.
 pub async fn acquire_or_renew_lease(
@@ -268,20 +284,79 @@ fn from_publish(error: PublishError) -> StorageError {
     StorageError(error.to_string())
 }
 
-/// Whether the object store already holds a published TUF generation (its `timestamp.json`). Used
-/// to fail closed when the local publisher state is empty but the store is not — re-initializing a
-/// fresh v1 TUF repo over an existing higher-versioned one would roll the generation back below the
-/// fleet's rollback floor and stall convergence.
-async fn store_has_published_metadata(
+/// The generation the object store is currently serving, read from the `version` of its published
+/// `timestamp.json`. `None` when the store holds no generation at all.
+///
+/// The ONE question asked of the store about published state, for every guard that needs it: has
+/// anything been published, and how far has it got? Both answers exist for the same reason — TUF
+/// clients remember the highest version they accepted and refuse anything lower, so publishing
+/// metadata numbered below what the store already serves wedges every node in the fleet
+/// permanently.
+///
+/// Read unverified, deliberately. This is not a trust decision but a rollback guard on this
+/// replica's own writes; anyone able to forge the number already holds write access to the prefix,
+/// and the worst a forged one can do is make this publisher refuse to publish.
+async fn store_published_version(
     store: &dyn ObjectStore,
     destination: &S3Destination,
-) -> Result<bool, StorageError> {
+) -> Result<Option<u64>, StorageError> {
     let key = crate::object_key(&destination.prefix, "metadata/timestamp.json");
-    match store.head(&key).await {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::NotFound { .. }) => Ok(false),
-        Err(e) => Err(StorageError(format!("probing published metadata: {e}"))),
+    let bytes = match crate::read_object_bounded(store, &key).await {
+        Ok(bytes) => bytes,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(StorageError(format!("probing published metadata: {e}"))),
+    };
+    published_timestamp_version(&bytes).map(Some)
+}
+
+/// The ONE rollback guard, asked before a pass signs anything: would the metadata this replica is
+/// about to upload be numbered BELOW what the store already serves?
+///
+/// Clients enforce a rollback floor, so a lower generation is rejected by every node that saw the
+/// higher one — forever, and with no self-healing path, because the replica that published it then
+/// records its own publication marker and never republishes.
+///
+/// Both ways of being behind are the same question, so they are answered here together. An EMPTY
+/// local state dir (a lost PVC, or a replica that never held the lease) would re-initialize at
+/// version 1. A STALE one is worse because it looks healthy: a replica that led up to version 5,
+/// lost the lease while another replica advanced the store to 40, and later reacquired it has
+/// `root.json` on disk and a stale publication marker — and `replace_release` numbers the next
+/// generation from LOCAL metadata, so it would upload version 6 over 40. Fail closed either way;
+/// what must be restored is the state volume of the replica holding the newest metadata (or the
+/// published prefix deleted to start over).
+async fn refuse_generation_rollback(
+    store: &dyn ObjectStore,
+    destination: &S3Destination,
+    repo_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(published) = store_published_version(store, destination).await? else {
+        return Ok(()); // nothing is served, so nothing can be rolled back.
+    };
+    if !repo_dir.join("metadata/root.json").exists() {
+        return Err(Box::new(StorageError(
+            "local publisher state is empty but the object store already holds a published \
+             generation; refusing to re-initialize a v1 TUF repo (restore the state volume)"
+                .into(),
+        )));
     }
+    let local = updated_tuf::repo::current_version(repo_dir).await?;
+    if local < published {
+        return Err(Box::new(StorageError(format!(
+            "local publisher state is at TUF generation {local} but the object store already \
+             serves {published}; refusing to publish a lower generation every node would reject as \
+             a rollback (restore the state volume of the replica that published {published})"
+        ))));
+    }
+    Ok(())
+}
+
+/// The `signed.version` of a published `timestamp.json`.
+fn published_timestamp_version(bytes: &[u8]) -> Result<u64, StorageError> {
+    let document: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| StorageError(format!("parsing published timestamp.json: {e}")))?;
+    document["signed"]["version"]
+        .as_u64()
+        .ok_or_else(|| StorageError("published timestamp.json has no signed.version".into()))
 }
 
 /// The finalizer that keeps a deleted [`UpdateRepository`] in `Terminating` until its published
@@ -412,6 +487,139 @@ async fn prune_prefix(store: &dyn ObjectStore, prefix: &str) -> Result<usize, St
     Ok(pruned)
 }
 
+/// How long every metadata document this control plane signs stays valid.
+const METADATA_EXPIRY_DAYS: i64 = 365;
+
+/// How little of that validity window may remain before the document is signed again.
+///
+/// A quarter of the window: long enough that renewal is never urgent (a control plane that is down
+/// for two months still comes back to a live fleet), short enough that renewal happens roughly
+/// three times per validity period, so a single failed attempt is not the failure.
+const METADATA_RENEWAL_DAYS: i64 = 90;
+
+/// The metadata this control plane is responsible for keeping fresh.
+///
+/// Two entries because they are re-signed by two different ceremonies: `sign_plan` re-signs the
+/// online roles on every publication and never touches the root, while the root is renewed on its
+/// own. They are checked together so freshness is decided in exactly one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TufRole {
+    Root,
+    /// targets, snapshot, and timestamp — one `sign_plan` re-signs all three with one expiry, so
+    /// `timestamp.json` speaks for the set.
+    Online,
+}
+
+/// Which of this repository's signed metadata documents are inside their renewal window at `now`.
+///
+/// A document that is missing or unreadable is deliberately NOT a renewal: nothing has been signed
+/// here yet (the initialization path handles that, with its own rollback guard), and metadata that
+/// cannot be parsed must not be re-signed on top of.
+async fn expiring_metadata(repo_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<TufRole> {
+    let horizon = now + chrono::Duration::days(METADATA_RENEWAL_DAYS);
+    let metadata = repo_dir.join("metadata");
+    let mut expiring = Vec::new();
+    for (role, file) in [
+        (TufRole::Root, "root.json"),
+        (TufRole::Online, "timestamp.json"),
+    ] {
+        if metadata_expiry(&metadata.join(file))
+            .await
+            .is_some_and(|expires| expires <= horizon)
+        {
+            expiring.push(role);
+        }
+    }
+    expiring
+}
+
+/// Whether this pass must sign and publish a generation.
+///
+/// FRESHNESS is a trigger in its own right, alongside changed content. The publication digest
+/// covers the content and deliberately not time, so a fleet at steady state matched it forever and
+/// never re-signed — walking straight into the hard expiry of its own metadata, at which point TUF
+/// refresh fails fleet-wide, `/enroll` and `/v1/node/secrets` answer 502, and every reconcile fails
+/// on the enrollment publisher. Nothing recovers from inside the loop.
+fn publication_required(content_unchanged: bool, renewals: &[TufRole]) -> bool {
+    !content_unchanged || !renewals.is_empty()
+}
+
+/// What "this repository is already published" means on disk: the content digest AND the digest of
+/// the local `root.json` that content was published under.
+///
+/// The root must be part of it because a root renewal rewrites `metadata/root.json` in place BEFORE
+/// this pass signs and uploads anything. If the upload then fails — a lost lease, a transient
+/// object-store error — the store keeps serving the OLD root while the local one has already moved
+/// on. Keyed on content alone, the next pass saw an unchanged digest and a no-longer-expiring root
+/// and therefore never published again, leaving `status.routingRootSha256` (read from the local
+/// root) pinned to a root the store does not serve: `/enroll` and `/v1/node/secrets` then answer 502
+/// for the whole fleet until some unrelated content change happens to heal it. With the root in the
+/// marker, the mismatch itself demands a publication on the very next pass.
+fn publication_marker(digest: &str, root_sha256: Option<String>) -> String {
+    format!("{digest} {}", root_sha256.unwrap_or_default())
+}
+
+/// Renew the TUF root in place when it is inside its renewal window — same key set, next version,
+/// fresh expiry. Returns the operator-facing reason when it could not be renewed, having logged the
+/// cause; `None` means there was nothing to do or it was done.
+///
+/// A renewal that fails is NOT a failed reconcile. The root that could not be re-signed is still
+/// valid for up to [`METADATA_RENEWAL_DAYS`], and the ordinary cause — the signing Secret no longer
+/// holds enough of the keys the current root lists, after a drifted or regenerated Secret — has
+/// nothing to do with the content being published. Propagating it stopped every rollout, every
+/// admission, and every durable write for the whole ninety-day window, over a condition the fleet
+/// was not affected by.
+///
+/// The failed role is dropped from `renewals` for the same reason it must not abort: `root.json` is
+/// unchanged, so it stays inside its window and would otherwise demand a freshly signed and
+/// uploaded generation on every reconcile — one per second — until the operator noticed. The
+/// operator is told by a status condition instead, and the next pass tries again.
+///
+/// Only ever called while holding the publisher lease, so two replicas cannot both bump the root.
+/// Idempotent by construction: a renewed root is not expiring, so the next pass no longer asks.
+async fn renew_expiring_root(
+    repo_dir: &Path,
+    keys_dir: &Path,
+    repository: &str,
+    renewals: &mut Vec<TufRole>,
+) -> Option<String> {
+    if !renewals.contains(&TufRole::Root) {
+        return None;
+    }
+    tracing::info!(
+        repository,
+        "renewing the TUF root: it is inside its renewal window"
+    );
+    let outcome = updated_tuf::repo::renew_root(
+        repo_dir,
+        &updated_tuf::repo::Keys::in_dir(keys_dir).roots,
+        METADATA_EXPIRY_DAYS,
+    )
+    .await;
+    let error = outcome.err()?;
+    tracing::error!(
+        repository,
+        %error,
+        "could not renew the TUF root; it is inside its renewal window and will HARD EXPIRE, after \
+         which every agent's metadata refresh fails at once. Content publication continues. Check \
+         that the signing Secret still holds the root keys the current root.json lists."
+    );
+    renewals.retain(|role| *role != TufRole::Root);
+    Some(format!(
+        "The TUF root is inside its renewal window and could not be re-signed: {error}"
+    ))
+}
+
+/// The `expires` instant a signed TUF metadata document declares, or `None` when it cannot be read.
+async fn metadata_expiry(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let expires = document.pointer("/signed/expires")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(expires)
+        .ok()
+        .map(|instant| instant.with_timezone(&chrono::Utc))
+}
+
 pub async fn reconcile_once(
     client: Client,
     namespace: &str,
@@ -448,6 +656,19 @@ pub async fn reconcile_once(
     // quarantining a group needs the deployment that group is still pinned to.
     let admitted_name = admitted_configmap_name(repository_name);
     let (durable, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
+    // A generation this replica published but never recorded is adopted before anything is planned
+    // from the loaded state — planning on a baseline that predates the live generation is what
+    // republishes an already-advanced node on its predecessor.
+    let (durable, admitted_version) = recover_pending_publication(
+        &configmaps,
+        &admitted_name,
+        namespace,
+        state_dir,
+        repository.controller_owner_ref(&()),
+        durable,
+        admitted_version,
+    )
+    .await?;
 
     let mut group_resources = groups_api.list(&ListParams::default()).await?;
     group_resources
@@ -464,13 +685,25 @@ pub async fn reconcile_once(
     // them to the unmatched-node pseudo-group would turn a typo'd digest or a bad `maxUnavailable`
     // into a fleet-wide, unthrottled, ungated deployment swap, and leaving them out of the
     // generation would delete their assignments outright (publication replaces every target).
-    let mut held_groups: BTreeMap<String, crate::rollout::AdmittedDeployment> = BTreeMap::new();
-    let hold_group =
-        |name: &str, held: &mut BTreeMap<String, crate::rollout::AdmittedDeployment>| {
-            if let Some(state) = durable.admitted.get(name) {
-                held.insert(name.to_string(), state.clone());
-            }
-        };
+    let mut held_groups: BTreeMap<String, crate::rollout::HeldGroup> = BTreeMap::new();
+    // The group's selector travels with its pin: quarantine must not change which agents belong to
+    // it, or an agent enrolled while the group is broken is published with the repository's
+    // fleet-wide default deployment. An unusable selector is carried as EMPTY, which selects
+    // nothing (see `HeldGroup::selects`) — the group's membership is genuinely unknown, and reading
+    // an empty selector as "every agent" would hold the whole fleet on one broken pin.
+    let hold_group = |group: &UpdateGroup,
+                      name: &str,
+                      held: &mut BTreeMap<String, crate::rollout::HeldGroup>| {
+        if let Some(state) = durable.admitted.get(name) {
+            held.insert(
+                name.to_string(),
+                crate::rollout::HeldGroup {
+                    state: state.clone(),
+                    match_labels: group.spec.selector.match_labels.clone(),
+                },
+            );
+        }
+    };
     for group in group_resources.iter() {
         let name = group.name_any();
         if name == crate::DEFAULT_GROUP {
@@ -481,7 +714,7 @@ pub async fn reconcile_once(
                 "`default` is reserved for agents that match no group; rename this UpdateGroup.",
             )
             .await?;
-            hold_group(&name, &mut held_groups);
+            hold_group(group, &name, &mut held_groups);
             quarantined_groups.insert(name);
             continue;
         }
@@ -493,7 +726,7 @@ pub async fn reconcile_once(
                 "This group's selector has no matchLabels; an empty selector would match every agent and is refused.",
             )
             .await?;
-            hold_group(&name, &mut held_groups);
+            hold_group(group, &name, &mut held_groups);
             quarantined_groups.insert(name);
             continue;
         }
@@ -507,7 +740,7 @@ pub async fn reconcile_once(
                     &format!("This group's deployment is invalid: {error}"),
                 )
                 .await?;
-                hold_group(&name, &mut held_groups);
+                hold_group(group, &name, &mut held_groups);
                 quarantined_groups.insert(name);
                 continue;
             }
@@ -530,7 +763,7 @@ pub async fn reconcile_once(
                             "maxUnavailable must be at least one",
                         )
                         .await?;
-                        hold_group(&name, &mut held_groups);
+                        hold_group(group, &name, &mut held_groups);
                         quarantined_groups.insert(name);
                         continue;
                     }
@@ -576,6 +809,25 @@ pub async fn reconcile_once(
             )
             .await?;
             quarantined_agents.insert(agent.name_any());
+            continue;
+        }
+        // A name the telemetry write path refuses is quarantined HERE, where the agent is admitted,
+        // rather than being placed and published. Kubernetes accepts a dot in a resource name and
+        // the traversal rule that gates placement permits one, but a report is a URL segment: the
+        // gateway rejects every PUT to `/telemetry/<name>.json` for such a node. It would be
+        // placed, published, and enrolled, and then never report for the life of the machine —
+        // permanently Silent, spending its group's `maxUnavailable`, holding its set's concurrency
+        // slot, and blocking every dependent group, with nothing naming the cause.
+        if !crate::node_name_is_reportable(&agent.name_any()) {
+            quarantine_agent(
+                &nodes_api,
+                agent,
+                "UnreportableName",
+                "This agent's name cannot appear in a telemetry report path (no `.`, `%`, `?` or \
+                 `#`), so it could never report its state. Recreate it with a name that can.",
+            )
+            .await?;
+            quarantined_agents.insert(agent.name_any());
         }
     }
     agent_resources
@@ -606,7 +858,9 @@ pub async fn reconcile_once(
     // "local publisher state is empty but the store has a generation" guard.
     if admitted_version.is_none()
         && durable.admitted.is_empty()
-        && store_has_published_metadata(store.as_ref(), &repository.spec.s3).await?
+        && store_published_version(store.as_ref(), &repository.spec.s3)
+            .await?
+            .is_some()
     {
         return Err(Box::new(StorageError(format!(
             "the durable admitted-state ConfigMap {admitted_name} is missing while a published \
@@ -688,54 +942,81 @@ pub async fn reconcile_once(
     };
 
     let desired_digest = desired_publication_digest(&repository.spec, &plan.digest)?;
-    let published_digest = state_dir.join("published-plan.sha256");
-    let up_to_date = tokio::fs::read_to_string(&published_digest)
+    let published_marker = state_dir.join("published-plan.sha256");
+    let content_unchanged = tokio::fs::read_to_string(&published_marker)
         .await
         .ok()
         .as_deref()
-        == Some(desired_digest.as_str());
-    if !up_to_date {
+        == Some(
+            publication_marker(&desired_digest, local_routing_root_sha256(state_dir).await)
+                .as_str(),
+        );
+    let repo_dir = state_dir.join("repository");
+    // Re-signing well before expiry is the standard TUF discipline (timestamp exists to prove
+    // freshness), and it is ONE mechanism: the same check renews the root, which `replace_release`
+    // never touches.
+    let mut renewals = expiring_metadata(&repo_dir, reconcile_now).await;
+    let initialized = repo_dir.join("metadata/root.json").exists();
+    // The root renewal is attempted BEFORE this pass commits to signing a generation, because a
+    // renewal that cannot be performed drops back out of `renewals` (see `renew_expiring_root`) and
+    // must then not be the reason a generation was signed at all.
+    let mut root_renewal_failure = None;
+    if (initialized && renewals.contains(&TufRole::Root))
+        || publication_required(content_unchanged, &renewals)
+    {
+        refuse_generation_rollback(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
         let signing = secrets
             .get(&repository.spec.signing_secret_ref.name)
             .await?;
         let keys_dir = state_dir.join("keys");
         materialize_signing_keys(&signing, &keys_dir).await?;
-        let repo_dir = state_dir.join("repository");
-        if !repo_dir.join("metadata/root.json").exists() {
-            // A fresh local state_dir (a lost PVC or a replica that never held the lease) must NOT
-            // re-init a v1 TUF repo when the object store already holds a published generation: clients
-            // enforce a rollback floor, so a v1 (< their current) would be rejected and the fleet would
-            // stop converging until numbering caught back up. Fail closed — refuse rather than roll back.
-            if store_has_published_metadata(store.as_ref(), &repository.spec.s3).await? {
+        if !initialized {
+            updated_tuf::repo::init(
+                &repo_dir,
+                &updated_tuf::repo::Keys::in_dir(&keys_dir),
+                METADATA_EXPIRY_DAYS,
+            )
+            .await?;
+        } else {
+            root_renewal_failure =
+                renew_expiring_root(&repo_dir, &keys_dir, &repository.name_any(), &mut renewals)
+                    .await;
+        }
+        if publication_required(content_unchanged, &renewals) {
+            crate::publisher::sign_plan(&repo_dir, &keys_dir, &plan, METADATA_EXPIRY_DAYS).await?;
+
+            // Re-verify leadership right before the irreversible S3 publish. The CPU-bound signing above can
+            // starve the main loop's 5s lease renewal past the 15s deadline; without this a former leader
+            // whose lease already expired (and was taken over by another replica) would still upload here,
+            // double-writing the generation. This closes the largest window (post-signing); the residual
+            // check→PUT gap is one request wide. Fail closed — skip the publish rather than split-brain write.
+            if !holds_lease(&client, namespace, "updatec-publisher", identity).await? {
                 return Err(Box::new(StorageError(
-                    "local publisher state is empty but the object store already holds a published \
-                     generation; refusing to re-initialize a v1 TUF repo (restore the state volume)"
+                    "publisher lease lost during reconcile; skipping publish to avoid a split-brain \
+                     write"
                         .into(),
                 )));
             }
-            updated_tuf::repo::init(&repo_dir, &updated_tuf::repo::Keys::in_dir(&keys_dir), 365)
-                .await?;
-        }
-        crate::publisher::sign_plan(&repo_dir, &keys_dir, &plan, 365).await?;
 
-        // Re-verify leadership right before the irreversible S3 publish. The CPU-bound signing above can
-        // starve the main loop's 5s lease renewal past the 15s deadline; without this a former leader
-        // whose lease already expired (and was taken over by another replica) would still upload here,
-        // double-writing the generation. This closes the largest window (post-signing); the residual
-        // check→PUT gap is one request wide. Fail closed — skip the publish rather than split-brain write.
-        if !holds_lease(&client, namespace, "updatec-publisher", identity).await? {
-            return Err(Box::new(StorageError(
-                "publisher lease lost during reconcile; skipping publish to avoid a split-brain write"
-                    .into(),
-            )));
-        }
+            // The marker this upload commits to, computed from the root as it stands NOW — after
+            // any renewal above — so it always describes the generation the store will serve.
+            let marker =
+                publication_marker(&desired_digest, local_routing_root_sha256(state_dir).await);
+            // Journalled BEFORE the upload and keyed to that marker, so the state this generation
+            // implies survives losing the in-cluster write below (see `recover_pending_publication`)
+            // without a failed upload ever being mistaken for a published one.
+            foundation::durable::atomic_write(
+                &state_dir.join(PENDING_STATE_FILE),
+                ".pending-",
+                &serde_json::to_vec(&PendingPublication {
+                    marker: marker.clone(),
+                    state: planned.clone(),
+                })?,
+            )?;
 
-        publish_repository(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
-        foundation::durable::atomic_write(
-            &published_digest,
-            ".published-",
-            desired_digest.as_bytes(),
-        )?;
+            publish_repository(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
+            foundation::durable::atomic_write(&published_marker, ".published-", marker.as_bytes())?;
+        }
     }
 
     // The durable state records what WAS published, so it is written only once the generation
@@ -744,14 +1025,15 @@ pub async fn reconcile_once(
     // blind node has — and writing it first turned any failed publish (an object-store error, or
     // the fail-closed lease and rollback guards above) into a durable record that nodes had been
     // handed a deployment nobody ever served. A failed publish now leaves the record untouched and
-    // the next pass replans from the same baseline. The reverse gap is harmless and self-healing:
-    // if this write fails after a successful publish, the next pass replans the same generation,
-    // finds it already published, and records it again.
+    // the next pass replans from the same baseline. The reverse gap — losing this write after a
+    // successful publish — is covered by the journal `recover_pending_publication` reads, because
+    // it is NOT self-healing on its own: the next pass would replan from a baseline that predates
+    // the live generation and could republish an advanced node on its predecessor.
     //
     // Reconcile runs every second; only write when the state actually changed, so a steady
     // generation makes no apiserver writes.
     if durable != planned {
-        store_admitted_state(
+        let _ = store_admitted_state(
             &configmaps,
             &admitted_name,
             namespace,
@@ -761,6 +1043,10 @@ pub async fn reconcile_once(
         )
         .await?;
     }
+    // The journal has served its purpose the moment the state it carries is recorded in-cluster.
+    tokio::fs::remove_file(state_dir.join(PENDING_STATE_FILE))
+        .await
+        .ok();
 
     // ONE projection path for both outcomes — a reconcile that reused an unchanged generation and
     // one that just signed a new one expose identical enrollment, status, and subscription state.
@@ -786,6 +1072,7 @@ pub async fn reconcile_once(
         snapshot: StatusSnapshot {
             repository: &repository,
             routing_root_sha256: local_routing_root_sha256(state_dir).await,
+            root_renewal_failure,
             groups: &group_resources.items,
             agents: &agent_resources.items,
             plan: &plan,
@@ -889,6 +1176,15 @@ fn admitted_configmap_name(repository_name: &str) -> String {
     format!("updatec-admitted-{repository_name}")
 }
 
+/// What an operator must do about an admitted-state document this controller cannot read. Nothing
+/// in the loop can repair one — every reconcile fails on it, forever — so the error has to name the
+/// remedy or it is an outage with no exit. It is a last resort and not automatic because it throws
+/// the rollout history away, which is exactly what the durable state exists to keep.
+const ADMITTED_STATE_REMEDY: &str =
+    "delete this ConfigMap to re-seed every group from its current desired deployment (the \
+     rollout is rebaselined: in-flight staging is forgotten and each set's concurrency is counted \
+     afresh)";
+
 /// Load the durable admitted set from its in-cluster ConfigMap. Returns the map (empty the very
 /// first time, before the ConfigMap exists) and the ConfigMap's `resourceVersion` for a
 /// compare-and-swap on write. The state is one document and fails closed as one document: partial
@@ -904,22 +1200,34 @@ async fn load_admitted_state(
     let data = configmap.data.as_ref();
     let encoded = data
         .and_then(|data| data.get("state.json"))
-        .ok_or_else(|| StorageError("admitted-state ConfigMap has no state.json".into()))?;
-    let admitted = serde_json::from_str(encoded)
-        .map_err(|error| StorageError(format!("invalid admitted state: {error}")))?;
+        .ok_or_else(|| {
+            StorageError(format!(
+                "admitted-state ConfigMap {name} has no state.json; {ADMITTED_STATE_REMEDY}"
+            ))
+        })?;
+    let admitted = serde_json::from_str(encoded).map_err(|error| {
+        StorageError(format!(
+            "invalid admitted state in ConfigMap {name}: {error}; {ADMITTED_STATE_REMEDY}"
+        ))
+    })?;
     // The published routing (node → group) and assignments (node → deployment identity) are their
     // own keys rather than fields of the first, so a repository that has only ever written the
     // admitted set reads back as "nothing recorded" instead of failing its whole document closed.
     let routing = match data.and_then(|data| data.get("routing.json")) {
-        Some(encoded) => serde_json::from_str(encoded)
-            .map_err(|error| StorageError(format!("invalid published routing: {error}")))?,
+        Some(encoded) => serde_json::from_str(encoded).map_err(|error| {
+            StorageError(format!(
+                "invalid published routing in ConfigMap {name}: {error}; {ADMITTED_STATE_REMEDY}"
+            ))
+        })?,
         None => BTreeMap::new(),
     };
     let assignments = match data.and_then(|data| data.get("assignments.json")) {
-        Some(encoded) => decode_assignments(
-            serde_json::from_str(encoded)
-                .map_err(|error| StorageError(format!("invalid published assignments: {error}")))?,
-        ),
+        Some(encoded) => decode_assignments(serde_json::from_str(encoded).map_err(|error| {
+            StorageError(format!(
+                "invalid published assignments in ConfigMap {name}: {error}; \
+                 {ADMITTED_STATE_REMEDY}"
+            ))
+        })?),
         None => BTreeMap::new(),
     };
     Ok((
@@ -930,6 +1238,82 @@ async fn load_admitted_state(
         },
         resource_version,
     ))
+}
+
+/// The local journal of the generation this replica is publishing, written between signing and
+/// upload and cleared once the durable state that describes it has been recorded in-cluster.
+///
+/// `marker` is the exact publication marker the upload commits to, so the next pass can tell a
+/// generation that reached the store from one that did not: the marker file is written ONLY after
+/// `publish_repository` returns, so `marker == published marker` is proof the store serves this
+/// generation.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingPublication {
+    marker: String,
+    state: DurableRolloutState,
+}
+
+/// The journal file, alongside the publication marker it is compared against.
+const PENDING_STATE_FILE: &str = "pending-state.json";
+
+/// Record the state a generation published but never got to store in-cluster.
+///
+/// The durable state is written AFTER the upload, because writing it first turned a failed publish
+/// into a record that nodes had been handed a deployment nobody served. The reverse gap is not
+/// harmless: reconcile is dropped at any await when the publisher lease renewal fails (a rolling
+/// restart), and losing the write after a successful publish leaves `assignments` naming the
+/// PREDECESSOR for a node the generation already advanced. If the group's admission gates have
+/// since closed, the next pass replans with `current` = the predecessor, reads that node as
+/// advanced on it, and publishes it backward — one signed generation, no `maxUnavailable`, no
+/// health gate.
+///
+/// So the state is journalled locally before the upload and adopted here on the next pass. The
+/// journal is evaluated at most once — it is removed whatever the verdict — so it can never
+/// re-apply itself over a later in-cluster write.
+async fn recover_pending_publication(
+    configmaps: &Api<ConfigMap>,
+    name: &str,
+    namespace: &str,
+    state_dir: &Path,
+    owner: Option<OwnerReference>,
+    durable: DurableRolloutState,
+    resource_version: Option<String>,
+) -> Result<(DurableRolloutState, Option<String>), Box<dyn std::error::Error>> {
+    let path = state_dir.join(PENDING_STATE_FILE);
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return Ok((durable, resource_version));
+    };
+    let recovered = match serde_json::from_slice::<PendingPublication>(&bytes) {
+        Ok(pending)
+            if Some(pending.marker.as_str())
+                == tokio::fs::read_to_string(state_dir.join("published-plan.sha256"))
+                    .await
+                    .ok()
+                    .as_deref() =>
+        {
+            Some(pending.state)
+        }
+        // Either the upload never completed — the marker for this generation was never written, so
+        // nothing was served and there is nothing to record — or the journal is unreadable.
+        _ => None,
+    };
+    let outcome = match recovered {
+        Some(state) if state != durable => {
+            tracing::warn!(
+                configmap = name,
+                "a published generation was never recorded in-cluster (the reconcile was cancelled \
+                 or the process restarted between the upload and the write); adopting it from the \
+                 local journal so no already-advanced node is republished on its predecessor"
+            );
+            let version =
+                store_admitted_state(configmaps, name, namespace, &state, resource_version, owner)
+                    .await?;
+            (state, version)
+        }
+        _ => (durable, resource_version),
+    };
+    tokio::fs::remove_file(&path).await.ok();
+    Ok(outcome)
 }
 
 /// The control plane's durable rollout state: what each group is pinned to, and which group each
@@ -944,7 +1328,7 @@ async fn load_admitted_state(
 /// generation does not keep its old assignment, its `agents/<node>.json` target simply stops
 /// existing. Knowing what a node was last published under is what lets a group that cannot be
 /// planned this pass (quarantined, or waiting on its inputs) leave that node exactly where it was.
-#[derive(Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DurableRolloutState {
     pub admitted: BTreeMap<String, crate::rollout::AdmittedDeployment>,
     pub routing: BTreeMap<String, String>,
@@ -993,7 +1377,7 @@ async fn store_admitted_state(
     state: &DurableRolloutState,
     resource_version: Option<String>,
     owner: Option<OwnerReference>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let data = BTreeMap::from([
         ("state.json".into(), serde_json::to_string(&state.admitted)?),
         (
@@ -1008,15 +1392,23 @@ async fn store_admitted_state(
     // A ConfigMap is one etcd object with a hard 1 MiB ceiling, and every per-node map here grows
     // with the fleet. Past the ceiling the apiserver rejects EVERY write, so the control plane can
     // neither record an admission nor advance a rollout — and it does so with an error that says
-    // nothing about fleet size. Refuse early, well under the limit, with the remedy.
-    const STATE_BYTES_LIMIT: usize = 768 * 1024;
+    // nothing about fleet size.
+    //
+    // The 768 KiB mark is therefore a WARNING, not a refusal. Refusing here bricked the repository
+    // for every already-admitted node — no publication ever completed again, and it never
+    // self-healed — which is a strictly worse outcome than writing a document the apiserver still
+    // accepts. What actually bounds the growth is [`MAX_ENROLLED_AGENTS`], enforced where agents are
+    // created; this reports how close a fleet is to the wall so the operator sees it coming.
     let bytes: usize = data.values().map(String::len).sum();
     if bytes > STATE_BYTES_LIMIT {
-        return Err(Box::new(StorageError(format!(
-            "the durable rollout state for this repository is {bytes} bytes, past the \
-             {STATE_BYTES_LIMIT}-byte ceiling a ConfigMap can hold; split this fleet across \
-             UpdateRepositories (the state is proportional to the number of published agents)"
-        ))));
+        tracing::warn!(
+            configmap = name,
+            bytes,
+            limit = STATE_BYTES_LIMIT,
+            "the durable rollout state for this repository is approaching the 1 MiB ceiling a \
+             ConfigMap can hold; split this fleet across UpdateRepositories (the state is \
+             proportional to the number of published agents)"
+        );
     }
     // Own the ConfigMap by its repository so deleting the repository reclaims this admitted-state
     // through ordinary Kubernetes GC — no finalizer needed for an in-cluster child.
@@ -1031,16 +1423,16 @@ async fn store_admitted_state(
         data: Some(data),
         ..Default::default()
     };
-    if resource_version.is_some() {
+    let written = if resource_version.is_some() {
         configmaps
             .replace(name, &PostParams::default(), &configmap)
-            .await?;
+            .await?
     } else {
         configmaps
             .create(&PostParams::default(), &configmap)
-            .await?;
-    }
-    Ok(())
+            .await?
+    };
+    Ok(written.metadata.resource_version)
 }
 
 /// Publish each `UpdateGroupSet`'s observed rollout state as its status.
@@ -1151,15 +1543,41 @@ async fn publish_enrollment_secrets(
         // walk plus several object-store reads PER AGENT, and this runs on every reconcile — for a
         // steady fleet of manual agents that is a continuous stream of requests producing a 409.
         if let Some(existing) = secrets.get_opt(&secret_name).await? {
-            check_enrollment_secret(&existing, &name, &assignment, &secret_name)?;
+            report_unusable_enrollment_secret(
+                check_enrollment_secret(&existing, &name, &assignment),
+                &name,
+                &secret_name,
+            );
             continue;
         }
         // Resolve the exact signed documents this agent pins straight from the published
         // consistent snapshot, through the one walk the gateway's `/enroll` also uses.
-        let signed =
-            crate::gateway::resolve_signed_enrollment(store, prefix, &assignment, trust_anchor)
-                .await
-                .map_err(|error| format!("resolving enrollment bundle for {name}: {error}"))?;
+        // A single agent's bundle may legitimately be unresolvable right now: a manual agent whose
+        // group has not been admitted yet (closed window, exhausted maxConcurrent, unresolved
+        // inputs) is deliberately left out of this generation, so no assignment target exists. That
+        // is a per-agent condition, not a publication failure — failing here would abort the rest
+        // of the projection, including the very status that explains why the group is gated.
+        let signed = match crate::gateway::resolve_signed_enrollment(
+            store,
+            prefix,
+            &assignment,
+            trust_anchor,
+        )
+        .await
+        {
+            Ok(signed) => signed,
+            Err(error) => {
+                tracing::warn!(
+                    agent = %name,
+                    assignment = %assignment,
+                    %error,
+                    "no enrollment bundle can be resolved for this agent yet, so its Secret is not \
+                     issued on this pass; this is expected while the agent's group is waiting to \
+                     be admitted. Every other agent, and publication, are unaffected."
+                );
+                continue;
+            }
+        };
         let bundle = signed.into_bundle(name.clone(), public_url, assignment.clone());
         let mut data = std::collections::BTreeMap::new();
         data.insert(
@@ -1183,7 +1601,11 @@ async fn publish_enrollment_secrets(
             // Lost a race with another writer (or our own earlier pass): re-read and validate.
             Err(kube::Error::Api(error)) if error.code == 409 => {
                 let existing = secrets.get(&secret_name).await?;
-                check_enrollment_secret(&existing, &name, &assignment, &secret_name)?;
+                report_unusable_enrollment_secret(
+                    check_enrollment_secret(&existing, &name, &assignment),
+                    &name,
+                    &secret_name,
+                );
             }
             Err(error) => return Err(error.into()),
         }
@@ -1216,28 +1638,43 @@ fn offline_enrollment_anchor(
 }
 
 /// Confirm an existing immutable enrollment Secret really is this agent's, for this assignment.
-/// A name collision with another agent's bundle must be an error, never silently accepted.
-fn check_enrollment_secret(
-    existing: &Secret,
-    agent: &str,
-    assignment: &str,
-    secret_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// A name collision with another agent's bundle is never silently accepted.
+fn check_enrollment_secret(existing: &Secret, agent: &str, assignment: &str) -> Result<(), String> {
     let bundle = existing
         .data
         .as_ref()
         .and_then(|data| data.get("enrollment.json"))
         .and_then(|bytes| serde_json::from_slice::<crate::EnrollmentBundle>(&bytes.0).ok());
-    if bundle
-        .as_ref()
-        .is_none_or(|bundle| bundle.agent_id != agent || bundle.assignment != assignment)
-    {
-        return Err(format!(
-            "immutable enrollment Secret {secret_name} is invalid or belongs to another agent"
-        )
-        .into());
+    match bundle {
+        Some(bundle) if bundle.agent_id == agent && bundle.assignment == assignment => Ok(()),
+        Some(bundle) => Err(format!(
+            "it carries a bundle for agent {:?} and assignment {:?}, not {agent:?} and \
+             {assignment:?}",
+            bundle.agent_id, bundle.assignment
+        )),
+        None => Err("it carries no readable enrollment.json".into()),
     }
-    Ok(())
+}
+
+/// Report an enrollment Secret this controller cannot use, WITHOUT failing the reconcile.
+///
+/// The Secret is created immutable, so nothing here can ever repair or overwrite one that is
+/// foreign, unreadable, or names a stale assignment — the ordinary cause being a changed
+/// `spec.assignmentPrefix` under a correctly owned bundle. Propagating it aborted the whole
+/// post-publication projection: every later step (set statuses, subscription delivery) was skipped
+/// and every reconcile failed, once per second, forever, over one agent's Secret. It is one agent's
+/// offline provisioning that is stuck, so it is reported as such and the pass carries on.
+fn report_unusable_enrollment_secret(outcome: Result<(), String>, agent: &str, secret_name: &str) {
+    if let Err(problem) = outcome {
+        tracing::error!(
+            agent,
+            secret = secret_name,
+            %problem,
+            "this agent's enrollment Secret cannot be used and is immutable, so this controller \
+             cannot reissue it; offline provisioning for this agent is stopped until an operator \
+             deletes the Secret. Every other agent, and publication, are unaffected."
+        );
+    }
 }
 
 pub(crate) fn metadata_version(metadata: &serde_json::Value, name: &str) -> Result<u64, String> {
@@ -1247,15 +1684,58 @@ pub(crate) fn metadata_version(metadata: &serde_json::Value, name: &str) -> Resu
         .ok_or_else(|| format!("signed metadata does not declare {name} version"))
 }
 
+/// Whether this repository can still enrol nodes, reported alongside `Ready` so the ceiling is
+/// visible long before it is reached — `/enroll` refuses at exactly the same number, and a fleet
+/// that has hit it must be split across repositories rather than left to fill one ConfigMap.
+fn enrollment_capacity_condition(generation: Option<i64>, agents: usize) -> ResourceCondition {
+    let full = agents >= MAX_ENROLLED_AGENTS as usize;
+    ResourceCondition {
+        condition_type: "EnrollmentCapacity".into(),
+        status: if full { "False" } else { "True" }.into(),
+        reason: if full { "AtCapacity" } else { "Available" }.into(),
+        message: format!("{agents} of at most {MAX_ENROLLED_AGENTS} agents are enrolled."),
+        observed_generation: generation,
+        last_transition_time: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// The condition type [`ready_condition`] and [`failed_condition`] both report on. Named because a
+/// writer that replaces the conditions array has to be able to say which entry is its own.
+const READY_CONDITION: &str = "Ready";
+
 /// A `Ready` [`ResourceCondition`] for `generation`, reporting success (`status: "True"`) or
 /// failure (`status: "False"`). The single place a Ready condition's fields are assembled;
 /// [`ready_condition`] and [`failed_condition`] are the two named entry points.
 fn condition(ok: bool, generation: Option<i64>, reason: &str, message: &str) -> ResourceCondition {
     ResourceCondition {
-        condition_type: "Ready".into(),
+        condition_type: READY_CONDITION.into(),
         status: if ok { "True" } else { "False" }.into(),
         reason: reason.into(),
         message: message.into(),
+        observed_generation: generation,
+        last_transition_time: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+/// Whether this repository's trust anchor is being kept fresh, reported unconditionally alongside
+/// `Ready`. A root renewal that fails deliberately does not stop content publication (see
+/// [`renew_expiring_root`]), so without a condition of its own the only symptom would be the root
+/// silently marching to its hard expiry — at which point every agent's metadata refresh fails at
+/// once, and nothing recovers from inside the loop.
+fn root_renewal_condition(generation: Option<i64>, failure: Option<&str>) -> ResourceCondition {
+    ResourceCondition {
+        condition_type: "RootRenewal".into(),
+        status: if failure.is_some() { "False" } else { "True" }.into(),
+        reason: if failure.is_some() {
+            "RenewalFailed"
+        } else {
+            "Current"
+        }
+        .into(),
+        message: failure.map_or_else(
+            || "The TUF root is signed and outside its renewal window.".to_string(),
+            str::to_string,
+        ),
         observed_generation: generation,
         last_transition_time: chrono::Utc::now().to_rfc3339(),
     }
@@ -1360,6 +1840,10 @@ struct StatusSnapshot<'a> {
     /// SHA-256 of the `root.json` this publisher signs with, recorded into the repository's status
     /// so enrollment can pin the store-served root against a value only the control plane writes.
     routing_root_sha256: Option<String>,
+    /// Why this pass could not renew the TUF root, when it tried and failed. Carried into the
+    /// repository's status because the failure is deliberately not fatal: publication continues and
+    /// this condition is the only thing that tells the operator the trust anchor is going stale.
+    root_renewal_failure: Option<String>,
     groups: &'a [UpdateGroup],
     agents: &'a [UpdateAgent],
     plan: &'a crate::PublicationPlan,
@@ -1415,6 +1899,7 @@ impl ReconcileProjection<'_> {
             StatusSnapshot {
                 repository: self.snapshot.repository,
                 routing_root_sha256: self.snapshot.routing_root_sha256.clone(),
+                root_renewal_failure: self.snapshot.root_renewal_failure.clone(),
                 groups: self.snapshot.groups,
                 agents: self.snapshot.agents,
                 plan: self.snapshot.plan,
@@ -1460,6 +1945,7 @@ async fn publish_resource_statuses(
     let StatusSnapshot {
         repository,
         routing_root_sha256,
+        root_renewal_failure,
         groups: group_resources,
         agents: agent_resources,
         plan,
@@ -1480,11 +1966,15 @@ async fn publish_resource_statuses(
                 .as_ref()
                 .and_then(|status| status.routing_root_sha256.clone())
         }),
-        conditions: vec![ready_condition(
-            repository_generation,
-            "Published",
-            "The complete routing generation is published.",
-        )],
+        conditions: vec![
+            ready_condition(
+                repository_generation,
+                "Published",
+                "The complete routing generation is published.",
+            ),
+            enrollment_capacity_condition(repository_generation, agent_resources.len()),
+            root_renewal_condition(repository_generation, root_renewal_failure.as_deref()),
+        ],
     };
     repositories
         .patch_status(
@@ -1631,24 +2121,12 @@ pub async fn record_repository_failure(
 ) -> Result<(), kube::Error> {
     let repositories: Api<UpdateRepository> = Api::namespaced(client, namespace);
     let repository = repositories.get(repository_name).await?;
-    let generation = repository.metadata.generation;
-    let status = UpdateRepositoryStatus {
-        observed_generation: generation,
-        published_digest: repository
-            .status
-            .as_ref()
-            .and_then(|status| status.published_digest.clone()),
-        agent_count: None,
-        // A failure never withdraws the trust anchor; enrollment must keep working.
-        routing_root_sha256: repository
-            .status
-            .and_then(|status| status.routing_root_sha256),
-        conditions: vec![failed_condition(
-            generation,
-            "ReconciliationFailed",
-            message,
-        )],
-    };
+    let observed = repository
+        .status
+        .as_ref()
+        .map(|status| status.conditions.as_slice())
+        .unwrap_or_default();
+    let status = failure_status(repository.metadata.generation, message, observed);
     repositories
         .patch_status(
             repository_name,
@@ -1657,6 +2135,43 @@ pub async fn record_repository_failure(
         )
         .await?;
     Ok(())
+}
+
+/// The status document a failed reconcile patches in. A failure observes the generation and nothing
+/// else: the published digest, the agent count, and the trust anchor are all claims only a
+/// SUCCESSFUL publish can make, so they are omitted and the last successful reconcile's values
+/// survive the merge patch (see [`UpdateRepositoryStatus`]). Pure, so that omission is testable —
+/// sending `null` for the agent count deleted the field `gateway::at_enrollment_capacity` reads,
+/// which silently uncapped enrollment for as long as the failure lasted.
+///
+/// `observed` is the conditions array the repository currently carries. A merge patch REPLACES an
+/// array wholesale, so the same omission rule applies to the entries of this one: a failure speaks
+/// only for [`READY_CONDITION`] and carries every other condition forward untouched. Rewriting the
+/// array with just its own entry deleted `EnrollmentCapacity` — the only operator-visible sign that
+/// `/enroll` is at its ceiling — for the entire duration of any reconcile failure.
+fn failure_status(
+    generation: Option<i64>,
+    message: &str,
+    observed: &[ResourceCondition],
+) -> UpdateRepositoryStatus {
+    let mut conditions = vec![failed_condition(
+        generation,
+        "ReconciliationFailed",
+        message,
+    )];
+    conditions.extend(
+        observed
+            .iter()
+            .filter(|condition| condition.condition_type != READY_CONDITION)
+            .cloned(),
+    );
+    UpdateRepositoryStatus {
+        observed_generation: generation,
+        published_digest: None,
+        agent_count: None,
+        routing_root_sha256: None,
+        conditions,
+    }
 }
 
 fn desired_publication_digest(
@@ -1726,6 +2241,311 @@ fn secret_string(
 mod lease_tests {
     use super::*;
 
+    /// Write a metadata document that declares nothing but when it expires — the only field the
+    /// renewal trigger reads.
+    fn signed_until(dir: &Path, file: &str, expires: chrono::DateTime<chrono::Utc>) {
+        std::fs::create_dir_all(dir.join("metadata")).unwrap();
+        std::fs::write(
+            dir.join("metadata").join(file),
+            serde_json::json!({"signed": {"expires": expires.to_rfc3339()}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_inside_its_renewal_window_is_re_signed_before_it_expires() {
+        let repo = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+
+        // Freshly signed: the content digest is the only publication trigger.
+        signed_until(
+            repo.path(),
+            "root.json",
+            now + chrono::Duration::days(METADATA_EXPIRY_DAYS),
+        );
+        signed_until(
+            repo.path(),
+            "timestamp.json",
+            now + chrono::Duration::days(METADATA_EXPIRY_DAYS),
+        );
+        let renewals = expiring_metadata(repo.path(), now).await;
+        assert!(renewals.is_empty());
+        assert!(!publication_required(true, &renewals), "nothing to do");
+        assert!(
+            publication_required(false, &renewals),
+            "changed content always publishes"
+        );
+
+        // Only the online metadata is inside its window, and the fleet is at steady state. It must
+        // still publish — the published-plan digest matches forever, so without this nothing is
+        // ever re-signed and the whole fleet stops loading the repository the day it expires — and
+        // it must NOT renew the root, which is a version bump of the fleet's trust anchor.
+        signed_until(
+            repo.path(),
+            "timestamp.json",
+            now + chrono::Duration::days(METADATA_RENEWAL_DAYS - 1),
+        );
+        let renewals = expiring_metadata(repo.path(), now).await;
+        assert_eq!(renewals, vec![TufRole::Online]);
+        assert!(publication_required(true, &renewals));
+        assert!(!renewals.contains(&TufRole::Root));
+
+        // The root inside its own window is what selects the renewal branch.
+        signed_until(
+            repo.path(),
+            "root.json",
+            now + chrono::Duration::days(METADATA_RENEWAL_DAYS - 1),
+        );
+        let renewals = expiring_metadata(repo.path(), now).await;
+        assert_eq!(renewals, vec![TufRole::Root, TufRole::Online]);
+        assert!(publication_required(true, &renewals));
+
+        // Already expired is still a renewal, not a special case.
+        signed_until(repo.path(), "root.json", now - chrono::Duration::days(1));
+        assert!(expiring_metadata(repo.path(), now)
+            .await
+            .contains(&TufRole::Root));
+
+        // Absent or unreadable is never a renewal: there is nothing signed to re-sign, and the
+        // initialization path (with its rollback guard) owns that case.
+        std::fs::write(repo.path().join("metadata/root.json"), b"not json").unwrap();
+        std::fs::remove_file(repo.path().join("metadata/timestamp.json")).unwrap();
+        assert!(expiring_metadata(repo.path(), now).await.is_empty());
+    }
+
+    /// A root that cannot be re-signed is an operator emergency, not a reason to stop publishing.
+    /// Propagating the error halted every rollout, admission, and durable write for the whole
+    /// ninety-day renewal window over a signing-Secret key set that has nothing to do with the
+    /// content — and dropping the role from `renewals` is what stops the un-renewable root
+    /// demanding a freshly signed generation on every reconcile for the same ninety days.
+    #[tokio::test]
+    async fn a_root_that_cannot_be_renewed_reports_itself_without_stopping_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repository");
+        let keys_dir = tmp.path().join("keys");
+        let keys = updated_tuf::repo::generate_keys(&keys_dir).await.unwrap();
+        updated_tuf::repo::init(&repo_dir, &keys, METADATA_EXPIRY_DAYS)
+            .await
+            .unwrap();
+
+        // The signing Secret was regenerated: its root keys are well formed but none of them is in
+        // the root role the live root.json lists, so the renewal cannot meet the role's threshold.
+        let backup = tmp.path().join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        for name in ["root.pk8", "root.next.pk8"] {
+            std::fs::copy(keys_dir.join(name), backup.join(name)).unwrap();
+            std::fs::remove_file(keys_dir.join(name)).unwrap();
+            updated_tuf::repo::generate_root_key(&keys_dir.join(name))
+                .await
+                .unwrap();
+        }
+        assert!(
+            updated_tuf::repo::renew_root(&repo_dir, &keys.roots, METADATA_EXPIRY_DAYS)
+                .await
+                .is_err(),
+            "the drifted key set must genuinely fail the renewal — this is what used to abort the \
+             whole reconcile"
+        );
+
+        let mut renewals = vec![TufRole::Root];
+        let failure = renew_expiring_root(&repo_dir, &keys_dir, "repo", &mut renewals)
+            .await
+            .expect("the failure is reported, not propagated");
+        assert!(renewals.is_empty(), "{renewals:?}");
+        assert!(
+            !publication_required(true, &renewals),
+            "an un-renewable root must stop forcing a re-signed generation every reconcile"
+        );
+        let condition = root_renewal_condition(Some(7), Some(&failure));
+        assert_eq!(condition.condition_type, "RootRenewal");
+        assert_eq!(condition.status, "False");
+        assert_eq!(condition.reason, "RenewalFailed");
+        assert_eq!(root_renewal_condition(Some(7), None).status, "True");
+
+        // Nothing was half-committed: the trust anchor is untouched, so the fleet keeps verifying
+        // against the root it already pinned.
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(repo_dir.join("metadata/root.json")).unwrap())
+                .unwrap();
+        assert_eq!(root["signed"]["version"], 1);
+
+        // The operator restores the real signing Secret: the renewal now succeeds and KEEPS its
+        // role, so this pass signs and uploads the generation carrying the new root.
+        for name in ["root.pk8", "root.next.pk8"] {
+            std::fs::copy(backup.join(name), keys_dir.join(name)).unwrap();
+        }
+        let mut renewals = vec![TufRole::Root];
+        assert!(
+            renew_expiring_root(&repo_dir, &keys_dir, "repo", &mut renewals)
+                .await
+                .is_none()
+        );
+        assert_eq!(renewals, vec![TufRole::Root]);
+        let root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(repo_dir.join("metadata/root.json")).unwrap())
+                .unwrap();
+        assert_eq!(root["signed"]["version"], 2);
+    }
+
+    /// A root renewal rewrites `root.json` BEFORE the pass signs and uploads, so a publish that
+    /// then fails leaves the local root ahead of the one the store serves. Keyed on the content
+    /// digest alone, the next pass saw unchanged content and a no-longer-expiring root and never
+    /// published again — while `status.routingRootSha256` (read from the LOCAL root) pinned every
+    /// `/enroll` and `/v1/node/secrets` request against a root the store does not serve. The marker
+    /// carries the root, so the mismatch itself demands the republication that heals it.
+    #[tokio::test]
+    async fn a_renewed_root_that_was_never_uploaded_forces_the_next_pass_to_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        let repo_dir = state_dir.join("repository");
+        let keys_dir = state_dir.join("keys");
+        let keys = updated_tuf::repo::generate_keys(&keys_dir).await.unwrap();
+        updated_tuf::repo::init(&repo_dir, &keys, METADATA_EXPIRY_DAYS)
+            .await
+            .unwrap();
+
+        // The last successful publication recorded this content under this root.
+        let digest = "content-digest";
+        let published = publication_marker(digest, local_routing_root_sha256(state_dir).await);
+        let unchanged = |marker: String| async move {
+            marker == publication_marker(digest, local_routing_root_sha256(state_dir).await)
+        };
+        assert!(unchanged(published.clone()).await, "nothing has moved yet");
+        assert!(
+            !publication_required(true, &[]),
+            "a steady generation publishes nothing"
+        );
+
+        // This pass renews the root and then fails to upload: the marker still describes the old
+        // root, and the root is no longer inside its renewal window, so `renewals` is empty.
+        let mut renewals = vec![TufRole::Root];
+        assert!(
+            renew_expiring_root(&repo_dir, &keys_dir, "repo", &mut renewals)
+                .await
+                .is_none()
+        );
+        assert!(expiring_metadata(&repo_dir, chrono::Utc::now())
+            .await
+            .is_empty());
+        assert!(
+            !unchanged(published.clone()).await,
+            "the local root moved, so this repository is NOT the one that was published"
+        );
+        assert!(
+            publication_required(unchanged(published.clone()).await, &[]),
+            "the next pass must sign and upload the renewed root"
+        );
+
+        // Once that publish succeeds the marker is rewritten from the root as it now stands, and
+        // the fleet is back at steady state.
+        let published = publication_marker(digest, local_routing_root_sha256(state_dir).await);
+        assert!(unchanged(published.clone()).await);
+        assert!(!publication_required(
+            unchanged(published.clone()).await,
+            &[]
+        ));
+    }
+
+    /// An enrollment Secret this controller cannot use is one agent's problem. It is immutable, so
+    /// nothing here can repair it — and propagating the verdict aborted the whole post-publication
+    /// projection, so set statuses stopped being written and no subscription webhook was ever
+    /// delivered again, every pass, over one Secret (a changed `spec.assignmentPrefix` is enough).
+    #[test]
+    fn an_unusable_enrollment_secret_is_reported_and_does_not_fail_the_pass() {
+        let bundle = |agent: &str, assignment: &str| Secret {
+            data: Some(std::collections::BTreeMap::from([(
+                "enrollment.json".to_string(),
+                ByteString(
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema": 1,
+                        "agentId": agent,
+                        "routingBaseUrl": "https://control/",
+                        "assignment": assignment,
+                        "routingRoot": "{}",
+                        "initial": {
+                            "timestamp": "{}",
+                            "snapshot": "{}",
+                            "targets": "{}",
+                            "agentDocument": "{}",
+                            "managedConfiguration": "{}",
+                        },
+                    }))
+                    .unwrap(),
+                ),
+            )])),
+            ..Default::default()
+        };
+        assert!(check_enrollment_secret(
+            &bundle("web-01", "a/web-01.json"),
+            "web-01",
+            "a/web-01.json"
+        )
+        .is_ok());
+        // Another agent's bundle under this agent's Secret name.
+        assert!(check_enrollment_secret(
+            &bundle("web-02", "a/web-02.json"),
+            "web-01",
+            "a/web-01.json"
+        )
+        .is_err());
+        // The agent's own bundle, but for the assignment path a since-changed prefix produced.
+        assert!(check_enrollment_secret(
+            &bundle("web-01", "a/web-01.json"),
+            "web-01",
+            "b/web-01.json"
+        )
+        .is_err());
+        // Arbitrary bytes under the name, which any principal with `create` on Secrets can place.
+        assert!(check_enrollment_secret(&Secret::default(), "web-01", "a/web-01.json").is_err());
+        // Reporting one is a log line, never a value the projection can fail on.
+        report_unusable_enrollment_secret(Err("unreadable".into()), "web-01", "web-01-enrollment");
+    }
+
+    #[test]
+    fn the_agent_ceiling_is_reported_on_the_repository_before_it_is_reached() {
+        let available = enrollment_capacity_condition(Some(3), 12);
+        assert_eq!(available.condition_type, "EnrollmentCapacity");
+        assert_eq!(available.status, "True");
+        assert!(available.message.contains("12 of at most"));
+        let full = enrollment_capacity_condition(Some(3), MAX_ENROLLED_AGENTS as usize);
+        assert_eq!(full.status, "False");
+        assert_eq!(full.reason, "AtCapacity");
+    }
+
+    #[test]
+    fn a_failed_reconcile_does_not_erase_what_the_last_successful_one_published() {
+        let observed = [
+            ready_condition(Some(3), "Published", "the last generation is live"),
+            enrollment_capacity_condition(Some(3), MAX_ENROLLED_AGENTS as usize),
+        ];
+        let patch =
+            serde_json::to_value(failure_status(Some(4), "reconciliation failed", &observed))
+                .unwrap();
+        // The status is a MERGE patch: a serialized `null` DELETES the field. Sending one for the
+        // agent count dropped `at_enrollment_capacity`'s only input, so `/enroll` ran uncapped from
+        // the first S3 outage or lost lease until a reconcile succeeded again.
+        for erased in ["agentCount", "publishedDigest", "routingRootSha256"] {
+            assert!(
+                patch.get(erased).is_none(),
+                "a failure claims nothing about {erased}, so it must be omitted, not nulled: \
+                 {patch}"
+            );
+        }
+        assert_eq!(patch["observedGeneration"], 4);
+        assert_eq!(patch["conditions"][0]["reason"], "ReconciliationFailed");
+        // A merge patch replaces the whole array, so the same rule applies inside it: the failure
+        // owns `Ready` and nothing else. Rewriting the array with only its own entry hid the
+        // enrollment ceiling for as long as the failure lasted.
+        let types: Vec<&str> = patch["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|condition| condition["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["Ready", "EnrollmentCapacity"], "{patch}");
+        assert_eq!(patch["conditions"][1]["reason"], "AtCapacity");
+    }
+
     #[test]
     fn consistent_snapshot_metadata_versions_are_resolved_from_signed_parents() {
         let timestamp = serde_json::json!({"signed":{"meta":{"snapshot.json":{"version":7}}}});
@@ -1774,7 +2594,7 @@ mod lease_tests {
                         inactive_repository_caches: 2,
                     },
                     timeouts: crate::TimeoutsSpec {
-                        check_interval_seconds: 60,
+                        check_interval_seconds: 15,
                         health_grace_seconds: 30,
                         health_successes: 2,
                         health_interval_seconds: 1,
@@ -1889,6 +2709,190 @@ mod lease_tests {
 
         // Re-pruning an already-clean prefix is a no-op — the resumability the finalizer relies on.
         assert_eq!(prune_prefix(&store, "tenant/routing").await.unwrap(), 0);
+    }
+
+    /// A replica whose local metadata is BEHIND the store must never publish. It led up to
+    /// generation 5, lost the lease while another replica advanced the store to 40, and reacquired
+    /// it: `root.json` is on disk so it looks healthy, its publication marker is stale so it
+    /// believes a publish is due, and `replace_release` numbers the next generation from LOCAL
+    /// metadata — so it would upload 6 over 40 and every node that ever saw 40 would reject the
+    /// fleet's routing as a rollback, permanently.
+    #[tokio::test]
+    async fn a_local_repository_behind_the_store_refuses_to_publish() {
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjPath;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repository");
+        let keys = updated_tuf::repo::generate_keys(&tmp.path().join("keys"))
+            .await
+            .unwrap();
+        updated_tuf::repo::init(&repo_dir, &keys, METADATA_EXPIRY_DAYS)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated_tuf::repo::current_version(&repo_dir).await.unwrap(),
+            1
+        );
+        let mut destination = repository("updates").s3;
+        destination.prefix = "routing".into();
+        let store = InMemory::new();
+        let publish = |version: u64| {
+            let store = &store;
+            async move {
+                store
+                    .put(
+                        &ObjPath::from("routing/metadata/timestamp.json"),
+                        PutPayload::from_bytes(
+                            serde_json::json!({ "signed": { "version": version } })
+                                .to_string()
+                                .into_bytes()
+                                .into(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // An empty store: nothing published, so nothing can be rolled back.
+        refuse_generation_rollback(&store, &destination, &repo_dir)
+            .await
+            .expect("a store with no generation cannot be rolled back");
+
+        publish(40).await;
+        assert_eq!(
+            store_published_version(&store, &destination).await.unwrap(),
+            Some(40)
+        );
+        let error = refuse_generation_rollback(&store, &destination, &repo_dir)
+            .await
+            .expect_err("a local repository at 1 must not republish over 40");
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to publish a lower generation"),
+            "{error}"
+        );
+
+        // The same guard covers an EMPTY local state dir, which would re-initialize at version 1.
+        let empty = tmp.path().join("fresh");
+        let error = refuse_generation_rollback(&store, &destination, &empty)
+            .await
+            .expect_err("a fresh state dir must not re-init over a published generation");
+        assert!(
+            error.to_string().contains("refusing to re-initialize"),
+            "{error}"
+        );
+
+        // Caught up (or ahead) is exactly what publishing is for.
+        publish(1).await;
+        refuse_generation_rollback(&store, &destination, &repo_dir)
+            .await
+            .expect("a local repository level with the store publishes normally");
+    }
+
+    /// A generation that reached the store but whose durable record was lost — reconcile is dropped
+    /// at any await when the publisher lease renewal fails — must be recovered before anything is
+    /// planned. Planning from a baseline that predates the live generation reads an already-advanced
+    /// node as still on its predecessor and republishes it there: one signed generation backwards,
+    /// no `maxUnavailable`, no health gate.
+    #[tokio::test]
+    async fn a_published_generation_whose_record_was_lost_is_recovered_before_planning() {
+        use axum::http::{Method, StatusCode};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        let advanced = DurableRolloutState {
+            admitted: BTreeMap::new(),
+            routing: BTreeMap::from([("n1".to_string(), "g".to_string())]),
+            assignments: BTreeMap::from([("n1".to_string(), "b".repeat(64))]),
+        };
+        let stale = || DurableRolloutState {
+            admitted: BTreeMap::new(),
+            routing: BTreeMap::from([("n1".to_string(), "g".to_string())]),
+            assignments: BTreeMap::from([("n1".to_string(), "a".repeat(64))]),
+        };
+        let journal = |marker: &str, state: &DurableRolloutState| {
+            std::fs::write(
+                state_dir.join(PENDING_STATE_FILE),
+                serde_json::to_vec(&PendingPublication {
+                    marker: marker.to_string(),
+                    state: DurableRolloutState {
+                        admitted: state.admitted.clone(),
+                        routing: state.routing.clone(),
+                        assignments: state.assignments.clone(),
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let recorded: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let client = crate::tests::apiserver({
+            let recorded = recorded.clone();
+            move |method: &Method, _: &str, body: Vec<u8>| {
+                if method != Method::GET {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(&body).unwrap());
+                }
+                (
+                    StatusCode::OK,
+                    serde_json::json!({ "metadata": { "name": "state", "resourceVersion": "9" } }),
+                )
+            }
+        });
+        let configmaps: Api<ConfigMap> = Api::namespaced(client, "prod");
+        let recover = |durable: DurableRolloutState| {
+            recover_pending_publication(
+                &configmaps,
+                "state",
+                "prod",
+                state_dir,
+                None,
+                durable,
+                Some("7".to_string()),
+            )
+        };
+
+        // The upload never completed: the marker for that generation was never written, so nothing
+        // was served and the journal is discarded rather than recorded.
+        journal("marker-of-a-generation-that-was-never-uploaded", &advanced);
+        let (durable, version) = recover(stale()).await.unwrap();
+        assert_eq!(durable.assignments["n1"], "a".repeat(64));
+        assert_eq!(version.as_deref(), Some("7"));
+        assert!(recorded.lock().unwrap().is_empty(), "nothing to record");
+        assert!(!state_dir.join(PENDING_STATE_FILE).exists());
+
+        // The upload DID complete — the marker file proves it — but the record was lost. The
+        // published state is adopted and written back, and planning proceeds from it.
+        std::fs::write(state_dir.join("published-plan.sha256"), "marker-v40").unwrap();
+        journal("marker-v40", &advanced);
+        let (durable, version) = recover(stale()).await.unwrap();
+        assert_eq!(
+            durable.assignments["n1"],
+            "b".repeat(64),
+            "the node the lost generation advanced is never planned as still on its predecessor"
+        );
+        assert_eq!(
+            version.as_deref(),
+            Some("9"),
+            "and the new resourceVersion is carried forward"
+        );
+        let recorded = recorded.lock().unwrap().clone();
+        let [patch] = recorded.as_slice() else {
+            panic!("exactly one in-cluster write, got {recorded:?}");
+        };
+        assert!(patch["data"]["assignments.json"]
+            .as_str()
+            .expect("the published assignments")
+            .contains(&"b".repeat(64)));
+        assert!(
+            !state_dir.join(PENDING_STATE_FILE).exists(),
+            "the journal is evaluated once, so it can never re-apply itself over a later write"
+        );
     }
 
     #[test]

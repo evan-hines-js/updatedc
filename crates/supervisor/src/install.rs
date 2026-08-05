@@ -49,7 +49,7 @@ fn advance_install(
 }
 
 /// Ensure a committed application exists, returning whether this boot performed the install
-/// (so the caller selects the `install` pre-start reason instead of `restart`).
+/// (so the caller selects the boot converge's `install` reason instead of `restart`).
 ///
 /// An in-flight install journal is reconciled first: a committed-but-uncleared install just
 /// clears it, an interrupted one is driven to completion from its recorded phase — either way
@@ -76,7 +76,7 @@ pub(crate) async fn ensure_installed(
         match classify_install_recovery(&tx, installed.as_ref()) {
             // The install committed but crashed before clearing its journal — the app never
             // launched. Clearing it is the last install step, so this boot still owns the first
-            // install: report it as such so pre-start runs with `reason=install`, not `restart`.
+            // install: report it as such so the boot converge runs with `reason=install`.
             InstallRecovery::Committed => {
                 // The installed record was already committed *provisional* by `place_and_commit`;
                 // clearing the journal is the last install step. The head still hasn't launched,
@@ -324,7 +324,7 @@ async fn place_and_commit(
     }
 
     // Place: point the active release at the staged bytes. Any operator first-install setup runs
-    // later, in the `pre-start` hook on the first launch (`reason=install`).
+    // later, in the reconciler's `apply` on the first launch (`reason=install`).
     store.activate(&tx.release)?;
     if tx.phase == InstallPhase::Prepared {
         advance_install(store, &mut tx, InstallPhase::Placed)?;

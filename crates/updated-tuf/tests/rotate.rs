@@ -306,3 +306,81 @@ async fn rotation_requires_a_continuity_key() {
         .to_string();
     assert!(error.contains("continuity"), "unexpected error: {error}");
 }
+
+#[tokio::test]
+async fn renewal_extends_the_root_without_changing_its_keys() {
+    let fixture = Fixture::new("renew").await;
+    let released = fixture.publish_app("1.0.0").await;
+    let metadata = fixture.metadata();
+    let before = signed_json(&metadata, "root.json").await["signed"]["expires"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A repository that keeps publishing still hard-expires at its original root's expiry —
+    // `replace_release` re-signs only targets/snapshot/timestamp — so renewal is what keeps a
+    // long-lived fleet loading at all. It is deliberately a re-sign, not a rotation: no key is
+    // minted, so nothing has to be persisted back into the signing Secret for the next renewal.
+    repo::renew_root(&fixture.repo_dir, &fixture.keys.roots, 730)
+        .await
+        .unwrap();
+
+    assert_eq!(root_version(&metadata, "root.json").await, 2);
+    assert!(metadata.join("2.root.json").exists());
+    assert_eq!(
+        root_keyids(&metadata, "root.json").await,
+        root_keyids(&metadata, "1.root.json").await,
+        "renewal changes the validity window and nothing else"
+    );
+    assert!(
+        signed_json(&metadata, "root.json").await["signed"]["expires"]
+            .as_str()
+            .unwrap()
+            > before.as_str(),
+        "the renewed root expires later than the one it replaces"
+    );
+
+    // The whole point: a node pinned to the ORIGINAL root still loads the repository, and the
+    // release published before the renewal is still there.
+    let repo = fixture.load_pinned_to_v1().await;
+    assert_eq!(repo.root().signed.version.get(), 2);
+    assert!(has_target(&repo, &released));
+}
+
+#[tokio::test]
+async fn renewal_ignores_keys_the_current_root_does_not_list() {
+    let fixture = Fixture::new("renew-foreign").await;
+    // The caller hands over its whole key directory, which drifts from the root the moment anyone
+    // rotates: a retired key stays on disk, a successor arrives before the rotation lands. Renewal
+    // is the one operation that runs unattended against a nearly-expired root, so a stray key must
+    // not turn every reconcile into a hard failure — it is ignored, and the threshold decides.
+    let mut keys = vec![fixture.mint_key("foreign.pk8").await];
+    keys.extend(fixture.keys.roots.iter().cloned());
+    repo::renew_root(&fixture.repo_dir, &keys, 365)
+        .await
+        .unwrap();
+    assert_eq!(root_version(&fixture.metadata(), "root.json").await, 2);
+    assert!(
+        fixture
+            .load_pinned_to_v1()
+            .await
+            .root()
+            .signed
+            .version
+            .get()
+            == 2
+    );
+
+    // Below the threshold there is nothing to sign with, and that IS a failure.
+    let foreign = fixture.mint_key("only-foreign.pk8").await;
+    for supplied in [vec![foreign], Vec::new()] {
+        let error = repo::renew_root(&fixture.repo_dir, &supplied, 365)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("of the current root's keys"),
+            "unexpected error: {error}"
+        );
+    }
+}

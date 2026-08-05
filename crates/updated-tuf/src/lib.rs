@@ -115,6 +115,28 @@ mod error_tests {
         }
     }
 
+    /// A contract-valid assignment, named so a test can tell which of two documents it got back.
+    fn assignment(deployment: &str) -> RepositoryAssignment {
+        RepositoryAssignment {
+            schema: RepositoryAssignment::SCHEMA,
+            deployment: deployment.into(),
+            metadata_url: "https://cdn/metadata/".into(),
+            targets_url: "https://cdn/targets/".into(),
+            report_url: None,
+            application: updated_contracts::artifact::TargetReference {
+                path: "app".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: updated_contracts::artifact::TargetReference {
+                path: "providers".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({}),
+            runtime: runtime(),
+        }
+    }
+
     /// Every way of not having a usable live assignment costs the node one launch of the managed
     /// application on enrollment-frozen configuration, so each must be distinguishable — an
     /// `Option` here would collapse "first boot" and "someone planted a document that would move
@@ -131,24 +153,7 @@ mod error_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let install_root = std::path::Path::new("/app");
         let path = updated::config::persisted_assignment_path(&dir);
-        let usable = || RepositoryAssignment {
-            schema: RepositoryAssignment::SCHEMA,
-            deployment: "deployment".into(),
-            metadata_url: "https://cdn/metadata/".into(),
-            targets_url: "https://cdn/targets/".into(),
-            report_url: None,
-            application: updated_contracts::artifact::TargetReference {
-                path: "app".into(),
-                sha256: "a".repeat(64),
-            },
-            ordered_install_fallback: false,
-            provider_set: updated_contracts::artifact::TargetReference {
-                path: "providers".into(),
-                sha256: "b".repeat(64),
-            },
-            release_root: serde_json::json!({}),
-            runtime: runtime(),
-        };
+        let usable = || assignment("deployment");
         let plant = |value: serde_json::Value| {
             std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         };
@@ -199,6 +204,47 @@ mod error_tests {
             .to_string();
         assert!(reason.contains("is malformed"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The enrollment bundle is written once and never rewritten, so every long-lived node
+    /// eventually holds an expired embedded chain. A node that has since resolved and persisted a
+    /// live routing assignment must still boot on it: the alternative — the state this replaces —
+    /// was a hard trust failure out of option parsing, a crash-looping supervisor, a stopped
+    /// application, and no update loop to ever fix it.
+    #[test]
+    fn an_expired_enrollment_bundle_still_boots_a_node_that_has_live_state() {
+        use super::{boot_assignment, LiveAssignment, VerifiedEmbedded};
+
+        let embedded = |expired_role| VerifiedEmbedded {
+            assignment: assignment("enrollment-frozen"),
+            expired_role,
+        };
+        let live = || LiveAssignment::Usable(Box::new(assignment("live")));
+
+        let booted = boot_assignment(embedded(Some("timestamp")), live())
+            .expect("an expired bundle must not stop a node that holds verified newer state");
+        assert_eq!(booted.deployment, "live");
+
+        // And the pin is not what was relaxed: with nothing newer to boot on, the expired chain is
+        // still the current repository state and is still refused, naming the role that expired.
+        let reason = boot_assignment(embedded(Some("timestamp")), LiveAssignment::Absent)
+            .expect_err("first use of an expired chain has no verified state to fall back to")
+            .to_string();
+        assert!(
+            reason.contains("embedded timestamp metadata is expired"),
+            "the refusal must name the expired role, got: {reason}"
+        );
+        // A live document that exists but cannot be booted on is not verified newer state either.
+        assert!(boot_assignment(
+            embedded(Some("root")),
+            LiveAssignment::Rejected("would move install_root".into())
+        )
+        .is_err());
+
+        // Unexpired, no live state: the ordinary first boot still runs on the embedded assignment.
+        let booted = boot_assignment(embedded(None), LiveAssignment::Absent)
+            .expect("a fresh bundle is the whole configuration a first boot has");
+        assert_eq!(booted.deployment, "enrollment-frozen");
     }
 
     #[test]
@@ -443,6 +489,111 @@ mod error_tests {
             );
         }
     }
+
+    fn routing(metadata_limit: u64) -> updated::config::Routing {
+        updated::config::Routing {
+            root: "/state/routing-root.json".into(),
+            base_url: "https://gateway.example/routing/".into(),
+            assignment: "assignments/agents/node.json".into(),
+            metadata_limit,
+            transport_timeout: std::time::Duration::from_secs(30),
+            mtls: updated::tls::Identity::new(
+                "/state/client.crt",
+                "/state/client.key",
+                "/state/ca.crt",
+            ),
+        }
+    }
+
+    /// The routing limits are the only ones no signed assignment and no operator setting can
+    /// raise, and both fail the node closed and non-retryably when they bite — so they are
+    /// decided here, above every shape the control plane may publish, not by the caller.
+    #[test]
+    fn routing_limits_are_floored_regardless_of_what_the_caller_configured() {
+        use super::{routing_source, ROUTING_METADATA_FLOOR, ROUTING_TARGET_LIMIT};
+
+        let source = routing_source(&routing(1024 * 1024)).unwrap();
+        assert_eq!(
+            source.metadata_url,
+            "https://gateway.example/routing/metadata/"
+        );
+        assert_eq!(
+            source.targets_url,
+            "https://gateway.example/routing/targets/"
+        );
+        assert_eq!(
+            source.metadata_limit, ROUTING_METADATA_FLOOR,
+            "a caller's small default must not become a fleet-wide ceiling on targets.json, \
+             which grows with the number of enrolled nodes"
+        );
+        assert_eq!(source.target_limit, ROUTING_TARGET_LIMIT);
+
+        // A caller asking for more than the floor keeps its own value.
+        let generous = routing_source(&routing(ROUTING_METADATA_FLOOR * 4)).unwrap();
+        assert_eq!(generous.metadata_limit, ROUTING_METADATA_FLOOR * 4);
+
+        let mut bad = routing(ROUTING_METADATA_FLOOR);
+        bad.base_url = "https://gateway.example/routing".into();
+        assert!(routing_source(&bad).is_err(), "the base must end in '/'");
+    }
+
+    /// The routing target limit must sit above the largest config bundle the signed contract
+    /// permits: a document the control plane may legitimately publish and the node then refuses
+    /// as `Error::Trust` is unfetchable forever, since that error is not retryable and no knob
+    /// raises this limit.
+    #[test]
+    fn the_routing_target_limit_admits_the_largest_contract_valid_assignment() {
+        use super::ROUTING_TARGET_LIMIT;
+        use updated_contracts::telemetry::{OutputManifest, OutputValue};
+
+        let mut runtime = runtime();
+        runtime.inputs = (0..OutputManifest::MAX_VALUES)
+            .map(|i| {
+                (
+                    format!("{i:0>128}"),
+                    OutputValue::String {
+                        value: "v".repeat(OutputManifest::MAX_STRING_BYTES),
+                    },
+                )
+            })
+            .collect();
+        runtime.secrets = (0..64)
+            .map(|i| updated_contracts::assignment::SecretReference {
+                environment: format!("SECRET_{i}"),
+                secret: "s".repeat(253),
+                key: "k".repeat(253),
+            })
+            .collect();
+        let assignment = RepositoryAssignment {
+            schema: RepositoryAssignment::SCHEMA,
+            deployment: "deployment".into(),
+            metadata_url: "https://cdn/metadata/".into(),
+            targets_url: "https://cdn/targets/".into(),
+            report_url: None,
+            application: updated_contracts::artifact::TargetReference {
+                path: "products/app/stable/1.0.0/linux-x86_64/app".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: updated_contracts::artifact::TargetReference {
+                path: "provider-sets/web.json".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({}),
+            runtime,
+        };
+        assignment
+            .validate()
+            .expect("this is the maximal shape the contract accepts, not an invalid one");
+        let encoded = serde_json::to_vec(&assignment).unwrap().len() as u64;
+        assert!(
+            encoded < ROUTING_TARGET_LIMIT,
+            "a contract-valid config bundle of {encoded} bytes must not exceed the \
+             {ROUTING_TARGET_LIMIT} byte routing limit"
+        );
+        // The old 64 KiB limit is the regression this guards: it sat below the contract.
+        assert!(encoded > 64 * 1024);
+    }
 }
 
 /// A target whose existence, length, and hashes are authenticated by the current
@@ -477,9 +628,13 @@ pub async fn resolve_managed_config(
 ) -> Result<updated::config::Config, Error> {
     let bootstrap = updated::enrollment::BootstrapConfig::load(bootstrap_path)
         .map_err(|error| Error::Local(format!("loading bootstrap config: {error}")))?;
-    let bundle = updated::enrollment::load_or_enroll_http(&bootstrap, enrollment_state)
-        .await
-        .map_err(|error| Error::Local(format!("loading enrollment bundle: {error}")))?;
+    let bundle = updated::enrollment::load_or_enroll_http(
+        &bootstrap,
+        enrollment_state,
+        &EmbeddedChainPolicy,
+    )
+    .await
+    .map_err(|error| Error::Local(format!("loading enrollment bundle: {error}")))?;
     let routing_root = enrollment_state.join("routing-root.json");
     foundation::durable::atomic_write_managed(
         &routing_root,
@@ -498,7 +653,9 @@ pub async fn resolve_managed_config(
         root: routing_root,
         base_url: bundle.routing_base_url.clone(),
         assignment: bundle.assignment.clone(),
-        metadata_limit: 1024 * 1024,
+        // Routing metadata sizing is not a per-node choice — it follows fleet size — so this states
+        // the shared floor rather than a private number of its own; see [`ROUTING_METADATA_FLOOR`].
+        metadata_limit: ROUTING_METADATA_FLOOR,
         transport_timeout: std::time::Duration::from_secs(30),
         mtls,
     };
@@ -508,32 +665,69 @@ pub async fn resolve_managed_config(
     // and the running supervisor must boot on those, not the enrollment-frozen values. The embedded
     // assignment seeds only the very first boot, before any live resolution — and the loop still
     // re-verifies and reconciles the live assignment every cycle, so a stale or tampered persisted
-    // file is corrected within one tick. Any read/parse/validate failure falls back to embedded.
-    let embedded = verify_embedded_assignment(&bundle)?;
-    let assignment =
-        match persisted_assignment(enrollment_state, &embedded.runtime.install_root).usable() {
-            Ok(live) => *live,
-            // Booting on the enrollment-frozen assignment is normal exactly once, on a node's first
-            // ever boot. Any later occurrence means THIS launch of the managed application uses the
-            // product, channel, arguments and secret mapping as of enrollment rather than whatever the
-            // control plane has since assigned — one launch on stale configuration, which the update
-            // loop then corrects a tick later. That correction is invisible, so the boot that needed
-            // it is stated outright, with the reason the live assignment was not usable.
-            Err(reason) => {
-                foundation::log::warn(
-                    "updated",
-                    &format!(
-                        "{reason}; this boot launches the managed application on the \
-                     enrollment-frozen assignment until the update loop resolves the current one"
-                    ),
-                );
-                embedded
-            }
-        };
+    // file is corrected within one tick. Any read/parse/validate failure falls back to embedded,
+    // which [`boot_assignment`] then requires to be fresh — the whole decision lives there.
+    let embedded = verify_embedded_chain(&bundle)?;
+    let live = persisted_assignment(enrollment_state, &embedded.assignment.runtime.install_root);
+    let assignment = boot_assignment(embedded, live)?;
     assignment
         .runtime
         .materialize(&assignment.deployment, routing)
         .map_err(Error::Trust)
+}
+
+/// Which assignment this boot launches the managed application on, or why it cannot boot at all.
+///
+/// This is where the enrollment bundle's freshness matters and the only place it may be waived.
+/// The embedded chain's expiry bounds how long it may stand in for *the current state of the
+/// repository*, and that is exactly the job it holds until the node resolves a live assignment of
+/// its own. Once one is persisted, the embedded copy has a different and permanent job — it is the
+/// enrollment-time root of trust that pinned `install_root` and authenticated the chain, and none
+/// of that decays. Requiring it to be fresh anyway is what turned a frozen bundle into a node that
+/// hard-fails at boot forever: the bundle is written once at enrollment and never refreshed, so
+/// every node outlives its embedded metadata, and the update loop that would fix it never starts.
+///
+/// Nothing here is relaxed but the clock. Every signature, threshold, digest and the `install_root`
+/// pin have already been checked by [`verify_embedded_chain`] and are checked identically whether
+/// the chain is expired or not; a node with no verified newer state still refuses to boot on an
+/// expired one.
+fn boot_assignment(
+    embedded: VerifiedEmbedded,
+    live: LiveAssignment,
+) -> Result<updated_contracts::assignment::RepositoryAssignment, Error> {
+    match live.usable() {
+        Ok(live) => {
+            // Worth saying even though the boot succeeds: the node is running on newer state than
+            // its enrollment material, and the material it would fall back to is no longer usable.
+            if let Some(role) = embedded.expired_role {
+                foundation::log::warn(
+                    "updated",
+                    &format!(
+                        "the enrollment bundle's embedded {role} metadata is expired; this boot \
+                         uses the persisted live routing assignment, but the node has no usable \
+                         fallback configuration left and must be re-enrolled"
+                    ),
+                );
+            }
+            Ok(*live)
+        }
+        // Booting on the enrollment-frozen assignment is normal exactly once, on a node's first
+        // ever boot. Any later occurrence means THIS launch of the managed application uses the
+        // product, channel, arguments and secret mapping as of enrollment rather than whatever the
+        // control plane has since assigned — one launch on stale configuration, which the update
+        // loop then corrects a tick later. That correction is invisible, so the boot that needed
+        // it is stated outright, with the reason the live assignment was not usable.
+        Err(reason) => {
+            foundation::log::warn(
+                "updated",
+                &format!(
+                    "{reason}; this boot launches the managed application on the \
+                     enrollment-frozen assignment until the update loop resolves the current one"
+                ),
+            );
+            embedded.fresh()
+        }
+    }
 }
 
 /// What the node-local copy of the live routing assignment turned out to be.
@@ -615,30 +809,46 @@ fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAss
                 ))
             }
         };
-    if let Err(error) = assignment.validate() {
-        return LiveAssignment::Rejected(format!("{} is invalid ({error})", path.display()));
+    if let Err(reason) = usable_as_boot_config(&assignment, install_root) {
+        return LiveAssignment::Rejected(format!("{} {reason}", path.display()));
     }
-    // `validate` covers the signed contract's shape but not its endpoints; they are otherwise
-    // first checked deep inside `assigned`, long after this document has become the boot config.
+    LiveAssignment::Usable(Box::new(assignment))
+}
+
+/// Whether a routing document may serve as this node's live boot config, or why it may not.
+///
+/// The signed contract's own `validate` covers its shape, but two of the facts that decide whether
+/// a node can boot on it are node-local and no publisher can check them: whether this build can
+/// fetch from the endpoints it names, and whether it leaves the node where the enrollment bundle
+/// put it. An `install_root` taken out of such a document would move the binary, state, journal and
+/// rejection set the guardian and supervisor operate on.
+///
+/// The writer that commits a freshly resolved document and the reader that boots on the committed
+/// one both come through here, so no document can become the live config by a route that skips a
+/// check. The reason is phrased as a predicate of the document ("is invalid …") so each caller
+/// prefixes its own subject.
+fn usable_as_boot_config(
+    assignment: &updated_contracts::assignment::RepositoryAssignment,
+    install_root: &Path,
+) -> Result<(), String> {
+    if let Err(error) = assignment.validate() {
+        return Err(format!("is invalid ({error})"));
+    }
     for (field, url) in [
         ("metadata_url", &assignment.metadata_url),
         ("targets_url", &assignment.targets_url),
     ] {
         if let Err(error) = validate_release_url(field, url) {
-            return LiveAssignment::Rejected(format!(
-                "{} has a bad {field}: {error}",
-                path.display()
-            ));
+            return Err(format!("has a bad {field}: {error}"));
         }
     }
     if assignment.runtime.install_root != install_root {
-        return LiveAssignment::Rejected(format!(
-            "{} would move install_root away from the enrollment-verified {}",
-            path.display(),
+        return Err(format!(
+            "would move install_root away from the enrollment-verified {}",
             install_root.display()
         ));
     }
-    LiveAssignment::Usable(Box::new(assignment))
+    Ok(())
 }
 
 /// Verify the complete initial TUF chain carried by an enrollment bundle and return
@@ -655,6 +865,156 @@ fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAss
 pub fn verify_embedded_assignment(
     bundle: &updated_contracts::enrollment::EnrollmentBundle,
 ) -> Result<updated_contracts::assignment::RepositoryAssignment, Error> {
+    verify_embedded_chain(bundle)?.fresh()
+}
+
+/// How near expiry an enrollment bundle's embedded chain must be before a node spends a
+/// control-plane request replacing it.
+///
+/// Generous on purpose. The material is checked on the boot path and then every 12 hours by the
+/// supervisor's identity tick, so a window of days means an ordinary node replaces its chain long
+/// before it matters and a node that is offline, or whose gateway is down, gets many attempts before
+/// its bundle stops counting as current. Nothing breaks the moment it lapses — an expired bundle
+/// still pins the root of trust and the install root, and a node with live state boots on it — so
+/// there is no reason to fetch aggressively.
+const BUNDLE_REFRESH_LEAD: jiff::SignedDuration = jiff::SignedDuration::from_hours(72);
+
+/// The trust half of [`updated::enrollment::BundlePolicy`]: when a persisted enrollment bundle is
+/// aging, and whether a replacement the gateway offers may be adopted.
+///
+/// The enrollment module owns the transport and the durability; this owns what the bytes mean,
+/// because deciding it needs the same TUF verification the boot path uses — and the refresh path
+/// must not have a second, weaker copy of it.
+pub struct EmbeddedChainPolicy;
+
+impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
+    /// A bundle is due for replacement once any role in its embedded chain is within
+    /// [`BUNDLE_REFRESH_LEAD`] of expiry — or once the chain can no longer be read at all, which is
+    /// the one case where a node cannot prove its material is current and should ask for material it
+    /// can.
+    fn needs_refresh(&self, current: &updated_contracts::enrollment::EnrollmentBundle) -> bool {
+        match earliest_expiry(current) {
+            Ok(expiry) => expiry.duration_since(jiff::Timestamp::now()) <= BUNDLE_REFRESH_LEAD,
+            Err(_) => true,
+        }
+    }
+
+    /// Adopt a candidate only if it verifies completely on its own terms AND continues this node's
+    /// enrollment-time root of trust.
+    ///
+    /// The chain check is [`verify_embedded_chain`] — the identical signature, threshold, digest and
+    /// `install_root` verification first use gets — plus [`VerifiedEmbedded::fresh`], since replacing
+    /// aging material with material that is already expired buys nothing.
+    ///
+    /// The root check is what makes the swap safe at all. A verified chain proves only that the
+    /// documents belong together under *whatever root came with them*, so on its own it would accept
+    /// a wholly attacker-minted bundle from a gateway that had been taken over, and the node's
+    /// enrollment-time pin would be worth nothing. [`root_chains_from`] requires the candidate's root
+    /// to be the pinned root or a rotation the pinned root itself signed — the same rule a TUF client
+    /// applies walking root versions forward.
+    fn accept(
+        &self,
+        candidate: &updated_contracts::enrollment::EnrollmentBundle,
+        current: &updated_contracts::enrollment::EnrollmentBundle,
+    ) -> std::io::Result<()> {
+        root_chains_from(&current.routing_root, &candidate.routing_root).map_err(refusal)?;
+        verify_embedded_chain(candidate)
+            .and_then(VerifiedEmbedded::fresh)
+            .map_err(refusal)?;
+        Ok(())
+    }
+}
+
+fn refusal(error: Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// The soonest any role of a bundle's embedded chain stops being usable as current state.
+///
+/// Signatures are deliberately NOT checked here: this answers "is it worth asking for newer
+/// material?", and a bundle whose chain does not verify is handled by refusing to boot on it, not by
+/// declining to refresh it.
+fn earliest_expiry(
+    bundle: &updated_contracts::enrollment::EnrollmentBundle,
+) -> Result<jiff::Timestamp, Error> {
+    let root: Signed<Root> = parse_embedded(bundle.routing_root.as_bytes(), "root")?;
+    let timestamp: Signed<Timestamp> =
+        parse_embedded(bundle.initial.timestamp.as_bytes(), "timestamp")?;
+    let snapshot: Signed<Snapshot> =
+        parse_embedded(bundle.initial.snapshot.as_bytes(), "snapshot")?;
+    let targets: Signed<Targets> = parse_embedded(bundle.initial.targets.as_bytes(), "targets")?;
+    [
+        root.signed.expires(),
+        timestamp.signed.expires(),
+        snapshot.signed.expires(),
+        targets.signed.expires(),
+    ]
+    .into_iter()
+    .min()
+    .ok_or_else(|| Error::Trust("embedded chain has no roles".into()))
+}
+
+/// Whether `candidate` may stand in for the root this node pinned at enrollment: byte-identical, or
+/// a later root version signed by the pinned root's own root-role keys.
+///
+/// Rotation is verified one step at a time, exactly as a TUF client walks it. A candidate that skips
+/// versions cannot be checked against what this node holds, so it is refused — the node keeps the
+/// root it has and asks again later, which is the right outcome even for a legitimate multi-step
+/// rotation: the running update loop performs the full rotation walk against the live repository, and
+/// the bundle catches up once the node's pinned root has advanced.
+fn root_chains_from(pinned: &str, candidate: &str) -> Result<(), Error> {
+    if pinned == candidate {
+        return Ok(());
+    }
+    let pinned: Signed<Root> = parse_embedded(pinned.as_bytes(), "pinned root")?;
+    let candidate: Signed<Root> = parse_embedded(candidate.as_bytes(), "candidate root")?;
+    // Authority first: whether the pinned root vouches for this document at all. A root it did not
+    // sign is a substitution, and saying so is more use to an operator than a version complaint —
+    // an attacker picks the version number, so that check can always be satisfied.
+    pinned.signed.verify_role(&candidate).map_err(|error| {
+        Error::Trust(format!(
+            "refreshed root is not signed by the pinned root: {error}"
+        ))
+    })?;
+    // Then monotonicity, which authority alone does not give: a rotation deliberately retains a
+    // continuity key, so the PREVIOUS root still verifies under the current one and replaying it
+    // would walk the node's root of trust backwards onto keys the operator has retired.
+    if candidate.signed.version <= pinned.signed.version {
+        return Err(Error::Trust(format!(
+            "refreshed root is version {} at or below the pinned root's {}",
+            candidate.signed.version, pinned.signed.version
+        )));
+    }
+    Ok(())
+}
+
+/// A fully verified embedded chain together with whether it is still within its own expiry window.
+///
+/// The two are separated because they answer different questions and only one of them decays.
+/// Signatures, thresholds and digests prove the documents belong together under the bundle's root —
+/// that is what pins this node's root of trust, and it is mandatory on every path. Expiry says only
+/// how long the chain may be taken for the repository's *current* state. [`boot_assignment`] is the
+/// one caller allowed to make that distinction, and only when it has verified newer state to use
+/// instead; every other caller goes through [`verify_embedded_assignment`], which demands both.
+struct VerifiedEmbedded {
+    assignment: updated_contracts::assignment::RepositoryAssignment,
+    /// The first role whose `expires` has passed, if any.
+    expired_role: Option<&'static str>,
+}
+
+impl VerifiedEmbedded {
+    /// The assignment if the chain is also still fresh enough to be treated as current.
+    fn fresh(self) -> Result<updated_contracts::assignment::RepositoryAssignment, Error> {
+        match self.expired_role {
+            Some(role) => Err(Error::Trust(format!("embedded {role} metadata is expired"))),
+            None => Ok(self.assignment),
+        }
+    }
+}
+
+fn verify_embedded_chain(
+    bundle: &updated_contracts::enrollment::EnrollmentBundle,
+) -> Result<VerifiedEmbedded, Error> {
     let root_bytes = bundle.routing_root.as_bytes();
     let timestamp_bytes = bundle.initial.timestamp.as_bytes();
     let snapshot_bytes = bundle.initial.snapshot.as_bytes();
@@ -679,16 +1039,14 @@ pub fn verify_embedded_assignment(
         .verify_role(&targets)
         .map_err(|error| Error::Trust(format!("embedded targets signature: {error}")))?;
     let now = jiff::Timestamp::now();
-    for (name, expires) in [
+    let expired_role = [
         ("root", root.signed.expires()),
         ("timestamp", timestamp.signed.expires()),
         ("snapshot", snapshot.signed.expires()),
         ("targets", targets.signed.expires()),
-    ] {
-        if expires <= now {
-            return Err(Error::Trust(format!("embedded {name} metadata is expired")));
-        }
-    }
+    ]
+    .into_iter()
+    .find_map(|(name, expires)| (expires <= now).then_some(name));
     if timestamp.signed.meta.len() != 1 {
         return Err(Error::Trust(
             "embedded timestamp must describe exactly snapshot.json".into(),
@@ -727,7 +1085,7 @@ pub fn verify_embedded_assignment(
         "managed configuration",
     )?;
     let actual_config = updated::hash::sha256_bytes(config_bytes);
-    if actual_config != agent.config.sha256 {
+    if !updated::hash::digests_match(&actual_config, &agent.config.sha256) {
         return Err(Error::Trust(
             "embedded managed configuration digest does not match agent document".into(),
         ));
@@ -735,7 +1093,10 @@ pub fn verify_embedded_assignment(
     let assignment: updated_contracts::assignment::RepositoryAssignment =
         parse_embedded(config_bytes, "managed configuration")?;
     assignment.validate().map_err(Error::Trust)?;
-    Ok(assignment)
+    Ok(VerifiedEmbedded {
+        assignment,
+        expired_role,
+    })
 }
 
 fn parse_embedded<T: serde::de::DeserializeOwned>(bytes: &[u8], name: &str) -> Result<T, Error> {
@@ -790,38 +1151,88 @@ pub struct ResolvedAssignment {
     pub sha256: String,
 }
 
+/// Byte ceiling for a routing target — the agent document and the config bundle it names.
+///
+/// Derived from the contract rather than picked, because a routing target that exceeds it is
+/// rejected as [`Error::Trust`], which is not retryable: the node stops updating entirely, points
+/// the operator at a tampering event that never happened, and no signed or operator-settable knob
+/// can raise the limit (the assignment's own `repository.target_limit` governs the *release*
+/// repository). So the ceiling must sit above the largest document the control plane is allowed to
+/// publish. A config bundle is a signed `RepositoryAssignment`, and everything the contract bounds
+/// in it is bounded here: `runtime.inputs` at `OutputManifest::MAX_VALUES` entries of a 128-byte
+/// name and a `MAX_STRING_BYTES` value, and 64 secret references of three ~253-byte fields. Both
+/// are counted at six bytes per source byte, the worst case for JSON string escaping (`\u00XX`).
+const ROUTING_TARGET_LIMIT: u64 = {
+    const ESCAPED: u64 = 6;
+    let inputs = updated_contracts::telemetry::OutputManifest::MAX_VALUES as u64
+        * ((128 + updated_contracts::telemetry::OutputManifest::MAX_STRING_BYTES as u64) * ESCAPED
+            + 64);
+    let secrets = 64 * (3 * 253 * ESCAPED + 64);
+    // The fields the contract leaves unbounded — `args`, and the embedded `release_root`, whose
+    // size follows the number of signing keys — get one flat megabyte between them. Nothing can
+    // make that provably sufficient; what it can do is put the failure far outside the shapes a
+    // control plane produces, instead of below them.
+    inputs + secrets + (1024 * 1024)
+};
+
+/// Floor for the routing repository's metadata limit, applied to whatever the caller configured.
+///
+/// The routing `targets.json` carries one entry per enrolled node plus one per deployment, so it
+/// grows linearly with the fleet — roughly 200 bytes each. It is the one metadata document whose
+/// size is a property of the fleet rather than of any one node's configuration, and, unlike the
+/// release repository's limit, no signed assignment or operator setting can raise it once it is
+/// too low. Exceeding it does not degrade one node: it aborts the `targets.json` fetch on every
+/// node at once, so the whole fleet stops resolving assignments simultaneously and the fix — a new
+/// supervisor binary — can no longer be delivered through the update path it broke. This floor
+/// puts that cliff past a hundred thousand nodes; a caller that wants more may still ask for more.
+const ROUTING_METADATA_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// Name prefix of the staging temp a target is streamed into before it is renamed over its
+/// destination. Named once because it is both what [`TrustedRepository::download_target`]
+/// creates and what it sweeps: a rename that never happened leaves this behind, and the sweep is
+/// the only thing that reclaims it.
+const TARGET_STAGING_PREFIX: &str = ".target-";
+
+/// The repository source the routing repository is loaded through — the one place routing
+/// metadata and target limits are decided, so both the fleet-scale floor and the contract-derived
+/// target ceiling apply to every caller regardless of what it configured.
+fn routing_source(
+    routing_config: &updated::config::Routing,
+) -> Result<updated::config::RepositorySource, Error> {
+    if !routing_config.base_url.ends_with('/') {
+        return Err(Error::Local(
+            "routing.base_url must end with '/' so metadata/ and targets/ are children".into(),
+        ));
+    }
+    let base = repository_base("routing.base_url", &routing_config.base_url)
+        .map_err(|error| Error::Local(error.to_string()))?;
+    let metadata_url = base
+        .join("metadata/")
+        .map_err(|e| Error::Local(format!("routing metadata URL: {e}")))?;
+    let targets_url = base
+        .join("targets/")
+        .map_err(|e| Error::Local(format!("routing targets URL: {e}")))?;
+    Ok(updated::config::RepositorySource {
+        root: routing_config.root.clone(),
+        metadata_url: metadata_url.to_string(),
+        targets_url: targets_url.to_string(),
+        metadata_limit: routing_config.metadata_limit.max(ROUTING_METADATA_FLOOR),
+        target_limit: ROUTING_TARGET_LIMIT,
+        transport_timeout: routing_config.transport_timeout,
+        mtls: routing_config.mtls.clone(),
+    })
+}
+
 impl TrustedRepository {
     /// Resolve only the signed routing document. This deliberately does not touch the
     /// selected release repository: callers can use the verified managed runtime to
     /// derive its install paths and resource limits first.
     pub async fn resolve_assignment(
         routing_config: &updated::config::Routing,
-        routing_datastore: &Path,
-        assignment_path: &Path,
+        paths: &updated::config::Paths,
     ) -> Result<ResolvedAssignment, Error> {
-        if !routing_config.base_url.ends_with('/') {
-            return Err(Error::Local(
-                "routing.base_url must end with '/' so metadata/ and targets/ are children".into(),
-            ));
-        }
-        let base = repository_base("routing.base_url", &routing_config.base_url)
-            .map_err(|error| Error::Local(error.to_string()))?;
-        let metadata_url = base
-            .join("metadata/")
-            .map_err(|e| Error::Local(format!("routing metadata URL: {e}")))?;
-        let targets_url = base
-            .join("targets/")
-            .map_err(|e| Error::Local(format!("routing targets URL: {e}")))?;
-        let source = updated::config::RepositorySource {
-            root: routing_config.root.clone(),
-            metadata_url: metadata_url.to_string(),
-            targets_url: targets_url.to_string(),
-            metadata_limit: routing_config.metadata_limit,
-            target_limit: 64 * 1024,
-            transport_timeout: routing_config.transport_timeout,
-            mtls: routing_config.mtls.clone(),
-        };
-        let routing = Self::load(&source, routing_datastore).await?;
+        let source = routing_source(routing_config)?;
+        let routing = Self::load(&source, &paths.routing_datastore).await?;
         let target = routing
             .all_targets()
             .into_iter()
@@ -837,7 +1248,7 @@ impl TrustedRepository {
         // failing between the two downloads, would leave the node's own config replaced by a
         // half-resolved document — and the next boot would silently fall back to the
         // enrollment-frozen assignment instead of the one it is actually running.
-        let staging = updated::config::with_suffix(assignment_path, ".resolving");
+        let staging = updated::config::with_suffix(&paths.assignment, ".resolving");
         routing.download_target(&target, &staging).await?;
         let bytes = tokio::fs::read(&staging)
             .await
@@ -853,11 +1264,26 @@ impl TrustedRepository {
         let assignment: updated_contracts::assignment::RepositoryAssignment =
             serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
-        assignment.validate().map_err(Error::Trust)?;
-        // Only a complete, verified, validated assignment is committed as the live one.
-        foundation::durable::atomic_write_managed(assignment_path, ".assignment-", &bytes)
-            .map_err(|e| Error::Local(format!("persisting the resolved assignment: {e}")))?;
+        // This write REPLACES the node's live boot config — the document the next boot launches the
+        // managed application from, before any network. So everything that decides whether a node
+        // can boot on it is proven here, ahead of the write, through the same check the reader
+        // applies: afterwards the last good assignment is already gone, and a document rejected
+        // later fails non-retryably with nothing to roll back to.
+        //
+        // Rejecting here is deliberately loud, and wider than it looks: this is the one refresh both
+        // the application check and the self-update ride on, so an unusable published assignment now
+        // stops the node updating at all until an operator republishes. That is the direction to
+        // fail — a document the node cannot boot on must never become the document it boots on — but
+        // it is a real escalation from persisting it and ignoring it at the next boot, which kept
+        // updates flowing while quietly running an assignment nobody had checked.
+        let usable = usable_as_boot_config(&assignment, &paths.install_root)
+            .map_err(|reason| Error::Trust(format!("the resolved assignment {reason}")));
+        // The staging file is scratch on every path out of here, including this one: leaving it
+        // behind on a rejection would accumulate one stale copy of an unusable document per refresh.
         let _ = std::fs::remove_file(&staging);
+        usable?;
+        foundation::durable::atomic_write_managed(&paths.assignment, ".assignment-", &bytes)
+            .map_err(|e| Error::Local(format!("persisting the resolved assignment: {e}")))?;
         Ok(ResolvedAssignment {
             // The digest TUF just verified these exact bytes against — the same value the control
             // plane published this configuration under, and the node's content identity for it.
@@ -875,9 +1301,7 @@ impl TrustedRepository {
         storage: &updated::config::Storage,
         paths: &updated::config::Paths,
     ) -> Result<Self, Error> {
-        let resolved =
-            Self::resolve_assignment(routing_config, &paths.routing_datastore, &paths.assignment)
-                .await?;
+        let resolved = Self::resolve_assignment(routing_config, paths).await?;
         let ResolvedAssignment {
             assignment,
             sha256: assignment_sha256,
@@ -905,8 +1329,6 @@ impl TrustedRepository {
             // The release repository is the same externally-exposed gateway as routing.
             mtls: routing_config.mtls.clone(),
         };
-        validate_release_url("metadata_url", &source.metadata_url)?;
-        validate_release_url("targets_url", &source.targets_url)?;
         let mut repository = Self::load(&source, &assignment_store).await?;
         repository.assignment = Some(assignment);
         repository.assignment_sha256 = Some(assignment_sha256);
@@ -1020,10 +1442,7 @@ impl TrustedRepository {
             .get("sha256")
             .map(hex::encode)
             .ok_or_else(|| Error::Trust(format!("target {} has no sha256", target.path)))?;
-        // Case-insensitive, matching `hash::verify_file` and `bundle.rs`: a signed assignment may
-        // carry an upper- or mixed-case digest, and `actual` is lowercase `hex::encode`. A
-        // case-sensitive `!=` here would spuriously reject a valid uppercase-digest assignment.
-        if !actual.eq_ignore_ascii_case(&reference.sha256) {
+        if !updated::hash::digests_match(&actual, &reference.sha256) {
             return Err(Error::Trust(format!(
                 "desired target {} has sha256 {}, expected {}",
                 target.path, actual, reference.sha256
@@ -1034,7 +1453,9 @@ impl TrustedRepository {
 
     /// Stream a verified target to `destination`. `tough` verifies length and
     /// hashes against the trusted metadata while streaming; if the stream yields
-    /// an error the partial file is unusable and is removed.
+    /// an error the partial file is unusable and is removed. Staging temps abandoned by an
+    /// earlier interrupted download in the same directory are swept first — see
+    /// [`TARGET_STAGING_PREFIX`].
     pub async fn download_target(
         &self,
         target: &VerifiedTarget,
@@ -1060,13 +1481,23 @@ impl TrustedRepository {
             )));
         }
         let dir = foundation::durable::parent_dir(destination);
+        // Reclaim staging temps orphaned by an abrupt death mid-stream. The error paths below
+        // remove their own partial file, but a SIGKILL, a power loss or a reboot between the
+        // create and the rename leaves a full-size `.target-*.tmp` that nothing else sweeps —
+        // the staging roots we download into hold fixed destination files, not per-attempt
+        // directories, so neither the bundle sweep nor directory pruning ever sees them. A
+        // crash-looping node would otherwise accumulate one bundle-sized orphan per attempt
+        // until the install root fills. `sweep_stale_temps` skips anything written recently,
+        // so a download in flight beside this one is never yanked.
+        foundation::durable::sweep_stale_temps(dir, TARGET_STAGING_PREFIX);
         // A downloaded target is node-local state, not a secret and not something this node
         // serves: it lands in the install root's staging area and is read back by this service
         // only. `create_temp_managed` keeps the deployment's own grant on that tree governing it,
         // rather than committing a protected DACL that an operator CLI or installer step running
         // as a different principal could then neither read nor replace.
-        let (file, temporary) = foundation::durable::create_temp_managed(dir, ".target-")
-            .map_err(|e| Error::Local(format!("creating target staging file: {e}")))?;
+        let (file, temporary) =
+            foundation::durable::create_temp_managed(dir, TARGET_STAGING_PREFIX)
+                .map_err(|e| Error::Local(format!("creating target staging file: {e}")))?;
         let mut file = tokio::fs::File::from_std(file);
         let mut written = 0u64;
         tokio::pin!(stream);
@@ -1194,5 +1625,159 @@ fn to_verified(path: &str, target: &Target) -> VerifiedTarget {
         length: target.length,
         hashes,
         custom: serde_json::to_value(&target.custom).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod bundle_refresh_tests {
+    use super::{earliest_expiry, root_chains_from, EmbeddedChainPolicy, BUNDLE_REFRESH_LEAD};
+    use crate::repo;
+    use std::path::{Path, PathBuf};
+    use updated::enrollment::BundlePolicy;
+    use updated_contracts::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "updated-tuf-{label}-{}-{}",
+            std::process::id(),
+            updated::rand::token().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Mint a repository whose metadata expires in `expiry_days`, and return its directory.
+    async fn minted(tmp: &Path, expiry_days: i64) -> PathBuf {
+        std::fs::create_dir_all(tmp).unwrap();
+        let repo_dir = tmp.join("repo");
+        let keys = repo::generate_keys(&tmp.join("keys")).await.unwrap();
+        repo::init(&repo_dir, &keys, expiry_days).await.unwrap();
+        repo_dir
+    }
+
+    /// The newest published copy of a role document. A consistent-snapshot repository writes the
+    /// version-prefixed name (`1.snapshot.json`) for everything but `timestamp.json`, so a test
+    /// asking for "snapshot.json" wants the highest version it finds.
+    fn role(repo_dir: &Path, file: &str) -> String {
+        let metadata = repo_dir.join("metadata");
+        if let Ok(bytes) = std::fs::read_to_string(metadata.join(file)) {
+            return bytes;
+        }
+        let newest = std::fs::read_dir(&metadata)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let version: u64 = name.strip_suffix(&format!(".{file}"))?.parse().ok()?;
+                Some((version, entry.path()))
+            })
+            .max_by_key(|(version, _)| *version)
+            .unwrap_or_else(|| panic!("no published {file} in {}", metadata.display()));
+        std::fs::read_to_string(newest.1).unwrap()
+    }
+
+    /// A bundle carrying a real repository's signed chain. Only the four role documents matter here:
+    /// expiry is read from them, and nothing in this module verifies the targets they sign.
+    fn bundle_from(repo_dir: &Path) -> EnrollmentBundle {
+        EnrollmentBundle {
+            schema: 1,
+            agent_id: "agent-a".into(),
+            routing_base_url: "https://updates.example/".into(),
+            assignment: "assignments/agents/agent-a.json".into(),
+            routing_root: role(repo_dir, "root.json"),
+            initial: InitialSignedConfiguration {
+                timestamp: role(repo_dir, "timestamp.json"),
+                snapshot: role(repo_dir, "snapshot.json"),
+                targets: role(repo_dir, "targets.json"),
+                agent_document: "{}".into(),
+                managed_configuration: "{}".into(),
+            },
+        }
+    }
+
+    /// The refresh exists to replace signed material before it stops counting as current, so the
+    /// trigger must be the chain's own expiry — read from the documents themselves, never assumed
+    /// from when the bundle was written.
+    #[tokio::test]
+    async fn a_chain_is_due_for_replacement_once_any_role_nears_its_expiry() {
+        let tmp = scratch("bundle-expiry");
+        let fresh = minted(&tmp.join("fresh"), 365).await;
+        let fresh = bundle_from(&fresh);
+        assert!(
+            !EmbeddedChainPolicy.needs_refresh(&fresh),
+            "a year of validity is not worth a control-plane request"
+        );
+        let due = minted(&tmp.join("due"), 1).await;
+        let due = bundle_from(&due);
+        assert!(
+            EmbeddedChainPolicy.needs_refresh(&due),
+            "a chain inside the {BUNDLE_REFRESH_LEAD:?} lead must be replaced while it is still valid"
+        );
+
+        // The earliest role governs, and an unreadable chain cannot be shown to be current — the one
+        // case where a node should ask for material it can actually read.
+        let mut mixed = fresh.clone();
+        mixed.initial.timestamp = due.initial.timestamp.clone();
+        assert!(earliest_expiry(&mixed).unwrap() < earliest_expiry(&fresh).unwrap());
+        assert!(EmbeddedChainPolicy.needs_refresh(&mixed));
+        let mut unreadable = fresh.clone();
+        unreadable.initial.snapshot = "{}".into();
+        assert!(EmbeddedChainPolicy.needs_refresh(&unreadable));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A verified chain proves only that its documents agree under whatever root arrived with them,
+    /// so the refresh would otherwise accept a wholly attacker-minted bundle from a gateway that had
+    /// been taken over — and the enrollment-time pin would be worth nothing. The candidate root must
+    /// be the pinned root, or a rotation the pinned root itself signed.
+    #[tokio::test]
+    async fn a_refreshed_root_must_be_the_pinned_root_or_a_rotation_it_signed() {
+        let tmp = scratch("bundle-root");
+        let repo_dir = tmp.join("repo");
+        let keys = repo::generate_keys(&tmp.join("keys")).await.unwrap();
+        repo::init(&repo_dir, &keys, 365).await.unwrap();
+        let v1 = role(&repo_dir, "root.json");
+
+        // An unrelated repository: a perfectly valid root, signed by keys this node never pinned.
+        let foreign_root = role(&minted(&tmp.join("foreign"), 365).await, "root.json");
+        let refusal = root_chains_from(&v1, &foreign_root)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("not signed by the pinned root"),
+            "a substituted root must be refused by name, got: {refusal}"
+        );
+
+        // The same bytes are trivially the same root of trust.
+        root_chains_from(&v1, &v1).expect("the pinned root is itself");
+
+        // One rotation, co-signed by the pinned root, is the case this must allow — otherwise a
+        // fleet could never refresh again after an operator rotates.
+        let successor = tmp.join("successor.pk8");
+        repo::generate_root_key(&successor).await.unwrap();
+        repo::rotate_root(&repo_dir, &keys.roots[1..], &successor, 365)
+            .await
+            .unwrap();
+        let v2 = role(&repo_dir, "root.json");
+        root_chains_from(&v1, &v2).expect("a rotation the pinned root signed is adoptable");
+
+        // Never backwards: an older root is a rollback however well it verifies.
+        let rollback = root_chains_from(&v2, &v1).unwrap_err().to_string();
+        assert!(
+            rollback.contains("at or below the pinned root"),
+            "a rollback must be refused by name, got: {rollback}"
+        );
+
+        // A second rotation cannot be checked against v1 in one step, so it is refused and the node
+        // keeps the root it has until its own rotation walk has caught up.
+        let third = tmp.join("third.pk8");
+        repo::generate_root_key(&third).await.unwrap();
+        repo::rotate_root(&repo_dir, std::slice::from_ref(&successor), &third, 365)
+            .await
+            .unwrap();
+        let v3 = role(&repo_dir, "root.json");
+        assert!(root_chains_from(&v1, &v3).is_err());
+        root_chains_from(&v2, &v3).expect("each single step still chains");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }

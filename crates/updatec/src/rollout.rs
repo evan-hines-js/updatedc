@@ -20,14 +20,23 @@ use crate::{DesiredDeployment, ResolvedGroup, UpdateGroupSet};
 use serde::{Deserialize, Serialize};
 use updated_contracts::telemetry::{Envelope, NodeReport};
 
-/// Durable group rollout state. `previous` remains present until every selected node has settled
-/// on `current`; this also prevents a second retarget from discarding the deployment held by nodes
-/// that have not advanced yet.
+/// Durable group rollout state: the deployment this group is rolling TOWARD, and every deployment
+/// its nodes may still be held ON.
+///
+/// `previous` is a list, most recent first, because a group's nodes are not always spread across
+/// only two deployments. Retargeting a rollout that is half-way through leaves nodes on the
+/// abandoned `current` as well as on the deployment it was staging away from, and a state that can
+/// name only one of them has no way to say "leave that node where it is": every node not on
+/// `current` or `previous` got assigned `previous`, so a single retarget reverted every advanced
+/// node in one signed generation, `maxUnavailable` and all. Each entry is retired by
+/// [`finish_staged_rollouts`] the moment no node is on it, down to the single most recent one that
+/// is kept solely to mean "a rollout is still staged", so the list holds the deployments the group
+/// is actually running and never accumulates.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AdmittedDeployment {
     pub current: DesiredDeployment,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous: Option<DesiredDeployment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous: Vec<DesiredDeployment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +133,39 @@ pub struct RolloutInputs<'a> {
     /// the only way a blind node can be staged at all: it produces no telemetry, so "has it been
     /// moved yet" can only be answered by what was published to it.
     pub published: &'a BTreeMap<String, String>,
+    /// Groups quarantined by validation this pass, with the deployment each is still pinned to.
+    ///
+    /// They are deliberately NOT planned here — a quarantined group has no usable spec to plan
+    /// from — but the control plane is still holding their nodes on these deployments, so the
+    /// deployments are running in the fleet. `assign_nodes` needs them for exactly that: a node
+    /// relabelled OUT of a quarantined group (the documented remediation) arrives in its new group
+    /// running one of them, and a group that cannot recognize where that node is hands it a
+    /// backward move no `maxUnavailable` budget is checked against.
+    pub held: &'a BTreeMap<String, HeldGroup>,
+}
+
+/// A group quarantined by validation this pass: the deployment it is still pinned to, plus the
+/// selector that says which agents are ITS agents.
+///
+/// The selector is carried because quarantine must not change where a node belongs. A group absent
+/// from the plan makes its nodes resolve to the `default` pseudo-group, and an agent enrolled while
+/// the group is broken has no previous routing to be carried forward on — so without the selector it
+/// was published with the repository's fleet-wide `default_deployment`, which is exactly the ungated
+/// deployment swap quarantine exists to prevent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldGroup {
+    pub state: AdmittedDeployment,
+    /// The group's own `spec.selector.matchLabels`. EMPTY means the selector itself is what
+    /// quarantined the group, and an empty selector selects NOTHING here — reading it as "matches
+    /// every agent" would hold the whole fleet on one broken group's pin.
+    pub match_labels: BTreeMap<String, String>,
+}
+
+impl HeldGroup {
+    /// Whether an agent carrying `labels` belongs to this quarantined group.
+    pub(crate) fn selects(&self, labels: &BTreeMap<String, String>) -> bool {
+        !self.match_labels.is_empty() && crate::selector_matches(&self.match_labels, labels)
+    }
 }
 
 /// What is known about ONE node's state relative to one deployment identity.
@@ -269,6 +311,20 @@ impl<'a> Observations<'a> {
             .collect()
     }
 
+    /// The deployment this node is actually running: what the last signed generation handed it, or
+    /// failing that what it reports acting on. `None` for a node nothing is known about — never
+    /// published, never reported — which is the only case with no "where it is" to hold it on.
+    ///
+    /// What was PUBLISHED is preferred over what is REPORTED for the same reason [`advanced`] takes
+    /// either: a node that reboots into the update it was just handed goes quiet for longer than
+    /// telemetry lives, and republishing what it already has must stay a no-op while it does.
+    fn placement(&self, node: &str) -> Option<String> {
+        self.published
+            .get(node)
+            .cloned()
+            .or_else(|| self.report(node).map(|report| report.assignment_sha256))
+    }
+
     /// Whether the last signed generation already handed `identity` to this node, or the node
     /// itself reports acting on it. Either one means the node has moved: absence of telemetry is
     /// not evidence of NOT having moved, and it is the only signal a blind node ever has.
@@ -294,7 +350,13 @@ impl<'a> Observations<'a> {
         // nodes one batch per generation. Judging on telemetry alone reported a mixed group settled
         // — releasing its set's concurrency slot and claiming the rollout was over — as soon as its
         // two observable nodes converged, while fifty blind ones were still being moved.
-        if state.previous.is_some() {
+        //
+        // Asked as "has every node this group selects been handed `current`?" rather than as
+        // "is `previous` empty?", because `previous` also carries bodies retained purely so a node
+        // that left this group mid-rollout can still be held where it is. A body nobody in this
+        // group is on is not a rollout in flight, and reading it as one held the group's set
+        // concurrency slot for as long as the departed node lived.
+        if !state.previous.is_empty() && !self.fully_handed(group, &state.current) {
             return Progress::Rolling;
         }
         let mut observable = false;
@@ -330,6 +392,23 @@ impl<'a> Observations<'a> {
         self.nodes(group)
             .into_iter()
             .all(|node| self.advanced(node, &identity))
+    }
+
+    /// Whether ANY node in the fleet is still placed on `deployment`, whatever group it is in now.
+    ///
+    /// The single retention rule for deployment BODIES. A node's group is a label, so the machine
+    /// running a deployment routinely outlives the group that handed it out: the group is deleted,
+    /// or the node is relabelled away mid-rollout. Once the body is gone the control plane cannot
+    /// say where that node is, and every fallback for an unaccountable node ends in handing it the
+    /// new group's `current` with no `maxUnavailable` staging and no health gate. So a body is
+    /// retired on exactly one question — is anyone still on it? — asked of the whole fleet.
+    fn placed_anywhere(&self, deployment: &DesiredDeployment) -> bool {
+        let Some(identity) = crate::deployment_identity(deployment) else {
+            return false;
+        };
+        self.node_groups
+            .keys()
+            .any(|node| self.advanced(node, &identity))
     }
 }
 
@@ -398,17 +477,13 @@ pub(crate) fn plan_rollouts(
         reports,
         public_keys,
         published,
+        held,
     } = inputs;
 
     let desired: BTreeMap<String, DesiredDeployment> = groups
         .iter()
         .map(|(name, group)| (name.clone(), group.deployment.clone()))
         .collect();
-    // Only pruning happens outside admission. A group is never *seeded* here: first admission runs
-    // through `admit_pending` like every later one, so a group's very first published deployment is
-    // gated on the same things a retarget is — resolved inputs and settled prerequisites. Seeding
-    // here instead would publish a cold cluster's consumer group with empty `runtime.inputs`.
-    admitted.retain(|name, _| desired.contains_key(name));
     let observations = Observations::new(
         node_groups,
         reports,
@@ -416,7 +491,12 @@ pub(crate) fn plan_rollouts(
         published,
         now.timestamp_millis().max(0) as u64,
     );
-    finish_staged_rollouts(admitted, &observations);
+    // Only pruning happens outside admission. A group is never *seeded* here: first admission runs
+    // through `admit_pending` like every later one, so a group's very first published deployment is
+    // gated on the same things a retarget is — resolved inputs and settled prerequisites. Seeding
+    // here instead would publish a cold cluster's consumer group with empty `runtime.inputs`.
+    retire_deleted_groups(admitted, &desired, &observations);
+    finish_staged_rollouts(admitted, &desired, &observations);
     let (mut plans, group_plans) =
         build_set_plans(sets, &desired, group_labels, admitted, &observations, now);
     admit_pending(
@@ -444,7 +524,7 @@ pub(crate) fn plan_rollouts(
         .map(|(name, _)| name.clone())
         .collect();
     let statuses = build_statuses(sets, &plans, &group_plans, &group_progress, &emergency, now);
-    let node_deployments = assign_nodes(groups, admitted, &observations);
+    let node_deployments = assign_nodes(groups, admitted, held, &observations);
     RolloutPlan {
         sets: statuses,
         node_deployments,
@@ -452,7 +532,8 @@ pub(crate) fn plan_rollouts(
     }
 }
 
-/// Retire the predecessor of every rollout whose staging is finished.
+/// Retire the predecessors of every rollout whose staging is finished, and the individual ones no
+/// node is left on.
 ///
 /// A predecessor exists for exactly one purpose: to be the deployment that the nodes NOT YET handed
 /// `current` keep running while the rollout moves them one `maxUnavailable` batch at a time. It is
@@ -466,13 +547,106 @@ pub(crate) fn plan_rollouts(
 /// group that lost its pinned keys mid-rollout silently turned a throttled rollout into an
 /// unthrottled fleet-wide swap. Staging is a property of publication, so it is decided on
 /// publication and applies to every generation change, rollbacks included.
-fn finish_staged_rollouts(
+/// Keep the admitted entry of a group the operator DELETED for exactly as long as some node is
+/// still placed on one of its deployments, compacted to those deployments alone.
+///
+/// A deleted group stops being planned immediately, but its deployment is still what its former
+/// nodes are RUNNING — they are relabelled into another group in the same commit, or fall to the
+/// pseudo-group `default`. Dropping the entry outright dropped the only copy of that body, so the
+/// group those nodes arrived in could not recognize where they were and handed them its own
+/// `current` in one signed generation, `maxUnavailable` and health gate skipped. The entry survives
+/// here as a BODY and nothing else: the group is absent from `desired`, so it is never planned,
+/// admitted, classified, counted against a set's concurrency, or assigned nodes.
+fn retire_deleted_groups(
     admitted: &mut BTreeMap<String, AdmittedDeployment>,
+    desired: &BTreeMap<String, DesiredDeployment>,
     observations: &Observations<'_>,
 ) {
+    admitted.retain(|name, state| {
+        if desired.contains_key(name) {
+            return true;
+        }
+        let mut live: Vec<DesiredDeployment> = std::iter::once(&state.current)
+            .chain(state.previous.iter())
+            .filter(|deployment| observations.placed_anywhere(deployment))
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            return false;
+        }
+        state.current = live.remove(0);
+        state.previous = live;
+        true
+    });
+}
+
+fn finish_staged_rollouts(
+    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+    desired: &BTreeMap<String, DesiredDeployment>,
+    observations: &Observations<'_>,
+) {
+    // The bodies some group's `current` already provides. A `current` is never retired, so a
+    // predecessor holding the identical body is redundant — the fleet-wide index `assign_nodes`
+    // builds is keyed by identity and answers from that `current` — and keeping it made a group
+    // that merely shares a deployment with another one carry a predecessor it had finished staging
+    // away from, for as long as the sibling ran it: permanently non-empty `previous`, on every
+    // group of a fleet that deploys the same body to several groups.
+    let provided: std::collections::HashSet<String> = admitted
+        .values()
+        .filter_map(|state| crate::deployment_identity(&state.current))
+        .collect();
+    let needed = |deployment: &DesiredDeployment| {
+        observations.placed_anywhere(deployment)
+            && !crate::deployment_identity(deployment).is_some_and(|id| provided.contains(&id))
+    };
     for (name, state) in admitted.iter_mut() {
-        if state.previous.is_some() && observations.fully_handed(name, &state.current) {
-            state.previous = None;
+        // A deleted group's entry is a retained body, not a rollout: it selects no node, so every
+        // staging question about it is vacuously true and answering them would discard the very
+        // bodies `retire_deleted_groups` just kept.
+        if !desired.contains_key(name) || state.previous.is_empty() {
+            continue;
+        }
+        if observations.fully_handed(name, &state.current) {
+            // Staging is over for the nodes this group selects NOW. A node relabelled away
+            // mid-rollout is not one of them and is still running one of these bodies, so the ones
+            // somebody is on are kept — as bodies only. `progress` asks `fully_handed` rather than
+            // reading this list, so a retained body never reports the group as still rolling.
+            state.previous.retain(|deployment| {
+                let retained = needed(deployment);
+                if retained {
+                    tracing::debug!(
+                        group = name,
+                        deployment = deployment.deployment,
+                        "predecessor retired for this group but kept as a body: a node elsewhere \
+                         in the fleet is still placed on it"
+                    );
+                }
+                retained
+            });
+            continue;
+        }
+        // The rollout is still staging, so retire only the individual predecessors no node is on
+        // any more — what a retarget of an already-staging rollout accumulates, and what keeps the
+        // list the size of the cohorts that actually exist.
+        //
+        // Never emptied here: a node that has been handed nothing at all (newly selected, never
+        // published) is on no predecessor either, and an empty list means "nothing is staged",
+        // which hands `current` to every node in one generation.
+        let live: Vec<DesiredDeployment> = state
+            .previous
+            .iter()
+            .filter(|deployment| needed(deployment))
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            // No node is on ANY of them, so dropping all but the most recent strands no cohort —
+            // and `assign_nodes` falls back to `previous[0]` and nothing else. Keeping the whole
+            // list instead let a group that can never finish staging (its nodes sit on deployments
+            // it does not name) accumulate one unretirable entry per retarget, growing the durable
+            // ConfigMap until the apiserver refused the write and no generation published again.
+            state.previous.truncate(1);
+        } else {
+            state.previous = live;
         }
     }
 }
@@ -602,27 +776,29 @@ fn admit_pending(
         }) {
             continue;
         }
-        // The predecessor a `maxUnavailable` batch stages away from is, in every case, the
-        // deployment run by the nodes this admission has NOT yet moved. There is exactly one rule,
+        // The predecessors a `maxUnavailable` batch stages away from are, in every case, the
+        // deployments run by the nodes this admission has NOT yet moved: everything this group was
+        // already admitted to, minus the deployment being admitted now. There is exactly one rule,
         // and it does not consult telemetry — staging is a property of what was published, so it
         // applies identically to a rollout, a rollback, and a group nothing can observe:
         //
-        // * First admission — nothing has ever been published for this group, so there is none.
-        // * A rollout still staging — its own predecessor, which its un-moved nodes are still on.
-        //   Overwriting that with the half-rolled `current` would strand the nodes that never
-        //   advanced.
-        // * Anything else — the deployment being replaced. `finish_staged_rollouts` retires a
-        //   predecessor only once every node has been handed `current`, so this is precisely what
-        //   the whole group is running. Note this stages EVERY change, including
-        //   one that keeps the deployment's name: advancement is decided on the published
-        //   configuration's digest, so a changed archive, argument, secret, or resolved input is as
-        //   stageable as a rename.
+        // * First admission — nothing has ever been published for this group, so there are none.
+        // * An ordinary retarget — the deployment being replaced, which every node still runs.
+        //   Note this stages EVERY change, including one that keeps the deployment's name:
+        //   advancement is decided on the published configuration's digest, so a changed archive,
+        //   argument, secret, or resolved input is as stageable as a rename.
+        // * A retarget of a rollout that is still staging — the abandoned `current` AND the
+        //   predecessor it was staging away from, because the group's nodes are spread across
+        //   both. Dropping either one strands its cohort: `assign_nodes` can only leave a node
+        //   where it is if the deployment it is on is still named here.
+        // * A rollback onto the predecessor of a staging rollout — the target simply drops out of
+        //   the list, leaving the half-rolled `current` the nodes that advanced are on. Keeping
+        //   the (equal) predecessor instead made every node that had advanced revert in a single
+        //   generation: `maxUnavailable` silently not applied to rollbacks.
         //
-        // Rolling BACK onto the predecessor of a staging rollout is the one inversion. The nodes
-        // left to move are then the ones already handed the half-rolled `current`, so `current` is
-        // what to stage away from. Recording the (equal) predecessor instead made every node that
-        // had advanced revert in a single generation — `maxUnavailable` silently not applied to
-        // rollbacks.
+        // `finish_staged_rollouts` retires each entry as soon as no node is on it, and collapses
+        // the list to one when no node is on any of them, so this grows only while cohorts
+        // genuinely exist and a repeated retarget cannot accumulate entries.
         let rolling = is_rolling(admitted, observations, &name);
         // An EMERGENCY CORRECTION waives the SCHEDULE, and nothing else. A schedule governs when
         // new change is introduced into a fleet; it is not a promise to leave the fleet on a
@@ -639,16 +815,14 @@ fn admit_pending(
         // and a release that bricks the agent itself emits no telemetry at all, so the one
         // emergency an operator most needs the escape hatch for was the one it could not detect.
         let emergency = groups[&name].emergency_correction;
-        let previous = admitted.get(&name).map(|state| {
-            if state.previous.as_ref() == Some(&desired[&name]) {
-                state.current.clone()
-            } else {
-                state
-                    .previous
-                    .clone()
-                    .unwrap_or_else(|| state.current.clone())
+        let mut previous: Vec<DesiredDeployment> = Vec::new();
+        if let Some(state) = admitted.get(&name) {
+            for deployment in std::iter::once(&state.current).chain(&state.previous) {
+                if deployment != &desired[&name] && !previous.contains(deployment) {
+                    previous.push(deployment.clone());
+                }
             }
-        });
+        }
         let admit = |admitted: &mut BTreeMap<String, AdmittedDeployment>| {
             admitted.insert(
                 name.clone(),
@@ -790,9 +964,27 @@ fn build_statuses(
 fn assign_nodes(
     groups: &BTreeMap<String, ResolvedGroup>,
     admitted: &BTreeMap<String, AdmittedDeployment>,
+    held: &BTreeMap<String, HeldGroup>,
     observations: &Observations<'_>,
 ) -> BTreeMap<String, DesiredDeployment> {
     let mut node_deployments = BTreeMap::new();
+    // Every deployment body the control plane still has, by identity. Group membership is a label,
+    // so a node arrives in a group already running one of these; this is what lets the group it
+    // arrived in republish that deployment verbatim instead of moving the node.
+    //
+    // Quarantined groups are in here too. They were pruned out of `admitted` above (they cannot be
+    // planned) and are restored by `domain::plan_reconcile` only after this runs, so reading
+    // `admitted` alone made the one node relabelling is FOR — a node moved out of a quarantined
+    // group — the one node whose placement could not be recognized. So are the bodies of DELETED
+    // groups and of retired predecessors that somebody is still on: `retire_deleted_groups` and
+    // `finish_staged_rollouts` keep a body for exactly as long as a node is placed on it, so
+    // "where is this node?" has an answer whenever the control plane ever published one.
+    let running: HashMap<String, &DesiredDeployment> = admitted
+        .values()
+        .chain(held.values().map(|held| &held.state))
+        .flat_map(|state| std::iter::once(&state.current).chain(state.previous.iter()))
+        .filter_map(|deployment| Some((crate::deployment_identity(deployment)?, deployment)))
+        .collect();
     for (name, group) in groups.iter() {
         // A group awaiting its first admission publishes nothing. Its nodes are left out of the
         // generation entirely (see `domain::plan_reconcile`) so they hold their last known
@@ -802,22 +994,30 @@ fn assign_nodes(
         };
         let mut nodes = observations.nodes(name);
         nodes.sort();
-        let Some(previous) = state.previous.as_ref() else {
-            for node in nodes {
-                node_deployments.insert(node.clone(), state.current.clone());
-            }
-            continue;
-        };
+        // There is ONE path here whether or not the group is mid-rollout. An empty `previous` means
+        // no DEPLOYMENT change is in flight; it does not mean every selected node is already on
+        // `current`. A node relabelled INTO a settled group arrives running whatever its old group
+        // handed it, and short-circuiting on `previous.is_empty()` handed `current` to all of them
+        // in one generation — a bulk relabel restarted every machine at once with no
+        // `maxUnavailable` and no health gate. For the machine a membership change is the same move
+        // as a deployment change, so it is staged the same way.
+        //
         // Advancement is judged on the exact configuration each node reports acting on, so a
         // change that keeps the deployment's name still stages one batch at a time.
-        let (Some(current_id), Some(previous_id)) = (
+        let (Some(current_id), Some(previous_ids)) = (
             crate::deployment_identity(&state.current),
-            crate::deployment_identity(previous),
+            state
+                .previous
+                .iter()
+                .map(crate::deployment_identity)
+                .collect::<Option<Vec<String>>>(),
         ) else {
             // Nothing can be shown to have advanced, so hold every node on the predecessor rather
-            // than guess.
+            // than guess. With no predecessor there is nothing to hold on and `current` is all the
+            // control plane has.
+            let fallback = state.previous.first().unwrap_or(&state.current);
             for node in nodes {
-                node_deployments.insert(node.clone(), previous.clone());
+                node_deployments.insert(node.clone(), fallback.clone());
             }
             continue;
         };
@@ -845,11 +1045,90 @@ fn assign_nodes(
                 node_deployments.insert(node.clone(), state.current.clone());
                 continue;
             }
-            let evidence = observations.evidence(node, &previous_id);
+            // WHERE this node actually is, among the deployments the group is still holding. A
+            // retarget of a staging rollout leaves nodes on the abandoned `current`, and judging
+            // them against one nominated predecessor read every one of them as Silent — so they
+            // each spent a slot of `maxUnavailable` they were not using, collapsing the budget to
+            // zero, and were then handed that predecessor anyway: a healthy node reverted for
+            // being in the wrong place. A node is held where it is, and only its own deployment
+            // decides whether it is available.
+            //
+            // "Where it is" reaches past this group's own deployments, because a node relabelled in
+            // from another group — healthy or quarantined — mid-roll is on neither `current` nor
+            // any of them (see `running`, which spans both). Falling through
+            // to the predecessor handed that machine a backward move — and the ONE move no budget
+            // was ever checked against, since only the forward move is gated below. It is held on
+            // exactly what it is already running instead, which is a no-op for it, and its own
+            // deployment decides whether it is available: a node healthy somewhere is not spending
+            // this group's `maxUnavailable` on a rollout it has not joined.
+            //
+            // ONE rule for a node whose placement this group does not recognize: it is HELD on
+            // whatever it is actually running, and if it moves at all the move is spent from the
+            // budget below. The fallbacks this replaced each assumed the opposite — that an
+            // unrecognized placement means "safe to hand out `current`" — and each turned a bulk
+            // relabel into a fleet-wide restart in a single signed generation: `hold == current`
+            // makes the `moved < budget` throttle a no-op, so every such node moved at once.
+            let (evidence, hold) = match previous_ids
+                .iter()
+                .position(|identity| observations.advanced(node, identity))
+            {
+                Some(position) => (
+                    observations.evidence(node, &previous_ids[position]),
+                    Some(&state.previous[position]),
+                ),
+                None => match observations.placement(node) {
+                    // The node IS somewhere. `running` answers with the body whenever the control
+                    // plane ever published it (bodies outlive their groups for exactly this). A
+                    // `None` here means the body is genuinely gone, so there is nothing to hold it
+                    // on — but moving it is still a move, so it waits for a budget slot like every
+                    // other and is simply left out of the generation until it gets one.
+                    Some(identity) => (
+                        observations.evidence(node, &identity),
+                        running.get(&identity).copied(),
+                    ),
+                    // Nothing has ever been published or reported for this node and this group has
+                    // no rollout staged: this is its FIRST delivery, not a move. No machine is
+                    // disrupted (none was ever handed anything) and there is no batch to take a
+                    // turn in, so a freshly enrolled agent is published immediately rather than
+                    // waiting a generation per sibling. It still counts against availability — it
+                    // is not on the release yet — and it can discharge that by reporting, because
+                    // it was published.
+                    None if state.previous.is_empty() => {
+                        if observations.evidence(node, &current_id).unavailable() {
+                            unavailable += 1;
+                        }
+                        node_deployments.insert(node.clone(), state.current.clone());
+                        continue;
+                    }
+                    // The same node while a rollout IS staged is part of the cohort being moved one
+                    // batch at a time, so it takes its turn like every other member — with nothing
+                    // to hold it on meanwhile, so it is simply left out until it gets a slot, which
+                    // costs it nothing because nothing was ever published for it. Handing it
+                    // `current` here instead delivered the in-flight release, unstaged, to every
+                    // node the control plane cannot account for while its siblings were still
+                    // moving one at a time.
+                    //
+                    // It is the ONE held node that does not spend a `maxUnavailable` slot, and that
+                    // exemption is what keeps the group from deadlocking. Counting it made the two
+                    // halves self-reinforcing: with no placement it reads `Silent`, taking a slot,
+                    // and with nothing to hold it on it is dropped from the generation whenever the
+                    // budget is spent — so it is never published, so it can never report, so it
+                    // stays Silent and holds that slot forever. One autoscaler-enrolled agent
+                    // joining a group with the default `maxUnavailable: 1` mid-rollout was enough
+                    // to freeze that group, and every group sequenced behind it, permanently.
+                    // Nothing is running on this node for its absence to disrupt, so there is
+                    // nothing for the availability budget to be protecting; it waits for a movement
+                    // slot, which the other nodes' convergence always frees.
+                    None => {
+                        held.push((node, NodeEvidence::Silent, None));
+                        continue;
+                    }
+                },
+            };
             if evidence.unavailable() {
                 unavailable += 1;
             }
-            held.push((node, evidence));
+            held.push((node, evidence, hold));
         }
         // A node held on the predecessor that positively reports itself BROKEN there is moved out of
         // turn — it does not need FREE capacity — but only onto a `current` some sibling is already
@@ -872,19 +1151,37 @@ fn assign_nodes(
         let capacity = group.max_unavailable.saturating_sub(unavailable);
         let rescue_budget = group.max_unavailable.max(1);
         let mut moved = 0usize;
-        for (node, evidence) in held {
+        for (node, evidence, hold) in held {
             let budget = if proven && evidence == NodeEvidence::Broken {
                 rescue_budget
             } else {
                 capacity
             };
+            // Out of budget means the node does not move — it is republished on exactly what it is
+            // already running, which is a no-op for that machine. The alternative, publishing one
+            // nominated predecessor to every held node, is a MOVE for anything not already on it,
+            // and one that no budget was ever checked against.
             let deployment = if moved < budget {
                 moved += 1;
-                state.current.clone()
+                Some(&state.current)
             } else {
-                previous.clone()
+                hold
             };
-            node_deployments.insert(node.clone(), deployment);
+            match deployment {
+                Some(deployment) => {
+                    node_deployments.insert(node.clone(), deployment.clone());
+                }
+                // Out of budget AND nothing to hold this node on. It is left out of the generation
+                // rather than moved unbudgeted; `domain::plan_reconcile` republishes it under its
+                // last routing, and it moves as soon as a slot frees.
+                None => tracing::warn!(
+                    node,
+                    group = name,
+                    "node is placed on a deployment the control plane no longer has a body for and \
+                     this group has no free maxUnavailable slot; leaving it out of this generation \
+                     rather than moving it unbudgeted"
+                ),
+            }
         }
     }
     node_deployments
@@ -980,7 +1277,7 @@ mod tests {
     fn admitted(deployment: DesiredDeployment) -> AdmittedDeployment {
         AdmittedDeployment {
             current: deployment,
-            previous: None,
+            previous: Vec::new(),
         }
     }
 
@@ -1058,7 +1355,7 @@ mod tests {
     fn admitted_now(deployment: &DesiredDeployment) -> AdmittedDeployment {
         AdmittedDeployment {
             current: deployment.clone(),
-            previous: None,
+            previous: Vec::new(),
         }
     }
 
@@ -1117,6 +1414,7 @@ mod tests {
                 reports: &baseline,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1131,6 +1429,7 @@ mod tests {
                 reports: &baseline,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1153,6 +1452,7 @@ mod tests {
                 reports: &one_settled,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1186,6 +1486,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1202,6 +1503,7 @@ mod tests {
                     reports: &reports,
                     public_keys: &keys,
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                 },
                 &mut admitted,
                 test_now(),
@@ -1230,6 +1532,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1238,7 +1541,7 @@ mod tests {
             .node_deployments
             .values()
             .all(|deployment| deployment.deployment == "v1"));
-        assert_eq!(admitted["g"].previous, None);
+        assert!(admitted["g"].previous.is_empty());
     }
 
     #[test]
@@ -1248,7 +1551,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         let reports = HashMap::from([
@@ -1266,6 +1569,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1289,7 +1593,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         let reports = HashMap::from([
@@ -1306,22 +1610,230 @@ mod tests {
                 reports: &reports,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v2");
         assert_eq!(
-            admitted["g"].previous.as_ref().unwrap().deployment,
-            "v0",
-            "the predecessor must stay the deployment un-advanced nodes actually run"
+            admitted["g"]
+                .previous
+                .iter()
+                .map(|deployment| deployment.deployment.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v1", "v0"],
+            "both cohorts survive the preemption: the abandoned v1 that n0 is on and the v0 the \
+             other two never left"
         );
         // `n0` is unhealthy on the abandoned v1, so it counts against `maxUnavailable` and no node
         // is advanced this pass: the preemption changes what is admitted, never the staging budget.
-        assert!(outcome
-            .node_deployments
-            .values()
-            .all(|deployment| deployment.deployment == "v0"));
+        // Every node is republished exactly where it already is — nothing moves in either
+        // direction on a pass with no budget.
+        assert_eq!(outcome.node_deployments["n0"].deployment, "v1");
+        assert_eq!(outcome.node_deployments["n1"].deployment, "v0");
+        assert_eq!(outcome.node_deployments["n2"].deployment, "v0");
+    }
+
+    /// The same preemption with the advanced cohort HEALTHY, which is the case that showed the
+    /// budget was not applied backwards at all: ten nodes at `maxUnavailable: 1`, five of them
+    /// published and healthy on v1 after five staged generations, retargeted to v2. Holding one
+    /// nominated predecessor meant all five read as Silent against it (so the budget collapsed to
+    /// zero) and were then handed it anyway — five healthy nodes downgraded in one signed
+    /// generation, which is exactly what `maxUnavailable` exists to prevent.
+    #[test]
+    fn a_retarget_never_yanks_a_healthy_advanced_node_backwards() {
+        let nodes: Vec<String> = (0..10).map(|index| format!("n{index}")).collect();
+        let groups = BTreeMap::from([("g".into(), group("g", deployment_named("v2")))]);
+        let node_groups: BTreeMap<String, String> = nodes
+            .iter()
+            .map(|node| (node.clone(), "g".to_string()))
+            .collect();
+        // Five nodes were staged onto v1 one generation at a time; the rest never left v0.
+        let advanced = |index: usize| index < 5;
+        let mut admitted = BTreeMap::from([(
+            "g".into(),
+            AdmittedDeployment {
+                current: deployment_named("v1"),
+                previous: vec![deployment_named("v0")],
+            },
+        )]);
+        let published: BTreeMap<String, String> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let deployment = if advanced(index) { "v1" } else { "v0" };
+                (
+                    node.clone(),
+                    crate::deployment_identity(&deployment_named(deployment)).unwrap(),
+                )
+            })
+            .collect();
+        let reports: HashMap<String, Envelope> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| report(node, if advanced(index) { "v1" } else { "v0" }, true))
+            .collect();
+
+        let outcome = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &pubkeys(&node_groups),
+                published: &published,
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+
+        assert_eq!(admitted["g"].current.deployment, "v2");
+        let moved: Vec<&String> = nodes
+            .iter()
+            .filter(|node| outcome.node_deployments[*node].deployment == "v2")
+            .collect();
+        assert_eq!(moved.len(), 1, "one node moves: maxUnavailable is 1");
+        for (index, node) in nodes.iter().enumerate() {
+            if moved.contains(&node) {
+                continue;
+            }
+            assert_eq!(
+                outcome.node_deployments[node].deployment,
+                if advanced(index) { "v1" } else { "v0" },
+                "{node} is healthy where it is and stays there until the budget reaches it"
+            );
+        }
+
+        // And it converges: no cohort is stranded, and each pass moves exactly one node.
+        let mut published = published_from(&outcome);
+        let mut reports = reports;
+        for node in outcome.node_deployments.keys() {
+            let (node, envelope) = report(node, &outcome.node_deployments[node].deployment, true);
+            reports.insert(node, envelope);
+        }
+        for _ in 0..12 {
+            let plan = plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &BTreeMap::new(),
+                    node_groups: &node_groups,
+                    reports: &reports,
+                    public_keys: &pubkeys(&node_groups),
+                    published: &published,
+                    held: &BTreeMap::new(),
+                },
+                &mut admitted,
+                test_now(),
+            );
+            let on_v2 = plan
+                .node_deployments
+                .values()
+                .filter(|deployment| deployment.deployment == "v2")
+                .count();
+            assert!(
+                on_v2 <= previously_on_v2(&published) + 1,
+                "one node per pass"
+            );
+            published = published_from(&plan);
+            for (node, deployment) in &plan.node_deployments {
+                let (node, envelope) = report(node, &deployment.deployment, true);
+                reports.insert(node, envelope);
+            }
+        }
+        let target = crate::deployment_identity(&deployment_named("v2")).unwrap();
+        assert!(
+            published.values().all(|identity| *identity == target),
+            "every node converges on the retarget"
+        );
+        assert!(
+            admitted["g"].previous.is_empty(),
+            "and the staging finishes: no cohort is left behind"
+        );
+    }
+
+    /// The same rule for a node that arrives from OUTSIDE the group. Group membership is a label,
+    /// so a node can be relabelled into a group mid-roll while running a deployment that group has
+    /// never held — on neither its `current` nor any of its predecessors. That node fell through to
+    /// "hold it on the most recent predecessor", which for it is a backward MOVE, and the only one
+    /// the per-generation budget was never checked against.
+    #[test]
+    fn a_node_relabelled_in_mid_roll_is_not_yanked_onto_a_deployment_it_never_ran() {
+        let nodes = ["n0", "n1", "n2", "z-arrival"];
+        let groups = BTreeMap::from([
+            ("g".into(), group("g", deployment_named("v2"))),
+            ("other".into(), group("other", deployment_named("w1"))),
+        ]);
+        // `z-arrival` sorts last, so the single-node movement budget is spent before it is reached:
+        // whatever it is assigned this pass is what "held where it is" has to mean.
+        let node_groups: BTreeMap<String, String> = nodes
+            .iter()
+            .map(|node| ((*node).to_string(), "g".to_string()))
+            .collect();
+        let mut admitted = BTreeMap::from([
+            (
+                "g".into(),
+                AdmittedDeployment {
+                    current: deployment_named("v2"),
+                    previous: vec![deployment_named("v1")],
+                },
+            ),
+            ("other".into(), admitted(deployment_named("w1"))),
+        ]);
+        let running = |node: &str| if node == "z-arrival" { "w1" } else { "v1" };
+        let published: BTreeMap<String, String> = nodes
+            .iter()
+            .map(|node| {
+                (
+                    (*node).to_string(),
+                    crate::deployment_identity(&deployment_named(running(node))).unwrap(),
+                )
+            })
+            .collect();
+        let reports: HashMap<String, Envelope> = nodes
+            .iter()
+            .map(|node| report(node, running(node), true))
+            .collect();
+
+        let outcome = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &pubkeys(&node_groups),
+                published: &published,
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+
+        assert_eq!(
+            outcome.node_deployments["z-arrival"].deployment, "w1",
+            "a node healthy on a deployment this group does not hold is republished on exactly \
+             that, not reverted onto a predecessor it has never run"
+        );
+        assert_eq!(
+            outcome
+                .node_deployments
+                .values()
+                .filter(|deployment| deployment.deployment == "v2")
+                .count(),
+            1,
+            "and the group's own staging is still one node per generation"
+        );
+    }
+
+    /// How many nodes the last published generation had on v2 — the baseline the next pass may
+    /// exceed by at most one.
+    fn previously_on_v2(published: &BTreeMap<String, String>) -> usize {
+        let v2 = crate::deployment_identity(&deployment_named("v2")).unwrap();
+        published.values().filter(|id| **id == v2).count()
     }
 
     /// The rollback shape of the same case: reverting to exactly the deployment the group still
@@ -1337,7 +1849,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         let reports = HashMap::from([
@@ -1354,14 +1866,14 @@ mod tests {
                 reports: &reports,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v0");
         assert_eq!(
-            admitted["g"].previous.as_ref().unwrap().deployment,
-            "v1",
+            admitted["g"].previous[0].deployment, "v1",
             "a rollback stages away from the half-rolled deployment, so THAT is the predecessor"
         );
         assert!(outcome
@@ -1387,7 +1899,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         let outcome = plan_rollouts(
@@ -1399,6 +1911,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1430,6 +1943,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports,
             },
             &mut admitted,
@@ -1467,6 +1981,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0,
             },
             &mut admitted,
@@ -1484,6 +1999,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0, // agents still on v0
             },
             &mut admitted,
@@ -1506,6 +2022,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_a_done,
             },
             &mut admitted,
@@ -1548,6 +2065,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0,
             },
             &mut admitted,
@@ -1562,6 +2080,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0,
             },
             &mut admitted,
@@ -1583,6 +2102,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0,
             },
             &mut failover_admitted,
@@ -1615,6 +2135,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0,
             },
             &mut cold_admitted,
@@ -1691,6 +2212,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &all_v0,
             },
             &mut admitted,
@@ -1711,6 +2233,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &all_v0,
             },
             &mut admitted,
@@ -1772,6 +2295,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -1844,6 +2368,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0(monday),
             },
             &mut admitted,
@@ -1861,6 +2386,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0(monday),
             },
             &mut admitted,
@@ -1889,6 +2415,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_v0(sunday),
             },
             &mut admitted,
@@ -1951,6 +2478,7 @@ mod tests {
                     node_groups: &node_groups,
                     public_keys: &pubkeys(&node_groups),
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                     reports: &reports_v0,
                 },
                 admitted,
@@ -2003,6 +2531,7 @@ mod tests {
                 node_groups: &node_groups,
                 public_keys: &pubkeys(&node_groups),
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
                 reports: &reports_a_done,
             },
             &mut admitted,
@@ -2069,6 +2598,7 @@ mod tests {
                     node_groups: &node_groups,
                     public_keys: &pubkeys(&node_groups),
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                     reports: &reports,
                 },
                 &mut admitted,
@@ -2111,6 +2641,7 @@ mod tests {
                     node_groups: &node_groups,
                     public_keys: &pubkeys(&node_groups),
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                     reports: &reports,
                 },
                 &mut admitted,
@@ -2171,6 +2702,7 @@ mod tests {
                     reports,
                     public_keys: &keys,
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                 },
                 admitted,
                 test_now(),
@@ -2200,7 +2732,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         groups.get_mut("g").unwrap().deployment = deployment_named("v0");
@@ -2218,6 +2750,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -2227,8 +2760,7 @@ mod tests {
             "the revert is admitted"
         );
         assert_eq!(
-            admitted["g"].previous.as_ref().unwrap().deployment,
-            "v1",
+            admitted["g"].previous[0].deployment, "v1",
             "and it is staged like any other change: the nodes left to move are the ones already \
              handed the half-rolled v1"
         );
@@ -2265,6 +2797,7 @@ mod tests {
                     node_groups: &node_groups,
                     public_keys: &pubkeys(&node_groups),
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                     reports: &reports,
                 },
                 admitted,
@@ -2327,6 +2860,7 @@ mod tests {
                     public_keys: &keys,
                     published,
                     reports: &reports,
+                    held: &BTreeMap::new(),
                 },
                 admitted,
                 test_now(),
@@ -2352,7 +2886,7 @@ mod tests {
         // One pass later every node has been handed it, so the staging is finished and the member
         // goes back to being unobservable rather than rolling forever.
         let statuses = run(&groups, &mut admitted, &mut published);
-        assert_eq!(admitted["b"].previous, None);
+        assert!(admitted["b"].previous.is_empty());
         assert_eq!(statuses.sets[0].unobservable, vec!["b".to_string()]);
         assert!(statuses.sets[0].rolling.is_empty());
 
@@ -2382,14 +2916,14 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v2");
         assert_eq!(
-            admitted["g"].previous.as_ref().unwrap().deployment,
-            "v1",
+            admitted["g"].previous[0].deployment, "v1",
             "the rollout still stages: the unverifiable node does not disable maxUnavailable"
         );
     }
@@ -2406,7 +2940,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         // `n0` was handed v1 last generation and is now rebooting: no fresh report at all.
@@ -2424,6 +2958,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &pubkeys(&node_groups),
                 published: &published,
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -2465,6 +3000,7 @@ mod tests {
                 reports: &HashMap::new(),
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -2491,6 +3027,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -2523,6 +3060,7 @@ mod tests {
                     reports: &reports,
                     public_keys: &keys,
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                 },
                 admitted,
                 test_now(),
@@ -2548,7 +3086,7 @@ mod tests {
             "a body change under an unchanged name must be re-admitted"
         );
         assert!(
-            admitted["g"].previous.is_some(),
+            !admitted["g"].previous.is_empty(),
             "and it must be STAGED: the predecessor is retained so the group rolls in batches"
         );
         // `max_unavailable` is 1 for this fixture, so exactly one of the three nodes receives the
@@ -2602,6 +3140,7 @@ mod tests {
                     reports: &reports,
                     public_keys: &keys,
                     published: &published,
+                    held: &BTreeMap::new(),
                 },
                 &mut admitted,
                 test_now(),
@@ -2626,10 +3165,84 @@ mod tests {
             vec![1, 2, 3, 3],
             "one node per pass, blind node included, until the whole group has v1"
         );
-        assert_eq!(
-            admitted["g"].previous, None,
+        assert!(
+            admitted["g"].previous.is_empty(),
             "and the rollout finishes: staging is judged on what was published, so a node that can \
              never report still completes it"
+        );
+    }
+
+    /// A node enrolled INTO a group while that group's rollout is already staged must not freeze
+    /// it. Such a node has no placement at all: nothing was ever published for it and it has never
+    /// reported. Counting it against `maxUnavailable` was a deadlock, because with nothing to hold
+    /// it on it is also left out of every generation it has no movement slot for — so it could
+    /// never be published, never report, and never release the slot it was spending. The group
+    /// stayed `Rolling` forever, holding its set's concurrency slot, and the new agent was never
+    /// handed anything at all.
+    #[test]
+    fn an_agent_enrolled_mid_rollout_does_not_freeze_its_group() {
+        let (mut groups, mut node_groups, labels) = three_node_group();
+        // Two agents an autoscaler enrolled after the rollout to v1 was already staged: keyed, but
+        // never published to and never heard from.
+        node_groups.insert("n3".into(), "g".into());
+        node_groups.insert("n4".into(), "g".into());
+        let keys = pubkeys(&node_groups);
+        let mut admitted = BTreeMap::from([("g".into(), admitted(deployment_named("v0")))]);
+        let mut reports = HashMap::from([
+            report("n0", "v0", true),
+            report("n1", "v0", true),
+            report("n2", "v0", true),
+        ]);
+        let mut published: BTreeMap<String, String> = ["n0", "n1", "n2"]
+            .into_iter()
+            .map(|node| {
+                (
+                    node.to_string(),
+                    crate::deployment_identity(&deployment_named("v0")).unwrap(),
+                )
+            })
+            .collect();
+        groups.get_mut("g").unwrap().deployment = deployment_named("v1");
+
+        let mut last = None;
+        for _ in 0..12 {
+            let plan = plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports: &reports,
+                    public_keys: &keys,
+                    published: &published,
+                    held: &BTreeMap::new(),
+                },
+                &mut admitted,
+                test_now(),
+            );
+            published = published_from(&plan);
+            for (node, deployment) in &plan.node_deployments {
+                let (node, envelope) = report(node, &deployment.deployment, true);
+                reports.insert(node, envelope);
+            }
+            last = Some(plan);
+        }
+        let plan = last.unwrap();
+        assert_eq!(
+            plan.node_deployments.len(),
+            5,
+            "every node of the group, the two new ones included, is in the generation"
+        );
+        assert!(
+            plan.node_deployments
+                .values()
+                .all(|deployment| deployment.deployment == "v1"),
+            "and the rollout reaches all of them: {:?}",
+            plan.node_deployments
+        );
+        assert!(
+            admitted["g"].previous.is_empty(),
+            "so the rollout finishes and stops holding its set's concurrency slot"
         );
     }
 
@@ -2700,7 +3313,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         let reports = HashMap::from([
@@ -2720,6 +3333,7 @@ mod tests {
                     reports: &reports,
                     public_keys: &keys,
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                 },
                 admitted,
                 now,
@@ -2753,7 +3367,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v1"),
-                previous: Some(deployment_named("v0")),
+                previous: vec![deployment_named("v0")],
             },
         )]);
         let reports = HashMap::from([
@@ -2771,14 +3385,14 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v0");
         assert_eq!(
-            admitted["g"].previous.as_ref().unwrap().deployment,
-            "v1",
+            admitted["g"].previous[0].deployment, "v1",
             "the nodes left to move are the ones already on v1, so v1 is what is staged away from"
         );
         let reverted = plan
@@ -2820,13 +3434,13 @@ mod tests {
                 reports: &HashMap::new(),
                 public_keys: &HashMap::new(),
                 published: &published,
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
         );
         assert_eq!(
-            admitted["g"].previous.as_ref().unwrap().deployment,
-            "v0",
+            admitted["g"].previous[0].deployment, "v0",
             "an unobservable group keeps its predecessor: staging is not an evidence question"
         );
         assert_eq!(
@@ -2864,7 +3478,7 @@ mod tests {
             "g".to_string(),
             AdmittedDeployment {
                 current: deployment_named("v2"),
-                previous: Some(deployment_named("v1")),
+                previous: vec![deployment_named("v1")],
             },
         )]);
         (groups, node_groups, labels, sets, admitted)
@@ -2898,6 +3512,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             monday(),
@@ -2928,7 +3543,7 @@ mod tests {
         let keys = pubkeys(&node_groups);
         // Fully rolled out on v2 — and n0 has been reporting unhealthy for weeks for reasons that
         // have nothing to do with the rollout.
-        admitted.get_mut("g").unwrap().previous = None;
+        admitted.get_mut("g").unwrap().previous.clear();
         let reports = HashMap::from([
             report_at(monday(), "n0", "v2", false),
             report_at(monday(), "n1", "v2", true),
@@ -2945,6 +3560,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             monday(),
@@ -2970,7 +3586,7 @@ mod tests {
         let keys = pubkeys(&node_groups);
         // Fully rolled out on v2 and reporting healthy: nothing is in flight, so nothing about
         // this group bypasses a slot for any other reason.
-        admitted.get_mut("g").unwrap().previous = None;
+        admitted.get_mut("g").unwrap().previous.clear();
         let reports = HashMap::from([
             report_at(monday(), "n0", "v2", true),
             report_at(monday(), "n1", "v2", true),
@@ -2987,6 +3603,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             monday(),
@@ -3012,7 +3629,7 @@ mod tests {
     fn an_ordinary_retarget_of_a_settled_group_is_refused_outside_the_window() {
         let (mut groups, node_groups, labels, sets, mut admitted) = escape_hatch_fixture();
         let keys = pubkeys(&node_groups);
-        admitted.get_mut("g").unwrap().previous = None;
+        admitted.get_mut("g").unwrap().previous.clear();
         let reports = HashMap::from([
             report_at(monday(), "n0", "v2", true),
             report_at(monday(), "n1", "v2", true),
@@ -3028,6 +3645,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             monday(),
@@ -3067,7 +3685,7 @@ mod tests {
                 "a".to_string(),
                 AdmittedDeployment {
                     current: deployment_named("v1"),
-                    previous: Some(deployment_named("v0")),
+                    previous: vec![deployment_named("v0")],
                 },
             ),
             ("b".to_string(), admitted(deployment_named("v2"))),
@@ -3093,6 +3711,7 @@ mod tests {
                     reports,
                     public_keys: &keys,
                     published: &BTreeMap::new(),
+                    held: &BTreeMap::new(),
                 },
                 admitted,
                 monday(),
@@ -3138,7 +3757,7 @@ mod tests {
             "g".into(),
             AdmittedDeployment {
                 current: deployment_named("v2"),
-                previous: Some(deployment_named("v1")),
+                previous: vec![deployment_named("v1")],
             },
         )]);
         // n000 already advanced and is healthy on v2, so v2 is PROVEN. Every other node reports
@@ -3158,6 +3777,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -3217,7 +3837,7 @@ mod tests {
                 "sibling".to_string(),
                 AdmittedDeployment {
                     current: deployment_named("s1"),
-                    previous: Some(deployment_named("s0")),
+                    previous: vec![deployment_named("s0")],
                 },
             ),
         ]);
@@ -3234,6 +3854,7 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
@@ -3296,6 +3917,7 @@ mod tests {
                     reports: &reports,
                     public_keys: &keys,
                     published: &published,
+                    held: &BTreeMap::new(),
                 },
                 &mut admitted,
                 test_now(),
@@ -3323,6 +3945,7 @@ mod tests {
                     reports: &reports,
                     public_keys: &keys,
                     published: &published,
+                    held: &BTreeMap::new(),
                 },
                 &mut admitted.clone(),
                 test_now(),
@@ -3351,11 +3974,280 @@ mod tests {
                 reports: &reports,
                 public_keys: &keys,
                 published: &published,
+                held: &BTreeMap::new(),
             },
             &mut admitted,
             test_now(),
         );
-        assert_eq!(admitted["b"].previous, None);
+        assert!(admitted["b"].previous.is_empty());
         assert_eq!(plan.groups["b"], GroupProgress::Settled);
+    }
+
+    /// A rollout whose nodes sit on a deployment the group does not name can never finish staging:
+    /// nothing is ever handed `current`, and no predecessor is ever retired because no node is on
+    /// one either. Retargeting such a group prepends the abandoned `current` every time, so keeping
+    /// the whole un-retirable list grew the durable ConfigMap by one deployment per retarget —
+    /// forever, until the apiserver refused the write at 1 MiB and no generation could publish
+    /// again. It collapses to the single entry `assign_nodes` actually falls back to instead.
+    #[test]
+    fn repeated_retargets_that_can_never_finish_staging_keep_the_state_bounded() {
+        let mut groups = BTreeMap::from([("g".into(), group("g", deployment_named("v0")))]);
+        let node_groups = BTreeMap::from([("n0".to_string(), "g".to_string())]);
+        let keys = pubkeys(&node_groups);
+        // The node was published a deployment no group here holds (its own group was deleted), and
+        // it is silent, so it spends the whole `maxUnavailable` budget and never moves.
+        let published = BTreeMap::from([(
+            "n0".to_string(),
+            crate::deployment_identity(&deployment_named("elsewhere")).unwrap(),
+        )]);
+        let mut admitted = BTreeMap::from([("g".to_string(), admitted(deployment_named("v0")))]);
+        for version in 1..=8 {
+            let target = format!("v{version}");
+            groups.get_mut("g").unwrap().deployment = deployment_named(&target);
+            let plan = plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &BTreeMap::new(),
+                    node_groups: &node_groups,
+                    reports: &HashMap::new(),
+                    public_keys: &keys,
+                    published: &published,
+                    held: &BTreeMap::new(),
+                },
+                &mut admitted,
+                test_now(),
+            );
+            assert!(
+                admitted["g"].previous.len() <= 2,
+                "retarget {version} left {} staged deployments in the durable state: {:?}",
+                admitted["g"].previous.len(),
+                admitted["g"]
+                    .previous
+                    .iter()
+                    .map(|deployment| deployment.deployment.clone())
+                    .collect::<Vec<_>>()
+            );
+            // The bound costs the node nothing, because the node is not moved either way: the
+            // control plane has no body for where it actually is, so it is left OUT of the
+            // generation until a `maxUnavailable` slot frees (`domain::plan_reconcile` republishes
+            // its last routing meanwhile). Publishing it `previous[0]` instead — a deployment it
+            // was never on — was a move, and the one move no budget was ever checked against.
+            assert!(
+                !plan.node_deployments.contains_key("n0"),
+                "retarget {version}: a node the control plane cannot place is never moved unbudgeted"
+            );
+        }
+    }
+
+    /// Relabelling a node OUT of a quarantined group is the documented remediation for one, so the
+    /// group it lands in must recognize where it is. A quarantined group is pruned from `admitted`
+    /// before `assign_nodes` runs and restored only afterwards, so reading `admitted` alone left
+    /// the node's deployment unrecognized and published it on the new group's predecessor — a
+    /// backward move, and the one move no `maxUnavailable` budget is ever checked against.
+    #[test]
+    fn a_node_relabelled_off_a_quarantined_group_is_never_moved_backward() {
+        let groups = BTreeMap::from([("core".into(), group("core", deployment_named("core-v2")))]);
+        let node_groups = BTreeMap::from([
+            ("n-moved".to_string(), "core".to_string()),
+            ("n-stuck".to_string(), "core".to_string()),
+        ]);
+        let keys = pubkeys(&node_groups);
+        // `core` is mid-rollout from core-v1 to core-v2: `n-stuck` was handed core-v2 and has gone
+        // quiet, which spends the group's single `maxUnavailable` slot.
+        let mut admitted = BTreeMap::from([(
+            "core".to_string(),
+            AdmittedDeployment {
+                current: deployment_named("core-v2"),
+                previous: vec![deployment_named("core-v1")],
+            },
+        )]);
+        // `edge` is quarantined: it is absent from the planned groups and its nodes are pinned.
+        let held = BTreeMap::from([(
+            "edge".to_string(),
+            HeldGroup {
+                state: AdmittedDeployment {
+                    current: deployment_named("edge-v1"),
+                    previous: Vec::new(),
+                },
+                match_labels: BTreeMap::from([("group".to_string(), "edge".to_string())]),
+            },
+        )]);
+        let published = BTreeMap::from([
+            (
+                "n-moved".to_string(),
+                crate::deployment_identity(&deployment_named("edge-v1")).unwrap(),
+            ),
+            (
+                "n-stuck".to_string(),
+                crate::deployment_identity(&deployment_named("core-v2")).unwrap(),
+            ),
+        ]);
+        let plan = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                node_groups: &node_groups,
+                reports: &HashMap::new(),
+                public_keys: &keys,
+                published: &published,
+                held: &held,
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(
+            plan.node_deployments["n-moved"],
+            deployment_named("edge-v1"),
+            "the relabelled node is republished on exactly what it is running, which is a no-op"
+        );
+        assert_eq!(
+            plan.node_deployments["n-stuck"],
+            deployment_named("core-v2")
+        );
+    }
+
+    /// A bulk relabel INTO a group that is not mid-rollout is still a move for every machine that
+    /// arrives, so it is staged against `maxUnavailable` like any other. The group's `previous` is
+    /// empty (no deployment change is in flight) and short-circuiting on that handed `current` to
+    /// all of them in one signed generation: three machines relabelled from `a` to `b` restarted at
+    /// once, with no budget and no health gate.
+    #[test]
+    fn nodes_relabelled_into_a_settled_group_are_staged_against_max_unavailable() {
+        // `b` is settled on v2; `a` is settled on v1 and still exists (it keeps a node of its own).
+        let groups = BTreeMap::from([
+            ("a".into(), group("a", deployment_named("v1"))),
+            ("b".into(), group("b", deployment_named("v2"))),
+        ]);
+        let node_groups = BTreeMap::from([
+            ("a-keeper".to_string(), "a".to_string()),
+            ("n0".to_string(), "b".to_string()),
+            // n1..n3 were just relabelled out of `a`, so they are still running v1.
+            ("n1".to_string(), "b".to_string()),
+            ("n2".to_string(), "b".to_string()),
+            ("n3".to_string(), "b".to_string()),
+        ]);
+        let mut admitted = BTreeMap::from([
+            ("a".to_string(), admitted(deployment_named("v1"))),
+            ("b".to_string(), admitted(deployment_named("v2"))),
+        ]);
+        let v1 = crate::deployment_identity(&deployment_named("v1")).unwrap();
+        let v2 = crate::deployment_identity(&deployment_named("v2")).unwrap();
+        let published = BTreeMap::from([
+            ("a-keeper".to_string(), v1.clone()),
+            ("n0".to_string(), v2),
+            ("n1".to_string(), v1.clone()),
+            ("n2".to_string(), v1.clone()),
+            ("n3".to_string(), v1),
+        ]);
+        let reports: HashMap<String, Envelope> = ["a-keeper", "n1", "n2", "n3"]
+            .iter()
+            .map(|node| report(node, "v1", true))
+            .chain(std::iter::once(report("n0", "v2", true)))
+            .collect();
+
+        let plan = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &pubkeys(&node_groups),
+                published: &published,
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+
+        assert_eq!(
+            ["n1", "n2", "n3"]
+                .iter()
+                .filter(|node| plan.node_deployments[**node].deployment == "v2")
+                .count(),
+            1,
+            "one relabelled node per generation moves; maxUnavailable is 1"
+        );
+        assert_eq!(
+            plan.node_deployments["n0"],
+            deployment_named("v2"),
+            "the node already on the group's deployment is republished on it"
+        );
+        assert_eq!(
+            plan.node_deployments["a-keeper"],
+            deployment_named("v1"),
+            "the source group is untouched"
+        );
+    }
+
+    /// The same bulk relabel with the source group DELETED in the same commit. Nothing in the
+    /// desired state holds v1 any more, so a group that answered "where is this node?" from the
+    /// planned groups alone could not place any of the arrivals and handed all of them `current` at
+    /// once: `hold == current` makes the `moved < budget` throttle a no-op, so every machine
+    /// restarted in one signed generation with no `maxUnavailable` and no health gate. The body of
+    /// a deleted group is retained for exactly as long as a node is placed on it, so the arrivals
+    /// are recognized and staged one per generation — and the relabel still converges.
+    #[test]
+    fn nodes_relabelled_in_from_a_deleted_group_are_staged_against_max_unavailable() {
+        // `a` is gone from desired state; only its retained admitted body says where its nodes are.
+        let groups = BTreeMap::from([("b".into(), group("b", deployment_named("v2")))]);
+        let node_groups: BTreeMap<String, String> = ["n1", "n2", "n3"]
+            .iter()
+            .map(|node| (node.to_string(), "b".to_string()))
+            .collect();
+        let mut admitted = BTreeMap::from([
+            ("a".to_string(), admitted(deployment_named("v1"))),
+            ("b".to_string(), admitted(deployment_named("v2"))),
+        ]);
+        let v1 = crate::deployment_identity(&deployment_named("v1")).unwrap();
+        let keys = pubkeys(&node_groups);
+        let mut published: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), v1.clone()))
+            .collect();
+        let mut reports: HashMap<String, Envelope> = ["n1", "n2", "n3"]
+            .iter()
+            .map(|node| report(node, "v1", true))
+            .collect();
+
+        let mut moved = Vec::new();
+        for _ in 0..4 {
+            let plan = plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &BTreeMap::new(),
+                    node_groups: &node_groups,
+                    reports: &reports,
+                    public_keys: &keys,
+                    published: &published,
+                    held: &BTreeMap::new(),
+                },
+                &mut admitted,
+                test_now(),
+            );
+            moved.push(
+                plan.node_deployments
+                    .values()
+                    .filter(|deployment| deployment.deployment == "v2")
+                    .count(),
+            );
+            published = published_from(&plan);
+            for (node, deployment) in &plan.node_deployments {
+                let (node, envelope) = report(node, &deployment.deployment, true);
+                reports.insert(node, envelope);
+            }
+        }
+        assert_eq!(
+            moved,
+            vec![1, 2, 3, 3],
+            "one relabelled machine per generation; maxUnavailable is 1"
+        );
+        assert!(
+            !admitted.contains_key("a"),
+            "and the deleted group's body is dropped the moment nobody is on it"
+        );
     }
 }

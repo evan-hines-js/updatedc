@@ -26,6 +26,8 @@ tokio-rustls = { workspace = true }
 # Sign a node report the way an agent does, so the telemetry write/read round trip is
 # exercised end to end rather than by hand-placing a file.
 aws-lc-rs = { workspace = true }
+# The connection deadline is minutes long; `test-util`'s paused clock exercises it in milliseconds.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 fips = ["updated/fips"]

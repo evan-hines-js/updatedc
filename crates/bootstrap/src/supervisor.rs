@@ -82,7 +82,7 @@ impl Supervisor {
         self.child.id()
     }
 
-    /// Whether the supervisor has exited.
+    /// Whether the supervisor has exited, sampled now.
     pub fn exited(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
@@ -188,6 +188,31 @@ pub trait Link {
     fn send_response(&mut self, resp: &Response) -> control::Result<()>;
     fn exited(&mut self) -> bool;
     fn stop(&mut self);
+
+    /// Whether the peer exits within `grace`.
+    ///
+    /// A failed read and the peer's exit are one event seen through two different pieces of
+    /// kernel bookkeeping: the socket reports EOF as soon as the process's descriptors close,
+    /// while the exit is not reapable — and so not visible to [`exited`](Self::exited) — until a
+    /// moment later. Sampling `exited` once at the instant of a read failure therefore loses that
+    /// race on the ordinary path and reports a supervisor that simply exited as a channel fault.
+    ///
+    /// Waiting a bounded moment makes the distinction decidable rather than timing-dependent: a
+    /// peer whose descriptors closed because it is exiting has been reaped by the time `grace` is
+    /// up, and one still running after it is a genuine channel fault. Only ever spent on a peer
+    /// that is already finished with this channel, so the healthy path never pays it.
+    fn exited_within(&mut self, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            if self.exited() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
 }
 
 impl Link for Supervisor {

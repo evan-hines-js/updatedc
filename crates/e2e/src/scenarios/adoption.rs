@@ -16,7 +16,6 @@ pub(crate) fn supervisor_crash_preserves_app(ctx: &Ctx) -> R {
     let mut boot = Proc::spawn(
         "guardian",
         &mut Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-            .check_interval("60s")
             // The default health policy requires multiple polls; be generous on CI.
             .health_grace("5s")
             .readiness_health(svc)
@@ -94,7 +93,6 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
     let mut boot = Proc::spawn(
         "tower",
         &mut Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-            .check_interval("60s")
             .health_grace("5s")
             .readiness_health(svc)
             .guardian()?,

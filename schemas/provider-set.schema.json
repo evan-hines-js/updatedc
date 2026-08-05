@@ -2,31 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://updated.dev/schemas/provider-set.schema.json",
   "title": "Updated Provider Set",
-  "description": "Signed, immutable capability overrides for the supervisor-owned built-in provider.",
+  "description": "Signed, immutable binding of a deployment to its node reconciler.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "id", "overrides"],
+  "required": ["schema", "id", "reconciler"],
   "properties": {
-    "schema": { "const": 2 },
+    "schema": { "const": 1 },
     "id": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
     },
-    "overrides": {
-      "type": "array",
-      "maxItems": 64,
-      "items": { "$ref": "#/$defs/override" }
-    }
+    "reconciler": { "$ref": "#/$defs/reconciler" }
   },
   "$defs": {
-    "override": {
+    "reconciler": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["capability", "artifact", "args", "timeout_millis"],
+      "required": ["artifact", "args", "timeout_millis"],
       "properties": {
-        "capability": { "enum": ["lifecycle"] },
         "artifact": {
           "$ref": "https://updated.dev/schemas/target-reference.schema.json"
         },

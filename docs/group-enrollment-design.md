@@ -78,7 +78,21 @@ Before expiry:
   - gateway derives the node name only from that verified certificate
   - gateway requires the UpdateAgent repository and pinned public key to match
   - persist the replacement leaf and restart the supervisor to rebuild every client
+
+While the bundle's signed metadata ages (checked at boot and on the same twice-daily tick):
+  - POST /bundle over mTLS, presenting the per-node certificate
+  - gateway derives the node name from that certificate, requires the UpdateAgent to still
+      be an enrolled member of this repository, and re-issues exactly what /enroll would
+      issue today (it mints and registers nothing)
+  - node adopts it only if the chain verifies AND the new routingRoot is the pinned root or
+      a single rotation signed by it; otherwise it keeps what it has and retries later
 ```
+
+The bundle carries TUF metadata, and TUF metadata expires. Written once at enrollment and
+never replaced, it would eventually hold nothing the node could take for the repository's
+current state — so it is refreshed, and refreshing it is best-effort: an expired bundle
+still pins the root of trust and the `install_root`, and a node with a live resolved
+assignment boots on that regardless.
 
 Group routing is by selector only: the agent carries the repository's enrollment
 labels, and a group's `selector.matchLabels` matches them. There is no implicit

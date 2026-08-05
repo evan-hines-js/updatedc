@@ -74,11 +74,24 @@ impl NodeSpiffeId {
 /// moment the key is read, not merely later at signing time: a caller that pins first and signs
 /// afterwards would otherwise durably pin an attacker-chosen key onto a node name from a CSR whose
 /// self-signature is garbage — the enrollment fails, but the pin (and the object) survives.
+/// The key SHAPE is enforced here, at the one place a pin is produced, not left to the verifier.
+/// CSR parsing accepts Ed25519, P-384 and RSA keys just as happily as P-256, and every one of them
+/// would be pinned and certified — after which `report_is_authentic_and_fresh` rejects every report
+/// the node ever sends on its `is_uncompressed_p256_point` gate. The node then looks permanently
+/// `Silent`: it holds a `maxUnavailable` slot in its group and a concurrency slot in its set, for a
+/// reason nothing surfaces. Refusing the CSR turns that into a 400 at the moment of the mistake.
 pub fn csr_public_key(csr_pem: &str) -> io::Result<Vec<u8>> {
     use rcgen::PublicKeyData;
     let csr = CertificateSigningRequestParams::from_pem(csr_pem)
         .map_err(|error| io::Error::other(format!("parsing CSR: {error}")))?;
-    Ok(csr.public_key.der_bytes().to_vec())
+    let key = csr.public_key.der_bytes().to_vec();
+    if !updated_contracts::telemetry::is_uncompressed_p256_point(&key) {
+        return Err(io::Error::other(
+            "CSR public key is not an uncompressed P-256 point; nodes must enroll with an \
+             ECDSA P-256 key so their signed telemetry can be verified",
+        ));
+    }
+    Ok(key)
 }
 
 /// The fleet CA that signs per-node client certificates at `/enroll`. Loaded from the same
@@ -346,6 +359,33 @@ mod tests {
             csr_params.public_key.der_bytes(),
             "the leaf must certify the CSR's own public key"
         );
+    }
+
+    /// A CSR is not automatically an ECDSA P-256 CSR: rcgen parses Ed25519, P-384 and RSA just as
+    /// happily. Pinning one of those keys mints a leaf for a node whose every signed report is then
+    /// rejected by `report_is_authentic_and_fresh`, leaving it permanently `Silent` — spending its
+    /// group's `maxUnavailable` and its set's concurrency slot with nothing to explain it. The wrong
+    /// key type must fail at enrollment instead.
+    #[test]
+    fn a_csr_whose_key_is_not_a_p256_point_is_refused() {
+        for algorithm in [&rcgen::PKCS_ED25519, &rcgen::PKCS_ECDSA_P384_SHA384] {
+            let key = KeyPair::generate_for(algorithm).unwrap();
+            let mut params = CertificateParams::new(vec![]).unwrap();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "updated enroll");
+            let csr = params.serialize_request(&key).unwrap().pem().unwrap();
+            // The CSR itself is well formed — it parses, and the CA would sign it.
+            assert!(CertificateSigningRequestParams::from_pem(&csr).is_ok());
+            assert!(
+                csr_public_key(&csr).is_err(),
+                "a {algorithm:?} CSR must never produce a pinned key"
+            );
+        }
+        // The one accepted shape still is.
+        let key_pem = updated::csr::generate_key().unwrap();
+        let csr = updated::csr::csr_for(&key_pem, "updated enroll").unwrap();
+        assert_eq!(csr_public_key(&csr).unwrap().len(), 65);
     }
 
     /// A tiny deterministic xorshift PRNG. Seeded from a constant so a fuzz failure reproduces

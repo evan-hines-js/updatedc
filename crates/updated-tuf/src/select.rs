@@ -69,12 +69,12 @@ fn select_update_from(
         // A head-version candidate that isn't those bytes is skipped so descent continues
         // to a lower, well-defined version rather than picking an ambiguous sibling.
         if let (Some(ceiling), Some(head_sha)) = (ceiling, head_sha) {
-            // Case-insensitively, like `TrustedRepository::exact_target`: `head_sha` is the raw
-            // `application.sha256` from a signed assignment, which validates as hex in any case.
-            // A case-sensitive comparison here would skip the very bytes the control plane
-            // assigned whenever that digest arrived upper- or mixed-case, and ordered fallback
-            // would descend past the head instead of installing it.
-            if &version == ceiling && !target_sha(&target).eq_ignore_ascii_case(head_sha) {
+            // Through `hash::digests_match`, like every digest comparison on the trust path:
+            // `head_sha` is the raw `application.sha256` from a signed assignment, which validates
+            // as hex in any case, so a case-sensitive comparison would skip the very bytes the
+            // control plane assigned and descend past the head instead of installing it.
+            if &version == ceiling && !updated::hash::digests_match(&target_sha(&target), head_sha)
+            {
                 note_skip(&format!(
                     "skipping {version}: not the assigned head bytes (sha256 mismatch)"
                 ));
@@ -171,13 +171,25 @@ impl TrustedRepository {
                 note_skip,
                 rejected,
             )
-            .map(|(target, version)| SelectedRelease {
-                sha256: target_sha(&target),
-                // Descended below the assigned head: pin the providers this app version
-                // was signed with, so app + providers roll back together.
-                provider_set: signed_provider_set(&target),
-                target,
-                version,
+            .map(|(target, version)| {
+                let sha256 = target_sha(&target);
+                // Only a descent pins the providers this app version was signed with, so that a
+                // rolled-back app and its providers move together. Ordered fallback normally
+                // selects the assigned head itself — a first install on a healthy assignment —
+                // and there the assignment's own `provider_set` governs, exactly as it does for
+                // an already-enrolled node taking the exact-pin branch below. Pinning the
+                // baked-in set here instead would strand every freshly enrolled node on the
+                // provider set the app was published with, so a provider-set-only assignment
+                // revision would silently reach enrolled nodes and not new ones, and the two
+                // would run different reconcilers at the same app version indefinitely.
+                let descended =
+                    !updated::hash::digests_match(&sha256, &assignment.application.sha256);
+                SelectedRelease {
+                    provider_set: descended.then(|| signed_provider_set(&target)).flatten(),
+                    sha256,
+                    target,
+                    version,
+                }
             });
             return Ok(selected);
         }
@@ -616,22 +628,23 @@ mod provider_binding {
         );
     }
 
-    // First install with a healthy head stays at 2.0.0 and carries B — the pair published
-    // together.
+    // First install with a healthy head stays at 2.0.0 and, like every other way of arriving at
+    // the head, defers to the assignment's own `provider_set`. Binding the app's baked-in set
+    // here would make a fresh node and an enrolled node at the same app version run different
+    // provider sets the moment a provider-set-only assignment revision is published.
     #[tokio::test]
-    async fn first_install_at_head_carries_the_heads_signed_provider_set() {
+    async fn first_install_at_head_defers_providers_to_the_assignment_like_every_other_node() {
         let repo = repo_with_assignment(true).await;
         let selected = repo
             .assigned_application(&policy(), None, |_| {}, |_, _| false)
             .unwrap()
             .expect("the head is selectable");
         assert_eq!(selected.version, "2.0.0");
-        assert_eq!(
-            selected
-                .provider_set
-                .expect("head binds its provider set")
-                .path,
-            "provider-sets/b.json"
+        assert!(
+            selected.provider_set.is_none(),
+            "ordered fallback binds a provider set only where it descended BELOW the assigned \
+             head; at the head the assignment governs, so a provider-set-only revision reaches \
+             newly enrolled and long-enrolled nodes alike"
         );
     }
 

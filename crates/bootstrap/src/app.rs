@@ -177,6 +177,7 @@ mod tests {
 mod unix_tests {
     use super::*;
     use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
 
     fn spec(program: &str, args: &[&str]) -> CommandSpec {
         CommandSpec {
@@ -185,6 +186,81 @@ mod unix_tests {
             env: std::env::vars_os().collect(),
             cwd: None,
         }
+    }
+
+    /// An application that forks a worker into its process group, reports the worker's PID, and
+    /// then does `then`. The worker is the thing only the group can reach: its parent is the
+    /// leader, so once the leader is gone and the handle is dropped, nothing else names it.
+    fn forking_app(reported: &Path, then: &str) -> CommandSpec {
+        let mut spec = spec("/bin/sh", &["-c"]);
+        spec.args.push(OsString::from(format!(
+            "sleep 30 & echo $! > '{}'; {then}",
+            reported.display()
+        )));
+        spec
+    }
+
+    /// A launcher-shaped application: the leader exits the instant a SIGTERM arrives, and the
+    /// worker it forked ignores the signal and keeps working for about a second before touching
+    /// `finished`. This is the shape the operator's stop grace exists for — the leader is done
+    /// early, the in-flight work is not.
+    ///
+    /// Both halves are written to survive the group-wide SIGTERM deterministically: the leader
+    /// waits in a *builtin* (a forked `sleep` started just after the signal would outlive it and
+    /// hold the leader open), and the worker's wait is a loop of short sleeps (its current `sleep`
+    /// is killed outright — only the shell ignores the signal — so one long sleep would end the
+    /// moment the stop began).
+    ///
+    /// The worker reports its OWN pid, and only after its `trap` is installed, so the test's
+    /// `reported_pid` is evidence the signal is already ignored there. Having the leader report
+    /// `$!` instead is a race the test loses under load: the pid is knowable the instant the
+    /// worker is forked, but the forked shell still has to exec and parse its way to the trap,
+    /// and a stop that lands in that window kills the worker outright with the default
+    /// disposition — the group then drains at once and the drain the test exists to prove never
+    /// happens.
+    fn launcher_app(reported: &Path, finished: &Path) -> CommandSpec {
+        let mut spec = spec("/bin/sh", &["-c"]);
+        spec.args.push(OsString::from(format!(
+            "trap 'exit 0' TERM; \
+             /bin/sh -c 'trap \"\" TERM; echo $$ > \"{reported}\"; \
+             n=0; while [ $n -lt 10 ]; do sleep 0.1; n=$((n+1)); \
+             done; : > \"{finished}\"' & wait",
+            finished = finished.display(),
+            reported = reported.display()
+        )));
+        spec
+    }
+
+    /// A fresh path for the helper application to report through.
+    fn fresh_path(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("guardian-app-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn reported_pid(path: &Path) -> libc::pid_t {
+        for _ in 0..200 {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the helper never reported its worker's pid");
+    }
+
+    /// Whether `pid` is gone. A killed worker is an orphan by then, so the init process reaps it
+    /// promptly and its PID stops existing; polling absorbs that delay.
+    fn gone(pid: libc::pid_t) -> bool {
+        for _ in 0..200 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
     }
 
     #[test]
@@ -218,6 +294,79 @@ mod unix_tests {
         app.stop(Duration::from_secs(2));
         assert!(!app.is_running());
         assert_eq!(app.poll_exit(), None, "a stopped app has no exit event");
+    }
+
+    #[test]
+    fn a_stop_gives_the_workers_the_rest_of_the_grace_when_the_leader_exits_first() {
+        // The grace is the operator's contract with the whole application, not with its leader.
+        // A launcher forwards the stop to its workers and exits at once; ending the window there
+        // SIGKILLs every worker mid-drain, silently truncating a multi-second configured grace to
+        // however long the leader took to notice the signal.
+        crate::sys::ignore_sigpipe();
+        let reported = fresh_path("early-leader-exit.pid");
+        let finished = fresh_path("early-leader-exit.done");
+        let grace = Duration::from_secs(10);
+        let mut app = App::none();
+        app.launch(&launcher_app(&reported, &finished), Duration::from_secs(1))
+            .unwrap();
+        let worker = reported_pid(&reported);
+
+        let started = std::time::Instant::now();
+        app.stop(grace);
+
+        assert!(
+            finished.exists(),
+            "the worker must keep its remaining grace after the leader exits"
+        );
+        assert!(
+            started.elapsed() < grace,
+            "and the stop must return as soon as the group drains, not sit out the window"
+        );
+        assert!(gone(worker), "a drained group leaves nothing running");
+    }
+
+    #[test]
+    fn an_observed_exit_takes_the_apps_whole_process_group_down() {
+        // `poll_exit` drops the process handle the instant it takes the exit code, so if the
+        // group is not taken down with it the workers the leader forked are unreachable forever
+        // — live processes the guardian can no longer signal. That is reachable in a plain
+        // update: a launcher-style app whose leader exits while its workers keep serving.
+        crate::sys::ignore_sigpipe();
+        let reported = fresh_path("observed-exit");
+        let mut app = App::none();
+        app.launch(&forking_app(&reported, "exit 5"), Duration::from_secs(1))
+            .unwrap();
+        let worker = reported_pid(&reported);
+
+        let mut code = None;
+        for _ in 0..200 {
+            if let Some(c) = app.poll_exit() {
+                code = Some(c);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(code, Some(5), "the leader's own exit code still surfaces");
+        assert!(gone(worker), "the app's workers must not outlive the app");
+    }
+
+    #[test]
+    fn dropping_a_running_app_takes_its_whole_process_group_down() {
+        // The application never outlives the guardian. `PR_SET_PDEATHSIG` promises that for the
+        // leader alone (and only on Linux), so dropping the handle is what has to end the group.
+        crate::sys::ignore_sigpipe();
+        let reported = fresh_path("dropped");
+        let mut app = App::none();
+        app.launch(&forking_app(&reported, "sleep 30"), Duration::from_secs(1))
+            .unwrap();
+        let worker = reported_pid(&reported);
+        let leader = app.pid().unwrap() as libc::pid_t;
+        assert!(app.is_running());
+
+        drop(app);
+
+        assert!(gone(leader), "the application must not outlive its handle");
+        assert!(gone(worker), "and neither must the workers it forked");
     }
 
     #[test]

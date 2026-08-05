@@ -22,9 +22,24 @@ use tokio::net::TcpStream;
 
 use crate::{LoadBalancer, Member};
 
-/// One HAProxy runtime-API exchange is bounded by this — the health fetches and the reconcile loop
-/// are already bounded elsewhere, and a single hung instance must not stall the others.
+/// The longest one HAProxy runtime-API exchange may take, whatever the cluster size. A single hung
+/// instance must not stall the others for longer than this even when there is budget to spare.
 const RUNTIME_API_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The budget for one runtime-API exchange when `instances` are programmed this reconcile.
+///
+/// Derived, not written down. The fan-out runs [`crate::FANOUT_CONCURRENCY`] wide, so `instances`
+/// take `ceil(instances / width)` waves, and the whole reconcile is bounded by
+/// [`crate::RECONCILE_TIMEOUT`] at the call site. A per-exchange timeout picked independently of
+/// those two holds only for as many instances as it happens to cover: one cluster larger than that
+/// and the waves past the outer deadline are never programmed at all — and it is the *same* leading
+/// instances that consume the budget every cycle, so the tail stays frozen on stale membership
+/// behind a single "timed out" line. Dividing the outer deadline by the wave count makes the fan-out
+/// fit by construction at any size.
+fn exchange_timeout(instances: usize) -> Duration {
+    let waves = instances.div_ceil(crate::FANOUT_CONCURRENCY).max(1) as u32;
+    RUNTIME_API_TIMEOUT.min(crate::RECONCILE_TIMEOUT / waves)
+}
 
 /// The HAProxy backend for a cluster of instances fronting one fleet. Every instance is programmed
 /// with the same member set; each is one `host:port` admin stats socket (`stats socket ipv4@*:PORT
@@ -53,22 +68,58 @@ fn desired_state(ready: bool) -> &'static str {
     }
 }
 
-/// Build the `;`-joined Runtime API command batch that converges every server to its member's
+/// HAProxy's default `tune.bufsize`. The Runtime API reads one command line into the request
+/// buffer, so a line longer than this cannot be processed at all — the instance errors or severs
+/// mid-command, identically on every cycle, and no server is ever programmed.
+const HAPROXY_BUFSIZE: usize = 16384;
+
+/// The longest command line we will send. Half the default buffer, because HAProxy reserves part of
+/// the buffer for its own use and an operator may have tuned `tune.bufsize` *down*; the cost of a
+/// smaller batch is one more short-lived connection, and the cost of an over-long one is a backend
+/// that is never programmed.
+const MAX_BATCH_BYTES: usize = HAPROXY_BUFSIZE / 2;
+
+/// The bytes a batch occupies on the wire: the commands plus the newline that terminates the
+/// command line. What HAProxy buffers is the line, so the line is what the limit is applied to.
+fn line_bytes(batch: usize) -> usize {
+    batch + "\n".len()
+}
+
+/// Build the `;`-joined Runtime API command batches that converge every server to its member's
 /// state. A server is named by its node identity (the same name `updated` writes into the HAProxy
-/// config under `backend`), so we only ever flip an existing server's admin state. Pure, so the
-/// health→command mapping is tested without a socket.
-fn state_commands(backend: &str, members: &[Member]) -> String {
-    members
-        .iter()
-        .map(|member| {
-            format!(
-                "set server {backend}/{} state {}",
-                member.node,
-                desired_state(member.ready)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+/// config under `backend`), so we only ever flip an existing server's admin state.
+///
+/// Split across batches so no single line exceeds [`MAX_BATCH_BYTES`]: one line per member is fine
+/// for a handful of nodes and roughly 400 nodes past the default `tune.bufsize`, at which point a
+/// single joined line stops being a command HAProxy can read at all — and because the config
+/// declares the servers without `check`, every one of them stays in its default *routable* state, so
+/// an unhealthy node keeps taking traffic. Chunking makes the batch size independent of the fleet
+/// size. Pure, so the health→command mapping is tested without a socket.
+fn state_batches(backend: &str, members: &[Member]) -> Vec<String> {
+    const SEPARATOR: &str = "; ";
+    let mut batches: Vec<String> = Vec::new();
+    for member in members {
+        let command = format!(
+            "set server {backend}/{} state {}",
+            member.node,
+            desired_state(member.ready)
+        );
+        match batches.last_mut() {
+            // What has to fit is the *line* HAProxy reads, so the trailing newline `run_commands`
+            // writes counts too, not the batch alone.
+            Some(batch)
+                if line_bytes(batch.len() + SEPARATOR.len() + command.len()) <= MAX_BATCH_BYTES =>
+            {
+                batch.push_str(SEPARATOR);
+                batch.push_str(&command);
+            }
+            // A lone command past the limit still gets its own batch rather than being dropped:
+            // a node name that long is a configuration problem, and HAProxy refusing it loudly is
+            // the fail-closed answer.
+            _ => batches.push(command),
+        }
+    }
+    batches
 }
 
 /// A HAProxy Runtime API response reports each command's failure inline (e.g. `No such server.`); a
@@ -83,30 +134,66 @@ fn response_error(response: &str) -> Option<String> {
     (!trouble.is_empty()).then(|| trouble.join("; "))
 }
 
-/// Send a command batch to one HAProxy admin socket and return its response text. One connection per
-/// instance per reconcile, bounded by [`RUNTIME_API_TIMEOUT`]; the socket closes the connection
-/// after a one-shot batch, so the response is read to EOF.
-async fn run_commands(endpoint: &str, batch: &str) -> Result<String, String> {
+/// Upper bound on one admin-socket response. A successful `set server ... state` prints nothing and
+/// a failure is a handful of short lines, so this only bounds a hostile or misdirected peer: the
+/// endpoints are operator-written `host:port` strings resolved over cluster DNS, and a typo'd port
+/// or a reused pod IP puts an arbitrary TCP peer at the other end. Reading to EOF there absorbs
+/// whatever it streams for the whole exchange budget, [`crate::FANOUT_CONCURRENCY`] connections at a
+/// time, until this component — the only writer of load-balancer membership — is OOM-killed and the
+/// fleet freezes at the last programmed set. Same rule as every other network read in the tree (see
+/// [`crate::REPORT_BYTES_LIMIT`]): the running total is what caps the read.
+const RUNTIME_API_RESPONSE_LIMIT: usize = 8 * 1024;
+
+/// Read one admin-socket response to EOF, failing rather than growing past
+/// [`RUNTIME_API_RESPONSE_LIMIT`]. Mirrors the shared HTTP bounded read; the transport differs (a
+/// raw socket has no declared length at all), the rule does not.
+async fn read_bounded_response(stream: &mut TcpStream) -> Result<String, String> {
+    let mut response = String::new();
+    // One byte past the limit, so an over-long response is detected rather than silently truncated
+    // into what looks like a valid (possibly empty ⇒ "success") reply.
+    let read = stream
+        .take(RUNTIME_API_RESPONSE_LIMIT as u64 + 1)
+        .read_to_string(&mut response)
+        .await
+        .map_err(|error| format!("reading: {error}"))?;
+    if read > RUNTIME_API_RESPONSE_LIMIT {
+        return Err(format!(
+            "reading: response exceeded {RUNTIME_API_RESPONSE_LIMIT} bytes"
+        ));
+    }
+    Ok(response)
+}
+
+/// Send every command batch to one HAProxy admin socket and return the concatenated response text.
+/// The socket is one-shot — it closes the connection after processing a batch line — so each batch
+/// is its own short-lived connection, sent in order. `budget` (see [`exchange_timeout`]) bounds the
+/// whole instance's exchange, batches included, so the fan-out still fits inside the reconcile
+/// deadline however many batches the fleet size produces. Each response is read to EOF, bounded by
+/// [`RUNTIME_API_RESPONSE_LIMIT`].
+async fn run_commands(
+    endpoint: &str,
+    batches: &[String],
+    budget: Duration,
+) -> Result<String, String> {
     let exchange = async {
-        let mut stream = TcpStream::connect(endpoint)
-            .await
-            .map_err(|error| format!("connecting: {error}"))?;
-        stream
-            .write_all(format!("{batch}\n").as_bytes())
-            .await
-            .map_err(|error| format!("writing: {error}"))?;
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .await
-            .map_err(|error| format!("reading: {error}"))?;
-        Ok::<_, String>(response)
+        let mut responses = String::new();
+        for batch in batches {
+            let mut stream = TcpStream::connect(endpoint)
+                .await
+                .map_err(|error| format!("connecting: {error}"))?;
+            stream
+                .write_all(format!("{batch}\n").as_bytes())
+                .await
+                .map_err(|error| format!("writing: {error}"))?;
+            responses.push_str(&read_bounded_response(&mut stream).await?);
+        }
+        Ok::<_, String>(responses)
     };
-    match tokio::time::timeout(RUNTIME_API_TIMEOUT, exchange).await {
+    match tokio::time::timeout(budget, exchange).await {
         Ok(result) => result.map_err(|error| format!("HAProxy runtime API {endpoint}: {error}")),
         Err(_) => Err(format!(
-            "HAProxy runtime API {endpoint} timed out after {}s",
-            RUNTIME_API_TIMEOUT.as_secs()
+            "HAProxy runtime API {endpoint} timed out after {}ms",
+            budget.as_millis()
         )),
     }
 }
@@ -114,25 +201,47 @@ async fn run_commands(endpoint: &str, batch: &str) -> Result<String, String> {
 #[async_trait::async_trait]
 impl LoadBalancer for HAProxyLb {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String> {
-        let batch = state_commands(&self.backend, members);
-        if batch.is_empty() {
+        let batches = state_batches(&self.backend, members);
+        if batches.is_empty() {
             return Ok(());
         }
         // Program every instance so the whole cluster converges. One unreachable or erroring instance
         // must not block the others — the reachable ones are still driven correctly — so failures are
         // collected and summarized rather than short-circuiting, and a persistently broken instance
         // stays visible and is retried next cycle.
-        let mut failures = Vec::new();
-        for endpoint in &self.endpoints {
-            match run_commands(endpoint, &batch).await {
-                Ok(response) => {
-                    if let Some(error) = response_error(&response) {
-                        failures.push(format!("{endpoint}: {error}"));
+        //
+        // Concurrently, because "must not block the others" is otherwise false: the whole reconcile
+        // is bounded by a deadline at the call site, so serialized exchanges let a few dead leading
+        // instances burn the outer budget and silently skip every instance after them — on every
+        // cycle, since the walk always restarts at the same dead instances. Each exchange's own
+        // budget is derived from that outer deadline and this fan-out's width, so the same
+        // truncation cannot return by way of a cluster larger than a fixed timeout happened to
+        // cover. Results are tagged with their index so the summary reads in configured order
+        // regardless of completion order.
+        use futures::stream::StreamExt;
+        let batches = batches.as_slice();
+        let budget = exchange_timeout(self.endpoints.len());
+        let mut exchanges = Vec::with_capacity(self.endpoints.len());
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            exchanges.push(async move {
+                let failure = match run_commands(endpoint, batches, budget).await {
+                    Ok(response) => {
+                        response_error(&response).map(|error| format!("{endpoint}: {error}"))
                     }
-                }
-                Err(error) => failures.push(error),
-            }
+                    Err(error) => Some(error),
+                };
+                (index, failure)
+            });
         }
+        let mut outcomes: Vec<(usize, Option<String>)> = futures::stream::iter(exchanges)
+            .buffer_unordered(crate::FANOUT_CONCURRENCY)
+            .collect()
+            .await;
+        outcomes.sort_by_key(|(index, _)| *index);
+        let failures: Vec<String> = outcomes
+            .into_iter()
+            .filter_map(|(_, failure)| failure)
+            .collect();
         if failures.is_empty() {
             Ok(())
         } else {
@@ -157,13 +266,13 @@ mod tests {
     fn commands_route_ready_nodes_and_drain_not_ready_ones() {
         let members = vec![member("agent-0", true), member("agent-1", false)];
         assert_eq!(
-            state_commands("fleet", &members),
-            "set server fleet/agent-0 state ready; set server fleet/agent-1 state drain"
+            state_batches("fleet", &members),
+            vec!["set server fleet/agent-0 state ready; set server fleet/agent-1 state drain"]
         );
         // A not-ready node drains (graceful), never hard maint — that is the zero-downtime property.
         assert_eq!(desired_state(true), "ready");
         assert_eq!(desired_state(false), "drain");
-        assert_eq!(state_commands("fleet", &[]), "");
+        assert!(state_batches("fleet", &[]).is_empty());
     }
 
     #[test]
@@ -175,6 +284,96 @@ mod tests {
         assert_eq!(
             response_error("No such server.\n"),
             Some("No such server.".to_string())
+        );
+    }
+
+    /// The whole fan-out must fit inside the deadline the reconcile is bounded by at EVERY cluster
+    /// size, not only at the sizes a fixed per-exchange timeout happened to cover. Past that point
+    /// the trailing waves are simply never programmed, identically every cycle.
+    #[test]
+    fn the_fan_out_fits_inside_the_reconcile_deadline_at_every_cluster_size() {
+        for instances in [0, 1, crate::FANOUT_CONCURRENCY, 96, 1000, 100_000] {
+            let waves = instances.div_ceil(crate::FANOUT_CONCURRENCY).max(1) as u32;
+            assert!(
+                exchange_timeout(instances) * waves <= crate::RECONCILE_TIMEOUT,
+                "{instances} instances take {waves} wave(s) of {:?}, past the {:?} deadline",
+                exchange_timeout(instances),
+                crate::RECONCILE_TIMEOUT
+            );
+        }
+        // A cluster that fits in one wave still gets no more than one exchange is ever worth: a
+        // hung instance must not hold its wave open for the entire reconcile.
+        assert_eq!(exchange_timeout(1), RUNTIME_API_TIMEOUT);
+    }
+
+    /// Every command line sent must fit in HAProxy's request buffer at EVERY fleet size, not only
+    /// at the two-member sizes the integration tests exercise. A single joined line crosses the
+    /// default `tune.bufsize` at roughly 400 members, and past that point HAProxy can read no
+    /// command at all: the whole backend stays in its declared (routable) state forever, so an
+    /// unhealthy node keeps taking traffic — deterministically, every cycle.
+    #[test]
+    fn every_command_batch_fits_haproxys_buffer_at_every_fleet_size() {
+        for members in [1usize, 2, 399, 400, 401, 5_000, 100_000] {
+            let fleet: Vec<Member> = (0..members)
+                .map(|index| member(&format!("agent-{index}"), index % 3 != 0))
+                .collect();
+            let batches = state_batches("fleet", &fleet);
+            for batch in &batches {
+                assert!(
+                    line_bytes(batch.len()) <= MAX_BATCH_BYTES,
+                    "{members} members produced a {}-byte line, past the {MAX_BATCH_BYTES}-byte limit",
+                    line_bytes(batch.len())
+                );
+                assert!(line_bytes(batch.len()) <= HAPROXY_BUFSIZE);
+            }
+            // Chunking must not drop, duplicate, or reorder a single member: the batches rejoined
+            // are exactly the commands the whole fleet implies, in configured order.
+            let sent: Vec<&str> = batches.iter().flat_map(|batch| batch.split("; ")).collect();
+            let expected: Vec<String> = fleet
+                .iter()
+                .map(|member| {
+                    format!(
+                        "set server fleet/{} state {}",
+                        member.node,
+                        desired_state(member.ready)
+                    )
+                })
+                .collect();
+            assert_eq!(sent, expected, "{members} members");
+        }
+        // A single command longer than the limit is still sent (loudly refused by HAProxy) rather
+        // than silently dropped.
+        let huge = state_batches("fleet", &[member(&"n".repeat(MAX_BATCH_BYTES), true)]);
+        assert_eq!(huge.len(), 1);
+    }
+
+    /// A misdirected or hostile peer on an admin socket must cost one logged failure, not the
+    /// healthproxy's memory: it is the only writer of load-balancer membership, so OOM-killing it
+    /// freezes the fleet at the last programmed set while unhealthy nodes keep taking traffic.
+    #[tokio::test]
+    async fn a_peer_that_streams_forever_is_cut_off_at_the_response_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // Never closes, never stops: exactly the read-to-EOF trap.
+                    let flood = vec![b'x'; 64 * 1024];
+                    while socket.write_all(&flood).await.is_ok() {}
+                });
+            }
+        });
+
+        let error = run_commands(
+            &endpoint,
+            &[state_batches("fleet", &[member("agent-0", true)])[0].clone()],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("an unbounded response must fail, not be absorbed");
+        assert!(
+            error.contains("exceeded"),
+            "expected a bounded-read failure, got: {error}"
         );
     }
 }

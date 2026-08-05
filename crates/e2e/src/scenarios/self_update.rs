@@ -5,7 +5,6 @@ use super::super::*;
 fn tower(ctx: &Ctx, dir: &Path, srv: &str, svc: &str, app: &Path, sup_v1: &Path) -> R<Command> {
     Sup::new(ctx, dir, srv, "app", appcmd(app, &["--addr", svc]))
         .readiness_health(svc)
-        .check_interval("60s")
         .health_grace("3s")
         .supervisor_check_interval("1s")
         .ready_timeout("15")
@@ -140,9 +139,16 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     ctx.publish(&dir, "supervisor", "2.0.0", &broken)?;
 
     let rejected = boot.wait_for_log("rejecting", EVENT_TIMEOUT);
-    // No loop: once the candidate is rejected, the supervisor must stop re-staging it.
-    std::thread::sleep(Duration::from_secs(6));
     let recorded = boot.wait_for_log("recorded rejected supervisor candidate", EVENT_TIMEOUT);
+    // "Never retried" is a counting claim, so count. Snapshot both rejection tallies, then let
+    // several supervisor check intervals (1s each here) elapse: a supervisor that forgot the
+    // rejected hash would re-stage the same broken 2.0.0 every interval and both tallies would
+    // climb, while every other assertion below — pointer, PID, served version — stayed green.
+    let rejections = boot.log_count("rejecting");
+    let records = boot.log_count("recorded rejected supervisor candidate");
+    std::thread::sleep(Duration::from_secs(6));
+    let retries = boot.log_count("rejecting") - rejections;
+    let re_records = boot.log_count("recorded rejected supervisor candidate") - records;
     let served = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);
     let pid2 = pid_after(&boot.captured_log(), "adopted the running application");
     let desired = desired_supervisor(&dir)?;
@@ -158,6 +164,11 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     }
     if !recorded {
         return fail("the failed candidate was not recorded as rejected by the supervisor");
+    }
+    if retries > 0 || re_records > 0 {
+        return fail(format!(
+            "the rejected supervisor candidate was re-staged after rejection ({retries} further rejections, {re_records} further rejection records in 6s)"
+        ));
     }
     // The pointer must still resolve to the exact v1 bytes, irrespective of Windows
     // versus Unix path separators. A substring test could silently pass on Windows.
@@ -201,7 +212,7 @@ pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
 
     ctx.publish(&dir, "supervisor", "2.0.0", &unstable)?;
     let began_confirmation = boot.wait_for_log("beginning its confirmation window", EVENT_TIMEOUT);
-    let rejected = boot.wait_for_log("exited before confirmation; rejecting it", EVENT_TIMEOUT);
+    let rejected = boot.wait_for_log("exited; rolling back and rejecting it", EVENT_TIMEOUT);
     let predecessor_returned =
         boot.wait_for_log("recorded rejected supervisor candidate", EVENT_TIMEOUT);
     let still_serving = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);

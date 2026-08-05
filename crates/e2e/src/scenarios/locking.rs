@@ -11,7 +11,6 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
 
     let mut first_cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .check_interval("60s")
         .health_grace("2s")
         .readiness_health(svc)
         .guardian()?;
@@ -33,7 +32,6 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     // rejection is still asserted directly below (the second never binds a port — it is refused
     // before launching the application — so reusing the first's address is safe).
     let second_cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .check_interval("60s")
         .health_grace("1s")
         .guardian()?;
     let second = Service::spawn("supervisor-2", &second_cmd);

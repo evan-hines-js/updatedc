@@ -49,6 +49,8 @@ x509-parser = { workspace = true }
 
 [dev-dependencies]
 base64.workspace = true
+# Collect a request body in the fake apiserver `crate::tests::apiserver` serves `kube::Client` from.
+http-body-util = "0.1"
 # Drive Axum routers directly in gateway tests via `ServiceExt::oneshot`, no socket needed.
 tower = { version = "0.5", features = ["util"] }
 

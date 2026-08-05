@@ -9,14 +9,6 @@ pub(crate) enum Outcome {
     RollbackPending,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LifecyclePhase {
-    Apply,
-    Healthcheck,
-    Rollback,
-    Inspect,
-}
-
 /// Why the application is being launched — passed to the provider as
 /// `--reason` so one program can branch (first-boot seeding vs. per-restart
 /// cleanup vs. an update) instead of needing a hook per situation.
@@ -33,17 +25,6 @@ impl LifecycleReason {
             Self::Install => "install",
             Self::Restart => "restart",
             Self::Update => "update",
-        }
-    }
-}
-
-impl LifecyclePhase {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Apply => "apply",
-            Self::Healthcheck => "healthcheck",
-            Self::Rollback => "rollback",
-            Self::Inspect => "inspect",
         }
     }
 }
@@ -277,7 +258,7 @@ pub(crate) trait DeploymentProvider {
     /// Invoke the release's signed node reconciler.
     fn lifecycle(
         &mut self,
-        phase: LifecyclePhase,
+        phase: Operation,
         lifecycle_attempt_id: &str,
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
@@ -349,7 +330,7 @@ pub(crate) fn prepare_fingerprint_job(
     opts: &Options,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<FingerprintJob> {
-    if invocation.phase != LifecyclePhase::Inspect {
+    if invocation.phase != Operation::Inspect {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "fingerprint job requires the fingerprint lifecycle phase",
@@ -379,19 +360,19 @@ fn fingerprint_from_output(
         .map_err(io::Error::other)
 }
 
-/// Launch a fresh application, running the operator's `pre-start` hook first — the one
-/// launch path for a first install or a plain restart. The hook gets
-/// `--reason` (`install`/`restart`) so one reconciler can do per-boot prep
-/// (seed a JBoss home, clear a wedged NFS mount) and tell a first boot from a restart.
+/// Launch a fresh application, converging the environment with the reconciler's `apply`
+/// operation first — the one launch path for a first install or a plain restart. `apply` gets
+/// `--reason` (`install`/`restart`) so one reconciler can do per-boot prep (seed a JBoss home,
+/// clear a wedged NFS mount) and tell a first boot from a restart.
 ///
 /// `reason` is `None` when the boot is resuming an interrupted transaction: recovery replays
-/// only that transaction's own minimal, idempotent steps, so the per-boot hook is skipped and
-/// the application is launched directly.
+/// only that transaction's own minimal, idempotent steps, so the per-boot converge is skipped
+/// and the application is launched directly.
 ///
-/// Fail-closed: if the hook fails the application is *not* launched — the error propagates
-/// and the guardian retries the whole tower with backoff. Application verification always
-/// requires the signed provider.
-pub(crate) fn launch_with_pre_start(
+/// Fail-closed: if `apply` fails the application is *not* launched — the error propagates
+/// and the guardian retries the whole tower with backoff. Readiness always requires the signed
+/// reconciler's `healthcheck`.
+pub(crate) fn launch_after_boot_apply(
     guardian: Guardian,
     opts: &Options,
     store: &dyn Store,
@@ -402,17 +383,17 @@ pub(crate) fn launch_with_pre_start(
             let installed = *installed;
             let release = installed.release;
             let lifecycle = installed.lifecycle;
-            // Pre-start is a per-boot environment hook, run on every launch. Release placement
-            // (including the provider-managed activation hook) already happened durably — in the install
-            // machine on a first boot, in the update transaction on an upgrade — so this path
-            // never places; it only prepares the environment before the launch.
+            // This is the per-boot environment converge, run on every launch. Release placement
+            // already happened durably — in the install machine on a first boot, in the update
+            // transaction on an upgrade — so this path never places; it only prepares the
+            // environment before the launch.
             invoke_deployment_provider(
                 lifecycle.as_ref(),
                 opts,
                 LifecycleInvocation {
-                    phase: LifecyclePhase::Apply,
+                    phase: Operation::Apply,
                     reason,
-                    id: "boot",
+                    id: attempt::BOOT,
                     pid: None,
                     candidate: &release,
                     predecessor: &release,
@@ -470,7 +451,7 @@ impl DeploymentProvider for DefaultProvider<'_> {
     }
     fn lifecycle(
         &mut self,
-        phase: LifecyclePhase,
+        phase: Operation,
         lifecycle_attempt_id: &str,
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
@@ -500,7 +481,7 @@ impl DeploymentProvider for DefaultProvider<'_> {
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()> {
         self.phases.invoke(LifecycleInvocation {
-            phase: LifecyclePhase::Apply,
+            phase: Operation::Apply,
             reason: LifecycleReason::Update,
             id: lifecycle_attempt_id,
             pid: None,
@@ -524,12 +505,21 @@ impl DeploymentProvider for DefaultProvider<'_> {
     }
 }
 
-/// Repeatedly invoke one signed provider observation until it supplies the configured
-/// consecutive-success evidence or the agent-owned deadline expires. The provider performs one
+/// THE readiness gate. Every readiness decision in this supervisor — the boot gate, a
+/// candidate's transaction gate, a crash-recovered rollback's gate — is this one function, and
+/// it can only ever ask the signed reconciler for [`Operation::Healthcheck`]: the operation is
+/// not a parameter, so no caller can gate readiness on anything else.
+///
+/// It repeatedly invokes that one observation until the reconciler supplies the configured
+/// consecutive-success evidence or the agent-owned deadline expires. The reconciler performs one
 /// application-specific observation; the agent owns cadence, bounds, cancellation, and policy.
-async fn became_healthy<T: DeploymentProvider>(
+///
+/// `lifecycle_attempt_id` is the transaction's own token when a transaction is gating its
+/// candidate — the reconciler may then rely on effects written by earlier operations of that exact
+/// attempt — and [`attempt::BOOT`] for a boot or restart, which observes only durable steady state
+/// and never impersonates a transaction whose attempt markers no longer exist.
+pub(crate) async fn became_healthy<T: DeploymentProvider>(
     tower: &mut T,
-    phase: LifecyclePhase,
     lifecycle_attempt_id: &str,
     candidate: &updated::bundle::ReleaseId,
     predecessor: &updated::bundle::ReleaseId,
@@ -541,7 +531,12 @@ async fn became_healthy<T: DeploymentProvider>(
     while Instant::now() < deadline {
         if Instant::now() >= next {
             let ok = tower
-                .lifecycle(phase, lifecycle_attempt_id, candidate, predecessor)
+                .lifecycle(
+                    Operation::Healthcheck,
+                    lifecycle_attempt_id,
+                    candidate,
+                    predecessor,
+                )
                 .is_ok();
             if readiness.observe(ok) {
                 return true;
@@ -556,40 +551,6 @@ async fn became_healthy<T: DeploymentProvider>(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
-}
-
-/// Transaction-local health gate. The provider may rely on effects written by earlier phases of
-/// this exact lifecycle attempt.
-pub(crate) async fn became_verified<T: DeploymentProvider>(
-    tower: &mut T,
-    lifecycle_attempt_id: &str,
-    candidate: &updated::bundle::ReleaseId,
-    predecessor: &updated::bundle::ReleaseId,
-) -> bool {
-    became_healthy(
-        tower,
-        LifecyclePhase::Healthcheck,
-        lifecycle_attempt_id,
-        candidate,
-        predecessor,
-    )
-    .await
-}
-
-/// Boot/restart health gate. It observes only durable steady state and never impersonates a
-/// lifecycle transaction whose attempt markers no longer exist.
-pub(crate) async fn became_steady<T: DeploymentProvider>(
-    tower: &mut T,
-    candidate: &updated::bundle::ReleaseId,
-) -> bool {
-    became_healthy(
-        tower,
-        LifecyclePhase::Healthcheck,
-        "boot",
-        candidate,
-        candidate,
-    )
-    .await
 }
 
 // ================================ the transaction ================================
@@ -814,7 +775,7 @@ async fn switch_over<T: DeploymentProvider>(
         "recording the health checkpoint",
         advance_transaction(store, &mut tx, TransactionPhase::HealthStarted)
     );
-    if !became_verified(tower, &tx.id, &candidate, &tx.previous_release).await {
+    if !became_healthy(tower, &tx.id, &candidate, &tx.previous_release).await {
         return reject_then_recover(store, &mut tx);
     }
     chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
@@ -864,7 +825,7 @@ async fn switch_over<T: DeploymentProvider>(
             release: candidate.clone(),
             archive_sha256: tx.candidate_archive_sha256.clone(),
             // The candidate's own providers are now the installed release's providers; persist them so
-            // pre-start and verification can run them on the next boot. (This is the
+            // the boot converge and the readiness gate can run them on the next boot. (This is the
             // candidate provider passed in — `tx.lifecycle` holds the *predecessor's*
             // now, for rollback.)
             lifecycle: Box::new(lifecycle),
@@ -962,7 +923,7 @@ pub(crate) fn persist_transaction(store: &mut dyn Store, tx: &Transaction) -> io
 /// PowerShell without a JSON parser or SDK. A bounded wait prevents a wedged enterprise
 /// integration from wedging the updater forever.
 pub(crate) struct LifecycleInvocation<'a> {
-    pub(crate) phase: LifecyclePhase,
+    pub(crate) phase: Operation,
     pub(crate) reason: LifecycleReason,
     pub(crate) id: &'a str,
     pub(crate) pid: Option<u32>,
@@ -991,7 +952,7 @@ fn run_lifecycle_command_output(
 
 struct PreparedLifecycleCommand {
     command: Command,
-    phase: LifecyclePhase,
+    phase: Operation,
     timeout: Duration,
 }
 
@@ -1017,7 +978,7 @@ fn prepare_lifecycle_command(
         ));
     }
     let timeout = lifecycle_timeout(phase, Duration::from_millis(lifecycle.timeout_millis));
-    let phase_name = phase.name();
+    let phase_name = phase.as_str();
     let app_provider = updated::provider::BundleStore::for_app(&opts.paths);
     let candidate_dir = app_provider.location(candidate);
     let predecessor_dir = app_provider.location(predecessor);
@@ -1106,8 +1067,8 @@ pub(crate) fn reconciler_output_path(
 
 const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-fn lifecycle_timeout(phase: LifecyclePhase, configured: Duration) -> Duration {
-    if phase == LifecyclePhase::Inspect {
+fn lifecycle_timeout(phase: Operation, configured: Duration) -> Duration {
+    if phase == Operation::Inspect {
         configured.min(FINGERPRINT_TIMEOUT)
     } else {
         configured
@@ -1145,7 +1106,7 @@ fn run_prepared_lifecycle_command_blocking(
         phase,
         timeout,
     } = prepared;
-    let phase_name = phase.name();
+    let phase_name = phase.as_str();
     let mut child = foundation::process::ContainedChild::spawn(command)?;
     let stdout = capture_reconciler_output(
         child
@@ -1256,11 +1217,11 @@ fn capture_reconciler_output(
 }
 
 fn report_reconciler_output(
-    phase: LifecyclePhase,
+    phase: Operation,
     stdout: std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
     stderr: std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
 ) -> io::Result<ReconcilerOutput> {
-    let operation = phase.name();
+    let operation = phase.as_str();
     let mut stdout_result = None;
     for (stream, handle) in [("stdout", stdout), ("stderr", stderr)] {
         let (bytes, truncated) = handle
@@ -1268,7 +1229,7 @@ fn report_reconciler_output(
             .map_err(|_| io::Error::other("node reconciler output reader panicked"))??;
         // Fingerprint stdout is opaque measured state, not diagnostics. It is hashed below and
         // must never be copied into logs; stderr remains the script's diagnostic channel.
-        if !(bytes.is_empty() || phase == LifecyclePhase::Inspect && stream == "stdout") {
+        if !(bytes.is_empty() || phase == Operation::Inspect && stream == "stdout") {
             let suffix = if truncated { " [truncated]" } else { "" };
             log(&format!(
                 "node reconciler {operation} {stream}{suffix}: {}",
@@ -1400,15 +1361,15 @@ mod tests {
     #[test]
     fn fingerprint_has_one_agent_owned_runtime_ceiling() {
         assert_eq!(
-            lifecycle_timeout(LifecyclePhase::Inspect, Duration::from_secs(86_400)),
+            lifecycle_timeout(Operation::Inspect, Duration::from_secs(86_400)),
             FINGERPRINT_TIMEOUT
         );
         assert_eq!(
-            lifecycle_timeout(LifecyclePhase::Inspect, Duration::from_secs(30)),
+            lifecycle_timeout(Operation::Inspect, Duration::from_secs(30)),
             Duration::from_secs(30)
         );
         assert_eq!(
-            lifecycle_timeout(LifecyclePhase::Healthcheck, Duration::from_secs(86_400)),
+            lifecycle_timeout(Operation::Healthcheck, Duration::from_secs(86_400)),
             Duration::from_secs(86_400)
         );
     }
@@ -1425,7 +1386,7 @@ mod tests {
         foundation::process::arrange_parent_death_signal(&mut command);
         let prepared = PreparedLifecycleCommand {
             command,
-            phase: LifecyclePhase::Inspect,
+            phase: Operation::Inspect,
             timeout: Duration::from_secs(30),
         };
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1569,7 +1530,9 @@ mod tests {
 
     #[derive(Default)]
     struct FakeTower {
-        phases: Vec<&'static str>,
+        /// Every reconciler invocation, as the operation's wire spelling and its attempt id —
+        /// the two halves of the argv contract a gate is required to honour.
+        invocations: Vec<(&'static str, String)>,
         fail_rollback: bool,
         fail_first_healthcheck: bool,
         healthcheck_calls: usize,
@@ -1588,17 +1551,18 @@ mod tests {
 
         fn lifecycle(
             &mut self,
-            phase: LifecyclePhase,
-            _: &str,
+            phase: Operation,
+            lifecycle_attempt_id: &str,
             _: &updated::bundle::ReleaseId,
             _: &updated::bundle::ReleaseId,
         ) -> io::Result<()> {
-            self.phases.push(phase.name());
-            if matches!(phase, LifecyclePhase::Healthcheck) {
+            self.invocations
+                .push((phase.as_str(), lifecycle_attempt_id.to_string()));
+            if matches!(phase, Operation::Healthcheck) {
                 self.healthcheck_calls += 1;
             }
-            if (matches!(phase, LifecyclePhase::Rollback) && self.fail_rollback)
-                || (matches!(phase, LifecyclePhase::Healthcheck)
+            if (matches!(phase, Operation::Rollback) && self.fail_rollback)
+                || (matches!(phase, Operation::Healthcheck)
                     && self.fail_first_healthcheck
                     && self.healthcheck_calls == 1)
             {
@@ -1633,14 +1597,55 @@ mod tests {
         }
     }
 
+    /// The readiness gate is the reconciler's `healthcheck` operation — by that exact published
+    /// spelling — under the reserved `boot` attempt identity. A reconciler answers argv, so a gate
+    /// that asked for any other operation name would silently fall through the reconciler's
+    /// dispatch and gate nothing.
     #[tokio::test]
-    async fn boot_health_uses_the_public_healthcheck_operation() {
+    async fn the_boot_gate_is_the_published_healthcheck_operation() {
         let release = release("22.0.0", "current");
         let mut tower = FakeTower::default();
 
-        assert!(became_steady(&mut tower, &release).await);
-        assert_eq!(tower.phases, ["healthcheck"]);
+        assert!(became_healthy(&mut tower, attempt::BOOT, &release, &release).await);
+        assert_eq!(tower.invocations, [("healthcheck", "boot".to_string())]);
         assert_eq!(tower.healthcheck_calls, 1);
+    }
+
+    /// The same one gate serves a transaction, carrying the transaction's own attempt id so the
+    /// reconciler can rely on effects its earlier operations wrote — and still asking for exactly
+    /// `healthcheck`.
+    #[tokio::test]
+    async fn the_transaction_gate_is_the_same_healthcheck_operation_under_the_attempt_id() {
+        let previous = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = MemoryStore::new(previous.clone());
+        let mut tower = FakeTower::default();
+
+        let outcome = apply_update(
+            &mut tower,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            reconciler_release(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, Outcome::Committed));
+        let gates: Vec<&(&str, String)> = tower
+            .invocations
+            .iter()
+            .filter(|(operation, _)| *operation == "healthcheck")
+            .collect();
+        let (_, attempt_id) = gates
+            .first()
+            .expect("a committed update is gated by the reconciler's healthcheck operation");
+        assert_eq!(gates.len(), 1);
+        assert!(
+            !updated_contracts::reconciler::attempt::is_reserved(attempt_id),
+            "a transaction gate carries its own attempt id, never a reserved observation identity"
+        );
     }
 
     #[tokio::test]

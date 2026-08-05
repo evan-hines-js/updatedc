@@ -24,6 +24,20 @@ pub(crate) struct Guardian {
     conn: Conn,
     caps: Capabilities,
     ready_nonce: Nonce,
+    /// The application the guardian is running, as this connection knows it: seeded from the
+    /// launch environment (a supervisor crash-relaunch or a candidate activation hands the live
+    /// PID across exec) and kept true by every stop and launch that goes through here. This is the
+    /// supervisor's ONE record of it — [`crate::app::App::pid`] reads it rather than keeping a
+    /// second copy that the two modes' launch paths would drift apart.
+    ///
+    /// The environment variable is fixed at exec time and can only ever be *stale*, so it is read
+    /// exactly once, here. A boot that stops the application before planning — repairing a
+    /// committed bundle that failed local verification — would otherwise still be told one is
+    /// running, and the planner would adopt a PID that no longer exists instead of launching, so
+    /// the boot health gate would probe an application that does not exist.
+    app_pid: Option<u32>,
+    /// Whether this launch has already sent `READY`. See [`Guardian::signal_ready`].
+    ready_signalled: bool,
 }
 
 impl Guardian {
@@ -45,7 +59,33 @@ impl Guardian {
             conn,
             caps,
             ready_nonce,
+            app_pid: adopted_app_pid(),
+            ready_signalled: false,
         })
+    }
+
+    /// The application the guardian is running right now, if any — what the boot planner adopts
+    /// instead of launching a duplicate.
+    pub(crate) fn running_app(&self) -> Option<u32> {
+        self.app_pid
+    }
+
+    /// A connection in the shape [`Guardian::connect`] produces when the guardian handed a live
+    /// application across exec, over a socketpair whose other end the test drives.
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_test(
+        stream: std::os::unix::net::UnixStream,
+        app_pid: Option<u32>,
+    ) -> Guardian {
+        Guardian {
+            conn: Conn { stream },
+            caps: Hello::current()
+                .negotiate(SUPPORTED_MAJORS)
+                .expect("this build negotiates with itself"),
+            ready_nonce: [0u8; 16],
+            app_pid,
+            ready_signalled: false,
+        }
     }
 
     /// Refuse to use an operation the guardian did not advertise. For today's single
@@ -77,7 +117,10 @@ impl Guardian {
         self.require(control::CAP_LAUNCH_APP_V1, "LAUNCH")
             .map_err(GuardianError::Refused)?;
         match self.exchange(&Request::Launch(spec.clone()))? {
-            Response::Launched { pid } => Ok(pid),
+            Response::Launched { pid } => {
+                self.app_pid = Some(pid);
+                Ok(pid)
+            }
             Response::Error(msg) => Err(GuardianError::Refused(format!(
                 "guardian could not launch the application: {msg}"
             ))),
@@ -89,8 +132,16 @@ impl Guardian {
 
     /// Stop the application (the guardian escalates to a hard kill). Used to quiesce it
     /// before activating a release during an update.
+    ///
+    /// The PID is forgotten as soon as the stop is asked for, whether or not the answer arrives.
+    /// Relaunching cannot duplicate an application — `bootstrap::app::App::launch` stops whatever
+    /// it is running before it spawns — so the only hazard left is the other direction: *adopting*
+    /// a process this supervisor asked to have stopped. That PID may be gone (the health gate then
+    /// probes an application that does not exist), or still be running the very bytes a repair
+    /// just replaced, with `active == installed` afterwards so drift enforcement never corrects it.
     pub(crate) fn stop(&mut self) -> Result<(), String> {
         self.require(control::CAP_STOP_APP, "STOP")?;
+        self.app_pid = None;
         self.expect_ok(&Request::Stop, "STOP")
     }
 
@@ -116,10 +167,34 @@ impl Guardian {
         )
     }
 
-    /// Prove this supervisor launch reached readiness (commits a candidate handoff).
-    pub(crate) fn signal_ready(&mut self) -> Result<(), String> {
-        self.require(control::CAP_READY, "READY")?;
-        self.expect_ok(&Request::Ready(self.ready_nonce), "READY")
+    /// Prove this supervisor launch reached readiness (commits a candidate handoff), and hand back
+    /// the proof that it was sent.
+    ///
+    /// A guardian that will not take the signal is warned about rather than fatal: this supervisor
+    /// is already running and there is nothing better to do about it. The token is returned either
+    /// way, because it records the *ordering* — that this call has happened — which is what the
+    /// waits behind it depend on.
+    ///
+    /// At most one `READY` reaches the guardian per launch. Boot recovery signals readiness as
+    /// soon as it starts waiting out a node-local transient (see `run`), and the boot path then
+    /// signals again at its ordinary point; a second frame on the wire would be answered — the
+    /// guardian's dispatch ignores it once the nonce is spent — but the supervisor would be
+    /// blocked on that exchange for no reason, so the send is made once here instead.
+    pub(crate) fn signal_ready(&mut self) -> ReadySignalled {
+        if self.ready_signalled {
+            return ReadySignalled(());
+        }
+        self.ready_signalled = true;
+        let sent = match self.require(control::CAP_READY, "READY") {
+            Ok(()) => self.expect_ok(&Request::Ready(self.ready_nonce), "READY"),
+            Err(unsupported) => Err(unsupported),
+        };
+        if let Err(error) = sent {
+            crate::warn(&format!(
+                "could not signal readiness to the guardian: {error}"
+            ));
+        }
+        ReadySignalled(())
     }
 
     fn expect_ok(&mut self, req: &Request, what: &str) -> Result<(), String> {
@@ -128,6 +203,23 @@ impl Guardian {
             Response::Error(msg) => Err(format!("guardian rejected {what}: {msg}")),
             other => Err(format!("unexpected reply to {what}: {other:?}")),
         }
+    }
+}
+
+/// Proof that this boot has already told the guardian the supervisor is ready. Only
+/// [`Guardian::signal_ready`] can make one — the field is private to this module — so a wait that
+/// demands one cannot be moved back in front of the readiness signal without failing to compile.
+///
+/// [`crate::secrets::SecretManager::acquire`] is that wait: in front of the signal, an unreachable
+/// secrets endpoint is indistinguishable from a supervisor binary that cannot start, and the
+/// candidate's bytes are then rejected by content hash, permanently.
+pub(crate) struct ReadySignalled(());
+
+#[cfg(test)]
+impl ReadySignalled {
+    /// Stand in for the guardian handshake, for tests of the waits that sit behind it.
+    pub(crate) fn for_test() -> ReadySignalled {
+        ReadySignalled(())
     }
 }
 
@@ -163,10 +255,10 @@ impl From<GuardianError> for std::io::Error {
     }
 }
 
-/// The application PID the guardian is already running, if any (a supervisor
-/// crash-relaunch or candidate activation), so the supervisor adopts rather than
-/// launching a duplicate.
-pub(crate) fn adopted_app_pid() -> Option<u32> {
+/// The application PID the guardian handed this supervisor across exec, if any (a supervisor
+/// crash-relaunch or candidate activation). Read once, into [`Guardian::app_pid`], which is the
+/// supervisor's only answer to "is an application running" from then on.
+fn adopted_app_pid() -> Option<u32> {
     std::env::var(control::APP_PID_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -219,6 +311,43 @@ pub(crate) struct Claim {
     content: String,
 }
 
+/// Where [`Claim::clear`] parks the one instance it took off the marker path. A fixed sibling name,
+/// not a fresh one per call: a single supervisor owns this state directory (the instance lock), so
+/// there is never a second clear in flight, and a fixed name is what makes an interrupted clear
+/// recoverable by [`recover_interrupted_clear`] rather than leaving orphans nothing will ever find.
+fn taken_path(marker: &Path) -> std::path::PathBuf {
+    updated::config::with_suffix(marker, ".clearing")
+}
+
+/// Put an instance back on the marker path. Only ever used for one that this boot took but must
+/// NOT consume — a newer instance, or one whose clear was interrupted. If a marker has landed on
+/// the path in the meantime it is newer evidence of the same event and wins; what must never
+/// happen is ending with no marker at all when one is owed.
+fn restore_taken(taken: &Path, marker: &Path) {
+    let restored = if marker.exists() {
+        foundation::durable::remove_file(taken)
+    } else {
+        std::fs::rename(taken, marker)
+    };
+    if let Err(error) = restored {
+        crate::warn(&format!(
+            "could not restore the guardian marker {}: {error}",
+            marker.display()
+        ));
+    }
+}
+
+/// A clear that died between taking the marker and deciding its fate left the instance it took
+/// beside the marker path. Restore it before reading, so that one-rename window cannot swallow a
+/// marker whose consequence had not committed. Runs on every claim, which is the only place a
+/// marker is ever read.
+fn recover_interrupted_clear(marker: &Path) {
+    let taken = taken_path(marker);
+    if taken.exists() {
+        restore_taken(&taken, marker);
+    }
+}
+
 fn warn_unusable(path: &Path, why: &str) {
     crate::warn(&format!(
         "guardian marker {} {why}; discarding it — it carries no evidence",
@@ -265,6 +394,7 @@ impl Marker {
     /// permission problem) is propagated — the environment is broken, not the file — while
     /// anything at the path that cannot *be* evidence is discarded and read as "no marker".
     fn claim(self) -> std::io::Result<Option<Claim>> {
+        recover_interrupted_clear(&self.path);
         let metadata = match std::fs::symlink_metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -305,24 +435,39 @@ impl Claim {
     /// If the bytes on disk are no longer the ones that were read, the guardian wrote a new marker
     /// while this boot was reconciling: that instance's evidence has been read by nobody, so it
     /// is left for the next boot.
+    /// The instance is taken off the marker path in ONE atomic step (a rename) before its bytes are
+    /// compared, so this call can only ever destroy the instance it took. Comparing in place and
+    /// then unlinking the *path* — the shape this replaced — left a window between the two calls:
+    /// the guardian owns the live application throughout boot reconciliation, and a marker it
+    /// renamed into place inside that window was unlinked with its evidence read by nobody, which
+    /// is precisely how a service exit gets lost and a crashed candidate confirmed.
     fn clear(self) -> std::io::Result<()> {
-        let rewritten = |path: &Path| {
-            crate::log(&format!(
-                "guardian marker {} was rewritten during boot reconciliation; leaving the new one \
-                 for the next boot",
-                path.display()
-            ));
-            Ok(())
-        };
-        match std::fs::read_to_string(&self.path) {
-            Ok(content) if content == self.content => foundation::durable::remove_file(&self.path),
-            // Different bytes — or bytes that are no longer text at all — are a different instance
-            // than the one that was read, and nobody has read that one.
-            Ok(_) => rewritten(&self.path),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => rewritten(&self.path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
+        let taken = taken_path(&self.path);
+        match std::fs::rename(&self.path, &taken) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
         }
+        let mine = match std::fs::read_to_string(&taken) {
+            Ok(content) => content == self.content,
+            // Bytes that are no longer text at all are a different instance than the one read.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                restore_taken(&taken, &self.path);
+                return Err(e);
+            }
+        };
+        if mine {
+            return foundation::durable::remove_file(&taken);
+        }
+        crate::log(&format!(
+            "guardian marker {} was rewritten during boot reconciliation; leaving the new one \
+             for the next boot",
+            self.path.display()
+        ));
+        restore_taken(&taken, &self.path);
+        Ok(())
     }
 
     /// Throw away a marker whose content is not evidence, without touching a newer instance that
@@ -488,6 +633,20 @@ struct Conn {
     writer: std::fs::File,
 }
 
+/// Clear `HANDLE_FLAG_INHERIT` on `handle`, so it is not inherited by anything this process
+/// launches. The Windows counterpart of [`set_cloexec`]: `std`'s spawn always passes
+/// `bInheritHandles = TRUE` with no attribute list, so this flag — which travels with the
+/// handle across spawn — is the only thing that stops the channel here.
+#[cfg(windows)]
+fn clear_inherit(handle: std::os::windows::io::RawHandle) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    let ok = unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 impl Conn {
     fn inherit() -> Result<Conn, String> {
@@ -504,10 +663,22 @@ impl Conn {
             .map_err(|_| format!("{CONTROL_ENV} write handle is not a number"))?;
         // Safety: the guardian created these anonymous-pipe ends and handed us their
         // inheritable handle values across spawn; nothing else owns them.
-        Ok(Conn {
+        let conn = Conn {
             reader: unsafe { std::fs::File::from_raw_handle(r as RawHandle) },
             writer: unsafe { std::fs::File::from_raw_handle(w as RawHandle) },
-        })
+        };
+        // The guardian marked these ends inheritable so they would survive *our* spawn. Clear
+        // it now that we own them, so the channel stops here: nothing we launch is a party to
+        // the control protocol, and a descendant of the operator's lifecycle provider holding
+        // these handles could drive the guardian directly — a single `Stop` frame would take
+        // the application down with no crash recorded and nothing to relaunch it. This is the
+        // exact counterpart of the unix arm's FD_CLOEXEC re-arm; bootstrap cannot do it for us,
+        // because the flag travels with the handle into this process.
+        for handle in [r as RawHandle, w as RawHandle] {
+            clear_inherit(handle)
+                .map_err(|e| format!("securing the control channel endpoint: {e}"))?;
+        }
+        Ok(conn)
     }
 
     fn reader(&mut self) -> &mut std::fs::File {
@@ -516,6 +687,81 @@ impl Conn {
 
     fn writer(&mut self) -> &mut std::fs::File {
         &mut self.writer
+    }
+}
+
+/// Answer one request the way the guardian would, so the exchange under test completes. Shared
+/// with [`crate::app`], whose provider-managed launch path is one such exchange.
+#[cfg(all(test, unix))]
+pub(crate) fn answering(
+    mut peer: std::os::unix::net::UnixStream,
+    response: Response,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        Request::read(&mut peer).expect("one request");
+        response.write(&mut peer).expect("one response");
+    })
+}
+
+/// The connection's own bookkeeping, driven over a real socketpair with a stand-in guardian
+/// answering one request. Unix-only because the channel endpoint is: on Windows it is a pair of
+/// anonymous pipe handles, and the state under test lives above that split.
+#[cfg(all(test, unix))]
+mod channel_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn an_acknowledged_stop_forgets_the_application_the_guardian_was_running() {
+        // Regression: the answer to "is an application running" was the launch environment, fixed
+        // at exec time and never updated. A boot that stopped the child to repair a committed
+        // bundle that failed local verification therefore still saw it running, and the planner
+        // adopted a PID that no longer existed — nothing was ever launched, and the boot health
+        // gate probed an application that did not exist.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let peer = answering(theirs, Response::Ok);
+        let mut guardian = Guardian::for_test(ours, Some(4321));
+        assert_eq!(guardian.running_app(), Some(4321));
+
+        guardian.stop().expect("the guardian acknowledges STOP");
+
+        assert_eq!(guardian.running_app(), None);
+        peer.join().expect("the stand-in guardian");
+    }
+
+    #[test]
+    fn an_unanswered_stop_forgets_the_application_too() {
+        // The guardian answers STOP with Ok unconditionally, so the only stop that fails is one
+        // whose channel died — a SIGKILLed guardian, a broken pipe. Keeping the PID through that
+        // was justified as "otherwise we launch a second application", which the guardian makes
+        // impossible (its `App::launch` stops whatever it is running first). What keeping it
+        // actually bought was ADOPTING a process this boot asked to have stopped: dead, or alive
+        // on the bytes a repair just replaced, and with active == installed nothing corrects it.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        drop(theirs);
+        let mut guardian = Guardian::for_test(ours, Some(4321));
+
+        assert!(guardian.stop().is_err(), "the channel is gone");
+
+        assert_eq!(guardian.running_app(), None);
+    }
+
+    #[test]
+    fn a_launch_records_the_application_it_started() {
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let peer = answering(theirs, Response::Launched { pid: 77 });
+        let mut guardian = Guardian::for_test(ours, None);
+
+        let spec = CommandSpec {
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+        };
+        assert!(matches!(guardian.launch(&spec), Ok(77)));
+
+        assert_eq!(guardian.running_app(), Some(77));
+        peer.join().expect("the stand-in guardian");
     }
 }
 
@@ -610,6 +856,43 @@ mod marker_tests {
             Some(Path::new("/state/supervisors/def/supervisor")),
             "the next boot sees the newer candidate, not the one already handled"
         );
+    }
+
+    #[test]
+    fn an_interrupted_clear_gives_the_instance_it_took_back() {
+        // Clearing takes the marker off its path with one rename so it can only ever destroy the
+        // instance it took — which means a process death in that window parks an instance beside
+        // the marker path. Reading is the only way to reach a marker, so reading restores it: an
+        // exit whose rollback never committed must not be lost to a crash mid-clear.
+        let state = dir("interrupted-clear");
+        write_markers(&state, "/state/supervisors/abc/supervisor");
+        let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
+        let content = std::fs::read_to_string(&marker).unwrap();
+        std::fs::rename(&marker, taken_path(&marker)).unwrap();
+
+        let evidence = Evidence::read(Some(&state)).unwrap();
+
+        assert!(evidence.service_exited(), "the taken instance is restored");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), content);
+        assert!(!taken_path(&marker).exists());
+    }
+
+    #[test]
+    fn an_interrupted_clear_never_displaces_a_newer_marker() {
+        // The parked instance is only ever evidence nobody has read, so a marker that has since
+        // landed on the path is at least as new: it wins, and the stale copy is dropped rather
+        // than renamed over it.
+        let state = dir("interrupted-clear-superseded");
+        write_markers(&state, "/state/supervisors/abc/supervisor");
+        let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
+        std::fs::rename(&marker, taken_path(&marker)).unwrap();
+        write_markers(&state, "/state/supervisors/def/supervisor");
+        let newest = std::fs::read_to_string(&marker).unwrap();
+
+        assert!(Evidence::read(Some(&state)).unwrap().service_exited());
+
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), newest);
+        assert!(!taken_path(&marker).exists());
     }
 
     #[test]

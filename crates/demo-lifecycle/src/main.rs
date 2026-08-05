@@ -11,40 +11,35 @@ use std::thread;
 use std::time::Duration;
 
 use foundation::durable;
+/// The reconciler protocol vocabulary is defined once, in the contracts crate; this fixture
+/// answers exactly the operations the supervisor invokes.
+use updated_contracts::reconciler::Operation;
 
 type Error = Box<dyn std::error::Error>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    Apply,
-    Healthcheck,
-    Rollback,
-    Inspect,
-}
+/// The provider execution timeout the demo signs into its provider set (`--provider-timeout-ms`).
+/// The supervisor bounds the *entire* hook invocation by it, so one `apply` — every fixed step
+/// plus BOTH dwells — must finish inside it or a healthy release is killed mid-apply and the
+/// cohort rolls back.
+const PROVIDER_TIMEOUT_MS: u64 = 15_000;
 
-impl Phase {
-    fn parse(value: &str) -> Result<Self, Error> {
-        match value {
-            "apply" => Ok(Self::Apply),
-            "healthcheck" => Ok(Self::Healthcheck),
-            "rollback" => Ok(Self::Rollback),
-            "inspect" => Ok(Self::Inspect),
-            _ => Err(format!("unknown lifecycle phase {value:?}").into()),
-        }
-    }
+/// Wall time an update `apply` spends outside its two dwells: one second each in `preflight`,
+/// `prepare`, `drain` and `start`, plus the two-second bound on `verify`'s probe.
+const APPLY_FIXED_WORK_MS: u64 = 6_000;
 
-    fn name(self) -> &'static str {
-        match self {
-            Self::Apply => "apply",
-            Self::Healthcheck => "healthcheck",
-            Self::Rollback => "rollback",
-            Self::Inspect => "inspect",
-        }
-    }
-}
+/// Headroom the dwell band leaves the timeout for everything wall time this fixture does not
+/// control: process spawn, artifact staging, and a demo cluster under load.
+const APPLY_MARGIN_MS: u64 = 3_000;
+
+/// Shortest representative pause for a dwelling phase.
+const DWELL_FLOOR_MS: u64 = 1_000;
+
+/// Longest one dwell may be: an `apply` performs two of them, and what is left of the provider
+/// timeout after the fixed work and the margin has to cover both.
+const DWELL_CEILING_MS: u64 = (PROVIDER_TIMEOUT_MS - APPLY_FIXED_WORK_MS - APPLY_MARGIN_MS) / 2;
 
 struct Deployment {
-    phase: Phase,
+    phase: Operation,
     attempt: String,
     candidate: String,
     predecessor: String,
@@ -60,7 +55,10 @@ struct Deployment {
 impl Deployment {
     fn load() -> Result<Self, Error> {
         let mut args = std::env::args().skip(1);
-        let phase = Phase::parse(&args.next().ok_or("missing reconciler operation")?)?;
+        let phase = args
+            .next()
+            .ok_or("missing reconciler operation")?
+            .parse::<Operation>()?;
         let values = named_arguments(args)?;
         let attempt = required_argument(&values, "--attempt-id")?.to_string();
         let candidate = required_argument(&values, "--candidate-version")?.to_string();
@@ -88,7 +86,7 @@ impl Deployment {
         // without repeating finished work. A per-boot hook is not an attempt: the supervisor
         // invokes it under a constant id on every launch, so honouring a marker there would turn
         // "run this before every start" into "run this once, ever".
-        if !matches!(self.phase, Phase::Healthcheck | Phase::Inspect)
+        if !matches!(self.phase, Operation::Healthcheck | Operation::Inspect)
             && !self.is_per_boot()
             && self.completed(self.phase)
         {
@@ -96,14 +94,15 @@ impl Deployment {
         }
         self.audit("started")?;
         match self.phase {
-            Phase::Apply => self.apply()?,
-            Phase::Healthcheck => self.periodic()?,
-            Phase::Rollback => self.rollback()?,
-            Phase::Inspect => self.fingerprint()?,
+            Operation::Apply => self.apply()?,
+            Operation::Healthcheck => self.periodic()?,
+            Operation::Rollback => self.rollback()?,
+            Operation::Inspect => self.fingerprint()?,
         }
-        if !matches!(self.phase, Phase::Healthcheck | Phase::Inspect) && !self.is_per_boot() {
+        if !matches!(self.phase, Operation::Healthcheck | Operation::Inspect) && !self.is_per_boot()
+        {
             self.write(
-                self.effects.join(format!("{}.done", self.phase.name())),
+                self.effects.join(format!("{}.done", self.phase.as_str())),
                 b"done\n",
             )?;
         }
@@ -174,7 +173,7 @@ impl Deployment {
             self.live.join("pre-drain-signalled"),
             self.attempt.as_bytes(),
         )?;
-        thread::sleep(self.dwell());
+        thread::sleep(self.dwell("pre-drain"));
         Ok(())
     }
 
@@ -189,21 +188,28 @@ impl Deployment {
             self.live.join("pre-start-prepared"),
             self.candidate.as_bytes(),
         )?;
-        thread::sleep(self.dwell());
+        thread::sleep(self.dwell("pre-start"));
         Ok(())
     }
 
-    /// A representative amount of operator work for this phase, in the 2–8s band. It is
-    /// derived from the attempt id and phase, so it is stable across a phase's crash-recovery
-    /// retries (the work "takes as long as it takes") yet varies across agents and phases —
-    /// the fleet looks alive without any phase risking the provider's execution timeout.
-    fn dwell(&self) -> Duration {
+    /// A representative amount of operator work for one dwelling step, in the
+    /// [`DWELL_FLOOR_MS`]–[`DWELL_CEILING_MS`] band. It is derived from the attempt id, the
+    /// operation and the step, so it is stable across a step's crash-recovery retries (the work
+    /// "takes as long as it takes") yet varies across agents and across the two dwelling steps of
+    /// one `apply` — the fleet looks alive. The band is sized so that both dwells plus every fixed
+    /// step still fit the provider's execution timeout with margin, for *every* attempt id.
+    fn dwell(&self, step: &str) -> Duration {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for byte in self.attempt.bytes().chain(self.phase.name().bytes()) {
+        for byte in self
+            .attempt
+            .bytes()
+            .chain(self.phase.as_str().bytes())
+            .chain(step.bytes())
+        {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        Duration::from_millis(2000 + hash % 6001)
+        Duration::from_millis(DWELL_FLOOR_MS + hash % (DWELL_CEILING_MS - DWELL_FLOOR_MS + 1))
     }
 
     fn drain(&self) -> Result<(), Error> {
@@ -355,7 +361,7 @@ impl Deployment {
         if self.effects.join(format!("{phase}.done")).is_file() {
             Ok(())
         } else {
-            Err(format!("{} requires completed {phase}", self.phase.name()).into())
+            Err(format!("{} requires completed {phase}", self.phase.as_str()).into())
         }
     }
 
@@ -365,9 +371,9 @@ impl Deployment {
         matches!(self.reason.as_str(), "install" | "restart")
     }
 
-    fn completed(&self, phase: Phase) -> bool {
+    fn completed(&self, phase: Operation) -> bool {
         self.effects
-            .join(format!("{}.done", phase.name()))
+            .join(format!("{}.done", phase.as_str()))
             .is_file()
     }
 
@@ -393,7 +399,7 @@ impl Deployment {
             .create(true)
             .append(true)
             .open(self.state.join("audit/lifecycle.tsv"))?;
-        writeln!(log, "{}\t{}\t{event}", self.phase.name(), self.attempt)?;
+        writeln!(log, "{}\t{}\t{event}", self.phase.as_str(), self.attempt)?;
         log.sync_all()?;
         Ok(())
     }
@@ -483,7 +489,7 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn deployment(root: PathBuf, phase: Phase, attempt: &str) -> Deployment {
+    fn deployment(root: PathBuf, phase: Operation, attempt: &str) -> Deployment {
         Deployment {
             phase,
             attempt: attempt.into(),
@@ -500,12 +506,68 @@ mod tests {
     }
 
     #[test]
+    fn an_update_apply_fits_the_signed_provider_timeout_for_every_attempt_id() {
+        // The supervisor bounds the whole hook invocation by the provider timeout the demo signs
+        // in, so the WORST case over attempt ids — fixed work plus both dwells — has to fit it
+        // with margin. Otherwise a healthy candidate is killed mid-apply and the cohort rolls
+        // back, deterministically for that attempt id (the retry re-runs the same steps).
+        let root = PathBuf::from("/nonexistent");
+        let mut worst = Duration::ZERO;
+        for id in 0..5_000u32 {
+            let deployment = deployment(root.clone(), Operation::Apply, &format!("attempt-{id}"));
+            let pre_drain = deployment.dwell("pre-drain");
+            let pre_start = deployment.dwell("pre-start");
+            for dwell in [pre_drain, pre_start] {
+                assert!(
+                    (Duration::from_millis(DWELL_FLOOR_MS)
+                        ..=Duration::from_millis(DWELL_CEILING_MS))
+                        .contains(&dwell),
+                    "dwell {dwell:?} outside the band for attempt-{id}"
+                );
+            }
+            worst = worst.max(pre_drain + pre_start);
+        }
+        let apply = Duration::from_millis(APPLY_FIXED_WORK_MS) + worst;
+        assert!(
+            apply + Duration::from_millis(APPLY_MARGIN_MS)
+                <= Duration::from_millis(PROVIDER_TIMEOUT_MS),
+            "worst-case apply {apply:?} leaves less than the margin under the provider timeout"
+        );
+    }
+
+    #[test]
+    fn the_two_dwells_of_one_apply_differ() {
+        // Both dwells run under Operation::Apply in one process. Keying only on attempt+operation
+        // made them identical, doubling the longest dwell into the timeout; the step must vary it.
+        let root = PathBuf::from("/nonexistent");
+        let mut distinct = 0;
+        for id in 0..1_000u32 {
+            let deployment = deployment(root.clone(), Operation::Apply, &format!("attempt-{id}"));
+            if deployment.dwell("pre-drain") != deployment.dwell("pre-start") {
+                distinct += 1;
+            }
+        }
+        assert!(
+            distinct > 900,
+            "dwells barely vary across steps: {distinct}"
+        );
+    }
+
+    #[test]
+    fn a_dwell_is_stable_across_crash_recovery_retries_of_its_step() {
+        let root = PathBuf::from("/nonexistent");
+        let first = deployment(root.clone(), Operation::Apply, "attempt-7").dwell("pre-drain");
+        let retry = deployment(root, Operation::Apply, "attempt-7").dwell("pre-drain");
+        assert_eq!(first, retry);
+    }
+
+    #[test]
     fn cold_boot_start_does_not_require_an_update_activation() {
         let root = std::env::temp_dir().join(format!(
             "updated-demo-lifecycle-cold-boot-{}",
             std::process::id()
         ));
-        let mut deployment = deployment(root.clone(), Phase::Apply, "boot");
+        let mut deployment = deployment(root.clone(), Operation::Apply, "boot");
         deployment.reason = "install".into();
         fs::create_dir_all(&deployment.live).unwrap();
 
@@ -536,7 +598,7 @@ mod tests {
         )
         .unwrap();
         fs::write(live.join("change-ticket.receipt"), b"complete\n").unwrap();
-        let deployment = deployment(root.clone(), Phase::Healthcheck, "healthcheck");
+        let deployment = deployment(root.clone(), Operation::Healthcheck, "healthcheck");
 
         assert!(!deployment.effects.join("start.done").exists());
         assert!(!deployment.live.join("migration.plan").exists());

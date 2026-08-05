@@ -3,7 +3,8 @@
 //! Two subcommands, no `kubectl` and no secret-management code of its own:
 //!
 //! * `trust-root` mints a fresh TUF trust root — a one-time bootstrap. It generates the
-//!   four ed25519 role keys into a directory (which the operator loads into Vault),
+//!   ed25519 role keys into an empty directory (which the operator loads into Vault) and
+//!   refuses one that already holds a role key, so a new root never inherits an old key,
 //!   initializes the empty release repository in S3, and prints the `root.json` that every
 //!   group pins in its `release_repository.root_json`. It needs no Kubernetes access at all.
 //!
@@ -46,6 +47,16 @@ type Error = Box<dyn std::error::Error>;
 /// The online role keys a release publish signs with. Root keys are not among them.
 const ONLINE_KEYS: [&str; 3] = ["targets.pk8", "snapshot.pk8", "timestamp.pk8"];
 
+/// Every role key a trust root is built from: the active root, its standby successor, and the
+/// three online roles. `trust-root` mints all five and must find none of them already present.
+const ROLE_KEYS: [&str; 5] = [
+    "root.pk8",
+    "root.next.pk8",
+    "targets.pk8",
+    "snapshot.pk8",
+    "timestamp.pk8",
+];
+
 /// Mint trust roots and publish signed releases from CI, without kubectl.
 #[derive(Parser, Debug)]
 #[command(name = "updatectl", about, long_about = None, disable_version_flag = true)]
@@ -84,7 +95,8 @@ struct Backend {
     /// Directory of ed25519 role keys. `deploy` needs only the online keys (`targets.pk8`,
     /// `snapshot.pk8`, `timestamp.pk8`) — in production a Vault-backed Secret mounted
     /// read-only. `trust-root`/`rotate-root` also use the root keys (`root.pk8` active plus
-    /// `root.next.pk8` standby). `trust-root` writes freshly minted keys here.
+    /// `root.next.pk8` standby). `trust-root` mints freshly generated keys here and refuses a
+    /// directory that already holds any role key — a fresh trust root never reuses one.
     #[arg(long, env = "UPDATECTL_KEYS_DIR")]
     keys_dir: PathBuf,
 
@@ -348,6 +360,10 @@ fn build_store(backend: &Backend) -> Result<(S3Destination, Arc<dyn ObjectStore>
 
 async fn trust_root(args: TrustRootArgs) -> Result<(), Error> {
     let backend = &args.backend;
+    // Before anything is minted, signed, or uploaded: a fresh trust root is only fresh if every
+    // one of its keys is. `repo::generate_keys` is idempotent, so a directory that still holds an
+    // old key silently pins that key into the new root.
+    ensure_keys_dir_is_empty(&backend.keys_dir)?;
     let (destination, store) = build_store(backend)?;
 
     // Refuse to silently invalidate an already-published repository.
@@ -365,7 +381,10 @@ async fn trust_root(args: TrustRootArgs) -> Result<(), Error> {
     // replacement republished at version 1 is silently rejected by every node that ever saw the
     // old repository — no error at the publisher, and every agent stalled indefinitely.
     let start_version = if initialized {
-        let next = live_metadata_version(store.as_ref(), &destination).await? + 1;
+        let next = RoleVersions::live(store.as_ref(), &destination)
+            .await?
+            .highest()
+            + 1;
         eprintln!(
             "replacing a live repository: starting its metadata at version {next} so clients \
              past the old versions still accept it (nodes must still be re-pinned to the new root)"
@@ -378,7 +397,7 @@ async fn trust_root(args: TrustRootArgs) -> Result<(), Error> {
     // Mint the role keys into the target directory (the operator loads these into Vault),
     // then build an empty signed repository in a throwaway temp dir.
     let keys = repo::generate_keys(&backend.keys_dir).await?;
-    eprintln!("wrote role keys to {}", backend.keys_dir.display());
+    eprintln!("minted fresh role keys in {}", backend.keys_dir.display());
     let repo_dir = tempfile::tempdir()?;
     repo::init_from_version(repo_dir.path(), &keys, args.expiry_days, start_version).await?;
     let root_json = tokio::fs::read(repo_dir.path().join("metadata/root.json")).await?;
@@ -429,21 +448,21 @@ async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
     }
 
     // Pull the current metadata so the new root version bumps from it.
-    let repo_dir = checkout_metadata(store.as_ref(), &destination, backend).await?;
+    let checkout = checkout_metadata(store.as_ref(), &destination, backend).await?;
 
     // Mint the successor, then publish a new root version co-signed by the retained standby
     // (which retires the old active key) and the successor.
     repo::generate_root_key(&args.new_key_out).await?;
     let retained = &keys.roots[1..];
     repo::rotate_root(
-        repo_dir.path(),
+        checkout.path(),
         retained,
         &args.new_key_out,
         args.expiry_days,
     )
     .await?;
-    let root_json = tokio::fs::read(repo_dir.path().join("metadata").join("root.json")).await?;
-    updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
+    let root_json = tokio::fs::read(checkout.path().join("metadata").join("root.json")).await?;
+    checkout.publish(store.as_ref(), &destination).await?;
 
     eprintln!(
         "rotated root at s3://{}/{}; minted successor key at {}",
@@ -508,7 +527,15 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
     })?;
 
     // Work in a throwaway temp dir: the repository checkout never outlives the process.
-    let repo_dir = checkout_metadata(store, &destination, backend).await?;
+    let checkout = checkout_metadata(store, &destination, backend).await?;
+
+    // Resolve the provider set against the metadata in hand, before any bundle is built.
+    let provider_set = resolve_provider_set(
+        &checkout,
+        args.provider_set_path.as_deref(),
+        args.provider_set_sha256.as_deref(),
+    )
+    .await?;
 
     // Build the bundle into a scratch dir, then register it as a signed target.
     let build_dir = tempfile::tempdir()?;
@@ -532,28 +559,19 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
         &args.product,
         archive,
     );
-    // Bind the provider set into this app version's signed metadata (clap guarantees both flags
-    // are present together), so a later ordered-fallback descent rolls providers back with it.
-    if let (Some(path), Some(sha256)) = (&args.provider_set_path, &args.provider_set_sha256) {
-        // Validate the digest here, at publish time. It is signed into the app target's metadata
-        // and only read much later, by an ordered-fallback descent on a node — where a typo'd or
-        // truncated digest surfaces as "provider set unresolvable" during a recovery, the worst
-        // moment to discover a publishing mistake.
-        if !updated_contracts::is_sha256_hex(sha256) {
-            return Err(format!(
-                "--provider-set-sha256 {sha256:?} is not a 64-character hex SHA-256"
-            )
-            .into());
-        }
+    // Bind the resolved provider set into this app version's signed metadata, so a later
+    // ordered-fallback descent rolls providers back with it.
+    if let Some((path, sha256)) = &provider_set {
         target = target.with_provider_set(path, sha256);
     }
     let target_name = target.name.clone();
-    repo::add_release(repo_dir.path(), &keys, vec![target], args.expiry_days).await?;
-    let sha256 = repo::target_sha256(repo_dir.path(), &target_name).await?;
+    repo::add_release(checkout.path(), &keys, vec![target], args.expiry_days).await?;
+    let sha256 = repo::target_sha256(checkout.path(), &target_name).await?;
 
     // Upload immutable target bytes first and re-signed metadata last (timestamp is the
-    // commit point) — the operator's exact publication order.
-    updatec::runtime::publish_repository(store, &destination, repo_dir.path()).await?;
+    // commit point) — the operator's exact publication order. The group patch below references
+    // this generation, so a concurrent publisher must abort the upload rather than drop it.
+    checkout.publish(store, &destination).await?;
     eprintln!("published signed target {target_name} (sha256 {sha256})");
 
     // Roll the group. A JSON merge patch touches only the application reference, leaving
@@ -580,6 +598,53 @@ async fn deploy(args: DeployArgs) -> Result<(), Error> {
     report_deploy(&args, &platform, &target_name, &sha256)
 }
 
+/// Resolve `--provider-set-path`/`--provider-set-sha256` against the signed metadata this publish
+/// already holds, returning the normalized reference to sign into the app target.
+///
+/// The reference is signed into the app version's custom metadata and then read exactly once,
+/// much later: when an ordered-fallback descent picks this version on a node, `stage_providers`
+/// calls `exact_target` on it. A well-formed but unresolvable reference — a stale copy-paste of a
+/// previous set's path against the new set's digest, or a set published under a different prefix —
+/// is accepted by every syntactic check and only fails there, leaving the node unable to complete
+/// the rollback it is in the middle of. The checkout in hand is the same signed targets metadata
+/// the node will verify against, so resolving it here turns that into a publish-time refusal with
+/// nothing signed or uploaded. Digest comparison is case-insensitive and the lowercase form is
+/// what gets signed, matching the hex every agent compares against.
+async fn resolve_provider_set(
+    checkout: &Checkout,
+    path: Option<&str>,
+    sha256: Option<&str>,
+) -> Result<Option<(String, String)>, Error> {
+    // clap's `requires` makes the flags all-or-nothing.
+    let (Some(path), Some(sha256)) = (path, sha256) else {
+        return Ok(None);
+    };
+    if !updated_contracts::is_sha256_hex(sha256) {
+        return Err(
+            format!("--provider-set-sha256 {sha256:?} is not a 64-character hex SHA-256").into(),
+        );
+    }
+    let sha256 = sha256.to_ascii_lowercase();
+    let signed = repo::target_sha256(checkout.path(), path)
+        .await
+        .map_err(|error| {
+            format!(
+            "--provider-set-path {path:?} does not resolve in this repository's signed metadata: \
+             {error}. Publish the provider set with `publish-provider-set` against this same \
+             bucket and prefix first, and pass the path it prints. Nothing was signed or uploaded."
+        )
+        })?;
+    if signed != sha256 {
+        return Err(format!(
+            "--provider-set-sha256 {sha256} does not match the signed digest of \
+             --provider-set-path {path:?}, which is {signed}: the two flags name different \
+             provider sets. Nothing was signed or uploaded."
+        )
+        .into());
+    }
+    Ok(Some((path.to_string(), sha256)))
+}
+
 /// The merge patch that rolls an `UpdateGroup` onto a freshly published target.
 ///
 /// `emergencyCorrection` is always written, true or false. A merge patch that omitted it would
@@ -598,19 +663,55 @@ fn group_patch(target: &str, sha256: &str, emergency: bool) -> serde_json::Value
 /// for a new target to be added and republished. Shared by the provider publish commands.
 async fn checkout_repository(
     backend: &Backend,
-) -> Result<
-    (
-        S3Destination,
-        Arc<dyn ObjectStore>,
-        repo::Keys,
-        tempfile::TempDir,
-    ),
-    Error,
-> {
+) -> Result<(S3Destination, Arc<dyn ObjectStore>, repo::Keys, Checkout), Error> {
     let (destination, store) = build_store(backend)?;
     let keys = open_keys(&backend.keys_dir)?;
-    let repo_dir = checkout_metadata(store.as_ref(), &destination, backend).await?;
-    Ok((destination, store, keys, repo_dir))
+    let checkout = checkout_metadata(store.as_ref(), &destination, backend).await?;
+    Ok((destination, store, keys, checkout))
+}
+
+/// One checked-out generation of a release repository's signed metadata, plus the per-role
+/// versions it was taken at.
+///
+/// Publishing is read-modify-write over shared S3 metadata: the checkout carries generation N,
+/// `repo::add_release` signs N+1 locally, and the upload overwrites `N+1.targets.json`,
+/// `N+1.snapshot.json`, and `timestamp.json` unconditionally. Two publishers against one prefix
+/// therefore each sign an N+1 that omits the other's targets, and the loser's freshly patched
+/// UpdateGroup points at a target that is no longer in verified metadata — every node in that
+/// group stalls on "desired target absent from verified metadata" until someone republishes.
+/// A single publisher per lineage is the documented model, so the recorded generation is not a
+/// lock; it is the check that makes the unsupported case abort loudly with nothing uploaded
+/// instead of silently dropping another publisher's signed targets.
+struct Checkout {
+    dir: tempfile::TempDir,
+    generation: RoleVersions,
+}
+
+impl Checkout {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Publish the edited checkout, refusing to overwrite a generation this process never saw.
+    async fn publish(
+        &self,
+        store: &dyn ObjectStore,
+        destination: &S3Destination,
+    ) -> Result<(), Error> {
+        let live = RoleVersions::live(store, destination).await?;
+        if let Some(moved) = live.moved_since(&self.generation) {
+            return Err(format!(
+                "release repository at s3://{}/{} moved {moved} while this publish was building \
+                 and signing: another publisher is writing the same prefix. Nothing was uploaded \
+                 — re-run this command once that publish has settled, and publish one release \
+                 lineage from one place.",
+                destination.bucket, destination.prefix
+            )
+            .into());
+        }
+        updatec::runtime::publish_repository(store, destination, self.path()).await?;
+        Ok(())
+    }
 }
 
 /// Check out a repository's current TUF metadata into a throwaway temp dir: create `metadata/` and
@@ -622,7 +723,7 @@ async fn checkout_metadata(
     store: &dyn ObjectStore,
     destination: &S3Destination,
     backend: &Backend,
-) -> Result<tempfile::TempDir, Error> {
+) -> Result<Checkout, Error> {
     let repo_dir = tempfile::tempdir()?;
     let metadata_dir = repo_dir.path().join("metadata");
     tokio::fs::create_dir_all(&metadata_dir).await?;
@@ -636,7 +737,13 @@ async fn checkout_metadata(
         )
         .into());
     }
-    Ok(repo_dir)
+    // Record the generation these bytes are, not the one the store holds a moment later: the
+    // republish compares against exactly what this checkout was built from.
+    let generation = RoleVersions::checkout(&metadata_dir).await?;
+    Ok(Checkout {
+        dir: repo_dir,
+        generation,
+    })
 }
 
 /// Publish a provider artifact bundle as a signed target, without rolling any group.
@@ -652,7 +759,7 @@ async fn publish_provider_artifact(args: ProviderArtifactArgs) -> Result<(), Err
         .split_once('-')
         .ok_or_else(|| format!("--platform must be <os>-<arch>, got {platform:?}"))?;
 
-    let (destination, store, keys, repo_dir) = checkout_repository(backend).await?;
+    let (destination, store, keys, checkout) = checkout_repository(backend).await?;
 
     let build_dir = tempfile::tempdir()?;
     let archive = build_dir.path().join("bundle.tar.zst");
@@ -676,9 +783,9 @@ async fn publish_provider_artifact(args: ProviderArtifactArgs) -> Result<(), Err
         archive,
     );
     let target_name = target.name.clone();
-    repo::add_release(repo_dir.path(), &keys, vec![target], args.expiry_days).await?;
-    let sha256 = repo::target_sha256(repo_dir.path(), &target_name).await?;
-    updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
+    repo::add_release(checkout.path(), &keys, vec![target], args.expiry_days).await?;
+    let sha256 = repo::target_sha256(checkout.path(), &target_name).await?;
+    checkout.publish(store.as_ref(), &destination).await?;
     // stdout carries the machine-readable `path sha256` for the caller to reference; diagnostics
     // go to stderr.
     println!("{target_name} {sha256}");
@@ -689,55 +796,55 @@ async fn publish_provider_artifact(args: ProviderArtifactArgs) -> Result<(), Err
 /// Publish an immutable provider set (`provider-sets/<id>.json`) as a signed target.
 async fn publish_provider_set(args: ProviderSetArgs) -> Result<(), Error> {
     let backend = &args.backend;
-    let reconciler = reconciler(
-        &args.provider_path,
-        &args.provider_sha256,
-        &args.provider_arg,
-        args.provider_timeout_ms,
-    )?;
-    let set = updated_contracts::artifact::ProviderSet {
-        schema: 1,
-        id: args.id.clone(),
-        reconciler,
-    };
+    let set = provider_set(&args)?;
 
-    let (destination, store, keys, repo_dir) = checkout_repository(backend).await?;
+    let (destination, store, keys, checkout) = checkout_repository(backend).await?;
 
     let build_dir = tempfile::tempdir()?;
     let source = build_dir.path().join("provider-set.json");
     tokio::fs::write(&source, serde_json::to_vec(&set)?).await?;
-    let target_name = format!("provider-sets/{}.json", args.id);
+    let target_name = format!("provider-sets/{}.json", set.id);
     let target = PublishTarget {
         name: target_name.clone(),
         source,
         custom: Default::default(),
     };
-    repo::add_release(repo_dir.path(), &keys, vec![target], args.expiry_days).await?;
-    let sha256 = repo::target_sha256(repo_dir.path(), &target_name).await?;
-    updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
+    repo::add_release(checkout.path(), &keys, vec![target], args.expiry_days).await?;
+    let sha256 = repo::target_sha256(checkout.path(), &target_name).await?;
+    checkout.publish(store.as_ref(), &destination).await?;
     println!("{target_name} {sha256}");
     eprintln!("published provider set {target_name} (sha256 {sha256})");
     Ok(())
 }
 
-/// Build a signed node reconciler from a validated artifact reference.
-fn reconciler(
-    path: &str,
-    sha256: &str,
-    args: &[String],
-    timeout_millis: u64,
-) -> Result<updated_contracts::artifact::Reconciler, Error> {
-    if !updated_contracts::is_sha256_hex(sha256) {
-        return Err(format!("provider sha256 {sha256:?} must be 64 hexadecimal characters").into());
-    }
-    Ok(updated_contracts::artifact::Reconciler {
-        artifact: updated_contracts::artifact::TargetReference {
-            path: path.to_owned(),
-            sha256: sha256.to_ascii_lowercase(),
+/// Build the provider-set document this command will sign, and hold it to exactly the rule every
+/// agent applies.
+///
+/// A published set is an immutable signed target: a document that fails `ProviderSet::validate`
+/// (a zero or over-long timeout, an id the grammar rejects, an unconfined provider path, too many
+/// arguments) is accepted by no node in the fleet, and the only remedy is publishing a corrected
+/// id. So the same `validate` the agent runs at staging time runs here, before any signing or
+/// upload, rather than a weaker digest-only approximation of it.
+fn provider_set(args: &ProviderSetArgs) -> Result<updated_contracts::artifact::ProviderSet, Error> {
+    let set = updated_contracts::artifact::ProviderSet {
+        schema: updated_contracts::artifact::ProviderSet::SCHEMA,
+        id: args.id.clone(),
+        reconciler: updated_contracts::artifact::Reconciler {
+            artifact: updated_contracts::artifact::TargetReference {
+                path: args.provider_path.clone(),
+                sha256: args.provider_sha256.to_ascii_lowercase(),
+            },
+            args: args.provider_arg.clone(),
+            timeout_millis: args.provider_timeout_ms,
         },
-        args: args.to_vec(),
-        timeout_millis,
-    })
+    };
+    set.validate().map_err(|error| {
+        format!(
+            "refusing to publish provider set {:?}: {error} (nothing was signed or uploaded)",
+            args.id
+        )
+    })?;
+    Ok(set)
 }
 
 /// Emit the machine-readable deploy result: a clean stdout payload (text or JSON) plus,
@@ -792,6 +899,35 @@ fn emit_github_outputs(pairs: &[(&str, &str)]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Refuse a `--keys-dir` that already holds any role key.
+///
+/// `repo::generate_keys` mints only what is missing — deliberately, so `keygen` can top up a
+/// directory. `trust-root` is the opposite promise: it mints a *fresh* trust root, and the
+/// operator who runs it after a key disclosure is running it precisely to retire the exposed key.
+/// Reusing a leftover file there would pin the compromised key into the new root and report
+/// success, so the reuse is refused outright rather than made a flag: minting into a clean
+/// directory is the only way to get a root whose keys are all new, and `--force` is about
+/// replacing the published *repository*, never about overwriting private keys in place.
+fn ensure_keys_dir_is_empty(dir: &Path) -> Result<(), Error> {
+    let present: Vec<&str> = ROLE_KEYS
+        .into_iter()
+        .filter(|key| dir.join(key).exists())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "--keys-dir {} already holds role keys ({}); `trust-root` mints a fresh trust root and \
+         will not reuse an existing key — a root minted over a disclosed key would still be \
+         signed by it. Point --keys-dir at an empty directory (move the old keys aside if they \
+         are still needed to serve the current repository). Nothing was minted, signed, or \
+         uploaded.",
+        dir.display(),
+        present.join(", ")
+    )
+    .into())
+}
+
 /// Resolve the signing keys from a mounted directory. `deploy` signs only the online roles
 /// (targets/snapshot/timestamp), so the root keys are deliberately **not** required here —
 /// a release pipeline never needs the root private keys, only `trust-root`/`rotate-root` do.
@@ -805,37 +941,88 @@ fn open_keys(dir: &Path) -> Result<repo::Keys, Error> {
     Ok(repo::Keys::in_dir(dir))
 }
 
-/// Whether the release repository has already been initialized (its `metadata/root.json`
-/// exists in S3).
-/// The highest metadata version the live repository has published, across root, timestamp,
-/// snapshot, and targets. Missing or unreadable documents count as zero: the point is a floor to
-/// start above, and every document that IS present raises it.
-async fn live_metadata_version(
-    store: &dyn ObjectStore,
-    destination: &S3Destination,
-) -> Result<u64, Error> {
-    let mut highest = 0;
-    for name in [
-        "root.json",
-        "timestamp.json",
-        "snapshot.json",
-        "targets.json",
-    ] {
-        let key = ObjectPath::from(object_key(&destination.prefix, &format!("metadata/{name}")));
-        let bytes = match store.get(&key).await {
-            Ok(result) => result.bytes().await?,
-            Err(object_store::Error::NotFound { .. }) => continue,
-            Err(error) => return Err(error.into()),
-        };
-        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|document| document.pointer("/signed/version")?.as_u64())
-            .unwrap_or(0);
-        highest = highest.max(version);
+/// The four top-level TUF roles, the documents whose versions a publish bumps.
+const TOP_LEVEL_METADATA: [&str; 4] = [
+    "root.json",
+    "timestamp.json",
+    "snapshot.json",
+    "targets.json",
+];
+
+/// The version each top-level TUF role currently declares, held per role rather than collapsed
+/// into one number.
+///
+/// A single maximum cannot serve as the concurrent-publish measure: the roles advance
+/// independently. `repo::publish_release` bumps targets/snapshot/timestamp and leaves root alone,
+/// while `repo::rotate_root` and `repo::renew_root` bump only root — and under
+/// `consistent_snapshot` (what `repo::init_from_version` writes) only `root.json` and
+/// `timestamp.json` exist at unversioned names, so a maximum reduces to `max(root, timestamp)`.
+/// One root rotation therefore parks the maximum above the timestamp and masks the next
+/// publisher's commit entirely. Comparing role by role means every publish path advances a role
+/// the guard is watching.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RoleVersions([u64; TOP_LEVEL_METADATA.len()]);
+
+impl RoleVersions {
+    /// Read the live repository's role versions from S3. Missing or unreadable documents count
+    /// as zero — the guard only cares that a role's version is the one this process saw.
+    async fn live(store: &dyn ObjectStore, destination: &S3Destination) -> Result<Self, Error> {
+        let mut versions = Self::default();
+        for (slot, name) in TOP_LEVEL_METADATA.iter().enumerate() {
+            let key =
+                ObjectPath::from(object_key(&destination.prefix, &format!("metadata/{name}")));
+            let bytes = match store.get(&key).await {
+                Ok(result) => result.bytes().await?,
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            versions.0[slot] = document_version(&bytes);
+        }
+        Ok(versions)
     }
-    Ok(highest)
+
+    /// The same measure taken over a local checkout's downloaded copies, so a checkout is
+    /// compared against exactly the bytes it was built from.
+    async fn checkout(metadata_dir: &Path) -> Result<Self, Error> {
+        let mut versions = Self::default();
+        for (slot, name) in TOP_LEVEL_METADATA.iter().enumerate() {
+            match tokio::fs::read(metadata_dir.join(name)).await {
+                Ok(bytes) => versions.0[slot] = document_version(&bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(versions)
+    }
+
+    /// The highest version any role has published — the floor a replacement repository must
+    /// start above, because a TUF client refuses any role document below the version it last
+    /// accepted for that role.
+    fn highest(&self) -> u64 {
+        self.0.iter().copied().max().unwrap_or(0)
+    }
+
+    /// The first role whose version differs from `base`, described for an operator, or `None`
+    /// when every role still stands where `base` saw it.
+    fn moved_since(&self, base: &Self) -> Option<String> {
+        TOP_LEVEL_METADATA
+            .iter()
+            .enumerate()
+            .find(|(slot, _)| self.0[*slot] != base.0[*slot])
+            .map(|(slot, name)| format!("{name} from version {} to {}", base.0[slot], self.0[slot]))
+    }
 }
 
+/// The version a signed TUF document declares; zero when it is unreadable.
+fn document_version(bytes: &[u8]) -> u64 {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|document| document.pointer("/signed/version")?.as_u64())
+        .unwrap_or(0)
+}
+
+/// Whether the release repository has already been initialized (its `metadata/root.json`
+/// exists in S3).
 async fn repo_initialized(
     store: &dyn ObjectStore,
     destination: &S3Destination,
@@ -931,6 +1118,349 @@ mod tests {
             credentials_secret_ref: None,
             endpoint: None,
         }
+    }
+
+    /// The same backend the CLI flags produce. `checkout_metadata` reads it only to name the
+    /// repository in its diagnostics.
+    fn backend(prefix: &str) -> Backend {
+        Backend {
+            keys_dir: PathBuf::new(),
+            bucket: "releases".into(),
+            region: "us-east-1".into(),
+            prefix: prefix.into(),
+            endpoint: None,
+        }
+    }
+
+    fn provider_set_args() -> ProviderSetArgs {
+        ProviderSetArgs {
+            backend: backend("releases/app"),
+            id: "web-linux-v4".into(),
+            provider_path: "providers/lifecycle/1.0.0/linux-x86_64/lifecycle".into(),
+            provider_sha256: "A".repeat(64),
+            provider_arg: Vec::new(),
+            provider_timeout_ms: 300_000,
+            expiry_days: 365,
+        }
+    }
+
+    /// A published provider set is an immutable signed target. Every flag combination the agent's
+    /// own `validate` rejects must be refused here, before signing — a set that no node can accept
+    /// cannot be repaired, only superseded under a new id.
+    #[test]
+    fn a_provider_set_is_held_to_the_agents_validation_before_it_is_signed() {
+        let set = provider_set(&provider_set_args()).unwrap();
+        assert_eq!(
+            set.reconciler.artifact.sha256,
+            "a".repeat(64),
+            "the digest is normalized to the lowercase hex every agent compares against"
+        );
+
+        let cases = [
+            ("timeout", {
+                let mut args = provider_set_args();
+                args.provider_timeout_ms = 0;
+                args
+            }),
+            ("id", {
+                let mut args = provider_set_args();
+                args.id = "web linux".into();
+                args
+            }),
+            ("artifact reference", {
+                let mut args = provider_set_args();
+                args.provider_path = "../escape".into();
+                args
+            }),
+            ("artifact reference", {
+                let mut args = provider_set_args();
+                args.provider_sha256 = "not-a-digest".into();
+                args
+            }),
+            ("arguments", {
+                let mut args = provider_set_args();
+                args.provider_arg = vec!["--flag".into(); 257];
+                args
+            }),
+        ];
+        for (expected, args) in cases {
+            let error = provider_set(&args)
+                .err()
+                .unwrap_or_else(|| panic!("{expected}: expected a rejection"))
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(
+                error.contains("nothing was signed"),
+                "the operator is told the repository is untouched: {error}"
+            );
+        }
+    }
+
+    /// Publishing is read-modify-write over shared signed metadata: two publishers against one
+    /// prefix each sign a generation N+1 that omits the other's targets, and the last upload wins
+    /// — silently erasing a target that a freshly patched UpdateGroup already points at. A
+    /// checkout must refuse to publish over a generation it never saw, uploading nothing.
+    #[tokio::test]
+    async fn a_republish_refuses_a_generation_it_did_not_check_out() {
+        let root = scratch("concurrent");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        let origin = root.join("origin");
+        repo::init(&origin, &keys, 365).await.unwrap();
+
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        let backend = backend("releases/app");
+        updatec::runtime::publish_repository(&store, &dest, &origin)
+            .await
+            .unwrap();
+
+        // Both publishers check out the same generation, as two CI jobs would.
+        let ours = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        let theirs = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        assert_eq!(
+            ours.generation,
+            RoleVersions::live(&store, &dest).await.unwrap()
+        );
+
+        // The other publisher commits while we are still building and signing.
+        let file = root.join("theirs.json");
+        tokio::fs::write(&file, b"{}").await.unwrap();
+        repo::add_release(
+            theirs.path(),
+            &keys,
+            vec![PublishTarget {
+                name: "provider-sets/theirs.json".into(),
+                source: file,
+                custom: Default::default(),
+            }],
+            365,
+        )
+        .await
+        .unwrap();
+        theirs.publish(&store, &dest).await.unwrap();
+        let published = RoleVersions::live(&store, &dest).await.unwrap();
+        assert_ne!(published, ours.generation);
+        let published = published.highest();
+
+        let error = ours
+            .publish(&store, &dest)
+            .await
+            .expect_err("a stale checkout must not overwrite the live generation")
+            .to_string();
+        assert!(error.contains("another publisher"), "{error}");
+
+        // The other publisher's generation is intact: nothing was uploaded over it.
+        assert_eq!(
+            RoleVersions::live(&store, &dest).await.unwrap().highest(),
+            published
+        );
+        let mirror = root.join("mirror");
+        tokio::fs::create_dir_all(&mirror).await.unwrap();
+        download_metadata(&store, &dest, &mirror).await.unwrap();
+        let targets = tokio::fs::read_to_string(mirror.join(format!("{published}.targets.json")))
+            .await
+            .unwrap();
+        assert!(
+            targets.contains("provider-sets/theirs.json"),
+            "the concurrent publisher's signed target survived"
+        );
+    }
+
+    /// The concurrent-publish guard must survive a root rotation. A rotation bumps root and
+    /// nothing else, so any measure that collapses the roles into one maximum is parked above the
+    /// timestamp — and every publish after it looks unchanged, letting a stale checkout overwrite
+    /// a concurrent publisher's signed targets exactly as if there were no guard at all.
+    #[tokio::test]
+    async fn a_root_rotation_does_not_blind_the_concurrent_publish_guard() {
+        let root = scratch("rotated-generation");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        let origin = root.join("origin");
+        repo::init(&origin, &keys, 365).await.unwrap();
+
+        // Rotate the root once: root reaches version 2 while timestamp stays at 1.
+        let successor = root.join("successor.pk8");
+        repo::generate_root_key(&successor).await.unwrap();
+        repo::rotate_root(&origin, &keys.roots[1..], &successor, 365)
+            .await
+            .unwrap();
+
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        let backend = backend("releases/app");
+        updatec::runtime::publish_repository(&store, &dest, &origin)
+            .await
+            .unwrap();
+
+        let ours = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        let theirs = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        // The state the guard used to be blind to: root is ahead of every other role.
+        assert!(
+            ours.generation.0[0] > ours.generation.0[1],
+            "root outranks timestamp after a rotation: {:?}",
+            ours.generation
+        );
+
+        let file = root.join("theirs.json");
+        tokio::fs::write(&file, b"{}").await.unwrap();
+        repo::add_release(
+            theirs.path(),
+            &keys,
+            vec![PublishTarget {
+                name: "provider-sets/theirs.json".into(),
+                source: file,
+                custom: Default::default(),
+            }],
+            365,
+        )
+        .await
+        .unwrap();
+        theirs.publish(&store, &dest).await.unwrap();
+
+        let error = ours
+            .publish(&store, &dest)
+            .await
+            .expect_err("a stale checkout must abort even when root outranks timestamp")
+            .to_string();
+        assert!(error.contains("timestamp.json"), "{error}");
+        assert!(error.contains("another publisher"), "{error}");
+
+        // The concurrent publisher's target is still the one in verified metadata.
+        let mirror = root.join("mirror");
+        tokio::fs::create_dir_all(&mirror).await.unwrap();
+        download_metadata(&store, &dest, &mirror).await.unwrap();
+        // Under consistent_snapshot the targets role lives only at its versioned name.
+        let mut survived = false;
+        for entry in std::fs::read_dir(&mirror).unwrap() {
+            let path = entry.unwrap().path();
+            if path.to_string_lossy().ends_with(".targets.json") {
+                survived |= std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("provider-sets/theirs.json");
+            }
+        }
+        assert!(
+            survived,
+            "the concurrent publisher's signed target survived"
+        );
+    }
+
+    /// `trust-root` promises a *fresh* trust root, and an operator reaches for it after a key
+    /// disclosure. `repo::generate_keys` is idempotent, so a directory still holding the exposed
+    /// key would be reused and the new root signed by it — the command must refuse instead, before
+    /// anything is minted, signed, or uploaded.
+    #[test]
+    fn trust_root_refuses_a_keys_dir_that_already_holds_a_role_key() {
+        let dir = scratch("trust-root-keys");
+        assert!(ensure_keys_dir_is_empty(&dir).is_ok(), "an empty dir mints");
+
+        std::fs::write(dir.join("targets.pk8"), b"leaked").unwrap();
+        let error = ensure_keys_dir_is_empty(&dir)
+            .expect_err("a leftover role key must be refused, never silently reused")
+            .to_string();
+        assert!(error.contains("targets.pk8"), "{error}");
+        assert!(error.contains("will not reuse"), "{error}");
+        assert!(error.contains("Nothing was minted"), "{error}");
+
+        // Every role key counts, including the standby root.
+        std::fs::remove_file(dir.join("targets.pk8")).unwrap();
+        std::fs::write(dir.join("root.next.pk8"), b"standby").unwrap();
+        assert!(ensure_keys_dir_is_empty(&dir).is_err());
+    }
+
+    /// The provider set a release pins is signed into the app target and read exactly once —
+    /// during an ordered-fallback descent on a node, mid-rollback. A well-formed but mismatched
+    /// path/digest pair is therefore resolved against the checked-out signed metadata here, where
+    /// the answer is already in hand, instead of stalling a node at recovery time.
+    #[tokio::test]
+    async fn deploy_resolves_the_pinned_provider_set_against_the_checked_out_metadata() {
+        let root = scratch("provider-set-ref");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        let origin = root.join("origin");
+        repo::init(&origin, &keys, 365).await.unwrap();
+
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        let backend = backend("releases/app");
+        updatec::runtime::publish_repository(&store, &dest, &origin)
+            .await
+            .unwrap();
+
+        // Publish one provider set, as `publish-provider-set` does.
+        let published = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        let file = root.join("set.json");
+        tokio::fs::write(&file, b"{}").await.unwrap();
+        repo::add_release(
+            published.path(),
+            &keys,
+            vec![PublishTarget {
+                name: "provider-sets/web-v4.json".into(),
+                source: file,
+                custom: Default::default(),
+            }],
+            365,
+        )
+        .await
+        .unwrap();
+        let sha = repo::target_sha256(published.path(), "provider-sets/web-v4.json")
+            .await
+            .unwrap();
+        published.publish(&store, &dest).await.unwrap();
+
+        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        assert_eq!(
+            resolve_provider_set(&checkout, Some("provider-sets/web-v4.json"), Some(&sha))
+                .await
+                .unwrap(),
+            Some(("provider-sets/web-v4.json".to_string(), sha.clone())),
+            "the published set resolves and is signed in its lowercase form"
+        );
+        assert_eq!(
+            resolve_provider_set(&checkout, None, None).await.unwrap(),
+            None,
+            "omitting the flags leaves provider selection to the assignment head"
+        );
+        assert_eq!(
+            resolve_provider_set(
+                &checkout,
+                Some("provider-sets/web-v4.json"),
+                Some(&sha.to_ascii_uppercase())
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
+            sha,
+            "digests compare case-insensitively and are normalized before signing"
+        );
+
+        // The stale copy-paste: a path that was never published, paired with a valid digest.
+        let error = resolve_provider_set(&checkout, Some("provider-sets/web-v3.json"), Some(&sha))
+            .await
+            .expect_err("an unresolvable provider set path must not be signed")
+            .to_string();
+        assert!(error.contains("does not resolve"), "{error}");
+        assert!(error.contains("Nothing was signed"), "{error}");
+
+        // A real path against the wrong release's digest.
+        let error = resolve_provider_set(
+            &checkout,
+            Some("provider-sets/web-v4.json"),
+            Some(&"b".repeat(64)),
+        )
+        .await
+        .expect_err("a digest that is not this target's must not be signed")
+        .to_string();
+        assert!(
+            error.contains("does not match the signed digest"),
+            "{error}"
+        );
+
+        let error =
+            resolve_provider_set(&checkout, Some("provider-sets/web-v4.json"), Some("nope"))
+                .await
+                .expect_err("a malformed digest is still rejected")
+                .to_string();
+        assert!(error.contains("64-character hex"), "{error}");
     }
 
     #[test]
