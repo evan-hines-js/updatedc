@@ -142,6 +142,14 @@ stateDiagram-v2
   (free slots) are two independent conditions, each represented once. A group with
   `spec.emergencyCorrection: true` waives the schedule — and only the schedule: it still waits for
   a free slot, so an emergency never becomes a fleet-wide simultaneous change.
+- **A new group is not a waiver.** A group's *first* admission skips the window only when the nodes
+  it selects have never been published to; creating an `UpdateGroup` over already-published
+  production machines is an ordinary admission and waits for the window like any other.
+  `spec.emergencyCorrection` remains the only schedule waiver.
+- **A quarantined dependency is present-but-frozen.** A `depends_on` edge into a held group is
+  satisfied and not traversed, so one quarantined group cannot abort publication for the whole
+  repository. Its dependents simply stay `Held` — their inputs never resolve — and their nodes keep
+  the routing they already have.
 
 - **Recurring windows** (UTC `HH:MM` spans, weekday/biweekly/N-weekly, may wrap past midnight):
   empty ⇒ always open; open if *any* window is active. Unparseable ⇒ closed (fail-safe).
@@ -408,7 +416,13 @@ Everything above shares four guarantees:
    the same place.
 2. **Atomic activation.** State lands via write-temp → fsync → rename → fsync-dir; releases live in
    content-addressed dirs (`versions/<v>-<sha>`, `supervisors/<sha>`) so nothing is overwritten in
-   place.
+   place. Those trees are re-hashed on every check, so a release's *writable* scratch is a sibling —
+   `work/<v>-<sha>`, and `providers/work/<v>-<sha>` for lifecycle providers — and that sibling, not
+   the release tree, is the launch `cwd`. It is seeded with a copy of the release manifest's
+   declared files so relative reads of bundled config still work, and it is reaped once its release
+   directory has been gone for a grace period spanning two collection passes — a single missing
+   observation is the staging window in which a live release is republished over a drifted tree, not
+   an orphan.
 3. **Confirm on proof, revert on doubt.** A head is only trusted after a health gate; an unproven
    head is descended-past (provisional) or reverted-from (confirmed within window).
 4. **Fail safe, never fail open.** Missing/stale/ambiguous signals hold the last known-good:

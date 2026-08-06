@@ -121,6 +121,22 @@ pub struct Ctx {
     pub platkey: String,
     /// `.exe` on Windows, empty elsewhere.
     pub exe: &'static str,
+    /// `E2E_FIPS` was set for this run: every binary that does crypto builds `--features fips`.
+    pub fips: bool,
+}
+
+/// The cargo features every supervisor build in the run uses: `chaos` for the crash-injection
+/// points the recovery scenarios need, plus `fips` under `E2E_FIPS` so the supervisors the
+/// self-update scenarios publish and run link the validated provider too — the same binary
+/// shape as `Ctx::supervisor`. One source of truth, so no supervisor fixture can silently
+/// drop out of FIPS mode (and so feature unification never rebuilds the supervisor between
+/// fixtures).
+pub fn supervisor_features(fips: bool) -> &'static [&'static str] {
+    if fips {
+        &["chaos", "fips"]
+    } else {
+        &["chaos"]
+    }
 }
 
 impl Ctx {
@@ -201,6 +217,7 @@ impl Ctx {
             work,
             target,
             root,
+            fips: std::env::var_os("E2E_FIPS").is_some(),
         })
     }
 
@@ -213,8 +230,11 @@ impl Ctx {
         // signing) are built `--features fips`, which links the validated aws-lc-rs. The guardian
         // and sample apps do no crypto, so they build unchanged. A FIPS build that cannot validate
         // its provider fails closed at startup.
-        let fips = std::env::var_os("E2E_FIPS").is_some();
-        let fips_feature: &[&str] = if fips { &["--features", "fips"] } else { &[] };
+        let fips_feature: &[&str] = if self.fips {
+            &["--features", "fips"]
+        } else {
+            &[]
+        };
         let crypto_cdn = [
             ["build", "--release", "-p", "server"].as_slice(),
             fips_feature,
@@ -222,21 +242,14 @@ impl Ctx {
         .concat();
         cargo(&self.root, None, &crypto_cdn)?;
         cargo(&self.root, None, &["build", "--release", "-p", "bootstrap"])?;
-        let supervisor_features = if fips { "chaos,fips" } else { "chaos" };
-        cargo(
-            &self.root,
-            None,
-            &[
-                "build",
-                "--release",
-                "-p",
-                "supervisor",
-                "--features",
-                supervisor_features,
-            ],
+        // Same package, env and features as every versioned supervisor fixture; only the
+        // staged name differs.
+        self.build_and_stage(
+            "supervisor",
+            &[],
+            supervisor_features(self.fips),
+            "supervisor-chaos",
         )?;
-        let built = self.target.join(format!("release/supervisor{}", self.exe));
-        std::fs::copy(built, &self.supervisor).map_err(str_err)?;
         Ok(())
     }
 
@@ -277,12 +290,12 @@ impl Ctx {
         self.build_and_stage(
             "supervisor",
             &[("SUPERVISOR_VERSION", version)],
-            &["chaos"],
+            supervisor_features(self.fips),
             &format!("supervisor-{version}"),
         )
     }
 
-    /// Build a chaos-only candidate that completes boot and signals ready, then exits
+    /// Build a candidate that completes boot and signals ready, then exits
     /// before the guardian's confirmation window can commit it.
     pub fn build_post_ready_crashing_supervisor(&self, version: &str) -> R<PathBuf> {
         self.build_and_stage(
@@ -291,7 +304,7 @@ impl Ctx {
                 ("SUPERVISOR_VERSION", version),
                 ("SUPERVISOR_CHAOS_EXIT_AFTER_READY", "1"),
             ],
-            &["chaos"],
+            supervisor_features(self.fips),
             &format!("supervisor-post-ready-crash-{version}"),
         )
     }
@@ -1130,4 +1143,19 @@ pub fn make_owner_writable(path: &Path) -> R {
         permissions.set_attributes(permissions.attributes() & !FILE_ATTRIBUTE_READONLY);
     }
     std::fs::set_permissions(path, permissions).map_err(str_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supervisor_features;
+
+    /// The self-update scenarios publish and run the fixtures `build_supervisor` /
+    /// `build_post_ready_crashing_supervisor` produce, so those builds must carry `fips`
+    /// under `E2E_FIPS` exactly as `Ctx::build`'s canonical supervisor does — otherwise a
+    /// FIPS run exercises the TUF-fetch, digest-verify and staging path on default crypto.
+    #[test]
+    fn every_supervisor_build_is_chaos_and_gains_fips_with_the_run() {
+        assert_eq!(supervisor_features(false), &["chaos"]);
+        assert_eq!(supervisor_features(true), &["chaos", "fips"]);
+    }
 }

@@ -145,8 +145,10 @@ struct RotateRootArgs {
     #[command(flatten)]
     backend: Backend,
 
-    /// Where to write the freshly minted successor root key (mode 0600). Load it into Vault
-    /// as the new standby after rotation. Must not already exist.
+    /// Where the freshly minted successor root key is written (mode 0600), once the rotation has
+    /// published. Load it into Vault as the new standby after rotation. Must not already exist —
+    /// an attempt whose publish does not land writes nothing here, so retrying the ceremony is
+    /// the identical re-run.
     #[arg(long, env = "UPDATECTL_NEW_KEY_OUT")]
     new_key_out: PathBuf,
 
@@ -434,6 +436,10 @@ async fn trust_root(args: TrustRootArgs) -> Result<(), Error> {
 
 async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
     let backend = &args.backend;
+
+    // Nothing is minted, signed or uploaded until the destination for the successor key is known
+    // to be free: the key that ends up at --new-key-out must be one this ceremony minted.
+    ensure_new_key_out_is_free(&args.new_key_out)?;
     let (destination, store) = build_store(backend)?;
 
     // The current root must carry two keys (active + standby) so one can sign the transition.
@@ -450,19 +456,16 @@ async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
     // Pull the current metadata so the new root version bumps from it.
     let checkout = checkout_metadata(store.as_ref(), &destination, backend).await?;
 
-    // Mint the successor, then publish a new root version co-signed by the retained standby
-    // (which retires the old active key) and the successor.
-    repo::generate_root_key(&args.new_key_out).await?;
+    // Mint the successor into a private staging file, then publish a new root version co-signed by
+    // the retained standby (which retires the old active key) and the successor. The staged key
+    // only moves to --new-key-out after the publish lands; an attempt that fails removes it, so
+    // the retry is a plain re-run that mints again.
+    let pending = PendingRootKey::mint(&args.new_key_out).await?;
     let retained = &keys.roots[1..];
-    repo::rotate_root(
-        checkout.path(),
-        retained,
-        &args.new_key_out,
-        args.expiry_days,
-    )
-    .await?;
+    repo::rotate_root(checkout.path(), retained, pending.path(), args.expiry_days).await?;
     let root_json = tokio::fs::read(checkout.path().join("metadata").join("root.json")).await?;
     checkout.publish(store.as_ref(), &destination).await?;
+    pending.commit()?;
 
     eprintln!(
         "rotated root at s3://{}/{}; minted successor key at {}",
@@ -926,6 +929,105 @@ fn ensure_keys_dir_is_empty(dir: &Path) -> Result<(), Error> {
         present.join(", ")
     )
     .into())
+}
+
+/// `--new-key-out` must name a path that does not exist. Whatever ends up there becomes a root
+/// key at threshold 1 for the whole fleet, so it has to be a key this ceremony minted — a file
+/// found at the path is of unknown provenance (planted by another local principal on a shared
+/// runner, or a stale copy of an online role key) and is never adopted, whatever its mode.
+fn ensure_new_key_out_is_free(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspecting --new-key-out {}: {error}", path.display()).into()),
+        Ok(_) => Err(format!(
+            "--new-key-out {} already exists; `rotate-root` signs the key at this path into the \
+             new root at threshold 1 and will only ever do that for a key it minted itself, so a \
+             pre-existing file is refused rather than adopted. A rotation whose publish did not \
+             land writes nothing here — retry the identical command. If this is a successor key \
+             from a completed rotation, point --new-key-out at a fresh path. Nothing was minted, \
+             signed, or uploaded.",
+            path.display()
+        )
+        .into()),
+    }
+}
+
+/// The successor root key, minted into a private staging file next to `--new-key-out` and moved
+/// there only once the rotated root has been published.
+///
+/// This is what makes the ceremony — the one that answers a suspected root-key disclosure —
+/// retryable without trusting a file on disk. The rotation is mint-then-publish and the publish
+/// is allowed to fail for routine reasons (the generation guard aborts when another publisher
+/// moved the prefix; S3 has transients). Such a failure uploads nothing, so the root is *not*
+/// rotated, and dropping this guard removes the staged key: `--new-key-out` is still free and the
+/// identical re-run mints a fresh successor and completes the ceremony. The operator never has to
+/// hand-delete private key material, and no path exists by which a key the ceremony did not mint
+/// reaches the new root.
+struct PendingRootKey {
+    staged: PathBuf,
+    destination: PathBuf,
+    committed: bool,
+}
+
+impl PendingRootKey {
+    /// Mint a fresh ed25519 key into a staging file. `repo::generate_root_key` creates it
+    /// exclusively at mode 0600, so a name another principal pre-planted is a hard error here
+    /// rather than an adoption.
+    async fn mint(destination: &Path) -> Result<Self, Error> {
+        let stem = destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "root-successor".to_string());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let staged =
+            destination.with_file_name(format!(".{stem}.pending.{}.{nonce}", std::process::id()));
+        repo::generate_root_key(&staged).await?;
+        Ok(Self {
+            staged,
+            destination: destination.to_path_buf(),
+            committed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.staged
+    }
+
+    /// Move the staged key to `--new-key-out`. Called only after the rotated root is published,
+    /// at which point the key must be delivered to the operator: if the destination was taken
+    /// since the pre-flight check, the staged file is kept and named rather than clobbered or
+    /// deleted.
+    fn commit(mut self) -> Result<(), Error> {
+        self.committed = true;
+        ensure_new_key_out_is_free(&self.destination).map_err(|error| {
+            format!(
+                "{error}\nThe root WAS rotated and published. The successor key is at {} — move \
+                 it somewhere safe and load it into Vault as the new standby.",
+                self.staged.display()
+            )
+        })?;
+        std::fs::rename(&self.staged, &self.destination).map_err(|error| {
+            format!(
+                "the root was rotated and published, but moving the successor key to {}: {error}. \
+                 The key is at {} — move it somewhere safe and load it into Vault as the new \
+                 standby.",
+                self.destination.display(),
+                self.staged.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for PendingRootKey {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.staged);
+        }
+    }
 }
 
 /// Resolve the signing keys from a mounted directory. `deploy` signs only the online roles
@@ -1515,6 +1617,120 @@ mod tests {
         assert!(open_keys(&dir).is_ok());
         std::fs::remove_file(dir.join("targets.pk8")).unwrap();
         assert!(open_keys(&dir).is_err(), "a missing online key is rejected");
+    }
+
+    /// The root rotation is mint-then-publish and the publish is allowed to fail (generation
+    /// guard, S3 transient), which uploads nothing and leaves the root unrotated. The identical
+    /// re-run — the only thing an operator answering a key disclosure should have to do — must
+    /// complete the ceremony, and the failed attempt must leave no key material behind for it to
+    /// stumble over.
+    #[tokio::test]
+    async fn an_interrupted_root_rotation_leaves_no_key_and_is_completed_by_an_identical_re_run() {
+        let root = scratch("rotate-retry");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        let origin = root.join("origin");
+        repo::init(&origin, &keys, 365).await.unwrap();
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        updatec::runtime::publish_repository(&store, &dest, &origin)
+            .await
+            .unwrap();
+
+        // Attempt one: the key is staged, then the publish fails and uploads nothing. Dropping
+        // the guard — what the process exit does — removes the staged key.
+        let successor = root.join("successor.pk8");
+        ensure_new_key_out_is_free(&successor).unwrap();
+        let staged = {
+            let pending = PendingRootKey::mint(&successor).await.unwrap();
+            pending.path().to_path_buf()
+        };
+        assert!(
+            !staged.exists(),
+            "the failed attempt removed its staged key"
+        );
+        assert!(
+            !successor.exists(),
+            "a rotation that did not publish writes nothing to --new-key-out"
+        );
+
+        // Attempt two: the same command, from the state attempt one left behind.
+        ensure_new_key_out_is_free(&successor)
+            .expect("the re-run is not blocked by the interrupted attempt");
+        let work = root.join("work");
+        let work_metadata = work.join("metadata");
+        tokio::fs::create_dir_all(&work_metadata).await.unwrap();
+        download_metadata(&store, &dest, &work_metadata)
+            .await
+            .unwrap();
+        let pending = PendingRootKey::mint(&successor).await.unwrap();
+        repo::rotate_root(&work, &keys.roots[1..], pending.path(), 365)
+            .await
+            .unwrap();
+        updatec::runtime::publish_repository(&store, &dest, &work)
+            .await
+            .unwrap();
+        pending.commit().unwrap();
+        let published = store
+            .get(&ObjectPath::from(object_key(
+                &dest.prefix,
+                "metadata/root.json",
+            )))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            document_version(&published),
+            2,
+            "the retry published the rotated root"
+        );
+        assert!(
+            successor.exists(),
+            "the successor key is delivered once the rotation published"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&successor).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the delivered key stays private");
+        }
+    }
+
+    /// Whatever sits at `--new-key-out` would be signed into the new root at threshold 1, so a
+    /// file the ceremony did not mint is refused — a private-looking mode is not provenance, and
+    /// nothing is signed or uploaded.
+    #[tokio::test]
+    async fn a_pre_existing_file_at_new_key_out_is_never_adopted_as_root_key_material() {
+        let root = scratch("rotate-planted");
+
+        // A key of the attacker's own making, at exactly the mode a minted key carries.
+        let planted = root.join("planted.pk8");
+        repo::generate_root_key(&planted).await.unwrap();
+        let bytes = std::fs::read(&planted).unwrap();
+        let error = ensure_new_key_out_is_free(&planted)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(
+            std::fs::read(&planted).unwrap(),
+            bytes,
+            "the refusal leaves the operator's path untouched"
+        );
+
+        // Nor a directory, nor a symlink pointing at key material elsewhere.
+        let dir = root.join("dir.pk8");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(ensure_new_key_out_is_free(&dir).is_err());
+        #[cfg(unix)]
+        {
+            let link = root.join("link.pk8");
+            std::os::unix::fs::symlink(&planted, &link).unwrap();
+            assert!(
+                ensure_new_key_out_is_free(&link).is_err(),
+                "a symlink is refused without following it"
+            );
+        }
     }
 
     /// Author a repo, publish it to an in-memory store, then run the CLI's own

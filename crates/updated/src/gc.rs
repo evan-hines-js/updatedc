@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::bundle::ReleaseId;
 
@@ -13,6 +13,98 @@ struct Entry {
     path: PathBuf,
     bytes: u64,
     modified: SystemTime,
+}
+
+/// Marker written into a workspace the moment its release directory is first observed missing.
+/// Dot-prefixed and namespaced so it cannot collide with anything an application keeps in its own
+/// working directory, and inside the workspace so it is removed with it.
+const ORPHAN_MARKER: &str = ".updated-orphaned-since";
+
+/// How long a release directory must stay missing before its workspace is scratch nobody owns.
+///
+/// This only has to outlast the window in which a *live* release is legitimately absent from
+/// `versions/`: [`crate::bundle::stage_bundle`] unlinks a drifted committed tree and republishes
+/// the verified one over it (`discard` → `sync_tree` → `rename`), which is milliseconds to seconds
+/// even for a large tree on a slow device. Ten minutes is far past that and still bounds how long
+/// genuinely dead scratch can occupy disk, given that a reap runs on every resolve and every
+/// confirmation tick.
+const ORPHAN_GRACE: Duration = Duration::from_secs(600);
+
+/// Drop every writable workspace under `work` whose release directory has been gone from
+/// `versions` since a previous pass.
+///
+/// A release's scratch (`work/<version>-<sha>`) must exist exactly as long as the release does: it
+/// is deliberately outside the content-addressed tree so the application can write to its own
+/// working directory without failing release verification, which also means nothing else prunes it.
+/// Both the launch path — which creates the workspace it is about to hand out — and the periodic
+/// collector that prunes the release directories call this, so scratch disappears once its release
+/// is gone rather than lingering until the node happens to launch something.
+///
+/// **A single observation of a missing release directory is not evidence of an orphan.** A release
+/// that is very much alive is transiently absent while [`crate::bundle::stage_bundle`] repairs a
+/// drifted committed tree: it `discard`s `versions/<id>` and only republishes the verified tree
+/// over it after `sync_tree`. A reap landing inside that window used to delete the running
+/// application's logs, pid file and database. The decision is therefore anchored on *persistent*
+/// absence: the first pass that sees the release missing only stamps [`ORPHAN_MARKER`] into the
+/// workspace, and a later pass removes the workspace only once that stamp has stood unchallenged
+/// for [`ORPHAN_GRACE`]. A release that comes back — a repair completing, or a crash between
+/// discard and rename healed by the next install — clears the stamp again, so its scratch survives.
+/// Nothing here takes a lock: this runs on the per-resolve launch path, which must never block on
+/// an installer.
+///
+/// Best-effort by design: leftover scratch costs disk, never correctness, and neither a launch nor
+/// a collection pass may fail because one stale directory resisted removal. Only direct children of
+/// `work` that are real directories are touched, and the release check is `is_dir` on the
+/// corresponding `versions` entry, so a dangling symlink or an unknown file never protects a
+/// workspace or leads deletion elsewhere.
+pub fn reap_orphaned_workspaces(work: &Path, versions: &Path) {
+    reap_orphaned_workspaces_after(work, versions, ORPHAN_GRACE);
+}
+
+/// [`reap_orphaned_workspaces`] with an explicit grace, so tests can drive the two-observation rule
+/// without sleeping.
+pub(crate) fn reap_orphaned_workspaces_after(work: &Path, versions: &Path, grace: Duration) {
+    let Ok(entries) = fs::read_dir(work) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let workspace = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&workspace) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let marker = workspace.join(ORPHAN_MARKER);
+        if versions.join(entry.file_name()).is_dir() {
+            // The release is here, so any earlier suspicion was the staging window (or a repair
+            // that has since completed). Forget it, or a future absence would be judged by a
+            // long-expired stamp.
+            let _ = fs::remove_file(&marker);
+            continue;
+        }
+        match orphaned_for(&marker) {
+            Some(elapsed) if elapsed >= grace => {
+                let _ = fs::remove_dir_all(&workspace);
+            }
+            Some(_) => {}
+            None => {
+                let _ = fs::write(&marker, b"");
+            }
+        }
+    }
+}
+
+/// How long this workspace has been marked orphaned, or `None` if it carries no usable mark yet.
+/// A clock that moved backwards since the mark was written reads as "not long enough", which only
+/// ever delays a deletion.
+fn orphaned_for(marker: &Path) -> Option<Duration> {
+    let modified = fs::metadata(marker).ok()?.modified().ok()?;
+    Some(
+        SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default(),
+    )
 }
 
 /// Remove oldest unprotected release directories until both inactive limits hold.
@@ -196,6 +288,109 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A workspace and its release directory, with application scratch already in the workspace.
+    fn workspace_pair(root: &Path, id: &ReleaseId) -> (PathBuf, PathBuf) {
+        let work = root.join("work").join(id.directory_name());
+        let release = root.join("versions").join(id.directory_name());
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&release).unwrap();
+        fs::write(work.join("app.db"), b"live application state").unwrap();
+        (work, release)
+    }
+
+    /// The defect: `stage_bundle` unlinks a drifted committed release before renaming the verified
+    /// tree over it, so a reap landing in that window saw `versions/<id>` missing and deleted the
+    /// *running* application's state. One observation of absence must decide nothing.
+    #[test]
+    fn a_transiently_absent_release_does_not_cost_its_workspace_its_scratch() {
+        let root = temp();
+        let id = release("1.0.0", 1);
+        let (work_dir, release_dir) = workspace_pair(&root, &id);
+        let work = root.join("work");
+        let versions = root.join("versions");
+
+        // Inside stage_bundle's discard -> sync_tree -> rename window.
+        fs::remove_dir_all(&release_dir).unwrap();
+        for _ in 0..3 {
+            reap_orphaned_workspaces(&work, &versions);
+        }
+        assert_eq!(
+            fs::read(work_dir.join("app.db")).unwrap(),
+            b"live application state"
+        );
+
+        // The repair republishes the tree; the suspicion must be forgotten, not banked.
+        fs::create_dir_all(&release_dir).unwrap();
+        reap_orphaned_workspaces(&work, &versions);
+        assert!(!work_dir.join(ORPHAN_MARKER).exists());
+        assert!(work_dir.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_workspace_is_reaped_once_its_release_has_stayed_gone() {
+        let root = temp();
+        let id = release("1.0.0", 1);
+        let (work_dir, release_dir) = workspace_pair(&root, &id);
+        let kept = release("2.0.0", 2);
+        let (kept_dir, _) = workspace_pair(&root, &kept);
+        let work = root.join("work");
+        let versions = root.join("versions");
+
+        fs::remove_dir_all(&release_dir).unwrap();
+        // First pass only records the absence, however long the grace.
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        assert!(work_dir.join(ORPHAN_MARKER).is_file());
+        assert!(work_dir.is_dir());
+        // A later pass, with the absence still standing, removes it.
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        assert!(!work_dir.exists());
+        assert!(kept_dir.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_release_that_returns_restarts_the_orphan_clock() {
+        let root = temp();
+        let id = release("1.0.0", 1);
+        let (work_dir, release_dir) = workspace_pair(&root, &id);
+        let work = root.join("work");
+        let versions = root.join("versions");
+
+        fs::remove_dir_all(&release_dir).unwrap();
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        fs::create_dir_all(&release_dir).unwrap();
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        // The stamp from the earlier absence must not authorize the next pass to delete.
+        fs::remove_dir_all(&release_dir).unwrap();
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        assert!(work_dir.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reaping_ignores_files_and_symlinks_under_work() {
+        let root = temp();
+        let work = root.join("work");
+        let versions = root.join("versions");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&versions).unwrap();
+        fs::write(work.join("stray-file"), b"bytes").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&versions, work.join("stray-link")).unwrap();
+        for _ in 0..2 {
+            reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        }
+        assert!(work.join("stray-file").is_file());
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(work.join("stray-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(versions.is_dir());
         let _ = fs::remove_dir_all(root);
     }
 

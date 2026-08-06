@@ -386,13 +386,7 @@ impl Demo {
             } else {
                 "resuming"
             };
-            state.running = true;
-            state.complete = false;
-            state.seed = seed;
-            state.error = None;
-            state.active_broken.clear();
-            state.active_valid.clear();
-            state.converging = false;
+            let first_loop = state.begin_run(seed);
             state.events.push(format!(
                 "seed {seed}: {verb} convergence chaos from {baseline_major}.0.0"
             ));
@@ -402,7 +396,7 @@ impl Demo {
                 );
             }
             trim_events(&mut state.events);
-            state.loop_number
+            first_loop
         };
         let demo = self.clone();
         let task = tokio::spawn(async move {

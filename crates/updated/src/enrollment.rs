@@ -453,7 +453,7 @@ async fn mint_leaf(bootstrap: &BootstrapConfig, state_dir: &Path) -> io::Result<
     )
     .await?;
     let enrolled: EnrollResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
-    enrolled.bundle.validate_shape()?;
+    validate_bundle(&enrolled.bundle)?;
     validate_leaf(
         &enrolled.leaf,
         &enrolled.chain,
@@ -707,8 +707,46 @@ fn persist_leaf(state_dir: &Path, leaf_pem: &str, chain_pem: &str) -> io::Result
 
 fn decode(bytes: &[u8]) -> io::Result<EnrollmentBundle> {
     let bundle: EnrollmentBundle = serde_json::from_slice(bytes).map_err(invalid_error)?;
-    bundle.validate_shape()?;
+    validate_bundle(&bundle)?;
     Ok(bundle)
+}
+
+/// The single gate every enrollment bundle passes before this node will look at it, wherever it
+/// came from: the persisted copy, a preplaced one, the `/enroll` response, or a `/bundle` refresh.
+fn validate_bundle(bundle: &EnrollmentBundle) -> io::Result<()> {
+    bundle.validate_shape()?;
+    assignment_names_its_own_agent(bundle)
+}
+
+/// A bundle's `assignment` must be the routing target of the agent the bundle names.
+///
+/// `agent_id` and `assignment` are plaintext fields the gateway chooses; TUF covers only
+/// `routing_root` and `initial.*`. `verify_embedded_chain` then verifies the embedded agent
+/// document against *whatever path the bundle names*, and an [`AgentDocument`] carries no node
+/// identity of its own — so without this rule a gateway that had been taken over could hand node A
+/// a bundle with `agent_id: "a"` (which the identity checks accept) naming
+/// `assignments/agents/b.json` plus node B's genuinely published, correctly signed documents. Every
+/// signature, threshold and digest verifies, the enrollment-time root pin gives nothing, and node A
+/// permanently runs node B's product, args, secret mapping and install root. Binding the path to
+/// the identity is what closes it: the control plane publishes each agent's assignment at exactly
+/// `<prefix>/agents/<agent>.json` (`gateway::agent_assignment`, and the API contract), so a bundle
+/// naming another agent's path is refused whether or not that path is genuinely signed.
+///
+/// [`AgentDocument`]: updated_contracts::artifact::AgentDocument
+fn assignment_names_its_own_agent(bundle: &EnrollmentBundle) -> io::Result<()> {
+    if bundle
+        .assignment
+        .strip_suffix(".json")
+        .and_then(|path| path.rsplit_once("/agents/"))
+        .is_some_and(|(_, agent)| agent == bundle.agent_id)
+    {
+        return Ok(());
+    }
+    Err(invalid(&format!(
+        "enrollment bundle for agent {:?} names the assignment {:?}, which is another agent's \
+         routing target",
+        bundle.agent_id, bundle.assignment
+    )))
 }
 
 fn consume_if_needed(path: &Path) -> io::Result<()> {

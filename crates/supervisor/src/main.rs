@@ -374,16 +374,12 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     if let Some(tx) = recovery_transaction.as_mut() {
-        // Only a transaction that can still begin a rollback is moved onto the rollback path. A
-        // journal already in a terminal phase (committed, or rolled back) has nothing left to
-        // undo, and asking it to advance is an invalid transition — one that would fail this boot,
-        // and every boot after it, on a journal that is merely spent.
-        if !tx.is_rollback()
-            && !matches!(
-                tx.phase,
-                TransactionPhase::Committed | TransactionPhase::RolledBack
-            )
-        {
+        // Move a forward transaction onto the rollback path so its resume gates open. Every
+        // recovery that reaches here can make this transition: `boot::journal_recovery` refuses to
+        // hand back a journal whose phase cannot drive a rollback (a terminal `Committed` or
+        // `RolledBack` file left behind by a tolerated `clear_journal` failure), and the
+        // `pending`-derived rollbacks are synthesized already on the path.
+        if !tx.is_rollback() {
             advance_transaction(&mut store, tx, TransactionPhase::RollbackStarted)?;
         }
     }
@@ -1280,10 +1276,27 @@ fn is_node_local_transient(error: &io::Error) -> bool {
         return true;
     }
     // A hardware/transport read or write error has no `ErrorKind` of its own — it arrives
-    // `Uncategorized`, which is not matchable — so it is recognised by its raw code.
+    // `Uncategorized`, which is not matchable — so it is recognised by its raw code. A post-commit
+    // fsync failure arrives wrapped by `foundation::durable` ("the change landed but is not proved
+    // durable"), and an `io::Error` carrying that payload cannot ALSO carry a raw code — `Os` and
+    // `Custom` are alternative representations — so for those the code lives one `source` hop down,
+    // which `foundation::durable` documents and pins with a regression test.
     #[cfg(unix)]
     {
-        error.raw_os_error() == Some(libc::EIO)
+        if error.raw_os_error() == Some(libc::EIO) {
+            return true;
+        }
+        let mut source = std::error::Error::source(error);
+        while let Some(current) = source {
+            if current
+                .downcast_ref::<io::Error>()
+                .is_some_and(|cause| cause.raw_os_error() == Some(libc::EIO))
+            {
+                return true;
+            }
+            source = current.source();
+        }
+        false
     }
     #[cfg(not(unix))]
     {
@@ -1332,6 +1345,12 @@ fn garbage_collect(opts: &Options, store: &dyn Store) {
             "garbage collecting lifecycle providers failed: {error}"
         )),
     }
+    // A release's writable working directory lives outside its content-addressed tree — the tree is
+    // re-hashed on every check, so an application writing to its own `cwd` would condemn it — which
+    // means pruning the tree does not take the scratch with it. Reap here, in the same pass, rather
+    // than leaving it to whenever the node next resolves a release for launch.
+    updated::gc::reap_orphaned_workspaces(&opts.paths.work, &opts.paths.versions);
+    updated::gc::reap_orphaned_workspaces(&opts.paths.provider_work, &opts.paths.provider_versions);
 }
 
 /// Reject the bytes of a *provisional* (never-health-proven) cold-installed head so the next
@@ -1408,17 +1427,15 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
             Installed::Present(state) => Some(&state.release),
             Installed::Missing | Installed::Invalid => None,
         };
-        return match updated::transaction::classify_recovery(
-            tx,
-            situation.active.as_ref(),
-            committed,
-        ) {
+        return match boot::journal_recovery(tx, situation.active.as_ref(), committed) {
             // The predecessor must actually be restored: this journal IS the recovery, and it is
             // resumed from its own recorded phase.
             updated::transaction::Recovery::RestorePredecessor => Some(tx.clone()),
             // The update's commit landed, so this journal has nothing left to undo — it is merely
             // spent (a tolerated `clear_journal` failure, or a crash between the commit and the
-            // journal's terminal write). What matters now is the same thing that matters with no
+            // journal's terminal write) — including when the active pointer has since moved off the
+            // candidate, which [`boot::journal_recovery`] resolves rather than mistaking a spent
+            // journal for a rollback it can never drive. What matters now is the same thing with no
             // journal at all: the boot plan treats the committed record's `pending` as
             // authoritative, so this boot may still be a confirmation-window revert. Derive that
             // rollback from `pending` exactly as the journal-less path does — the candidate's
@@ -1923,6 +1940,30 @@ mod tests {
     }
 
     #[test]
+    fn a_spent_committed_journal_whose_pointer_moved_derives_a_drivable_rollback() {
+        // The pointer fell back to the predecessor (an in-loop repair of a candidate that failed
+        // local verification) while a spent `Committed` journal was still on disk, and the process
+        // died before `commit_installed`. `classify_recovery` then reads `RestorePredecessor`, but
+        // the phase machine refuses to begin a rollback from `Committed`, so returning that journal
+        // verbatim produced a "recovery" with no rollback rank: every resume gate in
+        // `execute_boot_plan` closed and the plan's reconciliation was silently discarded.
+        let mut situation = window_crash(Some(Phase::Committed));
+        situation.active = Some(release("1.0.0", "one"));
+        situation.service_exited = false;
+
+        let tx = recovery_transaction(&situation)
+            .expect("a spent journal still owes the rollback its pointer already began");
+
+        assert_eq!(
+            tx.rollback_rank(),
+            Some(0),
+            "the recovery must sit on the rollback path, or every resume gate stays closed"
+        );
+        assert!(tx.recovery_pending(Phase::RollbackStopped));
+        assert!(tx.recovery_pending(Phase::PredecessorActivated));
+    }
+
+    #[test]
     fn a_journal_with_a_finished_rollback_is_not_re_run() {
         // Guard the scope of the fix: `NeverSwapped` (here, a completed rollback whose pointer is
         // back on the predecessor) is handled by the boot plan alone, and synthesizing anything
@@ -2066,6 +2107,39 @@ mod tests {
         assert!(
             health.observed(now, false, &timeouts),
             "past its grace, a genuinely dead application still fails its liveness check"
+        );
+    }
+
+    #[test]
+    fn a_bad_disk_is_still_recognised_behind_a_post_commit_wrapper() {
+        // `foundation::durable` wraps a failure that happens AFTER the rename landed, so the
+        // guardian does not roll back a pointer that already moved. Attaching that marker costs the
+        // `io::Error` its raw-code representation (`Os` and `Custom` are alternatives), so the errno
+        // is only reachable one `source` hop down — the shape rebuilt here, and the contract
+        // foundation documents on `Unsynced` and pins with its own regression test. A bad disk is a
+        // fault of the node either way and must still be waited out from behind readiness.
+        #[derive(Debug)]
+        struct PostCommit(io::Error);
+        impl std::fmt::Display for PostCommit {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for PostCommit {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let bad_disk = io::Error::from_raw_os_error(libc::EIO);
+        let wrapped = io::Error::new(bad_disk.kind(), PostCommit(bad_disk));
+        assert_eq!(
+            wrapped.raw_os_error(),
+            None,
+            "the wrapper is what makes the top-level code unreadable — the premise of this test"
+        );
+        assert!(
+            is_node_local_transient(&wrapped),
+            "a post-commit fsync EIO is a bad disk, not a bad release"
         );
     }
 

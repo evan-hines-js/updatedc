@@ -457,6 +457,10 @@ pub(crate) async fn exercise_fleet_actions(
         if let Some(error) = state["error"].as_str() {
             return Err(format!("fleet chaos failed: {error}").into());
         }
+        // `completedEpochs` counts the epochs finished by the run just started —
+        // `ChaosState::begin_run` zeroes it — so this waits on progress made by *this*
+        // pass. A pass that never converges an epoch times out below instead of reading
+        // the previous pass's converged fleet.
         if state["completedEpochs"].as_u64().unwrap_or(0) >= 1 {
             // Scope to the cohort fleet: the external slice rides the same `/fleet` listing
             // (total is 32 cohort + `DEMO_EXTERNAL_COUNT`) and is verified separately, so check

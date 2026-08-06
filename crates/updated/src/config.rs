@@ -245,6 +245,12 @@ pub struct Paths {
     pub install_root: PathBuf,
     pub versions: PathBuf,
     pub staging: PathBuf,
+    /// Per-release writable working directories for the managed application — the launch `cwd`.
+    /// Deliberately a sibling of `versions/`, never a child of it: `versions/<release>` is the
+    /// content-addressed tree `bundle::verify_release` re-hashes on every check, so a single file
+    /// an ordinary application writes to its own working directory would make the supervisor
+    /// condemn, re-download and republish the release forever. See [`crate::provider::BundleStore`].
+    pub work: PathBuf,
     pub active_release: PathBuf,
     pub download: PathBuf,
     pub state: PathBuf,
@@ -257,6 +263,9 @@ pub struct Paths {
     pub provider_versions: PathBuf,
     pub provider_staging: PathBuf,
     pub provider_download: PathBuf,
+    /// The same writable working directories for lifecycle-provider releases, which are re-verified
+    /// on exactly the same terms every time one is invoked.
+    pub provider_work: PathBuf,
 }
 
 /// Where the last live routing assignment is kept: beside the enrollment material in the
@@ -284,6 +293,7 @@ impl Paths {
             install_root: install_root.to_path_buf(),
             versions: install_root.join("versions"),
             staging: install_root.join("staging"),
+            work: install_root.join("work"),
             active_release: install_root.join("active-release"),
             download: install_root.join("staging/bundle.download"),
             state: state_dir.join("installed.json"),
@@ -296,6 +306,7 @@ impl Paths {
             provider_versions: install_root.join("providers/versions"),
             provider_staging: install_root.join("providers/staging"),
             provider_download: install_root.join("providers/staging/bundle.download"),
+            provider_work: install_root.join("providers/work"),
         }
     }
 }

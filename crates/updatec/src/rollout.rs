@@ -311,6 +311,16 @@ impl<'a> Observations<'a> {
             .collect()
     }
 
+    /// Whether any node this group selects is already published — running hardware the last signed
+    /// generation handed a deployment to, under another group or under `default`. It is what makes a
+    /// group's FIRST admission a change to production rather than a greenfield one, so the schedule
+    /// and concurrency gates apply to it exactly as they do to a retarget.
+    fn any_node_published(&self, group: &str) -> bool {
+        self.nodes(group)
+            .into_iter()
+            .any(|node| self.published.contains_key(node))
+    }
+
     /// The deployment this node is actually running: what the last signed generation handed it, or
     /// failing that what it reports acting on. `None` for a node nothing is known about — never
     /// published, never reported — which is the only case with no "where it is" to hold it on.
@@ -345,18 +355,24 @@ impl<'a> Observations<'a> {
             return Progress::Unobservable;
         };
         // Staging comes first, because it is in flight whether or not anything can be observed.
-        // `finish_staged_rollouts` retires `previous` at exactly the moment every selected node has
-        // been HANDED `current`, so a surviving predecessor means `assign_nodes` is still moving
-        // nodes one batch per generation. Judging on telemetry alone reported a mixed group settled
-        // — releasing its set's concurrency slot and claiming the rollout was over — as soon as its
-        // two observable nodes converged, while fifty blind ones were still being moved.
+        // Judging on telemetry alone reported a mixed group settled — releasing its set's
+        // concurrency slot and claiming the rollout was over — as soon as its two observable nodes
+        // converged, while fifty blind ones were still being moved.
         //
-        // Asked as "has every node this group selects been handed `current`?" rather than as
-        // "is `previous` empty?", because `previous` also carries bodies retained purely so a node
-        // that left this group mid-rollout can still be held where it is. A body nobody in this
-        // group is on is not a rollout in flight, and reading it as one held the group's set
-        // concurrency slot for as long as the departed node lived.
-        if !state.previous.is_empty() && !self.fully_handed(group, &state.current) {
+        // The ONE question is "has every node this group selects been handed `current`?", asked of
+        // what was published, and it is asked unconditionally — never as "is `previous` empty?".
+        // `previous` answers a different question in both directions. It is non-empty for bodies
+        // retained purely so a node that left this group mid-rollout can be held where it is, and
+        // reading that as a rollout in flight held the set's concurrency slot for as long as the
+        // departed node lived. And it is EMPTY for admissions that `assign_nodes` genuinely stages:
+        // a first admission over nodes some other group already published (there is no prior
+        // admitted entry to derive predecessors from), and a bulk relabel into a settled group. Both
+        // are moved one `maxUnavailable` batch per generation — `assign_nodes` holds an unadvanced
+        // node on its own placement whatever `previous` says — so skipping this check for them
+        // reported Settled/Unobservable mid-roll: the set's `maxConcurrent` was breached by creating
+        // N groups at once, and dependents opened while a third of the fleet was still on the old
+        // deployment.
+        if !self.fully_handed(group, &state.current) {
             return Progress::Rolling;
         }
         let mut observable = false;
@@ -460,10 +476,13 @@ struct SetPlan {
 /// admit them all at once — the breach of `max_concurrent` that node-local state allowed.
 ///
 /// A group's FIRST admission runs through the same gates as every later one (`admit_pending`):
-/// resolved inputs and settled prerequisites. It is exempt only from a set's concurrency slots and
-/// schedule, because there is no predecessor to stage away from and nothing yet published to
-/// protect. A group that has not been admitted at all publishes nothing for its nodes, and
-/// `domain::plan_reconcile` leaves them out of the generation entirely.
+/// resolved inputs and settled prerequisites. It is exempt from a set's concurrency slots and
+/// schedule ONLY when every node its selector picks has never been published anything — a
+/// greenfield group, with no predecessor to stage away from and nothing running to protect. A new
+/// `UpdateGroup` over machines the fleet already published to is a change to running production and
+/// takes both gates like any retarget (see `admit_pending` and docs/state-machines.md). A group that
+/// has not been admitted at all publishes nothing for its nodes, and `domain::plan_reconcile` leaves
+/// them out of the generation entirely.
 pub(crate) fn plan_rollouts(
     sets: &[UpdateGroupSet],
     inputs: RolloutInputs<'_>,
@@ -832,9 +851,15 @@ fn admit_pending(
                 },
             );
         };
-        // A group that has never been published has no predecessor to stage away from and nothing
-        // for a slot or a schedule to protect.
-        if !admitted.contains_key(&name) {
+        // A group with nothing to protect skips the schedule and the slot gate — and "nothing to
+        // protect" is a property of its NODES, not of its own admission record. A brand-new
+        // `UpdateGroup` whose selector picks up machines that are already published (under
+        // `default` or under another group) is a change to running production hardware: admitting it
+        // ungated restarted live machines during a freeze and consumed no concurrency slot, so
+        // creating N groups moved N cohorts at once past `max_concurrent`. Only a group every one of
+        // whose nodes has never been published anything passes here; `spec.emergencyCorrection` is
+        // the sole documented waiver of a schedule (docs/state-machines.md).
+        if !admitted.contains_key(&name) && !observations.any_node_published(&name) {
             admit(admitted);
             continue;
         }
@@ -2433,6 +2458,301 @@ mod tests {
         assert_eq!(statuses.sets[0].rolling, vec!["a".to_string()]);
     }
 
+    /// Creating an `UpdateGroup` is not a waiver of its set's schedule. The group has no admitted
+    /// entry, but its selector picked up a machine the last generation already published, so this
+    /// first admission moves running production hardware — it waits for the window like any other
+    /// change. Skipping the gates on "nothing yet published to protect" restarted a live machine
+    /// mid-freeze, and took no concurrency slot while doing it.
+    #[test]
+    fn a_new_group_selecting_already_published_nodes_still_waits_for_the_window() {
+        let monday = at("2026-07-20T12:00:00Z");
+        let sets = [windowed_set(vec![crate::window::RolloutWindow {
+            weekdays: vec![crate::window::Weekday::Sunday],
+            ..Default::default()
+        }])];
+        let group_labels = pair_labels();
+        let node_groups = pair_node_groups();
+        // `a` is settled on v0. `b` is brand new and wants v9; its node n-b is already published on
+        // v0 (it ran under another group until an operator relabelled it a moment ago).
+        let groups = BTreeMap::from([
+            ("a".to_string(), group("a", deployment_named("v0"))),
+            ("b".to_string(), group("b", deployment_named("v9"))),
+        ]);
+        let v0 = crate::deployment_identity(&deployment_named("v0")).unwrap();
+        let published = BTreeMap::from([
+            ("n-a".to_string(), v0.clone()),
+            ("n-b".to_string(), v0.clone()),
+        ]);
+        let reports = HashMap::from([
+            report_at(monday, "n-a", "v0", true),
+            report_at(monday, "n-b", "v0", true),
+        ]);
+        let mut admitted = BTreeMap::from([("a".to_string(), admitted(deployment_named("v0")))]);
+        let plan = plan_rollouts(
+            &sets,
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &group_labels,
+                node_groups: &node_groups,
+                public_keys: &pubkeys(&node_groups),
+                published: &published,
+                held: &BTreeMap::new(),
+                reports: &reports,
+            },
+            &mut admitted,
+            monday, // closed
+        );
+        assert!(plan.sets[0].frozen);
+        assert!(
+            !admitted.contains_key("b"),
+            "a new group over already-published machines is admitted only inside the window"
+        );
+        assert_eq!(
+            plan.node_deployments
+                .get("n-b")
+                .map(|d| d.deployment.clone()),
+            None,
+            "the live machine keeps the assignment the last generation gave it"
+        );
+
+        // Sunday: the window opens and the same admission goes through.
+        let sunday = at("2026-07-26T12:00:00Z");
+        let plan = plan_rollouts(
+            &sets,
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &group_labels,
+                node_groups: &node_groups,
+                public_keys: &pubkeys(&node_groups),
+                published: &published,
+                held: &BTreeMap::new(),
+                reports: &HashMap::from([
+                    report_at(sunday, "n-a", "v0", true),
+                    report_at(sunday, "n-b", "v0", true),
+                ]),
+            },
+            &mut admitted,
+            sunday, // open
+        );
+        assert!(!plan.sets[0].frozen);
+        assert_eq!(admitted["b"].current.deployment, "v9");
+    }
+
+    /// The other half of the same rule: a group whose nodes have never been published anywhere is
+    /// genuinely greenfield, so its first admission is not a change to anything running and is not
+    /// held behind the set's window.
+    #[test]
+    fn a_new_group_selecting_only_unpublished_nodes_is_admitted_while_frozen() {
+        let monday = at("2026-07-20T12:00:00Z");
+        let sets = [windowed_set(vec![crate::window::RolloutWindow {
+            weekdays: vec![crate::window::Weekday::Sunday],
+            ..Default::default()
+        }])];
+        let groups = BTreeMap::from([("b".to_string(), group("b", deployment_named("v9")))]);
+        let node_groups = BTreeMap::from([("n-b".to_string(), "b".to_string())]);
+        let mut admitted = BTreeMap::new();
+        plan_rollouts(
+            &sets,
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &pair_labels(),
+                node_groups: &node_groups,
+                public_keys: &pubkeys(&node_groups),
+                published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
+                reports: &HashMap::new(),
+            },
+            &mut admitted,
+            monday, // closed
+        );
+        assert_eq!(admitted["b"].current.deployment, "v9");
+    }
+
+    /// A first admission over already-published nodes has NO predecessor to record (there is no
+    /// prior admitted entry to derive one from) and `assign_nodes` stages it anyway — one
+    /// `maxUnavailable` batch per generation, holding each unmoved node on its own placement. So
+    /// staging must be judged on "has every selected node been handed `current`?", never on
+    /// "is `previous` non-empty?".
+    ///
+    /// Judging it on `previous` reported these groups Unobservable, which holds no concurrency slot:
+    /// three new `UpdateGroup`s over already-published blind machines were admitted on three
+    /// consecutive passes and moved three cohorts at once, past a `maxConcurrent` of 1 — exactly the
+    /// harm the "a new group is not a waiver" gate was added to prevent.
+    #[test]
+    fn a_new_group_staging_already_published_nodes_holds_its_sets_concurrency_slot() {
+        let mut set = pair_set();
+        set.spec.max_concurrent = Some(1);
+        let names = ["b1", "b2", "b3"];
+        let groups: BTreeMap<String, ResolvedGroup> = names
+            .iter()
+            .map(|name| ((*name).to_string(), group(name, deployment_named("v9"))))
+            .collect();
+        let group_labels: BTreeMap<String, BTreeMap<String, String>> = names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    BTreeMap::from([("set".to_string(), "pair-00".to_string())]),
+                )
+            })
+            .collect();
+        // Three nodes each, every one of them offline-provisioned (no pinned key, so nothing about
+        // them is ever observable) and already published on v0 by the last generation.
+        let node_groups: BTreeMap<String, String> = names
+            .iter()
+            .flat_map(|name| (0..3).map(move |i| (format!("n-{name}-{i}"), (*name).to_string())))
+            .collect();
+        let v0 = crate::deployment_identity(&deployment_named("v0")).unwrap();
+        let mut published: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), v0.clone()))
+            .collect();
+        let mut admitted = BTreeMap::new();
+        let admitted_names = |admitted: &BTreeMap<String, AdmittedDeployment>| {
+            admitted.keys().cloned().collect::<Vec<_>>()
+        };
+        // Three passes to stage b1's three nodes, one per generation. Nothing else is admitted
+        // while it does: b1 is ROLLING, so it holds the set's single slot.
+        for pass in 0..3 {
+            let plan = plan_rollouts(
+                &[set.clone()],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &group_labels,
+                    node_groups: &node_groups,
+                    public_keys: &HashMap::new(),
+                    published: &published,
+                    held: &BTreeMap::new(),
+                    reports: &HashMap::new(),
+                },
+                &mut admitted,
+                test_now(),
+            );
+            assert_eq!(
+                admitted_names(&admitted),
+                vec!["b1".to_string()],
+                "pass {pass}: only one group of this set may be moving at a time"
+            );
+            assert_eq!(
+                plan.groups["b1"],
+                GroupProgress::Rolling,
+                "pass {pass}: b1 is still being staged, so it is not settled and not unobservable"
+            );
+            assert_eq!(plan.sets[0].rolling, vec!["b1".to_string()]);
+            // What the last generation handed each node, carried forward as
+            // `domain::plan_reconcile` does it.
+            published.extend(published_from(&plan));
+            assert_eq!(
+                published.values().filter(|id| *id != &v0).count(),
+                pass + 1,
+                "pass {pass}: exactly one more node has been moved"
+            );
+        }
+        // b1 has now been handed v9 everywhere, so its slot frees and the next group takes it.
+        let plan = plan_rollouts(
+            &[set.clone()],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &group_labels,
+                node_groups: &node_groups,
+                public_keys: &HashMap::new(),
+                published: &published,
+                held: &BTreeMap::new(),
+                reports: &HashMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(
+            admitted_names(&admitted),
+            vec!["b1".to_string(), "b2".into()]
+        );
+        assert_eq!(
+            plan.groups["b1"],
+            GroupProgress::Unobservable,
+            "b1 is fully staged and nothing about it can be observed"
+        );
+    }
+
+    /// The same rule seen by a DEPENDENT: a group whose staging is still in flight is not Settled,
+    /// so nothing sequenced behind it opens. Reading settlement off telemetry alone — which a first
+    /// admission over already-published nodes reached, having no `previous` — reported the group
+    /// settled the moment its one observable node converged, and released the dependent while a
+    /// third of the fleet was still on the old deployment.
+    #[test]
+    fn a_dependent_waits_for_the_blind_two_thirds_of_its_prerequisite() {
+        let mut groups = BTreeMap::from([
+            ("b".to_string(), group("b", deployment_named("v9"))),
+            ("c".to_string(), group("c", deployment_named("c9"))),
+        ]);
+        groups.get_mut("c").unwrap().depends_on = vec!["b".to_string()];
+        // b: n0 is enrolled and reports; n1 and n2 are offline-provisioned and never will. All
+        // three are already published on v0, so this first admission is a change to production.
+        let node_groups = BTreeMap::from([
+            ("n0".to_string(), "b".to_string()),
+            ("n1".to_string(), "b".to_string()),
+            ("n2".to_string(), "b".to_string()),
+            ("n-c".to_string(), "c".to_string()),
+        ]);
+        let public_keys = HashMap::from([("n0".to_string(), TEST_KEY.1.clone())]);
+        let v0 = crate::deployment_identity(&deployment_named("v0")).unwrap();
+        let mut published: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), v0.clone()))
+            .collect();
+        let mut reports = HashMap::from([report("n0", "v0", true)]);
+        let mut admitted = BTreeMap::new();
+        for pass in 0..3 {
+            let plan = plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &BTreeMap::new(),
+                    node_groups: &node_groups,
+                    public_keys: &public_keys,
+                    published: &published,
+                    held: &BTreeMap::new(),
+                    reports: &reports,
+                },
+                &mut admitted,
+                test_now(),
+            );
+            assert_eq!(
+                plan.groups["b"],
+                GroupProgress::Rolling,
+                "pass {pass}: b is still handing v9 to its blind nodes"
+            );
+            assert!(
+                !admitted.contains_key("c"),
+                "pass {pass}: the dependent must not open while its prerequisite is mid-roll"
+            );
+            published.extend(published_from(&plan));
+            // The one node that can report does, as soon as it is handed the deployment.
+            if let Some(deployment) = plan.node_deployments.get("n0") {
+                let (node, envelope) = report("n0", &deployment.deployment, true);
+                reports.insert(node, envelope);
+            }
+        }
+        // Every node of b has been handed v9 and the one observable node reports it healthy, so b
+        // settles and c is admitted.
+        let plan = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                node_groups: &node_groups,
+                public_keys: &public_keys,
+                published: &published,
+                held: &BTreeMap::new(),
+                reports: &reports,
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(plan.groups["b"], GroupProgress::Settled);
+        assert_eq!(admitted["c"].current.deployment, "c9");
+    }
+
     fn calendared_set(calendar: Vec<crate::window::CalendarEntry>) -> UpdateGroupSet {
         UpdateGroupSet::new(
             "pair-00",
@@ -3246,21 +3566,29 @@ mod tests {
         );
     }
 
-    /// A blind node is never counted as healthy, only as unjudgeable: a group whose observable
-    /// agents are all healthy on the desired deployment settles (so dependents are not blocked
-    /// forever), while a group where NOTHING is observable is reported unobservable instead.
+    /// A blind node that has been HANDED the deployment is never counted as healthy, only as
+    /// unjudgeable: a group whose observable agents are all healthy on the desired deployment
+    /// settles (so dependents are not blocked forever), while a group where NOTHING is observable is
+    /// reported unobservable instead. Staging is decided first and separately — see
+    /// `a_group_still_being_staged_is_rolling_even_with_no_predecessor`.
     #[test]
     fn settlement_excludes_blind_nodes_rather_than_assuming_them_healthy() {
         let (groups, node_groups, _) = three_node_group();
         let mut keys = pubkeys(&node_groups);
         keys.remove("n2");
         let reports = HashMap::from([report("n0", "v0", true), report("n1", "v0", true)]);
-        let nothing_published = BTreeMap::new();
+        // Every node has been handed the deployment, the blind one included, so staging is over and
+        // the verdict is the telemetry question this test is about.
+        let identity = crate::deployment_identity(&groups["g"].deployment).unwrap();
+        let handed: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), identity.clone()))
+            .collect();
         let observations = Observations::new(
             &node_groups,
             &reports,
             &keys,
-            &nothing_published,
+            &handed,
             test_now().timestamp_millis() as u64,
         );
         assert_eq!(
@@ -3281,7 +3609,7 @@ mod tests {
             &node_groups,
             &reports,
             &no_keys,
-            &nothing_published,
+            &handed,
             test_now().timestamp_millis() as u64,
         );
         assert_eq!(

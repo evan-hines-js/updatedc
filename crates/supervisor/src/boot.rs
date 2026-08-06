@@ -24,27 +24,19 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
         .pending
         .as_ref()
         .is_some_and(|pending| s.active.as_ref() == Some(&pending.previous_release));
-    let pending_authoritative = if let Some(tx) = &s.journal {
-        reconcile_transaction(&mut plan, s, tx, &state) == Recovery::Committed
+    // A journal that still has recovery work to drive owns this boot's release reconciliation. A
+    // journal that is merely SPENT (see [`journal_recovery`]) is cleared and otherwise says nothing:
+    // the committed record decides, exactly as it does when no journal is on disk at all. Letting a
+    // spent file take the wheel is what left a boot planning a reconciliation whose every resume
+    // gate was closed — and then deleting the only evidence of it.
+    let carries_recovery = match &s.journal {
+        Some(tx) => reconcile_transaction(&mut plan, s, tx, &state) != Recovery::Committed,
+        None => false,
+    };
+    let pending_authoritative = if carries_recovery {
+        false
     } else if pending_revert_in_progress {
-        // A prior supervisor restored the predecessor pointer but crashed before the
-        // external rollback and final state commit. Preserve that direction: never
-        // "repair" the pointer back to the failed candidate.
-        let pending = state.pending.as_ref().expect("checked above");
-        plan.release = ReleaseFix::Activate(pending.previous_release.clone());
-        // Carry the predecessor's providers (the operator set `pending` holds for exactly this
-        // rollback) onto the restored record.
-        plan.commit = Some(InstalledState::confirmed(
-            pending.previous_repository_lineage.clone(),
-            pending.previous_release.clone(),
-            pending.previous_archive_sha256.clone(),
-            pending.lifecycle.clone(),
-        ));
-        plan.current = Some(pending.previous_release.version.clone());
-        plan.warn(format!(
-            "recovery: completing rollback from {} to {}",
-            state.release.version, pending.previous_release.version
-        ));
+        complete_pending_rollback(&mut plan, &state);
         false
     } else {
         enforce_installed(&mut plan, s, &state);
@@ -77,6 +69,74 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
     plan
 }
 
+/// A prior supervisor restored the predecessor pointer but crashed before the external rollback and
+/// the final state commit. Preserve that direction: never "repair" the pointer back to the failed
+/// candidate, and record the predecessor as what this node is running.
+fn complete_pending_rollback(plan: &mut Plan, state: &InstalledState) {
+    let pending = state
+        .pending
+        .as_ref()
+        .expect("a rollback in progress has a pending record");
+    plan.release = ReleaseFix::Activate(pending.previous_release.clone());
+    // Carry the predecessor's providers (the operator set `pending` holds for exactly this
+    // rollback) onto the restored record.
+    plan.commit = Some(InstalledState::confirmed(
+        pending.previous_repository_lineage.clone(),
+        pending.previous_release.clone(),
+        pending.previous_archive_sha256.clone(),
+        pending.lifecycle.clone(),
+    ));
+    plan.current = Some(pending.previous_release.version.clone());
+    plan.warn(format!(
+        "recovery: completing rollback from {} to {}",
+        state.release.version, pending.previous_release.version
+    ));
+}
+
+/// Whether a journal can still *drive* a rollback, asked of the phase machine itself rather than of
+/// a list of phases: the recovery driver's own two steps, replayed on a throwaway copy.
+///
+/// A journal off the rollback path is first moved onto it (`advance` to `RollbackStarted`), which
+/// the phase machine refuses from a terminal phase; a journal already on the path has work left
+/// exactly while a resume gate is open, which is what `recovery_pending` up to the final phase
+/// answers. Deriving it this way means a change to the phase machine moves this with it — the
+/// enumerate-one-phase version of this test is precisely what let `RolledBack` through.
+fn drives_rollback(tx: &Transaction) -> bool {
+    let mut probe = tx.clone();
+    if !probe.is_rollback() && probe.advance(TransactionPhase::RollbackStarted).is_err() {
+        return false;
+    }
+    probe.recovery_pending(TransactionPhase::RolledBack)
+}
+
+/// The recovery a journal on disk can actually *drive*.
+///
+/// [`transaction::classify_recovery`] reports what the world looks like. This adds the one fact only
+/// the recovery driver knows: a journal in a TERMINAL phase — `Committed`, whose forward commit
+/// landed, or `RolledBack`, whose rollback ran to the end — is SPENT. The phase machine refuses to
+/// (re)start a rollback from either (`Transaction::advance`), and every resume gate reads
+/// `rollback_rank`, which for a terminal phase leaves nothing pending. See [`drives_rollback`],
+/// which asks the machine instead of naming the phases.
+///
+/// Such a journal outlives its transaction whenever `clear_journal` fails (tolerated, with a
+/// warning, by the update's switch-over and by the rollback's finalize), and it stops classifying
+/// benignly the moment the active pointer moves off the release it names — an in-loop repair
+/// falling back to the predecessor, a `repair_from_assignment` installing the assigned release, or
+/// a restored backup. Classified `RestorePredecessor` it produced a boot that planned a quiesce, an
+/// activation and a commit, ran none of them (every gate closed), and cleared the journal anyway:
+/// the node ran one release while the installed record — and every heartbeat derived from it —
+/// named another. It is spent, so the committed record decides instead.
+pub(crate) fn journal_recovery(
+    tx: &Transaction,
+    active: Option<&updated::bundle::ReleaseId>,
+    committed: Option<&updated::bundle::ReleaseId>,
+) -> Recovery {
+    match transaction::classify_recovery(tx, active, committed) {
+        Recovery::RestorePredecessor if !drives_rollback(tx) => Recovery::Committed,
+        recovery => recovery,
+    }
+}
+
 fn reconcile_transaction(
     plan: &mut Plan,
     situation: &Situation,
@@ -84,8 +144,7 @@ fn reconcile_transaction(
     installed: &InstalledState,
 ) -> Recovery {
     plan.clear_journal = true;
-    let recovery =
-        transaction::classify_recovery(tx, situation.active.as_ref(), Some(&installed.release));
+    let recovery = journal_recovery(tx, situation.active.as_ref(), Some(&installed.release));
     if tx.candidate_rejection_required {
         plan.reject_app.push((
             tx.candidate_repository_lineage.clone(),
@@ -97,10 +156,16 @@ fn reconcile_transaction(
         ));
     }
     match recovery {
-        Recovery::Committed => plan.info(format!(
-            "recovery: release {} was already committed",
-            tx.candidate_release.version
-        )),
+        // Spent: nothing left to drive, so the journal contributes nothing but its own removal (and
+        // any rejection it recorded above). In particular it must NOT commit a release record — the
+        // committed record, reconciled below, is what names what this node runs.
+        Recovery::Committed => {
+            plan.info(format!(
+                "recovery: journal for {} is spent at phase {:?}",
+                tx.candidate_release.version, tx.phase
+            ));
+            return recovery;
+        }
         Recovery::NeverSwapped => plan.info(format!(
             "recovery: activation of {} never landed",
             tx.candidate_release.version
@@ -395,6 +460,263 @@ mod tests {
         assert_eq!(plan.release, ReleaseFix::None);
         assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
         assert!(plan.clear_journal);
+    }
+
+    /// The record as it looks when an update committed but its rollback was interrupted: the
+    /// installed candidate still holds the `pending` naming the predecessor it displaced.
+    fn candidate_with_pending(predecessor: &ReleaseId, candidate: ReleaseId) -> Installed {
+        Installed::Present(Box::new(InstalledState {
+            repository_lineage: lineage(),
+            release: candidate,
+            archive_sha256: "archive-two".into(),
+            lifecycle: provider(),
+            pending: Some(Pending {
+                lifecycle_attempt_id: "attempt".into(),
+                previous_release: predecessor.clone(),
+                previous_archive_sha256: "archive-one".into(),
+                previous_repository_lineage: lineage(),
+                committed_at: 100,
+                lifecycle: provider(),
+            }),
+            confirmed: true,
+        }))
+    }
+
+    fn spent_journal(
+        predecessor: ReleaseId,
+        candidate: ReleaseId,
+        phase: TransactionPhase,
+    ) -> Transaction {
+        Transaction {
+            id: "attempt".into(),
+            previous_release: predecessor,
+            previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
+            candidate_release: candidate,
+            candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
+            candidate_rejection_required: false,
+            lifecycle: provider(),
+            rollback_health_failures: 0,
+            phase,
+        }
+    }
+
+    fn spent_committed_journal(predecessor: ReleaseId, candidate: ReleaseId) -> Transaction {
+        spent_journal(predecessor, candidate, TransactionPhase::Committed)
+    }
+
+    /// Every phase of the transaction machine. The `match` is the guard: a phase added to
+    /// `updated::transaction::Phase` makes it non-exhaustive and fails the build, so this list —
+    /// and the spent-journal property below — cannot fall behind the machine it describes.
+    fn all_phases() -> [TransactionPhase; 30] {
+        use TransactionPhase::*;
+        let every = [
+            PreflightStarted,
+            PreflightCompleted,
+            PrepareStarted,
+            Prepared,
+            PreDrainStarted,
+            DrainStarted,
+            Drained,
+            StopStarted,
+            Stopped,
+            ActivateStarted,
+            CandidateActivated,
+            StartStarted,
+            CandidateStarted,
+            HealthStarted,
+            CandidateHealthy,
+            FinalizeStarted,
+            Finalized,
+            CommitStarted,
+            Committed,
+            RollbackStarted,
+            RollbackStopStarted,
+            RollbackStopped,
+            RollbackActivateStarted,
+            PredecessorActivated,
+            RollbackStartStarted,
+            PredecessorStarted,
+            RollbackHealthStarted,
+            PredecessorHealthy,
+            RollbackFinalizeStarted,
+            RolledBack,
+        ];
+        for phase in every {
+            match phase {
+                PreflightStarted
+                | PreflightCompleted
+                | PrepareStarted
+                | Prepared
+                | PreDrainStarted
+                | DrainStarted
+                | Drained
+                | StopStarted
+                | Stopped
+                | ActivateStarted
+                | CandidateActivated
+                | StartStarted
+                | CandidateStarted
+                | HealthStarted
+                | CandidateHealthy
+                | FinalizeStarted
+                | Finalized
+                | CommitStarted
+                | Committed
+                | RollbackStarted
+                | RollbackStopStarted
+                | RollbackStopped
+                | RollbackActivateStarted
+                | PredecessorActivated
+                | RollbackStartStarted
+                | PredecessorStarted
+                | RollbackHealthStarted
+                | PredecessorHealthy
+                | RollbackFinalizeStarted
+                | RolledBack => {}
+            }
+        }
+        every
+    }
+
+    #[test]
+    fn every_terminal_journal_phase_is_spent_and_no_other_phase_is() {
+        // The property the neutralisation rests on, asked of the phase machine rather than of a
+        // list: a journal is spent exactly when it can neither begin a rollback nor advance along
+        // one. Enumerating a single phase here is what let `RolledBack` drive a boot it could not
+        // execute, so assert the whole phase space instead.
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        for phase in all_phases() {
+            let tx = spent_journal(predecessor.clone(), candidate.clone(), phase);
+            let spent = !drives_rollback(&tx);
+            assert_eq!(
+                spent,
+                matches!(
+                    phase,
+                    TransactionPhase::Committed | TransactionPhase::RolledBack
+                ),
+                "{phase:?} classified spent={spent}"
+            );
+            // A spent journal must never be handed a recovery its resume gates cannot run.
+            if spent {
+                assert_eq!(
+                    journal_recovery(&tx, Some(&release("3.0.0", "three")), Some(&candidate)),
+                    Recovery::Committed,
+                    "{phase:?} cannot drive a rollback, so it must not claim one"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_spent_rolled_back_journal_never_commits_its_predecessor_over_a_third_release() {
+        // A rollback finished, wrote `RolledBack`, committed the predecessor — and then
+        // `clear_journal` failed (tolerated), so the journal survived. A later boot found that
+        // committed bundle corrupt and `repair_from_assignment` installed and activated the
+        // assigned release 3.0.0 *before* the journal was read. `classify_recovery` then reads
+        // `RestorePredecessor` (active != previous_release), but `RolledBack` is terminal: every
+        // resume gate is closed, so the planned quiesce and activation cannot run. Committing the
+        // predecessor record anyway left the node running 3.0.0 while `installed.json` — and every
+        // heartbeat off it — named 1.0.0, and the next boot's drift enforcement stopped the healthy
+        // application to re-activate the corrupt predecessor.
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let repaired = release("3.0.0", "three");
+        let mut situation = steady();
+        situation.active = Some(repaired.clone());
+        situation.installed = Installed::Present(Box::new(InstalledState::confirmed(
+            lineage(),
+            repaired.clone(),
+            "archive-three".into(),
+            provider(),
+        )));
+        situation.journal = Some(spent_journal(
+            predecessor,
+            candidate,
+            TransactionPhase::RolledBack,
+        ));
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(
+            plan.release,
+            ReleaseFix::None,
+            "the repaired release is both active and committed; nothing to reconcile"
+        );
+        assert_eq!(
+            plan.commit, None,
+            "a journal that cannot run its rollback must not commit that rollback's record"
+        );
+        assert_eq!(plan.current.as_deref(), Some("3.0.0"));
+        assert!(!plan.quiesce, "the healthy application must not be stopped");
+        assert!(plan.clear_journal, "the spent journal is removed");
+    }
+
+    #[test]
+    fn a_spent_committed_journal_does_not_suppress_the_rollback_it_left_half_done() {
+        // The update committed, `clear_journal` failed (tolerated), and a later in-loop repair fell
+        // back to the predecessor's pointer but died before `commit_installed`. The spent
+        // `Committed` journal then classifies `RestorePredecessor`, and taking it as the recovery
+        // produced a transaction with no rollback rank: the executor's resume gates closed, so the
+        // planned quiesce and activation never ran while the journal was cleared anyway — leaving
+        // the node running the predecessor with the record, and every heartbeat off it, naming the
+        // candidate.
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.active = Some(predecessor.clone());
+        situation.installed = candidate_with_pending(&predecessor, candidate.clone());
+        situation.journal = Some(spent_committed_journal(predecessor.clone(), candidate));
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(
+            plan.release,
+            ReleaseFix::Activate(predecessor.clone()),
+            "the predecessor the pointer already names is the release this boot reconciles"
+        );
+        assert_eq!(
+            plan.commit,
+            Some(InstalledState::confirmed(
+                lineage(),
+                predecessor,
+                "archive-one".into(),
+                provider(),
+            )),
+            "the record must name the release that is actually running"
+        );
+        assert_eq!(plan.current.as_deref(), Some("1.0.0"));
+        assert!(plan.clear_journal);
+    }
+
+    #[test]
+    fn a_committed_journal_that_still_agrees_with_the_pointer_confirms_its_update() {
+        // Guard the scope: an ordinary spent journal whose candidate is both active and installed
+        // is still the committed head, so the confirmation window — not a rollback — governs.
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.active = Some(candidate.clone());
+        situation.installed = candidate_with_pending(&predecessor, candidate.clone());
+        situation.journal = Some(spent_committed_journal(predecessor, candidate.clone()));
+        situation.now = 1_000;
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(plan.release, ReleaseFix::None);
+        assert_eq!(plan.current.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            plan.commit,
+            Some(InstalledState::confirmed(
+                lineage(),
+                candidate,
+                "archive-two".into(),
+                provider(),
+            )),
+            "the passed window confirms the candidate and clears its pending record"
+        );
     }
 
     #[test]
