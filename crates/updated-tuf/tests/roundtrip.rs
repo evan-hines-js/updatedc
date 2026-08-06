@@ -235,6 +235,9 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     std::fs::write(uppercase_state.join("agent.crt"), "preplaced leaf").unwrap();
     std::fs::write(uppercase_state.join("agent.key"), "preplaced key").unwrap();
     let mut uppercase_bundle = bundle.clone();
+    // A bundle's assignment must be its own agent's routing target, so this fixture is a second
+    // agent whose published document happens to carry the upper-cased digest.
+    uppercase_bundle.agent_id = "offline-uppercase".into();
     uppercase_bundle.assignment = uppercase_agent_path.into();
     uppercase_bundle.initial.agent_document = String::from_utf8(uppercase_agent_bytes).unwrap();
     std::fs::write(

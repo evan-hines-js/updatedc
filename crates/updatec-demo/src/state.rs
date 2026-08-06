@@ -83,3 +83,74 @@ pub(crate) struct ChaosState {
     pub(crate) events: Vec<String>,
     pub(crate) error: Option<String>,
 }
+
+impl ChaosState {
+    /// Reset every field that describes *one* chaos run and return the loop number the
+    /// run resumes from.
+    ///
+    /// `completed_epochs` counts the epochs finished by this run — `run_chaos` keeps a
+    /// run-local counter and publishes it here — so it must start at zero. Leaving the
+    /// previous run's value live makes any poller that gates on it (the `exercise` soak
+    /// driver) read the *last* run's result the instant the new run starts.
+    ///
+    /// Cross-run progress is deliberately preserved: `loop_number`, `epoch`, and the
+    /// per-cohort `updated_groups` / `rolled_back_groups` are what a mid-epoch restart
+    /// resumes from instead of re-exercising cohorts it already drove.
+    pub(crate) fn begin_run(&mut self, seed: u64) -> usize {
+        self.running = true;
+        self.complete = false;
+        self.completed_epochs = 0;
+        self.seed = seed;
+        self.error = None;
+        self.active_broken.clear();
+        self.active_valid.clear();
+        self.converging = false;
+        self.loop_number
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChaosState;
+
+    /// Regression: a restart must not inherit the previous run's completed-epoch count.
+    /// The `exercise` soak driver starts chaos and then waits for `completedEpochs >= 1`;
+    /// with a stale count every pass after the first passed vacuously in seconds, against
+    /// the fleet the *previous* pass had already converged.
+    #[test]
+    fn begin_run_clears_the_previous_runs_completed_epochs() {
+        let mut state = ChaosState {
+            running: false,
+            complete: true,
+            completed_epochs: 3,
+            seed: 1,
+            loop_number: 301,
+            epoch: 4,
+            error: Some("boom".into()),
+            active_broken: vec!["set-0".into()],
+            active_valid: vec!["set-1".into()],
+            converging: true,
+            updated_groups: vec!["set-1".into()],
+            rolled_back_groups: vec!["set-0".into()],
+            ..Default::default()
+        };
+
+        let first_loop = state.begin_run(7);
+
+        assert_eq!(state.completed_epochs, 0);
+        assert!(state.running);
+        assert!(!state.complete);
+        assert_eq!(state.seed, 7);
+        assert_eq!(state.error, None);
+        assert!(state.active_broken.is_empty());
+        assert!(state.active_valid.is_empty());
+        assert!(!state.converging);
+        // Mid-epoch resume: cross-run progress survives so divergence continues where
+        // it left off rather than re-exercising already-driven cohorts.
+        assert_eq!(first_loop, 301);
+        assert_eq!(state.loop_number, 301);
+        assert_eq!(state.epoch, 4);
+        assert_eq!(state.updated_groups, vec!["set-1".to_owned()]);
+        assert_eq!(state.rolled_back_groups, vec!["set-0".to_owned()]);
+    }
+}

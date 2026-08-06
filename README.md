@@ -320,12 +320,30 @@ install_root/
     bin/application
     config/...
   staging/
+  work/<version-manifest-id>/
+  providers/
+    versions/<version-manifest-id>/
+    staging/
+    work/<version-manifest-id>/
   state/
     installed.json
     transaction.json
     rejected
     tuf/
 ```
+
+`work/<version-manifest-id>` is the managed application's launch working directory, and
+`providers/work/<version-manifest-id>` is the equivalent for a lifecycle provider. Each is a
+*sibling* of the matching `versions/` tree and deliberately not the tree itself: `versions/<id>`
+is content-addressed and re-hashed by release verification on every check tick, so a single log,
+lockfile or cache an ordinary application writes into its own `cwd` would make the supervisor
+condemn a perfectly good release and re-download it forever. So that a program still finds its own
+bundled configuration, templates and assets where it expects them, the workspace is seeded on
+resolve with a private copy of every file the release manifest declares — a copy, not a link, so an
+application rewriting one of those files changes only its own workspace and never the
+content-addressed tree. A workspace is created on resolve and reaped once its release directory has
+stayed gone across collection passes, so it never outlives what it belongs to and scratch survives
+restarts and rollbacks onto a release the node has run before.
 
 The bootstrap has a separate state root containing `desired-supervisor`, lifecycle markers,
 and content-addressed supervisor candidates.

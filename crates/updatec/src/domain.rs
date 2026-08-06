@@ -4,7 +4,7 @@
 //! new durable admission state. Kubernetes, object storage, signing, and status writes live in
 //! adapters; none of them participate in rollout decisions.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use updated_contracts::telemetry::Envelope;
 
@@ -22,7 +22,14 @@ pub struct DesiredState<'a> {
     pub group_labels: &'a BTreeMap<String, BTreeMap<String, String>>,
     pub sets: &'a [UpdateGroupSet],
     pub nodes: &'a [ResolvedNode],
-    /// Groups quarantined by validation this pass, with the deployment each is still pinned to.
+    /// Every group quarantined by validation this pass, whether or not it has a durable pin.
+    ///
+    /// A quarantined group is present-but-frozen, not absent: dependents must not read it as a
+    /// missing dependency, which would fail the whole generation closed. A group created with a
+    /// typo'd digest was never admitted and so appears here but NOT in `held`.
+    pub quarantined: &'a BTreeSet<String>,
+    /// The subset of `quarantined` that has a durable pin, with the deployment each is still
+    /// pinned to.
     ///
     /// A quarantined group cannot be planned — its deployment does not parse, or its selector or
     /// `maxUnavailable` is unusable — but the nodes it was published for must not be re-routed
@@ -67,7 +74,7 @@ pub fn plan_reconcile(
     desired: DesiredState<'_>,
     observed: ObservedState<'_>,
 ) -> Result<ReconcilePlan, PlanError> {
-    crate::validate_dependency_graph(desired.groups)?;
+    crate::validate_dependency_graph(desired.groups, desired.quarantined)?;
     let node_groups = resolve_node_groups(
         desired.groups.values().cloned(),
         desired.nodes.iter().cloned(),
@@ -569,6 +576,7 @@ mod tests {
     ) -> Result<crate::domain::ReconcilePlan, PlanError> {
         let repository = repository();
         let nodes = edge_node();
+        let quarantined: BTreeSet<String> = held.keys().cloned().collect();
         plan_reconcile(
             DesiredState {
                 repository: &repository,
@@ -576,6 +584,7 @@ mod tests {
                 group_labels: &BTreeMap::new(),
                 sets: &[],
                 nodes: &nodes,
+                quarantined: &quarantined,
                 held,
             },
             ObservedState {
@@ -683,6 +692,7 @@ mod tests {
         ]);
         let repository = repository();
 
+        let quarantined: BTreeSet<String> = held.keys().cloned().collect();
         let planned = plan_reconcile(
             DesiredState {
                 repository: &repository,
@@ -690,6 +700,7 @@ mod tests {
                 group_labels: &BTreeMap::new(),
                 sets: &[],
                 nodes: &nodes,
+                quarantined: &quarantined,
                 held: &held,
             },
             ObservedState {
@@ -786,6 +797,7 @@ mod tests {
             .collect();
         let repository = repository();
 
+        let quarantined: BTreeSet<String> = held.keys().cloned().collect();
         let planned = plan_reconcile(
             DesiredState {
                 repository: &repository,
@@ -793,6 +805,7 @@ mod tests {
                 group_labels: &BTreeMap::new(),
                 sets: &[],
                 nodes: &nodes,
+                quarantined: &quarantined,
                 held: &held,
             },
             ObservedState {

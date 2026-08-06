@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -544,19 +544,43 @@ fn publication_required(content_unchanged: bool, renewals: &[TufRole]) -> bool {
     !content_unchanged || !renewals.is_empty()
 }
 
-/// What "this repository is already published" means on disk: the content digest AND the digest of
-/// the local `root.json` that content was published under.
+/// What "this repository is already published" means on disk: the content digest AND the digests of
+/// the SIGNED METADATA that content is served under — the local `root.json` and, for the online
+/// roles, `timestamp.json`.
 ///
-/// The root must be part of it because a root renewal rewrites `metadata/root.json` in place BEFORE
-/// this pass signs and uploads anything. If the upload then fails — a lost lease, a transient
-/// object-store error — the store keeps serving the OLD root while the local one has already moved
-/// on. Keyed on content alone, the next pass saw an unchanged digest and a no-longer-expiring root
-/// and therefore never published again, leaving `status.routingRootSha256` (read from the local
-/// root) pinned to a root the store does not serve: `/enroll` and `/v1/node/secrets` then answer 502
-/// for the whole fleet until some unrelated content change happens to heal it. With the root in the
-/// marker, the mismatch itself demands a publication on the very next pass.
-fn publication_marker(digest: &str, root_sha256: Option<String>) -> String {
-    format!("{digest} {}", root_sha256.unwrap_or_default())
+/// The metadata must be part of it because every re-sign rewrites those documents in place BEFORE
+/// this pass uploads anything. If the upload then fails — a lost lease, a transient object-store
+/// error, the reconcile future dropped mid-upload — the store keeps serving the OLD documents while
+/// the local ones have already moved on, and a marker keyed on CONTENT alone matches again on the
+/// next pass, so nothing ever republishes:
+///
+/// * ROOT: `status.routingRootSha256` (read from the local root) then pins every `/enroll` and
+///   `/v1/node/secrets` request against a root the store does not serve — 502 fleet-wide until some
+///   unrelated content change happens to heal it.
+/// * ONLINE roles: `sign_plan` re-signs targets/snapshot/timestamp with a fresh expiry, so the
+///   freshness trigger CLEARS ITSELF — `expiring_metadata` reads the freshly signed LOCAL
+///   `timestamp.json` and reports nothing expiring — and the store is left serving online metadata
+///   that hard-expires ~90 days later, at which point every agent's TUF refresh fails at once.
+///
+/// With both digests in the marker, a local re-sign that never reached the store IS the mismatch,
+/// and it demands the republication that heals it on the very next pass.
+async fn publication_marker(state_dir: &Path, digest: &str) -> String {
+    let metadata = state_dir.join("repository/metadata");
+    format!(
+        "{digest} {} {}",
+        file_sha256(&metadata.join("root.json"))
+            .await
+            .unwrap_or_default(),
+        file_sha256(&metadata.join("timestamp.json"))
+            .await
+            .unwrap_or_default()
+    )
+}
+
+/// The SHA-256 of a file, or `None` when it cannot be read.
+async fn file_sha256(path: &Path) -> Option<String> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    Some(updated::hash::sha256_bytes(&bytes))
 }
 
 /// Renew the TUF root in place when it is inside its renewal window — same key set, next version,
@@ -656,15 +680,22 @@ pub async fn reconcile_once(
     // quarantining a group needs the deployment that group is still pinned to.
     let admitted_name = admitted_configmap_name(repository_name);
     let (durable, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
+    // The object store is needed every reconcile — to recover an interrupted publication, to read
+    // the node telemetry that drives rollout planning, and to publish — so build it up front.
+    let store = build_store(&secrets, &repository.spec.s3).await?;
     // A generation this replica published but never recorded is adopted before anything is planned
     // from the loaded state — planning on a baseline that predates the live generation is what
     // republishes an already-advanced node on its predecessor.
     let (durable, admitted_version) = recover_pending_publication(
-        &configmaps,
-        &admitted_name,
-        namespace,
+        AdmittedRecord {
+            configmaps: &configmaps,
+            name: &admitted_name,
+            namespace,
+            owner: repository.controller_owner_ref(&()),
+        },
         state_dir,
-        repository.controller_owner_ref(&()),
+        store.as_ref(),
+        &repository.spec.s3,
         durable,
         admitted_version,
     )
@@ -680,7 +711,7 @@ pub async fn reconcile_once(
     // this generation — rather than aborting publication for every other resource.
     let mut groups = BTreeMap::new();
     let mut group_labels = BTreeMap::new();
-    let mut quarantined_groups: HashSet<String> = HashSet::new();
+    let mut quarantined_groups: BTreeSet<String> = BTreeSet::new();
     // What each quarantined group is still pinned to. Its nodes must keep exactly that: routing
     // them to the unmatched-node pseudo-group would turn a typo'd digest or a bad `maxUnavailable`
     // into a fleet-wide, unthrottled, ungated deployment swap, and leaving them out of the
@@ -845,17 +876,13 @@ pub async fn reconcile_once(
         })
         .collect();
 
-    // The object store is needed every reconcile — not only to publish, but to read the
-    // node telemetry that drives rollout planning — so build it up front.
-    let store = build_store(&secrets, &repository.spec.s3).await?;
-
-    // An ABSENT admitted-state ConfigMap reads as "no group has ever been admitted", and every
-    // group then takes the first-admission branch — which is deliberately exempt from
-    // `maxConcurrent`, `maxUnavailable`, and rollout windows, because a group with nothing
-    // published has nothing to stage. On a fleet that HAS published, that is the entire inventory
-    // re-admitted ungated in one generation. Deleting (or failing to restore) one ConfigMap must
-    // not be a fleet-wide unthrottled rollout, so this fails closed exactly like the analogous
-    // "local publisher state is empty but the store has a generation" guard.
+    // An ABSENT admitted-state ConfigMap reads as "no group has ever been admitted", so every group
+    // takes the first-admission branch and every group's staging baseline is lost: `previous` is
+    // empty for all of them, so nothing is staged away from, and the rollout history each set's
+    // concurrency accounting depends on is gone. On a fleet that HAS published, that is the entire
+    // inventory re-admitted from a blank baseline in one generation. Deleting (or failing to
+    // restore) one ConfigMap must not be a fleet-wide rebaseline, so this fails closed exactly like
+    // the analogous "local publisher state is empty but the store has a generation" guard.
     if admitted_version.is_none()
         && durable.admitted.is_empty()
         && store_published_version(store.as_ref(), &repository.spec.s3)
@@ -916,6 +943,7 @@ pub async fn reconcile_once(
             group_labels: &group_labels,
             sets: &set_resources.items,
             nodes: &resolved_nodes,
+            quarantined: &quarantined_groups,
             held: &held_groups,
         },
         crate::domain::ObservedState {
@@ -948,7 +976,8 @@ pub async fn reconcile_once(
         .ok()
         .as_deref()
         == Some(
-            publication_marker(&desired_digest, local_routing_root_sha256(state_dir).await)
+            publication_marker(state_dir, &desired_digest)
+                .await
                 .as_str(),
         );
     let repo_dir = state_dir.join("repository");
@@ -998,10 +1027,10 @@ pub async fn reconcile_once(
                 )));
             }
 
-            // The marker this upload commits to, computed from the root as it stands NOW — after
-            // any renewal above — so it always describes the generation the store will serve.
-            let marker =
-                publication_marker(&desired_digest, local_routing_root_sha256(state_dir).await);
+            // The marker this upload commits to, computed from the metadata as it stands NOW —
+            // after the root renewal and the online re-sign above — so it always describes the
+            // generation the store will serve, and is written only once that upload lands.
+            let marker = publication_marker(state_dir, &desired_digest).await;
             // Journalled BEFORE the upload and keyed to that marker, so the state this generation
             // implies survives losing the in-cluster write below (see `recover_pending_publication`)
             // without a failed upload ever being mistaken for a published one.
@@ -1010,6 +1039,9 @@ pub async fn reconcile_once(
                 ".pending-",
                 &serde_json::to_vec(&PendingPublication {
                     marker: marker.clone(),
+                    // What the store will serve if this upload lands — the second, independent way
+                    // the next pass can tell that it did.
+                    version: updated_tuf::repo::current_version(&repo_dir).await?,
                     state: planned.clone(),
                 })?,
             )?;
@@ -1163,10 +1195,7 @@ async fn read_node_reports(
 /// store-served root AGAINST, so taking it from the store would compare a document with itself.
 /// `None` before this replica has ever signed a generation.
 async fn local_routing_root_sha256(state_dir: &Path) -> Option<String> {
-    let root = tokio::fs::read(state_dir.join("repository/metadata/root.json"))
-        .await
-        .ok()?;
-    Some(updated::hash::sha256_bytes(&root))
+    file_sha256(&state_dir.join("repository/metadata/root.json")).await
 }
 
 /// The ConfigMap name that durably holds this repository's admitted set (group → pinned
@@ -1243,18 +1272,32 @@ async fn load_admitted_state(
 /// The local journal of the generation this replica is publishing, written between signing and
 /// upload and cleared once the durable state that describes it has been recorded in-cluster.
 ///
-/// `marker` is the exact publication marker the upload commits to, so the next pass can tell a
-/// generation that reached the store from one that did not: the marker file is written ONLY after
-/// `publish_repository` returns, so `marker == published marker` is proof the store serves this
-/// generation.
+/// `version` — the `timestamp.json` version this upload carries — is what decides whether the
+/// generation reached the store, because the STORE is the only thing that knows: it serves `version`
+/// iff this upload landed. `marker` is journalled beside it purely so the marker file can be
+/// FINISHED (it is written after `publish_repository` returns, so a process death in that gap — an
+/// OOM kill, an evicted pod — leaves the store serving this generation while the marker still names
+/// its predecessor); it is never read as evidence of the upload. Marker equality is neither
+/// necessary (that same gap) nor sufficient: the marker covers the content and the signed metadata,
+/// so a pass triggered by neither journals a marker already on disk before the upload was attempted.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PendingPublication {
     marker: String,
+    version: u64,
     state: DurableRolloutState,
 }
 
 /// The journal file, alongside the publication marker it is compared against.
 const PENDING_STATE_FILE: &str = "pending-state.json";
+
+/// Where the durable rollout state is recorded: the ConfigMap, and the owner reference that ties it
+/// to its repository.
+struct AdmittedRecord<'a> {
+    configmaps: &'a Api<ConfigMap>,
+    name: &'a str,
+    namespace: &'a str,
+    owner: Option<OwnerReference>,
+}
 
 /// Record the state a generation published but never got to store in-cluster.
 ///
@@ -1271,32 +1314,62 @@ const PENDING_STATE_FILE: &str = "pending-state.json";
 /// journal is evaluated at most once — it is removed whatever the verdict — so it can never
 /// re-apply itself over a later in-cluster write.
 async fn recover_pending_publication(
-    configmaps: &Api<ConfigMap>,
-    name: &str,
-    namespace: &str,
+    record: AdmittedRecord<'_>,
     state_dir: &Path,
-    owner: Option<OwnerReference>,
+    store: &dyn ObjectStore,
+    destination: &S3Destination,
     durable: DurableRolloutState,
     resource_version: Option<String>,
 ) -> Result<(DurableRolloutState, Option<String>), Box<dyn std::error::Error>> {
+    let AdmittedRecord {
+        configmaps,
+        name,
+        namespace,
+        owner,
+    } = record;
     let path = state_dir.join(PENDING_STATE_FILE);
     let Ok(bytes) = tokio::fs::read(&path).await else {
         return Ok((durable, resource_version));
     };
-    let recovered = match serde_json::from_slice::<PendingPublication>(&bytes) {
-        Ok(pending)
-            if Some(pending.marker.as_str())
-                == tokio::fs::read_to_string(state_dir.join("published-plan.sha256"))
-                    .await
-                    .ok()
-                    .as_deref() =>
-        {
-            Some(pending.state)
+    // The journal is unreadable: there is nothing to recover from it.
+    let mut recovered = None;
+    if let Ok(pending) = serde_json::from_slice::<PendingPublication>(&bytes) {
+        // The STORE is the ONE authority on whether the journalled generation was uploaded: it
+        // serves `version` iff this upload landed. The publication marker cannot answer it in
+        // either direction. It is not NECESSARY — it is written after the upload, so a death in that
+        // gap leaves it naming the predecessor while the store genuinely serves this generation —
+        // and it is not SUFFICIENT either: the marker describes the content and the signed metadata,
+        // so a pass triggered by neither (an admission that moves no node, over unchanged content
+        // and metadata) journals a marker that was ALREADY on disk before the upload was attempted,
+        // and reading that equality as proof adopted the state of an upload that never happened.
+        if store_published_version(store, destination).await? == Some(pending.version) {
+            let marker_path = state_dir.join("published-plan.sha256");
+            if tokio::fs::read_to_string(&marker_path)
+                .await
+                .ok()
+                .as_deref()
+                != Some(pending.marker.as_str())
+            {
+                // The upload landed and the process died before the marker write. Finish it, so the
+                // local record and the store agree again instead of the next pass republishing
+                // identical content under a new version.
+                tracing::warn!(
+                    version = pending.version,
+                    "the object store serves a generation whose local publication marker was never \
+                     written (the process died between the upload and the marker); adopting the \
+                     journalled state rather than discarding a live generation's rollout state"
+                );
+                foundation::durable::atomic_write(
+                    &marker_path,
+                    ".published-",
+                    pending.marker.as_bytes(),
+                )?;
+            }
+            recovered = Some(pending.state);
         }
-        // Either the upload never completed — the marker for this generation was never written, so
-        // nothing was served and there is nothing to record — or the journal is unreadable.
-        _ => None,
-    };
+        // Otherwise the upload never completed: the store does not serve this generation, so nothing
+        // was ever handed to a node and there is nothing to record.
+    }
     let outcome = match recovered {
         Some(state) if state != durable => {
             tracing::warn!(
@@ -2406,10 +2479,9 @@ mod lease_tests {
 
         // The last successful publication recorded this content under this root.
         let digest = "content-digest";
-        let published = publication_marker(digest, local_routing_root_sha256(state_dir).await);
-        let unchanged = |marker: String| async move {
-            marker == publication_marker(digest, local_routing_root_sha256(state_dir).await)
-        };
+        let published = publication_marker(state_dir, digest).await;
+        let unchanged =
+            |marker: String| async move { marker == publication_marker(state_dir, digest).await };
         assert!(unchanged(published.clone()).await, "nothing has moved yet");
         assert!(
             !publication_required(true, &[]),
@@ -2438,11 +2510,77 @@ mod lease_tests {
 
         // Once that publish succeeds the marker is rewritten from the root as it now stands, and
         // the fleet is back at steady state.
-        let published = publication_marker(digest, local_routing_root_sha256(state_dir).await);
+        let published = publication_marker(state_dir, digest).await;
         assert!(unchanged(published.clone()).await);
         assert!(!publication_required(
             unchanged(published.clone()).await,
             &[]
+        ));
+    }
+
+    /// The same defect on the ONLINE roles, which is worse because the trigger clears ITSELF:
+    /// `sign_plan` re-signs targets/snapshot/timestamp in place with a fresh expiry BEFORE the
+    /// upload, so after a failed upload `expiring_metadata` reads the freshly signed LOCAL
+    /// `timestamp.json` and reports nothing expiring. Keyed on content (and the root) alone, the
+    /// publish block was never entered again and the store kept serving the OLD online metadata
+    /// until it hard-expired ~90 days later — at which point every agent's TUF refresh fails at
+    /// once and `/enroll` answers 502 fleet-wide, with nothing inside the loop to recover. The
+    /// marker carries the online metadata too, so the local re-sign that never landed IS the
+    /// mismatch that demands the republication.
+    #[tokio::test]
+    async fn online_metadata_re_signed_but_never_uploaded_forces_the_next_pass_to_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        let repo_dir = state_dir.join("repository");
+        let now = chrono::Utc::now();
+        let digest = "content-digest";
+        signed_until(
+            &repo_dir,
+            "root.json",
+            now + chrono::Duration::days(METADATA_EXPIRY_DAYS),
+        );
+        // The online roles are inside their renewal window; the root, renewed earlier, is not. The
+        // last successful publication recorded this content under this metadata.
+        signed_until(
+            &repo_dir,
+            "timestamp.json",
+            now + chrono::Duration::days(METADATA_RENEWAL_DAYS - 1),
+        );
+        let published = publication_marker(state_dir, digest).await;
+        let renewals = expiring_metadata(&repo_dir, now).await;
+        assert_eq!(renewals, vec![TufRole::Online]);
+        assert!(
+            publication_required(true, &renewals),
+            "freshness alone must trigger a publication at steady state"
+        );
+
+        // That pass re-signs the online roles in place and then fails to upload them.
+        signed_until(
+            &repo_dir,
+            "timestamp.json",
+            now + chrono::Duration::days(METADATA_EXPIRY_DAYS),
+        );
+        let renewals = expiring_metadata(&repo_dir, now).await;
+        assert!(
+            renewals.is_empty(),
+            "the re-sign cleared its own trigger, so freshness cannot ask again"
+        );
+        let unchanged = published == publication_marker(state_dir, digest).await;
+        assert!(
+            !unchanged,
+            "the local online metadata moved, so this repository is NOT the one the store serves"
+        );
+        assert!(
+            publication_required(unchanged, &renewals),
+            "the next pass must sign and upload the re-signed online metadata"
+        );
+
+        // Once that publish succeeds the marker is rewritten from the metadata as it now stands,
+        // and the fleet is back at steady state.
+        let published = publication_marker(state_dir, digest).await;
+        assert!(!publication_required(
+            published == publication_marker(state_dir, digest).await,
+            &expiring_metadata(&repo_dir, now).await
         ));
     }
 
@@ -2800,6 +2938,8 @@ mod lease_tests {
     #[tokio::test]
     async fn a_published_generation_whose_record_was_lost_is_recovered_before_planning() {
         use axum::http::{Method, StatusCode};
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjPath;
 
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path();
@@ -2813,11 +2953,12 @@ mod lease_tests {
             routing: BTreeMap::from([("n1".to_string(), "g".to_string())]),
             assignments: BTreeMap::from([("n1".to_string(), "a".repeat(64))]),
         };
-        let journal = |marker: &str, state: &DurableRolloutState| {
+        let journal = |marker: &str, version: u64, state: &DurableRolloutState| {
             std::fs::write(
                 state_dir.join(PENDING_STATE_FILE),
                 serde_json::to_vec(&PendingPublication {
                     marker: marker.to_string(),
+                    version,
                     state: DurableRolloutState {
                         admitted: state.admitted.clone(),
                         routing: state.routing.clone(),
@@ -2827,6 +2968,26 @@ mod lease_tests {
                 .unwrap(),
             )
             .unwrap();
+        };
+        let mut destination = repository("updates").s3;
+        destination.prefix = "routing".into();
+        let store = InMemory::new();
+        let serve = |version: u64| {
+            let store = &store;
+            async move {
+                store
+                    .put(
+                        &ObjPath::from("routing/metadata/timestamp.json"),
+                        PutPayload::from_bytes(
+                            serde_json::json!({ "signed": { "version": version } })
+                                .to_string()
+                                .into_bytes()
+                                .into(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
         };
         let recorded: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
         let client = crate::tests::apiserver({
@@ -2847,29 +3008,57 @@ mod lease_tests {
         let configmaps: Api<ConfigMap> = Api::namespaced(client, "prod");
         let recover = |durable: DurableRolloutState| {
             recover_pending_publication(
-                &configmaps,
-                "state",
-                "prod",
+                AdmittedRecord {
+                    configmaps: &configmaps,
+                    name: "state",
+                    namespace: "prod",
+                    owner: None,
+                },
                 state_dir,
-                None,
+                &store,
+                &destination,
                 durable,
                 Some("7".to_string()),
             )
         };
 
-        // The upload never completed: the marker for that generation was never written, so nothing
-        // was served and the journal is discarded rather than recorded.
-        journal("marker-of-a-generation-that-was-never-uploaded", &advanced);
+        // The upload never completed: the marker for that generation was never written AND the
+        // store does not serve it, so nothing was served and the journal is discarded rather than
+        // recorded.
+        serve(39).await;
+        journal(
+            "marker-of-a-generation-that-was-never-uploaded",
+            40,
+            &advanced,
+        );
         let (durable, version) = recover(stale()).await.unwrap();
         assert_eq!(durable.assignments["n1"], "a".repeat(64));
         assert_eq!(version.as_deref(), Some("7"));
         assert!(recorded.lock().unwrap().is_empty(), "nothing to record");
         assert!(!state_dir.join(PENDING_STATE_FILE).exists());
 
-        // The upload DID complete — the marker file proves it — but the record was lost. The
-        // published state is adopted and written back, and planning proceeds from it.
+        // Marker equality is NOT proof of upload. A pass triggered by neither changed content nor
+        // expiring metadata — an admission whose nodes are all blocked by `maxUnavailable`, so the
+        // plan digest is unchanged — journals a marker that is ALREADY on disk from the previous
+        // successful generation. Its upload failed all the same, and the store still serves 39, so
+        // adopting on the marker recorded a generation no signed metadata ever carried.
         std::fs::write(state_dir.join("published-plan.sha256"), "marker-v40").unwrap();
-        journal("marker-v40", &advanced);
+        journal("marker-v40", 40, &advanced);
+        let (durable, version) = recover(stale()).await.unwrap();
+        assert_eq!(
+            durable.assignments["n1"],
+            "a".repeat(64),
+            "the store serves 39, so this journal describes an upload that never landed"
+        );
+        assert_eq!(version.as_deref(), Some("7"));
+        assert!(recorded.lock().unwrap().is_empty(), "nothing to record");
+        assert!(!state_dir.join(PENDING_STATE_FILE).exists());
+
+        // The upload DID complete — the store serves the exact generation the journal describes —
+        // but the record was lost. The published state is adopted and written back, and planning
+        // proceeds from it.
+        serve(40).await;
+        journal("marker-v40", 40, &advanced);
         let (durable, version) = recover(stale()).await.unwrap();
         assert_eq!(
             durable.assignments["n1"],
@@ -2893,6 +3082,95 @@ mod lease_tests {
             !state_dir.join(PENDING_STATE_FILE).exists(),
             "the journal is evaluated once, so it can never re-apply itself over a later write"
         );
+    }
+
+    /// The publication marker is written AFTER the upload returns, so a process death in that gap
+    /// (an OOM kill, an evicted pod) leaves the store serving generation N while the marker still
+    /// names N-1. Deciding on the marker alone read that as "never uploaded" and DELETED the
+    /// journal, so planning fell back to a baseline predating the live generation and republished
+    /// an already-advanced node on its predecessor. The store is asked instead: it serves the
+    /// journalled version, so the state is adopted and the interrupted marker write is finished.
+    #[tokio::test]
+    async fn a_generation_the_store_serves_is_recovered_even_when_the_marker_never_landed() {
+        use axum::http::{Method, StatusCode};
+        use object_store::memory::InMemory;
+        use object_store::path::Path as ObjPath;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path();
+        // The marker still names the PREDECESSOR: the process died before it was rewritten.
+        std::fs::write(state_dir.join("published-plan.sha256"), "marker-v39").unwrap();
+        std::fs::write(
+            state_dir.join(PENDING_STATE_FILE),
+            serde_json::to_vec(&PendingPublication {
+                marker: "marker-v40".into(),
+                version: 40,
+                state: DurableRolloutState {
+                    admitted: BTreeMap::new(),
+                    routing: BTreeMap::from([("n1".to_string(), "g".to_string())]),
+                    assignments: BTreeMap::from([("n1".to_string(), "b".repeat(64))]),
+                },
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut destination = repository("updates").s3;
+        destination.prefix = "routing".into();
+        let store = InMemory::new();
+        // The store genuinely serves generation 40: `publish_repository` uploads timestamp.json
+        // last, so on return the generation IS being served.
+        store
+            .put(
+                &ObjPath::from("routing/metadata/timestamp.json"),
+                PutPayload::from_bytes(
+                    serde_json::json!({ "signed": { "version": 40 } })
+                        .to_string()
+                        .into_bytes()
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let client = crate::tests::apiserver(move |_: &Method, _: &str, _: Vec<u8>| {
+            (
+                StatusCode::OK,
+                serde_json::json!({ "metadata": { "name": "state", "resourceVersion": "9" } }),
+            )
+        });
+        let configmaps: Api<ConfigMap> = Api::namespaced(client, "prod");
+        let (durable, version) = recover_pending_publication(
+            AdmittedRecord {
+                configmaps: &configmaps,
+                name: "state",
+                namespace: "prod",
+                owner: None,
+            },
+            state_dir,
+            &store,
+            &destination,
+            DurableRolloutState {
+                admitted: BTreeMap::new(),
+                routing: BTreeMap::from([("n1".to_string(), "g".to_string())]),
+                assignments: BTreeMap::from([("n1".to_string(), "a".repeat(64))]),
+            },
+            Some("7".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            durable.assignments["n1"],
+            "b".repeat(64),
+            "the live generation's state is adopted, not discarded as never-uploaded"
+        );
+        assert_eq!(version.as_deref(), Some("9"));
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("published-plan.sha256")).unwrap(),
+            "marker-v40",
+            "and the interrupted marker write is finished, so no identical republish follows"
+        );
+        assert!(!state_dir.join(PENDING_STATE_FILE).exists());
     }
 
     #[test]

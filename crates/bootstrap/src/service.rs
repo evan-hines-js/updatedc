@@ -31,8 +31,11 @@ pub struct Service {
     /// A spontaneous exit observed while the service was drained, held until it becomes
     /// observable. Reaping the exit is unavoidable — it is how it is observed at all, and
     /// taking it drops the process handle — so the only way it can still be rolled up is to
-    /// keep it here. Cleared by the next intentional [`stop`](Service::stop), which is the
-    /// supervisor superseding it (a rollback quiesces before relaunching).
+    /// keep it here. It belongs to a process that no longer exists, so it is superseded by
+    /// the next process the supervisor puts in its place — a [`launch`](Service::launch) —
+    /// and by an intentional [`stop`](Service::stop). It is rolled up only if the service
+    /// leaves Draining with no replacement, which is the tower genuinely having no
+    /// application.
     drained_exit: Option<i32>,
 }
 
@@ -57,14 +60,23 @@ impl Service {
     }
 
     pub fn launch(&mut self, spec: &CommandSpec, stop_grace: Duration) -> std::io::Result<u32> {
-        self.process.launch(spec, stop_grace)
+        let pid = self.process.launch(spec, stop_grace)?;
+        // A running process supersedes an exit deferred by an earlier drain: whatever died in
+        // the drained window is not this service's outcome once the supervisor has put a
+        // replacement in its place. The rollback after a candidate crashes reaches here
+        // WITHOUT an intervening stop — the crashed candidate is already gone, so the
+        // recovery boot plans no quiesce — and surfacing the dead candidate's code over the
+        // restored predecessor would tear the whole tower down after a rollback that had
+        // already succeeded. A launch that fails leaves it parked: there is then no
+        // application, and the deferred exit is still the service's outcome.
+        self.drained_exit = None;
+        Ok(pid)
     }
 
     pub fn stop(&mut self, stop_grace: Duration) {
         self.transition(State::Draining);
-        // An intentional stop supersedes an exit deferred by an earlier drain: the supervisor
-        // is quiescing to replace this process (a rollback, or the next update), so the dead
-        // candidate is no longer the service's outcome.
+        // An intentional stop likewise supersedes it: the supervisor is quiescing to replace
+        // this process, so the dead candidate is no longer the service's outcome.
         self.drained_exit = None;
         self.process.stop(stop_grace);
     }
@@ -106,7 +118,8 @@ impl Service {
         // application and no `service-exited` marker, so a crashed release that had already
         // committed would be confirmed instead of reverted. It surfaces the moment the
         // service leaves Draining — the supervisor returned the candidate to traffic, or
-        // withdrew it — which is exactly when the transaction stopped owning its failure.
+        // withdrew it — which is exactly when the transaction stopped owning its failure,
+        // and only if no replacement process superseded it in the meantime.
         if let Some(code) = self.process.poll_exit() {
             self.drained_exit = Some(code);
         }
@@ -143,40 +156,49 @@ mod tests {
     use super::*;
     use crate::sys::Process;
 
-    struct Exits(i32);
+    /// A fake process whose behaviour is encoded in the spec's program, as in
+    /// [`crate::app`]'s tests: `exit:N` has already exited with code `N`; anything else
+    /// runs until stopped.
+    struct Fake {
+        exit: Option<i32>,
+    }
 
-    impl Process for Exits {
+    impl Process for Fake {
         fn pid(&self) -> u32 {
             7
         }
 
         fn poll_exit(&mut self) -> Option<i32> {
-            Some(self.0)
+            self.exit
         }
 
         fn stop(&mut self, _grace: Duration) {}
     }
 
-    fn spawn_zero(_spec: &CommandSpec) -> std::io::Result<Box<dyn Process>> {
-        Ok(Box::new(Exits(0)))
+    fn fake_spawn(spec: &CommandSpec) -> std::io::Result<Box<dyn Process>> {
+        let exit = spec
+            .program
+            .to_str()
+            .and_then(|s| s.strip_prefix("exit:"))
+            .and_then(|n| n.parse().ok());
+        Ok(Box::new(Fake { exit }))
+    }
+
+    fn spec(program: &str) -> CommandSpec {
+        CommandSpec {
+            program: program.into(),
+            args: vec![],
+            env: vec![],
+            cwd: None,
+        }
     }
 
     #[test]
     fn the_service_machine_owns_process_exit_and_probe_failure_together() {
         let probes = ProbeMachine::new();
         let mut service = Service::new(probes.clone());
-        service.process = App::with_spawn(spawn_zero);
-        service
-            .launch(
-                &CommandSpec {
-                    program: "ignored".into(),
-                    args: vec![],
-                    env: vec![],
-                    cwd: None,
-                },
-                Duration::ZERO,
-            )
-            .unwrap();
+        service.process = App::with_spawn(fake_spawn);
+        service.launch(&spec("exit:0"), Duration::ZERO).unwrap();
         service.traffic_ready(true);
 
         assert_eq!(probes.state(), ProbeState::Serving);
@@ -209,19 +231,9 @@ mod tests {
     /// A candidate launched into the drained window of an update, which exits at once.
     fn drained_candidate(probes: &ProbeMachine) -> Service {
         let mut service = Service::new(probes.clone());
-        service.process = App::with_spawn(spawn_zero);
+        service.process = App::with_spawn(fake_spawn);
         service.stop(Duration::ZERO);
-        service
-            .launch(
-                &CommandSpec {
-                    program: "ignored".into(),
-                    args: vec![],
-                    env: vec![],
-                    cwd: None,
-                },
-                Duration::ZERO,
-            )
-            .unwrap();
+        service.launch(&spec("exit:0"), Duration::ZERO).unwrap();
         service
     }
 
@@ -286,5 +298,59 @@ mod tests {
 
         assert_eq!(service.poll_exit(), None);
         assert_eq!(probes.state(), ProbeState::Serving);
+    }
+
+    #[test]
+    fn a_relaunch_without_a_quiesce_supersedes_a_deferred_drained_exit() {
+        // The rollback that actually happens when a candidate crashes on start. The dead
+        // candidate's process is already gone, so the recovery boot sees no running
+        // application, plans no quiesce, and reaches `Request::Launch` for the predecessor
+        // with no `Request::Stop` in between — the one path that used to clear the deferred
+        // exit is unreachable on the one path that sets it. Surfacing the candidate's code
+        // over the restored predecessor tore the whole tower down (and wrote a
+        // `service-exited` marker blaming a healthy process) right after a successful
+        // rollback.
+        let probes = ProbeMachine::new();
+        let mut service = drained_candidate(&probes);
+        assert_eq!(service.poll_exit(), None, "drained: not yet the tower's");
+
+        service
+            .launch(&spec("run-forever"), Duration::ZERO)
+            .unwrap();
+        service.traffic_ready(true);
+
+        assert_eq!(
+            service.poll_exit(),
+            None,
+            "the restored predecessor is running; the dead candidate is not the outcome"
+        );
+        assert_eq!(probes.state(), ProbeState::Serving);
+    }
+
+    #[test]
+    fn a_failed_relaunch_leaves_the_deferred_exit_to_be_rolled_up() {
+        // The replacement is what supersedes the dead candidate, so a launch that never
+        // produced one must not swallow it: the tower has no application at all, and the
+        // exit is still its outcome.
+        let probes = ProbeMachine::new();
+        let mut service = Service::new(probes.clone());
+        service.process = App::with_spawn(|spec| {
+            if spec.program == "unlaunchable" {
+                Err(std::io::Error::other("no such program"))
+            } else {
+                fake_spawn(spec)
+            }
+        });
+        service.stop(Duration::ZERO);
+        service.launch(&spec("exit:9"), Duration::ZERO).unwrap();
+        assert_eq!(service.poll_exit(), None);
+
+        service
+            .launch(&spec("unlaunchable"), Duration::ZERO)
+            .unwrap_err();
+        service.traffic_ready(false);
+
+        assert_eq!(service.poll_exit(), Some(9));
+        assert_eq!(probes.state(), ProbeState::Failed);
     }
 }

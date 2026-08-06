@@ -234,6 +234,13 @@ fn durable_write(path: &Path, prefix: &str, data: &[u8], visibility: Visibility)
 /// there" and "its survival across a power loss is unproven" — travel in one `io::Result`
 /// instead of forcing a second return type on every durable primitive and every caller of one.
 /// [`committed_unsynced`] is how a caller asks.
+///
+/// The wrapped error is this type's `source`, and `io::Error`'s own `source` forwards to it, so
+/// the original — **raw OS code included** — stays one `Error::source()` hop from the returned
+/// error. That reachability is load-bearing: a `std::io::Error` carrying a payload cannot also
+/// carry a raw code (the two are alternative representations), and a caller that classifies a
+/// fault by its raw code rather than by `ErrorKind` — an fsync `EIO`, which has no `ErrorKind`
+/// of its own — has nowhere else to read it from.
 #[derive(Debug)]
 struct Unsynced(io::Error);
 
@@ -254,7 +261,11 @@ impl std::error::Error for Unsynced {
 }
 
 /// Tag a post-commit failure, keeping the underlying `ErrorKind` so a caller that only matches
-/// on the kind (`NotFound`, `PermissionDenied`, …) is unaffected by the wrapping.
+/// on the kind (`NotFound`, `PermissionDenied`, …) is unaffected by the wrapping, and keeping the
+/// underlying error itself reachable as the returned error's `source` so a caller that classifies
+/// by raw OS code (`EIO`, which arrives as an unmatchable `ErrorKind`) still finds it. Attaching a
+/// payload to an `io::Error` necessarily replaces its raw-code representation, so the source hop
+/// is the only place that code can live — see [`Unsynced`].
 fn unsynced(error: io::Error) -> io::Error {
     io::Error::new(error.kind(), Unsynced(error))
 }
@@ -501,6 +512,36 @@ mod tests {
         assert!(
             !committed_unsynced(&io::Error::from(io::ErrorKind::PermissionDenied)),
             "an ordinary failure is still an ordinary failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_post_commit_failure_keeps_its_raw_os_code_reachable() {
+        // An fsync EIO from a failing device is a node-local transient: the step that hit it earns
+        // another attempt, and the release that hit it earns nothing. EIO has no `ErrorKind` of
+        // its own — it arrives `Uncategorized`, which no caller can match — so the ONLY way to
+        // recognise it is its raw code, and an `io::Error` that carries the `Unsynced` payload
+        // cannot also carry that code. Whoever classifies must read it one `source()` hop down.
+        // Lose that hop and a transient disk fault reads as a bad release: the candidate
+        // supervisor is rejected by content hash and the node is stranded a release behind.
+        use std::error::Error;
+        let wrapped = unsynced(io::Error::from_raw_os_error(libc::EIO));
+
+        assert!(committed_unsynced(&wrapped), "the change still landed");
+        assert_eq!(
+            wrapped.kind(),
+            io::Error::from_raw_os_error(libc::EIO).kind(),
+            "the kind a caller matches on is untouched by the wrapping"
+        );
+        let cause = wrapped
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .expect("the wrapped error is the returned error's source");
+        assert_eq!(
+            cause.raw_os_error(),
+            Some(libc::EIO),
+            "the raw code must survive the wrapping, one source hop down"
         );
     }
 

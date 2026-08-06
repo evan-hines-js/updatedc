@@ -902,9 +902,9 @@ impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
     /// Adopt a candidate only if it verifies completely on its own terms AND continues this node's
     /// enrollment-time root of trust.
     ///
-    /// The chain check is [`verify_embedded_chain`] — the identical signature, threshold, digest and
-    /// `install_root` verification first use gets — plus [`VerifiedEmbedded::fresh`], since replacing
-    /// aging material with material that is already expired buys nothing.
+    /// The chain check is [`verify_embedded_chain`] — the identical signature, threshold and digest
+    /// verification first use gets — plus [`VerifiedEmbedded::fresh`], since replacing aging
+    /// material with material that is already expired buys nothing.
     ///
     /// The root check is what makes the swap safe at all. A verified chain proves only that the
     /// documents belong together under *whatever root came with them*, so on its own it would accept
@@ -912,15 +912,70 @@ impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
     /// enrollment-time pin would be worth nothing. [`root_chains_from`] requires the candidate's root
     /// to be the pinned root or a rotation the pinned root itself signed — the same rule a TUF client
     /// applies walking root versions forward.
+    ///
+    /// The three pins are the rest of it. A refresh exists to replace *aging metadata* and may do
+    /// nothing else: it must not move where the node's configuration comes from, nor where its
+    /// state lives. So the candidate must name the same assignment target and the same
+    /// `routing_base_url` as the bundle it replaces, and the assignment it embeds must keep the
+    /// same `install_root` — all checked against the CURRENT persisted bundle, exactly as
+    /// [`updated::enrollment::adopt_bundle`] pins `agent_id`, because the pin these boots derive is
+    /// read out of whatever bundle is persisted. Without them a refresh carrying another agent's
+    /// genuinely-signed assignment, or the same agent's assignment with an edited `installRoot`,
+    /// verifies perfectly and is adopted — and the next boot resolves someone else's configuration,
+    /// or repoints `versions/`, the transaction journal and the rejected-hash set at an empty
+    /// directory while the fail-closed [`usable_as_boot_config`] guard rejects the node's own live
+    /// assignment for having the *old* root.
+    ///
+    /// `routing_base_url` is the same class of move and the worst of the three, because it is the
+    /// one that disables the correction path. It is plaintext the gateway chooses and no TUF
+    /// signature covers it, so a refresh may carry the node's own bundle byte-identical but for a
+    /// `file:` or absolute-path base. That verifies trivially, and afterwards
+    /// `updated::enrollment`'s `can_reach_gateway` classifies the node as a local/offline
+    /// deployment: it stops asking for bundles at all, so no later refresh — not even from a
+    /// restored gateway — can undo it, and routing resolution fails as a retryable transport error
+    /// forever. Pinning it means a genuine gateway relocation is not adoptable by refresh, which is
+    /// correct: the refresh endpoint itself is reached through the node's bootstrap configuration,
+    /// not this field, so moving the fleet's routing origin is a re-enrollment, not a metadata
+    /// rotation.
     fn accept(
         &self,
         candidate: &updated_contracts::enrollment::EnrollmentBundle,
         current: &updated_contracts::enrollment::EnrollmentBundle,
     ) -> std::io::Result<()> {
         root_chains_from(&current.routing_root, &candidate.routing_root).map_err(refusal)?;
-        verify_embedded_chain(candidate)
+        if candidate.assignment != current.assignment {
+            return Err(refusal(Error::Trust(format!(
+                "refreshed enrollment bundle names the assignment {:?}, moving this node off the \
+                 enrollment-verified {:?}",
+                candidate.assignment, current.assignment
+            ))));
+        }
+        if candidate.routing_base_url != current.routing_base_url {
+            return Err(refusal(Error::Trust(format!(
+                "refreshed enrollment bundle would read routing from {:?}, moving this node off \
+                 the enrollment-verified {:?}",
+                candidate.routing_base_url, current.routing_base_url
+            ))));
+        }
+        let candidate = verify_embedded_chain(candidate)
             .and_then(VerifiedEmbedded::fresh)
             .map_err(refusal)?;
+        // The current bundle is deliberately verified WITHOUT the freshness requirement: it is the
+        // material being replaced precisely because it is aging, and an expired chain still pins
+        // this node's install root (see [`boot_assignment`]).
+        let pinned = verify_embedded_chain(current)
+            .map_err(refusal)?
+            .assignment
+            .runtime
+            .install_root;
+        if candidate.runtime.install_root != pinned {
+            return Err(refusal(Error::Trust(format!(
+                "refreshed enrollment bundle would move install_root to {} from the \
+                 enrollment-verified {}",
+                candidate.runtime.install_root.display(),
+                pinned.display()
+            ))));
+        }
         Ok(())
     }
 }

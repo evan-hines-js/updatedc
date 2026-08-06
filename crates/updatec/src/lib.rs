@@ -3,7 +3,7 @@
 //! Custom `UpdateAgent` resources represent agents anywhere. Group selectors determine
 //! which exact config bundle each minimal agent document references.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -714,6 +714,12 @@ pub enum PlanError {
         group: String,
         input: String,
     },
+    /// More dependency inputs than the signed output manifest admits, so the group's resolved
+    /// `runtime.inputs` could never be published.
+    TooManyDependencyInputs {
+        group: String,
+        inputs: usize,
+    },
     AmbiguousNode {
         node: String,
         groups: Vec<String>,
@@ -751,12 +757,25 @@ fn is_output_name(name: &str) -> bool {
 
 /// Validate the group dependency graph before planning a new publication. Invalid desired state
 /// fails the whole generation closed, preserving the last published assignments.
+///
+/// A QUARANTINED group is present-but-frozen, not missing: the resource exists, it simply cannot be
+/// planned this pass. Reading it as missing made one typo'd digest abort publication for the entire
+/// repository — the exact fleet-wide stall quarantine exists to prevent ("rather than aborting
+/// publication for every other resource"). Its dependents resolve no inputs from it, so they stay
+/// un-admitted and carry their current routing forward, which is what a frozen prerequisite should
+/// do.
+///
+/// The skip keys on the FULL quarantined set, not on the subset that has a durable pin (`held`): a
+/// group created with a typo'd digest was never admitted, so it has no pin at all, and that is the
+/// most likely way this state is ever reached.
 pub(crate) fn validate_dependency_graph(
     groups: &BTreeMap<String, ResolvedGroup>,
+    quarantined: &BTreeSet<String>,
 ) -> Result<(), PlanError> {
     fn visit(
         name: &str,
         groups: &BTreeMap<String, ResolvedGroup>,
+        quarantined: &BTreeSet<String>,
         state: &mut BTreeMap<String, u8>,
         stack: &mut Vec<String>,
     ) -> Result<(), PlanError> {
@@ -773,13 +792,27 @@ pub(crate) fn validate_dependency_graph(
         state.insert(name.to_string(), 1);
         stack.push(name.to_string());
         for dependency in &groups[name].depends_on {
+            if quarantined.contains(dependency) {
+                continue;
+            }
             if !groups.contains_key(dependency) {
                 return Err(PlanError::MissingDependency {
                     group: name.to_string(),
                     dependency: dependency.clone(),
                 });
             }
-            visit(dependency, groups, state, stack)?;
+            visit(dependency, groups, quarantined, state, stack)?;
+        }
+        // The resolved input COUNT is bounded by the signed manifest exactly as each input NAME is.
+        // `resolve_one` replaces `runtime.inputs` wholesale with one value per declared input, so a
+        // group declaring more than the manifest admits parses fine at admission and detonates the
+        // moment its producer first reports healthy: `deployment_identity` returns None from then
+        // on and every reconcile for the whole repository fails to build a publication.
+        if groups[name].inputs.len() > updated_contracts::telemetry::OutputManifest::MAX_VALUES {
+            return Err(PlanError::TooManyDependencyInputs {
+                group: name.to_string(),
+                inputs: groups[name].inputs.len(),
+            });
         }
         for (input, reference) in &groups[name].inputs {
             if !is_output_name(input)
@@ -800,7 +833,7 @@ pub(crate) fn validate_dependency_graph(
     let mut state = BTreeMap::new();
     let mut stack = Vec::new();
     for name in groups.keys() {
-        visit(name, groups, &mut state, &mut stack)?;
+        visit(name, groups, quarantined, &mut state, &mut stack)?;
     }
     Ok(())
 }
@@ -1330,7 +1363,7 @@ mod tests {
         ]);
         groups.get_mut("b").unwrap().depends_on = vec!["missing".into()];
         assert_eq!(
-            validate_dependency_graph(&groups),
+            validate_dependency_graph(&groups, &BTreeSet::new()),
             Err(PlanError::MissingDependency {
                 group: "b".into(),
                 dependency: "missing".into(),
@@ -1340,7 +1373,7 @@ mod tests {
         groups.get_mut("a").unwrap().depends_on = vec!["b".into()];
         groups.get_mut("b").unwrap().depends_on = vec!["a".into()];
         assert_eq!(
-            validate_dependency_graph(&groups),
+            validate_dependency_graph(&groups, &BTreeSet::new()),
             Err(PlanError::DependencyCycle(vec![
                 "a".into(),
                 "b".into(),
@@ -1359,7 +1392,7 @@ mod tests {
             },
         );
         assert_eq!(
-            validate_dependency_graph(&groups),
+            validate_dependency_graph(&groups, &BTreeSet::new()),
             Err(PlanError::InvalidDependencyInput {
                 group: "b".into(),
                 input: "leader".into(),
@@ -1389,7 +1422,7 @@ mod tests {
             },
         );
         assert_eq!(
-            validate_dependency_graph(&groups),
+            validate_dependency_graph(&groups, &BTreeSet::new()),
             Err(PlanError::InvalidDependencyInput {
                 group: "b".into(),
                 input: over_long.clone(),
@@ -1400,6 +1433,71 @@ mod tests {
         assert!(is_output_name("endpoint"));
         assert!(!is_output_name(""));
         assert!(!is_output_name("a/b"));
+    }
+
+    /// The manifest bounds the input COUNT at 64 as firmly as it bounds each name at 128 bytes, and
+    /// 65 distinct names may all reference one producer's single output. Admitting the count only
+    /// when `ManagedRuntime::validate` sees the RESOLVED map time-bombed on the producer first
+    /// reporting healthy: `deployment_identity` returned None from then on and
+    /// `build_publication_plan` failed repository-wide, every pass.
+    #[test]
+    fn more_dependency_inputs_than_the_signed_manifest_admits_are_rejected_at_admission() {
+        let mut groups = BTreeMap::from([
+            ("a".into(), group("a", &[("role", "a")])),
+            ("b".into(), group("b", &[("role", "b")])),
+        ]);
+        groups.get_mut("b").unwrap().depends_on = vec!["a".into()];
+        let limit = updated_contracts::telemetry::OutputManifest::MAX_VALUES;
+        for index in 0..limit {
+            groups.get_mut("b").unwrap().inputs.insert(
+                format!("peer{index}"),
+                GroupOutputReference {
+                    group: "a".into(),
+                    output: "endpoint".into(),
+                    aggregation: OutputAggregation::One,
+                },
+            );
+        }
+        assert_eq!(validate_dependency_graph(&groups, &BTreeSet::new()), Ok(()));
+
+        groups.get_mut("b").unwrap().inputs.insert(
+            format!("peer{limit}"),
+            GroupOutputReference {
+                group: "a".into(),
+                output: "endpoint".into(),
+                aggregation: OutputAggregation::One,
+            },
+        );
+        assert_eq!(
+            validate_dependency_graph(&groups, &BTreeSet::new()),
+            Err(PlanError::TooManyDependencyInputs {
+                group: "b".into(),
+                inputs: limit + 1,
+            })
+        );
+    }
+
+    /// A quarantined group is present-but-frozen, not missing. Reading it as missing let one typo'd
+    /// digest in one `UpdateGroup` that another group depends on abort publication for the ENTIRE
+    /// repository: no generation signed at all, so every group stopped receiving updates and no
+    /// agent could enroll until an operator fixed the typo.
+    #[test]
+    fn a_dependency_that_is_only_quarantined_does_not_abort_the_whole_generation() {
+        let mut groups = BTreeMap::from([("join".into(), group("join", &[("role", "join")]))]);
+        groups.get_mut("join").unwrap().depends_on = vec!["initialize".into()];
+        assert_eq!(
+            validate_dependency_graph(&groups, &BTreeSet::new()),
+            Err(PlanError::MissingDependency {
+                group: "join".into(),
+                dependency: "initialize".into(),
+            })
+        );
+
+        // Quarantine is keyed on the group being quarantined, NOT on it having a durable pin: the
+        // likeliest way to reach this state is an operator CREATING a group with a typo'd digest,
+        // which was never admitted and therefore has no pin to hold.
+        let quarantined = BTreeSet::from(["initialize".to_string()]);
+        assert_eq!(validate_dependency_graph(&groups, &quarantined), Ok(()));
     }
 
     /// Placement and telemetry must agree on what a node may be called. A dot is a legal Kubernetes

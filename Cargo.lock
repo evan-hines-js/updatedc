@@ -2584,6 +2584,7 @@ dependencies = [
  "serde",
  "socket2 0.5.10",
  "toml",
+ "updated",
 ]
 
 [[package]]

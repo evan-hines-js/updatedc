@@ -21,3 +21,8 @@ toml.workspace = true
 # SO_REUSEADDR so a fresh instance can rebind the port immediately after the
 # supervisor stops the previous one.
 socket2 = "0.5"
+
+[dev-dependencies]
+# The launch-path regression test resolves a real signed bundle through the same
+# provider the supervisor uses, then execs this crate's real binary against it.
+updated = { path = "../updated" }

@@ -482,6 +482,20 @@ async fn node_secrets(
     let Some(node) = identity.node_in(state.content.repository()) else {
         return StatusCode::FORBIDDEN.into_response();
     };
+    // The certificate says who the caller is; the `UpdateAgent` object says whether it is still one
+    // of ours. A leaf outlives the object that justified it (up to `LEAF_CERT_TTL_DAYS`), so a
+    // decommissioned or re-homed node kept reading its deployment's database passwords and API
+    // tokens from here for as long as no new generation was published — while `/bundle` and
+    // `/renew`, which gate on the same object, answered 403. The endpoint that returns actual
+    // secrets applies the same membership check as the one that returns metadata.
+    let agents: Api<crate::UpdateAgent> =
+        Api::namespaced(state.enrollment.client.clone(), &state.enrollment.namespace);
+    let Ok(agent) = agents.get(node).await else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    if !is_enrolled_member(&agent, &state.enrollment.repository) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let repositories: Api<crate::UpdateRepository> =
         Api::namespaced(state.enrollment.client.clone(), &state.enrollment.namespace);
     let Ok(repository) = repositories.get(&state.enrollment.repository).await else {
@@ -1430,12 +1444,24 @@ pub(crate) fn published_root_sha256(repository: &crate::UpdateRepository) -> Opt
         .filter(|digest| updated_contracts::is_sha256_hex(digest))
 }
 
-#[derive(Clone)]
-pub(crate) struct SignedEnrollment {
+/// The four TUF role documents of one published generation.
+///
+/// Every agent in a generation pins the SAME four, and `targets.json` alone carries an entry per
+/// published agent — so it is O(fleet) on its own. Owning a copy of it per agent made the verified
+/// enrollment cache O(fleet²) resident, tens of gigabytes at the documented `MAX_ENROLLED_AGENTS`
+/// ceiling, and the gateway was OOM-killed at exactly the fleet size it claims to support. It is a
+/// property of the generation, like the generation's expiry beside it, so it is held once and
+/// shared.
+pub(crate) struct SignedMetadata {
     pub root: String,
     pub timestamp: String,
     pub snapshot: String,
     pub targets: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct SignedEnrollment {
+    pub metadata: std::sync::Arc<SignedMetadata>,
     pub agent_document: String,
     pub managed_configuration: String,
 }
@@ -1457,11 +1483,11 @@ impl SignedEnrollment {
             agent_id,
             routing_base_url: format!("{}/", public_url.trim_end_matches('/')),
             assignment,
-            routing_root: self.root,
+            routing_root: self.metadata.root.clone(),
             initial: crate::InitialSignedConfiguration {
-                timestamp: self.timestamp,
-                snapshot: self.snapshot,
-                targets: self.targets,
+                timestamp: self.metadata.timestamp.clone(),
+                snapshot: self.metadata.snapshot.clone(),
+                targets: self.metadata.targets.clone(),
                 agent_document: self.agent_document,
                 managed_configuration: self.managed_configuration,
             },
@@ -1581,10 +1607,12 @@ pub(crate) async fn resolve_signed_enrollment(
         .map_err(|_| Unavailable(format!("managed configuration {config_path}")))?;
 
     let resolved = SignedEnrollment {
-        root,
-        timestamp,
-        snapshot,
-        targets,
+        metadata: std::sync::Arc::new(SignedMetadata {
+            root,
+            timestamp,
+            snapshot,
+            targets,
+        }),
         agent_document,
         managed_configuration,
     };
@@ -1601,7 +1629,7 @@ pub(crate) async fn resolve_signed_enrollment(
     // Cacheable only for as long as the chain that was just verified stays valid. If any role's
     // expiry cannot be read, nothing is memoized and every request re-verifies — slower, never
     // wrong.
-    if let Some(expires) = chain_expiry(&resolved) {
+    if let Some(expires) = chain_expiry(&resolved.metadata) {
         VERIFIED_ENROLLMENTS.insert(&generation, assignment, &resolved, expires);
     }
     Ok(resolved)
@@ -1613,12 +1641,12 @@ pub(crate) async fn resolve_signed_enrollment(
 /// The metadata chain is identical for every agent in a generation, so this is a property of the
 /// generation and is stored once alongside its key. `None` when any role's expiry is missing or
 /// unparseable, which makes the chain uncacheable rather than cacheable forever.
-fn chain_expiry(resolved: &SignedEnrollment) -> Option<chrono::DateTime<chrono::Utc>> {
+fn chain_expiry(metadata: &SignedMetadata) -> Option<chrono::DateTime<chrono::Utc>> {
     [
-        &resolved.root,
-        &resolved.timestamp,
-        &resolved.snapshot,
-        &resolved.targets,
+        &metadata.root,
+        &metadata.timestamp,
+        &metadata.snapshot,
+        &metadata.targets,
     ]
     .into_iter()
     .map(|document| {
@@ -1664,11 +1692,28 @@ fn generation_key(prefix: &str, expected_root_sha256: &str, timestamp: &str) -> 
 /// integer comparison per request. Only successful verifications are stored, and only for assignment
 /// paths derived from an already authenticated caller, so the map is bounded by the fleet's own
 /// agent count.
+///
+/// The generation's four ROLE DOCUMENTS are stored the same way, once beside the key, for the same
+/// reason and one harder one: `targets.json` carries an entry per published agent, so a per-agent
+/// copy of it makes this map O(fleet²) BYTES — the gateway is OOM-killed at its own supported fleet
+/// size, precisely in the steady state (nothing publishing, so nothing evicting) the cache exists to
+/// serve. An entry holds only what is genuinely per-agent.
 #[derive(Default)]
 struct Generation {
     key: String,
     expires: Option<chrono::DateTime<chrono::Utc>>,
-    entries: std::collections::HashMap<String, SignedEnrollment>,
+    /// This generation's role documents, shared by every entry below. `None` only before the first
+    /// insert into a fresh generation.
+    metadata: Option<std::sync::Arc<SignedMetadata>>,
+    entries: std::collections::HashMap<String, AgentDocuments>,
+}
+
+/// The part of a verified enrollment that is genuinely per-agent: its signed assignment document
+/// and the managed configuration that document names.
+#[derive(Clone)]
+struct AgentDocuments {
+    agent_document: String,
+    managed_configuration: String,
 }
 
 struct VerifiedEnrollments {
@@ -1691,7 +1736,13 @@ impl VerifiedEnrollments {
         if guard.key != generation || guard.expires.is_none_or(|expires| now >= expires) {
             return None;
         }
-        guard.entries.get(assignment).cloned()
+        let metadata = guard.metadata.as_ref()?;
+        let entry = guard.entries.get(assignment)?;
+        Some(SignedEnrollment {
+            metadata: std::sync::Arc::clone(metadata),
+            agent_document: entry.agent_document.clone(),
+            managed_configuration: entry.managed_configuration.clone(),
+        })
     }
 
     fn insert(
@@ -1708,12 +1759,23 @@ impl VerifiedEnrollments {
             *guard = Generation {
                 key: generation.to_string(),
                 expires: Some(expires),
+                metadata: None,
                 entries: std::collections::HashMap::new(),
             };
         }
+        // The role documents are stored for the generation, not for this agent: the first insert
+        // after a publish contributes them and every later one drops its own copy, so N agents cost
+        // one chain, not N.
         guard
-            .entries
-            .insert(assignment.to_string(), resolved.clone());
+            .metadata
+            .get_or_insert_with(|| std::sync::Arc::clone(&resolved.metadata));
+        guard.entries.insert(
+            assignment.to_string(),
+            AgentDocuments {
+                agent_document: resolved.agent_document.clone(),
+                managed_configuration: resolved.managed_configuration.clone(),
+            },
+        );
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Generation> {
@@ -2484,6 +2546,54 @@ mod tests {
         builder.body(Body::empty()).unwrap()
     }
 
+    /// A resolved chain for one agent of the generation `timestamp` names. Each call builds its own
+    /// `SignedMetadata`, exactly as a per-request resolve does.
+    fn enrollment(timestamp: &str, agent: &str) -> SignedEnrollment {
+        SignedEnrollment {
+            metadata: std::sync::Arc::new(SignedMetadata {
+                root: "root".into(),
+                timestamp: timestamp.into(),
+                snapshot: "snapshot".into(),
+                // Stands in for the real thing, which carries one signed entry per published agent.
+                targets: "targets".into(),
+            }),
+            agent_document: agent.into(),
+            managed_configuration: "config".into(),
+        }
+    }
+
+    /// The generation's role documents are held ONCE, however many agents are cached against it.
+    /// `targets.json` has an entry per published agent, so a per-agent copy made the cache
+    /// O(fleet²) bytes — ~15 GB at `MAX_ENROLLED_AGENTS`, and the gateway was OOM-killed at the
+    /// fleet size it documents, in exactly the steady state (no publishes, so no eviction) the cache
+    /// is for.
+    #[test]
+    fn one_generations_metadata_is_stored_once_however_many_agents_are_cached() {
+        let cache = VerifiedEnrollments {
+            inner: std::sync::Mutex::new(Generation::default()),
+        };
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::hours(1);
+        let generation = generation_key("routing", "anchor", "timestamp-1");
+        for index in 0..64 {
+            let path = format!("assignments/agents/node-{index}.json");
+            // Each agent resolves its own copy of the chain, as a real request does.
+            cache.insert(
+                &generation,
+                &path,
+                &enrollment("timestamp-1", "agent"),
+                expires,
+            );
+        }
+        let guard = cache.lock();
+        assert_eq!(guard.entries.len(), 64);
+        assert_eq!(
+            std::sync::Arc::strong_count(guard.metadata.as_ref().unwrap()),
+            1,
+            "the cache holds exactly one copy of the generation's role documents"
+        );
+    }
+
     /// A full TUF verification is per-request asymmetric-crypto work at a rate the fleet's polling
     /// interval multiplies, so it is memoized — but only for exactly as long as the generation it
     /// verified is the published one AND that generation's chain is unexpired. A publish re-signs
@@ -2495,14 +2605,7 @@ mod tests {
         let cache = VerifiedEnrollments {
             inner: std::sync::Mutex::new(Generation::default()),
         };
-        let chain = SignedEnrollment {
-            root: "root".into(),
-            timestamp: "timestamp-1".into(),
-            snapshot: "snapshot".into(),
-            targets: "targets".into(),
-            agent_document: "agent".into(),
-            managed_configuration: "config".into(),
-        };
+        let chain = enrollment("timestamp-1", "agent");
         let path = "assignments/agents/node.json";
         let now = chrono::Utc::now();
         let expires = now + chrono::Duration::hours(1);
@@ -2548,19 +2651,17 @@ mod tests {
         let role = |expires: &str| {
             serde_json::json!({"signed": {"expires": expires}, "signatures": []}).to_string()
         };
-        let chain = SignedEnrollment {
+        let chain = SignedMetadata {
             root: role("2030-01-01T00:00:00Z"),
             timestamp: role("2027-03-04T05:06:07Z"),
             snapshot: role("2029-01-01T00:00:00Z"),
             targets: role("2028-01-01T00:00:00Z"),
-            agent_document: "agent".into(),
-            managed_configuration: "config".into(),
         };
         assert_eq!(
             chain_expiry(&chain).unwrap().to_rfc3339(),
             "2027-03-04T05:06:07+00:00"
         );
-        let unreadable = SignedEnrollment {
+        let unreadable = SignedMetadata {
             snapshot: "not json".into(),
             ..chain
         };
