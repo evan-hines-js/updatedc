@@ -245,9 +245,19 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         serde_json::to_vec(&uppercase_bundle).unwrap(),
     )
     .unwrap();
-    let uppercase_config = updated_tuf::resolve_managed_config(&bootstrap, &uppercase_state)
-        .await
-        .unwrap();
+    // A node boots only on a bundle issued for the agent it is configured to enroll as, so this
+    // second agent needs its own bootstrap — reusing `offline`'s would be the split identity the
+    // enrollment path fails closed on, and would never reach the digest-casing behavior under test.
+    let uppercase_bootstrap = tmp.join("bootstrap-uppercase.toml");
+    std::fs::write(
+        &uppercase_bootstrap,
+        "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline-uppercase'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
+    )
+    .unwrap();
+    let uppercase_config =
+        updated_tuf::resolve_managed_config(&uppercase_bootstrap, &uppercase_state)
+            .await
+            .unwrap();
     assert_eq!(uppercase_config.application.product, "offline-app");
 
     // Boot configuration — the managed process's arguments, and which secret populates which
@@ -444,7 +454,6 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
             .unwrap()
             .to_string(),
         assignment: agent_path.to_string(),
-        metadata_limit: 1024 * 1024,
         transport_timeout: std::time::Duration::from_secs(5),
         mtls: updated::tls::Identity::new(
             repo_dir.join("client.crt"),

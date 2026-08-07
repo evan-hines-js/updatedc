@@ -15,6 +15,27 @@
 
 use std::io;
 use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
+
+/// How long [`ContainedChild::stop`] waits for the tree to be reaped after the hard kill. A
+/// caller that has to promise a shutdown budget to something else (a service manager) adds this
+/// to the grace it passes.
+pub const KILL_HEADROOM: Duration = Duration::from_secs(10);
+
+/// The exit-poll cadence of [`ContainedChild::stop`].
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// What [`ContainedChild::stop`] had to do to end the tree.
+#[derive(Debug)]
+pub enum Stopped {
+    /// The tree exited on the graceful request, within the grace.
+    Gracefully,
+    /// The grace expired (or the graceful request could not be delivered, in which case there is
+    /// no grace to sit out) and the tree was killed.
+    Killed,
+    /// The kill was issued and something was still unreaped when [`KILL_HEADROOM`] expired.
+    Surviving,
+}
 
 /// A spawned child plus the OS mechanism that binds its descendants into one killable
 /// tree. Dropping it releases that mechanism (on Windows, closing the job handle kills
@@ -177,6 +198,47 @@ impl ContainedChild {
         #[cfg(not(any(unix, windows)))]
         {
             Ok(())
+        }
+    }
+
+    /// Stop the whole tree: ask gracefully, wait out `grace`, then kill it and give the reap
+    /// [`KILL_HEADROOM`]. The one stop sequence in the workspace — every caller that owns a
+    /// contained tree wants exactly this, and hand-rolling it per call site is how two of them
+    /// came to disagree about what a failed graceful request means.
+    ///
+    /// It means: skip the grace. A break event that could not be delivered did not happen, so
+    /// sitting out the full grace only delays the kill and makes a clean stop look like a hang.
+    pub fn stop(&mut self, grace: Duration) -> Stopped {
+        let grace = match self.request_stop() {
+            Ok(()) => grace,
+            Err(_) => Duration::ZERO,
+        };
+        if self.reaped_within(grace) {
+            return Stopped::Gracefully;
+        }
+        let _ = self.kill_tree();
+        if self.reaped_within(KILL_HEADROOM) {
+            Stopped::Killed
+        } else {
+            Stopped::Surviving
+        }
+    }
+
+    /// Poll for the root child's exit for up to `budget`. An unusable handle ends the wait at
+    /// once — it can never start reporting an exit again.
+    fn reaped_within(&mut self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.try_wait() {
+                Ok(Some(_)) => return true,
+                Err(_) => return false,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(STOP_POLL.min(budget));
+                }
+            }
         }
     }
 

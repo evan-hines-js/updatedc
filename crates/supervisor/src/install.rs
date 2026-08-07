@@ -182,10 +182,9 @@ async fn apply_install(
     opts: &Options,
     store: &mut FileStore,
 ) -> Result<ColdInstall, Box<dyn std::error::Error>> {
-    let repo =
-        TrustedRepository::assigned(&opts.routing, &opts.repository, &opts.storage, &opts.paths)
-            .await
-            .map_err(|error| format!("loading the first trusted assignment: {error}"))?;
+    let repo = TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
+        .await
+        .map_err(|error| format!("loading the first trusted assignment: {error}"))?;
     let assignment = repo
         .assignment()
         .ok_or("the first trusted repository has no desired deployment")?;
@@ -198,11 +197,10 @@ async fn apply_install(
     // head and re-selects, so ordered fallback monotonically descends to the newest *installable*
     // release; the loop terminates when one installs or nothing selectable remains.
     let (prepared, providers) = loop {
-        match update_client::prepare_assigned_application(
-            update_client::ApplicationRequest {
+        match crate::acquire::prepare_assigned_application(
+            crate::acquire::ApplicationRequest {
                 repository: &repo,
                 application: &opts.application,
-                repository_config: &opts.repository,
                 paths: &opts.paths,
                 current_version: None,
             },
@@ -338,7 +336,7 @@ async fn place_and_commit(
         updated::state::read_enrollment(&opts.paths.state),
         updated::state::EnrollmentState::Missing
     ) {
-        updated::state::enroll(&opts.paths.state, tx.repository_lineage.clone())?;
+        updated::state::enroll(&opts.paths.state)?;
     }
     // Commit the head *provisional*: it has never launched, let alone proven healthy. If it turns
     // out to be a broken assigned head (crashes or wedges before its first passing gate) the boot

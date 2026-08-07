@@ -1,5 +1,4 @@
 use crate::*;
-use sha2::{Digest, Sha256};
 use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -853,8 +852,8 @@ pub(crate) fn magnolia_statefulset(
 /// `sha256(that)`. One derivation for every node kind — sample-app pods and Magnolia pods
 /// alike — so the demo can address any pod's CR without special cases.
 pub(crate) fn resource_name(hostname: &str) -> String {
-    let nonce = Sha256::digest(hostname);
-    let registration = format!("{:x}", Sha256::digest(format!("{nonce:x}")));
+    let nonce = updated::hash::sha256_bytes(hostname.as_bytes());
+    let registration = updated::hash::sha256_bytes(nonce.as_bytes());
     format!("agent-{}", &registration[..24])
 }
 
@@ -1185,8 +1184,7 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
 
     // A one-host inventory for the target, then run the shipped role against it.
     let (user, host) = ssh_target.split_once('@').unwrap_or(("root", ssh_target));
-    let dir = std::env::temp_dir().join("updatec-demo-external-vm");
-    std::fs::create_dir_all(&dir)?;
+    let dir = owner_only_scratch_dir("updatec-demo-external-vm")?;
     let inventory = dir.join("inventory.ini");
     std::fs::write(
         &inventory,
@@ -1216,16 +1214,13 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
         .args(["-e", &format!("updatedc_source={}", root.display())])
         .args(["-e", "updated_enrollment_url=https://updatec-gateway"])
         .args(["-e", &format!("@{}", vars.display())])
-        .args([
-            "-e",
-            &format!("updated_hostname={DEMO_EXTERNAL_VM_HOSTNAME}"),
-        ])
-        // The self-asserted enrollment name must be the sha-derived resource name the demo addresses
-        // the VM's UpdateAgent by (label_external_vm_agent uses the same), not the raw hostname.
+        // `updated_hostname` is the one variable the role writes as the self-asserted enrollment
+        // name, and it must be the sha-derived resource name the demo addresses the VM's
+        // UpdateAgent by (`label_external_vm_agent` uses the same), not the raw hostname.
         .args([
             "-e",
             &format!(
-                "updated_node_name={}",
+                "updated_hostname={}",
                 resource_name(DEMO_EXTERNAL_VM_HOSTNAME)
             ),
         ])
@@ -1236,20 +1231,152 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
         ]))
 }
 
+/// A fresh, unpredictable, owner-only directory under the system temp dir, removed when it drops.
+///
+/// The demo writes the fleet client key inside, so no run may leave a copy behind: the guard
+/// removes the directory on the way out of [`provision_external_vm`], whether the playbook
+/// succeeded or failed.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        // Best effort: a live demo is not worth aborting over a temp directory that would not
+        // delete, but it is worth saying so out loud — what stayed behind is a private key.
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            println!(
+                "[demo] could not remove {}, which holds a copy of the fleet client key: {error}",
+                self.0.display()
+            );
+        }
+    }
+}
+
+/// A fresh, unpredictable, owner-only directory under the system temp dir.
+///
+/// The demo drops the fleet client key in here, so the directory must be one no other local user
+/// could have pre-created: the name carries process-unique entropy and the directory is *created*
+/// (never adopted), so an existing entry — a planted directory, or a symlink into somewhere
+/// readable — makes the create fail rather than silently hand the secret over.
+fn owner_only_scratch_dir(prefix: &str) -> Result<ScratchDir, Box<dyn std::error::Error>> {
+    sweep_stale_scratch_dirs(prefix);
+    for _ in 0..8 {
+        let mut seed = updated::hash::Sha256Hasher::new();
+        seed.update(&std::process::id().to_le_bytes());
+        seed.update(
+            &std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+                .to_le_bytes(),
+        );
+        #[cfg(unix)]
+        {
+            let mut bytes = [0u8; 16];
+            let mut urandom = std::fs::File::open("/dev/urandom")?;
+            std::io::Read::read_exact(&mut urandom, &mut bytes)?;
+            seed.update(&bytes);
+        }
+        let name = seed.finish_hex()[..16].to_string();
+        let dir = env::temp_dir().join(format!("{prefix}-{name}"));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(ScratchDir(dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("could not create a private scratch directory under the temp directory".into())
+}
+
+/// How long a scratch directory must have sat untouched before the sweep treats it as abandoned.
+///
+/// A run that still owns its scratch keeps writing under it (and finishes in minutes), so an entry
+/// this old belongs to no live run — while anything younger might be a concurrent demo's, whose
+/// enrollment vars its playbook still needs.
+const SCRATCH_SWEEP_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Remove the scratch directories of runs that died before their [`ScratchDir`] could drop.
+///
+/// A `Drop` guard does not run for a Ctrl-C at the terminal or a kill during the playbook — the
+/// long part of this call — so without this, every interrupted demo leaves another copy of the
+/// fleet client key under the temp directory. The name shape `<prefix>-<entropy>` is one only
+/// [`owner_only_scratch_dir`] writes, so a matching entry is this demo's scratch and nothing else,
+/// but a *live* run's scratch looks exactly like a dead one's: only idleness separates them, hence
+/// [`SCRATCH_SWEEP_MIN_IDLE`]. Best effort throughout — a directory another user planted under the
+/// prefix is one we cannot remove, and refusing to run the demo over it would gain nothing, since
+/// the create below still refuses to adopt any existing entry.
+fn sweep_stale_scratch_dirs(prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(env::temp_dir()) else {
+        return;
+    };
+    let prefix = format!("{prefix}-");
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let idle = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok());
+        if !scratch_dir_is_abandoned(idle) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            println!(
+                "[demo] could not remove {}, the scratch directory an interrupted run left \
+                 behind: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Whether a scratch directory idle for `idle` is old enough to have outlived its run.
+///
+/// An unreadable or future-dated timestamp yields `None`, which counts as *not* abandoned: leaving
+/// a stale key behind is loud (the next sweep gets it) where deleting a live run's is not.
+fn scratch_dir_is_abandoned(idle: Option<std::time::Duration>) -> bool {
+    idle.is_some_and(|idle| idle >= SCRATCH_SWEEP_MIN_IDLE)
+}
+
 /// Write `bytes` to `path` readable only by this user — the demo's one place secret material
 /// lands on local disk.
+///
+/// The 0600 mode only applies to a file this call creates, so the file is opened `create_new`: a
+/// pre-existing entry (whose mode, or symlink target, we would otherwise inherit) is unlinked and
+/// the create retried once, and a second collision is an error rather than a permissive write.
 fn write_owner_only(
     path: &std::path::Path,
     bytes: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            options.open(path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
     std::io::Write::write_all(&mut file, bytes)?;
     Ok(())
 }
@@ -1868,5 +1995,20 @@ inspect\tfingerprint\tcompleted
             vec!["drain", "verify"],
             "the check must name every skipped sub-phase"
         );
+    }
+
+    /// The sweep runs while another demo may be mid-playbook, holding the enrollment vars its
+    /// `ansible-playbook` reads for minutes. Only a directory idle far longer than a run may be
+    /// removed; a freshly touched one — or one whose timestamp we could not read — stays.
+    #[test]
+    fn only_a_long_idle_scratch_directory_is_swept() {
+        assert!(!scratch_dir_is_abandoned(Some(
+            std::time::Duration::from_secs(0)
+        )));
+        assert!(!scratch_dir_is_abandoned(Some(
+            SCRATCH_SWEEP_MIN_IDLE - std::time::Duration::from_secs(1)
+        )));
+        assert!(!scratch_dir_is_abandoned(None));
+        assert!(scratch_dir_is_abandoned(Some(SCRATCH_SWEEP_MIN_IDLE)));
     }
 }

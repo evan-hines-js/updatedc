@@ -32,14 +32,3 @@ pub mod state;
 mod testing;
 pub mod tls;
 pub mod transaction;
-
-/// Deserialize an optional value while still requiring the field itself to exist.
-/// Serde otherwise treats a missing `Option<T>` as `None`, creating an implicit legacy
-/// schema alongside the current durable format.
-pub(crate) fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de>,
-{
-    <Option<T> as serde::Deserialize>::deserialize(deserializer)
-}

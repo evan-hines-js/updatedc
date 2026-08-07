@@ -94,9 +94,17 @@ then apply it after creating the desired-state resources below:
 kubectl apply -f deploy/kubernetes/updatec.yaml
 ```
 
-The supplied RBAC is entirely restricted to `updated-system`; `updatec` does not read
-Kubernetes Nodes, Pods, or workloads. The container
-runs as UID 65532 with a read-only root filesystem. Durable controller state goes only to
+The supplied RBAC is namespace-scoped to `updated-system` with exactly one exception: the
+`updatec-repository-reader` ClusterRole grants `list` on `updaterepositories` cluster-wide,
+bound to the `updatec` ServiceAccount. That one read exists because an object-store list is
+prefix-scoped, so before the finalizer prunes a deleted repository's S3 prefix it must find
+any other `UpdateRepository` whose prefix overlaps it in the same bucket — deleting `fleet`
+would otherwise sweep a live `fleet/staging`. A bucket is not scoped to a namespace, so
+neither can that search be; scoped to one namespace it missed exactly the cross-tenant
+nesting it exists to catch. It is read-only, one resource, one verb: every mutation stays in
+the namespaced Role, and installing the manifest therefore needs cluster-level permission to
+create a ClusterRole and ClusterRoleBinding. `updatec` still does not read Kubernetes Nodes,
+Pods, or workloads. The container runs as UID 65532 with a read-only root filesystem. Durable controller state goes only to
 its PVC; `/tmp` is an explicitly bounded, memory-backed `emptyDir` and is never durable.
 
 The manifest runs two explicit modes of the same binary. `updatec controller` is the
@@ -213,8 +221,9 @@ routing root, exact assignment identity, the initial agent/config targets, and t
 timestamp/snapshot/targets proof needed to verify that initial configuration offline.
 The agent never reads Kubernetes or edits CRDs.
 
-Dynamic agents receive only the enrollment URL and shared secret. For the supplied gateway,
-expose its Service through an HTTPS ingress or load balancer:
+Dynamic agents receive only the enrollment URL, the fleet CA, a self-asserted name, and the
+shared fleet enrollment certificate and key. For the supplied gateway, expose its Service
+through an HTTPS ingress or load balancer:
 
 ```toml
 [enrollment]

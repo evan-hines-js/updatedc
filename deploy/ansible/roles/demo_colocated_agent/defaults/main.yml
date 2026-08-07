@@ -1,4 +1,12 @@
 ---
-# The hostname pins the enrollment identity; the `-manual-` segment is what the UI reads as the
-# Magnolia role, so this node shows up as `magnolia · manual`.
+# Hash input for the enrollment name below — nothing else reads it. It MUST equal the
+# compiled-in `DEMO_EXTERNAL_VM_HOSTNAME` ("magnolia-manual-vm", crates/updatec-demo/src/layout.rs):
+# `updatec-demo setup` labels the manual Magnolia node by `resource_name(DEMO_EXTERNAL_VM_HOSTNAME)`
+# regardless of what is set here, and the demo UI reads that label (`demo.updated.dev/node`), not
+# this variable. Overriding it without changing the constant enrolls the agent under a name the
+# demo layer never patches — the UI's "Upgrade Magnolia" button with no node behind it.
 demo_colocated_hostname: magnolia-manual-vm
+# The self-asserted enrollment name written into /etc/updated/bootstrap.toml, and therefore the
+# UpdateAgent object the gateway creates: `agent-<first 24 hex of sha256(sha256(hostname))>`, the
+# same `resource_name` derivation the demo layer uses to address it (crates/updatec-demo/src/setup.rs).
+updated_hostname: "agent-{{ (demo_colocated_hostname | hash('sha256') | hash('sha256'))[:24] }}"

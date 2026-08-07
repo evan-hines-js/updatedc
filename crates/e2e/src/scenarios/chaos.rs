@@ -33,7 +33,7 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
             .guardian()?;
-        cmd.env("UPDATED_CHAOS_POINT", point);
+        cmd.env(updated::env::CHAOS_POINT, point);
         let boot = Proc::spawn("chaos", &mut cmd)?;
 
         // Repository refresh/provider staging happens before the transaction begins and
@@ -116,7 +116,7 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
             .guardian()?;
-        cmd.env("UPDATED_CHAOS_POINT", point);
+        cmd.env(updated::env::CHAOS_POINT, point);
         let boot = Proc::spawn("install-chaos", &mut cmd)?;
 
         // The first supervisor cold-installs and crashes once at `point`; the guardian must
@@ -193,7 +193,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             .confirmation_window("120s")
             .lifecycle(fixture_command)
             .guardian()?;
-        cmd.env("UPDATED_CHAOS_POINT", point);
+        cmd.env(updated::env::CHAOS_POINT, point);
         let tower = Service::spawn("rollback-chaos", &cmd);
 
         if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {

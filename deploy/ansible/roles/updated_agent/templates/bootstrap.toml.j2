@@ -1,7 +1,10 @@
 [enrollment]
 url = "{{ updated_enrollment_url }}"
-# This node's self-asserted enrollment name — becomes the minted cert's CN and its UpdateAgent.
-name = "{{ updated_node_name | default(inventory_hostname) }}"
+# This node's self-asserted enrollment name — the gateway mints it as the leaf certificate's CN and
+# creates the UpdateAgent object under exactly this string. It is the one knob that decides how the
+# control plane addresses this node, so `updated_hostname` — the variable the README documents and
+# the role defaults to the inventory name — is the single variable that reaches it.
+name = "{{ updated_hostname }}"
 # Identity is mutual TLS: this node presents the shared fleet enrollment certificate the fleet CA
 # signed. The config file holds only a name and paths — the certificate material is written by this
 # role.

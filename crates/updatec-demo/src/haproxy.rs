@@ -47,7 +47,7 @@ fn backend_servers() -> Vec<BackendServer> {
 /// never adds or removes servers), the frontend proxies real traffic to them, and `/haproxy-version`
 /// returns this release's version so the demo can observe the in-place re-exec actually swapping
 /// the running configuration. `master-worker` + the admin stats socket are what the provider's
-/// `activate` phase drives (SIGUSR2 re-exec) and what the healthproxy programs.
+/// `apply` operation drives (SIGUSR2 re-exec) and what the healthproxy programs.
 fn haproxy_cfg(version: &str, servers: &[BackendServer]) -> String {
     let mut cfg = String::new();
     cfg.push_str(&format!(
@@ -159,16 +159,16 @@ pub(crate) struct HaproxyRelease {
 /// signing keys `bootstrap_minio_release_repo` already minted onto the release PVC).
 ///
 /// The provider bundle is `scripts/haproxy/{lifecycle,lib.sh}` (the exact reexec provider proven by
-/// `scripts/linux-haproxy-e2e.sh`) published with an `activate` script so the reload-in-place phase
-/// runs. Each app release carries the real distro `haproxy` binary, a version-stamped `haproxy.cfg`,
-/// and `scripts/haproxy/launch` as `bin/launch` (the first-launch entrypoint the guardian execs).
-/// The two releases differ only in the version their config reports, so activating 2.0.0 is a pure
-/// SIGUSR2 config re-exec of the same master.
+/// `scripts/linux-haproxy-e2e.sh`). Each app release carries the real distro `haproxy` binary, a
+/// version-stamped `haproxy.cfg`, and `scripts/haproxy/launch` as `bin/launch` — the start line the
+/// provider's `apply` runs when no master is up yet, since this deployment is `provider-managed`
+/// and the agent starts no process of its own. The two releases differ only in the version their
+/// config reports, so applying 2.0.0 is a pure SIGUSR2 config re-exec of the same master.
 pub(crate) fn publish_haproxy_bundles(
     seed_deployment: &serde_json::Value,
     platform: &str,
 ) -> Result<HaproxyRelease, Box<dyn std::error::Error>> {
-    // 1. The provider set (activate-bearing, so the reload-in-place phase runs).
+    // 1. The provider set: the reconciler that owns the HAProxy process on every node.
     let provider = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
@@ -335,9 +335,16 @@ fn seed_deployment(edge: &serde_json::Value, release_root: &str) -> serde_json::
 
 /// The real `haproxy` UpdateGroup's deployment: clone `edge` (for CRD-field completeness), then
 /// override everything that makes it a HAProxy node — the app bundle, the HAProxy lifecycle
-/// provider set, the MinIO repo, the HAProxy product, an empty arg list (the launch entrypoint
-/// takes none), the readiness health check on HAProxy's monitor-uri, and a fast cadence with a
-/// short boot grace for HAProxy's few-second install.
+/// provider set, the MinIO repo, the HAProxy product, `provider-managed` mode, an empty arg list
+/// (the launch entrypoint takes none), and a fast cadence with a short boot grace for HAProxy's
+/// few-second install.
+///
+/// `provider-managed` is the mode this tier's whole claim rests on. The agent's stop and start
+/// become no-ops, so the HAProxy master is never stopped around an upgrade: the signed reconciler
+/// starts it once and thereafter re-execs that same master in place (SIGUSR2), which is what keeps
+/// the bound listeners — and therefore the traffic — alive across the switchover. In `managed` mode
+/// the agent would stop the master before `apply` ever ran, and there would be nothing left to
+/// re-exec.
 fn haproxy_group_deployment(
     edge: &serde_json::Value,
     release_root: &str,
@@ -353,7 +360,7 @@ fn haproxy_group_deployment(
     deployment["reportUrl"] = DEMO_REPORT_URL.into();
     deployment["orderedInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
-    deployment["runtime"]["mode"] = "managed".into();
+    deployment["runtime"]["mode"] = "provider-managed".into();
     deployment["runtime"]["installRoot"] = "/var/lib/updated/haproxy".into();
     deployment["runtime"]["args"] = serde_json::json!([]);
     deployment["runtime"]["timeouts"] = serde_json::json!({

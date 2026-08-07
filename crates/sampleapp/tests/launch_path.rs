@@ -22,7 +22,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use updated::bundle::{self, Entrypoints, ExpectedBundle};
+use updated::bundle::{self, ExpectedBundle};
 use updated::provider::BundleStore;
 
 const PRODUCT: &str = "app";
@@ -53,15 +53,7 @@ fn install_release(
     .unwrap();
 
     let archive = root.join(format!("{version}.tar.zst"));
-    bundle::create_bundle(
-        &source,
-        &archive,
-        PRODUCT,
-        version,
-        PLATFORM,
-        &Entrypoints::new(&entrypoint),
-    )
-    .unwrap();
+    bundle::create_bundle(&source, &archive, PRODUCT, version, PLATFORM, &entrypoint).unwrap();
 
     let store = BundleStore::new(
         root.join("versions"),

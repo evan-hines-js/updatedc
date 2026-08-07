@@ -92,7 +92,7 @@ fn inventory(pairs: &[(&str, &str)]) -> Vec<FleetNode> {
 
 #[tokio::test]
 async fn membership_reflects_each_node_health_and_drives_the_balancer() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    updated::tls::install_crypto_provider();
     let cdn = spawn_cdn(vec![
         ("agent-0".into(), true),
         ("agent-1".into(), false),
@@ -108,7 +108,14 @@ async fn membership_reflects_each_node_health_and_drives_the_balancer() {
     let client = reqwest::Client::new();
 
     let mut cache = updated_healthproxy::LastKnownGood::new();
-    let members = resolve_members(&client, &base, &inventory, &mut cache).await;
+    let members = resolve_members(
+        &client,
+        &base,
+        &inventory,
+        std::time::Duration::from_secs(2),
+        &mut cache,
+    )
+    .await;
     assert_eq!(
         members,
         vec![
@@ -153,7 +160,7 @@ async fn membership_reflects_each_node_health_and_drives_the_balancer() {
 /// report and blindly mass-evicting when the checker's own dependency blinks.
 #[tokio::test]
 async fn a_transient_cdn_outage_does_not_drain_a_freshly_healthy_node() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    updated::tls::install_crypto_provider();
     let cdn = spawn_cdn(vec![("agent-0".into(), true)]).await;
     let live = format!("http://{cdn}");
     let inventory = inventory(&[("agent-0", "10.0.0.1")]);
@@ -164,7 +171,14 @@ async fn a_transient_cdn_outage_does_not_drain_a_freshly_healthy_node() {
     let mut cache = updated_healthproxy::LastKnownGood::new();
 
     // Cycle 1: the live CDN reports the node healthy; the cache is populated.
-    let live_members = resolve_members(&client, &live, &inventory, &mut cache).await;
+    let live_members = resolve_members(
+        &client,
+        &live,
+        &inventory,
+        std::time::Duration::from_secs(2),
+        &mut cache,
+    )
+    .await;
     assert!(
         live_members[0].ready,
         "node should be ready from the live CDN"
@@ -174,7 +188,14 @@ async fn a_transient_cdn_outage_does_not_drain_a_freshly_healthy_node() {
     // fails, but the cached healthy report is still within the freshness window, so the node stays
     // in rotation instead of being drained by a transport error alone.
     let dead = "http://127.0.0.1:1";
-    let outage_members = resolve_members(&client, dead, &inventory, &mut cache).await;
+    let outage_members = resolve_members(
+        &client,
+        dead,
+        &inventory,
+        std::time::Duration::from_secs(2),
+        &mut cache,
+    )
+    .await;
     assert!(
         outage_members[0].ready,
         "a healthy node must survive a transient CDN outage via its last good report"

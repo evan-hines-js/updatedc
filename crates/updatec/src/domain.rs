@@ -8,9 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use updated_contracts::telemetry::Envelope;
 
-use crate::rollout::{
-    plan_rollouts, AdmittedDeployment, GroupProgress, HeldGroup, RolloutInputs, SetStatus,
-};
+use crate::rollout::{plan_rollouts, AdmittedDeployment, GroupProgress, RolloutInputs, SetStatus};
 use crate::{
     build_publication_plan, resolve_node_groups, DesiredDeployment, PlanError, PublicationPlan,
     ResolvedGroup, ResolvedNode, UpdateGroupSet, UpdateRepositorySpec,
@@ -22,12 +20,17 @@ pub struct DesiredState<'a> {
     pub group_labels: &'a BTreeMap<String, BTreeMap<String, String>>,
     pub sets: &'a [UpdateGroupSet],
     pub nodes: &'a [ResolvedNode],
-    /// Every group quarantined by validation this pass, whether or not it has a durable pin.
+    /// Every group quarantined by validation this pass, whether or not it has a durable pin, mapped
+    /// to the selector that says which agents are its agents.
     ///
     /// A quarantined group is present-but-frozen, not absent: dependents must not read it as a
     /// missing dependency, which would fail the whole generation closed. A group created with a
-    /// typo'd digest was never admitted and so appears here but NOT in `held`.
-    pub quarantined: &'a BTreeSet<String>,
+    /// typo'd digest was never admitted and so appears here but NOT in `held` — so this, not `held`,
+    /// is what decides whether an agent belongs to a quarantined group. An unusable selector is
+    /// carried as EMPTY, which selects nothing: the group's membership is genuinely unknown, and
+    /// reading an empty selector as "every agent" would withhold the whole fleet over one broken
+    /// group.
+    pub quarantined: &'a BTreeMap<String, BTreeMap<String, String>>,
     /// The subset of `quarantined` that has a durable pin, with the deployment each is still
     /// pinned to.
     ///
@@ -36,7 +39,7 @@ pub struct DesiredState<'a> {
     /// because of it. They keep this exact deployment until the group is fixed, so one typo'd
     /// digest in one `UpdateGroup` neither switches its nodes to the ungated default deployment
     /// nor drops their assignments out of the signed generation.
-    pub held: &'a BTreeMap<String, HeldGroup>,
+    pub held: &'a BTreeMap<String, AdmittedDeployment>,
 }
 
 pub struct ObservedState<'a> {
@@ -74,7 +77,8 @@ pub fn plan_reconcile(
     desired: DesiredState<'_>,
     observed: ObservedState<'_>,
 ) -> Result<ReconcilePlan, PlanError> {
-    crate::validate_dependency_graph(desired.groups, desired.quarantined)?;
+    let quarantined_names: BTreeSet<String> = desired.quarantined.keys().cloned().collect();
+    crate::validate_dependency_graph(desired.groups, &quarantined_names)?;
     let node_groups = resolve_node_groups(
         desired.groups.values().cloned(),
         desired.nodes.iter().cloned(),
@@ -122,6 +126,12 @@ pub fn plan_reconcile(
     // the group was broken, because it has no previous routing to carry. It is withheld here
     // instead: an agent with routing keeps it, one without is left out of the generation entirely
     // (nothing of it is published, so there is nothing to lose) until the group is fixed.
+    //
+    // Membership is decided from `quarantined`, the FULL set, not from `held`, the subset with a
+    // durable pin. A group quarantined before it was ever admitted — a typo'd digest on a group
+    // added or renamed in the same commit, a bad `maxUnavailable`, the reserved name `default` —
+    // has no pin, so keying on `held` matched none of its agents and handed the already-published
+    // ones the ungated `default_deployment` in a single signed generation.
     let quarantined: BTreeMap<&String, &String> = desired
         .nodes
         .iter()
@@ -132,9 +142,11 @@ pub fn plan_reconcile(
         })
         .filter_map(|node| {
             desired
-                .held
+                .quarantined
                 .iter()
-                .find(|(_, held)| held.selects(&node.labels))
+                .find(|(_, selector)| {
+                    !selector.is_empty() && crate::selector_matches(selector, &node.labels)
+                })
                 .map(|(name, _)| (&node.name, name))
         })
         .collect();
@@ -157,8 +169,8 @@ pub fn plan_reconcile(
     // A quarantined group is absent from the plan, so `plan_rollouts` pruned its admitted entry and
     // its nodes resolved to `default`. Restore both: the pin stays durable, and every node the
     // group was published for is republished under it, unchanged.
-    for (name, held) in desired.held {
-        admitted.insert(name.clone(), held.state.clone());
+    for (name, state) in desired.held {
+        admitted.insert(name.clone(), state.clone());
     }
 
     // Every deployment body the control plane still has, by identity — quarantined pins and the
@@ -191,20 +203,20 @@ pub fn plan_reconcile(
         // quarantined group; it must work.
         let last = observed.routing.get(node).filter(|last| {
             !rollout.node_deployments.contains_key(node)
-                || (group == crate::DEFAULT_GROUP && desired.held.contains_key(*last))
+                || (group == crate::DEFAULT_GROUP && desired.quarantined.contains_key(*last))
         });
-        let carried = last.and_then(|last| {
-            if last == crate::DEFAULT_GROUP {
-                Some((last.clone(), default.clone()))
-            } else {
-                admitted.get(last).map(|state| {
-                    (
-                        last.clone(),
-                        placed_deployment(state, observed.assignments.get(node), &bodies),
-                    )
-                })
+        let carried = match last {
+            Some(last) if last == crate::DEFAULT_GROUP => Some((last.clone(), default.clone())),
+            Some(last) if admitted.contains_key(last) => {
+                let deployment = placed_deployment(observed.assignments.get(node), &bodies)
+                    .ok_or_else(|| PlanError::UnknownPlacement {
+                        node: node.clone(),
+                        group: last.clone(),
+                    })?;
+                Some((last.clone(), deployment))
             }
-        });
+            _ => None,
+        };
         match carried {
             Some((last, deployment)) => {
                 if &last != group {
@@ -279,21 +291,18 @@ pub fn plan_reconcile(
 /// unrecognized one: quarantining the group then moved every one of those nodes onto its `current`
 /// in a single generation, ungated — precisely what freezing a quarantined rollout prevents.
 ///
-/// Falling back to `current` when the identity is nowhere at all is the one unavoidable case: no
-/// body for it exists anywhere, so there is nothing else to publish. Bodies are retained for as long
-/// as any node is placed on them (see `rollout::retire_deleted_groups`), so this is reachable only
-/// for an assignment the control plane never published.
+/// `None` when the node has no recorded assignment, or when its recorded identity is nowhere in the
+/// index — the caller faults the generation rather than guessing. Guessing meant `current`, which
+/// republished every node of a quarantined mid-rollout group onto the in-flight target at once: the
+/// unstaged, ungated move this function exists to prevent, taken precisely when the control plane
+/// has lost track of where the fleet is.
 fn placed_deployment(
-    state: &AdmittedDeployment,
     assigned: Option<&String>,
     bodies: &HashMap<String, &DesiredDeployment>,
-) -> DesiredDeployment {
-    let Some(assigned) = assigned else {
-        return state.current.clone();
-    };
+) -> Option<DesiredDeployment> {
     bodies
-        .get(assigned)
-        .map_or_else(|| state.current.clone(), |deployment| (*deployment).clone())
+        .get(assigned?)
+        .map(|deployment| (*deployment).clone())
 }
 
 fn resolve_group_inputs(
@@ -493,7 +502,6 @@ mod tests {
                         crate::GroupOutputReference {
                             group: "initialize".into(),
                             output: "endpoint".into(),
-                            aggregation: crate::OutputAggregation::One,
                         },
                     )]),
                     inputs_ready: false,
@@ -552,15 +560,6 @@ mod tests {
         }
     }
 
-    /// A quarantined group's held entry: the deployment it is still pinned to, plus the selector
-    /// that says which agents are its agents.
-    fn held_group(role: &str, state: AdmittedDeployment) -> HeldGroup {
-        HeldGroup {
-            state,
-            match_labels: BTreeMap::from([("role".to_string(), role.to_string())]),
-        }
-    }
-
     fn edge_node() -> Vec<ResolvedNode> {
         vec![ResolvedNode {
             name: "n1".into(),
@@ -568,15 +567,30 @@ mod tests {
         }]
     }
 
+    /// The quarantined-group map the runtime builds: each group's name mapped to the selector that
+    /// says which agents are its agents, whether or not it has a durable pin.
+    fn quarantined(groups: &[(&str, &str)]) -> BTreeMap<String, BTreeMap<String, String>> {
+        groups
+            .iter()
+            .map(|(name, role)| {
+                (
+                    (*name).to_string(),
+                    BTreeMap::from([("role".to_string(), (*role).to_string())]),
+                )
+            })
+            .collect()
+    }
+
     fn plan(
         groups: &BTreeMap<String, ResolvedGroup>,
-        held: &BTreeMap<String, HeldGroup>,
+        quarantined: &BTreeMap<String, BTreeMap<String, String>>,
+        held: &BTreeMap<String, AdmittedDeployment>,
         admitted: &BTreeMap<String, AdmittedDeployment>,
         routing: &BTreeMap<String, String>,
+        assignments: &BTreeMap<String, String>,
     ) -> Result<crate::domain::ReconcilePlan, PlanError> {
         let repository = repository();
         let nodes = edge_node();
-        let quarantined: BTreeSet<String> = held.keys().cloned().collect();
         plan_reconcile(
             DesiredState {
                 repository: &repository,
@@ -584,7 +598,7 @@ mod tests {
                 group_labels: &BTreeMap::new(),
                 sets: &[],
                 nodes: &nodes,
-                quarantined: &quarantined,
+                quarantined,
                 held,
             },
             ObservedState {
@@ -592,7 +606,7 @@ mod tests {
                 public_keys: &HashMap::new(),
                 admitted,
                 routing,
-                assignments: &BTreeMap::new(),
+                assignments,
                 now: chrono::Utc::now(),
             },
         )
@@ -635,13 +649,24 @@ mod tests {
             current: deployment("edge-v1"),
             previous: Vec::new(),
         };
-        let held = BTreeMap::from([("edge".to_string(), held_group("edge", pinned.clone()))]);
+        let held = BTreeMap::from([("edge".to_string(), pinned.clone())]);
         let admitted = BTreeMap::from([("edge".to_string(), pinned)]);
         let routing = BTreeMap::from([("n1".to_string(), "edge".to_string())]);
 
         // The quarantined group is absent from the planned groups entirely.
-        let planned = plan(&BTreeMap::new(), &held, &admitted, &routing)
-            .expect("a quarantined group is survivable");
+        let assignments = BTreeMap::from([(
+            "n1".to_string(),
+            crate::deployment_identity(&deployment("edge-v1")).unwrap(),
+        )]);
+        let planned = plan(
+            &BTreeMap::new(),
+            &quarantined(&[("edge", "edge")]),
+            &held,
+            &admitted,
+            &routing,
+            &assignments,
+        )
+        .expect("a quarantined group is survivable");
         assert_eq!(planned.publication.node_groups["n1"], "edge");
         assert!(
             planned
@@ -669,7 +694,7 @@ mod tests {
             current: deployment("edge-v2"),
             previous: vec![deployment("edge-v1")],
         };
-        let held = BTreeMap::from([("edge".to_string(), held_group("edge", pinned.clone()))]);
+        let held = BTreeMap::from([("edge".to_string(), pinned.clone())]);
         let admitted = BTreeMap::from([("edge".to_string(), pinned)]);
         let nodes: Vec<ResolvedNode> = ["n1", "n2", "n3"]
             .iter()
@@ -692,7 +717,7 @@ mod tests {
         ]);
         let repository = repository();
 
-        let quarantined: BTreeSet<String> = held.keys().cloned().collect();
+        let quarantined = quarantined(&[("edge", "edge")]);
         let planned = plan_reconcile(
             DesiredState {
                 repository: &repository,
@@ -738,7 +763,7 @@ mod tests {
         };
         // `edge` is quarantined (absent from the planned groups, present in `held`); the node now
         // carries `role: core` and selects the healthy, fully-admitted `core`.
-        let held = BTreeMap::from([("edge".to_string(), held_group("edge", pinned))]);
+        let held = BTreeMap::from([("edge".to_string(), pinned)]);
         let groups = BTreeMap::from([("core".to_string(), resolved("core", "edge", vec![]))]);
         let admitted = BTreeMap::from([(
             "core".to_string(),
@@ -749,7 +774,15 @@ mod tests {
         )]);
         let routing = BTreeMap::from([("n1".to_string(), "edge".to_string())]);
 
-        let planned = plan(&groups, &held, &admitted, &routing).expect("the relabel is plannable");
+        let planned = plan(
+            &groups,
+            &quarantined(&[("edge", "edge")]),
+            &held,
+            &admitted,
+            &routing,
+            &BTreeMap::new(),
+        )
+        .expect("the relabel is plannable");
         assert_eq!(planned.publication.node_groups["n1"], "core");
         assert_eq!(planned.routing["n1"], "core");
     }
@@ -766,7 +799,7 @@ mod tests {
             current: deployment("edge-v1"),
             previous: Vec::new(),
         };
-        let held = BTreeMap::from([("edge".to_string(), held_group("edge", pinned.clone()))]);
+        let held = BTreeMap::from([("edge".to_string(), pinned.clone())]);
         // `core` still exists and is admitted, so the body these nodes are actually on is one the
         // control plane still has.
         let admitted = BTreeMap::from([
@@ -797,7 +830,7 @@ mod tests {
             .collect();
         let repository = repository();
 
-        let quarantined: BTreeSet<String> = held.keys().cloned().collect();
+        let quarantined = quarantined(&[("edge", "edge")]);
         let planned = plan_reconcile(
             DesiredState {
                 repository: &repository,
@@ -837,13 +870,10 @@ mod tests {
     fn an_agent_that_arrives_while_its_group_is_quarantined_is_withheld_not_defaulted() {
         let held = BTreeMap::from([(
             "edge".to_string(),
-            held_group(
-                "edge",
-                AdmittedDeployment {
-                    current: deployment("edge-v1"),
-                    previous: Vec::new(),
-                },
-            ),
+            AdmittedDeployment {
+                current: deployment("edge-v1"),
+                previous: Vec::new(),
+            },
         )]);
         let admitted = BTreeMap::from([(
             "edge".to_string(),
@@ -853,8 +883,15 @@ mod tests {
             },
         )]);
         // n1 selects `edge` by label but has never been published: `routing` is empty.
-        let planned = plan(&BTreeMap::new(), &held, &admitted, &BTreeMap::new())
-            .expect("a quarantined group is survivable");
+        let planned = plan(
+            &BTreeMap::new(),
+            &quarantined(&[("edge", "edge")]),
+            &held,
+            &admitted,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("a quarantined group is survivable");
 
         assert!(
             !planned.routing.contains_key("n1"),
@@ -872,6 +909,58 @@ mod tests {
         );
     }
 
+    /// A group quarantined BEFORE it was ever admitted has no durable pin, so it is in
+    /// `quarantined` but not in `held`. Its agents must still be recognized as its agents:
+    /// deciding membership from `held` alone matched none of them, and the already-published ones
+    /// were handed the repository's ungated `default_deployment` in a single signed generation —
+    /// a different application, install root and provider set, with no `maxUnavailable` staging,
+    /// no health gate and no concurrency slot.
+    #[test]
+    fn a_group_quarantined_before_its_first_admission_still_withholds_the_default() {
+        // The operator replaced the admitted `edge` group with a renamed `edge2` carrying the same
+        // selector and a typo'd digest, so `edge2` is quarantined with nothing to pin.
+        let pinned = AdmittedDeployment {
+            current: deployment("edge-v1"),
+            previous: Vec::new(),
+        };
+        let admitted = BTreeMap::from([("edge".to_string(), pinned)]);
+        let routing = BTreeMap::from([("n1".to_string(), "edge".to_string())]);
+        let edge_v1 = crate::deployment_identity(&deployment("edge-v1")).unwrap();
+        let assignments = BTreeMap::from([("n1".to_string(), edge_v1.clone())]);
+        let repository = repository();
+        let nodes = edge_node();
+
+        let planned = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &quarantined(&[("edge2", "edge")]),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                public_keys: &HashMap::new(),
+                admitted: &admitted,
+                routing: &routing,
+                assignments: &assignments,
+                now: chrono::Utc::now(),
+            },
+        )
+        .expect("a quarantined group is survivable");
+
+        assert_eq!(
+            planned.publication.node_groups["n1"], "edge",
+            "the node keeps its published routing; it is never routed to `default`"
+        );
+        assert_eq!(
+            planned.assignments["n1"], edge_v1,
+            "the node keeps exactly the deployment it is running, not `default_deployment`"
+        );
+    }
+
     #[test]
     fn a_generation_that_would_drop_published_routing_fails_closed() {
         // The node was published under a group that no longer exists in any form, so nothing can be
@@ -882,7 +971,9 @@ mod tests {
             &unadmitted_edge_group(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &routing,
+            &BTreeMap::new(),
         )
         .unwrap_err();
         assert_eq!(error, PlanError::RoutingLoss(vec!["n1".to_string()]));

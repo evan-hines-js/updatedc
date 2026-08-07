@@ -1,14 +1,71 @@
 {
-  "schema": 2,
+  "schema": 3,
   "deployment": "production-web-2026-07-18.1",
   "metadata_url": "https://cdn.example.com/tuf/metadata/",
   "targets_url": "https://cdn.example.com/tuf/targets/",
+  "report_url": "https://reports.example.com/nodes/",
   "application": {
     "path": "products/web/stable/2.7.1/linux-x86_64/app",
     "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
   },
+  "ordered_install_fallback": false,
   "provider_set": {
     "path": "provider-sets/web-linux-v4.json",
     "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "release_root": {
+    "signed": {
+      "_type": "root",
+      "spec_version": "1.0.31",
+      "version": 1,
+      "expires": "2027-01-01T00:00:00Z",
+      "consistent_snapshot": true,
+      "keys": {},
+      "roles": {}
+    },
+    "signatures": []
+  },
+  "runtime": {
+    "mode": "managed",
+    "product": "web",
+    "channel": "stable",
+    "install_root": "/opt/web",
+    "args": ["--config", "/etc/web/config.toml"],
+    "secrets": [
+      {
+        "environment": "DATABASE_PASSWORD",
+        "secret": "production-database",
+        "key": "password"
+      }
+    ],
+    "inputs": {
+      "database_host": {
+        "type": "string",
+        "value": "db.production.internal"
+      }
+    },
+    "repository": {
+      "metadata_limit": 1048576,
+      "target_limit": 536870912,
+      "transport_timeout_seconds": 30
+    },
+    "storage": {
+      "inactive_releases": 2,
+      "inactive_providers": 2,
+      "inactive_supervisors": 2,
+      "inactive_bytes": 1073741824,
+      "inactive_repository_caches": 2
+    },
+    "timeouts": {
+      "check_interval_seconds": 15,
+      "health_grace_seconds": 30,
+      "health_successes": 2,
+      "health_interval_seconds": 1,
+      "retry_after_seconds": 60,
+      "refresh_retry_seconds": 5,
+      "confirmation_window_seconds": 120,
+      "supervisor_check_interval_seconds": 3600,
+      "drain_hold_seconds": 0
+    }
   }
 }

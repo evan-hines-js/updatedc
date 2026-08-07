@@ -25,6 +25,9 @@ TRAFFIC_PID=""
 
 cleanup() {
   set +e
+  # HAProxy is provider-managed: it is detached from the agent tower, so killing the tower does not
+  # take it with it and this is the only thing that reclaims the port it is bound to.
+  [[ -f "$INSTALL/runtime/haproxy.pid" ]] && kill "$(cat "$INSTALL/runtime/haproxy.pid")" 2>/dev/null
   [[ -n "$TRAFFIC_PID" ]] && kill "$TRAFFIC_PID" 2>/dev/null
   [[ -n "$TOWER_PID" ]] && kill "$TOWER_PID" 2>/dev/null
   [[ -n "$REPO_PID" ]] && kill "$REPO_PID" 2>/dev/null
@@ -150,16 +153,17 @@ provider_path="products/app-lifecycle/stable/1.0.0/linux-x86_64/app-lifecycle"
 for version in 1.0.0 2.0.0 4.0.0; do make_config "$WORK/bundle-$version" "$version"; done
 make_config "$WORK/bundle-3.0.0" 3.0.0 invalid-binary
 
-# The launcher is the manifested entrypoint only for first process creation. It puts HAProxy at a
-# stable path; subsequent upgrades are HAProxy's own SIGUSR2 re-execs. It is the real bundle
-# launcher (scripts/haproxy/launch), the same one the demo ships.
+# The deployment is provider-managed (see $RUNTIME above): the agent starts no application process,
+# so the launcher is what the reconciler's `apply` runs when no master is up. It puts HAProxy at a
+# stable path; every subsequent upgrade is HAProxy's own SIGUSR2 re-exec of that same master. It is
+# the real bundle launcher (scripts/haproxy/launch), the same one the demo ships.
 for tree in "$WORK"/bundle-*; do
   cp "$ROOT/scripts/haproxy/launch" "$tree/bin/launch"
   chmod 0755 "$tree/bin/launch"
 done
 
 cat >"$RUNTIME" <<EOF
-{"mode":"managed","product":"app","channel":"stable","install_root":"$INSTALL","args":[],"repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_supervisors":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"retry_after_seconds":60,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"supervisor_check_interval_seconds":3600}}
+{"mode":"provider-managed","product":"app","channel":"stable","install_root":"$INSTALL","args":[],"repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_supervisors":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"retry_after_seconds":60,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"supervisor_check_interval_seconds":3600}}
 EOF
 publish 1.0.0 "$WORK/bundle-1.0.0"
 "$BIN/server" export-enrollment --repo "$REPO" --assignment assignments/agents/agent.json \
@@ -185,6 +189,10 @@ REPO_PID="$!"
 TOWER_PID="$!"
 wait_version 1.0.0
 
+# First deployment: nothing but the reconciler can have started this master, because the agent owns
+# no application process in provider-managed mode — it says so itself in the log, and the serving
+# HAProxy above is the proof that `apply` did the starting.
+grep -q 'started provider-managed runtime' "$TOWER_LOG" || fail "the agent did not run this deployment in provider-managed mode"
 master_pid="$(cat "$INSTALL/runtime/haproxy.pid")"
 [[ "$(readlink "/proc/$master_pid/exe")" == "$INSTALL/runtime/haproxy" ]] || fail "master is not running the stable executable"
 initial_exe_inode="$(stat -Lc '%d:%i' "/proc/$master_pid/exe")"
@@ -200,6 +208,7 @@ publish 2.0.0 "$WORK/bundle-2.0.0"
 wait_version 2.0.0
 [[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "master PID changed on valid upgrade"
 new_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "HAProxy did not replace its worker"
+wait_master_loaded_runtime "$master_pid" || fail "master did not re-exec the runtime binary the upgrade staged"
 [[ "$(stat -Lc '%d:%i' "/proc/$master_pid/exe")" != "$initial_exe_inode" ]] || fail "master did not re-exec the candidate binary inode"
 
 # The updater provides at-least-once provider execution across the unavoidable
@@ -208,7 +217,7 @@ new_worker="$(wait_new_worker "$master_pid" "$old_worker")" || fail "HAProxy did
 release2="$(find "$INSTALL/versions" -maxdepth 1 -type d -name '2.0.0-*' -print -quit)"
 [[ -n "$release2" ]] || fail "could not locate the immutable HAProxy 2.0.0 release"
 for _ in 1 2; do
-  "$BIN/lifecycle" activate \
+  "$BIN/lifecycle" apply \
     --protocol 1 \
     --attempt-id haproxy-idempotency-replay \
     --reason update \
@@ -220,7 +229,12 @@ for _ in 1 2; do
     --predecessor-version 2.0.0
 done
 
-preflight_worker="$new_worker"
+# Those replays ran `apply` against the live master, which is the provider's in-place upgrade
+# path: it stages the release and SIGUSR2s the master. Prove it happened rather than assuming —
+# same master PID, a fresh worker, and the master's image is the freshly staged runtime binary.
+[[ "$(cat "$INSTALL/runtime/haproxy.pid")" == "$master_pid" ]] || fail "replayed apply restarted the master instead of re-execing it"
+preflight_worker="$(wait_new_worker "$master_pid" "$new_worker")" || fail "replayed apply did not turn the worker over"
+wait_master_loaded_runtime "$master_pid" || fail "master did not re-exec the runtime binary the replayed apply staged"
 preflight_inode="$(stat -Lc '%d:%i' "/proc/$master_pid/exe")"
 publish 3.0.0 "$WORK/bundle-3.0.0"
 sleep 6
@@ -237,4 +251,38 @@ wait_version 4.0.0
 kill "$TRAFFIC_PID"; wait "$TRAFFIC_PID" 2>/dev/null || true; TRAFFIC_PID=""
 [[ ! -s "$TRAFFIC_LOG" ]] || fail "traffic failed during HAProxy upgrades"
 
-echo "PASS: real HAProxy upgraded by SIGUSR2 with stable master PID $master_pid, safe duplicate activation, worker turnover, preflight rejection, and zero failed probes"
+# The other half of the provider's process duty: with the master gone, `apply` STARTS HAProxy — in
+# provider-managed mode nothing else will. This is the first-deployment path again, run against an
+# already-upgraded node. The traffic probe is stopped first, so the deliberate outage is not counted
+# as a dropped request; while it lasts the agent simply reports the node unhealthy (a provider-managed
+# liveness failure never tears the tower down, so no restart races this).
+release4="$(find "$INSTALL/versions" -maxdepth 1 -type d -name '4.0.0-*' -print -quit)"
+[[ -n "$release4" ]] || fail "could not locate the immutable HAProxy 4.0.0 release"
+kill "$master_pid"
+for _ in {1..100}; do
+  kill -0 "$master_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 "$master_pid" 2>/dev/null; then fail "the HAProxy master did not exit"; fi
+# The workers go with it; wait for the listener to be released so the restart cannot lose a bind.
+for _ in {1..100}; do
+  curl -fsS --max-time 1 "http://127.0.0.1:$HTTP_PORT/" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+"$BIN/lifecycle" apply \
+  --protocol 1 \
+  --attempt-id haproxy-start-duty \
+  --reason update \
+  --install-root "$INSTALL" \
+  --state-dir "$INSTALL/providers/state/haproxy" \
+  --candidate "$release4" \
+  --candidate-version 4.0.0 \
+  --predecessor "$release4" \
+  --predecessor-version 4.0.0
+restarted_pid="$(cat "$INSTALL/runtime/haproxy.pid")"
+[[ "$restarted_pid" != "$master_pid" ]] || fail "apply reported a master that is the one we killed"
+kill -0 "$restarted_pid" 2>/dev/null || fail "apply returned success without a running master"
+[[ "$(readlink "/proc/$restarted_pid/exe")" == "$INSTALL/runtime/haproxy" ]] || fail "the started master is not running the stable executable"
+wait_version 4.0.0
+
+echo "PASS: real HAProxy started by the provider, upgraded by SIGUSR2 with stable master PID $master_pid, safe duplicate activation, worker turnover, preflight rejection, and zero failed probes"

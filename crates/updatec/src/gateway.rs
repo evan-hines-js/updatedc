@@ -39,9 +39,12 @@ use tower_http::timeout::TimeoutLayer;
 /// response body, which hyper backpressures. A hung backend must not pin a connection forever.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound on a request body. Contract bodies (enrollment request, node report) are tiny; this
-/// only bounds a hostile or broken client, never a legitimate one.
-const BODY_LIMIT: usize = 64 * 1024;
+/// Upper bound on a request body. The largest legitimate body is a node's signed report envelope,
+/// so this IS that bound — the shared [`updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES`],
+/// which the writer's output-manifest allowance is derived from. Written as a derivation rather
+/// than a second literal: two 64 KiB limits stated in different units (raw manifest here, base64
+/// envelope there) is exactly how a healthy node ends up unable to publish at all.
+const BODY_LIMIT: usize = updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES;
 
 /// Max concurrent connections on the authenticated data listener.
 const DATA_CONNECTIONS: usize = 256;
@@ -63,6 +66,13 @@ struct ClientIdentity {
     /// certificate. Enrollment requires it to be absent; every steady-state route requires it to
     /// name this gateway's own repository.
     node: Option<crate::join::NodeSpiffeId>,
+    /// Hex of the leaf's certified public key (its `SubjectPublicKeyInfo` bit string), in exactly
+    /// the encoding `/enroll` pins onto the `UpdateAgent` — the leaf certifies the CSR's own key,
+    /// so the two are byte-identical for the holder the pin was minted for. `None` on a connection
+    /// with no client certificate. This is what makes a node's identity a KEY and not merely a
+    /// name: the handshake proved possession of it, so comparing it to the pin distinguishes the
+    /// machine that holds the name now from a previous holder of a re-enrolled name.
+    public_key: Option<String>,
 }
 
 impl ClientIdentity {
@@ -83,13 +93,15 @@ impl ClientIdentity {
     }
 }
 
-/// Extract the leaf certificate's Common Name from a completed server-side TLS connection.
+/// Extract the leaf certificate's identity — Common Name, SPIFFE node SAN and certified public
+/// key — from a completed server-side TLS connection.
 fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> ClientIdentity {
     use x509_parser::extensions::GeneralName;
 
     let anonymous = ClientIdentity {
         common_name: None,
         node: None,
+        public_key: None,
     };
     let Some(leaf) = conn.peer_certificates().and_then(|certs| certs.first()) else {
         return anonymous;
@@ -127,6 +139,8 @@ fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> ClientIdentit
     ClientIdentity {
         common_name: cn,
         node,
+        // The key the handshake proved possession of, encoded exactly as `/enroll` pinned it.
+        public_key: Some(hex::encode(&*cert.public_key().subject_public_key.data)),
     }
 }
 
@@ -211,8 +225,10 @@ struct Destination {
     prefix: Arc<str>,
 }
 
-/// Store + prefix — everything the repository and telemetry handlers need. The data router derives
-/// it (via [`FromRef`]), so those handlers require no Kubernetes context and stay trivially testable.
+/// Store + prefix — everything the repository handler needs. The data router derives it (via
+/// [`FromRef`]), so that handler requires no Kubernetes context and stays trivially testable. The
+/// repository NAME is not here: it is an authorization input every handler that needs it already
+/// holds on its `EnrollmentContext`, and one copy of it is the only way it cannot drift.
 #[derive(Clone)]
 struct ContentState {
     /// Rebuilt on a timer from the `UpdateRepository` and its credentials Secret, exactly as the
@@ -221,18 +237,11 @@ struct ContentState {
     /// token — until it expires and then answers every request with a 502 while the repository
     /// still reports Ready.
     destination: Arc<Reloadable<Destination>>,
-    /// The repository this gateway serves. Carried here because it is an AUTHORIZATION input, not
-    /// merely configuration: a client leaf is scoped to the repository that minted it, and a
-    /// handler must compare that scope against this before it acts on the caller's node name.
-    repository: Arc<str>,
 }
 
 impl ContentState {
     fn destination(&self) -> Arc<Destination> {
         self.destination.get()
-    }
-    fn repository(&self) -> &str {
-        &self.repository
     }
 }
 
@@ -381,6 +390,25 @@ impl FromRef<DataState> for ContentState {
     }
 }
 
+/// What a telemetry write needs: the destination to store the report in, plus the Kubernetes context
+/// to re-check that the writing node is still an enrolled member of this repository. A minted leaf
+/// outlives the object that justified it, so the certificate alone is not authorization — the same
+/// reason `/bundle`, `/renew` and `/v1/node/secrets` all resolve the `UpdateAgent` first.
+#[derive(Clone)]
+struct TelemetryState {
+    content: ContentState,
+    enrollment: EnrollmentContext,
+}
+
+impl FromRef<DataState> for TelemetryState {
+    fn from_ref(state: &DataState) -> Self {
+        Self {
+            content: state.content.clone(),
+            enrollment: state.enrollment.clone(),
+        }
+    }
+}
+
 fn data_router(state: DataState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -479,21 +507,22 @@ async fn node_secrets(
     State(state): State<DataState>,
     Extension(identity): Extension<ClientIdentity>,
 ) -> Response {
-    let Some(node) = identity.node_in(state.content.repository()) else {
+    let Some(node) = identity.node_in(&state.enrollment.repository) else {
         return StatusCode::FORBIDDEN.into_response();
     };
     // The certificate says who the caller is; the `UpdateAgent` object says whether it is still one
-    // of ours. A leaf outlives the object that justified it (up to `LEAF_CERT_TTL_DAYS`), so a
-    // decommissioned or re-homed node kept reading its deployment's database passwords and API
-    // tokens from here for as long as no new generation was published — while `/bundle` and
-    // `/renew`, which gate on the same object, answered 403. The endpoint that returns actual
-    // secrets applies the same membership check as the one that returns metadata.
+    // of ours, and whether the key this connection proved possession of is the one that name is
+    // pinned to. A leaf outlives the object that justified it (up to `LEAF_CERT_TTL_DAYS`), so a
+    // decommissioned, re-homed or superseded node kept reading its deployment's database passwords
+    // and API tokens from here for as long as no new generation was published — while `/renew`,
+    // which gates on the same pin, answered 403. The endpoint that returns actual secrets applies
+    // the same check as the one that mints certificates.
     let agents: Api<crate::UpdateAgent> =
         Api::namespaced(state.enrollment.client.clone(), &state.enrollment.namespace);
     let Ok(agent) = agents.get(node).await else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    if !is_enrolled_member(&agent, &state.enrollment.repository) {
+    if !is_pinned_leaf(&identity, &agent, &state.enrollment.repository) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let repositories: Api<crate::UpdateRepository> =
@@ -501,7 +530,10 @@ async fn node_secrets(
     let Ok(repository) = repositories.get(&state.enrollment.repository).await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let assignment = agent_assignment(&repository.spec.assignment_prefix, node);
+    let assignment = updated_contracts::telemetry::assignment_object_key(
+        &repository.spec.assignment_prefix,
+        node,
+    );
     let Some(trust_anchor) = published_root_sha256(&repository) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -606,10 +638,7 @@ pub async fn serve(
         enrollment.repository.clone(),
         destination.clone(),
     ));
-    let content = ContentState {
-        destination,
-        repository: Arc::from(enrollment.repository.as_str()),
-    };
+    let content = ContentState { destination };
     // Enrollment is a route on the one mTLS data listener now: the shared fleet enrollment cert
     // authenticates it, so there is no separate client-cert-less listener.
     let data_router = data_router(DataState {
@@ -870,12 +899,9 @@ async fn enroll(
     )
     .await
     {
-        Ok((bundle, leaf)) => Json(updated_contracts::enrollment::EnrollResponse {
-            leaf,
-            chain: String::new(),
-            bundle,
-        })
-        .into_response(),
+        Ok((bundle, leaf)) => {
+            Json(updated_contracts::enrollment::EnrollResponse { leaf, bundle }).into_response()
+        }
         Err(response) => response,
     }
 }
@@ -899,7 +925,7 @@ async fn renew(
     // repository may re-sign its own identity. The shared fleet bootstrap certificate mints leaves
     // at `/enroll` and nothing else.
     let Some(name) = identity
-        .node_in(state.content.repository())
+        .node_in(&state.enrollment.repository)
         .map(str::to_owned)
     else {
         return StatusCode::FORBIDDEN.into_response();
@@ -935,11 +961,7 @@ async fn renew(
                 repository = %state.enrollment.repository,
                 "renewed node certificate"
             );
-            Json(updated_contracts::enrollment::RenewalResponse {
-                leaf,
-                chain: String::new(),
-            })
-            .into_response()
+            Json(updated_contracts::enrollment::RenewalResponse { leaf }).into_response()
         }
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
@@ -951,19 +973,26 @@ async fn renew(
 /// cannot drift apart on — a gap on either would let a shared-fleet-cert holder mint a valid
 /// `CN=<name>` leaf for another node's name with an attacker key.
 fn is_pinned_identity(agent: &crate::UpdateAgent, repository: &str, public_key: &str) -> bool {
-    is_enrolled_member(agent, repository)
+    agent.spec.identity.kind == crate::AgentIdentityKind::Enrolled
+        && agent.spec.repository_ref.name == repository
         && agent.spec.identity.public_key.as_deref() == Some(public_key)
 }
 
-/// Whether `agent` is still an enrolled member of `repository`.
+/// The same rule for a route that presents no key in its body: the key comes from the connection's
+/// own leaf, which the handshake proved possession of.
 ///
-/// The membership half of [`is_pinned_identity`], on its own for the routes that authenticate by
-/// certificate rather than by a presented key: a leaf outlives the object that justified it, so a
-/// decommissioned, re-homed or manually-declared agent must stop being served the moment the object
-/// says so, not when its certificate finally expires.
-fn is_enrolled_member(agent: &crate::UpdateAgent, repository: &str) -> bool {
-    agent.spec.identity.kind == crate::AgentIdentityKind::Enrolled
-        && agent.spec.repository_ref.name == repository
+/// Membership alone is not enough here. A leaf outlives the object that justified it (up to
+/// `LEAF_CERT_TTL_DAYS`), and re-provisioning a machine under its existing hostname means deleting
+/// the `UpdateAgent` and letting the replacement enroll fresh — which pins a NEW key under the SAME
+/// name. Authorizing on name plus membership would hand the replacement's secrets, bundle and
+/// telemetry slot to any surviving holder of the old leaf for the rest of its 90-day life, and
+/// there is no revocation path. Binding to the pin makes a node's identity its key, so a superseded
+/// holder loses access the instant the replacement enrolls.
+fn is_pinned_leaf(identity: &ClientIdentity, agent: &crate::UpdateAgent, repository: &str) -> bool {
+    identity
+        .public_key
+        .as_deref()
+        .is_some_and(|public_key| is_pinned_identity(agent, repository, public_key))
 }
 
 /// Whether this repository already holds as many agents as it will enrol, read from the count the
@@ -1079,7 +1108,10 @@ async fn current_bundle(
     repository: &crate::UpdateRepository,
     name: &str,
 ) -> Result<crate::EnrollmentBundle, Response> {
-    let assignment = agent_assignment(&repository.spec.assignment_prefix, name);
+    let assignment = updated_contracts::telemetry::assignment_object_key(
+        &repository.spec.assignment_prefix,
+        name,
+    );
     // The consistent-snapshot metadata walk is shared with the operator's enrollment-Secret
     // publisher so this security-sensitive resolution lives in exactly one place. A newly
     // registered agent can legitimately race publication: an object that is not there yet is
@@ -1109,16 +1141,16 @@ async fn current_bundle(
 /// here — it mints leaves at `/enroll` and nothing else.
 ///
 /// Nothing is minted, created or mutated: this is a read of the material the node is already
-/// entitled to, under the name its own certificate proves. That is why it needs no CSR and no
-/// public-key pin check — the mTLS handshake already proved possession of the pinned key that leaf
-/// certifies, and re-issuing a bundle to the node it belongs to grants no authority the node does
-/// not already hold.
+/// entitled to, under the name its own certificate proves. It needs no CSR — the key comes from the
+/// leaf the handshake already proved possession of — but it does need that key to still be the one
+/// the name is pinned to, or a superseded holder of a re-enrolled name would be re-issued the
+/// replacement's bundle.
 async fn bundle(
     State(state): State<DataState>,
     Extension(identity): Extension<ClientIdentity>,
 ) -> Response {
     let Some(name) = identity
-        .node_in(state.content.repository())
+        .node_in(&state.enrollment.repository)
         .map(str::to_owned)
     else {
         return StatusCode::FORBIDDEN.into_response();
@@ -1129,9 +1161,9 @@ async fn bundle(
     let Ok(agent) = agents.get(&name).await else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    // A decommissioned (deleted) or re-homed agent stops receiving bundles the moment the object
-    // says so, even while its unexpired leaf still authenticates.
-    if !is_enrolled_member(&agent, &context.repository) {
+    // A decommissioned (deleted), re-homed or superseded agent stops receiving bundles the moment
+    // the object says so, even while its unexpired leaf still authenticates.
+    if !is_pinned_leaf(&identity, &agent, &context.repository) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let repositories: Api<crate::UpdateRepository> =
@@ -1231,11 +1263,6 @@ fn adopts_preapproval(existing: &crate::UpdateAgent, desired: &crate::UpdateAgen
         && existing.spec.repository_ref.name == desired.spec.repository_ref.name
 }
 
-/// The routing assignment target path for an agent: `<prefix>/agents/<name>.json`.
-pub(crate) fn agent_assignment(assignment_prefix: &str, name: &str) -> String {
-    format!("{}/agents/{name}.json", assignment_prefix.trim_matches('/'))
-}
-
 /// Store a node's running-state report at `<prefix>/telemetry/<node>.json`. The report must be
 /// well-formed and name the same node as the path — a report can only release a rollout throttle
 /// slot, so a malformed or misattributed one is rejected, not stored.
@@ -1246,8 +1273,13 @@ pub(crate) fn agent_assignment(assignment_prefix: &str, name: &str) -> String {
 /// mTLS leaf identity rustls verified is bound against the `node` in the path below: a node may
 /// write ONLY its own report. Without that check any fleet member could forge another node's
 /// settled/healthy report and drive its rollout past unhealthy peers, defeating the throttle.
+/// The `UpdateAgent` that leaf names must ALSO still be an enrolled member of this repository, the
+/// same rule `/bundle`, `/renew` and `/v1/node/secrets` apply: a leaf outlives the object that
+/// justified it, so a decommissioned or re-homed node keeps a usable certificate for the rest of its
+/// 90-day life, and one object per node is all there is — its stale write would overwrite the report
+/// the node that holds the name now is signing.
 async fn telemetry_put(
-    State(state): State<ContentState>,
+    State(state): State<TelemetryState>,
     Extension(identity): Extension<ClientIdentity>,
     OriginalUri(uri): OriginalUri,
     body: Bytes,
@@ -1261,7 +1293,7 @@ async fn telemetry_put(
     // fleet CA) could forge another node's healthy/settled report and drive its rollout past
     // unhealthy peers. `node_in` also excludes the shared bootstrap certificate, which is
     // enroll-only.
-    if identity.node_in(state.repository()) != Some(node) {
+    if identity.node_in(&state.enrollment.repository) != Some(node) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // A report travels as a DSSE envelope. The gateway does NOT verify its signature — it authorizes by
@@ -1284,10 +1316,49 @@ async fn telemetry_put(
     let Some(report) = updated_contracts::telemetry::report_payload_unverified(&envelope) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if report.node != node {
+    // `is_wellformed` is the same shape gate `report_is_authentic_and_fresh` applies on the read
+    // side. Storing a record that fails it strands the node: every consumer discards the report,
+    // the planner reads the node as silent, and it holds a `maxUnavailable` slot until someone
+    // notices. Refuse it at the door, where the writer still learns about it.
+    if report.node != node || !report.is_wellformed() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let destination = state.destination();
+    // The object half of the authorization, resolved through the same `UpdateAgent` read every
+    // other node-authenticated route uses. It runs after the local checks above so a malformed body
+    // costs no apiserver request, and before anything is written, so a decommissioned, re-homed or
+    // superseded agent stops being able to store a report the moment the object says so rather than
+    // when its certificate finally expires.
+    //
+    // Only a definitive answer refuses. The hole this closes is a stale leaf outliving its object,
+    // and the apiserver names that case exactly: a 404, or an object that is not this leaf's pinned
+    // identity in this repository. Every other failure — connection refused, 5xx, throttling — says
+    // nothing about membership, and refusing on it would couple the telemetry path to apiserver
+    // availability: reports are best-effort and never retried, and `updated-healthproxy` drains a
+    // backend whose report is older than `REPORT_FRESHNESS`, so an apiserver blip outlasting that
+    // window would stop every node's report at once and drain the whole fleet of healthy backends.
+    // So on an indefinite failure we fail open and accept on the strength of the verified mTLS leaf
+    // alone, which was the sole authority here before the membership check existed.
+    let context = &state.enrollment;
+    let agents: Api<crate::UpdateAgent> =
+        Api::namespaced(context.client.clone(), &context.namespace);
+    match agents.get(node).await {
+        Ok(agent) => {
+            if !is_pinned_leaf(&identity, &agent, &context.repository) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %node,
+                "reading the agent for a telemetry write failed; accepting on the client certificate alone"
+            );
+        }
+    }
+    let destination = state.content.destination();
     let key = crate::object_key(
         &destination.prefix,
         &updated_contracts::telemetry::report_object_key(node),
@@ -1923,13 +1994,23 @@ mod tests {
         )
     }
 
+    /// The key a test node's leaf certifies, hex as `peer_identity` encodes it.
+    const TEST_LEAF_KEY: &str = "04a1b2c3";
+
     fn node_leaf(repository: &str, node: &str) -> ClientIdentity {
+        node_leaf_keyed(repository, node, TEST_LEAF_KEY)
+    }
+
+    /// A minted node leaf certifying `public_key` — the previous holder of a re-enrolled name holds
+    /// a leaf identical to the replacement's but for this.
+    fn node_leaf_keyed(repository: &str, node: &str, public_key: &str) -> ClientIdentity {
         ClientIdentity {
             common_name: Some(node.into()),
             node: Some(crate::join::NodeSpiffeId {
                 repository: repository.into(),
                 node: node.into(),
             }),
+            public_key: Some(public_key.into()),
         }
     }
 
@@ -1949,6 +2030,7 @@ mod tests {
         let bootstrap = ClientIdentity {
             common_name: Some("updated-enrollment".into()),
             node: None,
+            public_key: Some(TEST_LEAF_KEY.into()),
         };
         assert_eq!(bootstrap.node_in("prod"), None);
         assert!(is_enrollment_identity(&bootstrap, "updated-enrollment"));
@@ -2004,27 +2086,53 @@ mod tests {
         ));
     }
 
-    /// Re-issuing a bundle presents no key, so membership is the whole gate: it must refuse exactly
-    /// what renewal refuses minus the key, and never merely trust that the connection authenticated.
+    /// The certificate-authenticated routes present no key in their body, so the gate reads it off
+    /// the connection's leaf: it must refuse exactly what renewal refuses, and never merely trust
+    /// that the connection authenticated.
     #[test]
-    fn re_issuing_a_bundle_requires_current_enrolled_membership() {
-        assert!(is_enrolled_member(
-            &renewal_agent(crate::AgentIdentityKind::Enrolled, "repo", Some("key")),
+    fn a_certificate_authenticated_route_requires_the_leaf_s_own_pinned_identity() {
+        let enrolled = renewal_agent(crate::AgentIdentityKind::Enrolled, "repo", Some("key"));
+        assert!(is_pinned_leaf(
+            &node_leaf_keyed("repo", "n", "key"),
+            &enrolled,
+            "repo"
+        ));
+        // Re-provisioning a machine under its existing hostname deletes the `UpdateAgent` and lets
+        // the replacement enroll fresh, pinning a NEW key to the SAME name. The previous holder's
+        // leaf still authenticates for the rest of its 90-day life and there is no revocation path,
+        // so the pin is the only thing that stops it reading the replacement's secrets, bundle and
+        // telemetry slot.
+        assert!(!is_pinned_leaf(
+            &node_leaf_keyed("repo", "n", "superseded-key"),
+            &enrolled,
             "repo"
         ));
         // The fleet CA is shared across repositories, so a leaf minted by another repository's
         // `/enroll` authenticates here and must still be refused this repository's material.
-        assert!(!is_enrolled_member(
+        assert!(!is_pinned_leaf(
+            &node_leaf_keyed("repo", "n", "key"),
             &renewal_agent(crate::AgentIdentityKind::Enrolled, "other", Some("key")),
             "repo"
         ));
         // An operator-declared node never enrolled, so nothing here was ever issued to it.
-        assert!(!is_enrolled_member(
+        assert!(!is_pinned_leaf(
+            &node_leaf_keyed("repo", "n", "key"),
             &renewal_agent(crate::AgentIdentityKind::Manual, "repo", Some("key")),
             "repo"
         ));
-        assert!(!is_enrolled_member(
+        assert!(!is_pinned_leaf(
+            &node_leaf_keyed("repo", "n", "key"),
             &renewal_agent(crate::AgentIdentityKind::Reserved, "repo", None),
+            "repo"
+        ));
+        // A connection with no client certificate carries no key and authorizes nothing.
+        assert!(!is_pinned_leaf(
+            &ClientIdentity {
+                common_name: None,
+                node: None,
+                public_key: None,
+            },
+            &enrolled,
             "repo"
         ));
     }
@@ -2397,13 +2505,65 @@ mod tests {
         ));
     }
 
-    /// A content-only router (repository + telemetry) over an in-memory store at prefix `routing`.
-    /// The repository and telemetry handlers need no Kubernetes context, so this needs no client.
-    fn router(store: Arc<InMemory>) -> Router {
+    fn content_state(store: Arc<InMemory>) -> ContentState {
+        ContentState {
+            destination: Arc::new(Reloadable::new(Destination {
+                store,
+                prefix: Arc::from("routing"),
+            })),
+        }
+    }
+
+    /// An `UpdateAgent` object as the apiserver would return it: an enrolled member of the
+    /// repository this test gateway serves.
+    fn enrolled_agent(name: &str) -> crate::UpdateAgent {
+        crate::UpdateAgent::new(
+            name,
+            crate::UpdateAgentSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: TEST_REPOSITORY.into(),
+                },
+                identity: crate::AgentIdentity {
+                    kind: crate::AgentIdentityKind::Enrolled,
+                    registration_sha256: None,
+                    // The key `node_leaf`'s certificate certifies: this is the machine that holds
+                    // the name now.
+                    public_key: Some(TEST_LEAF_KEY.into()),
+                },
+                labels: Default::default(),
+            },
+        )
+    }
+
+    /// A client answering every `UpdateAgent` read with whatever `answer` makes of the requested
+    /// name — the object telemetry's membership check reads.
+    fn agent_apiserver<A>(answer: A) -> Client
+    where
+        A: Fn(&str) -> (StatusCode, serde_json::Value) + Send + Sync + 'static,
+    {
+        crate::tests::apiserver(move |_, path, _| {
+            answer(path.rsplit('/').next().unwrap_or_default())
+        })
+    }
+
+    /// The repository + telemetry router over an in-memory store at prefix `routing`, with the
+    /// apiserver telemetry's membership check reads. The repository handlers need no Kubernetes
+    /// context, so they keep their own state and the two halves are merged.
+    fn router_with_agents(store: Arc<InMemory>, client: Client) -> Router {
         // `axum::routing::get` is fully qualified here because this test module also defines a
         // request-building helper named `get`.
-        Router::new()
+        let telemetry = Router::new()
             .route("/telemetry/{file}", axum::routing::put(telemetry_put))
+            .with_state(TelemetryState {
+                content: content_state(store.clone()),
+                enrollment: EnrollmentContext {
+                    client,
+                    namespace: "fleet-system".into(),
+                    repository: TEST_REPOSITORY.into(),
+                    public_url: "https://control".into(),
+                },
+            });
+        Router::new()
             .route(
                 "/metadata/{*rest}",
                 axum::routing::get(repo_get).head(repo_get),
@@ -2412,14 +2572,22 @@ mod tests {
                 "/targets/{*rest}",
                 axum::routing::get(repo_get).head(repo_get),
             )
+            .with_state(content_state(store))
+            .merge(telemetry)
             .layer(DefaultBodyLimit::max(BODY_LIMIT))
-            .with_state(ContentState {
-                destination: Arc::new(Reloadable::new(Destination {
-                    store,
-                    prefix: Arc::from("routing"),
-                })),
-                repository: Arc::from(TEST_REPOSITORY),
-            })
+    }
+
+    /// The steady state: every node the path names is a live enrolled member.
+    fn router(store: Arc<InMemory>) -> Router {
+        router_with_agents(
+            store,
+            agent_apiserver(|name| {
+                (
+                    StatusCode::OK,
+                    serde_json::to_value(enrolled_agent(name)).unwrap(),
+                )
+            }),
+        )
     }
 
     #[tokio::test]
@@ -2436,7 +2604,6 @@ mod tests {
             .route("/targets/{*rest}", axum::routing::get(repo_get))
             .with_state(ContentState {
                 destination: destination.clone(),
-                repository: Arc::from(TEST_REPOSITORY),
             });
         let read = |app: Router| async move {
             let response = app.oneshot(get("/targets/nested/app", None)).await.unwrap();
@@ -2799,6 +2966,7 @@ mod tests {
             identity.map(node_identity).unwrap_or(ClientIdentity {
                 common_name: None,
                 node: None,
+                public_key: None,
             }),
             body,
         )
@@ -2899,6 +3067,7 @@ mod tests {
         let bootstrap = ClientIdentity {
             common_name: Some("updated-agent".into()),
             node: None,
+            public_key: Some(TEST_LEAF_KEY.into()),
         };
         let request = telemetry_request_as("updated-agent.json", bootstrap, report);
         let (status, _, _) = send(store.clone(), request).await;
@@ -2909,11 +3078,144 @@ mod tests {
             .is_err());
     }
 
+    /// A minted leaf lives 90 days and outlives the object that justified it. A node that was
+    /// decommissioned (its `UpdateAgent` deleted) or re-homed to another repository must stop being
+    /// able to write the name's report the moment the object says so — there is exactly ONE
+    /// telemetry object per node, so a stale holder of the name's leaf would otherwise overwrite the
+    /// report the machine that holds the name NOW signs, and the planner, verifying against the new
+    /// pinned key, would count the name as unreported and spend its group's `maxUnavailable` on it.
+    #[tokio::test]
+    async fn a_node_no_longer_enrolled_here_cannot_write_telemetry() {
+        let deleted = agent_apiserver(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"kind": "Status", "code": 404}),
+            )
+        });
+        let rehomed = agent_apiserver(|name| {
+            let mut agent = enrolled_agent(name);
+            agent.spec.repository_ref.name = "staging".into();
+            (StatusCode::OK, serde_json::to_value(agent).unwrap())
+        });
+        // Never enrolled here at all: a manual (offline) identity has no pinned key, so nothing it
+        // writes could ever be verified.
+        let manual = agent_apiserver(|name| {
+            let mut agent = enrolled_agent(name);
+            agent.spec.identity.kind = crate::AgentIdentityKind::Manual;
+            (StatusCode::OK, serde_json::to_value(agent).unwrap())
+        });
+        for client in [deleted, rehomed, manual] {
+            let store = Arc::new(InMemory::new());
+            let request = telemetry_request(
+                "agent-9.json",
+                Some("agent-9"),
+                envelope_body("agent-9", "deploy-2", "2.0.0"),
+            );
+            let response = router_with_agents(store.clone(), client)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(
+                store
+                    .get(&ObjectPath::from("routing/telemetry/agent-9.json"))
+                    .await
+                    .is_err(),
+                "nothing was written"
+            );
+        }
+    }
+
+    /// Re-provisioning a machine under its existing hostname is delete-the-`UpdateAgent`-and-enroll:
+    /// the replacement pins a NEW key to the SAME name, while the previous holder's leaf stays
+    /// CA-valid for the rest of its 90 days with no revocation path. Name plus membership authorized
+    /// it — the object read returns the REPLACEMENT, which is enrolled here — so the superseded
+    /// holder could overwrite the one telemetry object the real machine signs, and the planner,
+    /// verifying against the new pinned key, would count the name as unreported and spend its
+    /// group's `maxUnavailable` on it. The leaf's own key must match the pin.
+    #[tokio::test]
+    async fn a_superseded_holder_of_a_re_enrolled_name_cannot_write_telemetry() {
+        let store = Arc::new(InMemory::new());
+        // The apiserver answers with the replacement: enrolled here, pinned to `TEST_LEAF_KEY`.
+        let replacement = agent_apiserver(|name| {
+            (
+                StatusCode::OK,
+                serde_json::to_value(enrolled_agent(name)).unwrap(),
+            )
+        });
+        let request = telemetry_request_as(
+            "agent-9.json",
+            node_leaf_keyed(TEST_REPOSITORY, "agent-9", "04deadbeef"),
+            envelope_body("agent-9", "deploy-2", "2.0.0"),
+        );
+        let response = router_with_agents(store.clone(), replacement)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            store
+                .get(&ObjectPath::from("routing/telemetry/agent-9.json"))
+                .await
+                .is_err(),
+            "nothing was written"
+        );
+    }
+
+    /// The other half of that gate: only a DEFINITIVE answer refuses. Reports are best-effort and
+    /// never retried, and `updated-healthproxy` drains a backend whose report went stale, so an
+    /// apiserver that is merely unreachable — or throttling, or 5xx-ing — must not stop the fleet's
+    /// reports and drain every healthy backend. The verified leaf was the sole authority on this
+    /// path before the membership check, and it remains sufficient when the apiserver says nothing.
+    #[tokio::test]
+    async fn telemetry_is_accepted_when_the_apiserver_cannot_answer() {
+        // Unreachable at the transport, and answering but unable to serve the read.
+        let unreachable = Client::new(
+            tower::service_fn(|_: axum::http::Request<kube::client::Body>| async {
+                Err::<axum::http::Response<kube::client::Body>, std::io::Error>(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "no apiserver"),
+                )
+            }),
+            "default",
+        );
+        let unavailable = agent_apiserver(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"kind": "Status", "code": 503}),
+            )
+        });
+        let throttled = agent_apiserver(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({"kind": "Status", "code": 429}),
+            )
+        });
+        for client in [unreachable, unavailable, throttled] {
+            let store = Arc::new(InMemory::new());
+            let body = envelope_body("agent-9", "deploy-2", "2.0.0");
+            let request = telemetry_request("agent-9.json", Some("agent-9"), body.clone());
+            let response = router_with_agents(store.clone(), client)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let stored = store
+                .get(&ObjectPath::from("routing/telemetry/agent-9.json"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(stored.as_ref(), body.as_slice(), "the report was written");
+        }
+    }
+
     #[test]
     fn only_the_configured_bootstrap_identity_can_enroll() {
         let bootstrap = |cn: &str| ClientIdentity {
             common_name: Some(cn.to_owned()),
             node: None,
+            public_key: Some(TEST_LEAF_KEY.into()),
         };
         assert!(is_enrollment_identity(
             &bootstrap("updated-agent"),
@@ -2926,7 +3228,8 @@ mod tests {
         assert!(!is_enrollment_identity(
             &ClientIdentity {
                 common_name: None,
-                node: None
+                node: None,
+                public_key: None,
             },
             "updated-agent"
         ));
@@ -2950,7 +3253,8 @@ mod tests {
         assert_eq!(
             ClientIdentity {
                 common_name: Some("updated-agent".into()),
-                node: None
+                node: None,
+                public_key: Some(TEST_LEAF_KEY.into()),
             }
             .node_in(TEST_REPOSITORY),
             None

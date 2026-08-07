@@ -1,10 +1,14 @@
 //! Development TUF publisher and static repository server (the mock CDN).
 //!
-//! - `init`    mint the four ed25519 role keys and an empty signed repository.
+//! - `init`    mint the five ed25519 role keys and an empty signed repository.
 //! - `publish-app` build and publish application bundles.
+//! - `publish-provider-artifact` alias of `publish-app` for provider binaries.
 //! - `publish-supervisor` publish supervisor bootstrap binaries.
 //! - `publish-provider-set` publish an immutable exact provider collection.
 //! - `publish-assignment` publish an exact desired deployment last.
+//! - `export-enrollment` write the enrollment bundle a node boots from.
+//! - `target-sha256` print the content address of a published target.
+//! - `gen-certs` mint the development mTLS certificate hierarchy.
 //! - `serve`   serve the repository directory over HTTP for clients to refresh.
 //!
 //! Publishing is an offline/CI operation; a deployed client never runs it.
@@ -43,7 +47,7 @@ async fn main() {
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|export-enrollment|target-sha256|serve> [flags]"
+                "usage: server <init|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|export-enrollment|target-sha256|gen-certs|serve> [flags]"
             );
             exit(2);
         }
@@ -155,6 +159,12 @@ async fn publish_assignment(args: &[String]) -> R {
     let runtime_path = flag(args, "--runtime").ok_or("--runtime <runtime.json> is required")?;
     let runtime = serde_json::from_slice(&std::fs::read(runtime_path)?)?;
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
+    // Where the node PUTs its signed running-state report. Optional, because a repository that
+    // nothing reads reports from does not need one — but without it `report_running_state` returns
+    // immediately, so every consumer of this repository (a healthproxy above all) sees a fleet that
+    // never speaks. `RepositoryAssignment::validate` below holds it to the same shape the control
+    // plane's own assignments carry.
+    let report_url = flag(args, "--report-url");
     let config_source = repo_dir.join(".config-build.json");
     let node_source = repo_dir.join(".node-build.json");
     let assignment = updated_contracts::assignment::RepositoryAssignment {
@@ -162,7 +172,7 @@ async fn publish_assignment(args: &[String]) -> R {
         deployment,
         metadata_url,
         targets_url,
-        report_url: None,
+        report_url,
         application,
         ordered_install_fallback,
         provider_set,
@@ -172,11 +182,9 @@ async fn publish_assignment(args: &[String]) -> R {
     assignment.validate()?;
     let config_bytes = serde_json::to_vec(&assignment)?;
     let config_sha256 = updated::hash::sha256_bytes(&config_bytes);
-    let (prefix, node_id) = name
-        .rsplit_once("/agents/")
-        .filter(|(prefix, node)| !prefix.is_empty() && !node.is_empty())
+    let (prefix, node_id) = updated_contracts::telemetry::split_assignment_path(&name)
         .ok_or("--name must use <prefix>/agents/<agent>.json")?;
-    let config_name = format!("{prefix}/configs/{config_sha256}.json");
+    let config_name = updated_contracts::telemetry::config_object_key(prefix, &config_sha256);
     let node = updated_contracts::artifact::AgentDocument {
         schema: 1,
         config: updated_contracts::artifact::TargetReference {
@@ -230,16 +238,23 @@ async fn publish_provider_set(args: &[String]) -> R {
             .parse()?,
     };
     let set = updated_contracts::artifact::ProviderSet {
-        schema: 1,
+        schema: updated_contracts::artifact::ProviderSet::SCHEMA,
         id: id.clone(),
         reconciler,
     };
+    // Validate before anything is signed: a published target is immutable and keyed by id, so a
+    // set that every node's `set.validate()` rejects at selection time could only be repaired by
+    // republishing under a *new* id. Same gate, same reason, as the production publisher.
+    set.validate().map_err(|error| {
+        format!("refusing to publish provider set {id:?}: {error} (nothing was signed or uploaded)")
+    })?;
     let source = repo_dir.join(".provider-set-build.json");
     let name = format!("provider-sets/{id}.json");
     let keys = repo::Keys::in_dir(&keys_dir);
     // Under the lock before the staging write, for the same reason as `publish_assignment`: the
     // staging name is fixed and shared, and `add_release` signs whatever bytes it finds there.
     let _publish_lock = lock_publisher(&repo_dir)?;
+    repo::verify_provider_set_reconciler(&repo_dir, &set).await?;
     foundation::durable::atomic_write(&source, ".provider-set-", &serde_json::to_vec(&set)?)?;
     repo::add_release(
         &repo_dir,
@@ -347,9 +362,7 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
                 &product,
                 &version,
                 platform,
-                &updated::bundle::Entrypoints {
-                    entrypoint: &entrypoint,
-                },
+                &entrypoint,
             )?;
             // Test-only: deliberately damage the just-built archive. It is corrupted *before*
             // `add_release` hashes it, so the published target is signed for its own broken bytes —
@@ -655,7 +668,9 @@ where
         respond_status(stream, 411, b"length required").await;
         return Ok(());
     };
-    if content_length > 64 * 1024 {
+    // The same envelope bound every other hop enforces, so the dev CDN accepts exactly the reports
+    // the production gateway does — and exactly the ones a node may sign.
+    if content_length > updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES {
         respond_status(stream, 413, b"payload too large").await;
         return Ok(());
     }

@@ -95,6 +95,13 @@ fn line_bytes(batch: usize) -> usize {
 /// declares the servers without `check`, every one of them stays in its default *routable* state, so
 /// an unhealthy node keeps taking traffic. Chunking makes the batch size independent of the fleet
 /// size. Pure, so the health→command mapping is tested without a socket.
+///
+/// BOTH operator-supplied names on this line — `backend` and the member's node identity — are
+/// interpolated into a `;`-joined batch on a `level admin` socket, so either one carrying `;` or
+/// whitespace would be a second command rather than a name. That is the configuration's business,
+/// not this function's: [`crate::is_balancer_safe`] refuses such a name at startup — for the
+/// identity in `parse_inventory`, for the backend in `Config::build` — where an operator typo is a
+/// configuration error instead of a fleet that is never programmed again.
 fn state_batches(backend: &str, members: &[Member]) -> Vec<String> {
     const SEPARATOR: &str = "; ";
     let mut batches: Vec<String> = Vec::new();
@@ -273,6 +280,26 @@ mod tests {
         assert_eq!(desired_state(true), "ready");
         assert_eq!(desired_state(false), "drain");
         assert!(state_batches("fleet", &[]).is_empty());
+    }
+
+    /// Every name that reaches this batch builder came through the inventory gate, so a name that
+    /// could end the command it is written into never exists at this layer — the batch for a member
+    /// is exactly one command, whatever the member set. (The gate itself is asserted in
+    /// [`crate::tests`].)
+    #[test]
+    fn one_member_is_always_exactly_one_command() {
+        let batches = state_batches(
+            "fleet",
+            &[member("agent-0", true), member("vm_db-17", false)],
+        );
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].matches("set server").count(), 2);
+        for injected in ["agent-0; shutdown frontend public", "agent-0 state maint"] {
+            assert!(
+                !crate::is_balancer_safe(injected),
+                "{injected:?} must be refused before it can be programmed"
+            );
+        }
     }
 
     #[test]

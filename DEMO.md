@@ -50,8 +50,8 @@ Internet access is required on the first run to pull crates and these pinned ima
 ### Platform / architecture
 
 - **macOS** (Apple Silicon or Intel) and **Linux** both run the core demo. The only
-  macOS-specific bit is the optional VM path, which auto-detects your LAN IP with
-  `ipconfig getifaddr en0`; on Linux, set `DEMO_HOST_IP` yourself.
+  macOS-specific bit is `scripts/demo.sh`'s Ansible playbook, which is Linux-only (apt,
+  systemd, `/etc/hosts`) — on macOS use `scripts/demo-local.sh`.
 - **Magnolia requires `linux-x86_64`.** The real Magnolia CMS nodes (author/publisher) and the
   manual "Upgrade Magnolia" VM are only available when the cluster's platform is x86_64 — the
   install provider fetches an x86_64 JRE. On **Apple Silicon (arm64)** the demo detects that
@@ -85,47 +85,54 @@ xcode-select --install    # C compiler
 From the repository root, with Docker running:
 
 ```sh
-./scripts/demo.sh start
+./scripts/demo-local.sh
 ```
 
-The first run builds the kind environment (a few minutes). When it's ready it opens
+`demo-local.sh` passes its arguments straight to `cargo run -p updatec-demo --`; with no
+arguments it runs `start`. The first run builds the kind environment (a few minutes). When
+it's ready it port-forwards the in-cluster demo service and opens
 **http://127.0.0.1:8088** (open it manually if your browser doesn't). Keep the terminal open —
 the demo drives the cluster while it runs.
 
-Other commands:
+The other `updatec-demo` subcommands:
 
 ```sh
-./scripts/demo.sh e2e --exit   # the automated CI path: build, exercise, assert, exit
-./scripts/demo.sh reset        # delete the demo cluster
+./scripts/demo-local.sh e2e --exit     # the automated CI path: build, exercise, assert, exit
+./scripts/demo-local.sh setup          # apply the demo layer onto an existing cluster
+./scripts/demo-local.sh exercise 3     # re-run the chaos pass N times on a live cluster
+./scripts/demo-local.sh serve          # just serve the UI process (no cluster work)
+./scripts/demo-local.sh reset          # delete the demo cluster
 ```
 
 Environment:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `UPDATEC_DEMO_PORT` | `8088` | Local UI port. |
+| `UPDATEC_DEMO_PORT` | `8088` | Local port the in-cluster demo service is forwarded to. |
 | `UPDATEC_DEMO_CLUSTER` | `updatec-demo` | kind cluster name. |
+| `DEMO_ADDRESS` | `0.0.0.0:8080` | Listen address for the bare `serve` subcommand. |
 
 ### Run it on a remote server (recommended for the full demo)
 
-You don't have to run the kind cluster on your laptop. If you set `DEMO_REMOTE_HOST` to a
-configured, reachable server, the launcher syncs the repo there, runs the **whole** demo on
-that server (kind, image builds, Magnolia, the on-network VM), and **tunnels the UI back** to
-`http://127.0.0.1:$PORT` on your laptop:
+You don't have to run the kind cluster on your laptop. `scripts/demo.sh` takes one optional
+argument — an SSH host — and runs the **same** Ansible playbook (`deploy/ansible/demo.yml`)
+either locally or on that host:
 
 ```sh
-export DEMO_REMOTE_HOST=root@build-box   # x86_64 Linux, passwordless SSH
-./scripts/demo.sh start                  # runs remotely, UI tunneled to your browser
+./scripts/demo.sh                  # locally (Linux; needs Docker + ansible), UI on http://localhost/
+./scripts/demo.sh root@build-box   # x86_64 Linux, passwordless SSH
 ```
 
+With a host it installs ansible there if needed, rsyncs the workspace to `updated-demo/` in
+the SSH user's home, runs the playbook on the server (kind, image builds, Magnolia, the
+on-network VM), and then **tunnels the server's nginx (port 80) back** to
+`http://127.0.0.1:8088` on your laptop (`UPDATEC_DEMO_PORT` overrides the local port).
+
 This is the natural way to get the **full** demo: Magnolia needs x86_64, and the VMs share the
-server's network. The laptop just drives it. If `DEMO_REMOTE_HOST` is unset or unreachable, the
-demo runs locally as above.
+server's network. The laptop just drives it.
 
 **The server needs** everything in Section 1 (Docker, kind, kubectl, Rust + build deps), the
-SSH user able to run Docker (root or the `docker` group), and `rsync`. It should be
-**x86_64** for Magnolia. Override the sync directory with `DEMO_REMOTE_DIR` (default
-`updated-demo` in the SSH user's home).
+SSH user able to run Docker (root or the `docker` group), and `rsync`.
 
 ---
 
@@ -159,14 +166,13 @@ reachable over passwordless SSH, the demo skips it and continues.
 ### Enable it
 
 ```sh
-DEMO_EXTERNAL_VM=root@10.0.0.206 ./scripts/demo.sh start
+DEMO_EXTERNAL_VM=root@10.0.0.206 ./scripts/demo-local.sh
 ```
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `DEMO_EXTERNAL_VM` | *(unset → skipped)* | SSH target of the VM, e.g. `root@10.0.0.206`. |
-| `DEMO_EXTERNAL_VM_KEY` | `~/.ssh/id_ed25519` | SSH private key to use. |
-| `DEMO_HOST_IP` | `ipconfig getifaddr en0` (macOS) | Your workstation's LAN IP the VM dials back to. **Required on Linux.** |
+| `DEMO_EXTERNAL_VM` | *(unset → skipped)* | SSH target of the VM, e.g. `root@10.0.0.206`. Skipped if it isn't reachable with `ssh -o BatchMode=yes`. |
+| `DEMO_HOST_IP` | `ipconfig getifaddr en0` (macOS), then `hostname -I` (Linux) | Your workstation's LAN IP the VM dials back to. Set it when detection picks the wrong interface. |
 
 You can also run the Ansible role directly against any fleet, independent of the demo — see
 [`deploy/ansible/README.md`](deploy/ansible/README.md).
@@ -175,10 +181,9 @@ You can also run the Ansible role directly against any fleet, independent of the
 
 ## 4. Troubleshooting
 
-- **"Another demo runner is already active":** a previous run left its lock. Re-run with
-  `--force` (`./scripts/demo.sh start --force`, or `DEMO_FORCE=1`) to clear it — it propagates
-  to the remote server too.
-- **Rebuild from scratch:** `./scripts/demo.sh reset`, then `start` again.
+- **Rebuild from scratch:** `./scripts/demo-local.sh reset`, then run it again with no
+  arguments. (`start` also tears down an existing `updatec-demo` cluster first — it always
+  builds clean.)
 - **Not enough pods / OOM / pods stuck `Pending`:** raise Docker's CPU/memory (Section 1).
 - **`aws-lc-rs` build fails on x86-64:** install NASM (`brew install nasm` / `apt-get install nasm`).
 - **The VM never appears as `magnolia · manual`:** check `ssh root@<vm> true` works without a

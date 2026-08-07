@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://updated.dev/schemas/desired-deployment.schema.json",
   "title": "Updated Desired Deployment",
-  "description": "A signed config document selecting release endpoints and exact application/provider targets.",
+  "description": "A signed config document selecting release endpoints, exact application/provider targets, the pinned release-repository root, and the node's managed runtime policy. Mirrors `RepositoryAssignment` in updated-contracts, which is deny_unknown_fields.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,29 +11,239 @@
     "metadata_url",
     "targets_url",
     "application",
-    "provider_set"
+    "ordered_install_fallback",
+    "provider_set",
+    "release_root",
+    "runtime"
   ],
   "properties": {
-    "schema": { "const": 2 },
+    "schema": { "const": 3 },
     "deployment": {
+      "description": "Opaque correlation identifier. Validation requires only that it is non-empty.",
       "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+      "minLength": 1
     },
     "metadata_url": {
+      "description": "Base URL of the release repository's TUF metadata. Usually an https:// URL ending in `/`; a `file://` URL or an absolute local path is accepted for offline repositories.",
       "type": "string",
-      "pattern": "^https://[^\\s]+/$"
+      "minLength": 1
     },
     "targets_url": {
+      "description": "Base URL of the release repository's TUF targets, under the same transport rules as `metadata_url`.",
       "type": "string",
-      "pattern": "^https://[^\\s]+/$"
+      "minLength": 1
+    },
+    "report_url": {
+      "description": "Optional base URL the node PUTs its signed report to. Must be an absolute http(s) URL with a host and without credentials, query, or fragment.",
+      "type": "string",
+      "pattern": "^https?://[^\\s/?#@]+(/[^\\s?#]*)?$"
     },
     "application": {
       "$ref": "https://updated.dev/schemas/target-reference.schema.json"
     },
+    "ordered_install_fallback": {
+      "description": "On a first install, allow the node to fall back to an ordered-lower release when the exact assigned target cannot be resolved.",
+      "type": "boolean"
+    },
     "provider_set": {
       "$ref": "https://updated.dev/schemas/target-reference.schema.json"
+    },
+    "release_root": {
+      "description": "The pinned TUF root metadata of the release repository, embedded verbatim as a signed `{signed, signatures}` envelope. Validation requires a JSON object.",
+      "type": "object"
+    },
+    "runtime": { "$ref": "#/$defs/runtime" }
+  },
+  "$defs": {
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "product",
+        "channel",
+        "install_root",
+        "args",
+        "repository",
+        "storage",
+        "timeouts"
+      ],
+      "properties": {
+        "mode": {
+          "description": "Omitted means `managed`. A `provider-managed` runtime must not declare application secrets.",
+          "enum": ["managed", "provider-managed"],
+          "default": "managed"
+        },
+        "product": {
+          "description": "One safe path component: non-empty, not `.` or `..`, and containing no `/`, `\\`, `:`, or control character.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^/\\\\:\\u0000-\\u001f\\u007f]+$"
+        },
+        "channel": { "type": "string", "minLength": 1 },
+        "install_root": {
+          "description": "Absolute install root on the node.",
+          "type": "string",
+          "pattern": "^(/|[A-Za-z]:[\\\\/])"
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "secrets": {
+          "description": "Omitted means none. Environment names must be unique across the array.",
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/secret_reference" }
+        },
+        "inputs": {
+          "description": "Omitted means none. Typed values resolved from prerequisite group outputs; secret values stay references.",
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[^/\\\\:\\u0000-\\u001f\\u007f]+$"
+          },
+          "additionalProperties": { "$ref": "#/$defs/output_value" }
+        },
+        "repository": { "$ref": "#/$defs/repository_limits" },
+        "storage": { "$ref": "#/$defs/storage" },
+        "timeouts": { "$ref": "#/$defs/timeouts" }
+      }
+    },
+    "secret_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["environment", "secret", "key"],
+      "properties": {
+        "environment": {
+          "description": "Target environment variable. Names that let a loader or interpreter execute attacker-chosen code (`PATH`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `PYTHONPATH`, `BASH_ENV`, `IFS`, and similar) are rejected.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Z_][A-Z0-9_]*$"
+        },
+        "secret": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "key": { "type": "string", "minLength": 1, "maxLength": 253 }
+      }
+    },
+    "output_value": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "value"],
+          "properties": {
+            "type": { "const": "string" },
+            "value": { "type": "string", "maxLength": 4096 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "secret", "key"],
+          "properties": {
+            "type": { "const": "secret_ref" },
+            "secret": { "type": "string", "minLength": 1, "maxLength": 253 },
+            "key": { "type": "string", "minLength": 1, "maxLength": 253 }
+          }
+        }
+      ]
+    },
+    "repository_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metadata_limit", "target_limit", "transport_timeout_seconds"],
+      "properties": {
+        "metadata_limit": { "type": "integer", "minimum": 1 },
+        "target_limit": { "type": "integer", "minimum": 1 },
+        "transport_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inactive_releases",
+        "inactive_providers",
+        "inactive_supervisors",
+        "inactive_bytes",
+        "inactive_repository_caches"
+      ],
+      "properties": {
+        "inactive_releases": { "type": "integer", "minimum": 0 },
+        "inactive_providers": { "type": "integer", "minimum": 0 },
+        "inactive_supervisors": { "type": "integer", "minimum": 0 },
+        "inactive_bytes": { "type": "integer", "minimum": 1 },
+        "inactive_repository_caches": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "timeouts": {
+      "description": "Every interval is bounded above: the two fields the node's report cadence rides on are capped at the freshness-derived maximum, and the rest at the 30-day contract ceiling.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_interval_seconds",
+        "health_grace_seconds",
+        "health_successes",
+        "health_interval_seconds",
+        "retry_after_seconds",
+        "refresh_retry_seconds",
+        "confirmation_window_seconds",
+        "supervisor_check_interval_seconds"
+      ],
+      "properties": {
+        "check_interval_seconds": {
+          "description": "Steady-state check cadence. The node heartbeats at the bottom of this loop, so it is capped by the report freshness window rather than the generic ceiling.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "refresh_retry_seconds": {
+          "description": "Check cadence after a retryable repository failure; same freshness-derived cap as `check_interval_seconds`.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "health_grace_seconds": {
+          "description": "Must be >= (health_successes - 1) * health_interval_seconds, otherwise the health streak can never complete inside the grace window.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        },
+        "health_successes": { "type": "integer", "minimum": 1 },
+        "health_interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        },
+        "retry_after_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        },
+        "confirmation_window_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        },
+        "supervisor_check_interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        },
+        "drain_hold_seconds": {
+          "description": "Omitted means no drain hold.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2592000
+        }
+      }
     }
   }
 }

@@ -9,13 +9,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use updated::config::{
-    with_suffix, Application, MaterializeRuntime, Paths, Repository, Routing, Storage, Timeouts,
+    with_suffix, Application, MaterializeRuntime, Paths, Routing, Storage, Timeouts,
 };
 use updated::env;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate, and shared with
 /// every reconciler implementation in this workspace.
 use updated_contracts::reconciler::{attempt, Operation};
 use updated_contracts::telemetry::REPORT_CADENCE_JITTER_PERCENT;
+mod acquire;
 mod app;
 mod boot;
 mod domain;
@@ -54,7 +55,6 @@ const SELF_VERSION: &str = env!("SUPERVISOR_VERSION");
 struct Options {
     deployment: String,
     routing: Routing,
-    repository: Repository,
     application: Application,
     timeouts: BoundedTimeouts,
     storage: Storage,
@@ -77,9 +77,12 @@ impl Options {
     /// can change it with no version bump. The version/provider are reconciled by
     /// `check_application`; this reconciles everything else onto the one live source.
     ///
-    /// Returns whether the *launch spec* changed — an app running the old args must be
-    /// relaunched to pick up the new ones, since a live process's argv cannot be rewritten in
-    /// place.
+    /// Returns whether the running process is stale on the new runtime — an app running the old
+    /// args, mode, or secrets must be relaunched to pick them up, since a live process's argv and
+    /// environment cannot be rewritten in place. Resolved `inputs` are stale in the other
+    /// direction: they are the reconciler's, delivered as `--input-file`, so the caller answers
+    /// this by running the environment converge (`converge_environment`) before the relaunch —
+    /// without it a changed input would stop and start the application to no effect at all.
     fn apply_runtime(&mut self, runtime: &updated_contracts::assignment::ManagedRuntime) -> bool {
         let relaunch = self.application.args != runtime.args
             || self.application.mode != runtime.mode
@@ -280,6 +283,13 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // install; there is no first-install branch after it.
     let first_install = ensure_installed(&opts, &mut store).await?;
 
+    // Claim the guardian's markers once, up front.
+    let mut evidence = guardian::Evidence::read(guardian::state_dir().as_deref())?;
+
+    // Whether this boot repaired a damaged committed tree — the one input the crash-attribution
+    // question below needs that no durable record holds. See `Situation::charge_crash_to_release`.
+    let mut bytes_repaired = false;
+
     // The disk is not trusted merely because it was verified during installation. This
     // check is local and deliberately precedes every repository access. A modified
     // committed bundle is never launched, even when the network is unavailable.
@@ -297,23 +307,46 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // left active and installed in agreement. The outcome is therefore ignorable: a stop
             // the guardian could not answer changes what this boot does, not what it believes.
             let _ = guardian.stop();
-            repair_committed_bundle(&opts, &mut store)
+            // The repaired-from repository is of no use on the boot path — there is no loop tick to
+            // report for yet, and the ordinary heartbeat starts one refresh later.
+            let _repo = repair_committed_bundle(&opts, &mut store)
                 .await
                 .map_err(|repair| {
                     format!(
                         "committed application bundle failed local verification ({error}); no signed repair was applicable: {repair}"
                     )
                 })?;
+            // A service exit recorded against a release whose committed tree was found DAMAGED is
+            // evidence about this disk, not about the release — the same reasoning that forbids
+            // `repair_committed_bundle` from rejecting the corrupt archive. Charged to the head it
+            // would permanently blacklist, by archive hash, the bytes this repair just
+            // re-downloaded and re-verified.
+            //
+            // Note what is NOT done here: the claim itself is not surrendered. Erasing it would
+            // disable every other consumer of the exit too — the revert to `pending`'s predecessor
+            // in `boot::confirm_or_revert`, the provisional-head descent below — and a release that
+            // died inside its confirmation window would then be relaunched and, once the window
+            // passed, CONFIRMED, with its rollback target dropped. The exit stays; only the
+            // permanent, hash-keyed rejection it would otherwise drive is withheld, via
+            // `Situation::charge_crash_to_release`. The next boot finds an intact tree and charges
+            // a repeat crash to the release, so this withholding is one boot deep and the descent
+            // still terminates.
+            bytes_repaired = true;
         }
     }
 
-    // Claim the guardian's markers once, up front, then gather the whole world into a Situation
-    // and let the pure boot planner decide everything: recovery, drift enforcement, crash
-    // rejection, pending confirm/revert, and whether to adopt the running application or launch a
-    // fresh one. Each claim is surrendered — and only then is its file erased — at the point the
-    // durable consequence it implies has landed.
-    let mut evidence = guardian::Evidence::read(guardian::state_dir().as_deref())?;
-    let situation = gather_situation(&opts, &store, &guardian, &evidence, first_install)?;
+    // Gather the whole world into a Situation and let the pure boot planner decide everything:
+    // recovery, drift enforcement, crash rejection, pending confirm/revert, and whether to adopt
+    // the running application or launch a fresh one. Each claim is surrendered — and only then is
+    // its file erased — at the point the durable consequence it implies has landed.
+    let situation = gather_situation(
+        &opts,
+        &store,
+        &guardian,
+        &evidence,
+        first_install,
+        bytes_repaired,
+    )?;
     let mut recovery_transaction = recovery_transaction(&situation);
     // A *provisional* committed head (`confirmed == false`, never health-proven) that crashed (the
     // guardian recorded a service exit) with no pending update to revert is a broken assigned head
@@ -329,7 +362,15 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // exhausted descent even though a healthy release was available (the fleet baseline-rejection
     // bug). A genuine crash of *this* head is caught on the next boot (no longer first_install) or,
     // if it fails its gate this boot, by the boot health gate below.
-    if situation.service_exited && recovery_transaction.is_none() && !situation.first_install {
+    //
+    // `charge_crash_to_release` rather than `service_exited` for the same reason and with the same
+    // shape: a boot that repaired this head's damaged tree must not reject the bytes it just
+    // re-verified. It relaunches them instead, and a head that crashes again is rejected by the
+    // next boot, which finds the tree intact.
+    if situation.charge_crash_to_release()
+        && recovery_transaction.is_none()
+        && !situation.first_install
+    {
         if let Installed::Present(state) = &situation.installed {
             if reject_provisional_head(&mut store, state, "crashed with no pending update")? {
                 // The rejection is durable now, so the claim that drove it can go.
@@ -548,9 +589,26 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let (installed, installed_lifecycle) =
         boot_gate_target(recovery_transaction.as_ref(), &installed_state);
     let mut tower = DefaultProvider::new(&mut app, &opts, installed_lifecycle.as_ref());
-    let boot_healthy =
-        update::became_healthy(&mut tower, attempt::BOOT, &installed, &installed).await;
-    if !boot_healthy {
+    let gate = update::became_healthy(&mut tower, attempt::BOOT, &installed, &installed).await;
+    if let update::Health::Inconclusive(cause) = &gate {
+        // No verdict about these bytes: the probes stopped reaching the node reconciler (a corrupt
+        // or pruned provider tree, ENOSPC/EACCES/EIO preparing the invocation), so this says more
+        // about the disk than about the release. Note it — and then fall through to the SAME
+        // bounded failure path an unhealthy gate takes.
+        //
+        // Why not a non-judging early return, the way `switch_over` answers an inconclusive gate?
+        // Because there is no "try again later" here: nothing is serving. These faults are
+        // deterministic (a provider tree that will not resolve resolves no better on the next
+        // boot), so an early return would relaunch into the identical failure forever with the node
+        // down — precisely what the bound below exists to prevent. Bounded descent to a release the
+        // node can actually run beats an unbounded crash loop, even at the cost of a rejection that
+        // the disk, not the release, earned.
+        warn(&format!(
+            "the boot readiness gate could not reach the node reconciler ({cause}); treating it as \
+             a failed gate so the bounded recovery below still terminates"
+        ));
+    }
+    if !matches!(gate, update::Health::Ready) {
         // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
         // dangerous case: `reject_provisional_head` below would no-op (the still-deferred
         // `store.installed()` holds the CONFIRMED candidate, not the predecessor), so without a
@@ -616,8 +674,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         advance_transaction(&mut store, tx, TransactionPhase::PredecessorHealthy)?;
     }
 
-    // A crash may have interrupted the operator's drain/prepare/finalize work. Once the
-    // predecessor is healthy again, replay the idempotent rollback phase with the same
+    // A crash may have interrupted the rollback between its journal barriers. Once the
+    // predecessor is healthy again, replay the idempotent rollback operation with the same
     // transaction identity before declaring the recovered tower ready.
     let rollback_incomplete = recovery_transaction
         .as_ref()
@@ -689,19 +747,21 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // the node's identity. If that identity can't build (an offline/non-mTLS deployment with no
     // CA on disk), fall back to a plain client: telemetry is best-effort, and a plain-HTTP report
     // target is served as usual.
-    let telemetry_node = telemetry::node_identity(&opts.routing);
-    let telemetry_client = opts
-        .routing
-        .mtls
-        .reqwest_client()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    // The node signs each report with the SAME per-node key that certifies its mTLS leaf, so the
-    // control plane verifies authenticity end-to-end (not just on the write hop). Loaded once as
-    // PKCS#8 DER; absent only for a mis-provisioned node, whose unsigned reports then fail closed at
-    // the throttle (treated as not-yet-settled) rather than being trusted.
-    let telemetry_signing_key = std::fs::read_to_string(&opts.routing.mtls.client_key)
-        .ok()
-        .and_then(|pem| updated::csr::key_pem_to_pkcs8_der(&pem).ok());
+    let heartbeat = Heartbeat {
+        client: opts
+            .routing
+            .mtls
+            .reqwest_client()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        node: telemetry::node_identity(&opts.routing),
+        // The node signs each report with the SAME per-node key that certifies its mTLS leaf, so
+        // the control plane verifies authenticity end-to-end (not just on the write hop). Loaded
+        // once as PKCS#8 DER; absent only for a mis-provisioned node, whose unsigned reports then
+        // fail closed at the throttle (treated as not-yet-settled) rather than being trusted.
+        signing_key: std::fs::read_to_string(&opts.routing.mtls.client_key)
+            .ok()
+            .and_then(|pem| updated::csr::key_pem_to_pkcs8_der(&pem).ok()),
+    };
     let mut fingerprints = fingerprint::Tracker::new(Instant::now());
     loop {
         // An unconfirmed update that ran its whole window without crashing is confirmed.
@@ -757,13 +817,24 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             loop_state.next_identity_check = now + IDENTITY_CHECK_INTERVAL;
             match updated::enrollment::BootstrapConfig::load(&opts.identity_renewal.bootstrap) {
                 Ok(bootstrap) => {
-                    match updated::enrollment::renew_node_material_if_due(
-                        &bootstrap,
-                        &opts.identity_renewal.state_dir,
-                        &updated_tuf::EmbeddedChainPolicy,
-                    )
-                    .await
+                    // The refresh policy reads the repository's published versioned roots to walk a
+                    // rotation the node was offline for, so it presents the same steady-state
+                    // identity every other metadata fetch does.
+                    let renewal = match bootstrap
+                        .enrollment
+                        .steady_identity(&opts.identity_renewal.state_dir)
                     {
+                        Ok(mtls) => {
+                            updated::enrollment::renew_node_material_if_due(
+                                &bootstrap,
+                                &opts.identity_renewal.state_dir,
+                                &updated_tuf::EmbeddedChainPolicy::new(mtls),
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match renewal {
                         Ok(true) => {
                             log("renewed node certificate; restarting to rebuild authenticated clients");
                             return Ok(());
@@ -784,7 +855,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // provider the committed record names *now* — see `probe_steady_target`, which is why
             // this tick's target exists only inside the call.
             let healthy = probe_steady_target(&store, |installed, lifecycle| {
-                let healthy = invoke_deployment_provider(
+                let healthy = run_lifecycle_command(
                     lifecycle,
                     &opts,
                     LifecycleInvocation {
@@ -800,7 +871,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(Err(error)) = fingerprints.poll(
                     now,
                     healthy,
-                    telemetry_node.as_deref().unwrap_or("unidentified-node"),
+                    heartbeat.node.as_deref().unwrap_or("unidentified-node"),
                     || {
                         prepare_fingerprint_job(
                             lifecycle,
@@ -845,8 +916,15 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 updated::bundle::verify_release(&opts.paths.versions, &installed.release)
             {
                 fingerprints.restart_after_deployment(Instant::now());
+                // Out of rotation before the bytes under the running application are repaired — the
+                // repair stops and replaces it. With NO drain hold: these bytes failed integrity
+                // verification, and every second of a configured hold is a second they keep
+                // executing, which is the one thing this arm exists to end. Best effort, like the
+                // stop below: a guardian that cannot be reached must not keep tampered bytes
+                // running.
+                let _ = withdraw_from_traffic(&mut app, DrainHold::None).await;
                 let _ = app::stop_runtime(&mut app);
-                repair_committed_bundle(&opts, &mut store)
+                let repaired_from = repair_committed_bundle(&opts, &mut store)
                     .await
                     .map_err(|repair| {
                         format!(
@@ -857,22 +935,77 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     updated::state::Installed::Present(state) => Some(state.release.version),
                     _ => None,
                 };
-                pending = None;
+                // Re-derive the in-memory confirmation intent from the record the repair just
+                // wrote, exactly like every other divergence site. The repair CARRIES an in-flight
+                // update's `pending` forward, so blanking it here would leave a durable `pending`
+                // this process can never confirm (only `confirm_due` -> `confirm_update`, off this
+                // local, clears it) — and the first ordinary crash days later would be read by
+                // `boot::confirm_or_revert` as an exit inside the confirmation window: a revert to
+                // the predecessor plus a permanent rejection of a release that had long since
+                // proven itself.
+                pending = installed_pending(&store);
+                // The SAME converge the runtime-relaunch path below runs, for the same reason: in
+                // provider-managed mode neither the stop above nor the launch below touches the
+                // application — the reconciler owns it — so `apply` is the only step that puts the
+                // repaired bytes into service. Without it the tampered image would keep running and
+                // the next probe would restore its readiness. NOT best effort: unlike the guardian
+                // stop, a converge that fails would leave the old image serving, so it propagates
+                // and this supervisor exits withdrawn, leaving boot recovery to converge and launch
+                // the repaired release.
+                converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
+                    format!("converging the environment onto the repaired bundle: {error}")
+                })?;
                 app.launch(&opts)?;
                 health.relaunched(&opts.timeouts);
+                // Take the repaired bundle through a LATER tick rather than falling through to the
+                // update check on this one: the check is legitimately due against the repaired
+                // release, but reaching it here would run a second withdraw-and-drain inside the
+                // same tick — this time paying the full configured hold — right after the repair
+                // deliberately skipped it.
+                //
+                // On the normal cadence, and deferring the self-update check with it, for the same
+                // reason the secrets arm below does: `check` is the only thing that advances the
+                // self-update clock and this `continue` skips it, so scheduling the next tick
+                // immediately would leave `self_due` true forever and collapse `wait` to its 100 ms
+                // floor. Drift that survives a repair (a reconciler `apply` writing into the
+                // content-addressed release directory) would then re-run withdraw + stop + a full
+                // TUF refresh and re-download + converge + launch ten times a second, forever.
+                let retry = jitter(opts.timeouts.check_interval, REPORT_CADENCE_JITTER_PERCENT);
+                loop_state.next_app_check = Instant::now() + retry;
+                self_update.defer(Instant::now() + retry);
+                // Report BEFORE leaving the tick. The heartbeat below is the node's only report
+                // writer and it runs only on ticks where a check is due — exactly the ticks this
+                // arm ends early — so skipping it silences the node completely for as long as the
+                // drift recurs, and one `REPORT_FRESHNESS` later the health proxy drains a node
+                // whose last word was stale rather than untrue. Reported not-settled, which is
+                // simply what `relaunched` just made true: this node was withdrawn from rotation
+                // and restarted onto repaired bytes, and it publishes settled again through the
+                // ordinary path as soon as a tick verifies clean and observes it ready.
+                //
+                // Off the repository the repair itself resolved, so this costs no second refresh.
+                // The predecessor fallback has none — it runs when the control plane is
+                // unreachable, which is also when there is nothing to report to.
+                if let Some(repo) = &repaired_from {
+                    heartbeat
+                        .emit(
+                            &opts,
+                            repo,
+                            &store,
+                            current.as_deref(),
+                            false,
+                            fingerprints.current(),
+                        )
+                        .await;
+                }
+                continue;
             }
         }
 
         // Resolve the agent document afresh, then load its release repository.
         // One verified result serves application and self checks this cycle, and a
         // control-plane reassignment therefore takes effect without process restart.
-        let repo = match TrustedRepository::assigned(
-            &opts.routing,
-            &opts.repository,
-            &opts.storage,
-            &opts.paths,
-        )
-        .await
+        let repo = match TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
+            .await
         {
             Ok(repo) => repo,
             Err(e) => {
@@ -935,12 +1068,31 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             opts.deployment = assignment.deployment.clone();
             let relaunch = opts.apply_runtime(&assignment.runtime) || secrets_changed;
             if relaunch {
-                // The launch spec changed. A live process cannot have its argv rewritten, so
-                // stop it and relaunch on the new args.
-                log("assignment runtime changed the launch spec; relaunching the application to apply it");
+                // The runtime changed under the running process. A live process cannot have its
+                // argv or environment rewritten, so stop it, converge the environment on the new
+                // runtime, and relaunch onto it.
+                log("assignment runtime changed; converging the environment and relaunching the application onto it");
                 fingerprints.restart_after_deployment(Instant::now());
+                // Leave rotation first, exactly as the update transaction does and through the same
+                // sequence: the converge below is the reconciler `apply` that reconfigures or
+                // restarts a provider-managed application, and there is no guardian stop in that
+                // mode to withdraw readiness as a side effect. Readiness comes back only through
+                // the ordinary observed-healthy path after `relaunched` re-arms probing, so a
+                // failure anywhere below leaves this node withdrawn.
+                withdraw_from_traffic(&mut app, DrainHold::configured(&opts))
+                    .await
+                    .map_err(|error| {
+                        format!("withdrawing from traffic to apply a new runtime: {error}")
+                    })?;
                 app::stop_runtime(&mut app).map_err(|error| {
-                    format!("stopping the application to apply a new launch spec: {error}")
+                    format!("stopping the application to apply a new runtime: {error}")
+                })?;
+                // The SAME converge the boot path runs, for the same reason and through the same
+                // function: resolved `inputs` reach the reconciler only as `--input-file` on a
+                // lifecycle invocation, so a revision that changes them takes effect here or not
+                // at all — relaunching the application alone would stop and start it for nothing.
+                converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
+                    format!("converging the environment onto the new runtime: {error}")
                 })?;
                 app.launch(&opts).map_err(|error| {
                     format!("relaunching the application with the new launch spec: {error}")
@@ -976,6 +1128,12 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // window is watched and a crash is caught on the next boot.
                     pending = installed_pending(&store);
                     garbage_collect(&opts, &store);
+                    // The transaction replaced the process. Everything this watch holds —
+                    // the failure count, the last observation, the probe deadline set
+                    // earlier in this same tick — describes the process that was just
+                    // stopped, so re-arm as at every other launch site rather than judging
+                    // a freshly started release on its predecessor's record.
+                    health.relaunched(&opts.timeouts);
                 }
                 AppOutcome::Unchanged => {}
                 AppOutcome::RestartForRecovery => {
@@ -995,39 +1153,81 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Best-effort rollout heartbeat, emitted after acting on the current assignment.
-        // `healthy` is true only when the running app is ready AND no update is still
-        // unconfirmed (`pending`) — so a node that has merely *fetched* a new assignment,
-        // or is mid-rollout, is never reported as settled on it. That is exactly what lets
-        // the control plane hold a pair's second member until the first has genuinely
-        // completed (installed and confirmed, or attempted and rolled back). Keyed off the
-        // current assignment's report URL, so adding or removing telemetry just starts or
-        // stops the heartbeat.
-        if let Some(assignment) = repo.assignment() {
-            // Do not report settled until the first steady-state observation has passed.
-            let settled = pending.is_none() && health.last_ready.unwrap_or(false);
-            let archive_sha256 = installed_archive_sha256(&store);
-            let manifest_sha256 = installed_manifest_sha256(&store);
-            let outputs = settled
-                .then(|| telemetry::load_outputs(&opts.paths.install_root, &manifest_sha256))
-                .flatten();
-            telemetry::report_running_state(
-                &telemetry_client,
-                assignment.report_url.as_deref(),
-                telemetry_node.as_deref(),
-                &telemetry::RunningState {
-                    deployment: &assignment.deployment,
-                    assignment_sha256: repo.assignment_sha256().unwrap_or_default(),
-                    version: current.as_deref().unwrap_or_default(),
-                    archive_sha256: &archive_sha256,
-                    healthy: settled,
-                    fingerprint: fingerprints.current(),
-                    outputs: outputs.as_ref(),
-                },
-                telemetry_signing_key.as_deref(),
+        // The rollout heartbeat, emitted after acting on the current assignment. Every path that
+        // leaves this tick early emits it first (see the integrity arm above) — see [`Heartbeat`].
+        heartbeat
+            .emit(
+                &opts,
+                &repo,
+                &store,
+                current.as_deref(),
+                pending.is_none() && health.last_ready.unwrap_or(false),
+                fingerprints.current(),
             )
             .await;
-        }
+    }
+}
+
+/// The rollout heartbeat's per-process inputs, so the one emitter can be called from every path
+/// that ends a tick.
+///
+/// There is exactly one report writer in the supervisor, and it is the only thing that keeps this
+/// node inside `REPORT_FRESHNESS` at the health proxy. Any tick that returns to the top without
+/// reaching it spends the node's freshness budget; a fault that recurs every tick (drift that
+/// survives a repair) spends it to zero and the node is drained for a reason no reader can see.
+/// Bundling the inputs here is what makes emitting from the early-exit paths a call rather than a
+/// copy of the block.
+struct Heartbeat {
+    client: reqwest::Client,
+    /// The node identity reports are keyed by; absent on a node with no derivable identity, which
+    /// simply never reports.
+    node: Option<String>,
+    /// The per-node key each report is signed with (PKCS#8 DER).
+    signing_key: Option<Vec<u8>>,
+}
+
+impl Heartbeat {
+    /// Write one best-effort report of what this node is running.
+    ///
+    /// `settled` is true only when the running app is ready AND no update is still unconfirmed —
+    /// so a node that has merely *fetched* a new assignment, or is mid-rollout, or was just
+    /// relaunched onto repaired bytes, is never reported as settled on it. That is what lets the
+    /// control plane hold a pair's second member until the first has genuinely completed. Keyed off
+    /// the current assignment's report URL, so adding or removing telemetry just starts or stops
+    /// the heartbeat.
+    async fn emit(
+        &self,
+        opts: &Options,
+        repo: &TrustedRepository,
+        store: &dyn Store,
+        version: Option<&str>,
+        settled: bool,
+        fingerprint: Option<&updated_contracts::telemetry::Fingerprint>,
+    ) {
+        let Some(assignment) = repo.assignment() else {
+            return;
+        };
+        let archive_sha256 = installed_archive_sha256(store);
+        let manifest_sha256 = installed_manifest_sha256(store);
+        let outputs = settled
+            .then(|| telemetry::load_outputs(&opts.paths.install_root, &manifest_sha256))
+            .flatten();
+        telemetry::report_running_state(
+            &self.client,
+            assignment.report_url.as_deref(),
+            self.node.as_deref(),
+            &telemetry::RunningState {
+                deployment: &assignment.deployment,
+                assignment_sha256: repo.assignment_sha256().unwrap_or_default(),
+                version: version.unwrap_or_default(),
+                archive_sha256: &archive_sha256,
+                healthy: settled,
+                fingerprint,
+                outputs: outputs.as_ref(),
+            },
+            self.signing_key.as_deref(),
+        )
+        .await;
     }
 }
 
@@ -1052,12 +1252,15 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 /// The corrupt archive is never *rejected*: a rejection is durable and never expires, and damage to
 /// this disk is evidence about this node, not about the release — rejecting it would permanently
 /// exclude a perfectly good version from this node and walk its ordered fallback downward.
+/// Returns the trusted repository the repair ran off, when it came from the assignment — the caller
+/// reports against it without a second refresh. The predecessor fallback below runs precisely when
+/// no repository could be loaded, so it has none to give.
 async fn repair_committed_bundle(
     opts: &Options,
     store: &mut FileStore,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<TrustedRepository>, Box<dyn std::error::Error>> {
     let assignment_error = match repair_from_assignment(opts, store).await {
-        Ok(()) => return Ok(()),
+        Ok(repo) => return Ok(Some(repo)),
         Err(error) => error,
     };
     let Installed::Present(installed) = store.installed() else {
@@ -1090,7 +1293,7 @@ async fn repair_committed_bundle(
         "repaired the committed application by falling back to the intact predecessor {}",
         pending.previous_release.version
     ));
-    Ok(())
+    Ok(None)
 }
 
 /// Re-acquire and re-commit the assigned application from the signed deployment contract. This is
@@ -1099,20 +1302,18 @@ async fn repair_committed_bundle(
 async fn repair_from_assignment(
     opts: &Options,
     store: &mut FileStore,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let repo =
-        TrustedRepository::assigned(&opts.routing, &opts.repository, &opts.storage, &opts.paths)
-            .await
-            .map_err(|error| format!("loading the signed repair assignment: {error}"))?;
+) -> Result<TrustedRepository, Box<dyn std::error::Error>> {
+    let repo = TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
+        .await
+        .map_err(|error| format!("loading the signed repair assignment: {error}"))?;
     let assignment = repo
         .assignment()
         .ok_or("the signed repository has no desired deployment")?;
     let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
-    let prepared = update_client::prepare_assigned_application(
-        update_client::ApplicationRequest {
+    let prepared = crate::acquire::prepare_assigned_application(
+        crate::acquire::ApplicationRequest {
             repository: &repo,
             application: &opts.application,
-            repository_config: &opts.repository,
             paths: &opts.paths,
             current_version: None,
         },
@@ -1124,20 +1325,40 @@ async fn repair_from_assignment(
     let (providers, _) = selection::stage_providers(opts, &repo, store, None)
         .await
         .map_err(|error| format!("staging the providers for the repair: {error}"))?;
-    store.commit_installed(&updated::state::InstalledState::confirmed(
-        lineage,
-        prepared.release.clone(),
-        prepared.archive_sha256,
-        Box::new(providers),
-    ))?;
+    // A repair replaces drifted BYTES; it does not decide an in-flight update. When it lands back
+    // on the release the record already names, the record's rollback intent and its provisional
+    // flag are carried through unchanged: erasing them would silently confirm an unconfirmed head —
+    // nothing left for `plan_boot` to revert on the next crash, and `garbage_collect` free to prune
+    // the very predecessor this function's own fallback depends on. A repair that lands on a
+    // different head (the assignment moved on) is a head this node has never launched, let alone
+    // health-gated, so it is committed provisional exactly as a cold install commits one — ordered
+    // fallback has to be able to descend past it if it turns out to be broken.
+    let (pending, confirmed) = match store.installed() {
+        Installed::Present(state) if state.release == prepared.release => {
+            (state.pending, state.confirmed)
+        }
+        _ => (None, false),
+    };
+    // Verify-then-point, and only then commit — the same order, and for the same reason, as the
+    // predecessor fallback in `repair_committed_bundle`: a failed `activate` (ENOSPC, a read-only
+    // remount) must leave the committed record exactly as it found it, so the fallback still has
+    // the `pending` it reads to recover.
     store.activate(&prepared.release)?;
+    store.commit_installed(&updated::state::InstalledState {
+        repository_lineage: lineage,
+        release: prepared.release.clone(),
+        archive_sha256: prepared.archive_sha256,
+        lifecycle: Box::new(providers),
+        pending,
+        confirmed,
+    })?;
     // Wording held stable: the e2e's offline-repair scenario asserts on this exact line, and the
     // scenario it covers — a `file:` routing repository, no network — is the one it names.
     log(&format!(
         "repaired the committed application from signed local deployment {}",
         prepared.version
     ));
-    Ok(())
+    Ok(repo)
 }
 
 /// End this supervisor because it cannot make progress, leaving every piece of durable evidence
@@ -1469,7 +1690,10 @@ fn confirmation_window_rollback(situation: &Situation) -> Option<Transaction> {
                     candidate_release: installed.release.clone(),
                     candidate_archive_sha256: installed.archive_sha256.clone(),
                     candidate_repository_lineage: installed.repository_lineage.clone(),
-                    candidate_rejection_required: situation.service_exited,
+                    // The rollback is owed either way; the permanent rejection that normally rides
+                    // with it is withheld when this boot repaired the candidate's damaged tree.
+                    // See [`Situation::charge_crash_to_release`].
+                    candidate_rejection_required: situation.charge_crash_to_release(),
                     lifecycle: pending.lifecycle.clone(),
                     rollback_health_failures: 0,
                     phase: TransactionPhase::RollbackStarted,
@@ -1494,7 +1718,7 @@ fn complete_recovery_activation(
     // Restore the predecessor's machine state through the same reconciler operation used for the
     // candidate. Managed mode has already stopped the candidate; provider-managed mode never
     // exposes or manipulates an application PID.
-    invoke_deployment_provider(
+    run_lifecycle_command(
         tx.lifecycle.as_ref(),
         opts,
         LifecycleInvocation {
@@ -1522,6 +1746,7 @@ fn gather_situation(
     guardian: &Guardian,
     evidence: &guardian::Evidence,
     first_install: bool,
+    bytes_repaired: bool,
 ) -> io::Result<Situation> {
     let active = store.active_release()?;
     let installed = store.installed();
@@ -1531,6 +1756,7 @@ fn gather_situation(
         active,
         journal,
         service_exited: evidence.service_exited(),
+        bytes_repaired,
         app_running: guardian.running_app(),
         first_install,
         bad_supervisor: evidence.rejected_supervisor().map(PathBuf::from),
@@ -1584,7 +1810,29 @@ fn execute_boot_plan(
         // Fallible on purpose, and cleared only here: a rejection that failed to reach disk must
         // not be mistaken for a durable one. If the write fails this boot fails with the marker
         // intact, so the next boot rejects the same candidate instead of re-staging it forever.
-        self_update.reject_candidate(path)?;
+        //
+        // With one exception, which is the marker module's own stated invariant: bytes that are not
+        // a content-addressed `supervisors/<hash>/<binary>` path — a stray write, a truncated or
+        // partially restored file — name no hash to suppress and are not evidence about any
+        // candidate. Failing the boot on them would fail identically on every subsequent boot (the
+        // marker is only ever cleared here), leaving the node permanently unbootable, so they are
+        // discarded with a warning and the marker is cleared.
+        //
+        // The shape is checked HERE, before the write is attempted, rather than by classifying the
+        // error afterwards: `reject_candidate` reports a missing path component and a component
+        // that is not a digest with two different kinds (`InvalidData` and, through
+        // `Rejections::reject`, `InvalidInput`), and `InvalidInput` is a kind a failing write could
+        // also carry. Deciding the question up front keeps "malformed marker" and "the rejection
+        // did not reach disk" from ever being the same test.
+        if rejected_supervisor_hash(path).is_some() {
+            self_update.reject_candidate(path)?;
+        } else {
+            warn(&format!(
+                "discarding an unusable rejected-supervisor marker: {} is not a content-addressed \
+                 supervisors/<hash>/<binary> path and names no candidate to suppress",
+                path.display()
+            ));
+        }
         evidence.clear_rejected_supervisor()?;
     }
     Ok(installed_pending(store))
@@ -1614,6 +1862,18 @@ fn apply_store_plan(
         store.reject(lineage, hash)?;
     }
     Ok(())
+}
+
+/// The candidate hash a rejected-supervisor marker names, or `None` when the marker's bytes are
+/// not a content-addressed `supervisors/<hash>/<binary>` path.
+///
+/// The same extraction `SelfUpdateState::reject_candidate` performs, plus the very predicate
+/// `Rejections::reject` validates with — [`updated::reject::is_rejection_key`], called rather than
+/// restated, so this accepts exactly the markers that path would accept however that grammar moves.
+/// Every marker it turns down would have failed there with no hash recorded anyway.
+fn rejected_supervisor_hash(path: &std::path::Path) -> Option<&str> {
+    let hash = path.parent()?.file_name()?.to_str()?;
+    updated::reject::is_rejection_key(hash).then_some(hash)
 }
 
 /// The unconfirmed update recorded in the installed state, if any.
@@ -1909,12 +2169,60 @@ mod tests {
                 phase,
             }),
             service_exited: true,
+            bytes_repaired: false,
             app_running: None,
             first_install: false,
             bad_supervisor: None,
             confirm_window: Duration::from_secs(60),
             now: 120,
         }
+    }
+
+    #[test]
+    fn the_integrity_repair_reports_before_it_ends_its_tick() {
+        // The node's report freshness is what keeps it in rotation, and the loop has exactly ONE
+        // report writer, reached only on ticks where a check is due. The integrity arm ends exactly
+        // those ticks early, so under drift that survives the repair — the arm's own stated case —
+        // a repair path that does not report leaves the node silent for as long as the drift
+        // recurs, and it is drained one REPORT_FRESHNESS later. Asserted structurally because the
+        // condition is "this early exit is not silent", which no value the loop returns expresses.
+        let source = include_str!("main.rs");
+        let emitter = concat!("telemetry::report_", "running_state(");
+        assert_eq!(
+            source.matches(emitter).count(),
+            1,
+            "reports must have exactly one writer, so every path that needs one calls Heartbeat::emit"
+        );
+        let arm = source
+            .find("let repaired_from = repair_committed_bundle")
+            .expect("the in-loop integrity repair");
+        let tail = &source[arm..];
+        let ends = tail.find("continue;").expect("the arm ends its tick");
+        assert!(
+            tail[..ends].contains("heartbeat"),
+            "the integrity repair must emit a heartbeat before leaving the tick"
+        );
+    }
+
+    #[test]
+    fn a_repaired_boot_still_owes_the_rollback_but_not_the_rejection() {
+        // Both halves of the attribution rule at the synthesis site. The rollback is owed whether
+        // or not this boot repaired the tree — the candidate's machine-state changes must be
+        // compensated either way — while `candidate_rejection_required`, which is permanent and
+        // keyed by archive hash, is charged only to bytes this boot did not just re-download.
+        let intact = recovery_transaction(&window_crash(None)).expect("the crash owes a rollback");
+        assert!(intact.candidate_rejection_required);
+
+        let mut situation = window_crash(None);
+        situation.bytes_repaired = true;
+        let repaired = recovery_transaction(&situation)
+            .expect("a repaired boot owes the same rollback; only the rejection is withheld");
+        assert!(repaired.is_rollback());
+        assert_eq!(repaired.previous_release, intact.previous_release);
+        assert!(
+            !repaired.candidate_rejection_required,
+            "the repair re-verified these bytes; they must not be blacklisted"
+        );
     }
 
     #[test]
@@ -2201,5 +2509,40 @@ mod tests {
             TransientRetry::BOOT.budget
         );
         assert!(TransientRetry::BOOT.interval < TransientRetry::BOOT.budget);
+    }
+
+    #[test]
+    fn a_marker_is_forwarded_for_rejection_exactly_when_the_rejection_record_would_take_it() {
+        // Regression: `execute_boot_plan` decides up front whether a rejected-supervisor marker
+        // names a candidate worth recording, and `SelfUpdateState::reject_candidate` then hands
+        // that hash to `Rejections::reject`. If the two grammars ever disagree, a marker this
+        // forwards fails the boot with `InvalidData` — and the marker is only ever cleared after a
+        // successful write, so every subsequent boot fails identically: the permanent boot loop.
+        // They cannot disagree by construction now (both go through
+        // `updated::reject::is_rejection_key`); this pins that they agree in behaviour too.
+        let digest: String = std::iter::repeat_n('a', 64).collect();
+        let path = std::env::temp_dir().join(format!("marker-agreement-{}", std::process::id()));
+        for candidate in [
+            digest.clone(),
+            format!("{digest}:{digest}"),
+            digest.to_ascii_uppercase(),
+            "not-a-digest".into(),
+            String::new(),
+            format!("{digest}:"),
+            format!("{digest}:{digest}:{digest}"),
+        ] {
+            let marker = std::path::Path::new("/var/lib/updated/supervisors")
+                .join(&candidate)
+                .join("supervisor");
+            let forwarded = rejected_supervisor_hash(&marker).is_some();
+            let mut rejections = updated::reject::Rejections::load(&path).unwrap();
+            let recordable = rejections.reject(&candidate).is_ok();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(
+                forwarded, recordable,
+                "{candidate:?}: forwarded={forwarded} but the rejection record would take it \
+                 ={recordable}"
+            );
+        }
     }
 }

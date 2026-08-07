@@ -10,11 +10,21 @@ covers both so you have the full picture.
 ## Part 1 — What already exists (done)
 
 ### `updatectl` crate — `crates/updatectl/`
-A small, CI-facing, Linux-only binary. Three subcommands:
+A small, CI-facing, Linux-only binary. Five subcommands: `trust-root`, `rotate-root`,
+`deploy`, `publish-provider-artifact`, and `publish-provider-set`.
 
-- **`trust-root`** — one-time bootstrap. Generates the ed25519 role keys into a directory,
-  initializes the empty TUF **release repository in S3**, and prints `root.json` (the value
-  to paste into a group's `release_repository.root_json`). **Needs no Kubernetes access.**
+- **`trust-root`** — one-time bootstrap, and the **only** command that mints a role key set.
+  Generates the ed25519 role keys into a directory, initializes the empty TUF **release
+  repository in S3**, and prints `root.json` (the value to paste into a group's
+  `release_repository.root_json`). **Needs no Kubernetes access.** The keys are minted into a
+  private staging dir *inside* `--keys-dir` and moved into place only after the publish lands,
+  so (a) no key the command did not mint itself can be signed into the new root, and (b) an
+  attempt that fails partway writes no key file to `--keys-dir` and is retried by the identical
+  re-run. A run killed by a signal skips `Drop` and leaves its staging dir; every mint first
+  sweeps `.trust-root.pending.*` (`sweep_stale_staging`), so the operator still never
+  hand-deletes private key material. Order after a successful publish: emit `root.json`
+  (`--root-out`/stdout) **first**, then move the keys — a delivery failure must not swallow the
+  document every group has to pin.
 - **`rotate-root`** — mint a successor root key, publish a **co-signed** new root version
   (activate standby, retire old, add fresh standby). Existing devices follow the chain
   automatically. Writes the successor to `--new-key-out`.
@@ -23,16 +33,31 @@ A small, CI-facing, Linux-only binary. Three subcommands:
   publishes it as a TUF target to S3, then **patches the named `UpdateGroup`'s
   `spec.deployment.application.{path,sha256}`** via a JSON merge patch. Touches k8s only for
   that one patch.
+- **`publish-provider-artifact`** — builds, signs, and publishes a lifecycle-provider
+  artifact bundle as a signed target. Like `deploy` but target-only: no group is rolled. A
+  provider set then binds the resulting `path`+`sha256`.
+- **`publish-provider-set`** — signs and publishes an immutable provider set
+  (`provider-sets/<id>.json`) as a target, binding the required provider artifact by
+  path+sha256. The S3-native counterpart of `server publish-provider-set`.
 
 CI-native UX: every flag also reads a `UPDATECTL_*` env var; AWS creds come from
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`; diagnostics → stderr, machine result → stdout
 (`--output text|json`); GitHub Actions step outputs when `$GITHUB_OUTPUT` is set.
 
 Key entry points in `crates/updatectl/src/main.rs`:
-- `trust_root()`, `rotate_root()`, `deploy()` — the three commands.
+- `trust_root()`, `rotate_root()`, `deploy()`, `publish_provider_artifact()`,
+  `publish_provider_set()` — the five commands.
 - `build_store()` — wires the S3 `ObjectStore` from `Backend` + AWS env creds (reuses
   `updatec::runtime::s3_store`).
-- `download_metadata()` / `repo_initialized()` — S3 metadata mirror + init check.
+- `download_metadata()` — S3 metadata mirror.
+- `RoleVersions::live()` — the one reading of published state: per-role version, `None` when
+  the document is absent. `is_initialized()` (any top-level role present) gates `--force`, and
+  `highest()` is the version floor a replacement must start above. Both come from that single
+  reading, so a half-deleted prefix (`root.json` gone, `timestamp.json` still at 47) can never
+  be re-initialized at version 1 and wedge the fleet.
+- `PendingRoleKeys` / `sweep_stale_staging` — staging guard for the bootstrap's five keys (the
+  `PendingRootKey` pattern applied to `trust-root`), plus the sweep that collects the staging
+  dirs of runs killed mid-publish.
 - `build_bundle()` — dir-or-single-file → `updated::bundle::create_bundle` (mirrors
   `server publish-app`'s single-file wrapping).
 - `open_keys()` — resolves **online keys only** (targets/snapshot/timestamp); `deploy`
@@ -45,7 +70,9 @@ Root rotation is a **multi-key-root** model (chosen over two independent anchors
   `root.pk8` plus `root.next.pk8` **if present** (so the operator's single-key assignment
   repo still works unchanged).
 - `generate_keys` now mints **two** root keys (`root.pk8` active + `root.next.pk8` standby)
-  alongside targets/snapshot/timestamp.
+  alongside targets/snapshot/timestamp. Every key is created with `create_new` at 0600, so a
+  file already standing at one of the names is a hard error, never validated-and-adopted: a
+  minted key set is always a wholly fresh one.
 - `generate_root_key(path)` — new; mints one ed25519 key (0600) for a rotation successor.
 - `init` registers **all** root keys in the root role (threshold 1) and signs with all.
 - `rotate_root(repo_dir, retained, new_root_key, expiry_days)` — new. Builds root vN+1 =

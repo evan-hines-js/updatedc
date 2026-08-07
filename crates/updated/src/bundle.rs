@@ -86,19 +86,6 @@ pub struct StagedRelease {
     pub archive_sha256: String,
 }
 
-/// The one executable a bundle declares. A node reconciler receives every operation through this
-/// entrypoint; phase-specific scripts are deliberately not part of the artifact protocol.
-pub struct Entrypoints<'a> {
-    pub entrypoint: &'a str,
-}
-
-impl<'a> Entrypoints<'a> {
-    /// An application (or legacy single-script provider) bundle: just the forward entrypoint.
-    pub fn new(entrypoint: &'a str) -> Self {
-        Self { entrypoint }
-    }
-}
-
 /// Build the canonical deterministic application archive from a prepared release tree.
 /// `source` must not itself contain `manifest.json`; the publisher generates it from the
 /// exact files that will be archived.
@@ -108,10 +95,10 @@ pub fn create_bundle(
     product: &str,
     version: &str,
     platform: &str,
-    entrypoints: &Entrypoints<'_>,
+    entrypoint: &str,
 ) -> io::Result<()> {
     semver::Version::parse(version).map_err(invalid)?;
-    validate_relative(entrypoints.entrypoint, 1024)?;
+    validate_relative(entrypoint, 1024)?;
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(invalid("bundle source is not a regular directory"));
@@ -123,7 +110,7 @@ pub fn create_bundle(
     for relative in &paths {
         let path = source.join(relative);
         let metadata = fs::symlink_metadata(&path)?;
-        let executable = relative == entrypoints.entrypoint || is_executable(&metadata);
+        let executable = relative == entrypoint || is_executable(&metadata);
         files.push(ManifestFile {
             path: relative.clone(),
             sha256: sha256_file(&path)?,
@@ -136,7 +123,7 @@ pub fn create_bundle(
         product: product.to_string(),
         version: version.to_string(),
         platform: platform.to_string(),
-        entrypoint: entrypoints.entrypoint.to_string(),
+        entrypoint: entrypoint.to_string(),
         files,
     };
     let expected = ExpectedBundle {
@@ -165,7 +152,7 @@ pub fn create_bundle(
 
 /// Build the canonical archive from a `source` that is *either* a prepared directory tree or a
 /// single executable file. A directory is bundled as-is; a lone file is first wrapped into a fresh
-/// tree — the file placed at `entrypoints.entrypoint`, plus a generated `config/release.toml`
+/// tree — the file placed at `entrypoint`, plus a generated `config/release.toml`
 /// carrying the version — built inside `wrap_dir`, then bundled. This is the one definition of the
 /// "wrap a lone binary" publishing shorthand, shared by every publish front end so the generated
 /// tree layout (and its `release.toml`) cannot drift between them. `wrap_dir` is (re)created fresh,
@@ -177,16 +164,16 @@ pub fn create_bundle_from_source(
     product: &str,
     version: &str,
     platform: &str,
-    entrypoints: &Entrypoints<'_>,
+    entrypoint: &str,
 ) -> io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_file() {
-        return create_bundle(source, archive, product, version, platform, entrypoints);
+        return create_bundle(source, archive, product, version, platform, entrypoint);
     }
     if wrap_dir.exists() {
         fs::remove_dir_all(wrap_dir)?;
     }
-    let destination = wrap_dir.join(entrypoints.entrypoint);
+    let destination = wrap_dir.join(entrypoint);
     let parent = destination
         .parent()
         .ok_or_else(|| invalid("bundle entrypoint has no parent directory"))?;
@@ -197,7 +184,7 @@ pub fn create_bundle_from_source(
         wrap_dir.join("config/release.toml"),
         format!("version = {version:?}\n"),
     )?;
-    create_bundle(wrap_dir, archive, product, version, platform, entrypoints)
+    create_bundle(wrap_dir, archive, product, version, platform, entrypoint)
 }
 
 impl BundleManifest {
@@ -424,7 +411,10 @@ pub(crate) fn stage_bundle(
     let (manifest, bytes) = extract(archive, stage.path(), expected, limits)?;
     let id = manifest.id(&bytes);
     let destination = versions_root.join(id.directory_name());
-    if destination.exists() {
+    // `symlink_metadata`, not `exists`: `exists` follows symlinks, so a dangling link at this
+    // name would report "nothing here", skip the repair below, and leave the rename to fail
+    // against an entry that does exist. What matters is whether the name is occupied at all.
+    if fs::symlink_metadata(&destination).is_ok() {
         // A content-addressed directory is only reusable while its complete tree still
         // matches the authenticated manifest. Do not let local drift become trusted just
         // because the same release is downloaded again.
@@ -435,7 +425,7 @@ pub(crate) fn stage_bundle(
         // member-by-member against the authenticated manifest — so this is never a rejection.
         // But it must also not be a dead end: refusing here and dropping the good tree would
         // leave the drifted directory in place forever, and every later attempt would
-        // short-circuit on `destination.exists()` and fail identically, so the assigned release
+        // short-circuit on the occupied name and fail identically, so the assigned release
         // could never install on this node again. Remove the invalid copy and republish the
         // verified one over it — the same repair a first install would have performed.
         //
@@ -1002,7 +992,7 @@ mod tests {
             "app",
             "2.0.0",
             "test-platform",
-            &Entrypoints::new("bin/app"),
+            "bin/app",
         )
         .unwrap();
         let staged = stage_bundle(
@@ -1041,7 +1031,7 @@ mod tests {
             "app",
             version,
             "test-platform",
-            &Entrypoints::new("bin/app"),
+            "bin/app",
         )
         .unwrap();
         archive
@@ -1338,6 +1328,47 @@ mod tests {
         read_release(&versions, &repaired.id).expect("the drifted tree was replaced, not trusted");
         assert!(!committed.join("undeclared").exists());
         assert_eq!(fs::read(committed.join("bin/app")).unwrap(), b"executable");
+        // Nothing of the repairing attempt is left behind in staging.
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    /// The same dead end, one shape further out: a *dangling* symlink at `versions/<id>` is an
+    /// entry that `exists` reports as absent, so gating the repair on it skipped both the reuse
+    /// check and the discard and left the rename to fail against a name that is in fact occupied.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_the_destination_is_repaired_by_the_next_stage() {
+        let root = root("stage-dangling");
+        let staging = root.join("staging");
+        let versions = root.join("versions");
+        let archive = sample_archive(&root, "1.0.0");
+
+        // Stage once to learn the content address, then put a link to nowhere in its place.
+        let staged = stage(&archive, &staging, &versions, "1.0.0");
+        let committed = versions.join(staged.id.directory_name());
+        let nowhere = root.join("nowhere");
+        fs::remove_dir_all(&committed).unwrap();
+        std::os::unix::fs::symlink(&nowhere, &committed).unwrap();
+        assert!(!committed.exists(), "the link resolves to nothing");
+        assert!(
+            fs::symlink_metadata(&committed).is_ok(),
+            "but the name is occupied"
+        );
+
+        let repaired = stage(&archive, &staging, &versions, "1.0.0");
+        assert_eq!(repaired.id, staged.id, "same content address");
+        read_release(&versions, &repaired.id).expect("the link was replaced by the verified tree");
+        assert!(
+            !fs::symlink_metadata(&committed)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the published release is a real directory, not the planted link"
+        );
+        assert!(
+            !nowhere.exists(),
+            "the link was unlinked, never written through"
+        );
         // Nothing of the repairing attempt is left behind in staging.
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }

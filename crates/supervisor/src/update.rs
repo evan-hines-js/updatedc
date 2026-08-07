@@ -228,21 +228,17 @@ pub(crate) const ROLLBACK_BOUNDARIES: &[&str] = &[
 //
 // What the transaction drives on the *live* side — the running application and its
 // readiness — behind a port, exactly as [`Store`] ports the durable side. The production
-// [`DefaultProvider`] performs the configured `Restart` mode over the guardian-owned [`App`]; a
+// [`DefaultProvider`] drives the guardian-owned [`App`] and the release's signed node reconciler; a
 // test fake scripts control outcomes and health, so every fault path of [`apply_update`] is
 // provable without a guardian, an HTTP server, or a real process.
 
-/// Bring a staged release into service — the activation hand-off moments. The port the transaction
-/// drives; the sole restart abstraction (the `Restart` mode is data the [`DefaultProvider`]
-/// lifecycle acts on). A post-activation failure does not roll back in-process: the transaction
-/// rejects the candidate, leaves a durable rollback journal, and the supervisor terminates so boot
-/// recovery performs the one rollback path.
 /// How the built-in drain waits, after readiness is withdrawn and before the running release is
 /// stopped, so the load balancer has removed this node from rotation first (no in-flight request
 /// lands on a stopping process).
 pub(crate) enum DrainHold {
-    /// Stop immediately — a `provider-managed` deployment (its provider owns the drain), or a
-    /// managed one that set the hold to zero.
+    /// Stop immediately — the operator set the hold to zero or left it unset, or the caller is
+    /// stopping bytes that failed integrity verification, where any wait is a wait spent running
+    /// them.
     None,
     /// Hold up to this long — a bounded ceiling on how long we wait after withdrawing readiness
     /// before stopping the running release, giving a readiness-aware load balancer time to remove
@@ -250,6 +246,55 @@ pub(crate) enum DrainHold {
     Bounded(Duration),
 }
 
+impl DrainHold {
+    /// The configured hold, which applies in BOTH runtime modes: readiness is the tower's (see
+    /// [`DefaultProvider::traffic_ready`]), so a provider-managed node is just as withdrawn here as
+    /// a managed one, and waiting for its load balancer to observe that is just as meaningful. An
+    /// unset hold is *no* hold — deterministic and never a stall.
+    pub(crate) fn configured(opts: &Options) -> Self {
+        match opts.timeouts.drain_hold {
+            Some(hold) if hold.is_zero() => DrainHold::None,
+            Some(hold) => DrainHold::Bounded(hold),
+            None => DrainHold::None,
+        }
+    }
+
+    /// Wait the hold out. The one implementation of the wait, shared by the transaction's
+    /// [`switch_over`] and by [`withdraw_from_traffic`].
+    async fn wait(self) {
+        match self {
+            DrainHold::None => {}
+            DrainHold::Bounded(hold) => tokio::time::sleep(hold).await,
+        }
+    }
+}
+
+/// Withdraw this node from traffic and wait out `hold` — the same two steps the update transaction
+/// runs (`tower.traffic_ready(false)` then [`DrainHold::wait`], with its drain journal barrier
+/// between them), for the callers that switch the application over *outside* a transaction: the
+/// loop's runtime relaunch and its bundle repair. Both stop, reconfigure or restart the running
+/// application through [`converge_environment`], and in provider-managed mode that converge is the
+/// only thing that touches the application — there is no guardian stop to fall back on — so without
+/// this the node would be reconfigured while still advertising `Serving`.
+///
+/// The caller chooses the hold, which is the whole difference between the two: an orderly relaunch
+/// passes [`DrainHold::configured`] so a readiness-aware load balancer can drain first, while the
+/// integrity repair passes [`DrainHold::None`] — bytes that failed verification must stop *now*,
+/// and sleeping out a configured hold would keep tampered bytes executing for exactly that long.
+///
+/// Readiness is not restored here. It returns only through the ordinary observed-healthy path
+/// (`app.traffic_ready(healthy)` on the next probe), so a caller that fails part-way leaves the
+/// node withdrawn.
+pub(crate) async fn withdraw_from_traffic(app: &mut App, hold: DrainHold) -> io::Result<()> {
+    app.traffic_ready(false)?;
+    hold.wait().await;
+    Ok(())
+}
+
+/// Bring a staged release into service — the activation hand-off moments. The port the transaction
+/// drives. A post-activation failure does not roll back in-process: the transaction rejects the
+/// candidate, leaves a durable rollback journal, and the supervisor terminates so boot recovery
+/// performs the one rollback path.
 pub(crate) trait DeploymentProvider {
     /// Change whether external traffic may reach the managed application.
     fn traffic_ready(&mut self, ready: bool) -> io::Result<()>;
@@ -283,31 +328,8 @@ pub(crate) trait DeploymentProvider {
 pub(crate) struct DefaultProvider<'a> {
     app: &'a mut App,
     opts: &'a Options,
-    phases: LoadedPhaseProvider<'a>,
-}
-
-/// The release-bound provider: the signed node reconciler that always travels with the install.
-struct LoadedPhaseProvider<'a> {
-    release: &'a updated::state::ProviderRelease,
-    opts: &'a Options,
-}
-
-impl<'a> LoadedPhaseProvider<'a> {
-    fn load(opts: &'a Options, release: &'a updated::state::ProviderRelease) -> Self {
-        Self { release, opts }
-    }
-
-    fn invoke(&self, invocation: LifecycleInvocation<'_>) -> io::Result<()> {
-        run_lifecycle_command(self.release, self.opts, invocation)
-    }
-}
-
-pub(crate) fn invoke_deployment_provider(
-    release: &updated::state::ProviderRelease,
-    opts: &Options,
-    invocation: LifecycleInvocation<'_>,
-) -> io::Result<()> {
-    LoadedPhaseProvider::load(opts, release).invoke(invocation)
+    /// The signed node reconciler that travels with the install.
+    lifecycle: &'a updated::state::ProviderRelease,
 }
 
 pub(crate) struct FingerprintJob {
@@ -379,30 +401,54 @@ pub(crate) fn launch_after_boot_apply(
     reason: Option<LifecycleReason>,
 ) -> io::Result<App> {
     if let Some(reason) = reason {
-        if let updated::state::Installed::Present(installed) = store.installed() {
-            let installed = *installed;
-            let release = installed.release;
-            let lifecycle = installed.lifecycle;
-            // This is the per-boot environment converge, run on every launch. Release placement
-            // already happened durably — in the install machine on a first boot, in the update
-            // transaction on an upgrade — so this path never places; it only prepares the
-            // environment before the launch.
-            invoke_deployment_provider(
-                lifecycle.as_ref(),
-                opts,
-                LifecycleInvocation {
-                    phase: Operation::Apply,
-                    reason,
-                    id: attempt::BOOT,
-                    pid: None,
-                    candidate: &release,
-                    predecessor: &release,
-                },
-            )?;
-            return crate::app::start(guardian, opts);
-        }
+        converge_environment(opts, store, reason)?;
     }
     crate::app::start(guardian, opts)
+}
+
+/// THE environment converge: run the committed release's `apply` outside a release transaction,
+/// so the reconciler sees the runtime the assignment names *now* — its resolved `inputs` above
+/// all, which reach the reconciler only through `--input-file` and are therefore never picked up
+/// by relaunching the application alone.
+///
+/// Release placement already happened durably — in the install machine on a first boot, in the
+/// update transaction on an upgrade — so this never places; it only prepares the environment for
+/// the launch that follows it.
+///
+/// The precondition differs by runtime mode, and only the managed one is about a process. In
+/// managed mode every caller has already stopped the application ([`launch_after_boot_apply`]
+/// before the boot launch; the loop's runtime relaunch and its bundle repair between their stop and
+/// their relaunch), so no application process is alive. In provider-managed mode there is no
+/// guardian-owned process to stop — [`crate::app::stop_runtime`] is a no-op and the reconciler owns
+/// the application — so `apply` runs *against a live reconciler-owned application* and is the very
+/// thing that reconfigures or restarts it onto the current release. Either way the invocation
+/// carries no PID: there is no application process this agent owns to name.
+///
+/// Fail-closed: the error propagates and the caller does not launch. Nothing is committed here,
+/// so a retry is the next boot or the next reconcile of the same assignment.
+pub(crate) fn converge_environment(
+    opts: &Options,
+    store: &dyn Store,
+    reason: LifecycleReason,
+) -> io::Result<()> {
+    let updated::state::Installed::Present(installed) = store.installed() else {
+        return Ok(());
+    };
+    let installed = *installed;
+    let release = installed.release;
+    let lifecycle = installed.lifecycle;
+    run_lifecycle_command(
+        lifecycle.as_ref(),
+        opts,
+        LifecycleInvocation {
+            phase: Operation::Apply,
+            reason,
+            id: attempt::BOOT,
+            pid: None,
+            candidate: &release,
+            predecessor: &release,
+        },
+    )
 }
 
 impl<'a> DefaultProvider<'a> {
@@ -418,7 +464,7 @@ impl<'a> DefaultProvider<'a> {
         DefaultProvider {
             app,
             opts,
-            phases: LoadedPhaseProvider::load(opts, lifecycle),
+            lifecycle,
         }
     }
 
@@ -436,18 +482,10 @@ impl DeploymentProvider for DefaultProvider<'_> {
     /// withdrawal here meant its switchover happened with the node still in rotation, which is the
     /// one thing the drain step exists to prevent.
     fn traffic_ready(&mut self, ready: bool) -> io::Result<()> {
-        self.app
-            .guardian
-            .traffic_ready(ready)
-            .map_err(io::Error::other)
+        Ok(self.app.guardian.traffic_ready(ready)?)
     }
     fn drain_hold(&self) -> DrainHold {
-        match self.opts.timeouts.drain_hold {
-            Some(hold) if hold.is_zero() => DrainHold::None,
-            Some(hold) => DrainHold::Bounded(hold),
-            // An unset drain hold is *no* hold — deterministic and never a stall.
-            None => DrainHold::None,
-        }
+        DrainHold::configured(self.opts)
     }
     fn lifecycle(
         &mut self,
@@ -458,14 +496,18 @@ impl DeploymentProvider for DefaultProvider<'_> {
     ) -> io::Result<()> {
         // The reconciler receives the guardian-owned PID while that managed process exists.
         let pid = self.hook_pid();
-        self.phases.invoke(LifecycleInvocation {
-            phase,
-            reason: LifecycleReason::Update,
-            id: lifecycle_attempt_id,
-            pid,
-            candidate,
-            predecessor,
-        })
+        run_lifecycle_command(
+            self.lifecycle,
+            self.opts,
+            LifecycleInvocation {
+                phase,
+                reason: LifecycleReason::Update,
+                id: lifecycle_attempt_id,
+                pid,
+                candidate,
+                predecessor,
+            },
+        )
     }
     fn stop(&mut self) -> io::Result<()> {
         if self.opts.application.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged
@@ -480,14 +522,18 @@ impl DeploymentProvider for DefaultProvider<'_> {
         candidate: &updated::bundle::ReleaseId,
         predecessor: &updated::bundle::ReleaseId,
     ) -> io::Result<()> {
-        self.phases.invoke(LifecycleInvocation {
-            phase: Operation::Apply,
-            reason: LifecycleReason::Update,
-            id: lifecycle_attempt_id,
-            pid: None,
-            candidate,
-            predecessor,
-        })
+        run_lifecycle_command(
+            self.lifecycle,
+            self.opts,
+            LifecycleInvocation {
+                phase: Operation::Apply,
+                reason: LifecycleReason::Update,
+                id: lifecycle_attempt_id,
+                pid: None,
+                candidate,
+                predecessor,
+            },
+        )
     }
     fn start(&mut self) -> io::Result<()> {
         if self.opts.application.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged
@@ -523,23 +569,45 @@ pub(crate) async fn became_healthy<T: DeploymentProvider>(
     lifecycle_attempt_id: &str,
     candidate: &updated::bundle::ReleaseId,
     predecessor: &updated::bundle::ReleaseId,
-) -> bool {
+) -> Health {
     let (grace, successes, interval) = tower.verification_policy();
     let deadline = Instant::now() + grace;
     let mut readiness = crate::app::Readiness::new(successes);
     let mut next = Instant::now();
+    // The verdict is the state of the LAST probe, not a latch over the whole grace. The first probe
+    // after a launch normally answers "not ready" while the application is still starting, so a
+    // latch saying "the reconciler answered at least once" would be set within ~100ms of every
+    // switch-over and could never be unset — a state volume that fills at t=2s would then still be
+    // reported as an unhealthy CANDIDATE and earn that release a permanent rejection. Whether the
+    // probes could still reach the reconciler when the deadline arrived is the question that
+    // actually distinguishes the two faults, so `unreached` is cleared by any answer and set by any
+    // failure in front of the reconciler.
+    let mut unreached: Option<io::Error> = None;
     while Instant::now() < deadline {
         if Instant::now() >= next {
-            let ok = tower
-                .lifecycle(
-                    Operation::Healthcheck,
-                    lifecycle_attempt_id,
-                    candidate,
-                    predecessor,
-                )
-                .is_ok();
+            let ok = match tower.lifecycle(
+                Operation::Healthcheck,
+                lifecycle_attempt_id,
+                candidate,
+                predecessor,
+            ) {
+                Ok(()) => {
+                    unreached = None;
+                    true
+                }
+                Err(error) if reconciler_answered(&error) => {
+                    unreached = None;
+                    false
+                }
+                // The probe never reached the reconciler. It still counts as a failed observation
+                // for cadence — readiness is consecutive evidence — but it is not a verdict.
+                Err(error) => {
+                    unreached = Some(error);
+                    false
+                }
+            };
             if readiness.observe(ok) {
-                return true;
+                return Health::Ready;
             }
             next = Instant::now()
                 + if ok {
@@ -550,7 +618,38 @@ pub(crate) async fn became_healthy<T: DeploymentProvider>(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    false
+    match unreached {
+        Some(error) => Health::Inconclusive(error),
+        None => Health::Unhealthy,
+    }
+}
+
+/// The verdict of a readiness gate.
+///
+/// The gate can only speak about the CANDIDATE when the reconciler actually ran and answered.
+/// Preparing an invocation touches the node — it re-resolves (and re-hashes) the staged provider
+/// bundle, creates the provider state directory, and writes the invocation's inputs — so a corrupt
+/// or partially pruned provider tree, ENOSPC, EACCES or a read-only remount fails the probe before
+/// the reconciler exists. That is evidence about this disk, not about the release, and answering it
+/// with a durable, never-expiring rejection would strand the node a version behind the fleet over a
+/// fault that says nothing about the candidate's bytes. Same split as `verify_release` vs.
+/// `point_active`, and `GuardianError::Refused` vs. `Channel`.
+pub(crate) enum Health {
+    Ready,
+    /// The grace expired with the reconciler still answering, and its last answer was not ready (a
+    /// non-zero exit, or it wedged past its own timeout).
+    Unhealthy,
+    /// No verdict: when the grace expired the probes were no longer reaching the reconciler at all.
+    /// Carries that failure for the log.
+    Inconclusive(io::Error),
+}
+
+/// Whether a failed lifecycle invocation is the reconciler's own answer rather than a node-local
+/// fault in front of it. The reconciler's answers are its non-zero exit ([`io::Error::other`]) and
+/// its timeout; everything else — a bundle that will not resolve, a directory that cannot be
+/// created, inputs that cannot be written, a program that will not spawn — happened before it ran.
+fn reconciler_answered(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::Other | io::ErrorKind::TimedOut)
 }
 
 // ================================ the transaction ================================
@@ -626,10 +725,8 @@ pub(crate) async fn apply_update<T: DeploymentProvider>(
     chaos.crossing(boundary::PREPARE_APPLIED);
     advance_transaction(store, &mut tx, TransactionPhase::Prepared)?;
 
-    // Pre-drain: custom logic *before* we withdraw from traffic — e.g. tell the app to
-    // begin shedding work — while the predecessor is still serving. Nothing has changed
-    // yet, so a failure here defers cleanly. No-op when the provider defines no pre-drain
-    // phase.
+    // Pre-drain: the last barrier while the predecessor is still serving. Nothing has changed yet,
+    // so a failure at or before it defers cleanly — which is what the barrier records.
     advance_transaction(store, &mut tx, TransactionPhase::PreDrainStarted)?;
     chaos.crossing(boundary::PRE_DRAIN_APPLIED);
 
@@ -683,16 +780,12 @@ async fn switch_over<T: DeploymentProvider>(
     // Built-in drain hold: having withdrawn readiness, wait for the load balancer to actually
     // remove this node before we stop the running release — otherwise an in-flight request lands
     // on a stopping process (the downtime a bare readiness flip leaves when endpoint removal lags
-    // the switchover). Bounded is a ceiling; a `provider-managed` deployment and an unset hold wait
-    // nothing here (the provider-managed Drain hook owns it, or the operator opted out).
-    match tower.drain_hold() {
-        DrainHold::None => {}
-        DrainHold::Bounded(hold) => tokio::time::sleep(hold).await,
-    }
+    // the switchover). Bounded is a ceiling; an unset hold (or an explicit zero) waits nothing,
+    // in either runtime mode.
+    tower.drain_hold().wait().await;
 
-    // Post-drain: custom logic *after* we are unready but *before* switchover — e.g. wait
-    // for the orchestrator to observe the failed probe and stop routing, or for in-flight
-    // connections to finish. Must run to completion before the predecessor is stopped.
+    // Drained: the barrier that separates "readiness withdrawn, hold observed" from the switchover
+    // itself, so a crash here is attributed to the drained window rather than to the stop.
     chaos.crossing(boundary::DRAIN_APPLIED);
     recover_on_error!(
         "recording the drained checkpoint",
@@ -775,8 +868,19 @@ async fn switch_over<T: DeploymentProvider>(
         "recording the health checkpoint",
         advance_transaction(store, &mut tx, TransactionPhase::HealthStarted)
     );
-    if !became_healthy(tower, &tx.id, &candidate, &tx.previous_release).await {
-        return reject_then_recover(store, &mut tx);
+    match became_healthy(tower, &tx.id, &candidate, &tx.previous_release).await {
+        Health::Ready => {}
+        Health::Unhealthy => return reject_then_recover(store, &mut tx),
+        // The gate never reached the reconciler, so it observed nothing about the candidate.
+        // Restart for boot recovery *without* recording a rejection — the same fail-safe class as
+        // the pointer-write and guardian-channel cases above — so the healthy release is retried
+        // once the node's own fault clears, rather than excluded from this node forever.
+        Health::Inconclusive(e) => {
+            warn(&format!(
+                "the readiness gate could not reach the node reconciler ({e}); restarting for boot recovery"
+            ));
+            return Outcome::RollbackPending;
+        }
     }
     chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
     recover_on_error!(
@@ -936,18 +1040,11 @@ pub(crate) fn run_lifecycle_command(
     opts: &Options,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<()> {
-    run_lifecycle_command_output(lifecycle, opts, invocation).map(|_| ())
-}
-
-fn run_lifecycle_command_output(
-    lifecycle: &updated::state::ProviderRelease,
-    opts: &Options,
-    invocation: LifecycleInvocation<'_>,
-) -> io::Result<ReconcilerOutput> {
     run_prepared_lifecycle_command(
         prepare_lifecycle_command(lifecycle, opts, invocation)?,
         None,
     )
+    .map(|_| ())
 }
 
 struct PreparedLifecycleCommand {
@@ -1535,6 +1632,12 @@ mod tests {
         invocations: Vec<(&'static str, String)>,
         fail_rollback: bool,
         fail_first_healthcheck: bool,
+        /// Fail EVERY healthcheck with this kind — a node-local fault in front of the reconciler
+        /// (`StorageFull`, `InvalidData`) as opposed to the reconciler's own answer (`Other`).
+        healthcheck_failure: Option<io::ErrorKind>,
+        /// The 1-based probe at which `healthcheck_failure` starts (0 and 1 both mean the first),
+        /// so a fault can be made to arrive PART WAY THROUGH a grace period.
+        healthcheck_failure_from: usize,
         healthcheck_calls: usize,
         fail_first_activation: bool,
         fail_process_stop: bool,
@@ -1560,6 +1663,11 @@ mod tests {
                 .push((phase.as_str(), lifecycle_attempt_id.to_string()));
             if matches!(phase, Operation::Healthcheck) {
                 self.healthcheck_calls += 1;
+                if let Some(kind) = self.healthcheck_failure {
+                    if self.healthcheck_calls >= self.healthcheck_failure_from.max(1) {
+                        return Err(io::Error::new(kind, "injected healthcheck failure"));
+                    }
+                }
             }
             if (matches!(phase, Operation::Rollback) && self.fail_rollback)
                 || (matches!(phase, Operation::Healthcheck)
@@ -1606,7 +1714,10 @@ mod tests {
         let release = release("22.0.0", "current");
         let mut tower = FakeTower::default();
 
-        assert!(became_healthy(&mut tower, attempt::BOOT, &release, &release).await);
+        assert!(matches!(
+            became_healthy(&mut tower, attempt::BOOT, &release, &release).await,
+            Health::Ready
+        ));
         assert_eq!(tower.invocations, [("healthcheck", "boot".to_string())]);
         assert_eq!(tower.healthcheck_calls, 1);
     }
@@ -1704,6 +1815,96 @@ mod tests {
         assert!(matches!(outcome, Outcome::Committed));
         assert_eq!(provider.healthcheck_calls, 2);
         assert!(store.rejected.is_empty());
+    }
+
+    /// A probe that fails before the reconciler runs — a corrupt provider tree, ENOSPC writing the
+    /// invocation's inputs — observed nothing about the candidate, so the gate is INCONCLUSIVE. A
+    /// reconciler that ran and answered badly is unhealthy. The two must not collapse together:
+    /// only the second is evidence about the release.
+    #[tokio::test]
+    async fn a_gate_that_never_reaches_the_reconciler_is_inconclusive_not_unhealthy() {
+        let candidate = release("2.0.0", "two");
+
+        let mut unreachable = FakeTower {
+            healthcheck_failure: Some(io::ErrorKind::StorageFull),
+            ..Default::default()
+        };
+        assert!(matches!(
+            became_healthy(&mut unreachable, attempt::BOOT, &candidate, &candidate).await,
+            Health::Inconclusive(_)
+        ));
+
+        let mut answered = FakeTower {
+            healthcheck_failure: Some(io::ErrorKind::Other),
+            ..Default::default()
+        };
+        assert!(matches!(
+            became_healthy(&mut answered, attempt::BOOT, &candidate, &candidate).await,
+            Health::Unhealthy
+        ));
+    }
+
+    /// The verdict follows the LAST probe, not "did the reconciler ever answer". After a
+    /// switch-over the first probe almost always answers "not ready" (the application is still
+    /// starting), so a latch on that first answer would make every later node-local fault look like
+    /// an unhealthy candidate. A disk that fills part way through the grace must still be
+    /// inconclusive.
+    #[tokio::test]
+    async fn a_fault_arriving_after_the_first_answer_is_still_inconclusive() {
+        let candidate = release("2.0.0", "two");
+        let mut provider = FakeTower {
+            // Probe 1 reaches the reconciler and it answers "not ready"; from probe 2 on, the state
+            // volume is full and no probe reaches it again.
+            fail_first_healthcheck: true,
+            healthcheck_failure: Some(io::ErrorKind::StorageFull),
+            healthcheck_failure_from: 2,
+            ..Default::default()
+        };
+
+        assert!(
+            matches!(
+                became_healthy(&mut provider, attempt::BOOT, &candidate, &candidate).await,
+                Health::Inconclusive(_)
+            ),
+            "one early answer must not latch the gate into judging the release"
+        );
+        assert!(provider.healthcheck_calls > 1, "the grace kept probing");
+    }
+
+    /// The harshest consequence in the system — a durable, never-expiring rejection — must never be
+    /// spent on a node-local fault. A gate that could not reach the reconciler restarts for boot
+    /// recovery with the candidate's bytes still installable, so the node converges forward again
+    /// once its disk is repaired instead of being stranded a release behind the fleet.
+    #[tokio::test]
+    async fn a_gate_that_never_reaches_the_reconciler_rolls_back_without_rejecting() {
+        let previous = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = MemoryStore::new(previous);
+        let mut provider = FakeTower {
+            healthcheck_failure: Some(io::ErrorKind::StorageFull),
+            ..Default::default()
+        };
+
+        let outcome = apply_update(
+            &mut provider,
+            &mut store,
+            &candidate,
+            "archive-two",
+            test_lineage(),
+            reconciler_release(),
+        )
+        .await
+        .expect("an unreachable reconciler restarts for recovery rather than failing fatally");
+
+        assert!(matches!(outcome, Outcome::RollbackPending));
+        assert!(
+            store.rejected.is_empty(),
+            "a node-local fault is not evidence about the candidate's bytes"
+        );
+        assert!(
+            store.journal.is_some(),
+            "boot recovery needs the rollback intent"
+        );
     }
 
     #[tokio::test]

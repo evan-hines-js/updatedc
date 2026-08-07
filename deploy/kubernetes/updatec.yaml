@@ -45,6 +45,27 @@ roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: updatec}
 subjects:
   - {kind: ServiceAccount, name: updatec, namespace: updated-system}
 ---
+# Cluster-wide LIST on updaterepositories, and nothing else. Before pruning a deleted repository's
+# S3 prefix the finalizer looks for another UpdateRepository whose prefix overlaps it in the same
+# bucket, because an object-store list is prefix-scoped: deleting `fleet` would sweep a live
+# `fleet/staging`. A bucket is not scoped to a namespace, so that search cannot be either — scoped
+# to one namespace it missed exactly the cross-tenant nesting it exists to catch. Read-only, one
+# resource, one verb; every mutation stays in the namespaced Role above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: updatec-repository-reader}
+rules:
+  - apiGroups: ["updated.dev"]
+    resources: ["updaterepositories"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: updatec-repository-reader}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: updatec-repository-reader}
+subjects:
+  - {kind: ServiceAccount, name: updatec, namespace: updated-system}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: updatec-controller, namespace: updated-system}

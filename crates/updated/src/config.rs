@@ -11,7 +11,6 @@ use updated_contracts::assignment::{ManagedRuntime, RuntimeMode, SecretReference
 pub struct Config {
     pub deployment: String,
     pub routing: Routing,
-    pub repository: Repository,
     pub application: Application,
     pub storage: Storage,
     pub timeouts: Timeouts,
@@ -26,7 +25,6 @@ pub struct Routing {
     pub base_url: String,
     /// Exact TUF target to resolve (for example `assignments/agents/agent-123.json`).
     pub assignment: String,
-    pub metadata_limit: u64,
     pub transport_timeout: Duration,
     /// The agent's mTLS identity for reaching the gateway — mandatory, never plaintext. The
     /// routing and release repositories are the same externally-exposed gateway, so both fetch
@@ -36,21 +34,18 @@ pub struct Routing {
 
 impl Routing {
     /// Whether this routing repository is local (a `file:` URL or an absolute directory path)
-    /// rather than a network gateway. The single definition of "local" — the offline-repair path
-    /// and the secrets manager both gate on it, and must agree: one deciding to reach the network
-    /// while the other assumes offline would split the trust model.
+    /// rather than a network gateway. See [`base_url_is_local`].
     pub fn is_local(&self) -> bool {
-        self.base_url.starts_with("file:") || Path::new(&self.base_url).is_absolute()
+        base_url_is_local(&self.base_url)
     }
 }
 
-/// Locally pinned trust and resource limits for the repository selected by the
-/// routing assignment. Its URLs deliberately do not live in local config.
-#[derive(Debug, Clone)]
-pub struct Repository {
-    pub metadata_limit: u64,
-    pub target_limit: u64,
-    pub transport_timeout: Duration,
+/// Whether a routing `base_url` names a local repository (a `file:` URL or an absolute directory
+/// path) rather than a network gateway. The single definition of "local" — the offline-repair path,
+/// the secrets manager, and enrollment all gate on it, and must agree: one deciding to reach the
+/// network while another assumes offline would split the trust model.
+pub fn base_url_is_local(base_url: &str) -> bool {
+    base_url.starts_with("file:") || Path::new(base_url).is_absolute()
 }
 
 /// Fully resolved repository input. Values of this type are constructed only
@@ -117,8 +112,7 @@ impl MaterializeRuntime for ManagedRuntime {
             supervisor_check_interval: Duration::from_secs(
                 self.timeouts.supervisor_check_interval_seconds,
             ),
-            // `None` (indefinite) is preserved; a finite value (including 0 = no hold) becomes
-            // a bounded ceiling.
+            // Carried through as-is; see [`Timeouts::drain_hold`] for what each value means.
             drain_hold: self.timeouts.drain_hold_seconds.map(Duration::from_secs),
         }
     }
@@ -132,11 +126,6 @@ impl MaterializeRuntime for ManagedRuntime {
         Ok(Config {
             deployment: deployment.to_owned(),
             routing,
-            repository: Repository {
-                metadata_limit: self.repository.metadata_limit,
-                target_limit: self.repository.target_limit,
-                transport_timeout: Duration::from_secs(self.repository.transport_timeout_seconds),
-            },
             application: self.application(),
             storage: self.storage(),
             timeouts: self.timeouts(),

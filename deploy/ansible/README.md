@@ -72,13 +72,15 @@ ansible-playbook -i inventory.ini install-agent.yml \
 | `updatedc_source` | yes | Path to the `updatedc` workspace on the control node; rsync'd to the target and built there (native binaries, no cross-compile). The former `updated_source` name remains a compatibility alias. |
 | `updated_enrollment_url` | — | Control-plane enrollment endpoint, HTTPS (default `https://updatec-gateway`). |
 | `updated_enrollment_client_cert` / `_client_key` / `_ca` | yes | base64 PEM of the fleet client certificate, its key, and the fleet CA — the mTLS identity (cert-manager issues these; there is no shared secret). |
-| `updated_hostname` | — | Stable identity the control plane addresses the node by (default: inventory name). |
+| `updated_hostname` | — | Stable identity the control plane addresses the node by (default: inventory name). Written verbatim as `name` in `/etc/updated/bootstrap.toml`; the gateway mints it as the node's certificate CN and creates the `UpdateAgent` object under exactly this string. |
 | `updated_demo_shim_host` / `updated_demo_shim_port` | — | **Demo only.** When set, the role points the in-cluster gateway names at a local `socat` forward to `host:port` — used by `updatec-demo` to reach the kind gateway exposed on the laptop's LAN. Omit in production. |
 
 ## What it installs
 
 - `/usr/local/bin/{bootstrap,supervisor}` — built from source on the target.
-- `/etc/updated/bootstrap.toml` — the two-line enrollment bootstrap.
+- `/etc/updated/bootstrap.toml` — the enrollment bootstrap: `url`, `name`, `client_cert`,
+  `client_key`, `ca`. No secret; the certificate material is written alongside it under
+  `/etc/updated/agent-tls/`.
 - `updated-agent.service` — the guardian, restarted on failure; its readiness/liveness probe
   is served on `:9090` (`/readyz`, `/livez`, `/startupz`), the same surface Kubernetes probes.
 - `updated-gateway-shim.service` — demo only (the socat forward).

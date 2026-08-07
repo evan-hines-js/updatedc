@@ -24,7 +24,8 @@ type Error = Box<dyn std::error::Error>;
 const PROVIDER_TIMEOUT_MS: u64 = 15_000;
 
 /// Wall time an update `apply` spends outside its two dwells: one second each in `preflight`,
-/// `prepare`, `drain` and `start`, plus the two-second bound on `verify`'s probe.
+/// `prepare`, `drain` and `start`, plus two seconds for the filesystem work of the remaining
+/// steps.
 const APPLY_FIXED_WORK_MS: u64 = 6_000;
 
 /// Headroom the dwell band leaves the timeout for everything wall time this fixture does not
@@ -33,6 +34,10 @@ const APPLY_MARGIN_MS: u64 = 3_000;
 
 /// Shortest representative pause for a dwelling phase.
 const DWELL_FLOOR_MS: u64 = 1_000;
+
+/// The live files an update replaces, and therefore exactly what `prepare` copies aside and
+/// `rollback` restores.
+const ROLLBACK_SET: [&str; 3] = ["application.war", "content.repository", "server.xml"];
 
 /// Longest one dwell may be: an `apply` performs two of them, and what is left of the provider
 /// timeout after the fixed work and the margin has to cover both.
@@ -152,16 +157,32 @@ impl Deployment {
             "server.xml",
             r#"<Server port="8005"><Service name="Catalina"/></Server>"#,
         )?;
-        fs::create_dir_all(&self.backup)?;
-        for name in ["application.war", "content.repository", "server.xml"] {
-            self.copy(&self.live.join(name), &self.backup.join(name))?;
-        }
+        self.capture_rollback_backup()?;
         self.write(
             self.effects.join("generated-install.properties"),
             format!("candidate={} attempt={}\n", self.candidate, self.attempt).as_bytes(),
         )?;
         thread::sleep(Duration::from_secs(1));
         Ok(())
+    }
+
+    /// Copy the predecessor's live state aside, exactly once per attempt.
+    ///
+    /// `apply` is replayed under the same attempt id — after a crash mid-apply, and by the
+    /// supervisor's recovery activation, which re-invokes the hook with candidate and predecessor
+    /// swapped. By then `activate` may already have written the candidate into `live`, so a second
+    /// copy would overwrite the predecessor bytes that this attempt's `rollback` restores. The
+    /// marker is written last, so a copy interrupted halfway is retaken rather than trusted.
+    fn capture_rollback_backup(&self) -> Result<(), Error> {
+        let marker = self.backup.join("captured");
+        if marker.is_file() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.backup)?;
+        for name in ROLLBACK_SET {
+            self.copy(&self.live.join(name), &self.backup.join(name))?;
+        }
+        self.write(marker, b"captured\n")
     }
 
     fn pre_drain(&self) -> Result<(), Error> {
@@ -272,18 +293,25 @@ impl Deployment {
         Ok(())
     }
 
+    /// Prove the activation from durable live state.
+    ///
+    /// The supervisor stops the managed process before it invokes this hook and only relaunches it
+    /// after the hook returns, so an in-transaction probe of the application would always find
+    /// nothing listening. The running application is evidence `periodic` collects, once there is a
+    /// process to collect it from.
     fn verify(&self) -> Result<(), Error> {
         self.require("start")?;
-        self.verify_running_version()?;
+        expect(&self.live.join("application.war"), &self.candidate)?;
+        expect(
+            &self.live.join("install.properties"),
+            &format!("candidate={} attempt={}", self.candidate, self.attempt),
+        )?;
         required_file(&self.live.join("migration.plan"))
     }
 
-    /// Observe the steady deployment without consulting transaction-local markers.
-    ///
-    /// `verify` runs inside the activation transaction and therefore proves that `start`
-    /// completed in that same attempt. `periodic` runs after the transaction has finished
-    /// (and after supervisor or pod restarts), so its evidence must come exclusively from
-    /// durable live state and the running application.
+    /// Observe the running application, which only exists outside the activation transaction:
+    /// `periodic` runs after the supervisor has relaunched the process (and after supervisor or
+    /// pod restarts), so its evidence comes from durable live state and the live socket.
     fn verify_running_version(&self) -> Result<(), Error> {
         let observed = ureq::get("http://127.0.0.1:8080/version")
             .timeout(Duration::from_secs(2))
@@ -346,7 +374,7 @@ impl Deployment {
     }
 
     fn rollback(&self) -> Result<(), Error> {
-        for name in ["application.war", "content.repository", "server.xml"] {
+        for name in ROLLBACK_SET {
             let source = self.backup.join(name);
             if source.is_file() {
                 self.copy(&source, &self.live.join(name))?;
@@ -580,6 +608,64 @@ mod tests {
         )
         .unwrap();
         required_file(&deployment.live.join("change-ticket.receipt")).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn in_transaction_verification_does_not_probe_the_stopped_application() {
+        // The supervisor stops the managed process before it invokes the activation hook and only
+        // relaunches it afterwards, so nothing is listening while `verify` runs. Verification must
+        // come from durable live state, or every update fails and rolls back.
+        let root = std::env::temp_dir().join(format!(
+            "updated-demo-lifecycle-verify-{}",
+            std::process::id()
+        ));
+        let deployment = deployment(root.clone(), Operation::Apply, "T");
+        fs::create_dir_all(&deployment.effects).unwrap();
+        fs::create_dir_all(&deployment.live).unwrap();
+        fs::write(deployment.effects.join("start.done"), b"done\n").unwrap();
+        fs::write(deployment.live.join("application.war"), b"22.0.0\n").unwrap();
+        fs::write(
+            deployment.live.join("install.properties"),
+            b"candidate=22.0.0 attempt=T\n",
+        )
+        .unwrap();
+        fs::write(
+            deployment.live.join("migration.plan"),
+            b"pending schema=2 version=22.0.0\n",
+        )
+        .unwrap();
+
+        deployment.verify().unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_replayed_apply_keeps_the_attempts_original_rollback_backup() {
+        // A crash after `activate` but before `apply.done` — or the supervisor's recovery
+        // activation, which re-invokes `apply` under the same attempt id — replays `prepare` with
+        // the candidate already in `live`. Re-copying then would leave `rollback` restoring the
+        // candidate's bytes as if they were the predecessor's.
+        let root = std::env::temp_dir().join(format!(
+            "updated-demo-lifecycle-backup-{}",
+            std::process::id()
+        ));
+        let deployment = deployment(root.clone(), Operation::Apply, "T");
+        fs::create_dir_all(&deployment.effects).unwrap();
+        fs::create_dir_all(&deployment.live).unwrap();
+        fs::write(deployment.effects.join("preflight.done"), b"done\n").unwrap();
+
+        deployment.prepare().unwrap();
+        expect(&deployment.backup.join("application.war"), "1.0.0").unwrap();
+
+        fs::write(deployment.live.join("application.war"), b"22.0.0\n").unwrap();
+        deployment.prepare().unwrap();
+        expect(&deployment.backup.join("application.war"), "1.0.0").unwrap();
+
+        deployment.rollback().unwrap();
+        expect(&deployment.live.join("application.war"), "1.0.0").unwrap();
 
         fs::remove_dir_all(root).unwrap();
     }

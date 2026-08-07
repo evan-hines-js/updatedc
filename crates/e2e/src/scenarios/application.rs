@@ -219,11 +219,11 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
 /// reexec (proven separately by the HAProxy master-worker test), a stop-start drops the
 /// listening socket — so zero-downtime here depends entirely on the drain: the built-in drain
 /// flips this node's
-/// readiness probe to unready *before* the old process is stopped, the guardian keeps it
-/// unready until the new release is healthy, and a tiny post-drain provider holds long
-/// enough for a readiness-aware load balancer to observe it. We prove that by putting a
-/// stand-in load balancer in front: 15 clients that only send to a Ready node must lose
-/// zero requests across the whole restart.
+/// readiness probe to unready *before* the old process is stopped, then holds for the
+/// configured drain hold — long enough for a readiness-aware load balancer to observe the
+/// withdrawal and stop routing — and the guardian keeps it unready until the new release is
+/// healthy. We prove that by putting a stand-in load balancer in front: 15 clients that only
+/// send to a Ready node must lose zero requests across the whole restart.
 pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -238,8 +238,6 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
 
-    // The whole post-drain provider: hold on the post-drain phase so the load balancer
-    // observes readyz failing before the old release is stopped.
     let fixture = dir.join("drain-grace-fixture");
     let lifecycle = vec![
         std::env::current_exe()
@@ -253,6 +251,12 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .check_interval("1s")
         .health_grace("2s")
+        // The window the stand-in load balancer gets to observe the withdrawal. A worker is only
+        // ever microseconds past its readyz check when it sends, so one second is orders of
+        // magnitude more than the in-flight gap, while costing the upgrade a single second — the
+        // scenario still fails outright if the ordering were stop-then-withdraw, because then no
+        // hold length excuses a request sent to a node that was still advertising Ready.
+        .drain_hold("1s")
         .guardian_probes(probes)
         .lifecycle(lifecycle)
         .guardian()?;
@@ -304,9 +308,11 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
                         .ok()
                         .and_then(|response| response.into_string().ok())
                         .is_some_and(|body| body == "1.0.0" || body == "2.0.0");
-                    // A failure only counts as a drop if the node still advertised Ready —
-                    // otherwise it drained mid-request and a real LB had already stopped it.
-                    if !ok && ready(&agent) {
+                    // The PRE-request readiness gate above is the whole condition: a real LB
+                    // had already routed this request. Rechecking readiness after the failure
+                    // would race the withdrawal and excuse exactly the stop-before-withdraw
+                    // ordering bug this scenario exists to catch.
+                    if !ok {
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }

@@ -77,16 +77,6 @@
     daemon_reload: true
 
 # ── Agent service ─────────────────────────────────────────────────────────────
-- name: Pin the enrollment identity from the hostname
-  # The guardian's enrollment nonce is sha256(hostname); pinning it lets the control plane
-  # address this node deterministically (mirrors the container entrypoint).
-  ansible.builtin.shell: |
-    mkdir -p /var/lib/updated/guardian
-    printf %s "{{ updated_hostname }}" | sha256sum | cut -d' ' -f1 \
-      > /var/lib/updated/guardian/registration-nonce
-  args:
-    creates: /var/lib/updated/guardian/registration-nonce
-
 - name: Ensure the agent mTLS directory exists
   ansible.builtin.file:
     path: /etc/updated/agent-tls

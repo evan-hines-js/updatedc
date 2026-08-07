@@ -22,8 +22,18 @@ use std::sync::Arc;
 use updated_healthproxy::endpointslice::EndpointSliceLb;
 use updated_healthproxy::{run, Config, LoadBalancer};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The DNS resolve pass sizes its fan-out from the blocking pool, because `getaddrinfo` holds
+    // one of those threads per lookup; pin the pool to the value that derivation is written
+    // against instead of inheriting whatever tokio defaults to.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(updated_healthproxy::BLOCKING_POOL_THREADS)
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Health documents may live on an HTTPS CDN; install the one crypto provider the rest of
     // the system uses. Idempotent, so a double install is not fatal.
     updated::tls::install_crypto_provider();
@@ -67,9 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.health_base
         );
     }
-    let http = reqwest::Client::builder()
-        .timeout(config.health_timeout)
-        .build()?;
+    // The per-fetch budget is owned by the poll plan (`tokio::time::timeout` around each fetch),
+    // which is what the fan-out arithmetic reasons about; the client does not bound it a second
+    // time at the same value.
+    let http = reqwest::Client::builder().build()?;
 
     run(http, config, load_balancer).await;
     Ok(())

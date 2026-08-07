@@ -43,8 +43,6 @@ impl EnrollmentRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollResponse {
     pub leaf: String,
-    #[serde(default)]
-    pub chain: String,
     pub bundle: EnrollmentBundle,
 }
 
@@ -58,8 +56,6 @@ pub struct RenewalRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RenewalResponse {
     pub leaf: String,
-    #[serde(default)]
-    pub chain: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

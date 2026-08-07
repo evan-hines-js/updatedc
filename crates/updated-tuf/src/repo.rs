@@ -301,7 +301,14 @@ fn sync_published_dirs(root: &Path, leaf: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Generate the four ed25519 role keys under `keys_dir` if they are not present.
+/// Generate the five ed25519 role keys under `keys_dir`.
+///
+/// Every key is created exclusively at mode 0600, so a file already standing at one of the
+/// names is a hard error rather than an adoption. Minting a role key set is minting a *fresh*
+/// one: a pre-existing file is of unknown provenance — a leftover from a retired root, or a
+/// key planted by another local principal — and signing it into a new trust root would pin it
+/// for the whole fleet while reporting success. Callers that want to keep existing keys must
+/// say so by not calling this.
 pub async fn generate_keys(keys_dir: &Path) -> Result<Keys> {
     tokio::fs::create_dir_all(keys_dir)
         .await
@@ -315,14 +322,9 @@ pub async fn generate_keys(keys_dir: &Path) -> Result<Keys> {
         "snapshot.pk8",
         "timestamp.pk8",
     ] {
-        let path = keys_dir.join(name);
-        if path.exists() {
-            validate_key_file(&path)?;
-            continue;
-        }
         let pkcs8 =
             Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| err("generating ed25519 key", e))?;
-        create_key_file(&path, pkcs8.as_ref())?;
+        create_key_file(&keys_dir.join(name), pkcs8.as_ref())?;
     }
     Ok(Keys::in_dir(keys_dir))
 }
@@ -343,16 +345,13 @@ pub async fn generate_root_key(path: &Path) -> Result<()> {
     create_key_file(path, pkcs8.as_ref())
 }
 
+/// Mint the key file itself: created exclusively (an existing key is never replaced) and
+/// owner-only on every platform, because the permissions are supplied at creation by
+/// [`foundation::durable::create_private_new`] — the same descriptor every other secret this
+/// repository writes gets, rather than a second `OpenOptions` call site that would have to keep
+/// the Windows DACL in step by hand.
 fn create_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
+    let mut file = foundation::durable::create_private_new(path)
         .map_err(|e| err("exclusively creating signing key", e))?;
     if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
         drop(file);
@@ -381,16 +380,17 @@ fn validate_key_file(path: &Path) -> Result<()> {
             )));
         }
     }
-    // No portable file-mode enforcement exists off Unix, so the 0600 guarantee cannot be
-    // upheld there. The control plane runs on Linux; this path is only reached in non-Unix
-    // dev/test. Warn loudly and proceed rather than silently skipping the check.
+    // Off Unix there is no mode to read back. A key this process minted is still owner-only —
+    // [`create_key_file`] hands the protected descriptor to the file at creation — but a key that
+    // was already on disk was created by something else, and its ACL is not inspected here. Say so
+    // rather than let a reused key look as checked as a freshly minted one.
     #[cfg(not(unix))]
     {
         foundation::log::warn(
             "updated-tuf",
             &format!(
-                "cannot enforce 0600 permissions on signing key {} on this platform; \
-                 proceeding without file-mode protection",
+                "cannot verify the permissions of the existing signing key {} on this platform; \
+                 keys minted here are owner-only at creation, one created elsewhere may not be",
                 path.display()
             ),
         );
@@ -602,12 +602,15 @@ pub async fn rotate_root(
     keys.insert(new_keyid.clone(), new_key);
     root_keyids.push(new_keyid);
     sources.push(local(new_root_key));
+    // The root role's threshold is repository state, not a constant: a root minted for
+    // multi-party signing must not be silently downgraded to a single signature by a rotation,
+    // which every node would accept because the new root is validly co-signed under the old one.
     roles.insert(
         RoleType::Root,
         RoleKeys {
             keyids: root_keyids,
-            threshold: nz(1),
-            _extra: HashMap::new(),
+            threshold: old_root_role.threshold,
+            _extra: old_root_role._extra.clone(),
         },
     );
 
@@ -960,6 +963,45 @@ pub async fn target_sha256(repo_dir: &Path, name: &str) -> Result<String> {
         .get(&name)
         .ok_or_else(|| RepoError(format!("target {:?} is absent from metadata", name.raw())))?;
     Ok(hex::encode(&target.hashes.sha256))
+}
+
+/// Resolve a provider set's reconciler artifact against the signed metadata a publisher already
+/// holds, before the set itself is signed.
+///
+/// `ProviderSet::validate` is syntactic: a stale copy-paste that pairs one artifact's path with a
+/// previous build's digest passes every check it makes and is signed into an immutable target. It
+/// then fails once, much later and fleet-wide, when `stage_providers` calls `exact_target` on a
+/// node — a cold install walks ordered fallback down past the version, and an update returns
+/// `Unchanged`, so the group stalls with nothing to correct in place. The repository in hand is
+/// the same signed targets metadata every agent verifies against, so resolving it here turns that
+/// into a publish-time refusal with nothing signed.
+///
+/// One definition for every publisher (`updatectl publish-provider-set` over S3, the dev server's
+/// local repository): a front end that skipped the check would sign exactly the immutable target
+/// the other one refuses.
+pub async fn verify_provider_set_reconciler(
+    repo_dir: &Path,
+    set: &updated_contracts::artifact::ProviderSet,
+) -> Result<()> {
+    let reference = &set.reconciler.artifact;
+    let signed = target_sha256(repo_dir, &reference.path)
+        .await
+        .map_err(|error| {
+            RepoError(format!(
+                "--provider-path {:?} does not resolve in this repository's signed metadata: \
+                 {error}. Publish the reconciler with `publish-provider-artifact` against this \
+                 same repository first, and pass the path and digest it prints. Nothing was signed.",
+                reference.path
+            ))
+        })?;
+    if signed != reference.sha256 {
+        return Err(RepoError(format!(
+            "--provider-sha256 {} does not match the signed digest of --provider-path {:?}, which \
+             is {signed}: the two flags name different reconciler builds. Nothing was signed.",
+            reference.sha256, reference.path
+        )));
+    }
+    Ok(())
 }
 
 /// The current generation number of the published repository: the TUF `timestamp` version, bumped

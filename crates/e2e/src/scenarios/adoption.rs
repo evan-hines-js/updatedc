@@ -107,7 +107,8 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
     let app_pid = pid_number_after(&boot.captured_log(), "started managed application pid")
         .ok_or("supervisor did not record the guardian-reported application PID")?;
     let guardian_pid = boot.pid();
-    let sup_pid = pid_after(&boot.captured_log(), "launched supervisor");
+    let sup_pid = pid_after(&boot.captured_log(), "launched supervisor")
+        .ok_or("guardian did not record the supervisor PID it launched")?;
     if !pid_alive(app_pid) {
         return fail("the application was not running before the stop");
     }
@@ -121,15 +122,13 @@ pub(crate) fn clean_stop_reaps_the_whole_tower(ctx: &Ctx) -> R {
     // reaper. Assert the whole tree is gone before dropping `boot` (whose own teardown would
     // otherwise mask a leak).
     let app_gone = wait_until(EVENT_TIMEOUT, || !pid_alive(app_pid));
-    let sup_gone = sup_pid.is_none_or(|s| wait_until(EVENT_TIMEOUT, || !pid_alive(s)));
+    let sup_gone = wait_until(EVENT_TIMEOUT, || !pid_alive(sup_pid));
     let guardian_exited = wait_until(EVENT_TIMEOUT, || boot.has_exited());
 
     if !app_gone || !sup_gone || !guardian_exited {
         // Reap any leak so a failure here does not poison later scenarios.
         kill_stray(&app);
-        if let Some(s) = sup_pid {
-            kill_pid(s);
-        }
+        kill_pid(sup_pid);
         return fail(format!(
             "a clean stop leaked processes (app_gone={app_gone}, sup_gone={sup_gone}, \
              guardian_exited={guardian_exited}) — the guardian did not forward the stop down"

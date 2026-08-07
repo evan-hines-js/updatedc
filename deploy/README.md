@@ -79,7 +79,7 @@ that activation.
 | Path | Contents |
 | --- | --- |
 | `/usr/lib/updated/bootstrap` (Linux), `/etc/updated/bootstrap` (macOS) | Installer-owned `bootstrap` — the root we ship; never self-updates, read-only |
-| `/etc/updated/bootstrap.toml` (Windows: `C:\Program Files\updated\bootstrap.toml`) | Read-only enrollment URL and shared key. The **canonical** config location — `control::DEFAULT_BOOTSTRAP_CONFIG`, which the bootstrap reads with no argument. Not a per-deployment choice: a co-resident process that must learn which fleet node it runs on looks exactly here. |
+| `/etc/updated/bootstrap.toml` (Windows: `C:\Program Files\updated\bootstrap.toml`) | Read-only enrollment bootstrap: the HTTPS enrollment URL, this node's self-asserted name, and the paths to the fleet client certificate, its key, and the fleet CA. Enrollment is mutual TLS, so this file holds no secret. The **canonical** config location — `control::DEFAULT_BOOTSTRAP_CONFIG`, which the bootstrap reads with no argument. Not a per-deployment choice: a co-resident process that must learn which fleet node it runs on looks exactly here. |
 | `/var/lib/updated/` (Linux), `/usr/local/var/updated/` (macOS) | Writable guardian state, the consumed signed enrollment bundle, supervisor candidates, application state, and TUF caches |
 
 Because supervisor candidates and immutable application bundles are updated, they live

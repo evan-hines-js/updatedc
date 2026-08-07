@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -410,6 +410,7 @@ async fn ensure_repository_finalizer(
 /// deletion. Idempotent and resumable: the finalizer holds the object in `Terminating`, so a crash
 /// mid-prune simply re-runs next reconcile, and re-pruning an already-empty prefix is a no-op.
 async fn finalize_repository(
+    client: &Client,
     repositories: &Api<UpdateRepository>,
     secrets: &Api<Secret>,
     repository: &UpdateRepository,
@@ -433,6 +434,22 @@ async fn finalize_repository(
              safely prune (it would list and delete the entire bucket); releasing the finalizer \
              and leaving its published artifacts in place — remove them by hand",
         );
+    } else if let Some(sibling) = overlapping_sibling(client, repository).await? {
+        // The same rule one level of nesting deeper: a prefix that is an ancestor of (or equal to)
+        // another repository's is not a scope either, because an object-store list is prefix-scoped
+        // and would sweep that repository's signed metadata and every published assignment. The
+        // sibling OBJECT existing is enough — whether or not it is itself deleting — because
+        // leaving objects behind is recoverable and deleting another repository's is not, so two
+        // nested repositories deleted together each block the other and both prefixes survive.
+        tracing::warn!(
+            repository = %repository.name_any(),
+            prefix = %repository.spec.s3.prefix,
+            sibling = %sibling.0,
+            sibling_prefix = %sibling.1,
+            "deleted repository's s3 prefix overlaps another repository's in the same bucket, so \
+             pruning it would delete that repository's published artifacts; releasing the \
+             finalizer and leaving this repository's artifacts in place — remove them by hand",
+        );
     } else {
         let store = build_store(secrets, &repository.spec.s3).await?;
         let pruned = prune_prefix(store.as_ref(), &repository.spec.s3.prefix).await?;
@@ -453,6 +470,126 @@ async fn finalize_repository(
         )
         .await?;
     Ok(())
+}
+
+/// The `namespace/name` and prefix of a sibling `UpdateRepository` whose published key space
+/// overlaps `repository`'s, if there is one.
+///
+/// An object-store list is prefix-scoped, so a prune deletes everything BELOW the prefix as well.
+/// Nesting one repository's prefix inside another's in the same bucket (`fleet` and `fleet/staging`)
+/// is a natural way to divide tenants and nothing refuses it, so deleting the outer one would sweep
+/// the inner one's signed metadata and every published assignment while it is still live and Ready.
+/// Two repositories are in the same key space when they name the same bucket and their endpoints are
+/// not DEFINITIVELY different (see [`endpoints_definitely_differ`]) — the bucket is what scopes the
+/// keys, and an endpoint written two ways is one store.
+///
+/// The rule is purely about STORAGE, so the search is across ALL NAMESPACES: a bucket is not scoped
+/// to a namespace, and tenants divided by namespace are exactly the ones that share one. Searching
+/// only the deleted repository's own namespace made every cross-namespace nesting invisible —
+/// deleting `fleet` in `tenant-a` still pruned `tenant-b`'s live `fleet/staging`, the precise loss
+/// this guard exists to prevent. Only the repository being finalized is excluded, matched on
+/// namespace AND name, since a same-named repository elsewhere is a different object.
+async fn overlapping_sibling(
+    client: &Client,
+    repository: &UpdateRepository,
+) -> Result<Option<(String, String)>, kube::Error> {
+    let repositories: Api<UpdateRepository> = Api::all(client.clone());
+    Ok(first_overlapping_sibling(
+        &repositories.list(&ListParams::default()).await?.items,
+        repository,
+    ))
+}
+
+/// The listing half of [`overlapping_sibling`], split out so the identity and key-space rules are
+/// testable without a cluster.
+fn first_overlapping_sibling(
+    others: &[UpdateRepository],
+    repository: &UpdateRepository,
+) -> Option<(String, String)> {
+    let identity = (repository.namespace(), repository.name_any());
+    others
+        .iter()
+        .find(|other| {
+            (other.namespace(), other.name_any()) != identity
+                && other.spec.s3.bucket == repository.spec.s3.bucket
+                && !endpoints_definitely_differ(
+                    &other.spec.s3.endpoint,
+                    &repository.spec.s3.endpoint,
+                )
+                && prefixes_overlap(&other.spec.s3.prefix, &repository.spec.s3.prefix)
+        })
+        .map(|other| {
+            (
+                format!(
+                    "{}/{}",
+                    other.namespace().unwrap_or_default(),
+                    other.name_any()
+                ),
+                other.spec.s3.prefix.clone(),
+            )
+        })
+}
+
+/// Whether two `spec.s3.endpoint` values definitely address DIFFERENT object stores.
+///
+/// The endpoint is optional and is otherwise a raw operator-written string: `s3_store` hands it
+/// straight to `AmazonS3Builder::with_endpoint`, and when it is absent the builder derives the
+/// endpoint from `region` instead. So `None` with `region: us-east-1` and an explicit
+/// `https://s3.us-east-1.amazonaws.com` are the same host, as are one MinIO address spelled with a
+/// trailing slash, in another case, or over `http` rather than `https`.
+///
+/// This gates an IRREVERSIBLE prune, so it fails closed: two endpoints count as different only when
+/// both are explicit and resolve to a different authority. Absent, unparsable, or equal-after-
+/// normalization all mean "assume the same store", whose worst outcome is refusing a delete.
+fn endpoints_definitely_differ(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => endpoint_authority(a) != endpoint_authority(b),
+        _ => false,
+    }
+}
+
+/// The `host[:port]` an endpoint addresses, lowercased, with any path/query dropped and a port that
+/// is its scheme's default removed. The scheme itself is not compared: `http` and `https` to one
+/// address are one store, and a store reached over both is exactly the case this must not miss.
+fn endpoint_authority(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    let (scheme, rest) = endpoint
+        .split_once("://")
+        .map_or(("", endpoint), |(scheme, rest)| (scheme, rest));
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest)
+        .to_ascii_lowercase();
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        "80"
+    } else {
+        "443"
+    };
+    // Split only on a trailing all-digit port, so a bare IPv6 host (`[::1]`) is left intact.
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            if port == default_port {
+                host.to_string()
+            } else {
+                authority
+            }
+        }
+        _ => authority,
+    }
+}
+
+/// Whether two key prefixes in one bucket name overlapping key spaces: identical, or one an ancestor
+/// of the other. Compared at path boundaries, so `fleet` does not "contain" `fleet-staging`; an
+/// empty prefix is the whole bucket and therefore overlaps every other.
+fn prefixes_overlap(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim_matches('/'), b.trim_matches('/'));
+    let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    shorter.is_empty()
+        || longer == shorter
+        || longer
+            .strip_prefix(shorter)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Delete every object under `prefix` in `store`, returning the count removed. Locations are collected
@@ -665,7 +802,7 @@ pub async fn reconcile_once(
     // UpdateRepository in `Terminating` until that prefix is pruned, and is placed on a live one so
     // the guarantee is in effect before anything is ever published.
     if repository.metadata.deletion_timestamp.is_some() {
-        finalize_repository(&repositories, &secrets, &repository).await?;
+        finalize_repository(&client, &repositories, &secrets, &repository).await?;
         return Ok(format!("finalized repository {repository_name}"));
     }
     ensure_repository_finalizer(&repositories, &repository).await?;
@@ -711,30 +848,29 @@ pub async fn reconcile_once(
     // this generation — rather than aborting publication for every other resource.
     let mut groups = BTreeMap::new();
     let mut group_labels = BTreeMap::new();
-    let mut quarantined_groups: BTreeSet<String> = BTreeSet::new();
+    // Every group quarantined this pass, mapped to the selector that says which agents are its
+    // agents. The selector travels with the quarantine — not only with the pin below — because a
+    // group quarantined BEFORE it was ever admitted has no pin at all, and its agents must still be
+    // recognized as belonging to it: otherwise they resolve to the unmatched-node pseudo-group and
+    // are handed the repository's fleet-wide default deployment, the exact ungated swap quarantine
+    // exists to prevent. An unusable selector is carried as EMPTY, which selects nothing — the
+    // group's membership is genuinely unknown, and reading an empty selector as "every agent" would
+    // withhold the whole fleet over one broken group.
+    let mut quarantined_groups: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     // What each quarantined group is still pinned to. Its nodes must keep exactly that: routing
     // them to the unmatched-node pseudo-group would turn a typo'd digest or a bad `maxUnavailable`
     // into a fleet-wide, unthrottled, ungated deployment swap, and leaving them out of the
     // generation would delete their assignments outright (publication replaces every target).
-    let mut held_groups: BTreeMap<String, crate::rollout::HeldGroup> = BTreeMap::new();
-    // The group's selector travels with its pin: quarantine must not change which agents belong to
-    // it, or an agent enrolled while the group is broken is published with the repository's
-    // fleet-wide default deployment. An unusable selector is carried as EMPTY, which selects
-    // nothing (see `HeldGroup::selects`) — the group's membership is genuinely unknown, and reading
-    // an empty selector as "every agent" would hold the whole fleet on one broken pin.
-    let hold_group = |group: &UpdateGroup,
-                      name: &str,
-                      held: &mut BTreeMap<String, crate::rollout::HeldGroup>| {
-        if let Some(state) = durable.admitted.get(name) {
-            held.insert(
-                name.to_string(),
-                crate::rollout::HeldGroup {
-                    state: state.clone(),
-                    match_labels: group.spec.selector.match_labels.clone(),
-                },
-            );
-        }
-    };
+    let mut held_groups: BTreeMap<String, crate::rollout::AdmittedDeployment> = BTreeMap::new();
+    // Only a group that has been admitted at least once has a pin, so this is a SUBSET of
+    // `quarantined_groups`; membership — which agents are a quarantined group's agents — is
+    // answered from `quarantined_groups` above, which covers the never-admitted ones too.
+    let hold_group =
+        |name: &str, held: &mut BTreeMap<String, crate::rollout::AdmittedDeployment>| {
+            if let Some(state) = durable.admitted.get(name) {
+                held.insert(name.to_string(), state.clone());
+            }
+        };
     for group in group_resources.iter() {
         let name = group.name_any();
         if name == crate::DEFAULT_GROUP {
@@ -745,8 +881,8 @@ pub async fn reconcile_once(
                 "`default` is reserved for agents that match no group; rename this UpdateGroup.",
             )
             .await?;
-            hold_group(group, &name, &mut held_groups);
-            quarantined_groups.insert(name);
+            hold_group(&name, &mut held_groups);
+            quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
             continue;
         }
         if group.spec.selector.match_labels.is_empty() {
@@ -757,8 +893,8 @@ pub async fn reconcile_once(
                 "This group's selector has no matchLabels; an empty selector would match every agent and is refused.",
             )
             .await?;
-            hold_group(group, &name, &mut held_groups);
-            quarantined_groups.insert(name);
+            hold_group(&name, &mut held_groups);
+            quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
             continue;
         }
         let deployment = match group.spec.deployment.clone().try_into() {
@@ -771,8 +907,8 @@ pub async fn reconcile_once(
                     &format!("This group's deployment is invalid: {error}"),
                 )
                 .await?;
-                hold_group(group, &name, &mut held_groups);
-                quarantined_groups.insert(name);
+                hold_group(&name, &mut held_groups);
+                quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
                 continue;
             }
         };
@@ -794,8 +930,8 @@ pub async fn reconcile_once(
                             "maxUnavailable must be at least one",
                         )
                         .await?;
-                        hold_group(group, &name, &mut held_groups);
-                        quarantined_groups.insert(name);
+                        hold_group(&name, &mut held_groups);
+                        quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
                         continue;
                     }
                     value => value.unwrap_or(1),
@@ -807,7 +943,7 @@ pub async fn reconcile_once(
     }
     group_resources
         .items
-        .retain(|group| !quarantined_groups.contains(&group.name_any()));
+        .retain(|group| !quarantined_groups.contains_key(&group.name_any()));
 
     let mut agent_resources = nodes_api.list(&ListParams::default()).await?;
     agent_resources
@@ -990,9 +1126,7 @@ pub async fn reconcile_once(
     // renewal that cannot be performed drops back out of `renewals` (see `renew_expiring_root`) and
     // must then not be the reason a generation was signed at all.
     let mut root_renewal_failure = None;
-    if (initialized && renewals.contains(&TufRole::Root))
-        || publication_required(content_unchanged, &renewals)
-    {
+    if publication_required(content_unchanged, &renewals) {
         refuse_generation_rollback(store.as_ref(), &repository.spec.s3, &repo_dir).await?;
         let signing = secrets
             .get(&repository.spec.signing_secret_ref.name)
@@ -1240,25 +1374,34 @@ async fn load_admitted_state(
         ))
     })?;
     // The published routing (node → group) and assignments (node → deployment identity) are their
-    // own keys rather than fields of the first, so a repository that has only ever written the
-    // admitted set reads back as "nothing recorded" instead of failing its whole document closed.
-    let routing = match data.and_then(|data| data.get("routing.json")) {
-        Some(encoded) => serde_json::from_str(encoded).map_err(|error| {
+    // own keys rather than fields of the first, but they are written in the same document by the
+    // same write, so a missing one is unreadable state — not a repository that has published
+    // nothing. Reading an absent `assignments.json` as "no node has ever been assigned" told the
+    // planner every carried-forward node was unplaceable.
+    let encoded = data
+        .and_then(|data| data.get("routing.json"))
+        .ok_or_else(|| {
             StorageError(format!(
-                "invalid published routing in ConfigMap {name}: {error}; {ADMITTED_STATE_REMEDY}"
+                "admitted-state ConfigMap {name} has no routing.json; {ADMITTED_STATE_REMEDY}"
             ))
-        })?,
-        None => BTreeMap::new(),
-    };
-    let assignments = match data.and_then(|data| data.get("assignments.json")) {
-        Some(encoded) => decode_assignments(serde_json::from_str(encoded).map_err(|error| {
+        })?;
+    let routing = serde_json::from_str(encoded).map_err(|error| {
+        StorageError(format!(
+            "invalid published routing in ConfigMap {name}: {error}; {ADMITTED_STATE_REMEDY}"
+        ))
+    })?;
+    let encoded = data
+        .and_then(|data| data.get("assignments.json"))
+        .ok_or_else(|| {
             StorageError(format!(
-                "invalid published assignments in ConfigMap {name}: {error}; \
-                 {ADMITTED_STATE_REMEDY}"
+                "admitted-state ConfigMap {name} has no assignments.json; {ADMITTED_STATE_REMEDY}"
             ))
-        })?),
-        None => BTreeMap::new(),
-    };
+        })?;
+    let assignments = decode_assignments(serde_json::from_str(encoded).map_err(|error| {
+        StorageError(format!(
+            "invalid published assignments in ConfigMap {name}: {error}; {ADMITTED_STATE_REMEDY}"
+        ))
+    })?);
     Ok((
         DurableRolloutState {
             admitted,
@@ -1609,8 +1752,10 @@ async fn publish_enrollment_secrets(
     for agent in offline {
         let name = agent.name_any();
         let secret_name = format!("{name}-enrollment");
-        let assignment =
-            crate::gateway::agent_assignment(&repository.spec.assignment_prefix, &name);
+        let assignment = updated_contracts::telemetry::assignment_object_key(
+            &repository.spec.assignment_prefix,
+            &name,
+        );
         // An existing Secret is final: it is immutable, so nothing below could rewrite it anyway.
         // Check that first, with one apiserver read. Resolving the signed bundle costs a metadata
         // walk plus several object-store reads PER AGENT, and this runs on every reconcile — for a
@@ -1680,7 +1825,21 @@ async fn publish_enrollment_secrets(
                     &secret_name,
                 );
             }
-            Err(error) => return Err(error.into()),
+            // The apiserver refused to create this one agent's Secret — a derived name over 253
+            // characters, an RBAC denial, a transient 5xx. Propagating it aborts the whole
+            // post-publication projection for the repository (set statuses, subscription delivery)
+            // on every pass, forever, over one agent's Secret; see
+            // [`report_unusable_enrollment_secret`]. It is one agent's offline provisioning that is
+            // stuck, so it is reported as such and the pass carries on — a transient cause retries
+            // next reconcile of its own accord.
+            Err(error) => tracing::error!(
+                agent = %name,
+                secret = %secret_name,
+                %error,
+                "this agent's enrollment Secret could not be created; offline provisioning for this \
+                 agent is stopped until the cause is cleared. Every other agent, and publication, \
+                 are unaffected."
+            ),
         }
     }
     Ok(())
@@ -2119,8 +2278,40 @@ async fn publish_resource_statuses(
     for agent in agent_resources {
         let name = agent.name_any();
         // A node withheld from this generation (its group is quarantined, or awaiting its first
-        // admission) has no routing to report; its status keeps whatever it last held.
+        // admission) is not in `plan.node_groups`, and no assignment target was signed for it.
         let selected = plan.node_groups.get(&name).cloned();
+        // So it must not claim one. Reporting `Ready=True`/`Published` with a concrete
+        // assignmentPath here showed a withheld agent as healthy and published while its machine's
+        // TUF fetch of that exact target 404s forever, and left the operator no signal at all that
+        // it is blocked on a quarantined group. The published fields are omitted with the same
+        // discipline a failed reconcile omits them (see [`UpdateRepositoryStatus`]): a claim only a
+        // published assignment can make is not made.
+        let (assignment_path, published_digest, condition) = if selected.is_some() {
+            (
+                Some(updated_contracts::telemetry::assignment_object_key(
+                    &repository.spec.assignment_prefix,
+                    &name,
+                )),
+                Some(plan.digest.clone()),
+                ready_condition(
+                    agent.metadata.generation,
+                    "Published",
+                    "This agent's exact assignment is published.",
+                ),
+            )
+        } else {
+            (
+                None,
+                None,
+                failed_condition(
+                    agent.metadata.generation,
+                    "Withheld",
+                    "This agent is not routed in the published generation: its group is waiting \
+                     for rollout capacity, a rollout window, its inputs, or a prerequisite group, \
+                     or it is held out of admission entirely.",
+                ),
+            )
+        };
         // The gate returns the report only when it is authentic, so a status can never be written from
         // an unverified envelope: there is no report value to read unless verification succeeded.
         let report = public_keys.get(&name).and_then(|key| {
@@ -2134,11 +2325,8 @@ async fn publish_resource_statuses(
         let status = UpdateAgentStatus {
             observed_generation: agent.metadata.generation,
             selected_group: selected,
-            assignment_path: Some(crate::gateway::agent_assignment(
-                &repository.spec.assignment_prefix,
-                &name,
-            )),
-            published_digest: Some(plan.digest.clone()),
+            assignment_path,
+            published_digest,
             reported_version: report
                 .as_ref()
                 .map(|report| report.version.clone())
@@ -2148,11 +2336,7 @@ async fn publish_resource_statuses(
                 .then(|| crate::LocalSecretReference {
                     name: format!("{name}-enrollment"),
                 }),
-            conditions: vec![ready_condition(
-                agent.metadata.generation,
-                "Published",
-                "This agent's exact assignment is published.",
-            )],
+            conditions: vec![condition],
         };
         agents
             .patch_status(
@@ -2847,6 +3031,161 @@ mod lease_tests {
 
         // Re-pruning an already-clean prefix is a no-op — the resumability the finalizer relies on.
         assert_eq!(prune_prefix(&store, "tenant/routing").await.unwrap(), 0);
+    }
+
+    #[test]
+    fn a_prefix_nested_under_another_is_recognized_as_overlapping() {
+        // A prune is prefix-scoped, so deleting `fleet` takes `fleet/staging` with it: nesting one
+        // tenant inside another is what the finalizer must refuse to prune, in either direction and
+        // whichever of the two is being deleted.
+        assert!(prefixes_overlap("fleet", "fleet/staging"));
+        assert!(prefixes_overlap("fleet/staging", "fleet"));
+        assert!(prefixes_overlap("/fleet/", "fleet/staging/deep"));
+        // Identical prefixes are the same key space, so one repository's prune destroys the other's.
+        assert!(prefixes_overlap("fleet", "fleet"));
+        // An empty prefix is the whole bucket and therefore overlaps everything.
+        assert!(prefixes_overlap("", "fleet"));
+        // Compared at path boundaries: a shared leading STRING is not a shared key space.
+        assert!(!prefixes_overlap("fleet", "fleet-staging"));
+        assert!(!prefixes_overlap("tenant/routing", "tenant/other"));
+    }
+
+    /// A bucket is not scoped to a namespace, so the sibling search must not be either: the nesting
+    /// that costs another tenant its published artifacts is exactly the one drawn along a namespace
+    /// boundary. Listing only the deleted repository's own namespace let `tenant-a`'s `fleet` prune
+    /// `tenant-b`'s live `fleet/staging`.
+    #[test]
+    fn an_overlapping_sibling_in_another_namespace_is_found() {
+        fn repo(
+            namespace: &str,
+            name: &str,
+            bucket: &str,
+            prefix: &str,
+        ) -> crate::UpdateRepository {
+            let mut spec = repository(bucket);
+            spec.s3.prefix = prefix.into();
+            let mut object = crate::UpdateRepository::new(name, spec);
+            object.metadata.namespace = Some(namespace.into());
+            object
+        }
+
+        let deleting = repo("tenant-a", "fleet", "artifacts", "fleet");
+        let nested = repo("tenant-b", "fleet-staging", "artifacts", "fleet/staging");
+        assert_eq!(
+            first_overlapping_sibling(std::slice::from_ref(&nested), &deleting),
+            Some(("tenant-b/fleet-staging".to_string(), "fleet/staging".into()))
+        );
+        // ...and in the other direction, whichever of the two is the one being deleted.
+        assert_eq!(
+            first_overlapping_sibling(std::slice::from_ref(&deleting), &nested),
+            Some(("tenant-a/fleet".to_string(), "fleet".into()))
+        );
+
+        // The repository being finalized is matched on namespace AND name, so it never blocks its
+        // own prune — but a same-named repository in another namespace is a different object and
+        // does.
+        assert_eq!(
+            first_overlapping_sibling(std::slice::from_ref(&deleting), &deleting),
+            None
+        );
+        assert_eq!(
+            first_overlapping_sibling(
+                &[repo("tenant-b", "fleet", "artifacts", "fleet")],
+                &deleting
+            )
+            .map(|sibling| sibling.0),
+            Some("tenant-b/fleet".to_string())
+        );
+
+        // A different bucket is a different key space, however the prefixes are drawn.
+        assert_eq!(
+            first_overlapping_sibling(
+                &[repo("tenant-b", "other", "elsewhere", "fleet/staging")],
+                &deleting
+            ),
+            None
+        );
+        // Same bucket, disjoint prefixes: each prune stays inside its own scope.
+        assert_eq!(
+            first_overlapping_sibling(
+                &[repo("tenant-b", "other", "artifacts", "fleet-staging")],
+                &deleting
+            ),
+            None
+        );
+    }
+
+    /// The endpoint half of the key-space rule fails CLOSED. It used to be exact `Option<String>`
+    /// equality, so every cosmetic way of spelling one host — omitted and left to `region`, a
+    /// trailing slash, a different case, `http` vs `https` — made a live nested sibling invisible
+    /// and pruned its published artifacts.
+    #[test]
+    fn a_sibling_is_shielded_unless_its_endpoint_is_definitively_different() {
+        fn repo(name: &str, prefix: &str, endpoint: Option<&str>) -> crate::UpdateRepository {
+            let mut spec = repository("artifacts");
+            spec.s3.prefix = prefix.into();
+            spec.s3.endpoint = endpoint.map(Into::into);
+            let mut object = crate::UpdateRepository::new(name, spec);
+            object.metadata.namespace = Some(format!("ns-{name}"));
+            object
+        }
+
+        // An absent endpoint is derived from `region`, so it is the same host as that region's URL
+        // written out in full: the two repositories share a key space.
+        let deleting = repo("fleet", "fleet", None);
+        let explicit = repo(
+            "staging",
+            "fleet/staging",
+            Some("https://s3.us-east-1.amazonaws.com"),
+        );
+        assert_eq!(
+            first_overlapping_sibling(std::slice::from_ref(&explicit), &deleting)
+                .map(|sibling| sibling.0),
+            Some("ns-staging/staging".to_string())
+        );
+        assert!(first_overlapping_sibling(std::slice::from_ref(&deleting), &explicit).is_some());
+
+        // Two explicit spellings of one MinIO deployment: trailing slash, host case, scheme, and a
+        // port left implicit rather than written out are all the same store.
+        for other in [
+            "https://MinIO.internal:9000",
+            "https://minio.internal:9000/",
+            "http://minio.internal:9000",
+            "https://minio.internal:9000/bucketpath",
+        ] {
+            let deleting = repo("fleet", "fleet", Some("https://minio.internal:9000"));
+            assert!(
+                first_overlapping_sibling(
+                    &[repo("staging", "fleet/staging", Some(other))],
+                    &deleting
+                )
+                .is_some(),
+                "{other} must be treated as the same store"
+            );
+        }
+        let deleting = repo("fleet", "fleet", Some("https://minio.internal"));
+        assert!(first_overlapping_sibling(
+            &[repo(
+                "staging",
+                "fleet/staging",
+                Some("https://minio.internal:443")
+            )],
+            &deleting
+        )
+        .is_some());
+
+        // Genuinely different hosts (or ports) are different key spaces, so the prune proceeds.
+        for other in ["https://minio.other:9000", "https://minio.internal:9001"] {
+            let deleting = repo("fleet", "fleet", Some("https://minio.internal:9000"));
+            assert_eq!(
+                first_overlapping_sibling(
+                    &[repo("staging", "fleet/staging", Some(other))],
+                    &deleting
+                ),
+                None,
+                "{other} is a different store"
+            );
+        }
     }
 
     /// A replica whose local metadata is BEHIND the store must never publish. It led up to

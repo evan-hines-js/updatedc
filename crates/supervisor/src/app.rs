@@ -22,8 +22,8 @@ impl App {
         self.guardian.running_app()
     }
 
-    pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), String> {
-        self.guardian.traffic_ready(ready)
+    pub(crate) fn traffic_ready(&mut self, ready: bool) -> io::Result<()> {
+        Ok(self.guardian.traffic_ready(ready)?)
     }
 
     /// Ask the guardian to (re)launch the application, updating our PID.
@@ -39,7 +39,7 @@ impl App {
         self.mode = opts.application.mode;
         if self.mode == updated_contracts::assignment::RuntimeMode::ProviderManaged {
             return match self.guardian.running_app() {
-                Some(_) => self.guardian.stop().map_err(io::Error::other),
+                Some(_) => Ok(self.guardian.stop()?),
                 None => Ok(()),
             };
         }
@@ -47,6 +47,9 @@ impl App {
         // A guardian `Channel` failure becomes `io::ErrorKind::ConnectionReset` (see
         // `GuardianError`); the update path recognizes that and recovers instead of rejecting.
         self.guardian.launch(&spec)?;
+        // The child's environment is fixed from here; record which secret values went into it so a
+        // later supervisor that adopts this process can tell whether they are still current.
+        opts.secrets.record_launched(&opts.paths.state);
         Ok(())
     }
 }
@@ -57,6 +60,17 @@ pub(crate) fn adopt(guardian: Guardian, opts: &Options, pid: u32) -> io::Result<
         // There is nothing to adopt: the guardian can only offer a PID for a process from the
         // previous managed contract, and entering provider-managed mode retires that child (see
         // [`App::launch`]) rather than keeping it.
+        return start(guardian, opts);
+    }
+    // The running process holds whatever secrets it was launched with, and the freshly acquired
+    // bundle is this supervisor's only baseline — `reconcile` would compare it against itself and
+    // never report a rotation that landed while this supervisor was down. Relaunch instead of
+    // adopting a process that would otherwise run on revoked credentials forever.
+    if !opts.secrets.launched_with_current(&opts.paths.state) {
+        log(
+            "the running application was launched with different secret values; relaunching it \
+             rather than adopting it",
+        );
         return start(guardian, opts);
     }
     log(&format!(
@@ -133,7 +147,7 @@ fn apply_secret_environment(
 /// for quiescing the running app — before activating a release, and when the boot planner
 /// stops an uncommitted candidate.
 pub(crate) fn stop(guardian: &mut Guardian) -> io::Result<()> {
-    guardian.stop().map_err(io::Error::other)
+    Ok(guardian.stop()?)
 }
 
 /// Stop the runtime only when the guardian owns it. In provider-managed mode the signed node
@@ -229,13 +243,12 @@ mod tests {
     /// mode is under test; the rest is the layout every other field derives from.
     #[cfg(unix)]
     fn options(mode: updated_contracts::assignment::RuntimeMode) -> crate::Options {
-        use updated::config::{Paths, Repository, Routing, Storage, Timeouts};
+        use updated::config::{Paths, Routing, Storage, Timeouts};
         let root = std::path::PathBuf::from("/nonexistent/updated-app-tests");
         let routing = Routing {
             root: root.join("enrollment/routing"),
             base_url: root.join("routing").display().to_string(),
             assignment: "assignments/agents/agent-test.json".into(),
-            metadata_limit: 1 << 20,
             transport_timeout: std::time::Duration::from_secs(30),
             mtls: updated::tls::Identity::new(
                 root.join("client.pem"),
@@ -255,11 +268,6 @@ mod tests {
                 args: Vec::new(),
                 secrets: Vec::new(),
                 inputs: BTreeMap::new(),
-            },
-            repository: Repository {
-                metadata_limit: 1 << 20,
-                target_limit: 1 << 20,
-                transport_timeout: std::time::Duration::from_secs(30),
             },
             routing,
             timeouts: crate::BoundedTimeouts::new(Timeouts::default()),
@@ -301,6 +309,40 @@ mod tests {
 
         assert_eq!(app.pid(), None);
         peer.join().expect("the guardian was asked to stop it");
+    }
+
+    /// A provider-managed switchover has no guardian stop to withdraw readiness as a side effect —
+    /// [`super::stop_runtime`] returns immediately and the reconciler's `apply` is what restarts
+    /// the application — so the callers outside the update transaction must withdraw it
+    /// explicitly, or the node is reconfigured while still advertising `Serving`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn withdrawing_from_traffic_unreadies_a_provider_managed_node() {
+        use updated_contracts::assignment::RuntimeMode;
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let peer = std::thread::spawn(move || {
+            let mut peer = theirs;
+            let request = control::Request::read(&mut peer).expect("one request");
+            control::Response::Ok
+                .write(&mut peer)
+                .expect("one response");
+            request
+        });
+        let opts = options(RuntimeMode::ProviderManaged);
+        let mut app = super::App {
+            guardian: crate::guardian::Guardian::for_test(ours, None),
+            mode: RuntimeMode::ProviderManaged,
+        };
+
+        crate::update::withdraw_from_traffic(&mut app, crate::update::DrainHold::configured(&opts))
+            .await
+            .expect("readiness is withdrawn");
+
+        assert!(matches!(
+            peer.join().expect("the guardian was asked"),
+            control::Request::TrafficReady(false)
+        ));
     }
 
     #[test]

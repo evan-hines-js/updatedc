@@ -10,3 +10,5 @@ keys/
 *.profraw
 *.profdata
 mutants.out*/
+# Added by code-review-graph
+.code-review-graph/

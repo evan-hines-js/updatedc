@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# First-launch entrypoint (bin/launch) for an updated-managed HAProxy node.
+# Start entrypoint (bin/launch) for a provider-managed HAProxy node.
 #
-# The guardian launches this once for first process creation. It projects THIS immutable release's
-# binary and configuration onto the stable runtime paths and execs HAProxy in master-worker
-# foreground; the guardian then owns the master PID. Every later upgrade never relaunches — the
-# lifecycle provider's `activate` makes this same master re-exec in place (SIGUSR2).
+# The deployment is `provider-managed`, so the agent starts no application process: the signed
+# lifecycle provider runs this launcher whenever no master of ours is running (the first deployment
+# on a node, or one whose master is gone). Every later upgrade is the provider making THIS master
+# re-exec in place (SIGUSR2), so this script runs once per master, not once per release.
+#
+# It projects the release it ships in onto the stable runtime paths and leaves a detached
+# master-worker behind under the stable pid file — detached because the provider invocation that
+# starts it must return, and the master must outlive it.
 #
 # Self-contained on purpose: the application bundle carries no dependency on the separately signed
 # provider bundle, so the projection is inlined here rather than sourced.
@@ -24,6 +28,21 @@ mv -f "$bin_tmp" "$runtime/haproxy"
 mv -f "$cfg_tmp" "$runtime/haproxy.cfg"
 trap - EXIT
 
-# -W master-worker, -db foreground (the guardian is the supervisor), -p stable pid file the provider
-# reads to signal the master. The master keeps this PID across every future reexec.
-exec "$runtime/haproxy" -W -db -f "$runtime/haproxy.cfg" -p "$runtime/haproxy.pid"
+# No master of ours is running, so any pid file here outlived the master that wrote it: remove it
+# rather than race the check below against a stale number.
+rm -f "$runtime/haproxy.pid"
+# -W master-worker, -D background (the master detaches into its own session and keeps running after
+# this script and the provider invocation that ran it exit), -p the stable pid file the provider
+# reads to signal the master. The master keeps that PID across every future re-exec.
+"$runtime/haproxy" -W -D -f "$runtime/haproxy.cfg" -p "$runtime/haproxy.pid"
+
+# Backgrounding means HAProxy's own startup failures land after this returns, so do not report a
+# start that did not happen: wait, bounded, for the master to actually be running.
+for _ in $(seq 1 100); do
+  if [[ -s "$runtime/haproxy.pid" ]] && kill -0 "$(<"$runtime/haproxy.pid")" 2>/dev/null; then
+    exit 0
+  fi
+  sleep 0.1
+done
+echo "haproxy-launch: no HAProxy master was running 10s after starting it" >&2
+exit 1

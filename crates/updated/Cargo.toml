@@ -27,10 +27,12 @@ zstd = { workspace = true }
 url = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
+# `BundlePolicy` is consulted through a `&dyn` and its accept step fetches intermediate roots, so
+# the trait needs an async method in object-safe form.
+async-trait = { workspace = true }
 # The agent's mTLS enrollment/repository identity — an aws-lc-rs rustls client config built
 # from cert/key/CA file paths (the bootstrap config holds paths, never secrets).
 rustls = { workspace = true }
-rustls-pki-types = { workspace = true }
 # Join-mode enrollment: the agent generates its keypair and a CSR locally (aws-lc-rs backend,
 # one crypto library) so no per-node certificate is ever provisioned out of band.
 rcgen = { workspace = true, features = ["x509-parser"] }

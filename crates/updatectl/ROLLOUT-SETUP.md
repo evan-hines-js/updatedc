@@ -71,6 +71,9 @@ This happens **once**, when you stand the system up. Budget a short session with
      --root-out root.json
    ```
 
+   * **`--keys-dir` must be a new, empty directory.** This is the one command that mints keys, and it mints *all* of them fresh; it refuses a directory that already holds any of them rather than reusing one, so a new trust root can never inherit an old or planted key.
+   * **If the command fails, or you interrupt it, just run it again.** No key file is written to `--keys-dir` unless the publish lands, so the retry is the identical command. An interrupted run (Ctrl-C, a CI timeout) can leave one hidden staging directory of keys for the repository it never published; the next run removes it automatically and says so — there is nothing to clean up by hand.
+   * **The seal is printed as soon as the storage is initialized**, before the keys are moved into `--keys-dir`. If the command then fails while placing the keys, it says so explicitly: the repository *is* published and the seal you have is the real one (it is also always fetchable from `metadata/root.json` in the bucket) — follow the message to collect the keys from the staging directory it names.
    * **Store the keys in Vault:** Move the files in `./new-keys` into Vault and delete the local copies. From here on, Vault is the only place the keys live.
    * **Register the public seal:** Give the `root.json` file to the Platform team; it gets attached to each device group's configuration. This teaches every device which seal is genuine.
 

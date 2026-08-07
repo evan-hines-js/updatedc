@@ -115,12 +115,14 @@ pub fn report_is_ready(node: &str, public_key: &PinnedKey, body: &[u8]) -> bool 
         .is_some_and(|report| report.healthy)
 }
 
-/// Upper bound on one fetched health document. A [`updated_contracts::telemetry::NodeReport`] is a few hundred bytes; this only
-/// bounds a hostile or broken CDN. The reports live in storage this component reads but does not
-/// control, so — exactly as on the agent side — a declared length is only a claim and the running
-/// total is what actually caps the read. Enforced through the one shared bounded-read helper so
-/// this path cannot drift from the agent's.
-const REPORT_BYTES_LIMIT: usize = 64 * 1024;
+/// Upper bound on one fetched health document: the shared
+/// [`updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES`], the same number the writer's
+/// manifest allowance is derived from, so no report a node may legitimately sign is unreadable
+/// here. The reports live in storage this component reads but does not control, so — exactly as on
+/// the agent side — a declared length is only a claim and the running total is what actually caps
+/// the read. Enforced through the one shared bounded-read helper so this path cannot drift from
+/// the agent's.
+const REPORT_BYTES_LIMIT: usize = updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES;
 
 /// Fetch one node's raw health document from the CDN. `Some(body)` only on a 2xx with a readable,
 /// bounded body; any transport error, non-success status, unreadable body, or a body exceeding
@@ -140,14 +142,123 @@ pub async fn fetch_report(
         .ok()
 }
 
-/// The width of every per-cycle fan-out: the node report poll here, and the load-balancer backend's
-/// own fan-out across its instances. Bounded so a large fleet neither serializes (one hung peer
-/// stalling the rest, risking a cycle longer than
-/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]) nor fans out an unbounded burst of
-/// simultaneous connections. One constant rather than one per fan-out, because the per-request
-/// budgets are derived from it against [`RECONCILE_TIMEOUT`] — two copies that agree today would
-/// silently stop agreeing.
+/// The floor on the width of every per-cycle fan-out: the node report poll here, and the
+/// load-balancer backend's own fan-out across its instances. A fan-out at least this wide is what
+/// keeps a cycle from serializing — one hung peer stalling the rest, risking a cycle longer than
+/// [`updated_contracts::telemetry::REPORT_FRESHNESS`] — while staying a modest number of
+/// simultaneous connections on the small fleets where nothing forces it wider.
+///
+/// It is a floor, not a cap: [`fanout_width`] raises a fan-out above it when the work needs it,
+/// bounded by that fan-out's share of the blocking pool. The load-balancer fan-outs, which resolve
+/// no names and have no pass deadline, use it as-is against [`RECONCILE_TIMEOUT`]. One constant
+/// rather than one per fan-out so the starting width the whole component reasons about has a single
+/// value — two copies that agree today would silently stop agreeing.
 pub(crate) const FANOUT_CONCURRENCY: usize = 32;
+
+/// How many blocking threads this component's runtime is built with, and therefore how many
+/// `getaddrinfo` calls can be in flight at once.
+///
+/// `tokio::net::lookup_host` is not async: every lookup occupies one thread of the blocking pool for
+/// its whole duration, so the pool size is a hard ceiling on the DNS fan-out's *real* width — a
+/// wider fan-out simply queues, and queued waves are waves. Pinned here rather than left to tokio's
+/// default, because both name-resolving fan-outs' widths are derived from it (see
+/// [`NAME_LOOKUP_CONCURRENCY`] and [`REPORT_POLL_CONCURRENCY`]), and a derivation resting on a
+/// default is one that silently stops holding when the default moves. The binary builds its runtime
+/// with exactly this value.
+pub const BLOCKING_POOL_THREADS: usize = 512;
+
+/// The half of [`BLOCKING_POOL_THREADS`] the EndpointSlice backend's hostname lookups may occupy
+/// (`endpointslice::NameResolver`).
+///
+/// `tokio::net::lookup_host` holds one blocking thread for the whole `getaddrinfo`, and abandoning
+/// the future does *not* free that thread, so this is not merely a per-pass width: it is a
+/// reservation held by a semaphore whose permits are released only when the blocking call really
+/// returns, across cycles. Without that, a blackholed resolver (20-40s per call) against a 2s
+/// reconcile interval fills the pool with lookups whose answers were already discarded.
+pub(crate) const NAME_LOOKUP_CONCURRENCY: usize = BLOCKING_POOL_THREADS / 2;
+
+/// The other half of [`BLOCKING_POOL_THREADS`]: the widest the report poll ([`poll_plan`]) may run.
+///
+/// The poll's requests look like pure network I/O, but each one needs `health_base` resolved
+/// through hyper's `GaiResolver` — the same blocking pool the hostname lookups use. A poll width
+/// past this share is width on paper only: the surplus requests queue behind the pool and run as a
+/// further wave, and it eats the reservation the lookup pass was sized against.
+pub(crate) const REPORT_POLL_CONCURRENCY: usize = BLOCKING_POOL_THREADS - NAME_LOOKUP_CONCURRENCY;
+
+// Both halves must leave room for the floor, or `fanout_width`'s clamp has an empty range.
+const _: () = assert!(
+    FANOUT_CONCURRENCY <= NAME_LOOKUP_CONCURRENCY && FANOUT_CONCURRENCY <= REPORT_POLL_CONCURRENCY
+);
+
+/// How wide one fan-out runs: one task in flight per unit of `wanted` work, floored at
+/// [`FANOUT_CONCURRENCY`] so a small fleet never serializes, and capped at `cap` — that fan-out's
+/// share of [`BLOCKING_POOL_THREADS`].
+///
+/// One derivation for every fan-out that resolves names, because the cap is the whole point and a
+/// second copy is a copy that loses it: a width past the pool is not width, it is a queue, so an
+/// uncapped derivation "fits" its deadline only on paper while the pass really runs several waves
+/// past it — and it silently spends the share the *other* fan-out was proven to fit inside.
+pub(crate) fn fanout_width(wanted: usize, cap: usize) -> usize {
+    wanted.clamp(FANOUT_CONCURRENCY, cap)
+}
+
+/// The share of [`updated_contracts::telemetry::REPORT_FRESHNESS`] one report-poll pass may spend,
+/// as a divisor: a quarter, leaving the rest of the window for the node's own report cadence, the
+/// reconcile that follows the pass, and the sleep between cycles.
+const POLL_SHARE: u32 = 4;
+
+/// How one report-poll pass is spread across the fleet: what each request gets, and how wide the
+/// fan-out must run for the whole pass to fit its share of the freshness window.
+struct PollPlan {
+    /// The budget for one report fetch. Always exactly the operator's configured
+    /// `HEALTHPROXY_HEALTH_TIMEOUT_SECS` — see [`poll_plan`] for why this is never scaled down.
+    timeout: Duration,
+    /// How many fetches are in flight at once, so `ceil(nodes / concurrency)` waves of `timeout`
+    /// fit the pass's share. Never narrower than [`FANOUT_CONCURRENCY`], never wider than
+    /// [`REPORT_POLL_CONCURRENCY`].
+    concurrency: usize,
+}
+
+/// Plan one report-poll pass over `nodes` given the operator's per-request `health_timeout`.
+///
+/// The pass gates rotation on freshness, so it must finish well inside
+/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]: a body fetched in the first wave is judged
+/// against a clock read after the last one, so a pass that outlives the window ages out reports
+/// that were fresh when they were read and drains healthy nodes — the mass eviction
+/// [`LastKnownGood`] exists to prevent, caused here by the checker's own cycle time.
+///
+/// What is derived from the window is the fan-out *width*, never the per-request budget. Deriving
+/// the budget instead is the same failure wearing the other mask: dividing the share across the
+/// waves a fixed width implies drives the per-request timeout under a real HTTPS round trip at
+/// fleet scale, at which point *every* fetch in the pass times out, the whole fleet falls to its
+/// last known report, and one freshness window later the entire fleet reads not-ready. So the
+/// operator's timeout stands and the fleet gets the parallelism it needs: `floor(share /
+/// health_timeout)` waves of that budget fit the share, and the width is whatever covers `nodes` in
+/// that many waves.
+///
+/// The width is capped at [`REPORT_POLL_CONCURRENCY`] all the same, because width past the pool is
+/// not width. Each fetch needs its host resolved through the same blocking pool the hostname
+/// lookups reserve their half of, so claiming more only queues the surplus behind the pool *and*
+/// starves the other fan-out. Past that size the arithmetic below stops fitting the share and the
+/// pass may run long; [`run`] says so once at startup rather than letting a derivation assert a
+/// fan-out the runtime cannot perform.
+///
+/// A `health_timeout` wider than the share itself cannot be both honored and bounded. The
+/// operator's budget wins — one wave, and the pass may run past its share — because a timeout below
+/// the round trip is worse than a slow cycle. [`run`] says so once at startup, since the operator's
+/// own setting is the cause.
+fn poll_plan(nodes: usize, health_timeout: Duration) -> PollPlan {
+    let share = REPORT_FRESHNESS / POLL_SHARE;
+    // `floor(share / health_timeout)`, at least one: a budget at or above the share still buys the
+    // one wave above. `max(1)` on the divisor because a zero timeout must not divide by zero.
+    let waves_allowed = usize::try_from(share.as_nanos() / health_timeout.as_nanos().max(1))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    PollPlan {
+        timeout: health_timeout,
+        concurrency: fanout_width(nodes.div_ceil(waves_allowed), REPORT_POLL_CONCURRENCY),
+    }
+}
 
 /// Resolve the desired membership: every configured node, with its readiness read from its
 /// current health report. Nodes are polled with bounded concurrency — one slow or hung node's
@@ -161,26 +272,39 @@ pub(crate) const FANOUT_CONCURRENCY: usize = 32;
 /// not-ready still drains the node, and a cached report older than the freshness window is
 /// not-ready — so the only behavior this changes is refusing to mass-evict on a checker blip.
 ///
+/// `health_timeout` is the operator's per-request budget; the fan-out widens with the fleet to keep
+/// the pass inside its share of the freshness window (see [`poll_plan`]).
+///
 /// `cache` carries the last good body per node across cycles (bounded by the fixed inventory) and is
 /// updated on every successful fetch. Order is preserved so the programmed set is stable.
 pub async fn resolve_members(
     client: &reqwest::Client,
     health_base: &str,
     inventory: &[FleetNode],
+    health_timeout: Duration,
     cache: &mut LastKnownGood<Vec<u8>>,
 ) -> Vec<Member> {
     use futures::stream::StreamExt;
     // Concurrent, cache-free fetch pass: gather this cycle's fresh bodies in parallel (the shared
     // cache is not touched here), each tagged with its inventory index to restore order afterward.
+    // Each fetch gets the operator's full budget and the pass runs as wide as fitting inside its
+    // share of the freshness window requires — a hung CDN costs one node's last-known-good fallback,
+    // never a cycle so long that bodies read at its start have aged out by the time they are judged.
+    let plan = poll_plan(inventory.len(), health_timeout);
+    let budget = plan.timeout;
     let fetched: Vec<(usize, Option<Vec<u8>>)> = futures::stream::iter(
         inventory
             .iter()
             .enumerate()
             .map(|(index, member)| async move {
-                (index, fetch_report(client, health_base, &member.node).await)
+                let fetch = fetch_report(client, health_base, &member.node);
+                (
+                    index,
+                    tokio::time::timeout(budget, fetch).await.ok().flatten(),
+                )
             }),
     )
-    .buffer_unordered(FANOUT_CONCURRENCY)
+    .buffer_unordered(plan.concurrency)
     .collect()
     .await;
     let mut fresh: Vec<Option<Vec<u8>>> = vec![None; inventory.len()];
@@ -313,23 +437,56 @@ pub async fn run(
     // Last good health body per node, so a transient CDN outage falls back to the last known report
     // (still freshness-bounded) instead of draining every healthy node at once.
     let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
+    // A per-request budget wider than the whole share a poll may spend cannot be both honored and
+    // bounded; the operator's budget wins (see [`poll_plan`]), so name the setting that causes it.
+    let share = REPORT_FRESHNESS / POLL_SHARE;
+    if config.health_timeout > share {
+        eprintln!(
+            "healthproxy: HEALTHPROXY_HEALTH_TIMEOUT_SECS={}s is wider than the {}s one report poll may spend of the {}s freshness window — a single fetch wave can outlast that share",
+            config.health_timeout.as_secs(),
+            share.as_secs(),
+            REPORT_FRESHNESS.as_secs()
+        );
+    }
+    // The poll's width is capped by the blocking pool it resolves through, so past a certain fleet
+    // size no width fits the pass into its share: the fleet is simply larger than one checker can
+    // poll in that window. Say it once, at startup, rather than letting the arithmetic claim a
+    // fan-out the runtime cannot perform — the answer is more checkers or a coarser cadence.
+    let plan = poll_plan(config.inventory.len(), config.health_timeout);
+    let waves = config.inventory.len().div_ceil(plan.concurrency).max(1) as u32;
+    if waves > 1 && plan.timeout.saturating_mul(waves) > share {
+        eprintln!(
+            "healthproxy: polling {} nodes takes {waves} wave(s) of {}s at the widest fan-out this runtime can resolve ({}), past the {}s share one poll may spend of the {}s freshness window — reports may age out mid-pass",
+            config.inventory.len(),
+            plan.timeout.as_secs(),
+            plan.concurrency,
+            share.as_secs(),
+            REPORT_FRESHNESS.as_secs()
+        );
+    }
     loop {
-        let members =
-            resolve_members(&client, &config.health_base, &config.inventory, &mut cache).await;
+        let members = resolve_members(
+            &client,
+            &config.health_base,
+            &config.inventory,
+            config.health_timeout,
+            &mut cache,
+        )
+        .await;
         for member in &members {
             let prior = previous.insert(member.node.clone(), member.ready);
             match classify_transition(prior, member.ready) {
                 Some(Transition::FirstOutOfPool) => eprintln!(
                     "healthproxy: {} starts out of {} (no ready health report yet)",
-                    member.node, config.service
+                    member.node, config.target()
                 ),
                 Some(Transition::Joined) => eprintln!(
                     "healthproxy: {} rejoined {} (health report ready)",
-                    member.node, config.service
+                    member.node, config.target()
                 ),
                 Some(Transition::Left) => eprintln!(
                     "healthproxy: {} left {} (health report not-ready) — draining it from the endpoint set",
-                    member.node, config.service
+                    member.node, config.target()
                 ),
                 None => {}
             }
@@ -339,14 +496,14 @@ pub async fn run(
             Ok(Err(error)) => {
                 eprintln!(
                     "healthproxy: reconciling {} failed: {error}",
-                    config.service
+                    config.target()
                 )
             }
             // A backend that never returns (e.g. a hung apiserver) must not freeze the loop and
             // strand the last programmed set — bound it, log, and retry next cycle.
             Err(_) => eprintln!(
                 "healthproxy: reconciling {} timed out after {}s; retrying next cycle",
-                config.service,
+                config.target(),
                 RECONCILE_TIMEOUT.as_secs()
             ),
         }
@@ -362,7 +519,8 @@ pub struct Config {
     pub health_base: String,
     /// Namespace of the target Service/EndpointSlice (Kubernetes backend).
     pub namespace: String,
-    /// The load balancer to program — a Service name for the EndpointSlice backend.
+    /// The load balancer to program — a Service name for the EndpointSlice backend, and unused by
+    /// the HAProxy backend, which names its target by backend instead (see [`Config::target`]).
     pub service: String,
     /// The named port endpoints are published on.
     pub port_name: String,
@@ -390,6 +548,15 @@ pub struct HAProxyTarget {
 }
 
 impl Config {
+    /// What the operational log calls the thing being programmed: the HAProxy backend name on the
+    /// HAProxy path (which has no Service and leaves `service` empty), the Service name otherwise.
+    pub fn target(&self) -> &str {
+        match &self.haproxy {
+            Some(haproxy) => &haproxy.backend,
+            None => &self.service,
+        }
+    }
+
     pub fn from_env() -> Result<Self, String> {
         Self::build(|key| std::env::var(key).ok())
     }
@@ -418,10 +585,20 @@ impl Config {
                 if endpoints.is_empty() {
                     return Err("HEALTHPROXY_HAPROXY_ENDPOINTS listed no endpoints".into());
                 }
-                Some(HAProxyTarget {
-                    endpoints,
-                    backend: get("HEALTHPROXY_HAPROXY_BACKEND").unwrap_or_else(|| "fleet".into()),
-                })
+                // The backend name is interpolated into the same `;`-joined admin batch as the node
+                // identity (`set server {backend}/{node} state …`), so it faces the same gate, for
+                // the same two reasons: `;` or whitespace in it appends a second command to a
+                // `level admin` socket, and anything HAProxy answers with an error fails EVERY
+                // reconcile forever — the whole fleet never programmed again behind one log line.
+                let backend = get("HEALTHPROXY_HAPROXY_BACKEND").unwrap_or_else(|| "fleet".into());
+                if backend.is_empty() || !is_balancer_safe(&backend) {
+                    return Err(format!(
+                        "HEALTHPROXY_HAPROXY_BACKEND={backend:?} is not a usable HAProxy backend \
+                         name: it must be non-empty and contain no `;` and no whitespace, or it \
+                         would end the command it is written into"
+                    ));
+                }
+                Some(HAProxyTarget { endpoints, backend })
             }
             _ => None,
         };
@@ -465,6 +642,10 @@ fn parse_port(
     }
 }
 
+/// A day: no interval or per-fetch budget this component honours is usefully longer, and an
+/// unbounded value turns duration arithmetic elsewhere into an overflow.
+const MAX_SECS: u64 = 24 * 60 * 60;
+
 fn parse_secs(
     get: &impl Fn(&str) -> Option<String>,
     key: &str,
@@ -473,15 +654,24 @@ fn parse_secs(
     match get(key) {
         None => Ok(default),
         Some(raw) => match raw.parse::<u64>() {
-            Ok(0) | Err(_) => Err(format!("{key} must be a positive integer, got {raw:?}")),
-            Ok(secs) => Ok(secs),
+            Ok(secs) if (1..=MAX_SECS).contains(&secs) => Ok(secs),
+            _ => Err(format!(
+                "{key} must be a positive integer of at most {MAX_SECS} seconds, got {raw:?}"
+            )),
         },
     }
 }
 
-/// Parse `node=address=pubkeyhex,node=address=pubkeyhex,…` into [`FleetNode`]s. The address must
-/// parse as a host — an `ip:port` or bare host — but the port is carried by the Service, so only the
-/// host portion is kept. The pinned public key is the node's enrollment EC point in hex; it is
+/// Parse `node=address=pubkeyhex,node=address=pubkeyhex,…` into [`FleetNode`]s. The node identity
+/// must satisfy [`updated_contracts::telemetry::is_valid_node`] — the same grammar the write path
+/// enforces on `telemetry/<node>.json` — because a name only this side accepts is a node whose
+/// report can never be stored where [`fetch_report`] looks for it: the URL 404s every cycle and the
+/// node is drained forever behind the same log line as a genuinely unhealthy one. The same identity
+/// is the server name this programs into the balancer, so the one property that grammar does not
+/// cover — [`is_balancer_safe`] — is checked once, here, rather than at each use. The address must
+/// parse as a host — see [`host_of`] — but the port is carried by the Service, so only the host
+/// portion is kept, and an address of no recognizable shape is a startup error rather than a
+/// guessed-at host that is silently left out of rotation forever. The pinned public key is the node's enrollment EC point in hex; it is
 /// required, and required to be a usable [`PinnedKey`]: a key that is missing, or present but of a
 /// shape no report could ever verify against, is a configuration error rather than a node that is
 /// silently drained forever with the same log line as an unhealthy one.
@@ -501,24 +691,26 @@ fn parse_inventory(raw: &str) -> Result<Vec<FleetNode>, String> {
                 "HEALTHPROXY_MEMBERS entry {entry:?} must be node=address=pubkeyhex"
             ));
         }
+        if !updated_contracts::telemetry::is_valid_node(node) {
+            return Err(format!(
+                "HEALTHPROXY_MEMBERS entry {entry:?} has node identity {node:?}, which is not a \
+                 valid node name: it must be a single path component (no `/`, `\\`, `:`, control \
+                 character, `.` or `..`) and must contain none of `. % ? #`"
+            ));
+        }
+        if !is_balancer_safe(node) {
+            return Err(format!(
+                "HEALTHPROXY_MEMBERS entry {entry:?} has node identity {node:?}, which is not a \
+                 usable balancer server name: it must contain no `;` and no whitespace, or it would \
+                 end the command it is written into"
+            ));
+        }
         let public_key = PinnedKey::parse(key_hex).map_err(|reason| {
             format!("HEALTHPROXY_MEMBERS entry {entry:?} has a pinned public key that {reason}")
         })?;
-        // Keep only the host: the Service owns the port. A bare IP literal (v4 *or* v6) is kept
-        // verbatim — an unbracketed IPv6 like `::1` has no port to strip and must not be split on
-        // its own colons. Otherwise an `ip:port`/`[ip]:port`/`host:port` has its trailing port
-        // dropped; a bare hostname is kept as-is.
-        let host = if address.parse::<std::net::IpAddr>().is_ok() {
-            address.to_string()
-        } else if let Ok(socket) = address.parse::<SocketAddr>() {
-            socket.ip().to_string()
-        } else {
-            address
-                .rsplit_once(':')
-                .map(|(h, _)| h)
-                .unwrap_or(address)
-                .to_string()
-        };
+        let host = host_of(address).ok_or_else(|| {
+            format!("HEALTHPROXY_MEMBERS entry {entry:?} has an address that is not an IP literal, an [IPv6] literal, a hostname, or any of those with a port")
+        })?;
         inventory.push(FleetNode {
             node: node.to_string(),
             address: host,
@@ -529,6 +721,86 @@ fn parse_inventory(raw: &str) -> Result<Vec<FleetNode>, String> {
         return Err("HEALTHPROXY_MEMBERS listed no members".into());
     }
     Ok(inventory)
+}
+
+/// Whether an operator-supplied name can be written into a balancer command verbatim. Both names
+/// `haproxy::state_batches` interpolates go through it — the node identity that becomes the server
+/// name, and the `backend` section that qualifies it — because they share one command line and one
+/// consequence.
+///
+/// [`updated_contracts::telemetry::is_valid_node`] is a URL/path grammar — it rejects `/ \ :`,
+/// `. % ? #`, and control characters — and none of that covers the syntax of the balancer the name
+/// is programmed into: the HAProxy Runtime API separates commands on a line with `;` and a
+/// command's own words with whitespace. A name carrying either does not name a server, it appends a
+/// second command to a `level admin` socket (`agent-0; shutdown frontend public` really does take
+/// the frontend down). Whitespace alone is enough to matter without any malice: `HAPROXY_BACKEND`
+/// with a copy-pasted trailing space emits `set server fleet /agent-0 state ready`, which HAProxy
+/// answers with an error for every member, so every reconcile fails and nothing is ever programmed.
+///
+/// It is applied where the value is *parsed* — [`parse_inventory`] for the identity,
+/// [`Config::build`] for the backend — because a name problem is a configuration error. Refusing it
+/// where it is interpolated instead would convert one operator typo into a fleet-wide outage: the
+/// backend would fail the whole reconcile, so *no* member — including every correctly named one —
+/// would ever be programmed again, every cycle, behind a single log line. That is exactly the
+/// "drained forever behind a log line" harm [`parse_inventory`] exists to prevent.
+fn is_balancer_safe(name: &str) -> bool {
+    !name.contains(|character: char| character == ';' || character.is_whitespace())
+}
+
+/// Extract the routable host from a configured member address, or `None` if the address is not a
+/// shape this component can route to.
+///
+/// The Service owns the port, so only the host is kept: a bare IP literal (v4 or v6) is kept
+/// verbatim — an unbracketed IPv6 like `::1` has no port to strip and must not be split on its own
+/// colons — a bracketed IPv6 is unwrapped with or without a trailing port, and an `ip:port` or
+/// `host:port` has its port dropped. A hostname may be root-anchored (`vm-db.internal.`): that
+/// trailing dot is the root label, not an empty one, and is dropped along with any port.
+///
+/// Anything else is `None`, which [`parse_inventory`] turns into a startup error. That is the same
+/// fail-closed policy as a mis-shaped pin, for the same reason: a host this function guessed at
+/// resolves to nothing on every cycle, so the node is left out of rotation forever behind a log
+/// line indistinguishable from a genuinely unreachable one. `[fd00::5]` — the natural bracketed
+/// spelling without a port — is exactly that case: split on its last colon it yields the host
+/// `[fd00:`, which is neither an IP literal nor a resolvable name.
+fn host_of(address: &str) -> Option<String> {
+    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string());
+    }
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return Some(socket.ip().to_string());
+    }
+    if let Some(rest) = address.strip_prefix('[') {
+        // A bracketed literal `SocketAddr` could not parse: either there is no port, or the port
+        // is unusable. Only the first is a routable address.
+        let (literal, after) = rest.split_once(']')?;
+        let ip: std::net::Ipv6Addr = literal.parse().ok()?;
+        return after.is_empty().then(|| ip.to_string());
+    }
+    // A hostname, optionally with a port. A name carries no colons of its own, so the only colon
+    // that may appear is the port separator — and it must actually introduce a port.
+    let (host, port) = match address.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (address, None),
+    };
+    if port.is_some_and(|port| port.parse::<u16>().is_err()) {
+        return None;
+    }
+    // A root-anchored FQDN (`vm-db.internal.`) is a legal spelling an operator may reasonably paste
+    // out of a DNS zone, so the one trailing dot is the root label rather than an empty one: drop it
+    // and validate what is left. Only that single dot is forgiven, so `host..example` and a bare `.`
+    // are still refused. The dot is dropped from the kept host too — the balancers this programs
+    // take a plain name, and the two spellings resolve identically.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let labelled = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        });
+    labelled.then(|| host.to_string())
 }
 
 #[cfg(test)]
@@ -860,6 +1132,149 @@ mod tests {
         );
     }
 
+    /// The backend name shares a command line with the node identity — `set server
+    /// {backend}/{node} state …`, `;`-joined onto a `level admin` socket — so it shares the
+    /// identity's gate. Gating only one of the two names is gating neither: a `;` in the backend
+    /// appends a second admin command to every batch (`shutdown frontend public` takes the frontend
+    /// down for real), and the likelier copy-paste trailing space emits `set server fleet /agent-0
+    /// …`, which HAProxy answers with an error for every member — so every reconcile fails and the
+    /// whole fleet is never programmed again, behind one log line.
+    ///
+    /// Refused at startup, where it is an operator's configuration error, rather than at the
+    /// interpolation, where it would be that fleet-wide outage.
+    #[test]
+    fn an_unsafe_haproxy_backend_name_is_a_startup_error() {
+        let one = format!("agent-0=10.0.0.1={}", pin(1));
+        let with_backend = |backend: &str| {
+            Config::build(env(&[
+                ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
+                ("HEALTHPROXY_SERVICE", "fleet-haproxy"),
+                ("HEALTHPROXY_MEMBERS", &one),
+                ("HEALTHPROXY_HAPROXY_ENDPOINTS", "10.0.0.9:9999"),
+                ("HEALTHPROXY_HAPROXY_BACKEND", backend),
+            ]))
+        };
+        for refused in [
+            // Command injection on the admin socket.
+            "fleet; shutdown frontend public",
+            // A copy-pasted trailing space: not malice, still every reconcile failing forever.
+            "fleet ",
+            " fleet",
+            "fl eet",
+            "fleet\n",
+            // Nothing at all is not a backend either.
+            "",
+        ] {
+            let error = with_backend(refused).expect_err(
+                "a backend name that ends the command it is written into must not start",
+            );
+            assert!(
+                error.contains("HEALTHPROXY_HAPROXY_BACKEND"),
+                "the error must name the setting at fault, got {error:?}"
+            );
+        }
+        // The same predicate as the node identity, so one gate really is one gate.
+        assert!(!is_balancer_safe("fleet; shutdown frontend public"));
+        assert!(is_balancer_safe("fleet-eu-west"));
+        // And an ordinary name still starts.
+        assert_eq!(
+            with_backend("fleet-eu-west")
+                .unwrap()
+                .haproxy
+                .unwrap()
+                .backend,
+            "fleet-eu-west"
+        );
+    }
+
+    /// The report poll gates rotation on freshness, so the pass that reads the reports must finish
+    /// well inside the freshness window at EVERY fleet size. Past that point bodies read in the
+    /// first wave age out before the pass ends and healthy nodes are drained — by the checker's own
+    /// cycle time, not by anything the nodes did.
+    ///
+    /// The pass may only buy that with *width*. Buying it by shrinking the per-request budget is
+    /// the same mass eviction by another route: below a real HTTPS round trip every fetch in the
+    /// pass times out, the whole fleet falls to last-known-good, and one window later the whole
+    /// fleet reads not-ready. So the operator's budget is a floor at every size.
+    ///
+    /// And the width it is bought with is a width the runtime can really deliver. Each fetch
+    /// resolves `health_base` through the same blocking pool the hostname lookups reserve half of,
+    /// so past [`REPORT_POLL_CONCURRENCY`] the surplus requests queue rather than run — an uncapped
+    /// derivation would "fit" the share only on paper (100_000 nodes asked for 14_286 simultaneous
+    /// requests against a 512-thread pool) while starving the other fan-out of the pool it was
+    /// sized against. Beyond the size the cap can cover, the honest answer is that the pass does not
+    /// fit and `run` says so at startup — not an arithmetic that claims otherwise.
+    #[test]
+    fn the_report_poll_fits_inside_its_share_of_the_freshness_window_at_every_fleet_size() {
+        let share = REPORT_FRESHNESS / POLL_SHARE;
+        for health_timeout in [
+            Duration::from_secs(1),
+            // The `HEALTHPROXY_HEALTH_TIMEOUT_SECS` default.
+            Duration::from_secs(2),
+            Duration::from_secs(10),
+            share,
+            // Wider than the whole share: one wave at the operator's budget, and it may overrun.
+            share * 2,
+        ] {
+            // 225 / 1000 / 4000 are the sizes at which the derived-budget form fell to 1.87s,
+            // 468ms and 117ms respectively — all under a real round trip, 225 already under the
+            // 2s default.
+            for nodes in [0, 1, FANOUT_CONCURRENCY, 96, 225, 1000, 4000, 100_000] {
+                let plan = poll_plan(nodes, health_timeout);
+                // (a) The operator's per-request budget is never shrunk to make the pass fit.
+                assert_eq!(
+                    plan.timeout, health_timeout,
+                    "{nodes} nodes must not shrink the operator's {health_timeout:?} budget"
+                );
+                assert!(plan.concurrency >= FANOUT_CONCURRENCY);
+                // (b) The width is one the runtime can actually run: never past this fan-out's
+                // share of the blocking pool every request resolves through.
+                assert!(
+                    plan.concurrency <= REPORT_POLL_CONCURRENCY,
+                    "{nodes} nodes ask for width {}, past the {REPORT_POLL_CONCURRENCY} requests the blocking pool can really resolve at once",
+                    plan.concurrency
+                );
+                // (c) The waves that width implies fit the share — whenever a width within the cap
+                // can make them fit at all. Exactly one wave is the other acceptable answer: it is
+                // all a budget at or above the share can afford, and all a fleet larger than the
+                // cap can cover in one.
+                let waves = nodes.div_ceil(plan.concurrency).max(1) as u32;
+                let fits_the_pool =
+                    nodes.div_ceil(REPORT_POLL_CONCURRENCY) as u32 * plan.timeout <= share;
+                assert!(
+                    waves == 1 || !fits_the_pool || plan.timeout * waves <= share,
+                    "{nodes} nodes take {waves} wave(s) of {:?} at width {}, past the {share:?} poll share a width within the pool could have fit",
+                    plan.timeout,
+                    plan.concurrency
+                );
+            }
+        }
+        // A fleet that fits the base width in the waves its budget allows is not fanned out wider
+        // than it needs to be.
+        assert_eq!(
+            poll_plan(FANOUT_CONCURRENCY, Duration::from_secs(2)).concurrency,
+            FANOUT_CONCURRENCY
+        );
+        // A fleet that does not gets exactly the parallelism that fits it into its allowed waves...
+        let waves_allowed = (share.as_secs() / 2) as usize;
+        assert_eq!(
+            poll_plan(1000, Duration::from_secs(2)).concurrency,
+            1000usize.div_ceil(waves_allowed)
+        );
+        // ...up to the pool's ceiling, which a fleet this size asks well past (4000 nodes wanted
+        // 572, 100_000 wanted 14_286 — 28x the whole pool).
+        assert_eq!(
+            poll_plan(4000, Duration::from_secs(2)).concurrency,
+            REPORT_POLL_CONCURRENCY
+        );
+        assert_eq!(
+            poll_plan(100_000, Duration::from_secs(2)).concurrency,
+            REPORT_POLL_CONCURRENCY
+        );
+        // The two name-resolving fan-outs partition the pool rather than each claiming all of it.
+        const { assert!(REPORT_POLL_CONCURRENCY + NAME_LOOKUP_CONCURRENCY <= BLOCKING_POOL_THREADS) };
+    }
+
     #[test]
     fn inventory_rejects_malformed_entries() {
         assert!(parse_inventory("agent-0").is_err());
@@ -888,6 +1303,80 @@ mod tests {
         let error = parse_inventory(&format!("agent-3=10.0.0.1={}", "ab".repeat(32)))
             .expect_err("a malformed pin is refused at config time");
         assert!(error.contains("uncompressed P-256 point"), "{error}");
+    }
+
+    /// A node identity this side accepts but the write path's grammar rejects is a node whose
+    /// report can never exist at `telemetry/<node>.json`: the fetch 404s every cycle and the node
+    /// is drained forever behind the same line as an unhealthy one. So the inventory is gated on
+    /// the very predicate the write path uses, and both sides are asserted to agree here.
+    #[test]
+    fn a_node_identity_the_write_path_could_never_store_is_a_startup_error() {
+        for node in ["agent-0", "agent_7", "AGENT-7", "a"] {
+            let parsed = parse_inventory(&format!("{node}=10.0.0.1={}", pin(1)))
+                .expect("a name the write path accepts is configurable");
+            assert_eq!(parsed[0].node, node);
+            assert_eq!(
+                updated_contracts::telemetry::node_from_path(&format!("/telemetry/{node}.json")),
+                Some(node),
+                "{node} must round-trip through the write path it was accepted for"
+            );
+        }
+        for node in [
+            "agent#1",
+            "agent.7",
+            "agent/7",
+            "agent\\7",
+            "agent:7",
+            "agent%2f7",
+            "agent?7",
+            ".",
+            "..",
+            "agent\n7",
+        ] {
+            let error = parse_inventory(&format!("{node}=10.0.0.1={}", pin(1)))
+                .expect_err("a name the write path rejects is refused at config time");
+            // The offending name is named back to the operator, escaped — a name whose damage is a
+            // stray `\n` must be legible in the log line that refuses it.
+            assert!(error.contains(&format!("{node:?}")), "{error}");
+            assert!(error.contains("valid node name"), "{error}");
+            assert_eq!(
+                updated_contracts::telemetry::node_from_path(&format!("/telemetry/{node}.json")),
+                None,
+                "{node} must be refused for exactly the reason claimed"
+            );
+        }
+        // The empty identity is refused too, by the `node=address=pubkeyhex` shape check that
+        // already ran — the grammar agrees, but the earlier message is the more useful one.
+        assert!(parse_inventory(&format!("=10.0.0.1={}", pin(1))).is_err());
+        // Length is not part of the grammar: a long-but-safe name is configurable.
+        assert!(parse_inventory(&format!("{}=10.0.0.1={}", "a".repeat(512), pin(1))).is_ok());
+    }
+
+    /// The identity is also the server name programmed into the balancer, where `;` separates
+    /// commands and whitespace separates a command's words — neither of which the write path's
+    /// URL/path grammar forbids. `agent-0; shutdown frontend public` would be two commands on a
+    /// `level admin` socket, so it must be refused *here*, at startup, where it is one operator's
+    /// typo: refusing it at the point of interpolation instead fails the whole reconcile, so every
+    /// correctly named node in the fleet stops being programmed too, every cycle, forever.
+    #[test]
+    fn a_node_identity_that_could_end_a_balancer_command_is_a_startup_error() {
+        for node in [
+            "agent-0; shutdown frontend public",
+            "agent-0;",
+            "agent-0 state maint",
+            "agent\t0",
+        ] {
+            let error = parse_inventory(&format!("{node}=10.0.0.1={}", pin(1)))
+                .expect_err("a name that would end the command it is written into is refused");
+            assert!(error.contains(&format!("{node:?}")), "{error}");
+            assert!(!is_balancer_safe(node));
+        }
+        // Everything the inventory grammar actually intends as an identity still passes, and it is
+        // the same set the write path accepts — one gate, not two disagreeing ones.
+        for node in ["agent-0", "vm_db-17", "AGENT-7"] {
+            assert!(is_balancer_safe(node));
+            assert!(parse_inventory(&format!("{node}=10.0.0.1={}", pin(1))).is_ok());
+        }
     }
 
     /// The last-known-good rule both the report fetch and the DNS lookup resolve through: a
@@ -924,12 +1413,66 @@ mod tests {
         );
     }
 
+    /// Every address spelling an operator may reasonably write, and what host it must yield.
+    /// A bracketed IPv6 *without* a port is the one that used to be split on its last colon into
+    /// `[fd00:` — accepted at startup, unresolvable forever after.
+    #[test]
+    fn every_address_form_yields_its_host() {
+        for (address, expected) in [
+            ("10.0.0.1", "10.0.0.1"),
+            ("10.0.0.1:8443", "10.0.0.1"),
+            ("fd00::5", "fd00::5"),
+            ("[fd00::5]", "fd00::5"),
+            ("[fd00::5]:8443", "fd00::5"),
+            ("host.example", "host.example"),
+            ("host.example:8443", "host.example"),
+            // Root-anchored FQDNs: the trailing dot is the root label, not an empty one.
+            ("vm-db.internal.", "vm-db.internal"),
+            ("vm-db.internal.:5432", "vm-db.internal"),
+        ] {
+            assert_eq!(
+                host_of(address).as_deref(),
+                Some(expected),
+                "address {address:?}"
+            );
+        }
+    }
+
+    /// An address of no recognizable shape must fail at startup. Guessing a host from it produces
+    /// one that resolves to nothing on every cycle, draining a healthy node forever behind a log
+    /// line identical to a genuinely unreachable one.
+    #[test]
+    fn an_unparseable_address_is_a_startup_error() {
+        for address in [
+            "[fd00::5",
+            "fd00::5]",
+            "[not-an-ip]",
+            "[fd00::5]:notaport",
+            "[fd00::5]junk",
+            "host.example:notaport",
+            // Only ONE trailing dot is the root label; a doubled dot is still an empty label.
+            "host..example",
+            "host.example..",
+            ".",
+            // Out of the port range: fail-closed, since the Service owns the port and a member
+            // written with an impossible one is a configuration error, not a routable host.
+            "host.example:65536",
+            "10.0.0.1:99999",
+            "",
+        ] {
+            assert_eq!(host_of(address), None, "address {address:?}");
+        }
+        let error = parse_inventory(&format!("agent-3=[fd00::5]junk={}", pin(1)))
+            .expect_err("an address of no recognizable shape is refused at config time");
+        assert!(error.contains("not an IP literal"), "{error}");
+    }
+
     #[test]
     fn inventory_keeps_only_the_host_across_address_forms() {
         let key = pin(1);
         let parsed = parse_inventory(&format!(
             "v4=10.0.0.1={key}, v4p=10.0.0.2:8080={key}, v6=::1={key}, v6p=[fe80::1]:8080={key}, \
-             h=vm-db.internal={key}, hp=vm-db.internal:5432={key}"
+             v6b=[fd00::5]={key}, h=vm-db.internal={key}, hp=vm-db.internal:5432={key}"
         ))
         .unwrap();
         let hosts: Vec<(String, String)> = parsed
@@ -944,6 +1487,8 @@ mod tests {
                 // A bare, unbracketed IPv6 must be kept whole — not split on its own colons.
                 ("v6".into(), "::1".to_string()),
                 ("v6p".into(), "fe80::1".to_string()),
+                // Bracketed without a port: the brackets are stripped, not split on.
+                ("v6b".into(), "fd00::5".to_string()),
                 ("h".into(), "vm-db.internal".to_string()),
                 ("hp".into(), "vm-db.internal".to_string()),
             ]

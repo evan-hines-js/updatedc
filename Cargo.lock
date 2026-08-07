@@ -2811,17 +2811,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2949,12 +2938,10 @@ dependencies = [
  "foundation",
  "libc",
  "reqwest 0.13.4",
- "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "update-client",
  "updated",
  "updated-contracts",
  "updated-tuf",
@@ -3412,15 +3399,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
-name = "update-client"
-version = "0.1.0"
-dependencies = [
- "foundation",
- "updated",
- "updated-tuf",
-]
-
-[[package]]
 name = "updatec"
 version = "0.1.0"
 dependencies = [
@@ -3462,7 +3440,6 @@ dependencies = [
 name = "updatec-demo"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "futures",
  "k8s-openapi",
  "kube",
@@ -3470,7 +3447,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "updatec",
  "updated",
@@ -3482,11 +3458,9 @@ name = "updatectl"
 version = "0.1.0"
 dependencies = [
  "clap",
- "foundation",
  "futures",
  "kube",
  "object_store",
- "rustls",
  "semver",
  "serde_json",
  "tempfile",
@@ -3503,6 +3477,7 @@ dependencies = [
 name = "updated"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aws-lc-rs",
  "foundation",
  "futures",
@@ -3510,7 +3485,6 @@ dependencies = [
  "rcgen",
  "reqwest 0.13.4",
  "rustls",
- "rustls-pki-types",
  "semver",
  "serde",
  "serde_json",
@@ -3546,7 +3520,6 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "reqwest 0.13.4",
- "rustls",
  "serde_json",
  "tokio",
  "updated",

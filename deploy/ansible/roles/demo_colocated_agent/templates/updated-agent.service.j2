@@ -4,9 +4,6 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# The guardian derives its enrollment identity from the hostname; pin it so the control plane
-# addresses this node deterministically as the manual Magnolia node.
-Environment=HOSTNAME={{ demo_colocated_hostname }}
 # No --supervisor-config: the bootstrap reads the canonical /etc/updated/bootstrap.toml,
 # which this role installs.
 ExecStart=/usr/local/bin/bootstrap \

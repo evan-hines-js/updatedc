@@ -127,7 +127,7 @@ impl BundleStore {
     /// and relaunch, every tick, forever. The working directory therefore has to be somewhere the
     /// integrity check does not own, and per-release rather than shared so two releases never
     /// inherit each other's scratch.
-    pub fn workspace(&self, release: &ReleaseId) -> PathBuf {
+    fn workspace(&self, release: &ReleaseId) -> PathBuf {
         self.work.join(release.directory_name())
     }
 
@@ -278,15 +278,7 @@ mod tests {
             fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let archive = root.join(format!("{product}-{version}.tar.zst"));
-        bundle::create_bundle(
-            &source,
-            &archive,
-            product,
-            version,
-            platform,
-            &bundle::Entrypoints::new("bin/app"),
-        )
-        .unwrap();
+        bundle::create_bundle(&source, &archive, product, version, platform, "bin/app").unwrap();
         archive
     }
 
@@ -309,7 +301,7 @@ mod tests {
             "demo",
             "1.2.3",
             "test-platform",
-            &bundle::Entrypoints::new("bin/app"),
+            "bin/app",
         )
         .unwrap();
 
@@ -365,7 +357,7 @@ mod tests {
             "lifecycle",
             "1.0.0",
             &platform,
-            &bundle::Entrypoints::new("bin/app"),
+            "bin/app",
         )
         .unwrap();
         let provider = store(&root);

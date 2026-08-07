@@ -114,6 +114,14 @@ pub(crate) struct Situation {
     /// requires a continuously running process, so the exact code affects outer restart
     /// behavior but not whether an unconfirmed release must be reconsidered.
     pub service_exited: bool,
+    /// This boot found the committed release DAMAGED on disk and repaired it before planning.
+    ///
+    /// The exit recorded against that release is then evidence about this disk, not about the
+    /// release: the bytes charged with the crash are not the bytes about to run. So the exit still
+    /// drives every *recoverable* consequence — the revert to `pending.previous_release`, the
+    /// descent past a provisional head — but nothing PERMANENT: see
+    /// [`Situation::charge_crash_to_release`].
+    pub bytes_repaired: bool,
     /// The PID of an application the guardian is already running (adopt, do not relaunch).
     pub app_running: Option<u32>,
     /// This boot performed a (re)install — [`ensure_installed`](crate::install::ensure_installed)
@@ -127,6 +135,23 @@ pub(crate) struct Situation {
     pub confirm_window: Duration,
     /// Unix seconds now (the only clock input; kept explicit so the planner stays pure).
     pub now: u64,
+}
+
+impl Situation {
+    /// Whether the service exit on disk may be charged to the committed release's BYTES — the one
+    /// question every permanent, hash-keyed rejection turns on.
+    ///
+    /// A rejection never expires and is keyed by archive hash, so charging it to the wrong bytes
+    /// blacklists a good release on this node forever and walks its ordered fallback downward. A
+    /// boot that repaired a damaged tree ([`Situation::bytes_repaired`]) re-downloaded and
+    /// re-verified that very archive, so the exit it is about to read describes bytes that no
+    /// longer exist. Every other consequence of the exit — reverting to the predecessor, descending
+    /// past a provisional head, relaunching rather than adopting — stays on: they are reversible,
+    /// and a release that genuinely crashes is caught by the next boot, which finds the tree intact
+    /// and therefore charges the crash to it.
+    pub fn charge_crash_to_release(&self) -> bool {
+        self.service_exited && !self.bytes_repaired
+    }
 }
 
 /// The boot planner's decision — a pure description the executor performs in order.

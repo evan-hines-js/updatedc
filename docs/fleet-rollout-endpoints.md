@@ -19,7 +19,7 @@ node.
 
 | # | Endpoint | What it serves | Trust anchor on the node | Who writes it | Cardinality |
 |---|----------|----------------|--------------------------|---------------|-------------|
-| 1 | **Enrollment gateway** | A dynamic API. A cold node presents a shared secret and receives its routing trust + its assignment pointer. | The enrollment URL + shared key in the two-line bootstrap file. | The control plane (operator). | One per control plane. Usually a *service*, not a CDN. |
+| 1 | **Enrollment gateway** | A dynamic mTLS API. A cold node presents the shared fleet enrollment certificate plus a CSR, and receives a per-node client certificate, its routing trust, and its assignment pointer. | The fleet CA and the shared enrollment certificate/key named in the bootstrap file (`url`, `ca`, `name`, `client_cert`, `client_key`). | The control plane (operator). | One per control plane. Usually a *service*, not a CDN. |
 | 2 | **Routing repository** | A small TUF repository of **per-node assignment documents** (`assignments/agents/<node>.json`). Each assignment names the release CDN and pins its trust. | A routing TUF **root** pinned at install (`Routing.root`). | The control plane signs assignments here. | One per fleet/tenant. Small, changes on every rollout. |
 | 3 | **Release repository** | A TUF repository of **immutable release bundles** — the application, its provider set, and supervisor self-updates. | A release TUF **root** that is *not* in local config — it is `release_root`, signed **into** the routing assignment. | The release publisher signs bundles here. | Often one large, shared, cache-friendly CDN. Changes rarely. |
 
@@ -46,10 +46,11 @@ sequenceDiagram
     participant R as 2 · Routing repo (TUF)
     participant C as 3 · Release repo (TUF / CDN)
 
-    Note over N: Boots with only { enrollment URL, shared key }
-    N->>E: enroll(shared key, node identity)
-    E-->>N: routing trust root + assignment name<br/>(assignments/agents/<node>.json)
-    Note over N: Bootstrap is now consumed (one-way)
+    Note over N: Boots with only { https enrollment URL, fleet CA,<br/>self-asserted name, shared fleet cert + key }
+    Note over N: Generates a durable keypair and a CSR
+    N->>E: POST /enroll over mutual TLS<br/>(shared fleet cert) with { name, CSR }
+    E-->>N: per-node client certificate (CN=name)<br/>+ routing trust root + assignment name<br/>(assignments/agents/<node>.json)
+    Note over N: Bootstrap is now consumed (one-way).<br/>Every later request uses the per-node cert.
 
     loop every check_interval (e.g. 1s)
         N->>R: fetch + TUF-verify assignment document
@@ -105,7 +106,7 @@ global CDN.
 
 ```mermaid
 flowchart LR
-    N[Agent] -->|enroll<br/>shared key| E["1 · Enrollment API<br/>(control-plane service)"]
+    N[Agent] -->|enroll over mTLS<br/>shared fleet cert + CSR| E["1 · Enrollment API<br/>(control-plane service)"]
     N -->|assignment| R["2 · Routing repo<br/>(per-tenant, dynamic)"]
     N -->|release bundle| C["3 · Release repo<br/>(global immutable CDN)"]
     E -. signs .-> R
@@ -155,11 +156,11 @@ re-config.
 ```mermaid
 flowchart LR
     subgraph node["what the node pins at install"]
-      B["bootstrap file:<br/>enrollment URL + shared key"]
+      B["bootstrap file:<br/>https enrollment URL, fleet CA,<br/>shared fleet cert + key"]
       RR["routing root<br/>(TUF trust anchor)"]
     end
-    B -->|authenticates once| E["1 · Enrollment"]
-    E -->|delivers| RR
+    B -->|authenticates once, by mTLS| E["1 · Enrollment"]
+    E -->|delivers per-node cert +| RR
     RR ==>|verifies| A["signed routing assignment"]
     A ==>|carries + pins| XR["release_root"]
     XR ==>|verifies| REL["signed release bundle"]
@@ -168,8 +169,10 @@ flowchart LR
     class B,RR pinned
 ```
 
-- **Enrollment** is trusted to authenticate a node and hand it a *routing root* and an
-  *assignment name*. It never names release bytes.
+- **Enrollment** is trusted to authenticate a node by mutual TLS, mint it a *per-node client
+  certificate* from its CSR, and hand it a *routing root* and an *assignment name*. It never
+  names release bytes. The shared fleet certificate authorizes the `/enroll` handshake and
+  nothing else; individual attribution and revocation come from the minted per-node cert.
 - **Routing** is trusted (via the pinned routing root) to name the release CDN, pin its
   root, and select the exact assigned version + runtime policy. It never serves release
   bytes.
@@ -191,7 +194,7 @@ The `updatec-demo` "Live fleet rollout" screen is topology **A (collapsed)**:
 
 | Concept | In the demo |
 |---------|-------------|
-| Enrollment gateway | The in-cluster `updatec` gateway; agents enroll with a shared secret over insecure in-cluster HTTP. |
+| Enrollment gateway | The in-cluster `updatec` gateway at `https://updatec-gateway`; agents enroll over mutual TLS with the shared fleet certificate cert-manager issued into the `agent-tls` Secret, and each receives its own minted per-node certificate. |
 | Routing repository | The same operator-managed TUF repo; each `demo-cohort-NN` group is a signed assignment the operator republishes when the demo patches its desired version. |
 | Release repository | The same in-cluster repo bucket, holding the versioned sample-app bundles the demo publishes (`23.0.0`, `24.0.0`, … , the converged `101.0.0`). |
 | Nodes | 80 stateless agent pods (16 cohorts × 5), `emptyDir` state — every restart is a cold enrollment, which is why signed `ordered_install_fallback` matters. |

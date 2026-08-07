@@ -21,31 +21,22 @@ s3://acme-updates-prod/
 └── prod/
     ├── routing/                              # written by updatec only
     │   ├── metadata/
-    │   │   ├── root.json
-    │   │   ├── 2.root.json                  # retained TUF root rotations
-    │   │   ├── targets.json
-    │   │   ├── snapshot.json
-    │   │   └── timestamp.json               # uploaded last; generation commit point
-    │   └── targets/
-    │       └── assignments/
-    │           ├── configs/
-    │           │   ├── default.json         # opaque deployment document
-    │           │   ├── edge.json
-    │           │   └── batch.json
-    │           └── agents/
-    │               ├── web-001.json         # exact hash/path reference to one config
-    │               ├── web-002.json
-    │               └── author-001.json
+    │   │   ├── root.json                    # current root, also served unversioned
+    │   │   ├── 1.root.json                  # every root version is retained
+    │   │   ├── 2.root.json
+    │   │   ├── 7.targets.json               # versioned names only; no bare targets.json
+    │   │   ├── 7.snapshot.json              # versioned names only; no bare snapshot.json
+    │   │   └── timestamp.json               # unversioned; uploaded last, commit point
+    │   └── targets/                          # every object is <sha256 of its bytes>.<signed path>
+    │       ├── <sha256>.assignments/configs/<config-id>.json   # opaque deployment document
+    │       ├── <sha256>.assignments/agents/web-001.json        # names one config by path + sha256
+    │       ├── <sha256>.assignments/agents/web-002.json
+    │       └── <sha256>.assignments/agents/author-001.json
     │
     └── releases/                             # written by release pipelines only
         ├── web-stable/                       # one release lineage / TUF repository
-        │   ├── metadata/
-        │   │   ├── root.json
-        │   │   ├── 2.root.json
-        │   │   ├── targets.json
-        │   │   ├── snapshot.json
-        │   │   └── timestamp.json
-        │   └── targets/
+        │   ├── metadata/                     # same role names as routing above
+        │   └── targets/                      # logical target names; see the note below
         │       ├── products/
         │       │   ├── web/stable/
         │       │   │   ├── 41.0.0/
@@ -80,6 +71,26 @@ s3://acme-updates-prod/
 The exact target names are authenticated by TUF metadata. Directories in this diagram
 are S3 key prefixes, not mutable server-side folders.
 
+Two naming rules apply to every repository published by this tooling, routing and release
+alike, and the release subtrees above show *logical* target names rather than object keys:
+
+- **Metadata is consistent-snapshot.** `targets` and `snapshot` are published only under
+  version-prefixed names (`7.targets.json`, `7.snapshot.json`); there is no bare
+  `targets.json` or `snapshot.json`. `root.json` is published both unversioned and as
+  `N.root.json` for every version. `timestamp.json` is the one unversioned role and is
+  written last.
+- **Target objects are content-addressed.** A target signed under the logical name
+  `assignments/agents/web-001.json` is stored at
+  `targets/<sha256 of its bytes>.assignments/agents/web-001.json`, so a new generation
+  never overwrites an object an older, still-valid snapshot points at.
+
+`updatec` names each config document by the SHA-256 of its own canonical bytes, so a
+config's object key repeats the same hash twice —
+`targets/<sha256>.assignments/configs/<sha256>.json`. Configs are deduplicated by content:
+N nodes on the same deployment share one config object, and the per-node
+`assignments/agents/<node>.json` document is only an exact path + SHA-256 reference to it.
+Config objects therefore have no operator-chosen names such as `edge.json` or `batch.json`.
+
 ## Public URL mapping
 
 Each metadata URL is a release-lineage identity. It must map to exactly one prefix:
@@ -96,15 +107,22 @@ A node configured with routing base URL
 
 ```text
 GET /routing/metadata/timestamp.json
-GET /routing/targets/assignments/agents/web-001.json
-GET /routing/targets/assignments/configs/edge.json
+GET /routing/metadata/7.snapshot.json
+GET /routing/metadata/7.targets.json
+GET /routing/targets/<sha256>.assignments/agents/web-001.json
+GET /routing/targets/<sha256>.assignments/configs/<config-id>.json
 ```
 
-The selected config then directs it to one release lineage:
+Each `<sha256>` is the digest the (already verified) metadata names for that object, so the
+client knows the key before it makes the request.
+
+The selected config then directs it to one release lineage (abridged — the signed
+`RepositoryAssignment` also carries `release_root`, `ordered_install_fallback`, and a
+`runtime` block; see `schemas/examples/desired-deployment.json` for a complete document):
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "deployment": "web-edge-2026-07-18",
   "metadata_url": "https://updates.acme.example/releases/web-stable/metadata/",
   "targets_url": "https://updates.acme.example/releases/web-stable/targets/",
@@ -146,13 +164,19 @@ spec:
       sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   signingSecretRef: {name: tuf-signing-keys}
   enrollment:
-    sharedSecretRef: {name: enrollment-secret}
+    labels: {updated.dev/role: edge}
   assignmentPrefix: assignments
   s3:
     bucket: acme-updates-prod
     prefix: prod/routing
     region: us-east-1
 ```
+
+`spec.enrollment` carries nothing but `labels`, the trusted labels stamped onto dynamically
+enrolled agents. There is no enrollment secret and no `enrollment-secret` Secret to create:
+`/enroll` is authenticated by mutual TLS at the gateway, where the node presents the shared
+fleet bootstrap client certificate the fleet CA issued, and the gateway signs the node's CSR
+into a per-node client certificate used for every request thereafter.
 
 `updatec` publishes only `prod/routing/metadata/**` and
 `prod/routing/targets/assignments/**`. It does not publish applications, providers, or

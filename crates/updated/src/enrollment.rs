@@ -4,7 +4,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rustls::pki_types::pem::PemObject;
 use serde::Deserialize;
 
 #[cfg(test)]
@@ -64,12 +63,24 @@ pub struct EnrollmentBootstrap {
 }
 
 impl EnrollmentBootstrap {
-    /// Reject an empty `name` (the one free-form field). `serde(deny_unknown_fields)` already rejects
-    /// removed enrollment fields and a missing cert path, so a stale config fails loudly
-    /// rather than silently enrolling wrong.
+    /// Reject an empty `name` and an empty path. `serde(deny_unknown_fields)` already rejects
+    /// removed enrollment fields and a missing one, but a present-but-empty value passes it and
+    /// would only fail at the first network use — the one thing eager validation exists to
+    /// prevent. The single validation site for a bootstrap.
     pub fn validate(&self) -> io::Result<()> {
         if self.name.trim().is_empty() {
             return Err(invalid("bootstrap enrollment name must not be empty"));
+        }
+        for (field, path) in [
+            ("ca", &self.ca),
+            ("client_cert", &self.client_cert),
+            ("client_key", &self.client_key),
+        ] {
+            if path.as_os_str().is_empty() {
+                return Err(invalid(&format!(
+                    "bootstrap enrollment {field} path must not be empty"
+                )));
+            }
         }
         Ok(())
     }
@@ -117,9 +128,6 @@ impl BootstrapConfig {
         // verifies the gateway against the pinned `ca` and presents the shared fleet enrollment cert.
         if url.scheme() != "https" {
             return Err(invalid("enrollment URL must use HTTPS"));
-        }
-        if config.enrollment.ca.as_os_str().is_empty() {
-            return Err(invalid("enrollment ca path must not be empty"));
         }
         // Validate eagerly so a misconfigured bootstrap fails at load, not at first network use.
         config.enrollment.validate()?;
@@ -211,31 +219,36 @@ pub async fn load_or_enroll_http(
     policy: &dyn BundlePolicy,
 ) -> io::Result<EnrollmentBundle> {
     let bundle_path = bundle_path(state_dir);
-    match load_existing_or_fresh(&bundle_path, "enrollment") {
+    match load_existing_or_fresh(&bundle_path) {
         // A preplaced (or already-loaded) bundle supplies routing/assignment/config, but carries no
         // identity. Mint the steady-state leaf now unless a prior boot already did — decoupling the
         // one-way bundle from the per-node cert is what lets an offline-seeded node still obtain a
         // real identity the first time it reaches the gateway.
         Some(loaded) => {
             let mut bundle = loaded?;
+            // The leaf's identity (`CN`) comes from the configured enrollment name, so whatever
+            // bundle this node runs on must name the same agent. Otherwise the node would run on one
+            // agent's routing/assignment while holding another agent's steady-state certificate — a
+            // split identity. Checked on EVERY boot, not only the one that mints the leaf: the
+            // bundle on disk can be replaced under an already-enrolled node (a config-management
+            // step, an image refresh), and nothing further down re-checks it — `refresh_bundle`'s
+            // own identity rule is skipped when the material is not yet aging, and warned away
+            // rather than propagated when it is. Fail closed on that misconfiguration.
+            if bundle.agent_id != bootstrap.enrollment.name {
+                return Err(invalid(&format!(
+                    "enrollment bundle is for agent {:?}, but this node is configured to enroll as \
+                     {:?}",
+                    bundle.agent_id, bootstrap.enrollment.name
+                )));
+            }
             // Mint the per-node steady-state leaf only when the node will actually present it: a
             // REMOTE gateway routing. A local/offline deployment (a `file:` or absolute-path
             // repository) reads routing and secrets straight from disk and never makes an mTLS
             // request, so it needs no per-node identity — and forcing an `/enroll` handshake it
             // cannot reach would wedge its boot. This mirrors the split the secrets client uses.
-            if routing_is_remote(&bundle.routing_base_url) && !joined_cert_path(state_dir).exists()
+            if !crate::config::base_url_is_local(&bundle.routing_base_url)
+                && !joined_cert_path(state_dir).exists()
             {
-                // The leaf's identity (`CN`) comes from the configured enrollment name, so it must
-                // name the same agent the preplaced bundle was issued for. Otherwise the node would
-                // run on one agent's routing/assignment while holding another agent's steady-state
-                // certificate — a split identity. Fail closed on that misconfiguration.
-                if bundle.agent_id != bootstrap.enrollment.name {
-                    return Err(invalid(&format!(
-                        "preplaced enrollment bundle is for agent {:?}, but this node is configured \
-                         to enroll as {:?}",
-                        bundle.agent_id, bootstrap.enrollment.name
-                    )));
-                }
                 // The `/enroll` response carries a freshly signed bundle beside the leaf. Adopting
                 // it is what makes minting an identity for a preplaced node also REFRESH the
                 // material it was seeded with: the preplaced copy was signed whenever the image was
@@ -243,7 +256,7 @@ pub async fn load_or_enroll_http(
                 // Rejected (a substituted root, an unverifiable chain) leaves the preplaced bundle
                 // exactly as it was — the leaf is still minted, and boot proceeds on it.
                 let minted = mint_leaf(bootstrap, state_dir).await?;
-                match adopt_bundle(&bundle_path, bootstrap, &minted, &bundle, policy) {
+                match adopt_bundle(&bundle_path, bootstrap, &minted, &bundle, policy).await {
                     Ok(()) => bundle = minted,
                     Err(error) => warn(&format!(
                         "keeping the preplaced enrollment bundle: the one minted with this node's \
@@ -291,7 +304,8 @@ fn warn(message: &str) {
 /// replacing, both need the TUF implementation, which depends on this crate and so cannot be
 /// depended on from here. Inverting it through this trait keeps ONE verification implementation
 /// rather than a weaker second copy on the refresh path.
-pub trait BundlePolicy {
+#[async_trait::async_trait]
+pub trait BundlePolicy: Sync {
     /// Whether `current`'s embedded metadata chain has expired, or is near enough to expiry that the
     /// node should try to replace it now. Asked before any network call, so a node holding fresh
     /// material spends nothing.
@@ -301,7 +315,16 @@ pub trait BundlePolicy {
     /// candidate's complete chain AND that its root is `current`'s pinned root or a rotation signed
     /// by it — otherwise a gateway an attacker controls could hand every node a root of its own and
     /// the enrollment-time pin would be worth nothing.
-    fn accept(&self, candidate: &EnrollmentBundle, current: &EnrollmentBundle) -> io::Result<()>;
+    ///
+    /// Async because a rotation the node was offline for spans several root versions, and the only
+    /// way to check one is against the version before it: the implementation fetches the
+    /// intermediate versioned roots the repository publishes and walks them one verified step at a
+    /// time. That fetch is the reason this is the one policy method that may touch the network.
+    async fn accept(
+        &self,
+        candidate: &EnrollmentBundle,
+        current: &EnrollmentBundle,
+    ) -> io::Result<()>;
 }
 
 /// Replace the node's persisted enrollment bundle when its signed material is aging, and return
@@ -357,7 +380,8 @@ async fn refresh_bundle(
         &candidate,
         current,
         policy,
-    )?;
+    )
+    .await?;
     Ok(Some(candidate))
 }
 
@@ -366,7 +390,8 @@ async fn refresh_bundle(
 /// that has not yet minted its per-node certificate has nothing to ask WITH, and the shared fleet
 /// enrollment cert authenticates the `/enroll` handshake and nothing else.
 fn can_reach_gateway(state_dir: &Path, current: &EnrollmentBundle) -> bool {
-    routing_is_remote(&current.routing_base_url) && joined_cert_path(state_dir).exists()
+    !crate::config::base_url_is_local(&current.routing_base_url)
+        && joined_cert_path(state_dir).exists()
 }
 
 /// Fetch this node's enrollment bundle as of now, authenticated by the per-node certificate it
@@ -396,7 +421,7 @@ async fn fetch_bundle(
 /// The one-way enrollment contract is untouched: the consumed marker is already set and stays set,
 /// and the write is atomic, so the bundle is never absent and this can never re-enable enrollment.
 /// What changes is only WHICH signed material the node keeps.
-fn adopt_bundle(
+async fn adopt_bundle(
     bundle_path: &Path,
     bootstrap: &BootstrapConfig,
     candidate: &EnrollmentBundle,
@@ -411,17 +436,9 @@ fn adopt_bundle(
             candidate.agent_id, bootstrap.enrollment.name
         )));
     }
-    policy.accept(candidate, current)?;
+    policy.accept(candidate, current).await?;
     let bytes = serde_json::to_vec(candidate).map_err(io::Error::other)?;
     foundation::durable::atomic_write_managed(bundle_path, ".enrollment-", &bytes)
-}
-
-/// Whether a routing base URL is a remote gateway (reached over mTLS) rather than a local `file:`
-/// or absolute-path repository read straight from disk. Mirrors the split the secrets client uses
-/// (`SecretManager::initialize`): only a remote deployment ever presents the per-node leaf, so only
-/// it needs one minted.
-fn routing_is_remote(base_url: &str) -> bool {
-    !(base_url.starts_with("file:") || Path::new(base_url).is_absolute())
 }
 
 /// Mint the node's per-node steady-state certificate through the `/enroll` mutual-TLS handshake and
@@ -456,12 +473,11 @@ async fn mint_leaf(bootstrap: &BootstrapConfig, state_dir: &Path) -> io::Result<
     validate_bundle(&enrolled.bundle)?;
     validate_leaf(
         &enrolled.leaf,
-        &enrolled.chain,
         &request.csr,
         &request.name,
         &bootstrap.enrollment.ca,
     )?;
-    persist_leaf(state_dir, &enrolled.leaf, &enrolled.chain)?;
+    persist_leaf(state_dir, &enrolled.leaf)?;
     Ok(enrolled.bundle)
 }
 
@@ -543,22 +559,15 @@ async fn renew_leaf_if_due(bootstrap: &BootstrapConfig, state_dir: &Path) -> io:
     let renewed: RenewalResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
     validate_leaf(
         &renewed.leaf,
-        &renewed.chain,
         &request.csr,
         &bootstrap.enrollment.name,
         &bootstrap.enrollment.ca,
     )?;
-    persist_leaf(state_dir, &renewed.leaf, &renewed.chain)?;
+    persist_leaf(state_dir, &renewed.leaf)?;
     Ok(true)
 }
 
-fn validate_leaf(
-    leaf_pem: &str,
-    chain_pem: &str,
-    csr_pem: &str,
-    expected_name: &str,
-    ca: &Path,
-) -> io::Result<()> {
+fn validate_leaf(leaf_pem: &str, csr_pem: &str, expected_name: &str, ca: &Path) -> io::Result<()> {
     use x509_parser::prelude::FromDer;
 
     let (_, leaf_pem) = x509_parser::pem::parse_x509_pem(leaf_pem.as_bytes())
@@ -588,10 +597,7 @@ fn validate_leaf(
         ));
     }
     let leaf_der = rustls::pki_types::CertificateDer::from(leaf_pem.contents);
-    let intermediates = rustls::pki_types::CertificateDer::pem_slice_iter(chain_pem.as_bytes())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| invalid(&format!("parsing issued certificate chain: {error}")))?;
-    crate::tls::verify_client_chain(leaf_der, &intermediates, ca)?;
+    crate::tls::verify_client_chain(leaf_der, ca)?;
     Ok(())
 }
 
@@ -604,18 +610,12 @@ fn chrono_now_unix() -> i64 {
 
 /// If enrollment has already run (the bundle is present, or the consumed marker is set), return the
 /// loaded bundle (or the consumed-but-missing error) without touching the network; return `None`
-/// when a fresh network enrollment is due. `what` names the mode in the "must not run for existing
-/// local state" error. Shared by both bootstrap modes so the one-way, consumed-once contract is
-/// enforced identically.
-fn load_existing_or_fresh(
-    bundle_path: &Path,
-    what: &'static str,
-) -> Option<io::Result<EnrollmentBundle>> {
+/// when a fresh network enrollment is due. Called only by [`load_or_enroll_http`], the sole
+/// bootstrap entry point, so the one-way, consumed-once contract lives on that one path.
+fn load_existing_or_fresh(bundle_path: &Path) -> Option<io::Result<EnrollmentBundle>> {
     (bundle_path.exists() || consumed_path(bundle_path).exists()).then(|| {
         load_or_enroll(bundle_path, || {
-            Err(invalid(&format!(
-                "{what} must not run for existing local state"
-            )))
+            Err(invalid("enrollment must not run for existing local state"))
         })
     })
 }
@@ -685,23 +685,17 @@ fn durable_key_pem(state_dir: &Path) -> io::Result<String> {
     Ok(key_pem)
 }
 
-/// Durably write the minted leaf (+ any issuer chain below the trusted CA). The key was persisted
-/// earlier by [`durable_key_pem`]; the root/CA itself stays the bootstrap-pinned `ca`.
+/// Durably write the minted leaf. The gateway's CA signs node leaves directly, so the leaf is the
+/// whole client certificate; the key was persisted earlier by [`durable_key_pem`], and the root/CA
+/// itself stays the bootstrap-pinned `ca`.
 ///
 /// A certificate is public — only the key beside it is a secret — so this takes the managed door
-/// and keeps the state directory's own grant, leaving the chain replaceable by an operator step.
-fn persist_leaf(state_dir: &Path, leaf_pem: &str, chain_pem: &str) -> io::Result<()> {
-    let mut cert = leaf_pem.to_string();
-    if !chain_pem.trim().is_empty() {
-        if !cert.ends_with('\n') {
-            cert.push('\n');
-        }
-        cert.push_str(chain_pem);
-    }
+/// and keeps the state directory's own grant, leaving it replaceable by an operator step.
+fn persist_leaf(state_dir: &Path, leaf_pem: &str) -> io::Result<()> {
     foundation::durable::atomic_write_managed(
         &joined_cert_path(state_dir),
         ".agent-crt-",
-        cert.as_bytes(),
+        leaf_pem.as_bytes(),
     )
 }
 
@@ -729,15 +723,13 @@ fn validate_bundle(bundle: &EnrollmentBundle) -> io::Result<()> {
 /// signature, threshold and digest verifies, the enrollment-time root pin gives nothing, and node A
 /// permanently runs node B's product, args, secret mapping and install root. Binding the path to
 /// the identity is what closes it: the control plane publishes each agent's assignment at exactly
-/// `<prefix>/agents/<agent>.json` (`gateway::agent_assignment`, and the API contract), so a bundle
+/// `<prefix>/agents/<agent>.json` (`telemetry::assignment_object_key`, and the API contract), so a
+/// bundle
 /// naming another agent's path is refused whether or not that path is genuinely signed.
 ///
 /// [`AgentDocument`]: updated_contracts::artifact::AgentDocument
 fn assignment_names_its_own_agent(bundle: &EnrollmentBundle) -> io::Result<()> {
-    if bundle
-        .assignment
-        .strip_suffix(".json")
-        .and_then(|path| path.rsplit_once("/agents/"))
+    if updated_contracts::telemetry::split_assignment_path(&bundle.assignment)
         .is_some_and(|(_, agent)| agent == bundle.agent_id)
     {
         return Ok(());
@@ -780,6 +772,7 @@ fn invalid_error(error: serde_json::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
     use rcgen::{
         CertificateParams, CertificateSigningRequestParams, DnType, ExtendedKeyUsagePurpose, IsCa,
         KeyPair, KeyUsagePurpose,
@@ -874,7 +867,9 @@ mod tests {
     struct FixedPolicy {
         stale: bool,
         verdict: Result<(), &'static str>,
-        consulted: Cell<bool>,
+        /// Atomic rather than a `Cell` only because the policy is consulted through a `&dyn` that
+        /// crosses an await point and so must be `Sync`.
+        consulted: std::sync::atomic::AtomicBool,
     }
 
     impl FixedPolicy {
@@ -882,28 +877,33 @@ mod tests {
             Self {
                 stale: true,
                 verdict: Ok(()),
-                consulted: Cell::new(false),
+                consulted: std::sync::atomic::AtomicBool::new(false),
             }
         }
         fn refusing() -> Self {
             Self {
                 stale: true,
                 verdict: Err("substituted root of trust"),
-                consulted: Cell::new(false),
+                consulted: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+        fn consulted(&self) -> bool {
+            self.consulted.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
+    #[async_trait::async_trait]
     impl BundlePolicy for FixedPolicy {
         fn needs_refresh(&self, _current: &EnrollmentBundle) -> bool {
             self.stale
         }
-        fn accept(
+        async fn accept(
             &self,
             _candidate: &EnrollmentBundle,
             _current: &EnrollmentBundle,
         ) -> io::Result<()> {
-            self.consulted.set(true);
+            self.consulted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.verdict.map_err(invalid)
         }
     }
@@ -934,14 +934,20 @@ mod tests {
         write_current();
         let candidate = bundle_for("agent-a", "rotated");
         let policy = FixedPolicy::accepting();
-        adopt_bundle(&path, &bootstrap, &candidate, &current, &policy).unwrap();
-        assert!(policy.consulted.get());
+        block_on(adopt_bundle(
+            &path, &bootstrap, &candidate, &current, &policy,
+        ))
+        .unwrap();
+        assert!(policy.consulted());
         assert_eq!(held(), candidate.routing_root);
 
         // Refused by the trust policy: nothing is written.
         write_current();
         let policy = FixedPolicy::refusing();
-        let error = adopt_bundle(&path, &bootstrap, &candidate, &current, &policy).unwrap_err();
+        let error = block_on(adopt_bundle(
+            &path, &bootstrap, &candidate, &current, &policy,
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("substituted root of trust"));
         assert_eq!(held(), current.routing_root);
 
@@ -950,9 +956,10 @@ mod tests {
         write_current();
         let foreign = bundle_for("agent-b", "rotated");
         let policy = FixedPolicy::accepting();
-        let error = adopt_bundle(&path, &bootstrap, &foreign, &current, &policy).unwrap_err();
+        let error =
+            block_on(adopt_bundle(&path, &bootstrap, &foreign, &current, &policy)).unwrap_err();
         assert!(error.to_string().contains("agent-b"));
-        assert!(!policy.consulted.get());
+        assert!(!policy.consulted());
         assert_eq!(held(), current.routing_root);
     }
 
@@ -971,6 +978,32 @@ mod tests {
         let mut local = remote.clone();
         local.routing_base_url = "file:///var/lib/updates/".into();
         assert!(!can_reach_gateway(dir.path(), &local));
+    }
+
+    /// A bundle naming another agent must be refused however long this node has been enrolled. The
+    /// mint path is the obvious place it appears, but the dangerous one is a bundle swapped under a
+    /// node that already holds its leaf: minting is skipped there, and the refresh path's identity
+    /// rule is both conditional on aging material and warned away rather than propagated. Boot must
+    /// fail closed, before any of the foreign agent's assignment is resolved.
+    #[test]
+    fn a_bundle_naming_another_agent_fails_the_boot_even_after_the_leaf_is_minted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = bootstrap_for(dir.path(), "agent-a");
+        let foreign = bundle_for("agent-b", "pinned");
+        std::fs::write(
+            bundle_path(dir.path()),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        // The node has already enrolled, so nothing on this boot would mint a leaf.
+        std::fs::write(joined_cert_path(dir.path()), "leaf").unwrap();
+
+        let policy = FixedPolicy::accepting();
+        let error = block_on(load_or_enroll_http(&bootstrap, dir.path(), &policy)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("agent-b"), "{error}");
+        // Refused on identity alone: no gateway was asked anything.
+        assert!(!policy.consulted());
     }
 
     fn write_bootstrap(dir: &Path, body: &str) -> PathBuf {
@@ -1070,11 +1103,11 @@ mod tests {
         std::fs::write(&ca_path, &ca_pem).unwrap();
         let csr = crate::csr::csr_for(&crate::csr::generate_key().unwrap(), "test").unwrap();
         let leaf = issue_test_leaf(&ca_pem, &ca_key, &csr, "agent-7");
-        validate_leaf(&leaf, "", &csr, "agent-7", &ca_path).unwrap();
+        validate_leaf(&leaf, &csr, "agent-7", &ca_path).unwrap();
 
         let (wrong_ca, _) = test_ca();
         std::fs::write(&ca_path, wrong_ca).unwrap();
-        assert!(validate_leaf(&leaf, "", &csr, "agent-7", &ca_path).is_err());
+        assert!(validate_leaf(&leaf, &csr, "agent-7", &ca_path).is_err());
     }
 
     /// The body of the named item in this module's own source, by brace matching from its first
