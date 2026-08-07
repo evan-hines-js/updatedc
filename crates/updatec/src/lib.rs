@@ -88,17 +88,6 @@ pub struct UpdateGroupSpec {
 pub struct GroupOutputReference {
     pub group: String,
     pub output: String,
-    /// Selection is explicit so updatedc never guesses how to combine several producers.
-    #[serde(default)]
-    pub aggregation: OutputAggregation,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum OutputAggregation {
-    /// The producing group must select exactly one node.
-    #[default]
-    One,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -704,6 +693,12 @@ pub enum PlanError {
     ReservedGroupName,
     /// The planned generation would publish no assignment for a node that already has one.
     RoutingLoss(Vec<String>),
+    /// A node carried forward on its last routing has no deployment body the control plane can
+    /// still resolve, so where it actually stands is unknown and nothing may be published for it.
+    UnknownPlacement {
+        node: String,
+        group: String,
+    },
     DuplicateNode(String),
     MissingDependency {
         group: String,
@@ -943,7 +938,10 @@ pub(crate) fn build_publication_plan(
         if references.contains_key(&id) {
             continue;
         }
-        let config = target(format!("{prefix}/configs/{id}.json"), bytes);
+        let config = target(
+            updated_contracts::telemetry::config_object_key(prefix, &id),
+            bytes,
+        );
         references.insert(
             id,
             ExactTarget {
@@ -962,7 +960,10 @@ pub(crate) fn build_publication_plan(
         };
         let bytes = serde_json::to_vec(&assignment)
             .map_err(|error| PlanError::Serialize(error.to_string()))?;
-        targets.push(target(format!("{prefix}/agents/{node}.json"), bytes));
+        targets.push(target(
+            updated_contracts::telemetry::assignment_object_key(prefix, node),
+            bytes,
+        ));
         node_assignments.insert(node.clone(), id);
     }
     targets.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1388,7 +1389,6 @@ mod tests {
             GroupOutputReference {
                 group: "a".into(),
                 output: "endpoint".into(),
-                aggregation: OutputAggregation::One,
             },
         );
         assert_eq!(
@@ -1418,7 +1418,6 @@ mod tests {
             GroupOutputReference {
                 group: "a".into(),
                 output: "endpoint".into(),
-                aggregation: OutputAggregation::One,
             },
         );
         assert_eq!(
@@ -1454,7 +1453,6 @@ mod tests {
                 GroupOutputReference {
                     group: "a".into(),
                     output: "endpoint".into(),
-                    aggregation: OutputAggregation::One,
                 },
             );
         }
@@ -1465,7 +1463,6 @@ mod tests {
             GroupOutputReference {
                 group: "a".into(),
                 output: "endpoint".into(),
-                aggregation: OutputAggregation::One,
             },
         );
         assert_eq!(

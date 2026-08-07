@@ -24,7 +24,6 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 # The pinned per-node public key is carried in config as hex (the enrollment EC point).
 hex = { workspace = true }
-rustls = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 # The first load-balancer backend programs Kubernetes EndpointSlices; kube-proxy forwards.

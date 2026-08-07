@@ -108,11 +108,65 @@ pub fn node_from_path(request_path: &str) -> Option<&str> {
     let node = request_path
         .strip_prefix(REPORT_PATH_PREFIX)?
         .strip_suffix(".json")?;
-    // Traversal safety is the shared component check; on top of that a report node is
-    // a URL segment and a clean identity, so it additionally forbids `.` (any dot, not just `.`/`..`)
-    // and the URL-significant `% ? #`.
-    let safe = crate::path::is_safe_component(node) && !node.contains(['.', '%', '?', '#']);
-    safe.then_some(node)
+    is_valid_node(node).then_some(node)
+}
+
+/// The segment that separates a routing-assignment prefix from the node it addresses. The control
+/// plane publishes each node's assignment at exactly `<prefix>/agents/<node>.json`.
+pub const ASSIGNMENT_AGENTS_SEGMENT: &str = "/agents/";
+
+/// The segment that separates a routing-assignment prefix from the content-addressed deployment
+/// document the node's assignment points at: `<prefix>/configs/<id>.json`.
+pub const ASSIGNMENT_CONFIGS_SEGMENT: &str = "/configs/";
+
+/// The routing-assignment target a node's document is published at, `<prefix>/agents/<node>.json`,
+/// tolerant of stray slashes on the prefix. The one writer of that layout — every control plane
+/// that signs assignments names them with this, and [`split_assignment_path`] is the only reader —
+/// so what is signed, what is served, and what a node believes is its own identity cannot drift.
+pub fn assignment_object_key(prefix: &str, node: &str) -> String {
+    format!(
+        "{}{ASSIGNMENT_AGENTS_SEGMENT}{node}.json",
+        prefix.trim_matches('/')
+    )
+}
+
+/// The deployment-document target an assignment references, `<prefix>/configs/<id>.json`, where
+/// `id` is the SHA-256 of the exact published bytes. Same layout ownership as
+/// [`assignment_object_key`].
+pub fn config_object_key(prefix: &str, id: &str) -> String {
+    format!(
+        "{}{ASSIGNMENT_CONFIGS_SEGMENT}{id}.json",
+        prefix.trim_matches('/')
+    )
+}
+
+/// Split a routing-assignment target path (`<prefix>/agents/<node>.json`) into its prefix and the
+/// node it addresses, rejecting anything that is not a valid node identity. The one reader of the
+/// layout [`assignment_object_key`] writes: the identity a node reports under, the identity an
+/// enrollment bundle's assignment must name, and the prefix a publisher derives sibling keys from
+/// are all the same fact, and must be read the same way.
+pub fn split_assignment_path(assignment: &str) -> Option<(&str, &str)> {
+    let (prefix, node) = assignment
+        .strip_suffix(".json")?
+        .rsplit_once(ASSIGNMENT_AGENTS_SEGMENT)?;
+    (!prefix.is_empty() && is_valid_node(node)).then_some((prefix, node))
+}
+
+/// The one grammar a node identity must satisfy. Traversal safety is the shared component check
+/// ([`crate::path::is_safe_component`]); on top of that a report node is a URL segment and a clean
+/// identity, so it additionally forbids `.` (any dot, not just `.`/`..`) and the URL-significant
+/// `% ? #`.
+///
+/// This is the predicate, not a copy of it: [`node_from_path`] gates the write path on it, and any
+/// component that *configures* node identities (the health proxy's member inventory) validates
+/// against the same function at startup. A name only one side accepts is a node whose report can
+/// never be stored where the other side looks for it — drained from rotation forever behind a log
+/// line indistinguishable from a genuinely unhealthy node — so there is exactly one definition.
+///
+/// Length is deliberately unbounded here: the identity is bounded downstream by the object key and
+/// URL it forms, and no hop imposes a shorter limit than those.
+pub fn is_valid_node(node: &str) -> bool {
+    crate::path::is_safe_component(node) && !node.contains(['.', '%', '?', '#'])
 }
 
 /// An opaque measurement of node state produced by the signed reconciler's `fingerprint` phase.
@@ -125,6 +179,35 @@ pub struct Fingerprint {
     /// SHA-256 of the exact stdout bytes emitted by one successful fingerprint invocation.
     pub output_sha256: String,
 }
+
+/// The one bound on a published report, stated in the units it actually crosses the wire in: the
+/// bytes of the signed DSSE envelope. Every hop enforces exactly this number — the gateway's and
+/// the dev CDN's request-body limits on the write, the healthproxy's bounded read on the way back —
+/// so there is no size a node may sign that some hop then refuses.
+///
+/// This matters because a rejected write is silent and permanent in effect: report writes are
+/// best-effort and never retried, and outputs ride only on *healthy* reports, so a node whose
+/// healthy report is too large keeps publishing nothing while its last unhealthy report stands, and
+/// it is drained from rotation forever while being perfectly healthy. The writer-side bound is
+/// therefore derived from this one ([`MAX_OUTPUT_MANIFEST_BYTES`]) rather than written beside it.
+pub const MAX_REPORT_ENVELOPE_BYTES: usize = 64 * 1024;
+
+/// What one signed envelope costs on top of the output manifest it carries, worst case: base64
+/// expands the whole report payload by 4/3 with padding, and on top of that sit the envelope's JSON
+/// scaffolding, the payload type, the base64 signature and keyid, and every report field that is
+/// not the manifest (node and deployment identities, two digests, the timestamp, the fingerprint).
+/// Reserved generously — the cost of reserving too much is a slightly smaller manifest allowance,
+/// the cost of reserving too little is a node that can never publish.
+const REPORT_ENVELOPE_OVERHEAD_BYTES: usize = 8 * 1024;
+
+/// The largest output manifest a node may attach to a report — the writer-side bound, derived so
+/// the WORST-CASE signed envelope for a manifest of exactly this size still fits
+/// [`MAX_REPORT_ENVELOPE_BYTES`] after base64 expansion and envelope overhead. Enforced by
+/// `supervisor::telemetry::load_outputs` before a manifest is ever attached, and asserted against
+/// a real signed envelope by this module's tests, so the two bounds cannot drift into agreeing on
+/// a number while disagreeing on its units.
+pub const MAX_OUTPUT_MANIFEST_BYTES: usize =
+    (MAX_REPORT_ENVELOPE_BYTES - REPORT_ENVELOPE_OVERHEAD_BYTES) * 3 / 4;
 
 /// Small, typed dataflow values emitted by a reconciler for dependent groups. The manifest is
 /// carried inside the node's signed report, so its producer identity, deployment, running archive,
@@ -574,6 +657,77 @@ mod tests {
         assert!(report_is_authentic_and_fresh(&malformed, "agent-9", &point, now_ms()).is_none());
     }
 
+    /// The writer-side allowance and the reader-side body limit must be the SAME bound, not the
+    /// same number in two different units. A manifest of exactly [`MAX_OUTPUT_MANIFEST_BYTES`],
+    /// attached to a report whose every other field is at its worst-case length, must sign into an
+    /// envelope that still fits [`MAX_REPORT_ENVELOPE_BYTES`] after base64 expansion — otherwise a
+    /// perfectly healthy node publishes nothing (writes are best-effort and never retried, and
+    /// outputs ride only on healthy reports) and is drained from rotation forever.
+    #[test]
+    fn the_worst_case_envelope_for_a_max_size_manifest_fits_the_body_limit() {
+        let size = |manifest: &OutputManifest| serde_json::to_vec(manifest).unwrap().len();
+        let mut manifest = OutputManifest {
+            schema: OutputManifest::SCHEMA,
+            values: BTreeMap::new(),
+        };
+        // Fill to the cap with maximum-length values, then top the last one up so the manifest is
+        // exactly at the bound rather than merely near it.
+        for index in 0.. {
+            let mut candidate = manifest.clone();
+            candidate.values.insert(
+                format!("output-{index:03}"),
+                OutputValue::String {
+                    value: "x".repeat(OutputManifest::MAX_STRING_BYTES),
+                },
+            );
+            if size(&candidate) > MAX_OUTPUT_MANIFEST_BYTES {
+                break;
+            }
+            manifest = candidate;
+        }
+        let name = "output-top".to_string();
+        let mut probe = manifest.clone();
+        probe.values.insert(
+            name.clone(),
+            OutputValue::String {
+                value: String::new(),
+            },
+        );
+        let fill = MAX_OUTPUT_MANIFEST_BYTES - size(&probe);
+        manifest.values.insert(
+            name,
+            OutputValue::String {
+                value: "x".repeat(fill),
+            },
+        );
+        assert_eq!(size(&manifest), MAX_OUTPUT_MANIFEST_BYTES);
+        manifest
+            .validate()
+            .expect("a manifest at the byte cap must be a valid one a node can actually attach");
+
+        // Worst case around it: the longest identities and every optional field present.
+        let mut report = NodeReport::new(
+            "n".repeat(253),
+            "d".repeat(253),
+            OTHER_DIGEST,
+            "1.2.3-rc.1+build.9999",
+            DIGEST,
+            true,
+        );
+        report.fingerprint = Some(Fingerprint {
+            definition_sha256: DIGEST.into(),
+            output_sha256: OTHER_DIGEST.into(),
+        });
+        report.outputs = Some(manifest);
+        let (pkcs8, _) = keypair();
+        let envelope = serde_json::to_vec(&sign_report(&report, &pkcs8).unwrap()).unwrap();
+        assert!(
+            envelope.len() <= MAX_REPORT_ENVELOPE_BYTES,
+            "a max-size manifest signs into a {}-byte envelope, past the {MAX_REPORT_ENVELOPE_BYTES}-byte limit every reader enforces",
+            envelope.len()
+        );
+    }
+
     #[test]
     fn typed_outputs_are_bounded_and_covered_by_the_report_signature() {
         let (envelope, point) = signed(|report| {
@@ -826,6 +980,30 @@ mod tests {
     #[test]
     fn report_key_is_namespaced_by_node() {
         assert_eq!(report_object_key("agent-7"), "telemetry/agent-7.json");
+    }
+
+    #[test]
+    fn the_assignment_layout_round_trips_and_rejects_foreign_paths() {
+        assert_eq!(
+            assignment_object_key("/assignments/", "agent-7"),
+            "assignments/agents/agent-7.json"
+        );
+        assert_eq!(
+            config_object_key("assignments", &"a".repeat(64)),
+            format!("assignments/configs/{}.json", "a".repeat(64))
+        );
+        assert_eq!(
+            split_assignment_path(&assignment_object_key("assignments", "agent-7")),
+            Some(("assignments", "agent-7"))
+        );
+        // No prefix, no node identity, and no `.json` are each not this layout.
+        assert_eq!(split_assignment_path("/agents/agent-7.json"), None);
+        assert_eq!(split_assignment_path("assignments/agents/.json"), None);
+        assert_eq!(split_assignment_path("assignments/agents/agent-7"), None);
+        assert_eq!(
+            split_assignment_path("assignments/configs/agent-7.json"),
+            None
+        );
     }
 
     #[test]

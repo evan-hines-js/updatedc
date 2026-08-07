@@ -95,18 +95,7 @@ impl Supervisor {
     /// recycled-PID hazard `kill_tree` was built to remove, one layer up: a caller that observed
     /// the exit and then stopped us would signal whatever the kernel handed that number to next.
     pub fn stop(&mut self) {
-        let _ = self.child.request_stop();
-        let deadline = Instant::now() + self.stop_grace;
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(POLL),
-                Err(_) => break,
-            }
-        }
-        // Grace expired: hard-kill the whole supervisor tree, not just the root child.
-        let _ = self.child.kill_tree();
-        let _ = self.child.wait();
+        let _ = self.child.stop(self.stop_grace);
     }
 }
 

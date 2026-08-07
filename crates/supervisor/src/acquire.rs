@@ -1,31 +1,29 @@
-//! Shared application acquisition core.
+//! Application acquisition: everything before activation.
 //!
-//! The supervised and update-before-launch front ends intentionally own different
-//! process lifecycles. Everything before activation is identical and lives here:
-//! exact assignment selection, policy authorization, rejection filtering, verified
-//! download, and bounded bundle installation.
+//! The supervised and update-before-launch front ends own different process lifecycles, but the
+//! steps up to activation are identical and live here: exact assignment selection, policy
+//! authorization, rejection filtering, verified download, and bounded bundle installation.
 
 use std::io;
 
 use updated::bundle::{ExpectedBundle, InstallError, ReleaseId, StagedRelease};
-use updated::config::{Application, Paths, Repository};
+use updated::config::{Application, Paths};
 use updated::provider::BundleStore;
 use updated_tuf::select::target_sha;
 use updated_tuf::{DefaultPolicy, TrustedRepository, VerifiedTarget};
 
-pub struct ApplicationRequest<'a> {
-    pub repository: &'a TrustedRepository,
-    pub application: &'a Application,
-    pub repository_config: &'a Repository,
-    pub paths: &'a Paths,
-    pub current_version: Option<&'a str>,
+pub(crate) struct ApplicationRequest<'a> {
+    pub(crate) repository: &'a TrustedRepository,
+    pub(crate) application: &'a Application,
+    pub(crate) paths: &'a Paths,
+    pub(crate) current_version: Option<&'a str>,
 }
 
 #[derive(Debug)]
-pub struct PreparedApplication {
-    pub release: ReleaseId,
-    pub version: String,
-    pub archive_sha256: String,
+pub(crate) struct PreparedApplication {
+    pub(crate) release: ReleaseId,
+    pub(crate) version: String,
+    pub(crate) archive_sha256: String,
     /// The provider set signed into the version actually selected, or `None` at the assigned head
     /// (where the assignment's own `provider_set` governs).
     ///
@@ -33,11 +31,11 @@ pub struct PreparedApplication {
     /// caller staged providers for — ordered fallback skips bundles rejected since — and a caller
     /// that cannot see which version it really got would pair an application with another
     /// version's providers.
-    pub provider_set: Option<updated_tuf::TargetReference>,
+    pub(crate) provider_set: Option<updated_tuf::TargetReference>,
 }
 
 #[derive(Debug)]
-pub enum PrepareError {
+pub(crate) enum PrepareError {
     Repository(updated_tuf::Error),
     /// The archive is bad, and these bytes may be rejected durably. Constructed only from
     /// [`updated::bundle::InstallError::Archive`].
@@ -52,7 +50,7 @@ pub enum PrepareError {
 }
 
 #[derive(Debug)]
-pub enum AcquireBundleError {
+pub(crate) enum AcquireBundleError {
     Repository(updated_tuf::Error),
     /// The archive is bad: the only variant a caller may turn into a durable rejection.
     Invalid {
@@ -90,7 +88,7 @@ impl PrepareError {
     /// A rejection is durable and never expires, so this is deliberately answerable only from
     /// the one variant built out of evidence about the archive: a transport failure, a local
     /// staging failure, or a drifted committed tree can never reach it.
-    pub fn rejected_archive(&self) -> Option<(&str, &str)> {
+    pub(crate) fn rejected_archive(&self) -> Option<(&str, &str)> {
         match self {
             Self::Bundle {
                 version,
@@ -127,7 +125,7 @@ impl std::error::Error for PrepareError {
 ///
 /// `Ok(None)` means the current version is already desired or these exact bytes were
 /// previously rejected. Activation and rejection persistence remain front-end policy.
-pub async fn prepare_assigned_application(
+pub(crate) async fn prepare_assigned_application(
     request: ApplicationRequest<'_>,
     mut is_rejected: impl FnMut(&str) -> bool,
 ) -> Result<Option<PreparedApplication>, PrepareError> {
@@ -149,8 +147,8 @@ pub async fn prepare_assigned_application(
         return Ok(None);
     };
     let platform = foundation::platform::platform_key();
-    let store = BundleStore::for_app(request.paths)
-        .with_target_limit(request.repository_config.target_limit);
+    let store =
+        BundleStore::for_app(request.paths).with_target_limit(request.repository.target_limit());
     let StagedRelease { id, .. } = acquire_verified_bundle(
         request.repository,
         &selected.target,
@@ -189,7 +187,7 @@ pub async fn prepare_assigned_application(
 /// The store already separates a verdict on the archive from a failure of this node; that split
 /// is carried through here rather than flattened, because the caller turns one of them into a
 /// permanent, never-expiring rejection of the release.
-pub async fn acquire_verified_bundle(
+pub(crate) async fn acquire_verified_bundle(
     repository: &TrustedRepository,
     target: &VerifiedTarget,
     destination: &std::path::Path,

@@ -42,6 +42,7 @@ pub struct Sup {
     args: Vec<String>,
     check_interval: Option<String>,
     health_grace: Option<String>,
+    drain_hold: Option<String>,
     health_successes: u32,
     confirmation_window: Option<String>,
     retry_after: Option<String>,
@@ -95,6 +96,7 @@ impl Sup {
             args: command.into_iter().skip(1).collect(),
             check_interval: None,
             health_grace: None,
+            drain_hold: None,
             health_successes: 1,
             confirmation_window: None,
             retry_after: None,
@@ -149,6 +151,13 @@ impl Sup {
     }
     pub fn health_grace(mut self, s: &str) -> Self {
         self.health_grace = Some(s.into());
+        self
+    }
+    /// How long the built-in drain holds after readiness is withdrawn and before the running
+    /// release is stopped. Unset means no hold at all (stop immediately), which is what every
+    /// scenario but the zero-downtime ones wants: it keeps their upgrades prompt.
+    pub fn drain_hold(mut self, s: &str) -> Self {
+        self.drain_hold = Some(s.into());
         self
     }
     pub fn health_successes(mut self, successes: u32) -> Self {
@@ -294,9 +303,7 @@ impl Sup {
             &product,
             "1.0.0",
             &self.platform,
-            &updated::bundle::Entrypoints {
-                entrypoint: &entrypoint,
-            },
+            &entrypoint,
         )
         .map_err(str_err)?;
         let staged = updated::provider::BundleStore::for_lifecycle(paths)
@@ -414,7 +421,7 @@ impl Sup {
                     self.supervisor_check_interval.as_ref(),
                     3600,
                 )?,
-                drain_hold_seconds: Some(0),
+                drain_hold_seconds: Some(seconds(self.drain_hold.as_ref(), 0)?),
             },
         };
         std::fs::write(
@@ -500,7 +507,7 @@ impl Sup {
             &self.product,
             "1.0.0",
             &format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            &updated::bundle::Entrypoints::new(&entrypoint),
+            &entrypoint,
         )
         .map_err(str_err)?;
         let staged = updated::provider::BundleStore::for_app(&paths)
@@ -518,7 +525,7 @@ impl Sup {
             "{}metadata/",
             self.repository_base_url
         ));
-        updated::state::enroll(&paths.state, lineage.clone()).map_err(str_err)?;
+        updated::state::enroll(&paths.state).map_err(str_err)?;
         // Carry the same signed provider set the published assignment references, so the seeded
         // predecessor is faithful to a cold-installed node (install stages its providers). Without
         // this the first update's rollback restores a predecessor with no providers to replay.

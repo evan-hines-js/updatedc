@@ -13,6 +13,12 @@ use windows_sys::Win32::Foundation::HANDLE;
 /// A launched application process, assigned to a kill-on-close Job Object so it dies with
 /// the guardian — never an orphan, never a duplicate. There is no re-adoption across a
 /// guardian restart.
+///
+/// The job holds the whole tree, not just the leader: workers the leader spawns inherit its
+/// membership, so they outlive the leader's own exit and are reachable — and killable — only
+/// through this handle. Every way this handle ends ([`stop`](crate::sys::Process::stop) or a
+/// plain drop) therefore takes the job down with it, which is the same guarantee the Unix
+/// adapter gets from its process group.
 struct Proc {
     pid: u32,
     process: HANDLE,
@@ -92,6 +98,32 @@ impl Proc {
             })
         }
     }
+
+    /// How many processes are still in the application's job object, or `None` if the job
+    /// could not be queried.
+    ///
+    /// This is the Windows counterpart of the Unix adapter's `group_alive`: it counts the
+    /// whole tree, so a leader that has exited while its workers keep draining still reads as
+    /// active. An exited-but-unclosed leader does not inflate the count — a job's
+    /// `ActiveProcesses` drops as each member terminates, regardless of who still holds a
+    /// handle to it.
+    fn job_active_processes(&self) -> Option<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+        unsafe {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+            let ok = QueryInformationJobObject(
+                self.job,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            );
+            (ok != 0).then_some(info.ActiveProcesses)
+        }
+    }
 }
 
 impl crate::sys::Process for Proc {
@@ -122,32 +154,57 @@ impl crate::sys::Process for Proc {
     /// `SIGTERM`→wait→`SIGKILL` path so a planned update/stop gets the same graceful window
     /// on every target rather than an abrupt kill.
     ///
+    /// The window is the job's, not the leader's. A launcher-style application forwards the
+    /// `CTRL_BREAK` to its workers and its leader exits immediately, and those workers finishing
+    /// their in-flight work are exactly what the operator configured the grace for — so the wait
+    /// ends on the *job* draining, never on the leader's own exit, which would truncate the drain
+    /// to whatever fraction of the window happened to have elapsed and then hand the still-running
+    /// workers straight to the kill-on-close job handle in [`Drop`]. This is the same contract the
+    /// Unix adapter states for its process group.
+    ///
     /// NOTE: needs Windows CI validation — this host cannot compile or exercise the
     /// `CREATE_NEW_PROCESS_GROUP` + `CTRL_BREAK_EVENT` interaction.
     fn stop(&mut self, grace: Duration) {
         use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        if self.poll_exit().is_some() {
-            return;
-        }
+        // Stopping is once-only: `App::stop` takes the `Proc` out of the `App` and drops it as
+        // soon as this returns, so there is no second stop to guard against.
+        //
         // Graceful: the app was spawned `CREATE_NEW_PROCESS_GROUP`, so its process-group id
         // equals its PID; `CTRL_BREAK` lets it run its shutdown handler. (`CTRL_C` cannot be
         // targeted at a specific group, so `CTRL_BREAK` is the one usable graceful signal.)
+        // PID-reuse is not a hazard here even if the leader has already exited: we still hold
+        // its process handle, and Windows keeps a PID reserved while any handle to it is open.
         unsafe {
             GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid);
         }
         let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if self.poll_exit().is_some() {
-                return;
+        loop {
+            // Latch the leader's exit code if it has one, but never end the window on it.
+            self.poll_exit();
+            match self.job_active_processes() {
+                // The whole tree is gone; the job has nothing left to kill.
+                Some(0) => break,
+                Some(_) => {}
+                // The job could not be queried, so the leader's handle is the only signal we
+                // have left. Falling back to it can truncate a worker drain, but it is better
+                // than spending the entire grace on an app that is already gone.
+                None => {
+                    if self.exited.is_some() {
+                        break;
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                // Hard fallback: kill the whole job.
+                unsafe {
+                    TerminateJobObject(self.job, 1);
+                    WaitForSingleObject(self.process, 5_000);
+                }
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
-        }
-        // Hard fallback: kill the whole job.
-        unsafe {
-            TerminateJobObject(self.job, 1);
-            WaitForSingleObject(self.process, 5_000);
         }
         self.exited.get_or_insert(1);
     }
@@ -156,7 +213,11 @@ impl crate::sys::Process for Proc {
 impl Drop for Proc {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::CloseHandle;
-        // Closing the kill-on-close job ends the app: on guardian exit that is intended.
+        // Closing the kill-on-close job ends the app: on guardian exit that is intended. For a
+        // `Proc` dropped while the application is still running this is the only thing that
+        // stops it; a completed stop has already drained or terminated the job, so nothing that
+        // was still working is cut short here (bar the query-failed fallback, which has no way
+        // to tell either).
         unsafe {
             CloseHandle(self.process);
             CloseHandle(self.job);

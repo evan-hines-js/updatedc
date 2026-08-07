@@ -135,7 +135,7 @@ impl Demo {
         if requested != &self.release {
             return Err("release declaration does not match the advertised signed target".into());
         }
-        self.publisher.publish(requested).await
+        self.publisher.publish().await
     }
 
     pub(crate) async fn version(&self) -> Result<String, reqwest::Error> {

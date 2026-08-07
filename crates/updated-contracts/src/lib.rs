@@ -17,8 +17,9 @@ pub mod reconciler;
 pub mod telemetry;
 
 /// Deserialize a nullable value while still requiring the field to be present. Serialized
-/// contracts use this for deliberate nullability without silently accepting an older shape.
-pub(crate) fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+/// contracts and durable records use this for deliberate nullability without silently accepting
+/// an older shape — serde otherwise treats a missing `Option<T>` as `None`.
+pub fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de>,
@@ -57,10 +58,6 @@ mod dependency_isolation {
         ("bootstrap", include_str!("../../bootstrap/Cargo.toml")),
         ("updated", include_str!("../../updated/Cargo.toml")),
         ("updated-tuf", include_str!("../../updated-tuf/Cargo.toml")),
-        (
-            "update-client",
-            include_str!("../../update-client/Cargo.toml"),
-        ),
         ("supervisor", include_str!("../../supervisor/Cargo.toml")),
         ("updatec", include_str!("../../updatec/Cargo.toml")),
         (

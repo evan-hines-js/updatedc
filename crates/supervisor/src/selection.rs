@@ -157,8 +157,8 @@ pub(crate) async fn stage_providers(
         .ok_or_else(|| unusable("node reconciler metadata has no version".into()))?;
     let platform = foundation::platform::platform_key();
     let provider_store = updated::provider::BundleStore::for_lifecycle(&opts.paths)
-        .with_target_limit(opts.repository.target_limit);
-    let staged_bundle = update_client::acquire_verified_bundle(
+        .with_target_limit(repo.target_limit());
+    let staged_bundle = crate::acquire::acquire_verified_bundle(
             repo,
             &target,
             &opts.paths.provider_download,
@@ -172,7 +172,7 @@ pub(crate) async fn stage_providers(
         .await
         .map_err(|error| {
             // Only invalid *content* is a verdict on the bundle; a failed acquisition is transient.
-            if matches!(&error, update_client::AcquireBundleError::Invalid { .. }) {
+            if matches!(&error, crate::acquire::AcquireBundleError::Invalid { .. }) {
                 if let Err(reject_error) = store.reject(&lineage, &sha) {
                     return unusable(format!("staging node reconciler failed: {error}; recording its rejection also failed: {reject_error}"));
                 }
@@ -230,11 +230,10 @@ pub(crate) async fn check_application(
     // releases, and the provider revision is naturally picked up by the next application release.
     // Every provider is now present before downloading the application. Nothing
     // below this point writes transaction intent or touches the live deployment.
-    let prepared = match update_client::prepare_assigned_application(
-        update_client::ApplicationRequest {
+    let prepared = match crate::acquire::prepare_assigned_application(
+        crate::acquire::ApplicationRequest {
             repository: repo,
             application: &opts.application,
-            repository_config: &opts.repository,
             paths: &opts.paths,
             current_version: ordered_current,
         },

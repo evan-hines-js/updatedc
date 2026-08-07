@@ -65,7 +65,7 @@ Control plane /enroll handler (mTLS, client cert REQUIRED):
   - create/patch UpdateAgent { identity: Enrolled, registration_sha256, public_key,
       labels += repository.enrollment.labels }   (idempotent, 409-tolerant)
   - assemble EnrollmentBundle (shared with the operator's published enrollment Secret)
-  - respond { leaf, chain, bundle }
+  - respond { leaf, bundle }
 
 Node:
   - persist agent.key (0600) + agent.crt to state dir
@@ -168,7 +168,7 @@ There is a single fleet CA, provisioned by cert-manager as a self-signed `Issuer
 - `enrollment.rs` — `EnrollmentBootstrap { url, ca, name, client_cert, client_key }`,
   `deny_unknown_fields` (a stale `group_id`/`nonce`/`token` field fails loudly).
   `EnrollmentRequest { name, csr }` + `name_is_wellformed`; `EnrollResponse { leaf,
-  chain, bundle }`. `load_or_enroll_http` is the single mTLS enroll flow.
+  bundle }`. `load_or_enroll_http` is the single mTLS enroll flow.
 - `csr.rs` — durable keypair + CSR generation (`rcgen`).
 
 **`crates/updatec` (control plane)**

@@ -82,7 +82,13 @@ pub fn run_artifact(artifact: &'static str) {
     VERSION.set(loaded).expect("version set once");
     ARTIFACT.set(artifact).expect("artifact set once");
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let fault = flag(&args, "--fault")
+    // `<flag> <value>`, the only form anything launches this fixture with.
+    let flag = |name: &str| {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|at| args.get(at + 1).cloned())
+    };
+    let fault = flag("--fault")
         .map(|value| Fault::parse(&value))
         .transpose()
         .unwrap_or_else(|error| {
@@ -95,7 +101,7 @@ pub fn run_artifact(artifact: &'static str) {
         eprintln!("sampleapp {}: injected exit before bind", version());
         std::process::exit(17);
     }
-    let addr = flag(&args, "--addr").unwrap_or_else(|| "127.0.0.1:9090".into());
+    let addr = flag("--addr").unwrap_or_else(|| "127.0.0.1:9090".into());
     let addr: SocketAddr = match addr.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -212,17 +218,4 @@ fn handle(mut stream: TcpStream) {
         eprintln!("sampleapp {}: explicitly triggered test crash", version());
         std::process::exit(1);
     }
-}
-
-fn flag(args: &[String], name: &str) -> Option<String> {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == name {
-            return it.next().cloned();
-        }
-        if let Some(v) = a.strip_prefix(&format!("{name}=")) {
-            return Some(v.to_string());
-        }
-    }
-    None
 }

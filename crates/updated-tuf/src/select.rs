@@ -13,14 +13,10 @@ use crate::{DefaultPolicy, TrustedRepository, VerifiedTarget};
 
 /// Hex sha256 of a verified target — its content hash. This is the identity that
 /// accepts a corrected republish (new bytes ⇒ new hash) and rejects exactly the
-/// bytes that failed. Empty only if the (already verified) metadata lacks a sha256,
-/// which the [`DefaultPolicy`] then refuses anyway.
+/// bytes that failed. Every verified target carries one, so this never falls back
+/// to a placeholder a digest comparison could match.
 pub fn target_sha(target: &VerifiedTarget) -> String {
-    target
-        .hashes
-        .get("sha256")
-        .map(hex::encode)
-        .unwrap_or_default()
+    hex::encode(&target.sha256)
 }
 
 fn matching_targets(
@@ -32,7 +28,10 @@ fn matching_targets(
         .into_iter()
         .filter_map(|target| policy.candidate_version(&target).ok().map(|v| (target, v)))
         .collect();
-    targets.sort_by(|a, b| b.1.cmp(&a.1));
+    // Newest first, and the path breaks ties: `all_targets` comes out of a HashMap, so a version
+    // tie left to input order would make two runs of the same node install different bytes and
+    // print the candidates in a different order each time.
+    targets.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.path.cmp(&b.0.path)));
     targets
 }
 
@@ -298,11 +297,8 @@ impl TrustedRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn candidate(version: &str, sha: u8) -> (VerifiedTarget, Version) {
-        let mut hashes = BTreeMap::new();
-        hashes.insert("sha256".to_string(), vec![sha; 32]);
         (
             VerifiedTarget {
                 path: format!(
@@ -311,7 +307,7 @@ mod tests {
                     std::env::consts::ARCH
                 ),
                 length: 1,
-                hashes,
+                sha256: vec![sha; 32],
                 custom: serde_json::json!({
                     "product": "app",
                     "channel": "stable",
@@ -593,7 +589,7 @@ mod provider_binding {
         let verified = VerifiedTarget {
             path: target.name.clone(),
             length: 1,
-            hashes: Default::default(),
+            sha256: vec![0u8; 32],
             custom: serde_json::to_value(&target.custom).unwrap(),
         };
         let bound = signed_provider_set(&verified).unwrap();

@@ -28,14 +28,6 @@
     - bootstrap
     - supervisor
 
-- name: Pin the enrollment identity so it registers as the manual Magnolia node
-  ansible.builtin.shell: |
-    mkdir -p /var/lib/updated/guardian
-    printf %s "{{ demo_colocated_hostname }}" | sha256sum | cut -d' ' -f1 \
-      > /var/lib/updated/guardian/registration-nonce
-  args:
-    creates: /var/lib/updated/guardian/registration-nonce
-
 - name: Read the fleet client identity issued by cert-manager in the cluster
   ansible.builtin.command:
     cmd: >-
@@ -43,6 +35,7 @@
       get secret agent-tls -o jsonpath={.data['{{ item }}']}
   register: demo_agent_tls
   changed_when: false
+  no_log: true
   loop: [tls.crt, tls.key, ca.crt]
 
 - name: Ensure the agent mTLS directory exists

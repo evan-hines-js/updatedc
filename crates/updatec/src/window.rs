@@ -132,7 +132,8 @@ pub struct CalendarEntry {
 
 impl CalendarEntry {
     /// The entry's absolute `[start, end)` instant span, or `None` if any field is
-    /// unparseable or `end <= start` (a misconfiguration `validate` surfaces).
+    /// unparseable, `end <= start`, or the span is not representable (all misconfigurations
+    /// `validate` surfaces).
     fn span(&self) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
         let date = parse_date(&self.date)?;
         let start = parse_minute(&self.start)?;
@@ -141,9 +142,13 @@ impl CalendarEntry {
             return None;
         }
         let midnight = date.and_hms_opt(0, 0, 0)?;
+        // Checked for the same reason `monday_of_week` is: adding a time-of-day offset to a date at
+        // the very top of the representable range PANICS rather than saturating, and this runs on
+        // the reconcile task for every set on every pass. Fail closed on an entry that cannot be
+        // placed on the timeline instead of killing the controller.
         Some((
-            midnight + Duration::minutes(start as i64),
-            midnight + Duration::minutes(end as i64),
+            midnight.checked_add_signed(Duration::minutes(start as i64))?,
+            midnight.checked_add_signed(Duration::minutes(end as i64))?,
         ))
     }
 
@@ -160,6 +165,15 @@ impl CalendarEntry {
             return Err(format!(
                 "end {:?} must be after start {:?} (dated entries do not wrap past midnight)",
                 self.end, self.start
+            ));
+        }
+        // Everything else that can make `span` unusable has been checked, so a `None` here is the
+        // remaining case: a date so near the end of the representable range that adding the
+        // time-of-day offset overflows. Named rather than left to fail closed silently.
+        if self.span().is_none() {
+            return Err(format!(
+                "date {:?} is too far in the future to carry a time-of-day span",
+                self.date
             ));
         }
         Ok(())
@@ -811,5 +825,28 @@ mod tests {
         assert!(entry("2026-08-25", "09:00", "06:00").validate().is_err());
         assert!(entry("2026-08-25", "09:00", "09:00").validate().is_err());
         assert!(entry("2026-08-25", "06:00", "09:00").validate().is_ok());
+    }
+
+    #[test]
+    fn a_date_with_no_representable_span_is_rejected_and_never_opens() {
+        // `%Y` parses signed six-digit years, so an operator can write the very last representable
+        // date; adding the time-of-day offset to it PANICS rather than saturating, and `span` runs
+        // on the reconcile task for every set on every pass — the panic killed the controller,
+        // which restarted, re-read the same UpdateGroupSet and died again, stopping publication
+        // for the whole repository.
+        let last = entry("+262142-12-31", "00:00", "24:00");
+        assert!(last.validate().is_err());
+        let calendar = std::slice::from_ref(&last);
+        assert!(
+            !calendar_open(calendar, at("2026-08-25T07:00:00Z")),
+            "an entry with no representable span never opens"
+        );
+        assert!(
+            !calendar_exhausted(calendar, at("2026-08-25T07:00:00Z")),
+            "and never counts as run out either"
+        );
+        // A minute earlier the span IS representable, so the ordinary rule applies and nothing is
+        // rejected — the bound is exactly where the arithmetic stops working.
+        assert!(entry("+262142-12-31", "00:00", "23:59").validate().is_ok());
     }
 }

@@ -8,9 +8,18 @@
 //! the application alive itself; a crash-looping update is caught on the next start by
 //! the supervisor reading the recorded crash, not by any supervision loop here.
 //!
-//! Everything runs on ONE thread. `poll` watches the control channel while the loop
-//! also checks the application process and the shutdown flag; there is no background
-//! thread.
+//! The control loop is single-threaded: `poll` watches the control channel while the same
+//! loop also checks the application process and the shutdown flag. Nothing about the
+//! supervisor, the application, or the release state is touched from anywhere else.
+//!
+//! It is not the only thread in the process, though. When `--probe-address` is set (the
+//! shipped units do set it), [`crate::probe::serve`] spawns a `guardian-probes` accept
+//! thread plus up to `MAX_CONCURRENT_PROBES` short-lived `guardian-probe` threads; they
+//! share [`ProbeMachine`], which is why its state is `Arc`ed atomics with acquire/release
+//! ordering rather than a plain field. On Windows the control channel additionally moves
+//! each write onto a scratch thread so a wedged pipe can be abandoned after a timeout.
+//! Every one of those threads is fatal to the whole tower if it panics (`panic = "abort"`),
+//! so they must stay as small as they are.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -409,9 +418,14 @@ fn serve_service<L: Link>(
                     }
                 }
                 // Forward compatibility, not a fault: a newer supervisor may send a tag this
-                // guardian has never heard of. Answer `Unsupported` and keep serving.
+                // guardian has never heard of. Answer `Unsupported` and keep serving — but a
+                // failed write here leaves the same half-written frame the dispatch arm above
+                // refuses to serve past, so it ends the channel the same way.
                 Err(control::Error::UnknownTag(_)) => {
-                    let _ = sup.send_response(&Response::Unsupported);
+                    if sup.send_response(&Response::Unsupported).is_err() {
+                        sup.stop();
+                        return conclude(cfg, &mut activation, "could not be written to");
+                    }
                 }
                 // Any other read failure ends this supervisor's usefulness, so it ends its
                 // lifetime — through the same `conclude` every other ending goes through.

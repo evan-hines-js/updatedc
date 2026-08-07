@@ -49,38 +49,11 @@ impl Proc {
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
-        let expected_ppid = std::process::id() as libc::pid_t;
-        // Safety: the hook runs in the forked child before exec and calls only
-        // async-signal-safe functions.
-        unsafe {
-            cmd.pre_exec(move || {
-                // Own process group, so the guardian can signal the app's whole tree.
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                // Die with the guardian: if it exits, the kernel kills this process, so a
-                // guardian crash can never orphan a running app into a duplicate. Linux
-                // only; on macOS the init system's process teardown covers this (macOS is
-                // a dev/test target, not a service target).
-                #[cfg(target_os = "linux")]
-                {
-                    libc::prctl(
-                        libc::PR_SET_PDEATHSIG,
-                        libc::SIGKILL as libc::c_ulong,
-                        0,
-                        0,
-                        0,
-                    );
-                    // Close the race: if the guardian already died between fork and here,
-                    // we will not get the signal, so check our parent is still the guardian.
-                    if libc::getppid() != expected_ppid {
-                        libc::_exit(0);
-                    }
-                }
-                let _ = expected_ppid;
-                Ok(())
-            });
-        }
+        // Own process group, so the guardian can signal the app's whole tree; and die with the
+        // guardian, so a guardian crash can never orphan a running app into a duplicate. Both are
+        // the workspace's one implementation of process containment.
+        cmd.process_group(0);
+        foundation::process::arrange_parent_death_signal(&mut cmd);
         let child = cmd.spawn()?;
         let pid = child.id();
         Ok(Proc {

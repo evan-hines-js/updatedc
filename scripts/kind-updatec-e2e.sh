@@ -472,10 +472,10 @@ BAD_LOG="$(kubectl -n updated-system logs manual-bad-enrollment -c agent)"
 [[ "$BAD_LOG" != *"started application pid"* ]]
 echo "corrupted installer enrollment failed closed before application launch"
 
-# Invalid online credentials are also fail-closed and may not leave registration state.
-BAD_REGISTRATION="$(printf bad-online-agent | shasum -a 256 | awk '{print $1}')"
-BAD_AGENT_HASH="$(printf %s "$BAD_REGISTRATION" | shasum -a 256 | awk '{print $1}')"
-BAD_AGENT_NAME="agent-${BAD_AGENT_HASH:0:24}"
+# Invalid online credentials are also fail-closed and may not leave registration state. The gateway
+# creates the UpdateAgent under the name the node self-asserts in its bootstrap file, so that is the
+# object this must prove was never created.
+BAD_AGENT_NAME=intruder
 cat <<'YAML' | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -489,8 +489,6 @@ spec:
       args:
         - |
           mkdir -p /var/lib/updated/guardian
-          nonce=$(printf bad-online-agent | sha256sum | cut -d' ' -f1)
-          printf %s "$nonce" >/var/lib/updated/guardian/registration-nonce
           # Present an intruder client cert NOT signed by the fleet CA: the gateway must reject
           # it at the mTLS handshake so enrollment fails closed. It still trusts the real fleet
           # CA for the gateway's server cert.

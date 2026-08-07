@@ -139,28 +139,32 @@ impl Guardian {
     /// a process this supervisor asked to have stopped. That PID may be gone (the health gate then
     /// probes an application that does not exist), or still be running the very bytes a repair
     /// just replaced, with `active == installed` afterwards so drift enforcement never corrects it.
-    pub(crate) fn stop(&mut self) -> Result<(), String> {
-        self.require(control::CAP_STOP_APP, "STOP")?;
+    pub(crate) fn stop(&mut self) -> Result<(), GuardianError> {
+        self.require(control::CAP_STOP_APP, "STOP")
+            .map_err(GuardianError::Refused)?;
         self.app_pid = None;
         self.expect_ok(&Request::Stop, "STOP")
     }
 
     /// Publish the application traffic state exposed by the guardian's stable probe
     /// endpoint. False is sent before drain; true only after health verification.
-    pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), String> {
-        self.require(control::CAP_TRAFFIC_STATE, "TRAFFIC_STATE")?;
+    pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), GuardianError> {
+        self.require(control::CAP_TRAFFIC_STATE, "TRAFFIC_STATE")
+            .map_err(GuardianError::Refused)?;
         self.expect_ok(&Request::TrafficReady(ready), "TRAFFIC_STATE")
     }
 
-    pub(crate) fn application_failed(&mut self) -> Result<(), String> {
-        self.require(control::CAP_FAIL_APPLICATION, "FAIL_APPLICATION")?;
+    pub(crate) fn application_failed(&mut self) -> Result<(), GuardianError> {
+        self.require(control::CAP_FAIL_APPLICATION, "FAIL_APPLICATION")
+            .map_err(GuardianError::Refused)?;
         self.expect_ok(&Request::ApplicationFailed, "FAIL_APPLICATION")
     }
 
     /// Hand off to a staged replacement supervisor at `path`; the guardian relaunches
     /// from it under a readiness gate after this supervisor exits.
-    pub(crate) fn replace_supervisor(&mut self, path: &Path) -> Result<(), String> {
-        self.require(control::CAP_REPLACE_SUPERVISOR_V1, "REPLACE_SUPERVISOR")?;
+    pub(crate) fn replace_supervisor(&mut self, path: &Path) -> Result<(), GuardianError> {
+        self.require(control::CAP_REPLACE_SUPERVISOR_V1, "REPLACE_SUPERVISOR")
+            .map_err(GuardianError::Refused)?;
         self.expect_ok(
             &Request::ReplaceSupervisor(path.as_os_str().to_os_string()),
             "REPLACE_SUPERVISOR",
@@ -187,7 +191,7 @@ impl Guardian {
         self.ready_signalled = true;
         let sent = match self.require(control::CAP_READY, "READY") {
             Ok(()) => self.expect_ok(&Request::Ready(self.ready_nonce), "READY"),
-            Err(unsupported) => Err(unsupported),
+            Err(unsupported) => Err(GuardianError::Refused(unsupported)),
         };
         if let Err(error) = sent {
             crate::warn(&format!(
@@ -197,11 +201,18 @@ impl Guardian {
         ReadySignalled(())
     }
 
-    fn expect_ok(&mut self, req: &Request, what: &str) -> Result<(), String> {
-        match self.exchange(req).map_err(|e| e.to_string())? {
+    /// The `GuardianError` variant is preserved: a transport failure here is not the
+    /// candidate's fault, and callers convert it into `io::ErrorKind::ConnectionReset` so boot
+    /// recovery retries instead of rejecting the release's bytes.
+    fn expect_ok(&mut self, req: &Request, what: &str) -> Result<(), GuardianError> {
+        match self.exchange(req)? {
             Response::Ok => Ok(()),
-            Response::Error(msg) => Err(format!("guardian rejected {what}: {msg}")),
-            other => Err(format!("unexpected reply to {what}: {other:?}")),
+            Response::Error(msg) => Err(GuardianError::Refused(format!(
+                "guardian rejected {what}: {msg}"
+            ))),
+            other => Err(GuardianError::Refused(format!(
+                "unexpected reply to {what}: {other:?}"
+            ))),
         }
     }
 }
@@ -229,6 +240,7 @@ impl ReadySignalled {
 /// a broken pipe, a closed or malformed frame — which is NEVER the candidate's fault. It maps to
 /// `io::ErrorKind::ConnectionReset` so the update path can let it drive boot recovery (which
 /// retries) instead of permanently rejecting a healthy release.
+#[derive(Debug)]
 pub(crate) enum GuardianError {
     Channel(String),
     Refused(String),

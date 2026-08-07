@@ -25,27 +25,22 @@ mod windows {
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::OnceLock;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    use windows_sys::Win32::Foundation::{
-        ERROR_INVALID_DATA, ERROR_SERVICE_SPECIFIC_ERROR, NO_ERROR,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_SERVICE_SPECIFIC_ERROR, NO_ERROR};
     use windows_sys::Win32::System::Services::*;
 
     use foundation::process::ContainedChild;
 
     const SERVICE_NAME: &str = "SelfUpdateSupervisor";
     const STOP_GRACE: Duration = Duration::from_secs(20);
-    /// Extra time reported to the SCM beyond [`STOP_GRACE`], covering the hard kill and reap that
-    /// follow an expired grace.
-    const STOP_KILL_HEADROOM: Duration = Duration::from_secs(10);
     /// How often the bootstrap is re-checked while watching it and while stopping it.
     const POLL: Duration = Duration::from_millis(100);
     static STOP: AtomicBool = AtomicBool::new(false);
     static STATUS: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
     static ARGS: OnceLock<Args> = OnceLock::new();
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct Args {
         bootstrap: OsString,
         state_dir: OsString,
@@ -87,19 +82,33 @@ mod windows {
     }
 
     fn parse_args() -> Result<Args, String> {
+        parse_from(std::env::args_os().skip(1))
+    }
+
+    /// Every flag here takes a value, and a flag without one is an error — including the
+    /// optional `--supervisor-config` and `--probe-address`. Treating a valueless flag as
+    /// "not given" would silently fall back to the bootstrap's defaults (its canonical config
+    /// path, no probe listener) while the SCM reports SERVICE_RUNNING, making this wrapper
+    /// weaker than the bootstrap it fronts, which rejects the same input.
+    fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
         let mut bootstrap = None;
         let mut state_dir = None;
         let mut supervisor_config = None;
         let mut supervisor = None;
         let mut probe_address = None;
-        let mut it = std::env::args_os().skip(1);
+        fn value(it: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString, String> {
+            it.next().ok_or_else(|| format!("{flag} needs a value"))
+        }
+        let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.to_string_lossy().as_ref() {
-                "--bootstrap" => bootstrap = it.next(),
-                "--state-dir" => state_dir = it.next(),
-                "--supervisor-config" => supervisor_config = it.next(),
-                "--supervisor" => supervisor = it.next(),
-                "--probe-address" => probe_address = it.next(),
+                "--bootstrap" => bootstrap = Some(value(&mut it, "--bootstrap")?),
+                "--state-dir" => state_dir = Some(value(&mut it, "--state-dir")?),
+                "--supervisor-config" => {
+                    supervisor_config = Some(value(&mut it, "--supervisor-config")?)
+                }
+                "--supervisor" => supervisor = Some(value(&mut it, "--supervisor")?),
+                "--probe-address" => probe_address = Some(value(&mut it, "--probe-address")?),
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -166,7 +175,7 @@ mod windows {
             report(
                 SERVICE_STOP_PENDING,
                 0,
-                (STOP_GRACE + STOP_KILL_HEADROOM).as_millis() as u32,
+                (STOP_GRACE + foundation::process::KILL_HEADROOM).as_millis() as u32,
                 NO_ERROR,
             );
         }
@@ -224,58 +233,24 @@ mod windows {
 
     /// Stop the bootstrap tree: a graceful console break first, then a hard kill of the whole
     /// job. Returns only once it is gone, or once the kill has been issued and the wait for it
-    /// has been given [`STOP_KILL_HEADROOM`] — the same budget the SCM was told to expect.
+    /// has been given [`foundation::process::KILL_HEADROOM`] — the same budget the SCM was told
+    /// to expect.
     ///
     /// Failures are logged, never propagated, and the last resort is structural rather than
     /// reported: the tree lives in a kill-on-close job object, so dropping `child` when this
     /// wrapper exits takes down anything that survived. There is no path on which a bootstrap
     /// outlives the service process that owns it.
     fn stop_bootstrap(child: &mut ContainedChild) {
-        // The graceful stop is `ContainedChild`'s: it owns the process group the break event
-        // addresses and the console borrowing a console-less service needs, so this wrapper holds
-        // no Windows console code of its own.
-        //
-        // If the event could not be delivered the graceful path did not happen: waiting out the
-        // full grace only delays the kill by 20 seconds and makes an operator-visible clean stop
-        // look like a hang. Say so, and go straight to the kill.
-        let grace = match child.request_stop() {
-            Ok(()) => STOP_GRACE,
-            Err(error) => {
-                eprintln!(
-                    "selfupdate-service: could not ask the bootstrap to stop gracefully \
-                     ({error}); stopping it without the graceful break"
-                );
-                Duration::ZERO
-            }
-        };
-        if reaped_within(child, grace) {
-            return;
-        }
-        // The grace expired: terminate the job, which takes the bootstrap and everything it
-        // spawned, not just the root process.
-        if let Err(error) = child.kill_tree() {
-            eprintln!("selfupdate-service: killing the bootstrap tree failed ({error})");
-        }
-        if !reaped_within(child, STOP_KILL_HEADROOM) {
-            eprintln!(
+        // The whole sequence — graceful console break, grace, hard kill of the job, reap — is
+        // `ContainedChild::stop`'s, including the decision to skip the grace when the break event
+        // could not be delivered. This wrapper only reports what it took.
+        match child.stop(STOP_GRACE) {
+            foundation::process::Stopped::Gracefully | foundation::process::Stopped::Killed => {}
+            foundation::process::Stopped::Surviving => eprintln!(
                 "selfupdate-service: the bootstrap did not exit after being killed; its \
                  kill-on-close job takes it down as this process exits"
-            );
+            ),
         }
-    }
-
-    /// Poll for the bootstrap's exit for up to `budget`. An unusable handle ends the wait at
-    /// once — it can never start reporting an exit again.
-    fn reaped_within(child: &mut ContainedChild, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
-            match child.try_wait() {
-                Ok(Some(_)) => return true,
-                Ok(None) => std::thread::sleep(POLL),
-                Err(_) => return false,
-            }
-        }
-        matches!(child.try_wait(), Ok(Some(_)))
     }
 
     fn spawn_bootstrap() -> Result<ContainedChild, String> {
@@ -322,7 +297,10 @@ mod windows {
         };
         unsafe {
             if SetServiceStatus(handle, &status) == 0 {
-                let _ = ERROR_INVALID_DATA; // retain Foundation feature on all SDKs
+                eprintln!(
+                    "selfupdate-service: reporting status to the SCM failed ({})",
+                    std::io::Error::last_os_error()
+                );
             }
         }
     }
@@ -332,6 +310,55 @@ mod windows {
             .encode_wide()
             .chain(Some(0))
             .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn argv(args: &[&str]) -> Vec<OsString> {
+            args.iter().map(OsString::from).collect()
+        }
+
+        const REQUIRED: [&str; 6] = [
+            "--bootstrap",
+            "b.exe",
+            "--state-dir",
+            "state",
+            "--supervisor",
+            "s.exe",
+        ];
+
+        #[test]
+        fn trailing_optional_flag_is_rejected() {
+            for flag in ["--supervisor-config", "--probe-address"] {
+                let mut args = REQUIRED.to_vec();
+                args.push(flag);
+                let err = parse_from(argv(&args)).unwrap_err();
+                assert_eq!(err, format!("{flag} needs a value"));
+            }
+        }
+
+        #[test]
+        fn trailing_required_flag_is_rejected() {
+            let err = parse_from(argv(&["--bootstrap"])).unwrap_err();
+            assert_eq!(err, "--bootstrap needs a value");
+        }
+
+        #[test]
+        fn full_command_line_parses() {
+            let mut args = REQUIRED.to_vec();
+            args.extend([
+                "--supervisor-config",
+                "c.toml",
+                "--probe-address",
+                "1.2.3.4:9",
+            ]);
+            let parsed = parse_from(argv(&args)).expect("parses");
+            assert_eq!(parsed.bootstrap, OsString::from("b.exe"));
+            assert_eq!(parsed.supervisor_config, Some(OsString::from("c.toml")));
+            assert_eq!(parsed.probe_address, Some(OsString::from("1.2.3.4:9")));
+        }
     }
 }
 

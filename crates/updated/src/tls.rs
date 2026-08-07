@@ -94,13 +94,10 @@ impl Identity {
     }
 }
 
-/// Verify a newly issued client chain against the same pinned CA and client-auth policy the
-/// gateway uses before it is allowed onto durable storage.
-pub fn verify_client_chain(
-    leaf: CertificateDer<'_>,
-    intermediates: &[CertificateDer<'_>],
-    ca: &Path,
-) -> io::Result<()> {
+/// Verify a newly issued client leaf against the same pinned CA and client-auth policy the
+/// gateway uses before it is allowed onto durable storage. The gateway signs node leaves directly
+/// off the pinned CA, so there is no intermediate to supply.
+pub fn verify_client_chain(leaf: CertificateDer<'_>, ca: &Path) -> io::Result<()> {
     use rustls::pki_types::UnixTime;
     let roots = load_roots(ca, "enrollment CA")?;
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -110,7 +107,7 @@ pub fn verify_client_chain(
     .build()
     .map_err(|error| invalid(&format!("building issued-certificate verifier: {error}")))?;
     verifier
-        .verify_client_cert(&leaf, intermediates, UnixTime::now())
+        .verify_client_cert(&leaf, &[], UnixTime::now())
         .map_err(|error| {
             invalid(&format!(
                 "issued client certificate is not trusted: {error}"

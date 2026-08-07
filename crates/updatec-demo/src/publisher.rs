@@ -54,18 +54,11 @@ impl KubernetesPublisher {
     pub(crate) fn repositories(&self) -> Api<UpdateRepository> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
-}
 
-/// Driven port: the application knows how to publish a release request, but not
-/// whether the adapter is Kubernetes, a test double, or another control plane.
-#[async_trait::async_trait]
-pub(crate) trait ReleasePublisher {
-    async fn publish(&self, release: &ReleaseRequest) -> Result<(), Box<dyn std::error::Error>>;
-}
-
-#[async_trait::async_trait]
-impl ReleasePublisher for KubernetesPublisher {
-    async fn publish(&self, _release: &ReleaseRequest) -> Result<(), Box<dyn std::error::Error>> {
+    /// Publish the demo's one release by patching the repository with the deployment the demo was
+    /// started with. The request itself carries nothing to publish — `Demo::apply` has already
+    /// held it to the advertised signed target — so this takes no argument.
+    pub(crate) async fn publish(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.repositories()
             .patch(
                 &self.repository,

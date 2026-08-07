@@ -13,21 +13,16 @@ use std::time::Duration;
 use updated::config::Routing;
 use updated_contracts::telemetry::{
     report_url as telemetry_report_url, sign_report, NodeReport, OutputManifest,
+    MAX_OUTPUT_MANIFEST_BYTES,
 };
 
-const MAX_OUTPUT_MANIFEST_BYTES: u64 = 64 * 1024;
-
 /// The node's own identity, derived from the exact routing target it resolves
-/// (`.../agents/<node>.json`). Returns `None` if the assignment path has no usable
-/// file stem, in which case the node simply never reports.
+/// (`<prefix>/agents/<node>.json`), read through the one parser of that layout. Returns `None` if
+/// the assignment is not a routing target naming a valid node identity, in which case the node
+/// simply never reports.
 pub fn node_identity(routing: &Routing) -> Option<String> {
-    let name = routing
-        .assignment
-        .rsplit('/')
-        .next()
-        .unwrap_or(&routing.assignment)
-        .strip_suffix(".json")?;
-    (!name.is_empty()).then(|| name.to_string())
+    updated_contracts::telemetry::split_assignment_path(&routing.assignment)
+        .map(|(_, node)| node.to_string())
 }
 
 /// What the node is running right now — the signed payload of one heartbeat, gathered by the
@@ -63,7 +58,11 @@ pub fn load_outputs(
     }
     let path = crate::update::reconciler_output_path(install_root, archive_sha256);
     let metadata = std::fs::metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_OUTPUT_MANIFEST_BYTES {
+    // The size bound is the *envelope* bound worked backwards (see
+    // `MAX_OUTPUT_MANIFEST_BYTES`): a manifest larger than this signs into a report no hop on the
+    // publish path would accept, and since outputs ride only on healthy reports, attaching it
+    // would silently drain a healthy node forever. Omitting the outputs keeps the node published.
+    if !metadata.is_file() || metadata.len() > MAX_OUTPUT_MANIFEST_BYTES as u64 {
         crate::warn("reconciler output manifest is not a bounded regular file; omitting outputs");
         return None;
     }
@@ -161,7 +160,6 @@ mod tests {
             root: std::path::PathBuf::from("/root"),
             base_url: "https://cdn/".into(),
             assignment: assignment.into(),
-            metadata_limit: 1024,
             transport_timeout: Duration::from_secs(5),
             mtls: updated::tls::Identity::new("tls.crt", "tls.key", "ca.crt"),
         }
@@ -194,7 +192,7 @@ mod tests {
         assert_eq!(load_outputs(root.path(), &identity), Some(manifest));
         assert_eq!(load_outputs(root.path(), &"b".repeat(64)), None);
 
-        std::fs::write(path, vec![b'x'; MAX_OUTPUT_MANIFEST_BYTES as usize + 1]).unwrap();
+        std::fs::write(path, vec![b'x'; MAX_OUTPUT_MANIFEST_BYTES + 1]).unwrap();
         assert_eq!(load_outputs(root.path(), &identity), None);
     }
 

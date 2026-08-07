@@ -133,18 +133,15 @@ fn parse_semver(v: &str) -> Result<semver::Version, PolicyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     const OS: &str = std::env::consts::OS;
     const ARCH: &str = std::env::consts::ARCH;
 
     fn target(path: &str, custom_version: &str) -> VerifiedTarget {
-        let mut hashes = BTreeMap::new();
-        hashes.insert("sha256".to_string(), vec![1u8; 32]);
         VerifiedTarget {
             path: path.to_string(),
             length: 1,
-            hashes,
+            sha256: vec![1u8; 32],
             custom: serde_json::json!({
                 "product": "app",
                 "channel": "stable",

@@ -39,11 +39,25 @@ enum Visibility {
 /// commit with no ACE for the service account, which could then neither read nor replace it, and
 /// no `icacls` grant could repair it.
 ///
-/// There is deliberately no owner-only counterpart to this: a secret is never streamed here — it
-/// is always one in-memory buffer — so [`atomic_write`] is the single door to
-/// [`Visibility::Private`], and there is no second one to keep in step with it.
+/// There is deliberately no owner-only *temp* counterpart to this: a secret is never streamed
+/// here — it is always one in-memory buffer — so [`atomic_write`] and [`create_private_new`] are
+/// the only doors to [`Visibility::Private`], and both go through the same [`create`].
 pub fn create_temp_managed(dir: &Path, prefix: &str) -> io::Result<(File, PathBuf)> {
     create_temp_with(dir, prefix, |path| create(path, Visibility::Managed))
+}
+
+/// Create `path` exclusively, readable by **the writing account alone** on every platform
+/// (`0o600` at `open(2)` on unix, an explicit protected DACL passed to `CreateFileW` on Windows),
+/// failing if it already exists.
+///
+/// This is [`atomic_write`]'s permission guarantee for the one shape that write cannot serve: a
+/// secret whose *creation* must be the exclusion — a signing key that may be minted only if the
+/// node does not already hold one, where a rename-over would silently replace the existing key
+/// instead of refusing. The caller owns writing, syncing, and cleaning up a partial file; what it
+/// must not own is the permissions, which is why this exists rather than a second
+/// `OpenOptions` call site that has to keep the Windows descriptor in step by hand.
+pub fn create_private_new(path: &Path) -> io::Result<File> {
+    create(path, Visibility::Private)
 }
 
 /// [`create_temp_managed`], but world-readable (`0o644` on unix; the directory's ACL on Windows) at

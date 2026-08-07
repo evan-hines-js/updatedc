@@ -634,4 +634,196 @@ mod tests {
             assert!(validate_report_url(invalid).is_err(), "{invalid}");
         }
     }
+
+    /// `CONTROLPLANE_API_CONTRACT.md` publishes `schemas/desired-deployment.schema.json` as the
+    /// normative wire contract and points integrators at `schemas/examples`; integrators write
+    /// control planes against those files rather than against this crate, and nothing else in the
+    /// workspace reads them. Without these checks the two drift into mutually unparseable shapes —
+    /// a document the published schema blesses that every agent rejects at
+    /// `serde_json::from_slice`, discovered only when a fleet-wide rollout stalls. This is the same
+    /// guard `artifact.rs`'s `published_schemas` module applies to the sibling contracts.
+    mod published_schema {
+        use super::*;
+        use serde_json::Value;
+
+        fn read(relative: &str) -> Value {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../schemas")
+                .join(relative);
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|error| panic!("parsing {}: {error}", path.display()))
+        }
+
+        /// The field names the Rust type actually serializes, from a value with every optional
+        /// field populated.
+        fn serialized(value: &impl Serialize) -> Vec<String> {
+            let mut keys: Vec<String> = serde_json::to_value(value)
+                .expect("serialize")
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        /// A strict object schema must be closed, declare exactly the fields the type serializes,
+        /// and require all of them except the ones serde may omit — otherwise a schema-valid
+        /// document loses a mandatory field or a type-valid document trips
+        /// `additionalProperties`.
+        fn assert_object(object: &Value, value: &impl Serialize, optional: &[&str], what: &str) {
+            assert_eq!(
+                object["additionalProperties"],
+                Value::Bool(false),
+                "{what} is deny_unknown_fields"
+            );
+            let mut properties: Vec<String> = object["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{what} properties"))
+                .keys()
+                .cloned()
+                .collect();
+            properties.sort();
+            assert_eq!(properties, serialized(value), "{what} properties");
+
+            let mut required: Vec<String> = object["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{what} required"))
+                .iter()
+                .map(|name| name.as_str().expect("required name").to_owned())
+                .collect();
+            required.sort();
+            let mut expected: Vec<String> = properties
+                .into_iter()
+                .filter(|name| !optional.contains(&name.as_str()))
+                .collect();
+            expected.sort();
+            assert_eq!(required, expected, "{what} required");
+        }
+
+        /// A value with every serde-optional field populated, so the schema's property set is
+        /// compared against the widest document this type can emit.
+        fn complete() -> RepositoryAssignment {
+            let mut value = assignment();
+            value.report_url = Some("https://reports.example.test/nodes/".into());
+            value.runtime.secrets.push(SecretReference {
+                environment: "DATABASE_PASSWORD".into(),
+                secret: "production-database".into(),
+                key: "password".into(),
+            });
+            value.runtime.inputs.insert(
+                "database_host".into(),
+                crate::telemetry::OutputValue::String {
+                    value: "db.production.internal".into(),
+                },
+            );
+            value.validate().unwrap();
+            value
+        }
+
+        #[test]
+        fn desired_deployment_schema_matches_the_type() {
+            let schema = read("desired-deployment.schema.json");
+            assert_eq!(
+                schema["$id"],
+                Value::from("https://updated.dev/schemas/desired-deployment.schema.json")
+            );
+            let value = complete();
+
+            assert_object(&schema, &value, &["report_url"], "assignment");
+            assert_eq!(
+                schema["properties"]["schema"]["const"],
+                Value::from(RepositoryAssignment::SCHEMA)
+            );
+            for reference in ["application", "provider_set"] {
+                assert_eq!(
+                    schema["properties"][reference]["$ref"],
+                    Value::from("https://updated.dev/schemas/target-reference.schema.json"),
+                    "{reference}"
+                );
+            }
+            // `validate` demands a JSON object here, so the schema must not admit a bare string.
+            assert_eq!(schema["properties"]["release_root"]["type"], "object");
+            assert_eq!(schema["properties"]["runtime"]["$ref"], "#/$defs/runtime");
+
+            let runtime = &schema["$defs"]["runtime"];
+            assert_object(
+                runtime,
+                &value.runtime,
+                &["mode", "secrets", "inputs"],
+                "runtime",
+            );
+            assert_eq!(
+                runtime["properties"]["secrets"]["maxItems"],
+                Value::from(64)
+            );
+            assert_eq!(
+                runtime["properties"]["inputs"]["maxProperties"],
+                Value::from(crate::telemetry::OutputManifest::MAX_VALUES)
+            );
+            assert_object(
+                &schema["$defs"]["secret_reference"],
+                &value.runtime.secrets[0],
+                &[],
+                "secret_reference",
+            );
+            assert_object(
+                &schema["$defs"]["repository_limits"],
+                &value.runtime.repository,
+                &[],
+                "repository_limits",
+            );
+            assert_object(
+                &schema["$defs"]["storage"],
+                &value.runtime.storage,
+                &[],
+                "storage",
+            );
+
+            // The two ceilings `ManagedRuntime::validate` enforces must be the ones the schema
+            // publishes, or an integrator sizes a fleet's cadence against a number that fails
+            // closed on every node.
+            let timeouts = &schema["$defs"]["timeouts"];
+            assert_object(
+                timeouts,
+                &value.runtime.timeouts,
+                &["drain_hold_seconds"],
+                "timeouts",
+            );
+            for cadence in ["check_interval_seconds", "refresh_retry_seconds"] {
+                assert_eq!(
+                    timeouts["properties"][cadence]["maximum"],
+                    Value::from(crate::telemetry::MAX_CHECK_INTERVAL_SECONDS),
+                    "{cadence}"
+                );
+            }
+            for bounded in [
+                "health_grace_seconds",
+                "health_interval_seconds",
+                "retry_after_seconds",
+                "confirmation_window_seconds",
+                "supervisor_check_interval_seconds",
+                "drain_hold_seconds",
+            ] {
+                assert_eq!(
+                    timeouts["properties"][bounded]["maximum"],
+                    Value::from(MAX_INTERVAL_SECONDS),
+                    "{bounded}"
+                );
+            }
+        }
+
+        /// The published example is the first thing an integrator copies: it must be a document
+        /// this build parses and accepts.
+        #[test]
+        fn the_published_example_parses_and_validates() {
+            let example: RepositoryAssignment =
+                serde_json::from_value(read("examples/desired-deployment.json")).unwrap();
+            example.validate().unwrap();
+            assert_eq!(example.schema, RepositoryAssignment::SCHEMA);
+        }
+    }
 }

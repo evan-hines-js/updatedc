@@ -3,6 +3,10 @@ set -euo pipefail
 
 # Signed HAProxy node reconciler. The agent supplies the operation and context as ordinary argv;
 # this script contains only HAProxy-specific machine-state policy.
+#
+# The deployment is `provider-managed`: the agent's stop and start are no-ops, so this reconciler
+# owns the HAProxy process outright. `apply` (and `rollback`) start the release when no master of
+# ours is running and re-exec the live master in place when one is — see `converge_release`.
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/haproxy/lib.sh
@@ -48,16 +52,17 @@ case "$operation" in
     [[ -x "$candidate/bin/haproxy" ]] || die "candidate $candidate has no executable bin/haproxy"
     "$candidate/bin/haproxy" -c -f "$candidate/config/haproxy.cfg" >/dev/null \
       || die "candidate HAProxy configuration failed validation"
-    stage_runtime "$candidate" "$runtime"
+    converge_release "$candidate" "$root"
     ;;
   rollback)
-    stage_runtime "$predecessor" "$runtime"
+    converge_release "$predecessor" "$root"
     ;;
   healthcheck)
+    # This deployment is `provider-managed`: the agent owns no application process, so a running,
+    # identified master under the runtime pid file is the whole of "healthy" — before the first
+    # upgrade as much as after one.
     [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"
-    [[ -f "$runtime/haproxy.pid" ]] || die "master pid file is missing"
-    master=$(<"$runtime/haproxy.pid")
-    kill -0 "$master"
+    live_master "$runtime" || die "no HAProxy master is running"
     ;;
   inspect)
     [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"

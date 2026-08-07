@@ -43,12 +43,24 @@ verified, rollback-safe identity.
 With Docker, Kind, kubectl, Cargo, and curl installed, run:
 
 ```sh
-./scripts/demo.sh
+./scripts/demo-local.sh
 ```
 
-Open [http://127.0.0.1:8088](http://127.0.0.1:8088) if the browser does not open
-automatically. The first run builds the local Kind environment and can take a few
-minutes. Keep the script running while using the page.
+That runs `updatec-demo start`, which builds the Kind environment, applies the demo layer,
+and port-forwards the in-cluster demo service to
+[http://127.0.0.1:8088](http://127.0.0.1:8088) (override the port with
+`UPDATEC_DEMO_PORT`); it opens the browser for you. The first run takes a few minutes.
+Keep the script running while using the page.
+
+`scripts/demo.sh` is the other, Ansible-driven path. It takes no subcommands — its single
+optional argument is an SSH host:
+
+```sh
+./scripts/demo.sh                  # run deploy/ansible/demo.yml on this machine (Linux;
+                                   # needs ansible) — UI at http://localhost/ via nginx
+./scripts/demo.sh root@10.0.0.206  # rsync the workspace to that host, run the same
+                                   # playbook there, tunnel its port 80 to 127.0.0.1:8088
+```
 
 This opens a local page with a red managed application and a small typed `release.json`.
 Publishing it creates the update through the real Kubernetes operator. The demo service
@@ -70,21 +82,25 @@ back to its exact predecessor while the successful group advances. The demo veri
 exact mixed result, holds it for ten seconds, increments the seed, and repeats. CI runs
 one bounded generation; the interactive demo runs continuously.
 
-Delete the demo with:
+Delete the demo cluster with:
 
 ```sh
-./scripts/demo.sh reset
+./scripts/demo-local.sh reset
 ```
 
 The same browser-button path is an executable E2E test:
 
 ```sh
-./scripts/demo.sh e2e --exit
+cargo run -p updatec-demo -- e2e --exit    # or: ./scripts/demo-local.sh e2e --exit
 ```
 
-CI runs that command in its own Kind job and blocks release publication unless the
-red-to-green lifecycle transaction and the complete failure/rollback/recovery scenario
-both pass.
+CI (`.github/workflows/ci.yml`) runs `cargo run -p updatec-demo -- e2e --exit` in its own
+Kind job and blocks release publication unless the red-to-green lifecycle transaction and
+the complete failure/rollback/recovery scenario both pass.
+
+`updatec-demo` accepts `start`, `setup`, `e2e [--exit]`, `exercise [passes]`, `serve`, and
+`reset`; `scripts/demo-local.sh` passes its arguments straight through and defaults to
+`start`.
 
 ## Architecture
 
@@ -459,7 +475,10 @@ is for development and for control planes built on other orchestrators.
 - [Control-plane API contract](CONTROLPLANE_API_CONTRACT.md)
 - [Kubernetes operator guide](deploy/kubernetes/README.md)
 - [Single-path mTLS + CSR enrollment](docs/group-enrollment-design.md)
-- [Node decommission via signed tombstone](docs/decommission-design.md)
+- Node decommission: delete the node's `UpdateAgent` object. The gateway checks enrolled
+  membership on every request, so a deleted or re-homed agent stops being served bundles,
+  secrets, and routing immediately — even while its unexpired leaf certificate still
+  authenticates. There is no tombstone artifact.
 - [Deployment adapters](deploy/README.md)
 - [Reference bootstrap](deploy/bootstrap.toml)
 

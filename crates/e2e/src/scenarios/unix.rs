@@ -135,7 +135,9 @@ pub(crate) fn key_perms(ctx: &Ctx) -> R {
     let dir = ctx.work.join("keyperms");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     ctx.init_repo(&dir)?;
-    for role in ["root", "targets", "snapshot", "timestamp"] {
+    // Every key `server init` mints, including the standby root that becomes the fleet-wide
+    // root on the next rotate-root.
+    for role in ["root", "root.next", "targets", "snapshot", "timestamp"] {
         let mode = std::fs::metadata(ctx.key(&dir, role))
             .map_err(str_err)?
             .permissions()

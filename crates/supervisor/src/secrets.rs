@@ -5,17 +5,18 @@ use updated::config::Routing;
 use updated_contracts::assignment::SecretReference;
 
 use crate::guardian::ReadySignalled;
+use updated_contracts::telemetry::REPORT_CADENCE_JITTER_PERCENT;
 
 const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Retry schedule for [`SecretManager::acquire`]: doubling from [`INITIAL_RETRY`] up to
-/// [`MAX_RETRY`], forever.
-const INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
-const MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+/// Base of the retry schedule for [`SecretManager::acquire`], grown by
+/// [`crate::schedule::network_backoff`] and jittered like every other supervisor network retry, so
+/// a control-plane outage does not bring the whole fleet back on the same boundary.
+const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The wait after a failed attempt: doubling, capped at [`MAX_RETRY`], never giving up.
-fn next_backoff(previous: std::time::Duration) -> std::time::Duration {
-    (previous * 2).min(MAX_RETRY)
+/// Where the digest of the launched bundle lives, beside the rest of the supervisor's state.
+fn launched_path(state: &std::path::Path) -> std::path::PathBuf {
+    state.join("secrets-launched")
 }
 
 #[derive(Default, serde::Deserialize, PartialEq, Eq)]
@@ -94,8 +95,13 @@ impl SecretManager {
         shutdown: &AtomicBool,
         _ready: ReadySignalled,
     ) -> bool {
-        let mut backoff = INITIAL_RETRY;
+        let mut failures: u32 = 0;
         while let Err(error) = self.reconcile(deployment, references).await {
+            let backoff = crate::schedule::jitter(
+                crate::schedule::network_backoff(RETRY_BASE, failures),
+                REPORT_CADENCE_JITTER_PERCENT,
+            );
+            failures = failures.saturating_add(1);
             crate::warn(&format!(
                 "fetching the assigned secrets failed ({error}); retrying in {}s",
                 backoff.as_secs()
@@ -103,9 +109,47 @@ impl SecretManager {
             if crate::app::sleep_interruptible(backoff, shutdown).await {
                 return false;
             }
-            backoff = next_backoff(backoff);
         }
         true
+    }
+
+    /// The digest of the values currently held, as recorded beside the installed state when the
+    /// application is launched with them.
+    fn digest(&self) -> String {
+        let mut hasher = updated::hash::Sha256Hasher::new();
+        for (name, value) in &self.current.values {
+            hasher.update(name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(value.as_bytes());
+            hasher.update(b"\0");
+        }
+        hasher.finish_hex()
+    }
+
+    /// Record the values the application was just launched with. A later supervisor that adopts
+    /// that still-running process compares against this: the process's environment was fixed at its
+    /// launch, so a rotation that landed while this supervisor was down is otherwise invisible —
+    /// [`Self::reconcile`] would compare the rotated bundle against itself and report no change,
+    /// and the application would run on revoked credentials indefinitely.
+    pub(crate) fn record_launched(&self, state: &std::path::Path) {
+        let path = launched_path(state);
+        if let Err(error) = foundation::durable::atomic_write_managed(
+            &path,
+            "secrets-launched",
+            self.digest().as_bytes(),
+        ) {
+            crate::warn(&format!(
+                "recording the launched secret generation failed ({error}); the next adoption \
+                 relaunches the application to be sure it holds current values"
+            ));
+        }
+    }
+
+    /// Whether a process launched under the recorded digest still holds these values. An
+    /// unreadable record answers false: relaunching is the safe direction.
+    pub(crate) fn launched_with_current(&self, state: &std::path::Path) -> bool {
+        std::fs::read_to_string(launched_path(state))
+            .is_ok_and(|recorded| recorded == self.digest())
     }
 
     pub(crate) fn values(&self) -> &BTreeMap<String, String> {
@@ -228,7 +272,6 @@ mod tests {
             root: "/var/lib/updated/routing".into(),
             base_url: base_url.into(),
             assignment: "assignments/agents/agent.json".into(),
-            metadata_limit: 1024,
             transport_timeout: std::time::Duration::from_secs(30),
             mtls: updated::tls::Identity::new("client.pem", "client.key", "ca.pem"),
         }
@@ -250,15 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn the_fetch_backoff_doubles_to_a_cap_and_never_gives_up() {
-        let mut waits = vec![INITIAL_RETRY];
-        for _ in 0..8 {
-            waits.push(next_backoff(*waits.last().expect("seeded above")));
-        }
-        assert_eq!(
-            waits.iter().map(|w| w.as_secs()).collect::<Vec<_>>(),
-            vec![1, 2, 4, 8, 16, 32, 60, 60, 60]
-        );
+    fn the_fetch_backoff_grows_to_a_cap_and_never_gives_up() {
+        let waits: Vec<u64> = (0..9)
+            .map(|failures| crate::schedule::network_backoff(RETRY_BASE, failures).as_secs())
+            .collect();
+        assert_eq!(waits, vec![1, 2, 4, 8, 16, 32, 64, 64, 64]);
     }
 
     /// A manager aimed at an endpoint nothing is listening on: every fetch fails, immediately, for

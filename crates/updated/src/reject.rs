@@ -23,13 +23,6 @@ impl Rejections {
         })
     }
 
-    /// Path of the deliberately local break-glass allowlist. Adding an exact rejection
-    /// key here and restarting the runtime permits those same bytes to be tried again.
-    /// Normal remediation publishes corrected bytes, whose new digest needs no override.
-    pub fn override_path(path: &Path) -> PathBuf {
-        override_path(path)
-    }
-
     /// Whether these exact bytes were rejected. Rejections do not expire: retrying an
     /// unchanged, proven-bad artifact only creates an availability loop. Publishing
     /// corrected bytes produces a new digest and is immediately eligible. An exact key
@@ -92,21 +85,31 @@ fn load_keys(path: &Path, record: &str) -> std::io::Result<HashSet<String>> {
     Ok(hashes)
 }
 
+/// Path of the deliberately local break-glass allowlist. Adding an exact rejection key here and
+/// restarting the runtime permits those same bytes to be tried again. Normal remediation
+/// publishes corrected bytes, whose new digest needs no override.
 fn override_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".allow");
     PathBuf::from(name)
 }
 
+/// Whether `hash` is a well-formed rejection key: a plain SHA-256 digest (supervisor
+/// candidates) or `repository-lineage:digest` (application candidates). The single
+/// definition of that grammar — callers that must know in advance whether
+/// [`Rejections::reject`] would accept a key ask here rather than restating it.
+pub fn is_rejection_key(hash: &str) -> bool {
+    updated_contracts::is_sha256_hex(hash)
+        || hash.split_once(':').is_some_and(|(lineage, digest)| {
+            updated_contracts::is_sha256_hex(lineage) && updated_contracts::is_sha256_hex(digest)
+        })
+}
+
 /// Canonical rejection key. Supervisor candidates use their plain digest; application
 /// candidates use `repository-lineage:digest`, preventing a rejection in one metadata
 /// lineage from poisoning a different lineage that happens to reuse the same bytes.
 fn digest_key(hash: &str) -> Result<String, String> {
-    let valid = updated_contracts::is_sha256_hex(hash)
-        || hash.split_once(':').is_some_and(|(lineage, digest)| {
-            updated_contracts::is_sha256_hex(lineage) && updated_contracts::is_sha256_hex(digest)
-        });
-    if !valid {
+    if !is_rejection_key(hash) {
         return Err(format!(
             "invalid rejection key (expected a SHA-256 digest or lineage:digest, got {} characters)",
             hash.len()
@@ -179,7 +182,7 @@ mod tests {
         first.reject(&other).unwrap();
         assert!(first.is_rejected(&rejected));
 
-        std::fs::write(Rejections::override_path(&path), format!("{rejected}\n")).unwrap();
+        std::fs::write(override_path(&path), format!("{rejected}\n")).unwrap();
         let restarted = Rejections::load(&path).unwrap();
         assert!(
             !restarted.is_rejected(&rejected),
@@ -194,7 +197,7 @@ mod tests {
     #[test]
     fn malformed_break_glass_file_fails_closed() {
         let path = tmp("bad-break-glass");
-        std::fs::write(Rejections::override_path(&path), "all\n").unwrap();
+        std::fs::write(override_path(&path), "all\n").unwrap();
         assert_eq!(
             Rejections::load(&path).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData

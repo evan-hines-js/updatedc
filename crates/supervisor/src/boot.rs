@@ -176,7 +176,7 @@ fn reconcile_transaction(
             // stops the uncommitted candidate and relaunches the predecessor.
             plan.quiesce = situation.app_running.is_some();
             plan.release = ReleaseFix::Activate(tx.previous_release.clone());
-            if situation.service_exited && !tx.candidate_rejection_required {
+            if situation.charge_crash_to_release() && !tx.candidate_rejection_required {
                 plan.reject_app.push((
                     tx.candidate_repository_lineage.clone(),
                     tx.candidate_archive_sha256.clone(),
@@ -232,10 +232,16 @@ fn confirm_or_revert(
         // Reload deployments adopt the still-running predecessor; restart deployments stop-start it.
         plan.quiesce = situation.app_running.is_some();
         plan.release = ReleaseFix::Activate(pending.previous_release.clone());
-        plan.reject_app.push((
-            installed.repository_lineage.clone(),
-            installed.archive_sha256.clone(),
-        ));
+        // The revert is unconditional; the permanent rejection that normally rides with it is not.
+        // See [`Situation::charge_crash_to_release`]: a boot that repaired this release's damaged
+        // tree cannot blame its (re-downloaded, re-verified) bytes for the exit, but it still owes
+        // the predecessor its rollback.
+        if situation.charge_crash_to_release() {
+            plan.reject_app.push((
+                installed.repository_lineage.clone(),
+                installed.archive_sha256.clone(),
+            ));
+        }
         // Revert to the predecessor carrying its providers (held in `pending`) so the restored
         // release keeps its crash-watch, readiness gate, and boot converge — see the confirm
         // branch below, which carries the same three for the forward case.
@@ -301,6 +307,7 @@ mod tests {
             active: Some(current),
             journal: None,
             service_exited: false,
+            bytes_repaired: false,
             app_running: None,
             first_install: false,
             bad_supervisor: None,
@@ -717,6 +724,170 @@ mod tests {
             )),
             "the passed window confirms the candidate and clears its pending record"
         );
+    }
+
+    /// A head committed as unconfirmed over `1.0.0`, whose application then exited. `now` is past
+    /// the confirmation window, so a boot that failed to read the exit would CONFIRM it.
+    fn crashed_inside_its_window() -> Situation {
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.active = Some(candidate.clone());
+        situation.installed = Installed::Present(Box::new(InstalledState {
+            repository_lineage: lineage(),
+            release: candidate,
+            archive_sha256: "archive-two".into(),
+            lifecycle: provider(),
+            pending: Some(Pending {
+                lifecycle_attempt_id: "attempt".into(),
+                previous_release: predecessor,
+                previous_archive_sha256: "archive-one".into(),
+                previous_repository_lineage: lineage(),
+                committed_at: 100,
+                lifecycle: provider(),
+            }),
+            confirmed: true,
+        }));
+        situation.service_exited = true;
+        situation.now = 10_000;
+        situation
+    }
+
+    #[test]
+    fn a_crash_inside_the_window_reverts_and_rejects_when_the_tree_was_intact() {
+        // The unrepaired side of the attribution rule: nothing damaged this disk, so the exit is
+        // the release's own and it is both reverted and permanently rejected — and never confirmed,
+        // though its window has long passed.
+        let plan = plan_boot(&crashed_inside_its_window());
+
+        assert_eq!(
+            plan.release,
+            ReleaseFix::Activate(release("1.0.0", "one")),
+            "the predecessor must be reactivated"
+        );
+        assert_eq!(
+            plan.commit,
+            Some(InstalledState::confirmed(
+                lineage(),
+                release("1.0.0", "one"),
+                "archive-one".into(),
+                provider(),
+            )),
+            "the predecessor, not the crashed candidate, is what this node runs"
+        );
+        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
+    }
+
+    #[test]
+    fn a_repair_withholds_the_rejection_but_never_the_revert() {
+        // The repaired side: this boot re-downloaded and re-verified `archive-two`, so the exit
+        // cannot be charged to those bytes — but the predecessor is still owed its rollback, and
+        // the crashed head must still NOT be confirmed even with its window passed. Withholding the
+        // exit itself (clearing the marker) is what would confirm it.
+        let mut situation = crashed_inside_its_window();
+        situation.bytes_repaired = true;
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(
+            plan.release,
+            ReleaseFix::Activate(release("1.0.0", "one")),
+            "a repair must not disable the revert"
+        );
+        assert_eq!(
+            plan.commit,
+            Some(InstalledState::confirmed(
+                lineage(),
+                release("1.0.0", "one"),
+                "archive-one".into(),
+                provider(),
+            )),
+            "the crashed head must never be committed as confirmed by a repaired boot"
+        );
+        assert!(
+            plan.reject_app.is_empty(),
+            "a release whose damaged tree this boot repaired must not be blacklisted: {:?}",
+            plan.reject_app
+        );
+    }
+
+    #[test]
+    fn a_repair_withholds_the_journal_driven_rejection_but_still_restores_the_predecessor() {
+        // The same rule at the other rejection site: a journal-driven `RestorePredecessor` whose
+        // rejection would be derived from the exit rather than carried in the journal.
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.active = Some(candidate.clone());
+        situation.installed = Installed::Present(Box::new(InstalledState {
+            repository_lineage: lineage(),
+            release: candidate.clone(),
+            archive_sha256: "archive-two".into(),
+            lifecycle: provider(),
+            pending: None,
+            confirmed: true,
+        }));
+        situation.service_exited = true;
+        situation.bytes_repaired = true;
+        situation.journal = Some(Transaction {
+            id: "attempt".into(),
+            previous_release: predecessor.clone(),
+            previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
+            candidate_release: candidate,
+            candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
+            candidate_rejection_required: false,
+            lifecycle: provider(),
+            rollback_health_failures: 0,
+            phase: TransactionPhase::RollbackStarted,
+        });
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(plan.release, ReleaseFix::Activate(predecessor));
+        assert!(
+            plan.reject_app.is_empty(),
+            "the exit describes a repaired tree, not the candidate's bytes: {:?}",
+            plan.reject_app
+        );
+    }
+
+    #[test]
+    fn a_repair_never_suppresses_a_rejection_the_journal_itself_recorded() {
+        // Scope guard: `candidate_rejection_required` is a durable fact recorded by the failed
+        // activation, not an inference from the crash marker, so a repair must not swallow it.
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut situation = steady();
+        situation.active = Some(candidate.clone());
+        situation.installed = Installed::Present(Box::new(InstalledState {
+            repository_lineage: lineage(),
+            release: candidate.clone(),
+            archive_sha256: "archive-two".into(),
+            lifecycle: provider(),
+            pending: None,
+            confirmed: true,
+        }));
+        situation.service_exited = true;
+        situation.bytes_repaired = true;
+        situation.journal = Some(Transaction {
+            id: "attempt".into(),
+            previous_release: predecessor,
+            previous_archive_sha256: "archive-one".into(),
+            previous_repository_lineage: lineage(),
+            candidate_release: candidate,
+            candidate_archive_sha256: "archive-two".into(),
+            candidate_repository_lineage: lineage(),
+            candidate_rejection_required: true,
+            lifecycle: provider(),
+            rollback_health_failures: 0,
+            phase: TransactionPhase::RollbackStarted,
+        });
+
+        let plan = plan_boot(&situation);
+
+        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
     }
 
     #[test]

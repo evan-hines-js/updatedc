@@ -10,7 +10,6 @@
 //! [`repo`] is the offline side: minting a TUF repository (four ed25519 roles) and
 //! publishing releases. The dev/mock server uses it; a client never does.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use aws_lc_rs::digest::{digest, SHA256};
@@ -69,10 +68,35 @@ impl std::error::Error for Error {}
 /// retryable; everything else (signature, rollback, expiry, hash/length, corrupt
 /// state) fails closed.
 fn classify(e: tough::error::Error) -> Error {
-    match e {
+    match &e {
+        // `tough` verifies content integrity *inside* the fetch stream (a SHA-256
+        // digest adapter and a size cap), so a hash mismatch or an oversize body
+        // surfaces as a transport error carrying the real cause. Those are trust
+        // failures — the bytes were tampered with, and retrying the same mirror is
+        // not a fix.
+        tough::error::Error::Transport { source, .. } if is_integrity_failure(source) => {
+            Error::Trust(e.to_string())
+        }
         tough::error::Error::Transport { .. } => Error::Transport(e.to_string()),
-        other => Error::Trust(other.to_string()),
+        _ => Error::Trust(e.to_string()),
     }
+}
+
+/// Whether a `tough` transport error actually reports a content-integrity failure
+/// (SHA-256 mismatch or size overrun) raised by the fetch stream's adapters.
+fn is_integrity_failure(source: &tough::TransportError) -> bool {
+    let mut cause = std::error::Error::source(source);
+    while let Some(error) = cause {
+        if matches!(
+            error.downcast_ref::<tough::error::Error>(),
+            Some(tough::error::Error::HashMismatch { .. })
+                | Some(tough::error::Error::MaxSizeExceeded { .. })
+        ) {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -213,11 +237,16 @@ mod error_tests {
     /// application, and no update loop to ever fix it.
     #[test]
     fn an_expired_enrollment_bundle_still_boots_a_node_that_has_live_state() {
-        use super::{boot_assignment, LiveAssignment, VerifiedEmbedded};
+        use super::{boot_assignment, Generation, LiveAssignment, VerifiedEmbedded};
 
         let embedded = |expired_role| VerifiedEmbedded {
             assignment: assignment("enrollment-frozen"),
             expired_role,
+            generation: Generation {
+                timestamp: 1,
+                snapshot: 1,
+                targets: 1,
+            },
         };
         let live = || LiveAssignment::Usable(Box::new(assignment("live")));
 
@@ -490,12 +519,11 @@ mod error_tests {
         }
     }
 
-    fn routing(metadata_limit: u64) -> updated::config::Routing {
+    fn routing() -> updated::config::Routing {
         updated::config::Routing {
             root: "/state/routing-root.json".into(),
             base_url: "https://gateway.example/routing/".into(),
             assignment: "assignments/agents/node.json".into(),
-            metadata_limit,
             transport_timeout: std::time::Duration::from_secs(30),
             mtls: updated::tls::Identity::new(
                 "/state/client.crt",
@@ -509,10 +537,10 @@ mod error_tests {
     /// raise, and both fail the node closed and non-retryably when they bite — so they are
     /// decided here, above every shape the control plane may publish, not by the caller.
     #[test]
-    fn routing_limits_are_floored_regardless_of_what_the_caller_configured() {
+    fn routing_limits_are_fixed_regardless_of_what_the_caller_configured() {
         use super::{routing_source, ROUTING_METADATA_FLOOR, ROUTING_TARGET_LIMIT};
 
-        let source = routing_source(&routing(1024 * 1024)).unwrap();
+        let source = routing_source(&routing()).unwrap();
         assert_eq!(
             source.metadata_url,
             "https://gateway.example/routing/metadata/"
@@ -521,18 +549,10 @@ mod error_tests {
             source.targets_url,
             "https://gateway.example/routing/targets/"
         );
-        assert_eq!(
-            source.metadata_limit, ROUTING_METADATA_FLOOR,
-            "a caller's small default must not become a fleet-wide ceiling on targets.json, \
-             which grows with the number of enrolled nodes"
-        );
+        assert_eq!(source.metadata_limit, ROUTING_METADATA_FLOOR);
         assert_eq!(source.target_limit, ROUTING_TARGET_LIMIT);
 
-        // A caller asking for more than the floor keeps its own value.
-        let generous = routing_source(&routing(ROUTING_METADATA_FLOOR * 4)).unwrap();
-        assert_eq!(generous.metadata_limit, ROUTING_METADATA_FLOOR * 4);
-
-        let mut bad = routing(ROUTING_METADATA_FLOOR);
+        let mut bad = routing();
         bad.base_url = "https://gateway.example/routing".into();
         assert!(routing_source(&bad).is_err(), "the base must end in '/'");
     }
@@ -603,8 +623,9 @@ pub struct VerifiedTarget {
     /// The logical TUF target path.
     pub path: String,
     pub length: u64,
-    /// Hash algorithm -> digest bytes (currently `sha256`).
-    pub hashes: BTreeMap<String, Vec<u8>>,
+    /// The sha256 digest bytes the metadata signs. Always present: TUF targets metadata carries it
+    /// for every target, so there is no "unhashed target" case for a caller to handle.
+    pub sha256: Vec<u8>,
     /// Signed, opaque custom metadata (product/version/os/arch/...).
     pub custom: serde_json::Value,
 }
@@ -628,10 +649,18 @@ pub async fn resolve_managed_config(
 ) -> Result<updated::config::Config, Error> {
     let bootstrap = updated::enrollment::BootstrapConfig::load(bootstrap_path)
         .map_err(|error| Error::Local(format!("loading bootstrap config: {error}")))?;
+    // The gateway that serves routing and release metadata is the same externally-exposed listener
+    // the agent enrolled through, so ongoing fetches present the same mTLS identity: the per-node
+    // certificate the node minted at `/enroll`. The refresh policy is given it too, since catching a
+    // lagging pin up means reading the repository's published versioned roots.
+    let mtls = bootstrap
+        .enrollment
+        .steady_identity(enrollment_state)
+        .map_err(|error| Error::Local(format!("resolving steady-state mTLS identity: {error}")))?;
     let bundle = updated::enrollment::load_or_enroll_http(
         &bootstrap,
         enrollment_state,
-        &EmbeddedChainPolicy,
+        &EmbeddedChainPolicy::new(mtls.clone()),
     )
     .await
     .map_err(|error| Error::Local(format!("loading enrollment bundle: {error}")))?;
@@ -642,20 +671,10 @@ pub async fn resolve_managed_config(
         bundle.routing_root.as_bytes(),
     )
     .map_err(|error| Error::Local(format!("materializing routing root: {error}")))?;
-    // The gateway that serves routing and release metadata is the same externally-exposed listener
-    // the agent enrolled through, so ongoing fetches present the same mTLS identity: the per-node
-    // certificate the node minted at `/enroll`.
-    let mtls = bootstrap
-        .enrollment
-        .steady_identity(enrollment_state)
-        .map_err(|error| Error::Local(format!("resolving steady-state mTLS identity: {error}")))?;
     let routing = updated::config::Routing {
         root: routing_root,
         base_url: bundle.routing_base_url.clone(),
         assignment: bundle.assignment.clone(),
-        // Routing metadata sizing is not a per-node choice — it follows fleet size — so this states
-        // the shared floor rather than a private number of its own; see [`ROUTING_METADATA_FLOOR`].
-        metadata_limit: ROUTING_METADATA_FLOOR,
         transport_timeout: std::time::Duration::from_secs(30),
         mtls,
     };
@@ -885,8 +904,157 @@ const BUNDLE_REFRESH_LEAD: jiff::SignedDuration = jiff::SignedDuration::from_hou
 /// The enrollment module owns the transport and the durability; this owns what the bytes mean,
 /// because deciding it needs the same TUF verification the boot path uses — and the refresh path
 /// must not have a second, weaker copy of it.
-pub struct EmbeddedChainPolicy;
+///
+/// It carries the node's steady-state mTLS identity for one reason: adopting a root the node was
+/// offline several rotations for needs the intermediate versioned roots, and those are fetched from
+/// the same routing repository, over the same transport, that every other metadata fetch uses.
+pub struct EmbeddedChainPolicy {
+    mtls: updated::tls::Identity,
+}
 
+/// How long a single versioned-root fetch may take.
+///
+/// This bounds *progress*, not elapsed time — it is reset by every chunk, exactly like the
+/// `read_timeout` on the underlying client — so on its own it does not bound the walk at all. The
+/// total bound is [`ROOT_CATCH_UP_DEADLINE`]; this one just fails a single obviously-dead fetch
+/// early so a walk with one bad version left in it can still finish.
+const ROOT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The total wall-clock budget for one whole rotation walk, however many versions it covers.
+///
+/// [`ROOT_FETCH_TIMEOUT`] resets on every byte, so a gateway that trickles one byte just under it
+/// holds a single fetch open until the 64 MiB metadata floor is reached — and the walk is up to
+/// [`MAX_ROOT_CATCH_UP`] such fetches, run in sequence, awaited inline on the boot path and in the
+/// supervisor's single control loop. Without one deadline over the whole walk a node stops probing
+/// and reporting health while still looking alive, which is the failure the control-plane deadline
+/// on the other two gateway calls exists to prevent.
+///
+/// Thirty seconds is set by the health path, not by the work: the healthproxy drains a node whose
+/// report is older than `REPORT_FRESHNESS` (60s), and the heartbeat runs on the same loop this walk
+/// blocks, so the stall this deadline permits must stay well inside that window or the walk itself
+/// causes the drain it exists to prevent. The work still fits: a versioned root is a few kilobytes
+/// of JSON, so even at the [`MAX_ROOT_CATCH_UP`] ceiling of 64 versions this leaves ~0.4s per
+/// fetch, and a real catch-up is one to three versions — which gets the whole budget and can still
+/// spend the full [`ROOT_FETCH_TIMEOUT`] on a single slow fetch. It is also invisible against the
+/// 12h identity tick that drives the refresh, and short enough that a boot behind a dead gateway
+/// proceeds rather than hangs.
+///
+/// Fail-closed on expiry: the walk is abandoned, the candidate is refused, and the node keeps the
+/// root it has — the same outcome an unreachable repository already gets. A genuinely slow but
+/// honest origin loses nothing permanent: the walk holds no partial state (the pin only moves when
+/// a whole bundle is adopted), and the next tick simply retries against a hopefully quicker origin.
+const ROOT_CATCH_UP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How many root versions one catch-up may walk.
+///
+/// This is what keeps the bound on the walk a property of the node rather than of the candidate: a
+/// bundle claiming version `u64::MAX` would otherwise ask the node to attempt that many fetches.
+///
+/// 64, not the `max_root_updates` ceiling `tough` uses for its own walk. The two are not the same
+/// question: `tough` bounds a walk against a repository it is already talking to, while this bounds
+/// how much sequential network work an *unauthenticated* candidate document can conscript the node's
+/// control loop into. Roots are renewed about yearly and rotated only on a key ceremony, so even a
+/// pessimistic four version bumps a year makes 64 more than fifteen years of lag — far past the
+/// point where a node's own certificates have expired and re-enrollment is the answer anyway. The
+/// smaller ceiling shrinks the worst case a hostile or hung origin can impose by sixteen times at no
+/// cost to any node that can still be recovered by refresh.
+const MAX_ROOT_CATCH_UP: u64 = 64;
+
+impl EmbeddedChainPolicy {
+    /// The policy as this node's own: `mtls` is the per-node steady-state identity the routing
+    /// repository is read through, used only to fetch intermediate versioned roots.
+    pub fn new(mtls: updated::tls::Identity) -> Self {
+        Self { mtls }
+    }
+
+    /// The versioned roots `versions` names, in ascending order, as far as they could be fetched.
+    ///
+    /// Best-effort by design, and safe to be: nothing here decides anything. Whatever comes back is
+    /// handed to [`root_chains_from`], which verifies every step and refuses the candidate outright
+    /// if the chain it was given does not reach it. So a repository that is unreachable, a version
+    /// the operator never published, or a gateway serving garbage all end the same way the old
+    /// behaviour did — the node keeps the root it has — while a genuine multi-version rotation is
+    /// walked one signed step at a time.
+    ///
+    /// The range is [`catch_up_range`]'s, computed and bounded by the caller before a single byte is
+    /// fetched, and the roots come from the CURRENT bundle's `routing_base_url`, the origin this node
+    /// has been pinned to since enrollment, never from anything the candidate names: a candidate that
+    /// could choose where its own predecessors are fetched from would supply the whole chain itself.
+    ///
+    /// This is the only part of [`Self::accept`] that touches the network, which is why the caller
+    /// can put a single [`ROOT_CATCH_UP_DEADLINE`] over the whole of it.
+    async fn rotation_chain(
+        &self,
+        base_url: &str,
+        versions: std::ops::RangeInclusive<u64>,
+    ) -> Vec<String> {
+        let metadata = match repository_base("routing.base_url", base_url).and_then(|base| {
+            base.join("metadata/")
+                .map_err(|e| Error::Local(e.to_string()))
+        }) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                foundation::log::warn(
+                    "updated",
+                    &format!("cannot locate the published rotation chain: {error}"),
+                );
+                return Vec::new();
+            }
+        };
+        let mut chain = Vec::new();
+        for version in versions {
+            match self.versioned_root(&metadata, version).await {
+                Ok(root) => chain.push(root),
+                Err(error) => {
+                    foundation::log::warn(
+                        "updated",
+                        &format!(
+                            "stopping the root catch-up at version {version}: {error}; the node \
+                             keeps the root it has"
+                        ),
+                    );
+                    break;
+                }
+            }
+        }
+        chain
+    }
+
+    /// Fetch `<metadata>/<version>.root.json` — the copy a TUF repository publishes precisely so a
+    /// client can walk the rotation chain — bounded by the routing metadata size floor so an
+    /// unbounded response cannot be read into memory.
+    async fn versioned_root(&self, metadata: &Url, version: u64) -> Result<String, Error> {
+        let url = metadata
+            .join(&format!("{version}.root.json"))
+            .map_err(|error| Error::Local(format!("versioned root URL: {error}")))?;
+        let stream = timeout(
+            ROOT_FETCH_TIMEOUT,
+            tough::Transport::fetch(&transport::transport(&self.mtls), url.clone()),
+        )
+        .await
+        .map_err(|_| transport_timeout(ROOT_FETCH_TIMEOUT, "fetching a versioned root"))?
+        .map_err(|error| Error::Transport(format!("fetching {url}: {error}")))?;
+        let mut bytes = Vec::new();
+        tokio::pin!(stream);
+        while let Some(chunk) = timeout(ROOT_FETCH_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| transport_timeout(ROOT_FETCH_TIMEOUT, "reading a versioned root"))?
+        {
+            let chunk =
+                chunk.map_err(|error| Error::Transport(format!("reading {url}: {error}")))?;
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > ROUTING_METADATA_FLOOR {
+                return Err(Error::Trust(format!(
+                    "{url} exceeded the {ROUTING_METADATA_FLOOR} byte metadata limit"
+                )));
+            }
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| Error::Trust(format!("{url} is not UTF-8: {error}")))
+    }
+}
+
+#[async_trait::async_trait]
 impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
     /// A bundle is due for replacement once any role in its embedded chain is within
     /// [`BUNDLE_REFRESH_LEAD`] of expiry — or once the chain can no longer be read at all, which is
@@ -910,8 +1078,10 @@ impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
     /// documents belong together under *whatever root came with them*, so on its own it would accept
     /// a wholly attacker-minted bundle from a gateway that had been taken over, and the node's
     /// enrollment-time pin would be worth nothing. [`root_chains_from`] requires the candidate's root
-    /// to be the pinned root or a rotation the pinned root itself signed — the same rule a TUF client
-    /// applies walking root versions forward.
+    /// to be reachable from the pinned root by verified single-version steps — the same rule a TUF
+    /// client applies walking root versions forward, and the reason [`Self::rotation_chain`] fetches
+    /// the intermediate versioned roots first: a node that was offline across two root renewals is
+    /// two versions behind, and each of those versions is checkable only against the one before it.
     ///
     /// The three pins are the rest of it. A refresh exists to replace *aging metadata* and may do
     /// nothing else: it must not move where the node's configuration comes from, nor where its
@@ -937,12 +1107,32 @@ impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
     /// correct: the refresh endpoint itself is reached through the node's bootstrap configuration,
     /// not this field, so moving the fleet's routing origin is a re-enrollment, not a metadata
     /// rotation.
-    fn accept(
+    ///
+    /// Order matters as much as the checks do. EVERY check that can be made from the two documents
+    /// alone runs before the first byte is fetched — the roots parse, the candidate's root version is
+    /// in [`catch_up_range`]'s window, the three pins hold, both chains verify, and neither of the
+    /// non-root roles goes backwards. Only then is the rotation chain walked, because the walk takes
+    /// its version range from `candidate.routing_root`, a document nothing has authenticated yet:
+    /// deciding locally first means a candidate a compromised gateway made up costs the node one
+    /// parse rather than up to [`MAX_ROOT_CATCH_UP`] sequential network round trips on the same task
+    /// that drives health probes and self-update. The walk that does happen is bounded as a whole by
+    /// [`ROOT_CATCH_UP_DEADLINE`], so no response — however slowly trickled — can hold that task
+    /// open indefinitely.
+    async fn accept(
         &self,
         candidate: &updated_contracts::enrollment::EnrollmentBundle,
         current: &updated_contracts::enrollment::EnrollmentBundle,
     ) -> std::io::Result<()> {
-        root_chains_from(&current.routing_root, &candidate.routing_root).map_err(refusal)?;
+        let pinned_root: Signed<Root> =
+            parse_embedded(current.routing_root.as_bytes(), "pinned root").map_err(refusal)?;
+        let candidate_root: Signed<Root> =
+            parse_embedded(candidate.routing_root.as_bytes(), "candidate root").map_err(refusal)?;
+        let walk = catch_up_range(
+            &pinned_root,
+            &candidate_root,
+            current.routing_root == candidate.routing_root,
+        )
+        .map_err(refusal)?;
         if candidate.assignment != current.assignment {
             return Err(refusal(Error::Trust(format!(
                 "refreshed enrollment bundle names the assignment {:?}, moving this node off the \
@@ -957,27 +1147,141 @@ impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
                 candidate.routing_base_url, current.routing_base_url
             ))));
         }
-        let candidate = verify_embedded_chain(candidate)
-            .and_then(VerifiedEmbedded::fresh)
-            .map_err(refusal)?;
+        let offered = verify_embedded_chain(candidate).map_err(refusal)?;
         // The current bundle is deliberately verified WITHOUT the freshness requirement: it is the
         // material being replaced precisely because it is aging, and an expired chain still pins
         // this node's install root (see [`boot_assignment`]).
-        let pinned = verify_embedded_chain(current)
-            .map_err(refusal)?
-            .assignment
-            .runtime
-            .install_root;
-        if candidate.runtime.install_root != pinned {
+        let held = verify_embedded_chain(current).map_err(refusal)?;
+        no_generation_rollback(current, candidate, &held.generation, &offered.generation)
+            .map_err(refusal)?;
+        let pinned = held.assignment.runtime.install_root;
+        let offered_assignment = offered.fresh().map_err(refusal)?;
+        if offered_assignment.runtime.install_root != pinned {
             return Err(refusal(Error::Trust(format!(
                 "refreshed enrollment bundle would move install_root to {} from the \
                  enrollment-verified {}",
-                candidate.runtime.install_root.display(),
+                offered_assignment.runtime.install_root.display(),
                 pinned.display()
             ))));
         }
+        // Last, because it is the only step that touches the network, and under one deadline for
+        // the whole walk rather than one per fetch.
+        let chain = match walk {
+            None => Vec::new(),
+            Some(versions) => timeout(
+                ROOT_CATCH_UP_DEADLINE,
+                self.rotation_chain(&current.routing_base_url, versions),
+            )
+            .await
+            .map_err(|_| {
+                refusal(transport_timeout(
+                    ROOT_CATCH_UP_DEADLINE,
+                    "walking the published rotation chain; the node keeps the root it has",
+                ))
+            })?,
+        };
+        root_chains_from(&current.routing_root, &candidate.routing_root, &chain)
+            .map_err(refusal)?;
         Ok(())
     }
+}
+
+/// The versioned roots that must be fetched to check `candidate` against `pinned`, or `None` when
+/// nothing lies in between and [`root_chains_from`] can decide with no network at all.
+///
+/// This is the whole of the local pre-flight on the root, and it exists so the *candidate* cannot
+/// choose how much work the node does. `identical` is the byte equality [`root_chains_from`] treats
+/// as trivially chaining, passed in rather than recomputed so the two agree by construction.
+///
+/// Three outcomes short-circuit before any fetch: a candidate below the pin is a rollback, a
+/// candidate at the pin that is not the same bytes is a substitution, and a candidate more than
+/// [`MAX_ROOT_CATCH_UP`] ahead is a fast-forward. All three are refusals the one-step rule would
+/// reach anyway — the point of reaching them here is that they cost nothing.
+fn catch_up_range(
+    pinned: &Signed<Root>,
+    candidate: &Signed<Root>,
+    identical: bool,
+) -> Result<Option<std::ops::RangeInclusive<u64>>, Error> {
+    let (held, offered) = (pinned.signed.version.get(), candidate.signed.version.get());
+    if identical {
+        return Ok(None);
+    }
+    if offered <= held {
+        return Err(Error::Trust(format!(
+            "the refreshed root is version {offered}, not ahead of the pinned root {held}: an \
+             older or substituted root is a rollback however well it verifies"
+        )));
+    }
+    if offered - held > MAX_ROOT_CATCH_UP {
+        return Err(Error::Trust(format!(
+            "the refreshed root is version {offered}, more than the {MAX_ROOT_CATCH_UP} versions \
+             ahead of the pinned root {held} that a catch-up may walk, so it is refused as a \
+             fast-forward"
+        )));
+    }
+    // Adjacent: the one-step rule decides it with nothing in between.
+    Ok((offered - held > 1).then(|| held + 1..=offered - 1))
+}
+
+/// Rollback protection for the three roles the root check does not cover.
+///
+/// The root is held to "never backwards" by [`chains_one_step`], but a bundle carries a whole
+/// generation of the routing repository, and until this ran nothing stopped a gateway from replying
+/// with the SAME root and an OLDER — still genuinely signed, still unexpired — timestamp, snapshot
+/// and targets. Everything verifies, so the node durably adopts the withdrawn managed configuration
+/// those targets sign, and the next boot that falls back to its enrollment material launches the
+/// application on it. That is precisely the rollback the TUF client rules forbid, applied to the
+/// same adoption path that already forbids it for the root.
+///
+/// The rule is TUF's own: a role's version may never decrease, and equal versions must mean equal
+/// bytes, since a repository that changes a role's content without bumping its version has
+/// republished under an identity it already used. Equal-and-identical is the case that must keep
+/// passing — a same-generation re-fetch is what an ordinary refresh returns when nothing has been
+/// published since, and refusing it would break refresh idempotence.
+fn no_generation_rollback(
+    current: &updated_contracts::enrollment::EnrollmentBundle,
+    candidate: &updated_contracts::enrollment::EnrollmentBundle,
+    held: &Generation,
+    offered: &Generation,
+) -> Result<(), Error> {
+    for (role, held, offered, held_bytes, offered_bytes) in [
+        (
+            "timestamp",
+            held.timestamp,
+            offered.timestamp,
+            &current.initial.timestamp,
+            &candidate.initial.timestamp,
+        ),
+        (
+            "snapshot",
+            held.snapshot,
+            offered.snapshot,
+            &current.initial.snapshot,
+            &candidate.initial.snapshot,
+        ),
+        (
+            "targets",
+            held.targets,
+            offered.targets,
+            &current.initial.targets,
+            &candidate.initial.targets,
+        ),
+    ] {
+        if offered < held {
+            return Err(Error::Trust(format!(
+                "refreshed enrollment bundle carries {role} version {offered}, below the \
+                 {held} this node already holds: an older generation is a rollback however well \
+                 it verifies"
+            )));
+        }
+        if offered == held && held_bytes != offered_bytes {
+            return Err(Error::Trust(format!(
+                "refreshed enrollment bundle carries a different {role} document at the same \
+                 version {offered} this node already holds"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn refusal(error: Error) -> std::io::Error {
@@ -998,46 +1302,82 @@ fn earliest_expiry(
     let snapshot: Signed<Snapshot> =
         parse_embedded(bundle.initial.snapshot.as_bytes(), "snapshot")?;
     let targets: Signed<Targets> = parse_embedded(bundle.initial.targets.as_bytes(), "targets")?;
-    [
-        root.signed.expires(),
-        timestamp.signed.expires(),
-        snapshot.signed.expires(),
-        targets.signed.expires(),
-    ]
-    .into_iter()
-    .min()
-    .ok_or_else(|| Error::Trust("embedded chain has no roles".into()))
+    // The four roles are fixed, so the soonest of them is total — there is no "no roles" case to
+    // fail closed on.
+    Ok(root
+        .signed
+        .expires()
+        .min(timestamp.signed.expires())
+        .min(snapshot.signed.expires())
+        .min(targets.signed.expires()))
 }
 
 /// Whether `candidate` may stand in for the root this node pinned at enrollment: byte-identical, or
-/// a later root version signed by the pinned root's own root-role keys.
+/// reachable from the pinned root through `intermediates` by verified single-version steps.
 ///
-/// Rotation is verified one step at a time, exactly as a TUF client walks it. A candidate that skips
-/// versions cannot be checked against what this node holds, so it is refused — the node keeps the
-/// root it has and asks again later, which is the right outcome even for a legitimate multi-step
-/// rotation: the running update loop performs the full rotation walk against the live repository, and
-/// the bundle catches up once the node's pinned root has advanced.
-fn root_chains_from(pinned: &str, candidate: &str) -> Result<(), Error> {
+/// This is the TUF root rotation walk. Each document is checked against the one before it — a
+/// threshold of signatures from the PREVIOUS root's root role, and a version exactly one higher —
+/// and every verified step advances the pin, so the last intermediate is what the candidate itself
+/// must chain from. Nothing here trusts a version number on its own: an attacker picks those freely,
+/// which is why authority is checked first at every link and the version rule second.
+///
+/// The one-step rule in both directions is what the walk buys. Backwards, a rotation deliberately
+/// retains a continuity key, so an OLD root still verifies under the current one and replaying it
+/// would move the node's root of trust onto keys the operator has retired. Forwards, a root minted
+/// at an arbitrary version by one leaked key would pin the node above every genuine root the
+/// operator will ever publish, and each of those is then refused as a rollback — a node bricked
+/// past re-enrolment. Neither is possible when no accepted step may skip a version.
+///
+/// A bundle carries exactly one root document (`routing_root`), so the intermediates are not in it:
+/// [`EmbeddedChainPolicy::rotation_chain`] fetches the `<n>.root.json` copies the repository
+/// publishes for exactly this purpose. That is what lets a node that was offline across two root
+/// renewals catch up — without it the pin advanced only by adoption, adoption allowed only one
+/// step, and a node two versions behind could never accept another bundle again. Fail-closed
+/// throughout: a missing, unfetchable or non-consecutive intermediate leaves the chain short of the
+/// candidate, the candidate is refused, and the node keeps the root it has.
+fn root_chains_from(pinned: &str, candidate: &str, intermediates: &[String]) -> Result<(), Error> {
     if pinned == candidate {
         return Ok(());
     }
-    let pinned: Signed<Root> = parse_embedded(pinned.as_bytes(), "pinned root")?;
+    let mut held: Signed<Root> = parse_embedded(pinned.as_bytes(), "pinned root")?;
+    for step in intermediates {
+        let next: Signed<Root> = parse_embedded(step.as_bytes(), "intermediate root")?;
+        let version = next.signed.version;
+        chains_one_step(&held, &next, &format!("published root version {version}"))?;
+        held = next;
+    }
     let candidate: Signed<Root> = parse_embedded(candidate.as_bytes(), "candidate root")?;
-    // Authority first: whether the pinned root vouches for this document at all. A root it did not
-    // sign is a substitution, and saying so is more use to an operator than a version complaint —
-    // an attacker picks the version number, so that check can always be satisfied.
-    pinned.signed.verify_role(&candidate).map_err(|error| {
+    chains_one_step(&held, &candidate, "the refreshed root")
+}
+
+/// One link of the rotation walk: `next` must carry a threshold of signatures from `previous`'s root
+/// role and be exactly one version ahead of it. `subject` names the document so a refusal says which
+/// link broke; `previous` is always the node's pin, since every verified link becomes it.
+fn chains_one_step(
+    previous: &Signed<Root>,
+    next: &Signed<Root>,
+    subject: &str,
+) -> Result<(), Error> {
+    // Authority first: whether the root the node holds vouches for this document at all. A root it
+    // did not sign is a substitution, and saying so is more use to an operator than a version
+    // complaint — an attacker picks the version number, so that check can always be satisfied.
+    previous.signed.verify_role(next).map_err(|error| {
         Error::Trust(format!(
-            "refreshed root is not signed by the pinned root: {error}"
+            "{subject} is not signed by the pinned root: {error}"
         ))
     })?;
-    // Then monotonicity, which authority alone does not give: a rotation deliberately retains a
-    // continuity key, so the PREVIOUS root still verifies under the current one and replaying it
-    // would walk the node's root of trust backwards onto keys the operator has retired.
-    if candidate.signed.version <= pinned.signed.version {
+    // A pinned root at `u64::MAX` has no successor at all, so every candidate is refused rather
+    // than wrapping onto — or re-accepting — the version the node already holds.
+    let expected = previous.signed.version.checked_add(1).ok_or_else(|| {
+        Error::Trust(format!(
+            "pinned root is version {}, which has no successor",
+            previous.signed.version
+        ))
+    })?;
+    if next.signed.version != expected {
         return Err(Error::Trust(format!(
-            "refreshed root is version {} at or below the pinned root's {}",
-            candidate.signed.version, pinned.signed.version
+            "{subject} is version {}, not the pinned root's successor {expected}",
+            next.signed.version
         )));
     }
     Ok(())
@@ -1055,6 +1395,21 @@ struct VerifiedEmbedded {
     assignment: updated_contracts::assignment::RepositoryAssignment,
     /// The first role whose `expires` has passed, if any.
     expired_role: Option<&'static str>,
+    /// Which generation of the routing repository the chain is, for [`no_generation_rollback`].
+    generation: Generation,
+}
+
+/// The version each non-root role of an embedded chain carries.
+///
+/// [`verify_embedded_chain`] already proves these three are consistent with each other — snapshot's
+/// against timestamp's metafile, targets' against snapshot's — so one of them moving is the whole
+/// generation moving. They are surfaced separately from the assignment because they answer the
+/// question the assignment cannot: not "do these documents belong together?" but "are they newer
+/// than what this node already had?".
+struct Generation {
+    timestamp: u64,
+    snapshot: u64,
+    targets: u64,
 }
 
 impl VerifiedEmbedded {
@@ -1139,18 +1494,17 @@ fn verify_embedded_chain(
         config_bytes,
         "managed configuration",
     )?;
-    let actual_config = updated::hash::sha256_bytes(config_bytes);
-    if !updated::hash::digests_match(&actual_config, &agent.config.sha256) {
-        return Err(Error::Trust(
-            "embedded managed configuration digest does not match agent document".into(),
-        ));
-    }
     let assignment: updated_contracts::assignment::RepositoryAssignment =
         parse_embedded(config_bytes, "managed configuration")?;
     assignment.validate().map_err(Error::Trust)?;
     Ok(VerifiedEmbedded {
         assignment,
         expired_role,
+        generation: Generation {
+            timestamp: timestamp.signed.version.get(),
+            snapshot: snapshot.signed.version.get(),
+            targets: targets.signed.version.get(),
+        },
     })
 }
 
@@ -1271,7 +1625,7 @@ fn routing_source(
         root: routing_config.root.clone(),
         metadata_url: metadata_url.to_string(),
         targets_url: targets_url.to_string(),
-        metadata_limit: routing_config.metadata_limit.max(ROUTING_METADATA_FLOOR),
+        metadata_limit: ROUTING_METADATA_FLOOR,
         target_limit: ROUTING_TARGET_LIMIT,
         transport_timeout: routing_config.transport_timeout,
         mtls: routing_config.mtls.clone(),
@@ -1304,21 +1658,31 @@ impl TrustedRepository {
         // half-resolved document — and the next boot would silently fall back to the
         // enrollment-frozen assignment instead of the one it is actually running.
         let staging = updated::config::with_suffix(&paths.assignment, ".resolving");
-        routing.download_target(&target, &staging).await?;
-        let bytes = tokio::fs::read(&staging)
-            .await
-            .map_err(|e| Error::Local(format!("reading verified agent document: {e}")))?;
-        let agent: updated_contracts::artifact::AgentDocument = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Trust(format!("invalid agent document: {e}")))?;
-        agent.validate().map_err(Error::Trust)?;
-        let config = routing.exact_target(&agent.config)?;
-        routing.download_target(&config, &staging).await?;
-        let bytes = tokio::fs::read(&staging)
-            .await
-            .map_err(|e| Error::Local(format!("reading verified config bundle: {e}")))?;
-        let assignment: updated_contracts::assignment::RepositoryAssignment =
-            serde_json::from_slice(&bytes)
-                .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
+        let staged = async {
+            routing.download_target(&target, &staging).await?;
+            let bytes = tokio::fs::read(&staging)
+                .await
+                .map_err(|e| Error::Local(format!("reading verified agent document: {e}")))?;
+            let agent: updated_contracts::artifact::AgentDocument = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::Trust(format!("invalid agent document: {e}")))?;
+            agent.validate().map_err(Error::Trust)?;
+            let config = routing.exact_target(&agent.config)?;
+            routing.download_target(&config, &staging).await?;
+            let bytes = tokio::fs::read(&staging)
+                .await
+                .map_err(|e| Error::Local(format!("reading verified config bundle: {e}")))?;
+            let assignment: updated_contracts::assignment::RepositoryAssignment =
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| Error::Trust(format!("invalid config bundle: {e}")))?;
+            Ok::<_, Error>((assignment, bytes))
+        }
+        .await;
+        // The staging file is scratch on every path out of here, failures included: an agent
+        // document whose config target is absent from metadata fails on every poll, and each one
+        // would otherwise leave a file named like the live assignment holding the intermediate
+        // document. Nothing sweeps it — `download_target` reclaims only its own prefix.
+        let _ = std::fs::remove_file(&staging);
+        let (assignment, bytes) = staged?;
         // This write REPLACES the node's live boot config — the document the next boot launches the
         // managed application from, before any network. So everything that decides whether a node
         // can boot on it is proven here, ahead of the write, through the same check the reader
@@ -1331,18 +1695,14 @@ impl TrustedRepository {
         // fail — a document the node cannot boot on must never become the document it boots on — but
         // it is a real escalation from persisting it and ignoring it at the next boot, which kept
         // updates flowing while quietly running an assignment nobody had checked.
-        let usable = usable_as_boot_config(&assignment, &paths.install_root)
-            .map_err(|reason| Error::Trust(format!("the resolved assignment {reason}")));
-        // The staging file is scratch on every path out of here, including this one: leaving it
-        // behind on a rejection would accumulate one stale copy of an unusable document per refresh.
-        let _ = std::fs::remove_file(&staging);
-        usable?;
+        usable_as_boot_config(&assignment, &paths.install_root)
+            .map_err(|reason| Error::Trust(format!("the resolved assignment {reason}")))?;
         foundation::durable::atomic_write_managed(&paths.assignment, ".assignment-", &bytes)
             .map_err(|e| Error::Local(format!("persisting the resolved assignment: {e}")))?;
         Ok(ResolvedAssignment {
             // The digest TUF just verified these exact bytes against — the same value the control
             // plane published this configuration under, and the node's content identity for it.
-            sha256: hex::encode(digest(&SHA256, &bytes).as_ref()),
+            sha256: updated::hash::sha256_bytes(&bytes),
             assignment,
         })
     }
@@ -1350,9 +1710,13 @@ impl TrustedRepository {
     /// Resolve the agent's exact, TUF-verified document and then load the
     /// selected release repository. Repeating this operation is how a running node
     /// observes control-plane group changes without restart.
+    ///
+    /// The repository's own limits and timeout come from the assignment that was just verified —
+    /// the same document that names the repository — so a control-plane change to them takes
+    /// effect on the next cycle like every other runtime field, with no node-local copy to drift
+    /// from it or to pin the process to its boot-time values.
     pub async fn assigned(
         routing_config: &updated::config::Routing,
-        repository_config: &updated::config::Repository,
         storage: &updated::config::Storage,
         paths: &updated::config::Paths,
     ) -> Result<Self, Error> {
@@ -1361,6 +1725,7 @@ impl TrustedRepository {
             assignment,
             sha256: assignment_sha256,
         } = resolved;
+        let limits = &assignment.runtime.repository;
         let assignment_key = assignment_identity(&assignment);
         let assignment_store = paths.datastore.join(&assignment_key);
         std::fs::create_dir_all(&assignment_store).map_err(|error| {
@@ -1378,9 +1743,9 @@ impl TrustedRepository {
             root: release_root,
             metadata_url: assignment.metadata_url.clone(),
             targets_url: assignment.targets_url.clone(),
-            metadata_limit: repository_config.metadata_limit,
-            target_limit: repository_config.target_limit,
-            transport_timeout: repository_config.transport_timeout,
+            metadata_limit: limits.metadata_limit,
+            target_limit: limits.target_limit,
+            transport_timeout: Duration::from_secs(limits.transport_timeout_seconds),
             // The release repository is the same externally-exposed gateway as routing.
             mtls: routing_config.mtls.clone(),
         };
@@ -1477,6 +1842,14 @@ impl TrustedRepository {
         self.assignment_sha256.as_deref()
     }
 
+    /// The largest target this repository will fetch — for [`assigned`](Self::assigned), the
+    /// ceiling the resolved assignment signs. Callers that bound what they do with a downloaded
+    /// target (bundle extraction, say) read it here rather than from a node-local copy, so one
+    /// signed value governs the whole acquisition.
+    pub fn target_limit(&self) -> u64 {
+        self.config.target_limit
+    }
+
     /// Resolve an exact target reference without version or "latest" selection.
     pub fn exact_target(
         &self,
@@ -1492,11 +1865,7 @@ impl TrustedRepository {
                     reference.path
                 ))
             })?;
-        let actual = target
-            .hashes
-            .get("sha256")
-            .map(hex::encode)
-            .ok_or_else(|| Error::Trust(format!("target {} has no sha256", target.path)))?;
+        let actual = hex::encode(&target.sha256);
         if !updated::hash::digests_match(&actual, &reference.sha256) {
             return Err(Error::Trust(format!(
                 "desired target {} has sha256 {}, expected {}",
@@ -1620,7 +1989,7 @@ fn assignment_identity(assignment: &updated_contracts::assignment::RepositoryAss
         bytes.extend_from_slice(&(endpoint.len() as u64).to_be_bytes());
         bytes.extend_from_slice(endpoint.as_bytes());
     }
-    hex::encode(digest(&SHA256, &bytes).as_ref())
+    updated::hash::sha256_bytes(&bytes)
 }
 
 fn validate_release_url(name: &str, raw: &str) -> Result<(), Error> {
@@ -1631,7 +2000,15 @@ fn validate_release_url(name: &str, raw: &str) -> Result<(), Error> {
 /// are accepted directly; an absolute directory path is the shorthand used by a
 /// manually placed assignment. All forms resolve to the same TUF transport.
 fn repository_base(name: &str, raw: &str) -> Result<Url, Error> {
-    let parsed = Url::parse(raw).ok();
+    // An absolute path is decided by the platform, not by URL syntax: a Windows
+    // drive-letter path parses as a URL whose scheme is the drive letter, so it
+    // must be recognised as a directory before `Url::parse` sees it. This is the
+    // same rule `updated::config::base_url_is_local` applies to the same string.
+    let parsed = if Path::new(raw).is_absolute() {
+        None
+    } else {
+        Url::parse(raw).ok()
+    };
     let url = match parsed {
         Some(url) if matches!(url.scheme(), "http" | "https" | "file") => url,
         Some(url) if !url.scheme().is_empty() => {
@@ -1673,12 +2050,10 @@ fn transport_timeout(timeout: Duration, operation: &str) -> Error {
 }
 
 fn to_verified(path: &str, target: &Target) -> VerifiedTarget {
-    let mut hashes = BTreeMap::new();
-    hashes.insert("sha256".to_string(), target.hashes.sha256.to_vec());
     VerifiedTarget {
         path: path.to_string(),
         length: target.length,
-        hashes,
+        sha256: target.hashes.sha256.to_vec(),
         custom: serde_json::to_value(&target.custom).unwrap_or(serde_json::Value::Null),
     }
 }
@@ -1731,6 +2106,16 @@ mod bundle_refresh_tests {
         std::fs::read_to_string(newest.1).unwrap()
     }
 
+    /// The policy as a node holds it. The identity is only ever presented when a versioned root is
+    /// fetched over the network, which none of these cases reaches, so the paths need not exist.
+    fn policy() -> EmbeddedChainPolicy {
+        EmbeddedChainPolicy::new(updated::tls::Identity::new(
+            "/nonexistent/agent.crt",
+            "/nonexistent/agent.key",
+            "/nonexistent/ca.crt",
+        ))
+    }
+
     /// A bundle carrying a real repository's signed chain. Only the four role documents matter here:
     /// expiry is read from them, and nothing in this module verifies the targets they sign.
     fn bundle_from(repo_dir: &Path) -> EnrollmentBundle {
@@ -1759,13 +2144,13 @@ mod bundle_refresh_tests {
         let fresh = minted(&tmp.join("fresh"), 365).await;
         let fresh = bundle_from(&fresh);
         assert!(
-            !EmbeddedChainPolicy.needs_refresh(&fresh),
+            !policy().needs_refresh(&fresh),
             "a year of validity is not worth a control-plane request"
         );
         let due = minted(&tmp.join("due"), 1).await;
         let due = bundle_from(&due);
         assert!(
-            EmbeddedChainPolicy.needs_refresh(&due),
+            policy().needs_refresh(&due),
             "a chain inside the {BUNDLE_REFRESH_LEAD:?} lead must be replaced while it is still valid"
         );
 
@@ -1774,10 +2159,10 @@ mod bundle_refresh_tests {
         let mut mixed = fresh.clone();
         mixed.initial.timestamp = due.initial.timestamp.clone();
         assert!(earliest_expiry(&mixed).unwrap() < earliest_expiry(&fresh).unwrap());
-        assert!(EmbeddedChainPolicy.needs_refresh(&mixed));
+        assert!(policy().needs_refresh(&mixed));
         let mut unreadable = fresh.clone();
         unreadable.initial.snapshot = "{}".into();
-        assert!(EmbeddedChainPolicy.needs_refresh(&unreadable));
+        assert!(policy().needs_refresh(&unreadable));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1795,7 +2180,7 @@ mod bundle_refresh_tests {
 
         // An unrelated repository: a perfectly valid root, signed by keys this node never pinned.
         let foreign_root = role(&minted(&tmp.join("foreign"), 365).await, "root.json");
-        let refusal = root_chains_from(&v1, &foreign_root)
+        let refusal = root_chains_from(&v1, &foreign_root, &[])
             .unwrap_err()
             .to_string();
         assert!(
@@ -1804,7 +2189,7 @@ mod bundle_refresh_tests {
         );
 
         // The same bytes are trivially the same root of trust.
-        root_chains_from(&v1, &v1).expect("the pinned root is itself");
+        root_chains_from(&v1, &v1, &[]).expect("the pinned root is itself");
 
         // One rotation, co-signed by the pinned root, is the case this must allow — otherwise a
         // fleet could never refresh again after an operator rotates.
@@ -1814,25 +2199,196 @@ mod bundle_refresh_tests {
             .await
             .unwrap();
         let v2 = role(&repo_dir, "root.json");
-        root_chains_from(&v1, &v2).expect("a rotation the pinned root signed is adoptable");
+        root_chains_from(&v1, &v2, &[]).expect("a rotation the pinned root signed is adoptable");
 
         // Never backwards: an older root is a rollback however well it verifies.
-        let rollback = root_chains_from(&v2, &v1).unwrap_err().to_string();
+        let rollback = root_chains_from(&v2, &v1, &[]).unwrap_err().to_string();
         assert!(
-            rollback.contains("at or below the pinned root"),
+            rollback.contains("not the pinned root's successor"),
             "a rollback must be refused by name, got: {rollback}"
         );
 
-        // A second rotation cannot be checked against v1 in one step, so it is refused and the node
-        // keeps the root it has until its own rotation walk has caught up.
+        // Never forwards past one step either, even when the pinned root's own keys signed the
+        // candidate: a root minted at an arbitrarily high version is a fast-forward, and adopting
+        // it would leave the node pinned above every genuine root the operator will ever publish —
+        // an unrecoverable state, since each of those is then refused as a rollback.
+        let ahead_dir = tmp.join("ahead");
+        repo::init_from_version(&ahead_dir, &keys, 365, u64::MAX)
+            .await
+            .unwrap();
+        let ahead = role(&ahead_dir, "root.json");
+        let fast_forward = root_chains_from(&v1, &ahead, &[]).unwrap_err().to_string();
+        assert!(
+            fast_forward.contains("not the pinned root's successor"),
+            "a version fast-forward must be refused by name, got: {fast_forward}"
+        );
+
+        // A second rotation cannot be checked against v1 alone — but it is exactly what a node that
+        // was offline across two ceremonies comes back to, so it is adoptable once the root in
+        // between is supplied. The pin advances through the walk: v2 verifies under v1, v3 under v2.
         let third = tmp.join("third.pk8");
         repo::generate_root_key(&third).await.unwrap();
         repo::rotate_root(&repo_dir, std::slice::from_ref(&successor), &third, 365)
             .await
             .unwrap();
         let v3 = role(&repo_dir, "root.json");
-        assert!(root_chains_from(&v1, &v3).is_err());
-        root_chains_from(&v2, &v3).expect("each single step still chains");
+        assert!(root_chains_from(&v1, &v3, &[]).is_err());
+        root_chains_from(&v2, &v3, &[]).expect("each single step still chains");
+        root_chains_from(&v1, &v3, std::slice::from_ref(&v2))
+            .expect("a two-version rotation chains once the root in between is walked");
+
+        // What the walk must not become: a way to pass off a chain that skips. Handing the walk the
+        // candidate itself in place of the missing v2 is a chain with a hole in it, and v1 never
+        // signed v3, so it fails at the link that cannot be verified rather than at the version
+        // count — the fast-forward stays blocked no matter how the intermediates are supplied.
+        let skipped = root_chains_from(&v1, &v3, std::slice::from_ref(&v3))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            skipped.contains("published root version 3")
+                && skipped.contains("not signed by the pinned root"),
+            "a chain that skips a version must be refused by name, got: {skipped}"
+        );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::{classify, repository_base, validate_release_url, Error};
+    use crate::repo;
+    use std::path::{Path, PathBuf};
+    use tough::{ExpirationEnforcement, FilesystemTransport, Limits, RepositoryLoader};
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "updated-tuf-{label}-{}-{}",
+            std::process::id(),
+            updated::rand::token().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn minted(tmp: &Path) -> PathBuf {
+        let repo_dir = tmp.join("repo");
+        let keys = repo::generate_keys(&tmp.join("keys")).await.unwrap();
+        repo::init(&repo_dir, &keys, 365).await.unwrap();
+        repo_dir
+    }
+
+    /// Load a minted repository off the filesystem, the way a node loads it over the wire.
+    async fn load(repo_dir: &Path, datastore: &Path, snapshot_limit: u64) -> Result<(), Error> {
+        let root = std::fs::read(repo_dir.join("metadata/root.json")).unwrap();
+        let metadata_url = repository_base(
+            "metadata base",
+            &format!("{}/", repo_dir.join("metadata").display()),
+        )
+        .unwrap();
+        let targets_url = repository_base(
+            "targets base",
+            &format!("{}/", repo_dir.join("targets").display()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(datastore).unwrap();
+        RepositoryLoader::new(&root, metadata_url, targets_url)
+            .transport(FilesystemTransport)
+            .datastore(datastore.to_owned())
+            .limits(Limits {
+                max_root_size: 1024 * 1024,
+                max_targets_size: 1024 * 1024,
+                max_timestamp_size: 1024 * 1024,
+                max_snapshot_size: snapshot_limit,
+                max_root_updates: 1024,
+            })
+            .expiration_enforcement(ExpirationEnforcement::Safe)
+            .load()
+            .await
+            .map(|_| ())
+            .map_err(classify)
+    }
+
+    /// The newest published copy of a versioned role document.
+    fn newest(metadata: &Path, file: &str) -> PathBuf {
+        std::fs::read_dir(metadata)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let version: u64 = name.strip_suffix(&format!(".{file}"))?.parse().ok()?;
+                Some((version, entry.path()))
+            })
+            .max_by_key(|(version, _)| *version)
+            .unwrap_or_else(|| panic!("no published {file} in {}", metadata.display()))
+            .1
+    }
+
+    /// `tough` checks content integrity inside the fetch stream, so a hash mismatch and a size
+    /// overrun both arrive wrapped in its transport variant. They are tampering, not a flaky link:
+    /// classifying them as retryable would retry a compromised mirror on the fast cadence and
+    /// raise no trust alarm.
+    #[tokio::test]
+    async fn tampered_metadata_is_a_trust_failure_not_a_retryable_transport_blip() {
+        let tmp = scratch("integrity");
+        let repo_dir = minted(&tmp).await;
+
+        // A clean repository loads, so the failures below are about the tampering only.
+        load(&repo_dir, &tmp.join("clean"), 1024 * 1024)
+            .await
+            .expect("a freshly minted repository verifies");
+
+        // A missing file is a genuine transport problem and stays retryable.
+        let empty = tmp.join("empty/metadata");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::copy(repo_dir.join("metadata/root.json"), empty.join("root.json")).unwrap();
+        let missing = load(&tmp.join("empty"), &tmp.join("missing-store"), 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            missing.is_retryable(),
+            "an absent file is a transport problem, got: {missing}"
+        );
+
+        // One flipped byte in signed metadata: the digest adapter fails the stream.
+        let snapshot = newest(&repo_dir.join("metadata"), "snapshot.json");
+        let mut bytes = std::fs::read(&snapshot).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&snapshot, &bytes).unwrap();
+        let tampered = load(&repo_dir, &tmp.join("tampered-store"), 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(tampered, Error::Trust(_)) && !tampered.is_retryable(),
+            "a hash mismatch must fail closed, got: {tampered}"
+        );
+
+        // An oversize role document is the other in-stream integrity check.
+        std::fs::write(&snapshot, &bytes[..last]).unwrap();
+        let oversize = load(&repo_dir, &tmp.join("oversize-store"), 8)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(oversize, Error::Trust(_)) && !oversize.is_retryable(),
+            "a length overrun must fail closed, got: {oversize}"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// An absolute directory path is a documented location form. On Windows it carries a drive
+    /// letter, which `Url::parse` happily reads as a one-letter scheme — so the path form has to be
+    /// recognised before parsing, or an offline deployment is refused as a tampering event.
+    #[test]
+    fn an_absolute_directory_path_is_a_location_not_a_scheme() {
+        let base = if cfg!(windows) {
+            r"C:\ProgramData\updated\release\metadata\"
+        } else {
+            "/opt/update/metadata/"
+        };
+        let url = repository_base("metadata base", base).expect("an absolute path is a location");
+        assert_eq!(url.scheme(), "file");
+        assert!(validate_release_url("metadata_url", base).is_ok());
+        // A real unsupported scheme is still refused.
+        assert!(validate_release_url("metadata_url", "ftp://cdn.example/metadata/").is_err());
     }
 }

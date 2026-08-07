@@ -69,7 +69,7 @@ pub struct InstalledState {
     /// steady-state install and a first install (nothing to revert to). Folded into this
     /// atomic record so the commit and its rollback intent land together — there is no
     /// separate "arm" step to be interrupted.
-    #[serde(deserialize_with = "crate::required_option")]
+    #[serde(deserialize_with = "updated_contracts::required_option")]
     pub pending: Option<Pending>,
     /// Whether this head has proven itself healthy at least once. `false` marks a *provisional*
     /// cold install: a head placed from the first trusted assignment that has never passed a
@@ -221,11 +221,10 @@ pub enum Installed {
     Invalid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Enrollment {
-    initial_repository_lineage: RepositoryLineage,
-}
+/// The only content an enrollment record ever holds. Reading anything else back is corruption,
+/// and [`read_enrollment`] reports it as [`EnrollmentState::Invalid`] so the node fails closed
+/// instead of mistaking a damaged record for a node that was never enrolled.
+const ENROLLMENT_MARKER: &[u8] = b"enrolled\n";
 
 pub enum EnrollmentState {
     Present,
@@ -239,12 +238,8 @@ pub fn enrollment_path(installed_path: &Path) -> PathBuf {
 
 /// Permanently consume bootstrap eligibility before the first installed-state commit.
 /// A crash after this write can require operator recovery, but can never re-enter bootstrap.
-pub fn enroll(installed_path: &Path, lineage: RepositoryLineage) -> io::Result<()> {
+pub fn enroll(installed_path: &Path) -> io::Result<()> {
     let path = enrollment_path(installed_path);
-    let bytes = serde_json::to_vec(&Enrollment {
-        initial_repository_lineage: lineage,
-    })
-    .map_err(io::Error::other)?;
     // Once-only: this record is what makes bootstrap eligibility unrepeatable, so an existing one
     // is never overwritten. The single install lock makes this check sufficient — it is the same
     // owner that would have written it.
@@ -258,17 +253,13 @@ pub fn enroll(installed_path: &Path, lineage: RepositoryLineage) -> io::Result<(
     // the process died mid-write — and a record that is present but unparseable is worse than
     // either state it sits between: the node is refused a cold install (bootstrap is spent) and
     // refused a normal boot (the record is invalid), with nothing on disk able to resolve it.
-    foundation::durable::atomic_write_managed(&path, ".enrollment-", &bytes)
+    foundation::durable::atomic_write_managed(&path, ".enrollment-", ENROLLMENT_MARKER)
 }
 
 pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
     match std::fs::read(enrollment_path(installed_path)) {
-        Ok(raw) => match serde_json::from_slice::<Enrollment>(&raw) {
-            Ok(enrollment) if enrollment.initial_repository_lineage.validate() => {
-                EnrollmentState::Present
-            }
-            Ok(_) | Err(_) => EnrollmentState::Invalid,
-        },
+        Ok(raw) if raw == ENROLLMENT_MARKER => EnrollmentState::Present,
+        Ok(_) => EnrollmentState::Invalid,
         Err(error) if error.kind() == io::ErrorKind::NotFound => EnrollmentState::Missing,
         Err(_) => EnrollmentState::Invalid,
     }
@@ -442,14 +433,16 @@ mod tests {
     #[test]
     fn enrollment_is_one_way_and_survives_missing_installed_state() {
         let path = tmp("enrollment");
-        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
-        enroll(&path, lineage.clone()).unwrap();
+        enroll(&path).unwrap();
         assert!(matches!(read_enrollment(&path), EnrollmentState::Present));
         assert_eq!(
-            enroll(&path, lineage).unwrap_err().kind(),
+            enroll(&path).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert!(matches!(read_installed(&path), Installed::Missing));
         assert!(matches!(read_enrollment(&path), EnrollmentState::Present));
+        // A damaged record fails closed: it is neither a usable enrollment nor a fresh start.
+        std::fs::write(enrollment_path(&path), b"tampered").unwrap();
+        assert!(matches!(read_enrollment(&path), EnrollmentState::Invalid));
     }
 }

@@ -29,7 +29,6 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
     Ok(Options {
         deployment: cfg.deployment,
         routing: cfg.routing,
-        repository: cfg.repository,
         application: cfg.application,
         timeouts,
         storage: cfg.storage,

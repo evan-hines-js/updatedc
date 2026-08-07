@@ -236,4 +236,4 @@ and identity requirements.
 
 The longer rationale, deployment templates, trust model, on-disk state model, and
 configuration reference are in `README.md`, `deploy/README.md`, and
-`deploy/config.toml`.
+`deploy/bootstrap.toml`.

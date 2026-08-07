@@ -20,6 +20,11 @@
   roles:
     # Order matters: bring up the cluster + gateway ingress, enroll the co-located agent, THEN
     # apply the demo layer (which labels that now-enrolled agent into the manual Magnolia group).
+    # The agent enrolls under `updated_hostname`, which `demo_colocated_agent`'s defaults derive
+    # from `demo_colocated_hostname` — which must stay equal to the compiled-in
+    # `DEMO_EXTERNAL_VM_HOSTNAME` the demo layer addresses (see that role's defaults). Neither is
+    # freely overridable: changing the name means changing the constant in
+    # crates/updatec-demo/src/layout.rs too.
     - demo_deps
     - demo_cluster
     - demo_ingress

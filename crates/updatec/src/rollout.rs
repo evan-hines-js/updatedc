@@ -80,6 +80,10 @@ pub struct SetStatus {
     pub name: String,
     pub member_count: usize,
     pub max_concurrent: usize,
+    /// Members occupying one of this set's concurrency slots: a rollout of theirs is in flight.
+    /// That includes a member the operator has since RETARGETED — its own verdict is
+    /// [`GroupProgress::Held`], but the rollout it was admitted to is still running and still holds
+    /// the slot, so it belongs to the count that explains why a sibling is being refused.
     pub rolling: Vec<String>,
     pub settled: Vec<String>,
     /// Members no evidence can ever come from — they select no agent, or EVERY agent they select
@@ -133,7 +137,10 @@ pub struct RolloutInputs<'a> {
     /// the only way a blind node can be staged at all: it produces no telemetry, so "has it been
     /// moved yet" can only be answered by what was published to it.
     pub published: &'a BTreeMap<String, String>,
-    /// Groups quarantined by validation this pass, with the deployment each is still pinned to.
+    /// Groups quarantined by validation this pass that have a durable pin, with the deployment each
+    /// is still pinned to. Which agents belong to a quarantined group is answered elsewhere, from
+    /// the full quarantined set (see [`crate::domain::DesiredState::quarantined`]) — a group
+    /// quarantined before its first admission has no pin at all and so is absent here.
     ///
     /// They are deliberately NOT planned here — a quarantined group has no usable spec to plan
     /// from — but the control plane is still holding their nodes on these deployments, so the
@@ -141,31 +148,7 @@ pub struct RolloutInputs<'a> {
     /// relabelled OUT of a quarantined group (the documented remediation) arrives in its new group
     /// running one of them, and a group that cannot recognize where that node is hands it a
     /// backward move no `maxUnavailable` budget is checked against.
-    pub held: &'a BTreeMap<String, HeldGroup>,
-}
-
-/// A group quarantined by validation this pass: the deployment it is still pinned to, plus the
-/// selector that says which agents are ITS agents.
-///
-/// The selector is carried because quarantine must not change where a node belongs. A group absent
-/// from the plan makes its nodes resolve to the `default` pseudo-group, and an agent enrolled while
-/// the group is broken has no previous routing to be carried forward on — so without the selector it
-/// was published with the repository's fleet-wide `default_deployment`, which is exactly the ungated
-/// deployment swap quarantine exists to prevent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HeldGroup {
-    pub state: AdmittedDeployment,
-    /// The group's own `spec.selector.matchLabels`. EMPTY means the selector itself is what
-    /// quarantined the group, and an empty selector selects NOTHING here — reading it as "matches
-    /// every agent" would hold the whole fleet on one broken group's pin.
-    pub match_labels: BTreeMap<String, String>,
-}
-
-impl HeldGroup {
-    /// Whether an agent carrying `labels` belongs to this quarantined group.
-    pub(crate) fn selects(&self, labels: &BTreeMap<String, String>) -> bool {
-        !self.match_labels.is_empty() && crate::selector_matches(&self.match_labels, labels)
-    }
+    pub held: &'a BTreeMap<String, AdmittedDeployment>,
 }
 
 /// What is known about ONE node's state relative to one deployment identity.
@@ -542,7 +525,25 @@ pub(crate) fn plan_rollouts(
         .filter(|(_, group)| group.emergency_correction)
         .map(|(name, _)| name.clone())
         .collect();
-    let statuses = build_statuses(sets, &plans, &group_plans, &group_progress, &emergency, now);
+    // The members actually occupying a concurrency slot, read from the SAME gate `build_set_plans`
+    // counts them with. A member retargeted mid-roll is `Held` on the operator's question — what it
+    // is running is not what was asked for — while the rollout it was ADMITTED to still holds the
+    // slot, and reporting only the verdict left that member in no status list at all: the set
+    // published `rollingCount: 0` while refusing every sibling, with nothing naming the holder.
+    let slot_holders: BTreeSet<String> = desired
+        .keys()
+        .filter(|name| is_rolling(admitted, &observations, name))
+        .cloned()
+        .collect();
+    let statuses = build_statuses(
+        sets,
+        &plans,
+        &group_plans,
+        &group_progress,
+        &slot_holders,
+        &emergency,
+        now,
+    );
     let node_deployments = assign_nodes(groups, admitted, held, &observations);
     RolloutPlan {
         sets: statuses,
@@ -551,21 +552,6 @@ pub(crate) fn plan_rollouts(
     }
 }
 
-/// Retire the predecessors of every rollout whose staging is finished, and the individual ones no
-/// node is left on.
-///
-/// A predecessor exists for exactly one purpose: to be the deployment that the nodes NOT YET handed
-/// `current` keep running while the rollout moves them one `maxUnavailable` batch at a time. It is
-/// therefore retired on the staging question — has every selected node been handed `current`? —
-/// which is answered from what was published, not from telemetry.
-///
-/// Deciding this on telemetry instead was the wedge in both directions. Requiring evidence of
-/// health held the predecessor forever for a group that can produce none. Retiring it whenever the
-/// group stopped being observable did the opposite and worse: `assign_nodes` takes the
-/// no-predecessor path when it is absent and hands `current` to EVERY node in one generation, so a
-/// group that lost its pinned keys mid-rollout silently turned a throttled rollout into an
-/// unthrottled fleet-wide swap. Staging is a property of publication, so it is decided on
-/// publication and applies to every generation change, rollbacks included.
 /// Keep the admitted entry of a group the operator DELETED for exactly as long as some node is
 /// still placed on one of its deployments, compacted to those deployments alone.
 ///
@@ -599,6 +585,25 @@ fn retire_deleted_groups(
     });
 }
 
+/// Retire the predecessors of every rollout whose staging is finished, and the individual ones no
+/// node is left on.
+///
+/// A predecessor exists for exactly one purpose: to be the deployment that the nodes NOT YET handed
+/// `current` keep running while the rollout moves them one `maxUnavailable` batch at a time. It is
+/// therefore retired on the staging question — has every selected node been handed `current`? —
+/// which is answered from what was published, not from telemetry.
+///
+/// Deciding this on telemetry instead was the wedge in both directions. Requiring evidence of
+/// health held the predecessor forever for a group that can produce none. Retiring it whenever the
+/// group stopped being observable did the opposite and worse: `assign_nodes` takes the
+/// no-predecessor path when it is absent and hands `current` to EVERY node in one generation, so a
+/// group that lost its pinned keys mid-rollout silently turned a throttled rollout into an
+/// unthrottled fleet-wide swap. Staging is a property of publication, so it is decided on
+/// publication and applies to every generation change, rollbacks included.
+///
+/// The list is never emptied while a rollout is still staging — see `truncate(1)` below: an empty
+/// `previous` means "nothing is staged", and a group whose nodes sit on deployments it does not
+/// name would otherwise have every one of them read as unplaced.
 fn finish_staged_rollouts(
     admitted: &mut BTreeMap<String, AdmittedDeployment>,
     desired: &BTreeMap<String, DesiredDeployment>,
@@ -927,6 +932,7 @@ fn build_statuses(
     plans: &[SetPlan],
     group_plans: &BTreeMap<String, Vec<usize>>,
     group_progress: &BTreeMap<String, GroupProgress>,
+    slot_holders: &BTreeSet<String>,
     emergency: &BTreeSet<String>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<SetStatus> {
@@ -954,9 +960,17 @@ fn build_statuses(
                     emergency_members.push(name.clone());
                 }
                 match group_progress.get(name) {
-                    // Held back — neither rolling nor settled on its desire. A member with no
-                    // admitted entry has not been published at all, which is the same story for a
-                    // reader, and a member absent from the map is not planned this pass.
+                    // Held back — neither rolling nor settled ON ITS DESIRE. It is still listed as
+                    // rolling when the rollout it was ADMITTED to is in flight, because that
+                    // rollout occupies one of the set's concurrency slots (`slot_holders` is the
+                    // very gate `build_set_plans` counts). Reporting the verdict alone left such a
+                    // member in no list at all: `status.rollingCount` read 0 while the set refused
+                    // every sibling for want of a slot, with no field naming the holder. A member
+                    // with no admitted entry has not been published at all, which is the same story
+                    // for a reader, and a member absent from the map is not planned this pass.
+                    Some(GroupProgress::Held) if slot_holders.contains(name) => {
+                        rolling.push(name.clone())
+                    }
                     Some(GroupProgress::Held) | None => {}
                     Some(GroupProgress::Settled) => settled_members.push(name.clone()),
                     Some(GroupProgress::Rolling) => rolling.push(name.clone()),
@@ -989,7 +1003,7 @@ fn build_statuses(
 fn assign_nodes(
     groups: &BTreeMap<String, ResolvedGroup>,
     admitted: &BTreeMap<String, AdmittedDeployment>,
-    held: &BTreeMap<String, HeldGroup>,
+    held: &BTreeMap<String, AdmittedDeployment>,
     observations: &Observations<'_>,
 ) -> BTreeMap<String, DesiredDeployment> {
     let mut node_deployments = BTreeMap::new();
@@ -1006,7 +1020,7 @@ fn assign_nodes(
     // "where is this node?" has an answer whenever the control plane ever published one.
     let running: HashMap<String, &DesiredDeployment> = admitted
         .values()
-        .chain(held.values().map(|held| &held.state))
+        .chain(held.values())
         .flat_map(|state| std::iter::once(&state.current).chain(state.previous.iter()))
         .filter_map(|deployment| Some((crate::deployment_identity(deployment)?, deployment)))
         .collect();
@@ -1029,29 +1043,34 @@ fn assign_nodes(
         //
         // Advancement is judged on the exact configuration each node reports acting on, so a
         // change that keeps the deployment's name still stages one batch at a time.
-        let (Some(current_id), Some(previous_ids)) = (
-            crate::deployment_identity(&state.current),
-            state
-                .previous
-                .iter()
-                .map(crate::deployment_identity)
-                .collect::<Option<Vec<String>>>(),
-        ) else {
-            // Nothing can be shown to have advanced, so hold every node on the predecessor rather
-            // than guess. With no predecessor there is nothing to hold on and `current` is all the
-            // control plane has.
-            let fallback = state.previous.first().unwrap_or(&state.current);
-            for node in nodes {
-                node_deployments.insert(node.clone(), fallback.clone());
-            }
+        // A `current` with no identity cannot be published (`build_publication_plan` encodes the
+        // same body) and nothing can be shown to have advanced onto it, so this group FAILS CLOSED:
+        // it publishes nothing this pass and its nodes are left out of the generation, holding
+        // whatever they already run. The arm this replaced republished `previous[0]` to every node
+        // of the group in one signed generation — a second, unbudgeted assignment path, in the one
+        // situation where the control plane understands the group least.
+        let Some(current_id) = crate::deployment_identity(&state.current) else {
+            tracing::warn!(
+                group = name,
+                deployment = state.current.deployment,
+                "admitted deployment cannot be encoded, so this group publishes nothing this pass; \
+                 its nodes keep the assignment they already have"
+            );
             continue;
         };
+        // The predecessors that still have an identity, paired with their bodies. One that cannot
+        // be encoded is not a place a node can be recognized on or held on — it is absent from
+        // `running` for the same reason — so it drops out here and the nodes on it take the same
+        // budgeted turn as every other unrecognized placement. Abandoning the whole rule because
+        // ONE stored body is unreadable is what turned a control-plane version skew into a
+        // fleet-wide republish.
+        let previous: Vec<(String, &DesiredDeployment)> = state
+            .previous
+            .iter()
+            .filter_map(|deployment| Some((crate::deployment_identity(deployment)?, deployment)))
+            .collect();
         let mut unavailable = 0usize;
         let mut held = Vec::new();
-        // Whether any node of this group is positively observed healthy ON `current`. It is what
-        // makes `current` a PROVEN target rather than an unproven one, which is the only condition
-        // under which an already-broken node is moved out of turn below.
-        let mut proven = false;
         for node in nodes {
             // A node has advanced once it either REPORTS `current` or was already PUBLISHED
             // `current` in the last generation. The published half is what makes a node's
@@ -1062,7 +1081,6 @@ fn assign_nodes(
             // report. Absence of evidence is not evidence of not having advanced; it still counts
             // against `maxUnavailable` below, which is what actually holds the rollout back.
             let on_current = observations.evidence(node, &current_id);
-            proven |= on_current == NodeEvidence::Healthy;
             if observations.advanced(node, &current_id) {
                 if on_current.unavailable() {
                     unavailable += 1;
@@ -1093,13 +1111,13 @@ fn assign_nodes(
             // unrecognized placement means "safe to hand out `current`" — and each turned a bulk
             // relabel into a fleet-wide restart in a single signed generation: `hold == current`
             // makes the `moved < budget` throttle a no-op, so every such node moved at once.
-            let (evidence, hold) = match previous_ids
+            let (evidence, hold) = match previous
                 .iter()
-                .position(|identity| observations.advanced(node, identity))
+                .position(|(identity, _)| observations.advanced(node, identity))
             {
                 Some(position) => (
-                    observations.evidence(node, &previous_ids[position]),
-                    Some(&state.previous[position]),
+                    observations.evidence(node, &previous[position].0),
+                    Some(previous[position].1),
                 ),
                 None => match observations.placement(node) {
                     // The node IS somewhere. `running` answers with the body whenever the control
@@ -1118,7 +1136,7 @@ fn assign_nodes(
                     // waiting a generation per sibling. It still counts against availability — it
                     // is not on the release yet — and it can discharge that by reporting, because
                     // it was published.
-                    None if state.previous.is_empty() => {
+                    None if previous.is_empty() => {
                         if observations.evidence(node, &current_id).unavailable() {
                             unavailable += 1;
                         }
@@ -1155,29 +1173,40 @@ fn assign_nodes(
             }
             held.push((node, evidence, hold));
         }
-        // A node held on the predecessor that positively reports itself BROKEN there is moved out of
-        // turn — it does not need FREE capacity — but only onto a `current` some sibling is already
-        // observed healthy on. It is already unavailable, so moving it to a PROVEN release cannot
-        // disrupt anything further, and refusing to move it is what left a rollback unable to
-        // rescue the node the rollout broke: that one node's own unavailability consumed the entire
-        // budget the rollback needed to reach it. Every half of the condition is load-bearing.
-        // An UNPROVEN `current` never gets the exemption, so a degraded node still spends the
-        // budget and holds a rollout back rather than being fed an untried release. And only a
-        // positively verified unhealthy report qualifies: silence must not, or a telemetry outage
-        // would read as "everything is already down" and move the whole fleet in one generation.
+        // A node that positively reports itself BROKEN where it is gets moved out of turn: it does
+        // not need FREE capacity, because it is already unavailable and moving something that is
+        // already down cannot spend more availability. Refusing to move it is what left a rollback
+        // unable to rescue the node the rollout broke — that node's own unavailability consumed the
+        // entire budget the rollback needed to reach it.
+        //
+        // The rescue is deliberately NOT conditioned on `current` being proven healthy on some
+        // sibling. A rollback exists for the release that is bad on EVERY node, where nothing is
+        // proven and nothing ever can be until a node moves: requiring a proven target made that
+        // state a fixed point, so a fully-broken group never placed one node on the deployment the
+        // operator reverted to, stayed `Rolling` for ever, and held its set's concurrency slot
+        // against every sibling. A broken node has nothing left to lose, and the throttle that
+        // matters is the batch size, not the provenance of the target.
         //
         // What a rescue is exempt from is the SHORTFALL, not the batch size: it draws on the full
         // `maxUnavailable` instead of what is left of it, and still spends from the same
         // per-generation movement budget as every other node. Exempting it from the budget
         // entirely turned an app-level health blip — a downstream dependency, an expired licence,
         // one bad config every node reports on — into an unthrottled fleet-wide move in a single
-        // signed generation. At least one node always moves, so the rollback that has to reach a
-        // broken node still makes progress every pass.
+        // signed generation. Only a positively verified unhealthy report qualifies: silence must
+        // not, or a telemetry outage would read as "everything is already down" and hand the whole
+        // fleet a release nothing is known about, one batch per pass, with no health gate left.
+        //
+        // A HEALTHY or silent node is unaffected — it moves only into free `capacity`, so an
+        // unproven `current` is never fed to the part of the fleet that is still working. And a
+        // broken node can never be crowded out by its healthy siblings: any group holding one has
+        // `unavailable >= 1`, so `capacity < rescue_budget` and at least one rescue slot always
+        // survives the pass. At least one node always moves, so the rollback that has to reach a
+        // broken node makes progress every pass.
         let capacity = group.max_unavailable.saturating_sub(unavailable);
-        let rescue_budget = group.max_unavailable.max(1);
+        let rescue_budget = group.max_unavailable;
         let mut moved = 0usize;
         for (node, evidence, hold) in held {
-            let budget = if proven && evidence == NodeEvidence::Broken {
+            let budget = if evidence == NodeEvidence::Broken {
                 rescue_budget
             } else {
                 capacity
@@ -1599,10 +1628,13 @@ mod tests {
             &mut admitted,
             test_now(),
         );
-        assert!(outcome
-            .node_deployments
-            .values()
-            .all(|deployment| deployment.deployment == "v0"));
+        // The one degraded node spends the whole budget, so neither HEALTHY node advances — that is
+        // exactly what `maxUnavailable` is protecting. The degraded node is itself already down, so
+        // it is the one node this pass moves: a rescue draws on the full budget rather than on
+        // what is left of it.
+        assert_eq!(outcome.node_deployments["n0"].deployment, "v0");
+        assert_eq!(outcome.node_deployments["n1"].deployment, "v0");
+        assert_eq!(outcome.node_deployments["n2"].deployment, "v1");
     }
 
     /// A rollout onto a release that is unhealthy on its very first node must stay correctable.
@@ -1651,11 +1683,11 @@ mod tests {
             "both cohorts survive the preemption: the abandoned v1 that n0 is on and the v0 the \
              other two never left"
         );
-        // `n0` is unhealthy on the abandoned v1, so it counts against `maxUnavailable` and no node
-        // is advanced this pass: the preemption changes what is admitted, never the staging budget.
-        // Every node is republished exactly where it already is — nothing moves in either
-        // direction on a pass with no budget.
-        assert_eq!(outcome.node_deployments["n0"].deployment, "v1");
+        // `n0` is unhealthy on the abandoned v1, so it counts against `maxUnavailable` and the two
+        // HEALTHY nodes stay exactly where they are: the preemption changes what is admitted, never
+        // the staging budget. `n0` itself is already down, so the correction reaches it out of turn
+        // — the whole point of preempting a rollout that broke its first node.
+        assert_eq!(outcome.node_deployments["n0"].deployment, "v2");
         assert_eq!(outcome.node_deployments["n1"].deployment, "v0");
         assert_eq!(outcome.node_deployments["n2"].deployment, "v0");
     }
@@ -4121,6 +4153,245 @@ mod tests {
         );
     }
 
+    /// The case a rollback EXISTS for: a release that is bad on every node. Nothing is observed
+    /// healthy on the deployment being reverted to — nothing can be, until a node gets there — so
+    /// requiring a proven target made this a fixed point. The whole `maxUnavailable` budget was
+    /// consumed by the very nodes the rollback had to rescue, not one node was ever placed on
+    /// `current`, and the group reported `Rolling` for ever while holding its set's concurrency
+    /// slot against every sibling.
+    #[test]
+    fn a_rollback_of_a_fully_broken_release_reaches_every_node() {
+        let (mut groups, node_groups, labels) = three_node_group();
+        let keys = pubkeys(&node_groups);
+        // v1 rolled out completely and then went bad on all three nodes; the operator reverts to v0.
+        let mut admitted = BTreeMap::from([("g".into(), admitted(deployment_named("v1")))]);
+        let broken = HashMap::from([
+            report("n0", "v1", false),
+            report("n1", "v1", false),
+            report("n2", "v1", false),
+        ]);
+        let on_v1 = crate::deployment_identity(&deployment_named("v1")).unwrap();
+        let mut published: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), on_v1.clone()))
+            .collect();
+        groups.get_mut("g").unwrap().deployment = deployment_named("v0");
+        // One more node every pass, and never zero: no node ever reports itself healthy on v0, so
+        // the rollback runs entirely on the evidence it actually has — that the nodes it has not
+        // reached are already down.
+        for pass in 1..=3 {
+            let plan = plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports: &broken,
+                    public_keys: &keys,
+                    published: &published,
+                    held: &BTreeMap::new(),
+                },
+                &mut admitted,
+                test_now(),
+            );
+            assert_eq!(admitted["g"].current.deployment, "v0");
+            let reverted = plan
+                .node_deployments
+                .values()
+                .filter(|deployment| deployment.deployment == "v0")
+                .count();
+            assert_eq!(
+                reverted, pass,
+                "pass {pass} places exactly one more node on the reverted deployment"
+            );
+            published = published_from(&plan);
+        }
+    }
+
+    /// The same starvation with a single casualty: one node broken on the release, the rest healthy
+    /// on it, and a forward correction. That one node's own unavailability spent the entire budget,
+    /// so the correction could never reach it and the group stayed `Rolling` for ever. The broken
+    /// node moves; its HEALTHY siblings do not, because the target is still unproven.
+    #[test]
+    fn a_forward_correction_reaches_the_one_node_the_release_broke() {
+        let (mut groups, node_groups, labels) = three_node_group();
+        let keys = pubkeys(&node_groups);
+        let mut admitted = BTreeMap::from([("g".into(), admitted(deployment_named("v1")))]);
+        let mut reports = HashMap::from([
+            report("n0", "v1", false),
+            report("n1", "v1", true),
+            report("n2", "v1", true),
+        ]);
+        groups.get_mut("g").unwrap().deployment = deployment_named("v2");
+        let first = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &keys,
+                published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(first.node_deployments["n0"].deployment, "v2");
+        assert_eq!(first.node_deployments["n1"].deployment, "v1");
+        assert_eq!(first.node_deployments["n2"].deployment, "v1");
+        // Once the rescued node reports the correction healthy, the budget is whole again and the
+        // healthy cohort follows one node at a time like any other rollout.
+        reports.extend([report("n0", "v2", true)]);
+        let second = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &keys,
+                published: &published_from(&first),
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+        let on_current = second
+            .node_deployments
+            .values()
+            .filter(|deployment| deployment.deployment == "v2")
+            .count();
+        assert_eq!(on_current, 2, "the rescued node plus one healthy sibling");
+    }
+
+    /// A fleet-wide telemetry outage is NOT "everything is already down". Silence holds every node
+    /// exactly where it is — an unobservable fleet is not one to feed a release nothing is known
+    /// about — and it is not a fixed point either: the moment any evidence arrives the pass acts on
+    /// it. Reading silence as a rescue would have made a lost report endpoint move the whole fleet
+    /// one batch per pass with no health gate left anywhere.
+    #[test]
+    fn fleet_wide_silence_holds_every_node_and_clears_the_moment_evidence_arrives() {
+        let (mut groups, node_groups, labels) = three_node_group();
+        let keys = pubkeys(&node_groups);
+        let mut admitted = BTreeMap::from([("g".into(), admitted(deployment_named("v1")))]);
+        let on_v1 = crate::deployment_identity(&deployment_named("v1")).unwrap();
+        let published: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), on_v1.clone()))
+            .collect();
+        groups.get_mut("g").unwrap().deployment = deployment_named("v0");
+        let silent = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &HashMap::new(),
+                public_keys: &keys,
+                published: &published,
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(admitted["g"].current.deployment, "v0");
+        assert!(
+            silent
+                .node_deployments
+                .values()
+                .all(|deployment| deployment.deployment == "v1"),
+            "nothing can be observed, so every node is republished exactly where it is"
+        );
+        // The agents come back and say the release is broken. That is evidence, so the rollback
+        // starts moving on the very next pass.
+        let broken = HashMap::from([
+            report("n0", "v1", false),
+            report("n1", "v1", false),
+            report("n2", "v1", false),
+        ]);
+        let observed = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &broken,
+                public_keys: &keys,
+                published: &published_from(&silent),
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(
+            observed
+                .node_deployments
+                .values()
+                .filter(|deployment| deployment.deployment == "v0")
+                .count(),
+            1,
+            "one node per pass — the outage never bought the rollback a bigger batch"
+        );
+    }
+
+    /// A member retargeted while its previous rollout is still in flight is `Held` on the
+    /// operator's question and still holds its set's concurrency slot. Reporting only the verdict
+    /// left it out of every status list, so the set published `rollingCount: 0` while refusing its
+    /// sibling with nothing naming the holder.
+    #[test]
+    fn a_held_member_with_an_in_flight_rollout_is_reported_as_holding_the_slot() {
+        let node_groups = BTreeMap::from([
+            ("n-a0".to_string(), "a".to_string()),
+            ("n-a1".to_string(), "a".to_string()),
+            ("n-b".to_string(), "b".to_string()),
+        ]);
+        let mut groups = BTreeMap::from([
+            ("a".to_string(), group("a", deployment_named("v2"))),
+            ("b".to_string(), group("b", deployment_named("v0"))),
+        ]);
+        // `a`'s retarget cannot be admitted — a producer group has not published its outputs yet —
+        // so `a` stays Held while the v1 rollout it is running keeps the pair's only slot.
+        groups.get_mut("a").unwrap().inputs_ready = false;
+        let mut admitted = BTreeMap::from([
+            (
+                "a".to_string(),
+                AdmittedDeployment {
+                    current: deployment_named("v1"),
+                    previous: vec![deployment_named("v0")],
+                },
+            ),
+            ("b".to_string(), admitted(deployment_named("v0"))),
+        ]);
+        let reports = HashMap::from([
+            report("n-a0", "v1", true),
+            report("n-a1", "v0", true),
+            report("n-b", "v0", true),
+        ]);
+        let plan = plan_rollouts(
+            &[pair_set()],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &pair_labels(),
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &pubkeys(&node_groups),
+                published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
+            },
+            &mut admitted,
+            test_now(),
+        );
+        assert_eq!(plan.groups["a"], GroupProgress::Held);
+        assert_eq!(admitted["a"].current.deployment, "v1");
+        assert_eq!(
+            plan.sets[0].rolling,
+            vec!["a".to_string()],
+            "the member occupying the set's only slot is named, whatever its own verdict is"
+        );
+        assert_eq!(plan.sets[0].settled, vec!["b".to_string()]);
+    }
+
     /// Every consumer reads ONE verdict per group. A change to a deployment's body that keeps its
     /// name is a real change the nodes have not received, so while the set has no free slot for it
     /// the group is `Held` — the deployment NAME comparison the status path used reported it fully
@@ -4393,12 +4664,9 @@ mod tests {
         // `edge` is quarantined: it is absent from the planned groups and its nodes are pinned.
         let held = BTreeMap::from([(
             "edge".to_string(),
-            HeldGroup {
-                state: AdmittedDeployment {
-                    current: deployment_named("edge-v1"),
-                    previous: Vec::new(),
-                },
-                match_labels: BTreeMap::from([("group".to_string(), "edge".to_string())]),
+            AdmittedDeployment {
+                current: deployment_named("edge-v1"),
+                previous: Vec::new(),
             },
         )]);
         let published = BTreeMap::from([

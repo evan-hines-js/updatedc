@@ -5,7 +5,6 @@ members = [
     "crates/updated",
     "crates/updated-contracts",
     "crates/updated-tuf",
-    "crates/update-client",
     "crates/control",
     "crates/server",
     "crates/bootstrap",
@@ -66,7 +65,6 @@ clap = { version = "4", features = ["derive", "env"] }
 k8s-openapi = { version = "0.25", features = ["v1_32"] }
 schemars = "0.8"
 async-trait = "0.1"
-sha2 = "0.10"
 object_store = { version = "0.12", features = ["aws"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -77,8 +75,6 @@ zstd = "0.13"        # the sole application bundle compression format
 # Async HTTP for the supervisor's localhost health probe (no TLS needed).
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
-# PEM parsing for the agent mTLS identity and gateway server/CA material (paths, not secrets).
-rustls-pki-types = { version = "1", features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 # Mint the fleet CA + gateway server cert + agent client cert (the way `server init` mints TUF
 # keys), on the aws-lc-rs backend so there is one crypto library.

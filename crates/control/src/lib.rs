@@ -90,7 +90,7 @@ pub fn encode_supervisor_pointer(target: &Path) -> io::Result<String> {
 
 /// Decode a supervisor pointer file's contents, refusing anything that is not exactly the header
 /// line followed by one non-empty path.
-pub fn decode_supervisor_pointer(text: &str) -> io::Result<PathBuf> {
+fn decode_supervisor_pointer(text: &str) -> io::Result<PathBuf> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_string());
     let mut lines = text.lines();
     if lines.next() != Some(SUPERVISOR_POINTER_HEADER) {
@@ -116,8 +116,6 @@ pub fn read_supervisor_pointer(path: &Path) -> io::Result<Option<PathBuf>> {
 
 /// The protocol major this build implements.
 pub const PROTOCOL_MAJOR: u16 = 1;
-/// The protocol minor this build implements.
-pub const PROTOCOL_MINOR: u16 = 0;
 
 /// Maximum framed message size. A command spec (argv + full environment) is the
 /// largest message and is comfortably under this; the cap only bounds a malformed peer.
@@ -162,7 +160,6 @@ const TAG_UNSUPPORTED: u8 = 0x84;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub majors: Vec<u16>,
-    pub minor: u16,
     pub capabilities: Vec<u16>,
 }
 
@@ -180,7 +177,6 @@ impl Hello {
     pub fn current() -> Hello {
         Hello {
             majors: vec![PROTOCOL_MAJOR],
-            minor: PROTOCOL_MINOR,
             capabilities: CURRENT_CAPS.to_vec(),
         }
     }
@@ -191,7 +187,6 @@ impl Hello {
         w.write_all(&[FRAMING_VERSION])?;
         let mut body = Vec::new();
         put_u16_list(&mut body, &self.majors);
-        put_u16(&mut body, self.minor);
         put_u16_list(&mut body, &self.capabilities);
         write_frame(w, &body)?;
         Ok(())
@@ -212,11 +207,9 @@ impl Hello {
         let body = read_frame(r)?;
         let mut at = 0usize;
         let majors = get_u16_list(&body, &mut at)?;
-        let minor = get_u16(&body, &mut at)?;
         let capabilities = get_u16_list(&body, &mut at)?;
         Ok(Hello {
             majors,
-            minor,
             capabilities,
         })
     }
@@ -539,7 +532,7 @@ fn get_spec(buf: &[u8], at: &mut usize) -> Result<CommandSpec> {
 }
 
 // ── message encode/decode ────────────────────────────────────────────────────────
-// Decoders read the fields they know and ignore any trailing bytes, so a future minor
+// Decoders read the fields they know and ignore any trailing bytes, so a future build
 // can append optional fields without breaking an older reader (forward-compat).
 
 impl Request {
@@ -766,7 +759,6 @@ mod tests {
     fn negotiation_without_a_shared_major_fails_closed() {
         let hello = Hello {
             majors: vec![2, 3],
-            minor: 0,
             capabilities: vec![CAP_LAUNCH_APP_V1],
         };
         assert!(hello.negotiate(&[1]).is_none());
