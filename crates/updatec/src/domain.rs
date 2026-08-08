@@ -31,6 +31,15 @@ pub struct DesiredState<'a> {
     /// reading an empty selector as "every agent" would withhold the whole fleet over one broken
     /// group.
     pub quarantined: &'a BTreeMap<String, BTreeMap<String, String>>,
+    /// Nodes the operator froze (`UpdateAgent.spec.hold`): excluded from admission and always
+    /// republished on exactly the body their recorded assignment names — the same carry-forward
+    /// arm quarantine-withheld nodes use, failing the generation closed when the body cannot be
+    /// resolved, so a hold can never silently become a move.
+    pub holds: &'a BTreeSet<String>,
+    /// Nodes the operator benched from load-balancer rotation (`UpdateAgent.spec.cordon`):
+    /// treated as absent by rollout accounting, still updated, and projected as drained to the
+    /// healthproxy by the runtime.
+    pub cordons: &'a BTreeSet<String>,
     /// The subset of `quarantined` that has a durable pin, with the deployment each is still
     /// pinned to.
     ///
@@ -71,11 +80,18 @@ pub struct ReconcilePlan {
     /// re-derived "rolling" and "held" from a deployment-NAME comparison reported a group `Ready`
     /// while a body change to it was still unadmitted.
     pub groups: BTreeMap<String, GroupProgress>,
+    /// Per-group node accounting from the planner, for the metrics exposition and the alert
+    /// conditions ([`crate::rollout::GroupNodes`]).
+    pub node_counts: BTreeMap<String, crate::rollout::GroupNodes>,
+    /// Groups bound by the regression verdict, with the halted deployment each is bound by, for
+    /// the per-group `DeploymentHalted` condition.
+    pub halted_groups: BTreeMap<String, crate::HaltedDeployment>,
 }
 
 pub fn plan_reconcile(
     desired: DesiredState<'_>,
     observed: ObservedState<'_>,
+    attempts: &mut crate::rollout::AttemptLog,
 ) -> Result<ReconcilePlan, PlanError> {
     let quarantined_names: BTreeSet<String> = desired.quarantined.keys().cloned().collect();
     crate::validate_dependency_graph(desired.groups, &quarantined_names)?;
@@ -102,8 +118,11 @@ pub fn plan_reconcile(
             public_keys: observed.public_keys,
             published: observed.assignments,
             held: desired.held,
+            holds: desired.holds,
+            cordons: desired.cordons,
         },
         &mut admitted,
+        attempts,
         observed.now,
     );
 
@@ -151,7 +170,14 @@ pub fn plan_reconcile(
         })
         .collect();
     for (node, selected) in &node_groups {
-        if selected == crate::DEFAULT_GROUP && !quarantined.contains_key(node) {
+        // A HELD unmatched node is not handed the current default: hold means "exactly the body
+        // your recorded assignment names", and the current `default_deployment` may have moved
+        // since. It takes the carry-forward below instead, which republishes the recorded body by
+        // identity and faults the generation closed if that body is gone.
+        if selected == crate::DEFAULT_GROUP
+            && !quarantined.contains_key(node)
+            && !desired.holds.contains(node)
+        {
             rollout
                 .node_deployments
                 .insert(node.clone(), default.clone());
@@ -169,22 +195,54 @@ pub fn plan_reconcile(
     // A quarantined group is absent from the plan, so `plan_rollouts` pruned its admitted entry and
     // its nodes resolved to `default`. Restore both: the pin stays durable, and every node the
     // group was published for is republished under it, unchanged.
+    //
+    // The reserved key is NOT restorable. An `UpdateGroup` literally named `default` is quarantined
+    // on sight and therefore never admitted, so it has no pin of its own — the only thing keyed
+    // `default` in the durable map is the lineage recorded below, and restoring that here put the
+    // PRE-compaction copy back over the one `retire_deleted_groups` had just compacted, every
+    // pass. `previous` then grew one whole deployment body per `default_deployment` edit, with
+    // nothing able to prune it, until the admitted-state ConfigMap outgrew the apiserver's object
+    // limit and no generation could publish again. This is the guard that makes "no real group may
+    // claim it" below true of every path, not just of `resolve_node_groups`.
     for (name, state) in desired.held {
+        if name == crate::DEFAULT_GROUP {
+            continue;
+        }
         admitted.insert(name.clone(), state.clone());
     }
 
-    // Every deployment body the control plane still has, by identity — quarantined pins and the
-    // retained bodies of deleted groups included, because the held states were restored just above.
-    // Built by the one function `assign_nodes` builds its index with, so "where is this node?" is
-    // answered identically here and there.
-    let mut bodies = crate::rollout::bodies_by_identity(admitted.values());
-    // The repository default is a body nodes are published with too, so it belongs in the index
-    // that answers "which body is this node actually on?". Without it a withheld node last routed
-    // to `default` had no recoverable placement at all, and the carry-forward reached for the
-    // CURRENT default instead — the swap the withholding exists to prevent.
+    // The repository default is a deployment nodes RUN, so its bodies are retained exactly like a
+    // group's: recorded in the admitted map under the reserved pseudo-group name (no real group
+    // may claim it), where the planner's `retire_deleted_groups` already keeps each superseded
+    // body for as long as some node is placed on it. Without this, a node frozen on the OLD
+    // default — held, or withheld behind a quarantined group — had no recoverable placement the
+    // moment the operator edited `default_deployment`, and the generation faulted closed
+    // fleet-wide with nothing able to clear it.
     if let Some(identity) = crate::deployment_identity(&default) {
-        bodies.insert(identity, &default);
+        match admitted.entry(crate::DEFAULT_GROUP.to_string()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(AdmittedDeployment {
+                    current: default.clone(),
+                    previous: Vec::new(),
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                if crate::deployment_identity(&state.current).as_ref() != Some(&identity) {
+                    let superseded = std::mem::replace(&mut state.current, default.clone());
+                    if !state.previous.contains(&superseded) {
+                        state.previous.insert(0, superseded);
+                    }
+                }
+            }
+        }
     }
+
+    // Every deployment body the control plane still has, by identity — quarantined pins, the
+    // retained bodies of deleted groups, and the default lineage included, because all were
+    // restored or recorded just above. Built by the one function `assign_nodes` builds its index
+    // with, so "where is this node?" is answered identically here and there.
+    let bodies = crate::rollout::bodies_by_identity(admitted.values());
 
     // A node whose group has not been admitted even once has no deployment of its own to publish.
     // It must NOT simply be left out: publication replaces the whole target set, so omitting a node
@@ -234,7 +292,17 @@ pub fn plan_reconcile(
             // since the node was published) carries forward unchanged; a default that HAS changed
             // is not reconstructible from the recorded identity, so the generation faults closed
             // and the last publication stays live rather than the node being swapped or dropped.
-            Some(last) if quarantined.contains_key(node) || admitted.contains_key(last) => {
+            // A HELD node takes this arm whatever group it was last routed to — `default`
+            // included: hold freezes the node on the exact recorded body, and the ordinary
+            // `default` arm below would hand it the CURRENT default instead. An ordinary node
+            // last routed to `default` must NOT take it merely because the default lineage is
+            // recorded in `admitted` under the reserved name: unheld and unquarantined, it keeps
+            // following the repository default — the fleet-wide switch — via the arm below.
+            Some(last)
+                if quarantined.contains_key(node)
+                    || desired.holds.contains(node)
+                    || (last != crate::DEFAULT_GROUP && admitted.contains_key(last)) =>
+            {
                 let deployment = placed_deployment(observed.assignments.get(node), &bodies)
                     .ok_or_else(|| PlanError::UnknownPlacement {
                         node: node.clone(),
@@ -303,6 +371,8 @@ pub fn plan_reconcile(
         assignments,
         set_statuses: rollout.sets,
         groups: rollout.groups,
+        node_counts: rollout.node_counts,
+        halted_groups: rollout.halted_groups,
     })
 }
 
@@ -632,6 +702,8 @@ mod tests {
                 nodes: &nodes,
                 quarantined,
                 held,
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
@@ -641,6 +713,7 @@ mod tests {
                 assignments,
                 now: chrono::Utc::now(),
             },
+            &mut crate::rollout::AttemptLog::default(),
         )
     }
 
@@ -759,6 +832,8 @@ mod tests {
                 nodes: &nodes,
                 quarantined: &quarantined,
                 held: &held,
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
@@ -768,6 +843,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
+            &mut crate::rollout::AttemptLog::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -853,6 +929,8 @@ mod tests {
                 nodes: &nodes,
                 quarantined: &quarantined(&[("edge", "edge")]),
                 held: &held,
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
@@ -862,6 +940,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
+            &mut crate::rollout::AttemptLog::default(),
         )
         .expect("removing the label is plannable");
         assert_eq!(planned.publication.node_groups["n1"], crate::DEFAULT_GROUP);
@@ -1008,6 +1087,8 @@ mod tests {
                 nodes: &nodes,
                 quarantined: &quarantined,
                 held: &held,
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
@@ -1017,6 +1098,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
+            &mut crate::rollout::AttemptLog::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -1107,6 +1189,8 @@ mod tests {
                 nodes: &nodes,
                 quarantined: &quarantined(&[("edge2", "edge")]),
                 held: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
@@ -1116,6 +1200,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
+            &mut crate::rollout::AttemptLog::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -1145,5 +1230,276 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, PlanError::RoutingLoss(vec!["n1".to_string()]));
+    }
+
+    /// docs/node-controls-design.md — hold: the recorded body is republished VERBATIM through the
+    /// same carry-forward arm quarantine uses, and when the identity index cannot resolve that
+    /// body the generation fails closed — a hold can never silently become a move.
+    #[test]
+    fn a_held_node_keeps_its_recorded_body_and_fails_closed_when_it_is_gone() {
+        // `edge` is mid-rollout to edge-v2; n1 is recorded on the predecessor edge-v1 and held.
+        let pinned = AdmittedDeployment {
+            current: deployment("edge-v2"),
+            previous: vec![deployment("edge-v1")],
+        };
+        let admitted = BTreeMap::from([("edge".to_string(), pinned)]);
+        let groups = BTreeMap::from([("edge".to_string(), resolved("edge", "edge", vec![]))]);
+        let routing = BTreeMap::from([("n1".to_string(), "edge".to_string())]);
+        let v1 = crate::deployment_identity(&deployment("edge-v1")).unwrap();
+        let assignments = BTreeMap::from([("n1".to_string(), v1.clone())]);
+        let repository = repository();
+        let nodes = edge_node();
+        let holds = BTreeSet::from(["n1".to_string()]);
+        let mut groups_for_plan = groups.clone();
+        // The group's desired deployment IS the admitted current, so an unheld node would be
+        // handed edge-v2 immediately.
+        groups_for_plan.get_mut("edge").unwrap().deployment = deployment("edge-v2");
+
+        let planned = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &groups_for_plan,
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &holds,
+                cordons: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                public_keys: &HashMap::new(),
+                admitted: &admitted,
+                routing: &routing,
+                assignments: &assignments,
+                now: chrono::Utc::now(),
+            },
+            &mut crate::rollout::AttemptLog::default(),
+        )
+        .expect("a held node is plannable");
+        assert_eq!(
+            planned.assignments["n1"], v1,
+            "the held node is republished on exactly the body its recorded assignment names"
+        );
+        assert_eq!(planned.publication.node_groups["n1"], "edge");
+
+        // The recorded body can no longer be resolved: the generation fails closed for this node,
+        // exactly as the quarantine carry-forward does.
+        let gone = BTreeMap::from([(
+            "n1".to_string(),
+            crate::deployment_identity(&deployment("long-retired")).unwrap(),
+        )]);
+        let error = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &groups_for_plan,
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &holds,
+                cordons: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                public_keys: &HashMap::new(),
+                admitted: &admitted,
+                routing: &routing,
+                assignments: &gone,
+                now: chrono::Utc::now(),
+            },
+            &mut crate::rollout::AttemptLog::default(),
+        )
+        .expect_err("a hold whose body is gone must never become a move");
+        assert!(
+            matches!(error, PlanError::UnknownPlacement { ref node, .. } if node == "n1"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// A hold on an UNMATCHED node survives the operator editing `default_deployment`: the default
+    /// lineage is recorded in the admitted map under the reserved pseudo-group name, so the held
+    /// node's recorded body stays resolvable and is republished verbatim — instead of one hold
+    /// plus one default edit faulting every generation fleet-wide with nothing able to clear it.
+    /// An unheld node keeps following the default switch, exactly as before.
+    #[test]
+    fn a_held_default_node_survives_a_default_deployment_change() {
+        let repository_v1 = repository();
+        let old_default =
+            DesiredDeployment::try_from(repository_v1.default_deployment.clone()).unwrap();
+        let nodes = edge_node();
+        // Pass 1: no groups at all — the node is unmatched and published under `default`.
+        let first = plan_reconcile(
+            DesiredState {
+                repository: &repository_v1,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                public_keys: &HashMap::new(),
+                admitted: &BTreeMap::new(),
+                routing: &BTreeMap::new(),
+                assignments: &BTreeMap::new(),
+                now: chrono::Utc::now(),
+            },
+            &mut crate::rollout::AttemptLog::default(),
+        )
+        .unwrap();
+        let old_identity = crate::deployment_identity(&old_default).unwrap();
+        assert_eq!(first.assignments["n1"], old_identity);
+        assert!(
+            first.admitted.contains_key(crate::DEFAULT_GROUP),
+            "the default lineage is recorded under the reserved name"
+        );
+
+        // Pass 2: the operator edits the default AND holds the node. The recorded body resolves
+        // through the lineage and is republished verbatim.
+        let mut repository_v2 = repository();
+        repository_v2.default_deployment.application.sha256 = "3".repeat(64);
+        let holds = BTreeSet::from(["n1".to_string()]);
+        let second = plan_reconcile(
+            DesiredState {
+                repository: &repository_v2,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &holds,
+                cordons: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                public_keys: &HashMap::new(),
+                admitted: &first.admitted,
+                routing: &first.routing,
+                assignments: &first.assignments,
+                now: chrono::Utc::now(),
+            },
+            &mut crate::rollout::AttemptLog::default(),
+        )
+        .expect("a held default node with a recorded lineage is plannable");
+        assert_eq!(
+            second.assignments["n1"], old_identity,
+            "the held node keeps exactly the body its recorded assignment names"
+        );
+
+        // Pass 3: the hold is cleared and the node follows the fleet-wide default switch.
+        let third = plan_reconcile(
+            DesiredState {
+                repository: &repository_v2,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                public_keys: &HashMap::new(),
+                admitted: &second.admitted,
+                routing: &second.routing,
+                assignments: &second.assignments,
+                now: chrono::Utc::now(),
+            },
+            &mut crate::rollout::AttemptLog::default(),
+        )
+        .unwrap();
+        let new_default =
+            DesiredDeployment::try_from(repository_v2.default_deployment.clone()).unwrap();
+        assert_eq!(
+            third.assignments["n1"],
+            crate::deployment_identity(&new_default).unwrap(),
+            "a cleared hold releases the node back onto the current default"
+        );
+    }
+
+    /// An `UpdateGroup` literally named `default` is quarantined for its reserved name, and the
+    /// runtime hands every quarantined group's durable entry over as a `held` pin — which for that
+    /// name is not a pin at all, it is the repository's default LINEAGE. Restoring it would put the
+    /// pre-compaction copy back over the one the planner had just compacted, every pass, so
+    /// `previous` would grow one whole deployment body per `default_deployment` edit with nothing
+    /// able to prune it, until the admitted-state ConfigMap outgrew the apiserver's object limit
+    /// and no generation could publish again. The reserved key is not restorable.
+    #[test]
+    fn a_held_entry_under_the_reserved_name_never_resurrects_the_default_lineage() {
+        let nodes = edge_node();
+        let repository_v1 = repository();
+        let mut repository_v2 = repository();
+        repository_v2.default_deployment.application.sha256 = "3".repeat(64);
+        let plan = |repository: &crate::UpdateRepositorySpec,
+                    held: &BTreeMap<String, crate::rollout::AdmittedDeployment>,
+                    quarantined: &BTreeMap<String, BTreeMap<String, String>>,
+                    previous: Option<&ReconcilePlan>| {
+            let empty_admitted = BTreeMap::new();
+            let empty_map = BTreeMap::new();
+            plan_reconcile(
+                DesiredState {
+                    repository,
+                    groups: &BTreeMap::new(),
+                    group_labels: &BTreeMap::new(),
+                    sets: &[],
+                    nodes: &nodes,
+                    quarantined,
+                    holds: &BTreeSet::new(),
+                    cordons: &BTreeSet::new(),
+                    held,
+                },
+                ObservedState {
+                    reports: &HashMap::new(),
+                    public_keys: &HashMap::new(),
+                    admitted: previous.map_or(&empty_admitted, |plan| &plan.admitted),
+                    routing: previous.map_or(&empty_map, |plan| &plan.routing),
+                    assignments: previous.map_or(&empty_map, |plan| &plan.assignments),
+                    now: chrono::Utc::now(),
+                },
+                &mut crate::rollout::AttemptLog::default(),
+            )
+            .unwrap()
+        };
+        // Two default edits, so the lineage carries a superseded body the node has since left.
+        let first = plan(&repository_v1, &BTreeMap::new(), &BTreeMap::new(), None);
+        let second = plan(
+            &repository_v2,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(&first),
+        );
+        assert!(
+            !second.admitted[crate::DEFAULT_GROUP].previous.is_empty(),
+            "the setup this test exists for: the lineage still carries the old default while the \
+             node is on it"
+        );
+        // Now an UpdateGroup named `default` appears. It is quarantined on sight (an empty
+        // selector claims no node) and the runtime offers its durable entry — the lineage — as a
+        // held pin. The node has meanwhile moved onto the new default, so the old body is
+        // retirable, and the restore must not bring it back.
+        let third = plan(
+            &repository_v2,
+            &BTreeMap::from([(
+                crate::DEFAULT_GROUP.to_string(),
+                second.admitted[crate::DEFAULT_GROUP].clone(),
+            )]),
+            &BTreeMap::from([(crate::DEFAULT_GROUP.to_string(), BTreeMap::new())]),
+            Some(&second),
+        );
+        assert!(
+            third.admitted[crate::DEFAULT_GROUP].previous.is_empty(),
+            "a held entry under the reserved name must not undo the lineage's compaction: {:?}",
+            third.admitted[crate::DEFAULT_GROUP].previous
+        );
     }
 }

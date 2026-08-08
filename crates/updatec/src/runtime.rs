@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -789,6 +789,43 @@ async fn metadata_expiry(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|instant| instant.with_timezone(&chrono::Utc))
 }
 
+/// Cross-pass controller state the reconcile loop owns and threads through every pass: the alert
+/// sink and the in-memory progress marks the `RolloutStuck` condition derives from, plus the
+/// consecutive-failure count `ReconcileFailing` reports. Lives in the main loop, not in
+/// `reconcile_once`, because all three must survive individual passes.
+pub struct ReconcileHooks {
+    pub alerts: Option<Arc<crate::alerts::AlertSink>>,
+    pub progress: crate::alerts::ProgressTracker,
+    /// The regression verdict's observation memory (`rollout::AttemptLog`): which assignments each
+    /// node has been seen attempting. Losing it (a restart, a leader change) only delays a halt
+    /// until the still-contained nodes' report sequences re-prove it.
+    pub regressions: crate::rollout::AttemptLog,
+    /// Failed passes in a row WITHIN one leadership epoch. Reset by a successful publish, and by
+    /// the loop whenever this replica stops being the leader — a streak that spanned the gap let
+    /// one ordinary transient after a handover reach the `ReconcileFailing` threshold on its own.
+    pub consecutive_failures: u32,
+}
+
+impl ReconcileHooks {
+    pub fn new(alerts: Option<Arc<crate::alerts::AlertSink>>) -> Self {
+        Self {
+            alerts,
+            progress: crate::alerts::ProgressTracker::new(),
+            regressions: crate::rollout::AttemptLog::new(),
+            consecutive_failures: 0,
+        }
+    }
+}
+
+/// What a successful reconcile pass hands back: the published digest, and the fleet snapshot the
+/// metrics listener projects at scrape time.
+pub struct ReconcileOutcome {
+    pub digest: String,
+    /// `None` when the pass had no fleet to project (repository finalization) — the caller keeps
+    /// the previous snapshot rather than overwriting it with zeros.
+    pub snapshot: Option<crate::metrics::FleetSnapshot>,
+}
+
 pub async fn reconcile_once(
     client: Client,
     namespace: &str,
@@ -796,7 +833,9 @@ pub async fn reconcile_once(
     state_dir: &Path,
     public_url: &str,
     identity: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
+    hooks: &mut ReconcileHooks,
+) -> Result<ReconcileOutcome, Box<dyn std::error::Error>> {
+    let pass_started = std::time::Instant::now();
     let repositories: Api<UpdateRepository> = Api::namespaced(client.clone(), namespace);
     let repository = repositories.get(repository_name).await?;
     let groups_api: Api<UpdateGroup> = Api::namespaced(client.clone(), namespace);
@@ -811,7 +850,11 @@ pub async fn reconcile_once(
     // the guarantee is in effect before anything is ever published.
     if repository.metadata.deletion_timestamp.is_some() {
         finalize_repository(&client, &repositories, &secrets, &repository).await?;
-        return Ok(format!("finalized repository {repository_name}"));
+        hooks.consecutive_failures = 0;
+        return Ok(ReconcileOutcome {
+            digest: format!("finalized repository {repository_name}"),
+            snapshot: None,
+        });
     }
     ensure_repository_finalizer(&repositories, &repository).await?;
 
@@ -960,7 +1003,7 @@ pub async fn reconcile_once(
     // Quarantine a malformed-identity agent — never the whole reconcile — and drop it from this
     // generation: a bad identity never resolved to an assignment, so there is nothing to preserve.
     // Overlapping selectors are deliberately NOT handled here. An ambiguous node must hold the last
-    // known-good routing (fail safe, never fail open — docs/state-machines.md), so we leave it in
+    // known-good routing (fail safe, never fail open), so we leave it in
     // the plan and let `build_publication_plan` fault the whole generation closed with
     // `AmbiguousNode`; `reconcile_once` returns that error and the previous publication stays live.
     let mut quarantined_agents: HashSet<String> = HashSet::new();
@@ -1018,6 +1061,20 @@ pub async fn reconcile_once(
             name: node.name_any(),
             labels: node.spec.labels.clone(),
         })
+        .collect();
+    // The per-node operational controls, straight from each agent's spec. Both are pure planner
+    // inputs: a hold changes only what is published FOR the node (its recorded body, verbatim) and
+    // a cordon changes only what the endpoint projection publishes ABOUT it — the pull model
+    // holds, nothing reaches into a machine.
+    let holds: BTreeSet<String> = agent_resources
+        .iter()
+        .filter(|agent| agent.spec.hold)
+        .map(|agent| agent.name_any())
+        .collect();
+    let cordons: BTreeSet<String> = agent_resources
+        .iter()
+        .filter(|agent| agent.spec.cordon)
+        .map(|agent| agent.name_any())
         .collect();
 
     // An ABSENT admitted-state ConfigMap reads as "no group has ever been admitted", so every group
@@ -1089,6 +1146,8 @@ pub async fn reconcile_once(
             nodes: &resolved_nodes,
             quarantined: &quarantined_groups,
             held: &held_groups,
+            holds: &holds,
+            cordons: &cordons,
         },
         crate::domain::ObservedState {
             reports: &reports,
@@ -1098,6 +1157,7 @@ pub async fn reconcile_once(
             assignments: &durable.assignments,
             now: reconcile_now,
         },
+        &mut hooks.regressions,
     )?;
     let crate::domain::ReconcilePlan {
         publication: plan,
@@ -1106,6 +1166,8 @@ pub async fn reconcile_once(
         assignments: planned_assignments,
         set_statuses,
         groups: group_progress,
+        node_counts,
+        halted_groups,
     } = outcome;
     let planned = DurableRolloutState {
         admitted: planned_admitted,
@@ -1222,6 +1284,14 @@ pub async fn reconcile_once(
         .await
         .ok();
 
+    // The endpoint projection: which nodes the healthproxy must program as drained regardless of
+    // their reports — the one channel a cordon travels. Outside the signed generation because it
+    // is not desired state (see `updated_contracts::endpoints`), and written read-compare-put so a
+    // steady fleet costs one GET per pass, not a PUT. Best-effort like every other post-publication
+    // delivery (`deliver_subscriptions`): one unreadable object here must not stall publication for
+    // the whole repository, and the write retries on the next pass of its own accord.
+    publish_endpoint_projection(store.as_ref(), &repository.spec.s3.prefix, &cordons).await;
+
     // ONE projection path for both outcomes — a reconcile that reused an unchanged generation and
     // one that just signed a new one expose identical enrollment, status, and subscription state.
     //
@@ -1253,14 +1323,123 @@ pub async fn reconcile_once(
             reports: &reports,
             group_progress: &group_progress,
             public_keys: &public_keys,
+            holds: &holds,
+            node_counts: &node_counts,
+            halted_groups: &halted_groups,
             now: reconcile_now,
         },
         sets: &sets_api,
         set_resources: &set_resources.items,
         set_statuses: &set_statuses,
     };
-    projection.publish().await?;
-    Ok(plan.digest)
+    projection.publish(hooks).await?;
+    // Everything fallible has now succeeded, so the failure streak resets here — never earlier:
+    // resetting before the projection made `ReconcileFailing` blind to any failure inside the
+    // projection stage itself, the last third of every pass.
+    hooks.consecutive_failures = 0;
+
+    // The metrics snapshot: pure projection of what this pass already computed, handed to the
+    // scrape listener by the main loop. The fleet-wide freshness counts are SUMS of the planner's
+    // per-group accounting — the one definition of "fresh", not a second derivation — and the
+    // deployment labels come from the admitted map, which carries every group's current plus the
+    // repository default under its reserved name.
+    let mut deployments: Vec<String> = planned
+        .admitted
+        .values()
+        .map(|state| state.current.deployment.clone())
+        .collect();
+    deployments.sort();
+    deployments.dedup();
+    let (reports_fresh, reports_observable) = node_counts
+        .values()
+        .fold((0, 0), |(fresh, observable), counts| {
+            (fresh + counts.fresh, observable + counts.observable)
+        });
+    let snapshot = crate::metrics::FleetSnapshot {
+        reconcile_timestamp_seconds: reconcile_now.timestamp().max(0) as u64,
+        reconcile_duration_seconds: pass_started.elapsed().as_secs_f64(),
+        generation: updated_tuf::repo::current_version(&repo_dir).await.ok(),
+        deployments,
+        groups: group_progress
+            .iter()
+            .map(|(name, progress)| {
+                (
+                    name.clone(),
+                    (
+                        *progress,
+                        node_counts.get(name).cloned().unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect(),
+        reports_fresh,
+        reports_stale: reports_observable.saturating_sub(reports_fresh),
+        quarantined_groups: quarantined_groups.len(),
+    };
+    Ok(ReconcileOutcome {
+        digest: plan.digest,
+        snapshot: Some(snapshot),
+    })
+}
+
+/// Publish the endpoint projection — the cordoned set — to the object store the healthproxy polls.
+///
+/// A cordon is invisible on the node (the application keeps running, the supervisor is unaware),
+/// so the ONLY thing it may change is what the control plane publishes about the node: this
+/// document, at [`updated_contracts::endpoints::ENDPOINTS_OBJECT_KEY`] under the repository
+/// prefix, beside the telemetry namespace the healthproxy already reads. Read-compare-put keeps a
+/// steady state at one bounded GET per reconcile.
+///
+/// Best-effort: a failure is logged and retried next pass, never propagated — the projection is
+/// operator convenience, and publication for the whole repository must not stall over it. The
+/// unguarded write also means a lame-duck leader can briefly overwrite a new leader's projection;
+/// that self-heals on the new leader's next one-second pass, which is the same bound a cordon's
+/// ordinary propagation already has.
+async fn publish_endpoint_projection(
+    store: &dyn ObjectStore,
+    prefix: &str,
+    cordons: &BTreeSet<String>,
+) {
+    let key = crate::object_key(prefix, updated_contracts::endpoints::ENDPOINTS_OBJECT_KEY);
+    let desired = match serde_json::to_vec(&updated_contracts::endpoints::EndpointProjection::new(
+        cordons.clone(),
+    )) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "encoding the endpoint projection");
+            return;
+        }
+    };
+    if desired.len() > updated_contracts::endpoints::MAX_PROJECTION_BYTES {
+        // Unreachable at the enrollment ceiling, but the shared bound must hold on the write side
+        // too — a reader refuses an oversized document by failing OPEN, which would silently
+        // release every cordon.
+        tracing::warn!(
+            bytes = desired.len(),
+            "endpoint projection exceeds the shared bound; not publishing it"
+        );
+        return;
+    }
+    match crate::read_object_bounded(store, &key).await {
+        Ok(existing) if existing == desired => return,
+        Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+        Err(error) => {
+            tracing::warn!(%error, "probing the endpoint projection; cordon changes wait for the next pass");
+            return;
+        }
+    }
+    match store
+        .put(&key, PutPayload::from_bytes(desired.into()))
+        .await
+    {
+        Ok(_) => tracing::info!(
+            cordoned = cordons.len(),
+            "published the endpoint projection: cordoned nodes are programmed as drained"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "publishing the endpoint projection; cordon changes wait for the next pass")
+        }
+    }
 }
 
 /// Push change-tracking events to every [`UpdateSubscription`](crate::UpdateSubscription) covering
@@ -1664,6 +1843,7 @@ async fn publish_group_set_statuses(
     sets: &Api<UpdateGroupSet>,
     set_resources: &[UpdateGroupSet],
     statuses: &[SetStatus],
+    alerts: Option<&Arc<crate::alerts::AlertSink>>,
 ) -> Result<(), kube::Error> {
     let params = PatchParams::default();
     let by_name: HashMap<&str, &SetStatus> = statuses
@@ -1707,6 +1887,53 @@ async fn publish_group_set_statuses(
                  set's rollout schedule until the flag is cleared"
             );
         }
+        // Edge-triggered like `frozen`: a halt is a steady state that persists until the operator
+        // stages corrected bytes, and the regression verdict is recomputed once per second.
+        if status.halted != last.map(|status| status.halted.clone()).unwrap_or_default() {
+            tracing::warn!(
+                set = %name,
+                halted = ?status.halted,
+                "the regression verdict changed: enough nodes proved a staged deployment bad. \
+                 Admission to each halted deployment is stopped in every member group until a \
+                 deployment with a different identity is published."
+            );
+        }
+        // The alertable set conditions, beside Ready: the regression verdict, and whether the
+        // reconcile loop itself is converging. Transitions only reach the webhook.
+        let previous = last
+            .map(|status| status.conditions.as_slice())
+            .unwrap_or_default();
+        let mut conditions = vec![ready_condition(
+            set.metadata.generation,
+            "Reconciled",
+            "This set's rollout throttle is reconciled.",
+        )];
+        let mut fired_events = Vec::new();
+        for next in [
+            crate::alerts::deployment_halted(
+                set.metadata.generation,
+                &status.halted,
+                chrono::Utc::now(),
+            ),
+            // This writer only runs on a pass that has succeeded this far, so the streak it
+            // reports is zero by construction; the failing loop's own writer
+            // (`record_reconcile_failing`) is the only place a non-zero streak can come from.
+            crate::alerts::reconcile_failing(set.metadata.generation, 0),
+        ] {
+            let condition_type = next.condition_type.clone();
+            let (published, fired) = crate::alerts::carry_transition(
+                crate::alerts::existing(previous, &condition_type),
+                next,
+            );
+            if fired {
+                fired_events.push(crate::alerts::AlertEvent::from_condition(
+                    "UpdateGroupSet",
+                    &name,
+                    &published,
+                ));
+            }
+            conditions.push(published);
+        }
         let published = UpdateGroupSetStatus {
             observed_generation: set.metadata.generation,
             member_count: Some(status.member_count as u32),
@@ -1725,11 +1952,8 @@ async fn publish_group_set_statuses(
             // Same merge-patch reasoning as `frozen`: write the explicit bool so a set that
             // re-gates (a new approved window added after exhaustion) clears a stale `true`.
             calendar_exhausted: Some(status.calendar_exhausted),
-            conditions: vec![ready_condition(
-                set.metadata.generation,
-                "Reconciled",
-                "This set's rollout throttle is reconciled.",
-            )],
+            halted: status.halted.clone(),
+            conditions,
         };
         sets.patch_status(
             &name,
@@ -1737,6 +1961,9 @@ async fn publish_group_set_statuses(
             &Patch::Merge(serde_json::json!({"status": published})),
         )
         .await?;
+        if let Some(sink) = alerts {
+            sink.spawn(fired_events);
+        }
     }
     Ok(())
 }
@@ -1929,14 +2156,13 @@ pub(crate) fn metadata_version(metadata: &serde_json::Value, name: &str) -> Resu
 /// that has hit it must be split across repositories rather than left to fill one ConfigMap.
 fn enrollment_capacity_condition(generation: Option<i64>, agents: usize) -> ResourceCondition {
     let full = agents >= MAX_ENROLLED_AGENTS as usize;
-    ResourceCondition {
-        condition_type: "EnrollmentCapacity".into(),
-        status: if full { "False" } else { "True" }.into(),
-        reason: if full { "AtCapacity" } else { "Available" }.into(),
-        message: format!("{agents} of at most {MAX_ENROLLED_AGENTS} agents are enrolled."),
-        observed_generation: generation,
-        last_transition_time: chrono::Utc::now().to_rfc3339(),
-    }
+    condition(
+        "EnrollmentCapacity",
+        !full,
+        generation,
+        if full { "AtCapacity" } else { "Available" },
+        &format!("{agents} of at most {MAX_ENROLLED_AGENTS} agents are enrolled."),
+    )
 }
 
 /// The condition type [`ready_condition`] and [`failed_condition`] both report on. Named because a
@@ -1946,9 +2172,15 @@ const READY_CONDITION: &str = "Ready";
 /// A `Ready` [`ResourceCondition`] for `generation`, reporting success (`status: "True"`) or
 /// failure (`status: "False"`). The single place a Ready condition's fields are assembled;
 /// [`ready_condition`] and [`failed_condition`] are the two named entry points.
-fn condition(ok: bool, generation: Option<i64>, reason: &str, message: &str) -> ResourceCondition {
+fn condition(
+    condition_type: &str,
+    ok: bool,
+    generation: Option<i64>,
+    reason: &str,
+    message: &str,
+) -> ResourceCondition {
     ResourceCondition {
-        condition_type: READY_CONDITION.into(),
+        condition_type: condition_type.into(),
         status: if ok { "True" } else { "False" }.into(),
         reason: reason.into(),
         message: message.into(),
@@ -1963,30 +2195,25 @@ fn condition(ok: bool, generation: Option<i64>, reason: &str, message: &str) -> 
 /// silently marching to its hard expiry — at which point every agent's metadata refresh fails at
 /// once, and nothing recovers from inside the loop.
 fn root_renewal_condition(generation: Option<i64>, failure: Option<&str>) -> ResourceCondition {
-    ResourceCondition {
-        condition_type: "RootRenewal".into(),
-        status: if failure.is_some() { "False" } else { "True" }.into(),
-        reason: if failure.is_some() {
+    condition(
+        "RootRenewal",
+        failure.is_none(),
+        generation,
+        if failure.is_some() {
             "RenewalFailed"
         } else {
             "Current"
-        }
-        .into(),
-        message: failure.map_or_else(
-            || "The TUF root is signed and outside its renewal window.".to_string(),
-            str::to_string,
-        ),
-        observed_generation: generation,
-        last_transition_time: chrono::Utc::now().to_rfc3339(),
-    }
+        },
+        failure.unwrap_or("The TUF root is signed and outside its renewal window."),
+    )
 }
 
 fn ready_condition(generation: Option<i64>, reason: &str, message: &str) -> ResourceCondition {
-    condition(true, generation, reason, message)
+    condition(READY_CONDITION, true, generation, reason, message)
 }
 
 fn failed_condition(generation: Option<i64>, reason: &str, message: &str) -> ResourceCondition {
-    condition(false, generation, reason, message)
+    condition(READY_CONDITION, false, generation, reason, message)
 }
 
 /// An [`UpdateGroupStatus`] carrying the generation-scoped fields (matched count, digest,
@@ -2002,6 +2229,7 @@ fn group_generation_status(
         observed_generation: generation,
         matched_agents,
         published_digest,
+        held_agents: None,
         conditions: vec![condition],
     }
 }
@@ -2016,7 +2244,7 @@ async fn quarantine_group(
     message: &str,
 ) -> Result<(), kube::Error> {
     tracing::warn!(group = %group.name_any(), reason, message, "quarantining UpdateGroup for this generation");
-    let status = group_generation_status(
+    let mut status = group_generation_status(
         group.metadata.generation,
         None,
         group
@@ -2024,6 +2252,20 @@ async fn quarantine_group(
             .as_ref()
             .and_then(|status| status.published_digest.clone()),
         failed_condition(group.metadata.generation, reason, message),
+    );
+    // A merge patch replaces the conditions array wholesale, so this writer speaks only for Ready
+    // and carries every other condition forward untouched — the same rule `failure_status`
+    // documents. Rewriting the array bare deleted the group's alert conditions, losing their
+    // transition times and re-firing their webhooks when the group healed.
+    status.conditions.extend(
+        group
+            .status
+            .as_ref()
+            .map(|status| status.conditions.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|condition| condition.condition_type != READY_CONDITION)
+            .cloned(),
     );
     groups
         .patch_status(
@@ -2054,7 +2296,20 @@ async fn quarantine_agent(
         enrollment_secret_ref: None,
         reported_version: prior.and_then(|status| status.reported_version.clone()),
         reported_ready: prior.and_then(|status| status.reported_ready),
-        conditions: vec![failed_condition(agent.metadata.generation, reason, message)],
+        held: Some(agent.spec.hold),
+        cordoned: Some(agent.spec.cordon),
+        // Same wholesale-replacement rule as `quarantine_group`: speak for Ready alone, carry
+        // every foreign condition forward.
+        conditions: std::iter::once(failed_condition(agent.metadata.generation, reason, message))
+            .chain(
+                prior
+                    .map(|status| status.conditions.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|condition| condition.condition_type != READY_CONDITION)
+                    .cloned(),
+            )
+            .collect(),
     };
     agents
         .patch_status(
@@ -2092,6 +2347,13 @@ struct StatusSnapshot<'a> {
     /// source for whether a group is held, rolling, settled, or unobservable.
     group_progress: &'a BTreeMap<String, crate::rollout::GroupProgress>,
     public_keys: &'a HashMap<String, Vec<u8>>,
+    /// Agents the operator is holding (`spec.hold`), for the per-group `heldAgents` projection.
+    holds: &'a BTreeSet<String>,
+    /// Per-group node accounting from the planner, for the alert conditions.
+    node_counts: &'a BTreeMap<String, crate::rollout::GroupNodes>,
+    /// Groups bound by the regression verdict, for the per-group `DeploymentHalted` condition —
+    /// the one place a halted SET-LESS group is operator-visible.
+    halted_groups: &'a BTreeMap<String, crate::HaltedDeployment>,
     now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -2125,7 +2387,7 @@ impl ReconcileProjection<'_> {
         })
     }
 
-    async fn publish(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn publish(&self, hooks: &mut ReconcileHooks) -> Result<(), Box<dyn std::error::Error>> {
         // Statuses first, enrollment Secrets second. The repository status is where the trust
         // anchor this pass signed with is recorded, and a missing anchor makes offline enrollment
         // fail loudly below — so the anchor must be written before anything is allowed to fail on
@@ -2146,8 +2408,14 @@ impl ReconcileProjection<'_> {
                 reports: self.snapshot.reports,
                 group_progress: self.snapshot.group_progress,
                 public_keys: self.snapshot.public_keys,
+                holds: self.snapshot.holds,
+                node_counts: self.snapshot.node_counts,
+                halted_groups: self.snapshot.halted_groups,
                 now: self.snapshot.now,
             },
+            self.set_resources,
+            &mut hooks.progress,
+            hooks.alerts.as_ref(),
         )
         .await?;
         publish_enrollment_secrets(
@@ -2160,7 +2428,13 @@ impl ReconcileProjection<'_> {
             self.published_root_sha256().as_deref(),
         )
         .await?;
-        publish_group_set_statuses(self.sets, self.set_resources, self.set_statuses).await?;
+        publish_group_set_statuses(
+            self.sets,
+            self.set_resources,
+            self.set_statuses,
+            hooks.alerts.as_ref(),
+        )
+        .await?;
         deliver_subscriptions(
             self.client,
             self.namespace,
@@ -2173,9 +2447,23 @@ impl ReconcileProjection<'_> {
     }
 }
 
+/// The `stuckAfterSeconds` governing a group: the tightest value among the sets whose selectors
+/// claim it, else the default. A group in no set still gets the default — a stuck rollout is worth
+/// naming whether or not a set throttles it.
+fn stuck_after_seconds(sets: &[UpdateGroupSet], group: &UpdateGroup) -> u64 {
+    sets.iter()
+        .filter(|set| crate::selector_matches(&set.spec.selector.match_labels, group.labels()))
+        .filter_map(|set| set.spec.stuck_after_seconds)
+        .min()
+        .unwrap_or(crate::alerts::DEFAULT_STUCK_AFTER_SECONDS)
+}
+
 async fn publish_resource_statuses(
     apis: ResourceApis<'_>,
     snapshot: StatusSnapshot<'_>,
+    sets: &[UpdateGroupSet],
+    progress_marks: &mut crate::alerts::ProgressTracker,
+    alerts: Option<&Arc<crate::alerts::AlertSink>>,
 ) -> Result<(), kube::Error> {
     let ResourceApis {
         repositories,
@@ -2192,8 +2480,13 @@ async fn publish_resource_statuses(
         reports,
         group_progress,
         public_keys,
+        holds,
+        node_counts,
+        halted_groups,
         now,
     } = snapshot;
+    // The stuck clock only tracks groups that still exist; a deleted group's mark must not linger.
+    progress_marks.retain(|name| group_progress.contains_key(name));
     let params = PatchParams::default();
     let repository_generation = repository.metadata.generation;
     let repository_status = UpdateRepositoryStatus {
@@ -2270,12 +2563,72 @@ async fn publish_resource_statuses(
                  can report telemetry, so its health is unconfirmed.",
             ),
         };
-        let status = group_generation_status(
+        let mut status = group_generation_status(
             group.metadata.generation,
             Some(matched as u32),
             Some(plan.digest.clone()),
             condition,
         );
+        // A forgotten hold must be a visible condition, not a mystery: the count of this group's
+        // held agents rides its status every pass, keyed on the published routing so it counts
+        // exactly the agents this group is accountable for.
+        status.held_agents = Some(
+            plan.node_groups
+                .iter()
+                .filter(|(node, selected)| *selected == &name && holds.contains(*node))
+                .count() as u32,
+        );
+        // The alertable conditions, appended beside Ready every pass and cleared the same way —
+        // standard condition semantics, never deleted. Each is a projection of a verdict computed
+        // above (the planner's progress, the freshness counts admission already read); no new
+        // detection logic lives here. The previous value is read off the resource itself, so a
+        // transition time survives a leader change and only genuine flips reach the webhook.
+        let previous = group
+            .status
+            .as_ref()
+            .map(|status| status.conditions.as_slice())
+            .unwrap_or_default();
+        let counts = node_counts.get(&name).cloned().unwrap_or_default();
+        let progressed_at =
+            progress_marks.observe(&name, counts.target.clone(), counts.on_target, now);
+        // A halted group's own status carries the verdict — the fleet-wide halt binds set-less
+        // groups too, and a freeze with no visible cause is not a control.
+        let bound = halted_groups
+            .get(&name)
+            .map(std::slice::from_ref)
+            .unwrap_or(&[]);
+        let alertable = [
+            crate::alerts::rollout_stuck(
+                group.metadata.generation,
+                progress == crate::rollout::GroupProgress::Rolling,
+                progressed_at,
+                stuck_after_seconds(sets, group),
+                now,
+            ),
+            crate::alerts::reports_stale(
+                group.metadata.generation,
+                counts.fresh,
+                counts.observable,
+                group.spec.max_unavailable.unwrap_or(1),
+            ),
+            crate::alerts::deployment_halted(group.metadata.generation, bound, now),
+        ];
+        let mut fired_events = Vec::new();
+        for next in alertable {
+            let condition_type = next.condition_type.clone();
+            let (published, fired) = crate::alerts::carry_transition(
+                crate::alerts::existing(previous, &condition_type),
+                next,
+            );
+            if fired {
+                fired_events.push(crate::alerts::AlertEvent::from_condition(
+                    "UpdateGroup",
+                    &name,
+                    &published,
+                ));
+            }
+            status.conditions.push(published);
+        }
         groups
             .patch_status(
                 &name,
@@ -2283,6 +2636,12 @@ async fn publish_resource_statuses(
                 &Patch::Merge(serde_json::json!({"status": status})),
             )
             .await?;
+        // Enqueued the moment the condition is durably written, never later: transitions that
+        // waited for the whole projection were silently lost when a later stage failed, and the
+        // edge trigger meant they never re-fired.
+        if let Some(sink) = alerts {
+            sink.spawn(fired_events);
+        }
     }
 
     for agent in agent_resources {
@@ -2342,6 +2701,10 @@ async fn publish_resource_statuses(
                 .map(|report| report.version.clone())
                 .filter(|version| !version.is_empty()),
             reported_ready: report.as_ref().map(|report| report.healthy),
+            // Explicit bools, never omitted: this status is a merge patch, and omitting the field
+            // would leave a cleared hold or cordon reading `true` forever.
+            held: Some(agent.spec.hold),
+            cordoned: Some(agent.spec.cordon),
             enrollment_secret_ref: (agent.spec.identity.kind == crate::AgentIdentityKind::Manual)
                 .then(|| crate::LocalSecretReference {
                     name: format!("{name}-enrollment"),
@@ -2401,6 +2764,67 @@ pub async fn record_repository_failure(
             &Patch::Merge(serde_json::json!({"status": status})),
         )
         .await?;
+    Ok(())
+}
+
+/// Record a failed pass against every `UpdateGroupSet`: bump the failure streak and write the
+/// `ReconcileFailing` condition, which rises on CONSECUTIVE failures (one failed pass is an
+/// ordinary transient the next second retries). Called from the loop's failure branch, where
+/// `publish_group_set_statuses` — the success-path writer of the same condition — never runs; the
+/// conditions array is patched alone, with every foreign condition carried forward, so a failing
+/// loop can still raise the one condition that says so. Transitions go to the same webhook sink.
+pub async fn record_reconcile_failing(
+    client: Client,
+    namespace: &str,
+    hooks: &mut ReconcileHooks,
+) -> Result<(), kube::Error> {
+    hooks.consecutive_failures = hooks.consecutive_failures.saturating_add(1);
+    let sets: Api<UpdateGroupSet> = Api::namespaced(client, namespace);
+    for set in sets.list(&ListParams::default()).await? {
+        let name = set.name_any();
+        let observed = set
+            .status
+            .as_ref()
+            .map(|status| status.conditions.as_slice())
+            .unwrap_or_default();
+        let next =
+            crate::alerts::reconcile_failing(set.metadata.generation, hooks.consecutive_failures);
+        let (published, fired) = crate::alerts::carry_transition(
+            crate::alerts::existing(observed, crate::alerts::RECONCILE_FAILING),
+            next,
+        );
+        // The condition's message is streak-independent, so once it has stabilized every further
+        // failed pass would patch an identical document: skip the write — a failing loop must not
+        // also be an apiserver write per set per second.
+        if !fired
+            && crate::alerts::existing(observed, crate::alerts::RECONCILE_FAILING)
+                == Some(&published)
+        {
+            continue;
+        }
+        let event = crate::alerts::AlertEvent::from_condition("UpdateGroupSet", &name, &published);
+        // A merge patch replaces the conditions array wholesale, so every condition this writer
+        // does not speak for is carried forward untouched — the same rule `failure_status` applies.
+        let mut conditions: Vec<ResourceCondition> = observed
+            .iter()
+            .filter(|condition| condition.condition_type != crate::alerts::RECONCILE_FAILING)
+            .cloned()
+            .collect();
+        conditions.push(published);
+        sets.patch_status(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({"status": {"conditions": conditions}})),
+        )
+        .await?;
+        // Enqueued per set, after ITS durable write: a later set's failed patch must not lose an
+        // earlier set's already-recorded transition.
+        if fired {
+            if let Some(sink) = &hooks.alerts {
+                sink.spawn(vec![event]);
+            }
+        }
+    }
     Ok(())
 }
 

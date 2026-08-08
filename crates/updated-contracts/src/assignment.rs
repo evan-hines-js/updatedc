@@ -627,8 +627,8 @@ mod tests {
         }
     }
 
-    /// `CONTROLPLANE_API_CONTRACT.md` publishes `schemas/desired-deployment.schema.json` as the
-    /// normative wire contract and points integrators at `schemas/examples`; integrators write
+    /// `schemas/desired-deployment.schema.json` is the normative wire contract, with
+    /// `schemas/examples` as its reference documents; integrators write
     /// control planes against those files rather than against this crate, and nothing else in the
     /// workspace reads them. Without these checks the two drift into mutually unparseable shapes —
     /// a document the published schema blesses that every agent rejects at

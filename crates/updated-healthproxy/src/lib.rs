@@ -24,6 +24,7 @@
 
 pub mod endpointslice;
 pub mod haproxy;
+pub mod metrics;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -140,6 +141,69 @@ pub async fn fetch_report(
     updated::http::read_bounded(response, "node health report", REPORT_BYTES_LIMIT)
         .await
         .ok()
+}
+
+/// Fetch the control plane's endpoint projection — the cordoned set — from the same base the
+/// reports come from, resolving through [`LastKnownGood`] exactly as a report fetch does: a blip
+/// of the checker's own dependency must not flap a deliberate cordon.
+///
+/// Fails OPEN in every terminal direction (see `updated_contracts::endpoints`): a store that has
+/// no projection (404), an unreadable document, or a cache that aged out all mean "nobody is
+/// cordoned" — health alone then governs, which is the safe steady state.
+///
+/// Returns the cordoned set and whether the projection was actually OBSERVED this cycle. Failing
+/// open is deliberate; failing open SILENTLY is not — the caller stamps the observation into the
+/// metrics exposition and logs the edges, so "every cordon was released because the projection
+/// stopped being readable" is an alertable fact rather than something an operator infers from a
+/// node quietly taking production traffic again.
+pub async fn fetch_drained(
+    client: &reqwest::Client,
+    health_base: &str,
+    health_timeout: Duration,
+    cache: &mut LastKnownGood<Vec<u8>>,
+) -> (std::collections::BTreeSet<String>, bool) {
+    let url = updated_contracts::endpoints::endpoints_url(health_base);
+    let fetch = async {
+        let response = client.get(&url).send().await.ok()?;
+        // A 404 — no projection ever published — is simply a failed observation here, resolved
+        // through the cache like any other: special-casing it as a definitive empty document
+        // CACHED that emptiness, so one transient 404 both un-cordoned the fleet for the cycle
+        // and destroyed the last-known-good the cordon was supposed to be bridged with. A store
+        // that genuinely has no projection resolves to an empty cache, which reads as "nobody is
+        // cordoned" below — the same fail-open answer, without the poisoning.
+        updated::http::read_bounded(
+            response,
+            "endpoint projection",
+            updated_contracts::endpoints::MAX_PROJECTION_BYTES,
+        )
+        .await
+        .ok()
+    };
+    let fresh = tokio::time::timeout(health_timeout, fetch)
+        .await
+        .ok()
+        .flatten();
+    let observed = fresh.is_some();
+    let cordoned = match cache.resolve("endpoints", fresh, Instant::now()) {
+        Some(body) => updated_contracts::endpoints::EndpointProjection::parse(&body),
+        None => std::collections::BTreeSet::new(),
+    };
+    (cordoned, observed)
+}
+
+/// Whether a drained node's drain is explained by report STALENESS: nothing usable was observed
+/// at all, or the last observed report's own timestamp is outside the freshness window. Metric
+/// classification only — the drain itself was already decided by the one trust gate — so the
+/// timestamp is read off the unverified document, which cannot make anything more trusted than
+/// the gate already decided.
+pub fn drain_is_stale(now_ms: u64, body: Option<&[u8]>) -> bool {
+    let Some(body) = body else {
+        return true;
+    };
+    serde_json::from_slice::<Envelope>(body)
+        .ok()
+        .and_then(|envelope| updated_contracts::telemetry::unverified_report(&envelope))
+        .is_some_and(|report| !report.is_fresh(now_ms))
 }
 
 /// The floor on the width of every per-cycle fan-out: the node report poll here, and the
@@ -437,6 +501,24 @@ pub async fn run(
     // Last good health body per node, so a transient CDN outage falls back to the last known report
     // (still freshness-bounded) instead of draining every healthy node at once.
     let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
+    // The control plane's endpoint projection (cordoned nodes), through the same last-known-good
+    // discipline as the reports it travels beside.
+    let mut drained_cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
+    // Whether the projection was readable last cycle, and who it cordoned — the two things the
+    // edge logs below need, so a lost cordon says so instead of reading as a health event.
+    // Readable starts true so the FIRST failed observation is an edge and gets logged.
+    let mut projection_readable = true;
+    let mut prior_drained: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The scrape state, updated at the bottom of every cycle; the listener only reads it.
+    let shared_metrics: metrics::Shared = Arc::default();
+    if let Some(address) = config.metrics_address.clone() {
+        let served = shared_metrics.clone();
+        tokio::spawn(async move {
+            if let Err(error) = metrics::serve(address, served).await {
+                eprintln!("healthproxy: metrics listener failed: {error}");
+            }
+        });
+    }
     // A per-request budget wider than the whole share a poll may spend cannot be both honored and
     // bounded; the operator's budget wins (see [`poll_plan`]), so name the setting that causes it.
     let share = REPORT_FRESHNESS / POLL_SHARE;
@@ -465,23 +547,83 @@ pub async fn run(
         );
     }
     loop {
-        let members = resolve_members(
-            &client,
-            &config.health_base,
-            &config.inventory,
-            config.health_timeout,
-            &mut cache,
-        )
-        .await;
+        // The projection fetch runs BESIDE the report poll, not before it: serialized, its
+        // timeout added up to a full `health_timeout` of dead time outside the share `poll_plan`
+        // sizes the pass to fit inside the freshness window.
+        let ((drained, projection_observed), mut members) = tokio::join!(
+            fetch_drained(
+                &client,
+                &config.health_base,
+                config.health_timeout,
+                &mut drained_cache,
+            ),
+            resolve_members(
+                &client,
+                &config.health_base,
+                &config.inventory,
+                config.health_timeout,
+                &mut cache,
+            )
+        );
+        // The projection fails OPEN, so its own failure is the one thing that must not be silent:
+        // once the last-known-good ages out, every cordon is released and the benched machines
+        // take production traffic again while `UpdateAgent.status.cordoned` still reads true. Both
+        // edges are logged, and the metrics exposition carries when it was last observed so the
+        // release is alertable rather than inferred.
+        if projection_observed != projection_readable {
+            projection_readable = projection_observed;
+            if projection_observed {
+                eprintln!(
+                    "healthproxy: endpoint projection at {} is readable again",
+                    updated_contracts::endpoints::endpoints_url(&config.health_base)
+                );
+            } else {
+                eprintln!(
+                    "healthproxy: endpoint projection at {} is unreadable; cordons hold from the last observed projection for up to {}s and are then released",
+                    updated_contracts::endpoints::endpoints_url(&config.health_base),
+                    LastKnownGood::<Vec<u8>>::STALENESS.as_secs()
+                );
+            }
+        }
+        if !prior_drained.is_empty() && drained.is_empty() && !projection_observed {
+            eprintln!(
+                "healthproxy: the endpoint projection aged out — {} cordon(s) released, health alone now governs {}",
+                prior_drained.len(),
+                config.target()
+            );
+        }
+        // A cordoned node is programmed drained WHATEVER its report says — the same drained state
+        // a stale report produces, so the backend handling is unchanged. Applied after health is
+        // resolved so an uncordon restores the node's real readiness the same cycle.
+        for member in &mut members {
+            if drained.contains(&member.node) {
+                member.ready = false;
+            }
+        }
         for member in &members {
             let prior = previous.insert(member.node.clone(), member.ready);
-            match classify_transition(prior, member.ready) {
+            let transition = classify_transition(prior, member.ready);
+            match transition {
                 Some(Transition::FirstOutOfPool) => eprintln!(
                     "healthproxy: {} starts out of {} (no ready health report yet)",
                     member.node, config.target()
                 ),
+                // A rejoin has TWO causes and they are not interchangeable: the node's health
+                // report went ready, or its cordon was lifted — either by the operator or by the
+                // projection ageing out, which puts a deliberately benched machine back into
+                // production traffic. Claiming "health report ready" for the second named the
+                // wrong cause for the one edge an operator most needs explained.
+                Some(Transition::Joined) if prior_drained.contains(&member.node) => eprintln!(
+                    "healthproxy: {} rejoined {} (no longer cordoned)",
+                    member.node,
+                    config.target()
+                ),
                 Some(Transition::Joined) => eprintln!(
                     "healthproxy: {} rejoined {} (health report ready)",
+                    member.node, config.target()
+                ),
+                Some(Transition::Left) if drained.contains(&member.node) => eprintln!(
+                    "healthproxy: {} left {} (cordoned by the control plane) — draining it from the endpoint set",
                     member.node, config.target()
                 ),
                 Some(Transition::Left) => eprintln!(
@@ -490,9 +632,46 @@ pub async fn run(
                 ),
                 None => {}
             }
+            // The staleness counter: a drain whose cause is the report AGING OUT, told apart from
+            // a genuine not-ready report and from a cordon, off the last observed document. A
+            // FIRST sighting that is already stale counts too — a checker started against an
+            // already-silent fleet is exactly the silent freshness failure this series exists to
+            // make visible.
+            if matches!(
+                transition,
+                Some(Transition::Left) | Some(Transition::FirstOutOfPool)
+            ) && !drained.contains(&member.node)
+            {
+                let body = cache.resolve(&member.node, None, Instant::now());
+                if drain_is_stale(now_ms(), body.as_deref()) {
+                    shared_metrics
+                        .lock()
+                        .expect("metrics lock")
+                        .reports_stale_total += 1;
+                }
+            }
+        }
+        prior_drained = drained;
+        // Stamped on the OBSERVATION, not on the reconcile: this series answers "is the cordon
+        // set this proxy is programming still coming from the control plane", and a scrape that
+        // sees it fall more than `LastKnownGood::STALENESS` behind wall clock is watching every
+        // cordon get released.
+        if projection_observed {
+            shared_metrics
+                .lock()
+                .expect("metrics lock")
+                .endpoints_timestamp_seconds = now_ms() / 1000;
         }
         match tokio::time::timeout(RECONCILE_TIMEOUT, load_balancer.reconcile(&members)).await {
-            Ok(Ok(())) => {}
+            // The scrape state describes what was PROGRAMMED, so it is stamped only when the
+            // reconcile actually landed: a timestamp that advanced on failed cycles answered "is
+            // it alive" yes while nothing had been programmed for minutes.
+            Ok(Ok(())) => {
+                let mut metrics = shared_metrics.lock().expect("metrics lock");
+                metrics.backends_up = members.iter().filter(|member| member.ready).count();
+                metrics.backends_drained = members.len() - metrics.backends_up;
+                metrics.reconcile_timestamp_seconds = now_ms() / 1000;
+            }
             Ok(Err(error)) => {
                 eprintln!(
                     "healthproxy: reconciling {} failed: {error}",
@@ -536,6 +715,9 @@ pub struct Config {
     /// Kubernetes EndpointSlice. The same health→membership core drives either backend; this only
     /// selects which one. `None` ⇒ the EndpointSlice backend (the `service`/`port` fields above).
     pub haproxy: Option<HAProxyTarget>,
+    /// When set (`HEALTHPROXY_METRICS_ADDRESS`), serve `GET /metrics` on this address — plain
+    /// HTTP, cluster-internal, read-only, nothing else. Default off.
+    pub metrics_address: Option<String>,
 }
 
 /// A cluster of HAProxy instances to program from health (see [`haproxy::HAProxyLb`]).
@@ -619,6 +801,17 @@ impl Config {
             interval,
             health_timeout,
             haproxy,
+            // Validated here so a typo is a startup error, not a listener that silently never
+            // came up behind a Ready process.
+            metrics_address: get("HEALTHPROXY_METRICS_ADDRESS")
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .parse::<SocketAddr>()
+                        .map(|address| address.to_string())
+                        .map_err(|error| format!("HEALTHPROXY_METRICS_ADDRESS={value:?}: {error}"))
+                })
+                .transpose()?,
         })
     }
 }
@@ -1493,5 +1686,76 @@ mod tests {
                 ("hp".into(), "vm-db.internal".to_string()),
             ]
         );
+    }
+
+    /// The staleness classifier behind `healthproxy_reports_stale_total`: a drain is attributed to
+    /// staleness when nothing was observed at all, or when the last observed report's own
+    /// timestamp is outside the freshness window. A genuinely not-ready or unusable report is a
+    /// different cause and is not counted. Metric only — the drain itself was already decided by
+    /// the one trust gate.
+    #[test]
+    fn a_drain_is_attributed_to_staleness_only_when_the_report_aged_out() {
+        let now = now_ms();
+        assert!(
+            drain_is_stale(now, None),
+            "nothing observed at all is stale"
+        );
+        assert!(
+            !drain_is_stale(now, Some(&report("agent-7", false))),
+            "a fresh not-ready report is a health drain, not a staleness drain"
+        );
+        assert!(
+            !drain_is_stale(now, Some(b"not json")),
+            "an unusable body is not attributed to staleness"
+        );
+        let stale = report_with("agent-7", true, |report| {
+            report.reported_at_ms =
+                now.saturating_sub(REPORT_FRESHNESS.as_millis() as u64 + 10_000);
+        });
+        assert!(drain_is_stale(now, Some(&stale)));
+    }
+
+    /// docs/node-controls-design.md — cordon: the endpoint projection resolves through the same
+    /// last-known-good discipline as the reports, and fails OPEN: no projection, or one that aged
+    /// out entirely, means nobody is cordoned and health alone governs.
+    #[test]
+    fn the_drained_projection_is_sticky_across_blips_and_fails_open() {
+        use std::collections::BTreeSet;
+        let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
+        let projection =
+            serde_json::to_vec(&updated_contracts::endpoints::EndpointProjection::new(
+                BTreeSet::from(["agent-0".to_string()]),
+            ))
+            .unwrap();
+        let now = Instant::now();
+
+        // A fresh fetch programs the cordon.
+        let drained = cache
+            .resolve("endpoints", Some(projection.clone()), now)
+            .map(|body| updated_contracts::endpoints::EndpointProjection::parse(&body))
+            .unwrap_or_default();
+        assert!(drained.contains("agent-0"));
+
+        // A checker-side blip reuses the last known projection: a deliberate cordon must not flap
+        // because the CDN blinked.
+        let drained = cache
+            .resolve("endpoints", None, now + Duration::from_secs(1))
+            .map(|body| updated_contracts::endpoints::EndpointProjection::parse(&body))
+            .unwrap_or_default();
+        assert!(drained.contains("agent-0"));
+
+        // Aged out entirely: fail open — nobody cordoned, health alone governs. This is also what
+        // a store that never published a projection resolves to: every fetch (404 included) is a
+        // failed observation, and an empty cache reads as an empty set — never a cached empty
+        // document that would erase a real cordon on one transient 404.
+        let drained = cache
+            .resolve(
+                "endpoints",
+                None,
+                now + LastKnownGood::<Vec<u8>>::STALENESS + Duration::from_secs(1),
+            )
+            .map(|body| updated_contracts::endpoints::EndpointProjection::parse(&body))
+            .unwrap_or_default();
+        assert!(drained.is_empty());
     }
 }

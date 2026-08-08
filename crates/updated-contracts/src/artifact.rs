@@ -173,7 +173,7 @@ mod tests {
             .contains("artifact reference"));
     }
 
-    /// `CONTROLPLANE_API_CONTRACT.md` publishes `schemas/*.schema.json` as the normative wire
+    /// The `schemas/*.schema.json` files are the normative wire
     /// contract, and integrators write producers against those files rather than against this
     /// crate. Nothing else in the workspace reads `schemas/`, so without these checks the two can
     /// drift into mutually unparseable shapes — a published document every agent rejects at

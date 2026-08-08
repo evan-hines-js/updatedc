@@ -728,10 +728,12 @@ where
 /// The namespaces this server serves. The two TUF halves, plus the report namespace it also
 /// accepts writes into — a namespace this server can write but never read back would 404 every
 /// consumer's fetch while each `PUT` reported success.
-const SERVED_NAMESPACES: [&str; 3] = [
+const SERVED_NAMESPACES: [&str; 4] = [
     "metadata",
     "targets",
     updated_contracts::telemetry::REPORT_NAMESPACE,
+    // The control plane's endpoint projection (cordoned nodes), read by the healthproxy.
+    "endpoints",
 ];
 
 /// Map a request path to a file inside `root`. Which request paths name a repository object is

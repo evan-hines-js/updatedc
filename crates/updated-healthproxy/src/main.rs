@@ -23,6 +23,7 @@
 //! - `HEALTHPROXY_PORT` / `_PORT_NAME` endpoint port and name (default `8080` / `http`).
 //! - `HEALTHPROXY_INTERVAL_SECS`       reconcile cadence (default `2`).
 //! - `HEALTHPROXY_HEALTH_TIMEOUT_SECS` per-fetch timeout (default `2`).
+//! - `HEALTHPROXY_METRICS_ADDRESS`     serve `GET /metrics` on this address (default off).
 
 use std::sync::Arc;
 

@@ -3,7 +3,6 @@
 <!--
   launchd job for the self-updating supervisor (macOS). Template — adjust paths,
   URLs, and intervals, then install as a system daemon:
-  Ownership terminology is defined canonically in deploy/README.md.
 
       sudo cp com.example.updated-supervisor.plist /Library/LaunchDaemons/
       sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.updated-supervisor.plist

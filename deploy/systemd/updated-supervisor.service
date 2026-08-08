@@ -1,6 +1,5 @@
 # systemd unit for the self-updating supervisor (Linux). Template — adjust paths,
 # URLs, user, and intervals for your deployment, then install as:
-# Ownership terminology is defined canonically in deploy/README.md.
 #
 #   install -m0644 updated-supervisor.service /etc/systemd/system/
 #   systemctl daemon-reload
