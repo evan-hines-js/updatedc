@@ -163,16 +163,16 @@ pub(crate) async fn start_demo(
 async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
     // Magnolia is only published for linux-x86_64 (its install provider fetches an x86_64 JRE),
     // so on any other platform — e.g. an arm64 kind cluster on Apple Silicon — its bundle is
-    // absent. Detect that from the repo and skip the Magnolia nodes and the manual/VM upgrade
+    // absent. Detect that from the repo and skip the Magnolia nodes and the out-of-cluster VM
     // entirely, running the rest of the demo. Run the full test (with Magnolia) on an x86_64 box.
     let platform = repository_platform()?.trim().to_string();
     let magnolia_path = format!("products/magnolia/stable/1.0.0/{platform}/app");
     let magnolia_enabled = repository_target_sha(&magnolia_path).is_ok();
     if magnolia_enabled {
-        println!("[demo] deploying {DEMO_MAGNOLIA_TOTAL} in-cluster Magnolia CMS nodes (author + publisher pairs); the manual, button-upgraded node is the out-of-cluster VM (if provisioned)");
+        println!("[demo] deploying {DEMO_MAGNOLIA_TOTAL} in-cluster Magnolia CMS nodes (author + publisher pairs); the manual node is the out-of-cluster VM (if provisioned), rolled by `updatectl deploy` against its own UpdateGroup");
         apply_magnolia_fleet()?;
     } else {
-        println!("[demo] Magnolia is not published for {platform} (x86_64 only) — skipping Magnolia nodes and the manual/VM upgrade");
+        println!("[demo] Magnolia is not published for {platform} (x86_64 only) — skipping the Magnolia nodes and the out-of-cluster VM");
     }
     println!("[demo] waiting for enrollment and assigning every new node");
     label_demo_agents()?;
@@ -180,12 +180,6 @@ async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
         label_magnolia_agents()?;
     }
     label_external_agents()?;
-    let green_path = kubectl_value("updategroup", "edge", "{.spec.deployment.application.path}")?;
-    let green_sha = kubectl_value(
-        "updategroup",
-        "edge",
-        "{.spec.deployment.application.sha256}",
-    )?;
     // The sample-app cohorts resolve their provider set from MinIO; its sha is published and
     // returned by `bootstrap_minio_release_repo`, not read from the release-server repo here.
     let provider_path = "provider-sets/rube-goldberg.json";
@@ -201,8 +195,6 @@ async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
     };
     println!("[demo] applying the UI, RBAC, per-set services/ingress, and per-agent groups");
     apply_demo_resources(
-        &green_path,
-        &green_sha,
         provider_path,
         magnolia_enabled,
         &magnolia_path,
@@ -444,7 +436,8 @@ pub(crate) async fn exercise_fleet_actions(
     exit_after: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     start_fleet_chaos(client, url, Some(seed), exit_after.then_some(1)).await?;
-    for _ in 0..600 {
+    // One epoch's own budget, so a slow-but-healthy run is not failed by its driver.
+    for _ in 0..DEMO_EPOCH_TIMEOUT_SECS {
         let body = client
             .get(format!("{url}/chaos"))
             .send()
@@ -487,7 +480,10 @@ pub(crate) async fn exercise_fleet_actions(
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err("seeded fleet chaos did not converge within 600 seconds".into())
+    Err(
+        format!("seeded fleet chaos did not converge within {DEMO_EPOCH_TIMEOUT_SECS} seconds")
+            .into(),
+    )
 }
 
 pub(crate) async fn start_fleet_chaos(
@@ -847,10 +843,17 @@ pub(crate) fn magnolia_statefulset(
     })
 }
 
-/// The `UpdateAgent` resource name the operator derives for a pod, from its hostname: the
-/// enrollment nonce is `sha256(hostname)` and the registration (hence the CR name) is
-/// `sha256(that)`. One derivation for every node kind — sample-app pods and Magnolia pods
-/// alike — so the demo can address any pod's CR without special cases.
+/// The enrollment name a host asserts, and hence the `UpdateAgent` resource name that node's
+/// CR carries: the enrollment nonce is `sha256(hostname)` and the registration (hence the CR
+/// name) is `sha256(that)`. One derivation for every node kind — sample-app pods, Magnolia pods,
+/// and the out-of-cluster demo VM alike — so the demo can address any node's CR without special
+/// cases.
+///
+/// **This is the only implementation of that derivation.** The nodes that assert the name
+/// (`crates/updatec/e2e/agent.sh`), the kind e2e that looks the CRs up
+/// (`scripts/kind-updatec-e2e.sh`), and the demo playbook (`deploy/ansible/demo.yml`) all read it
+/// out of this function through `updatec-demo agent-name <hostname>` rather than re-deriving it,
+/// so the name cannot drift between producer and consumers.
 pub(crate) fn resource_name(hostname: &str) -> String {
     let nonce = updated::hash::sha256_bytes(hostname.as_bytes());
     let registration = updated::hash::sha256_bytes(nonce.as_bytes());
@@ -1185,7 +1188,7 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
     // A one-host inventory for the target, then run the shipped role against it.
     let (user, host) = ssh_target.split_once('@').unwrap_or(("root", ssh_target));
     let dir = owner_only_scratch_dir("updatec-demo-external-vm")?;
-    let inventory = dir.join("inventory.ini");
+    let inventory = dir.path().join("inventory.ini");
     std::fs::write(
         &inventory,
         format!("[updated_agents]\n{host} ansible_user={user}\n"),
@@ -1195,7 +1198,7 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
     // from the cert-manager-issued secret (base64; Ansible b64decodes it onto the VM). These go in
     // an owner-only vars FILE, never on the command line: `-e key=<private key>` puts the fleet
     // client key in every process listing on this machine for as long as the playbook runs.
-    let vars = dir.join("enrollment-vars.json");
+    let vars = dir.path().join("enrollment-vars.json");
     write_owner_only(
         &vars,
         serde_json::to_vec(&serde_json::json!({
@@ -1233,69 +1236,16 @@ pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std:
 
 /// A fresh, unpredictable, owner-only directory under the system temp dir, removed when it drops.
 ///
-/// The demo writes the fleet client key inside, so no run may leave a copy behind: the guard
-/// removes the directory on the way out of [`provision_external_vm`], whether the playbook
-/// succeeded or failed.
-struct ScratchDir(PathBuf);
-
-impl ScratchDir {
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        // Best effort: a live demo is not worth aborting over a temp directory that would not
-        // delete, but it is worth saying so out loud — what stayed behind is a private key.
-        if let Err(error) = std::fs::remove_dir_all(&self.0) {
-            println!(
-                "[demo] could not remove {}, which holds a copy of the fleet client key: {error}",
-                self.0.display()
-            );
-        }
-    }
-}
-
-/// A fresh, unpredictable, owner-only directory under the system temp dir.
-///
 /// The demo drops the fleet client key in here, so the directory must be one no other local user
-/// could have pre-created: the name carries process-unique entropy and the directory is *created*
-/// (never adopted), so an existing entry — a planted directory, or a symlink into somewhere
-/// readable — makes the create fail rather than silently hand the secret over.
-fn owner_only_scratch_dir(prefix: &str) -> Result<ScratchDir, Box<dyn std::error::Error>> {
+/// could have pre-created or could read: [`tempfile`] mints an unpredictable name, creates it
+/// exclusively at mode 0700, and removes the tree on drop — the workspace's one way to hold a
+/// private scratch directory. What it does not cover is a run killed by a signal, which never
+/// drops anything: [`sweep_stale_scratch_dirs`] collects those.
+fn owner_only_scratch_dir(prefix: &str) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
     sweep_stale_scratch_dirs(prefix);
-    for _ in 0..8 {
-        let mut seed = updated::hash::Sha256Hasher::new();
-        seed.update(&std::process::id().to_le_bytes());
-        seed.update(
-            &std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-                .to_le_bytes(),
-        );
-        #[cfg(unix)]
-        {
-            let mut bytes = [0u8; 16];
-            let mut urandom = std::fs::File::open("/dev/urandom")?;
-            std::io::Read::read_exact(&mut urandom, &mut bytes)?;
-            seed.update(&bytes);
-        }
-        let name = seed.finish_hex()[..16].to_string();
-        let dir = env::temp_dir().join(format!("{prefix}-{name}"));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&dir) {
-            Ok(()) => return Ok(ScratchDir(dir)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err("could not create a private scratch directory under the temp directory".into())
+    Ok(tempfile::Builder::new()
+        .prefix(&format!("{prefix}-"))
+        .tempdir()?)
 }
 
 /// How long a scratch directory must have sat untouched before the sweep treats it as abandoned.
@@ -1305,7 +1255,7 @@ fn owner_only_scratch_dir(prefix: &str) -> Result<ScratchDir, Box<dyn std::error
 /// enrollment vars its playbook still needs.
 const SCRATCH_SWEEP_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
-/// Remove the scratch directories of runs that died before their [`ScratchDir`] could drop.
+/// Remove the scratch directories of runs that died before their [`tempfile::TempDir`] could drop.
 ///
 /// A `Drop` guard does not run for a Ctrl-C at the terminal or a kill during the playbook — the
 /// long part of this call — so without this, every interrupted demo leaves another copy of the
@@ -1406,20 +1356,46 @@ pub(crate) fn label_external_vm_agent() -> Result<(), Box<dyn std::error::Error>
 /// signed identities [`bootstrap_minio_release_repo`] mints and republishes onto the shared PVC.
 type ReleaseBootstrap = (String, String, String, String);
 
+/// The MinIO release repository every demo group resolves its bundles from, pinned to the root
+/// `bootstrap_minio_release_repo` minted onto the shared release PVC. Built from the same
+/// endpoint/bucket/prefix constants [`release_repository_flags`] addresses, so what `updatectl`
+/// publishes into and what a group resolves out of are one fact.
+pub(crate) fn minio_release_repository(release_root: &str) -> serde_json::Value {
+    serde_json::json!({
+        "metadataUrl": release_repository_url("metadata"),
+        "targetsUrl": release_repository_url("targets"),
+        "rootJson": release_root,
+    })
+}
+
+/// A seed group's deployment: a full clone of the fully-valid `edge` deployment (so every
+/// CRD-required field is present) with only its release repository pointed at MinIO. Its selector
+/// matches nothing, so no node adopts it; `updatectl deploy` overwrites its `application` and the
+/// published bundle's product/entrypoint come from the deploy flags, so the runtime here is unused.
+pub(crate) fn seed_deployment(edge: &serde_json::Value, release_root: &str) -> serde_json::Value {
+    let mut deployment = edge["spec"]["deployment"].clone();
+    deployment["releaseRepository"] = minio_release_repository(release_root);
+    deployment
+}
+
 pub(crate) fn bootstrap_minio_release_repo(
     edge: &serde_json::Value,
     platform: &str,
 ) -> Result<ReleaseBootstrap, Box<dyn std::error::Error>> {
     // Returns (release_root, baseline_path, baseline_sha, provider_sha).
+    // Every `updatectl` below addresses the one release repository the groups resolve from.
+    let repository = release_repository_flags();
     // 1. Mint keys + initialize the repo once, onto the shared PVC (skip if already there).
     run(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
         "-c",
-        "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
-         if [ ! -f /data/release-keys/root.json ]; then mkdir -p /data/release-keys; \
-         updatectl trust-root --keys-dir /data/release-keys --bucket updates --prefix releases \
-         --endpoint http://minio:9000 --region us-east-1 --root-out /data/release-keys/root.json; fi",
+        &format!(
+            "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
+             if [ ! -f /data/release-keys/root.json ]; then mkdir -p /data/release-keys; \
+             updatectl trust-root --keys-dir /data/release-keys {repository} \
+             --root-out /data/release-keys/root.json; fi"
+        ),
     ]))?;
     let release_root = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
         "--",
@@ -1430,12 +1406,7 @@ pub(crate) fn bootstrap_minio_release_repo(
     // 2. Seed the baseline. `updatectl deploy` publishes AND patches a group, so deploy to a
     //    throwaway group whose repo is MinIO, read back the content-addressed path+sha the
     //    cohorts start on, then delete it. Its selector matches nothing, so no node adopts it.
-    let mut seed_deployment = edge["spec"]["deployment"].clone();
-    seed_deployment["releaseRepository"] = serde_json::json!({
-        "metadataUrl": "http://minio:9000/updates/releases/metadata/",
-        "targetsUrl": "http://minio:9000/updates/releases/targets/",
-        "rootJson": release_root,
-    });
+    let seed_deployment = seed_deployment(edge, &release_root);
     apply_json(&serde_json::json!({
         "apiVersion": "updated.dev/v1alpha1",
         "kind": "UpdateGroup",
@@ -1455,9 +1426,8 @@ pub(crate) fn bootstrap_minio_release_repo(
              rm -rf /tmp/seed && mkdir -p /tmp/seed/bin /tmp/seed/config; \
              cp /usr/local/bin/sampleapp /tmp/seed/bin/app; \
              printf 'version = \"22.0.0\"\\n' >/tmp/seed/config/release.toml; \
-             updatectl deploy --keys-dir /data/release-keys --bucket updates --prefix releases \
-             --endpoint http://minio:9000 --region us-east-1 --namespace updated-system \
-             --group release-seed --product app --channel stable --version 22.0.0 \
+             updatectl deploy --keys-dir /data/release-keys {repository} \
+             --namespace updated-system --group release-seed --product app --channel stable --version 22.0.0 \
              --entrypoint bin/app --platform {platform} --source /tmp/seed"
         ),
     ]))?;
@@ -1489,6 +1459,7 @@ pub(crate) fn bootstrap_minio_release_repo(
     ]))?;
     // 3. Publish the demo node reconciler into MinIO. The sample-app cohorts resolve both the
     //    application and reconciler from this repository.
+    let provider_timeout_ms = demo_lifecycle::PROVIDER_TIMEOUT_MS;
     let provider_sets = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
@@ -1499,14 +1470,12 @@ pub(crate) fn bootstrap_minio_release_repo(
              cp /usr/local/bin/demo-lifecycle /tmp/rube/bin/lifecycle; \
              chmod 0755 /tmp/rube/bin/lifecycle; \
              art=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
-               --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
-               --product demo-enterprise-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
+               {repository} --product demo-enterprise-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
                --source /tmp/rube --platform {platform}); \
              set -- $art; \
              reconciler=$(updatectl publish-provider-set --keys-dir /data/release-keys \
-               --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
-               --id rube-goldberg --provider-path \"$1\" --provider-sha256 \"$2\" \
-               --provider-timeout-ms 15000); \
+               {repository} --id rube-goldberg --provider-path \"$1\" --provider-sha256 \"$2\" \
+               --provider-timeout-ms {provider_timeout_ms}); \
              echo \"$reconciler\" | awk '{{print $NF}}'"
         ),
     ]))?;
@@ -1526,8 +1495,6 @@ pub(crate) fn bootstrap_minio_release_repo(
 // into one struct once the Magnolia demo wiring is finalized (it is currently being pared back).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_demo_resources(
-    green_path: &str,
-    green_sha: &str,
     provider_path: &str,
     magnolia_enabled: bool,
     magnolia_path: &str,
@@ -1568,11 +1535,7 @@ pub(crate) fn apply_demo_resources(
     let (release_root, baseline_path, baseline_sha, provider_sha) =
         bootstrap_minio_release_repo(&edge, &platform)?;
     let provider = serde_json::json!({"path": provider_path, "sha256": provider_sha});
-    let minio_release_repository = serde_json::json!({
-        "metadataUrl": "http://minio:9000/updates/releases/metadata/",
-        "targetsUrl": "http://minio:9000/updates/releases/targets/",
-        "rootJson": release_root,
-    });
+    let minio_release_repository = minio_release_repository(&release_root);
     // The sample-app cohorts (and the external slice) start on the MinIO-published baseline the
     // demo then rolls with `updatectl deploy`, not the release-server baseline the callers pass.
     let success_path = baseline_path.as_str();
@@ -1602,7 +1565,6 @@ pub(crate) fn apply_demo_resources(
             "healthGraceSeconds": 8,
             "healthSuccesses": 1,
             "healthIntervalSeconds": 1,
-            "retryAfterSeconds": 2,
             "refreshRetrySeconds": 1,
             "confirmationWindowSeconds": 3,
             "supervisorCheckIntervalSeconds": 3600,
@@ -1638,7 +1600,6 @@ pub(crate) fn apply_demo_resources(
     let mut items = serde_json::json!([
             {"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":"updatec-demo","namespace":"updated-system"}},
             {"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role","metadata":{"name":"updatec-demo","namespace":"updated-system"},"rules":[
-                {"apiGroups":["updated.dev"],"resources":["updaterepositories"],"resourceNames":["default"],"verbs":["get","patch"]},
                 {"apiGroups":["updated.dev"],"resources":["updateagents"],"verbs":["get","list","patch"]},
                 {"apiGroups":["updated.dev"],"resources":["updategroups"],"verbs":["get","list","patch"]},
                 {"apiGroups":["updated.dev"],"resources":["updategroupsets"],"verbs":["get","list","create","patch"]},
@@ -1696,7 +1657,6 @@ pub(crate) fn apply_demo_resources(
             "healthGraceSeconds": 360,
             "healthSuccesses": 1,
             "healthIntervalSeconds": 3,
-            "retryAfterSeconds": 10,
             "refreshRetrySeconds": 5,
             "confirmationWindowSeconds": 10,
             "supervisorCheckIntervalSeconds": 3600
@@ -1725,9 +1685,9 @@ pub(crate) fn apply_demo_resources(
         ));
     }
     // The out-of-cluster VM IS the manual Magnolia node (no in-cluster pod stands in): the
-    // `magnolia-manual` group the "Upgrade Magnolia" button rolls selects the VM's `external-vm`
-    // cohort. It installs Magnolia through the identical mechanism as the in-cluster pods; the
-    // only difference is it runs on a real VM the reconciler fronts.
+    // `magnolia-manual` group selects the VM's `external-vm` cohort. It installs Magnolia through
+    // the identical mechanism as the in-cluster pods; the only difference is it runs on a real VM
+    // the reconciler fronts.
     if magnolia_enabled {
         items.push(magnolia_group(
             MAGNOLIA_MANUAL_GROUP,
@@ -1841,11 +1801,8 @@ pub(crate) fn apply_demo_resources(
     items.extend(
         serde_json::json!([
             {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"updatec-demo","namespace":"updated-system"},"spec":{"replicas":1,"selector":{"matchLabels":{"app":"updatec-demo"}},"template":{"metadata":{"labels":{"app":"updatec-demo"}},"spec":{"serviceAccountName":"updatec-demo","containers":[{"name":"demo","image":"updatec-e2e:kind","imagePullPolicy":"Never","command":["/usr/local/bin/updatec-demo","serve"],"env":[
-                {"name":"DEMO_APPLICATION_PATH","value":green_path},
-                {"name":"DEMO_APPLICATION_SHA256","value":green_sha},
                 {"name":"DEMO_PROVIDER_PATH","value":provider_path},
                 {"name":"DEMO_PROVIDER_SHA256","value":provider_sha},
-                {"name":"DEMO_APPLICATION_URL","value":"http://agent-4.agents:8080"},
                 {"name":"DEMO_REPOSITORY_DATA","value":"/release-data"},
                 {"name":"AWS_ACCESS_KEY_ID","value":"minio"},
                 {"name":"AWS_SECRET_ACCESS_KEY","value":"minio123"}

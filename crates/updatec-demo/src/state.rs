@@ -13,11 +13,9 @@ pub(crate) struct FleetNode {
     pub(crate) kind: Option<String>,
     pub(crate) healthy: bool,
     pub(crate) in_load_balancer: bool,
-    /// Telemetry: how long the /readyz probe took, in ms.
-    pub(crate) readyz_probe_millis: u64,
-    /// Telemetry: why the node read out of the load balancer, if it did — distinguishes a
-    /// real not-ready ("readyz 503") from the demo's own probe timing out, so the UI can tell
-    /// a genuine flap from a slow probe.
+    /// Telemetry: why the node reads out of the load balancer, if it does — a readiness the
+    /// watch saw withdrawn, a watch that stalled (failing closed), or a `readyz` failure still
+    /// inside its debounce, so the UI can tell a genuine flap from a stale view.
     pub(crate) probe_note: Option<String>,
 }
 

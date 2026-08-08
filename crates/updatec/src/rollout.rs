@@ -1000,6 +1000,26 @@ fn build_statuses(
         .collect()
 }
 
+/// Every deployment body the control plane still has, keyed by identity. Group membership is a
+/// label, so a node arrives in a group already running one of these; this is what lets the group it
+/// arrived in republish that deployment verbatim instead of moving the node. The bodies of DELETED
+/// groups and of retired predecessors somebody is still on are in here too: `retire_deleted_groups`
+/// and `finish_staged_rollouts` keep a body for exactly as long as a node is placed on it, so
+/// "where is this node?" has an answer whenever the control plane ever published one.
+///
+/// The ONE place that index is expressed: `assign_nodes` uses it to decide placements and
+/// `domain::plan_reconcile` uses it to carry a node's last placement forward, and the two must
+/// recognize exactly the same set of bodies or a carried node faults the whole generation with
+/// `PlanError::UnknownPlacement`.
+pub(crate) fn bodies_by_identity<'a>(
+    states: impl Iterator<Item = &'a AdmittedDeployment>,
+) -> HashMap<String, &'a DesiredDeployment> {
+    states
+        .flat_map(|state| std::iter::once(&state.current).chain(state.previous.iter()))
+        .filter_map(|deployment| Some((crate::deployment_identity(deployment)?, deployment)))
+        .collect()
+}
+
 fn assign_nodes(
     groups: &BTreeMap<String, ResolvedGroup>,
     admitted: &BTreeMap<String, AdmittedDeployment>,
@@ -1007,23 +1027,11 @@ fn assign_nodes(
     observations: &Observations<'_>,
 ) -> BTreeMap<String, DesiredDeployment> {
     let mut node_deployments = BTreeMap::new();
-    // Every deployment body the control plane still has, by identity. Group membership is a label,
-    // so a node arrives in a group already running one of these; this is what lets the group it
-    // arrived in republish that deployment verbatim instead of moving the node.
-    //
-    // Quarantined groups are in here too. They were pruned out of `admitted` above (they cannot be
-    // planned) and are restored by `domain::plan_reconcile` only after this runs, so reading
-    // `admitted` alone made the one node relabelling is FOR — a node moved out of a quarantined
-    // group — the one node whose placement could not be recognized. So are the bodies of DELETED
-    // groups and of retired predecessors that somebody is still on: `retire_deleted_groups` and
-    // `finish_staged_rollouts` keep a body for exactly as long as a node is placed on it, so
-    // "where is this node?" has an answer whenever the control plane ever published one.
-    let running: HashMap<String, &DesiredDeployment> = admitted
-        .values()
-        .chain(held.values())
-        .flat_map(|state| std::iter::once(&state.current).chain(state.previous.iter()))
-        .filter_map(|deployment| Some((crate::deployment_identity(deployment)?, deployment)))
-        .collect();
+    // Quarantined groups have to be indexed too. They were pruned out of `admitted` above (they
+    // cannot be planned) and are restored by `domain::plan_reconcile` only after this runs, so
+    // reading `admitted` alone made the one node relabelling is FOR — a node moved out of a
+    // quarantined group — the one node whose placement could not be recognized.
+    let running = bodies_by_identity(admitted.values().chain(held.values()));
     for (name, group) in groups.iter() {
         // A group awaiting its first admission publishes nothing. Its nodes are left out of the
         // generation entirely (see `domain::plan_reconcile`) so they hold their last known
@@ -1306,7 +1314,6 @@ mod tests {
                 health_grace_seconds: 1,
                 health_successes: 1,
                 health_interval_seconds: 1,
-                retry_after_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,

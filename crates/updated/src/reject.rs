@@ -126,15 +126,15 @@ mod tests {
         std::iter::repeat_n(byte, 64).collect()
     }
 
-    fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("reject-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("rejected")
+    fn tmp() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rejected");
+        (dir, path)
     }
 
     #[test]
     fn rejects_then_survives_reload() {
-        let path = tmp("persist");
+        let (_dir, path) = tmp();
         let digest = hash('2');
         let mut r = Rejections::load(&path).unwrap();
         assert!(!r.is_rejected(&digest));
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn application_rejections_are_scoped_to_repository_lineage() {
-        let path = tmp("lineage");
+        let (_dir, path) = tmp();
         let digest = hash('2');
         let x = format!("{}:{digest}", hash('a'));
         let y = format!("{}:{digest}", hash('b'));
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn rejection_is_not_a_retry_timer() {
-        let path = tmp("permanent");
+        let (_dir, path) = tmp();
         let digest = hash('2');
         let mut r = Rejections::load(&path).unwrap();
         r.reject(&digest).unwrap();
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn exact_break_glass_entry_allows_rejected_bytes_after_restart() {
-        let path = tmp("break-glass");
+        let (_dir, path) = tmp();
         let rejected = format!("{}:{}", hash('a'), hash('2'));
         let other = format!("{}:{}", hash('a'), hash('3'));
         let mut first = Rejections::load(&path).unwrap();
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn malformed_break_glass_file_fails_closed() {
-        let path = tmp("bad-break-glass");
+        let (_dir, path) = tmp();
         std::fs::write(override_path(&path), "all\n").unwrap();
         assert_eq!(
             Rejections::load(&path).unwrap_err().kind(),
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn clear_removes_the_entry() {
-        let path = tmp("clear");
+        let (_dir, path) = tmp();
         let digest = hash('2');
         let mut r = Rejections::load(&path).unwrap();
         r.reject(&digest).unwrap();
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn corrupt_record_fails_closed() {
-        let path = tmp("corrupt");
+        let (_dir, path) = tmp();
         std::fs::write(&path, "not-a-hash\tnope\n").unwrap();
         assert_eq!(
             Rejections::load(&path).unwrap_err().kind(),
@@ -230,7 +230,7 @@ mod tests {
         // save() must never be able to write a record load() rejects: the record is read
         // before anything else the supervisor does, so one bad key would be a permanent,
         // un-restartable crash loop rather than one failed rejection.
-        let path = tmp("write-contract");
+        let (_dir, path) = tmp();
         let mut r = Rejections::load(&path).unwrap();
         for bad in ["", "v2", "2.0.0", &hash('g'), &"a".repeat(63)] {
             assert_eq!(
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn a_digest_is_matched_case_insensitively() {
-        let path = tmp("case");
+        let (_dir, path) = tmp();
         let mut r = Rejections::load(&path).unwrap();
         r.reject(&hash('A')).unwrap();
         assert!(r.is_rejected(&hash('a')), "one digest, one entry");

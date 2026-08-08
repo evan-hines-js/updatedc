@@ -6,7 +6,7 @@
 
 use std::io;
 
-use updated::bundle::{ExpectedBundle, InstallError, ReleaseId, StagedRelease};
+use updated::bundle::{ExpectedBundle, InstallError, ReleaseId};
 use updated::config::{Application, Paths};
 use updated::provider::BundleStore;
 use updated_tuf::select::target_sha;
@@ -24,14 +24,6 @@ pub(crate) struct PreparedApplication {
     pub(crate) release: ReleaseId,
     pub(crate) version: String,
     pub(crate) archive_sha256: String,
-    /// The provider set signed into the version actually selected, or `None` at the assigned head
-    /// (where the assignment's own `provider_set` governs).
-    ///
-    /// Carried out rather than discarded because selection here can descend BELOW the version a
-    /// caller staged providers for — ordered fallback skips bundles rejected since — and a caller
-    /// that cannot see which version it really got would pair an application with another
-    /// version's providers.
-    pub(crate) provider_set: Option<updated_tuf::TargetReference>,
 }
 
 #[derive(Debug)]
@@ -149,7 +141,7 @@ pub(crate) async fn prepare_assigned_application(
     let platform = foundation::platform::platform_key();
     let store =
         BundleStore::for_app(request.paths).with_target_limit(request.repository.target_limit());
-    let StagedRelease { id, .. } = acquire_verified_bundle(
+    let id = acquire_verified_bundle(
         request.repository,
         &selected.target,
         &request.paths.download,
@@ -177,7 +169,6 @@ pub(crate) async fn prepare_assigned_application(
         release: id,
         version: selected.version,
         archive_sha256: selected.sha256,
-        provider_set: selected.provider_set,
     }))
 }
 
@@ -193,7 +184,7 @@ pub(crate) async fn acquire_verified_bundle(
     destination: &std::path::Path,
     store: &BundleStore,
     expected: &ExpectedBundle<'_>,
-) -> Result<StagedRelease, AcquireBundleError> {
+) -> Result<ReleaseId, AcquireBundleError> {
     repository
         .download_target(target, destination)
         .await

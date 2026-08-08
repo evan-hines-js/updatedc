@@ -1,36 +1,42 @@
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 fn bootstrap() -> Command {
     Command::new(env!("CARGO_BIN_EXE_bootstrap"))
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("bootstrap-cli-{}-{tag}-{n}", std::process::id()))
+/// A unique, not-yet-created path inside a fresh scratch directory. The returned guard owns the
+/// directory: hold it for as long as the path is in use (including by a spawned child), because
+/// dropping it deletes the tree.
+fn temp_dir(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let guard = tempfile::tempdir().unwrap();
+    let path = guard.path().join(tag);
+    (guard, path)
 }
 
 #[cfg(unix)]
-fn supervisor_script(tag: &str, body: &str) -> std::path::PathBuf {
+fn supervisor_script(tag: &str, body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
-    let dir = temp_dir(tag);
+    let (guard, dir) = temp_dir(tag);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("supervisor");
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    path
+    (guard, path)
 }
 
 #[cfg(unix)]
-fn start_guardian(tag: &str, supervisor: &std::path::Path) -> std::process::Child {
-    let state = temp_dir(tag);
-    bootstrap()
+fn start_guardian(
+    tag: &str,
+    supervisor: &std::path::Path,
+) -> (tempfile::TempDir, std::process::Child) {
+    let (guard, state) = temp_dir(tag);
+    let child = bootstrap()
         .args(["--state-dir", state.to_str().unwrap()])
         .args(["--supervisor-config", "/unused/config.toml"])
         .args(["--supervisor", supervisor.to_str().unwrap()])
         .spawn()
-        .unwrap()
+        .unwrap();
+    (guard, child)
 }
 
 #[cfg(unix)]
@@ -68,7 +74,7 @@ fn missing_path_value_is_a_usage_error() {
 
 #[test]
 fn first_boot_without_a_supervisor_fails_closed() {
-    let state = temp_dir("unseeded");
+    let (_tmp, state) = temp_dir("unseeded");
     let output = bootstrap()
         .args(["--state-dir", state.to_str().unwrap()])
         .args(["--supervisor-config", "/unused/config.toml"])
@@ -89,7 +95,7 @@ fn the_config_path_defaults_so_a_standard_deployment_never_names_it() {
     // location (`control::DEFAULT_BOOTSTRAP_CONFIG`) and every deployment adapter relies on that
     // default rather than restating a path. Reaching the *supervisor* fail-closed check (exit 1)
     // rather than an argument error (exit 2) is what proves the default was applied.
-    let state = temp_dir("default-config");
+    let (_tmp, state) = temp_dir("default-config");
     let output = bootstrap()
         .args(["--state-dir", state.to_str().unwrap()])
         .output()
@@ -129,15 +135,15 @@ fn help_prints_the_complete_operator_contract() {
 #[cfg(unix)]
 #[test]
 fn guardian_stays_alive_until_sigterm_then_exits_cleanly() {
-    let ready = temp_dir("steady-ready");
-    let supervisor = supervisor_script(
+    let (_ready_tmp, ready) = temp_dir("steady-ready");
+    let (_script_tmp, supervisor) = supervisor_script(
         "steady-supervisor",
         &format!(
             "trap 'exit 0' TERM INT\ntouch '{}'\nwhile :; do sleep 1; done",
             ready.display()
         ),
     );
-    let mut child = start_guardian("steady-state", &supervisor);
+    let (_state_tmp, mut child) = start_guardian("steady-state", &supervisor);
     assert!(
         wait_for_path(&ready, std::time::Duration::from_secs(3)),
         "supervisor never reached readiness marker"
@@ -167,11 +173,12 @@ fn start_guardian_backoff_probe(
     tag: &str,
     supervisor: &std::path::Path,
 ) -> (
+    tempfile::TempDir,
     std::process::Child,
     std::sync::Arc<std::sync::Mutex<String>>,
 ) {
     use std::io::Read;
-    let state = temp_dir(tag);
+    let (guard, state) = temp_dir(tag);
     let mut child = bootstrap()
         .args(["--state-dir", state.to_str().unwrap()])
         .args(["--supervisor-config", "/unused/config.toml"])
@@ -197,7 +204,7 @@ fn start_guardian_backoff_probe(
                 .push_str(&String::from_utf8_lossy(&buf[..n]));
         }
     });
-    (child, log)
+    (guard, child, log)
 }
 
 #[cfg(unix)]
@@ -224,8 +231,8 @@ fn supervisor_backoff_is_interrupted_by_shutdown() {
     // guardian's own durable log line, emitted only on the cut-short path. No wall-clock margin
     // is compared anywhere, so no amount of machine load can flake this: the timeouts below are
     // only anti-hang ceilings, orders of magnitude above the real (sub-second) latencies.
-    let supervisor = supervisor_script("failed-supervisor", "exit 7");
-    let (mut child, log) = start_guardian_backoff_probe("backoff", &supervisor);
+    let (_script_tmp, supervisor) = supervisor_script("failed-supervisor", "exit 7");
+    let (_state_tmp, mut child, log) = start_guardian_backoff_probe("backoff", &supervisor);
     let ceiling = std::time::Duration::from_secs(30);
 
     assert!(

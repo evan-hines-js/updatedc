@@ -1298,29 +1298,12 @@ async fn telemetry_put(
     }
     // A report travels as a DSSE envelope. The gateway does NOT verify its signature — it authorizes by
     // the mTLS leaf above, and the signature is end-to-end evidence for the consumers that read the
-    // stored bytes back. What it does check is that the envelope is well formed and that its payload
-    // names the node whose key it is being stored under, so a malformed or misfiled record is refused
-    // at the door rather than stored for a reader to trip over.
-    let Ok(envelope) = serde_json::from_slice::<updated_contracts::telemetry::Envelope>(&body)
-    else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    // Same shape bounds the consumer gate applies, refused at the door: a node signs with one key,
-    // so a stuffed signature list is only ever an attempt to make every later read pay for a pile
-    // of ECDSA verifications.
-    if envelope.payload_type != updated_contracts::telemetry::REPORT_PAYLOAD_TYPE
-        || envelope.signatures.len() > updated_contracts::telemetry::Envelope::MAX_SIGNATURES
-    {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let Some(report) = updated_contracts::telemetry::report_payload_unverified(&envelope) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    // `is_wellformed` is the same shape gate `report_is_authentic_and_fresh` applies on the read
-    // side. Storing a record that fails it strands the node: every consumer discards the report,
-    // the planner reads the node as silent, and it holds a `maxUnavailable` slot until someone
-    // notices. Refuse it at the door, where the writer still learns about it.
-    if report.node != node || !report.is_wellformed() {
+    // stored bytes back. `accept_report_envelope` is the one shared write-side gate: well-formed
+    // envelope, bounded signature count, and a payload that names the node it is being stored under.
+    // Storing a record that fails it strands the node — every consumer discards the report, the
+    // planner reads the node as silent, and it holds a `maxUnavailable` slot until someone notices —
+    // so it is refused at the door, where the writer still learns about it.
+    if updated_contracts::telemetry::accept_report_envelope(&body, node).is_none() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     // The object half of the authorization, resolved through the same `UpdateAgent` read every
@@ -1620,7 +1603,10 @@ pub(crate) async fn resolve_signed_enrollment(
     // interpreted. Without this, an attacker who can write the prefix substitutes a root of their
     // own, signs a matching chain under it, and every node that enrolls afterwards pins THEIR root
     // as its routing anchor — the whole fleet's trust chain, replaced silently.
-    if !updated::hash::sha256_bytes(root.as_bytes()).eq_ignore_ascii_case(expected_root_sha256) {
+    if !updated::hash::digests_match(
+        &updated::hash::sha256_bytes(root.as_bytes()),
+        expected_root_sha256,
+    ) {
         return Err(Malformed(
             "published routing root does not match the control plane's trust anchor".into(),
         ));
@@ -1884,30 +1870,25 @@ async fn object_text(
 }
 
 fn repository_key(prefix: &str, request_path: &str) -> Option<ObjectPath> {
-    if request_path.contains(['?', '#', '%', '\\']) || !request_path.starts_with('/') {
+    // The grammar — which paths name a repository object — is `crate::served`'s, shared with the
+    // dev CDN so the two servers an agent cannot tell apart accept exactly the same requests.
+    let object = crate::served::repository_object(request_path)?;
+    if !matches!(object.namespace, "metadata" | "targets") {
         return None;
     }
-    let mut parts = request_path[1..].split('/');
-    let namespace = parts.next()?;
-    if !matches!(namespace, "metadata" | "targets") {
-        return None;
+    Some(crate::object_key(prefix, &object.key()))
+}
+
+/// The object store's spelling of a parsed [`crate::served::ByteRange`]: it takes the bounded
+/// shape as a half-open range, so the inclusive end becomes `end + 1`.
+fn range_of(range: crate::served::ByteRange) -> GetRange {
+    match range {
+        crate::served::ByteRange::Offset(start) => GetRange::Offset(start),
+        crate::served::ByteRange::Bounded { start, end } => {
+            GetRange::Bounded(start..end.saturating_add(1))
+        }
+        crate::served::ByteRange::Suffix(n) => GetRange::Suffix(n),
     }
-    let tail: Vec<_> = parts.collect();
-    // Confined path safety is the one shared guard; a served object key additionally rejects any
-    // dot-leading segment (no `.`/`..` climb and no hidden keys).
-    if tail.is_empty()
-        || !tail
-            .iter()
-            .all(|part| updated_contracts::path::is_safe_component(part) && !part.starts_with('.'))
-    {
-        return None;
-    }
-    let key = [prefix.trim_matches('/'), namespace, &tail.join("/")]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    ObjectPath::parse(key).ok()
 }
 
 /// Read the single `Range` header (if any). A duplicate `Range` header, a non-ASCII value, or a
@@ -1921,41 +1902,8 @@ fn parse_range(headers: &HeaderMap) -> Result<Option<GetRange>, ()> {
         return Err(());
     }
     let value = value.to_str().map_err(|_| ())?;
-    Ok(Some(parse_range_value(value.trim())?))
-}
-
-/// Parse a single HTTP byte range: open-ended (`bytes=100-`), bounded (`bytes=0-99`, end
-/// inclusive), or suffix (`bytes=-500`, the last N bytes). Multi-range requests and any malformed
-/// value are refused (`Err`), matching the read path's conservative framing.
-fn parse_range_value(value: &str) -> Result<GetRange, ()> {
-    let spec = value.strip_prefix("bytes=").ok_or(())?;
-    if spec.contains(',') {
-        return Err(());
-    }
-    let (start, end) = spec.split_once('-').ok_or(())?;
-    let range = match (start.trim(), end.trim()) {
-        ("", "") => return Err(()),
-        // Suffix: the last N bytes. A zero-length suffix is unsatisfiable.
-        ("", suffix) => {
-            let n: u64 = suffix.parse().map_err(|_| ())?;
-            if n == 0 {
-                return Err(());
-            }
-            GetRange::Suffix(n)
-        }
-        // Open-ended: everything from `start` onward.
-        (start, "") => GetRange::Offset(start.parse().map_err(|_| ())?),
-        // Bounded: `start`..=`end` inclusive, so the exclusive upper bound is `end + 1`.
-        (start, end) => {
-            let start: u64 = start.parse().map_err(|_| ())?;
-            let end: u64 = end.parse().map_err(|_| ())?;
-            if end < start {
-                return Err(());
-            }
-            GetRange::Bounded(start..end.saturating_add(1))
-        }
-    };
-    Ok(range)
+    let range = crate::served::parse_range_value(value).ok_or(())?;
+    Ok(Some(range_of(range)))
 }
 
 fn safe_etag(value: &str) -> Option<&str> {
@@ -2890,23 +2838,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_range_accepts_open_bounded_and_suffix() {
-        assert_eq!(parse_range_value("bytes=100-"), Ok(GetRange::Offset(100)));
-        assert_eq!(
-            parse_range_value("bytes=0-99"),
-            Ok(GetRange::Bounded(0..100))
-        );
-        assert_eq!(parse_range_value("bytes=-500"), Ok(GetRange::Suffix(500)));
-        for invalid in [
-            "bytes=-",
-            "bytes=-0",
-            "bytes=5-2",
-            "bytes=0-1,3-4",
-            "1-2",
-            "bytes=",
+    fn every_parsed_range_shape_reaches_the_object_store_intact() {
+        // The grammar itself is `crate::served`'s and tested there; what this owns is the
+        // translation into the store's half-open bounded range.
+        for (value, expected) in [
+            ("bytes=100-", GetRange::Offset(100)),
+            ("bytes=0-99", GetRange::Bounded(0..100)),
+            ("bytes=-500", GetRange::Suffix(500)),
         ] {
-            assert_eq!(parse_range_value(invalid), Err(()), "{invalid}");
+            let mut headers = HeaderMap::new();
+            headers.insert(header::RANGE, value.parse().unwrap());
+            assert_eq!(parse_range(&headers), Ok(Some(expected)), "{value}");
         }
+    }
+
+    #[test]
+    fn a_duplicate_or_malformed_range_header_is_refused() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::RANGE, "bytes=0-1".parse().unwrap());
+        headers.append(header::RANGE, "bytes=2-3".parse().unwrap());
+        assert_eq!(parse_range(&headers), Err(()));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=5-2".parse().unwrap());
+        assert_eq!(parse_range(&headers), Err(()));
+        assert_eq!(parse_range(&HeaderMap::new()), Ok(None));
     }
 
     #[tokio::test]

@@ -18,7 +18,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{timeout, Duration};
 use tough::schema::{Role, Root, Signed, Snapshot, Target, Targets, Timestamp};
 use tough::{ExpirationEnforcement, Limits, Repository, RepositoryLoader, TargetName};
-use updated::config::MaterializeRuntime;
 use url::Url;
 
 pub mod policy;
@@ -130,7 +129,6 @@ mod error_tests {
                 health_grace_seconds: 1,
                 health_successes: 1,
                 health_interval_seconds: 1,
-                retry_after_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,
@@ -169,12 +167,8 @@ mod error_tests {
     fn each_way_of_lacking_a_live_assignment_is_reported_distinctly() {
         use super::{persisted_assignment, LiveAssignment};
 
-        let dir = std::env::temp_dir().join(format!(
-            "updated-tuf-live-assignment-{}-{}",
-            std::process::id(),
-            updated::rand::token().unwrap()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().to_path_buf();
         let install_root = std::path::Path::new("/app");
         let path = updated::config::persisted_assignment_path(&dir);
         let usable = || assignment("deployment");
@@ -335,7 +329,6 @@ mod error_tests {
                 health_grace_seconds: 1,
                 health_successes: 1,
                 health_interval_seconds: 1,
-                retry_after_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,
@@ -410,7 +403,6 @@ mod error_tests {
                     health_grace_seconds: 1,
                     health_successes: 1,
                     health_interval_seconds: 1,
-                    retry_after_seconds: 1,
                     refresh_retry_seconds: 1,
                     confirmation_window_seconds: 1,
                     supervisor_check_interval_seconds: 1,
@@ -467,11 +459,8 @@ mod error_tests {
         });
         assert_ne!(active, stale);
 
-        let datastore = std::env::temp_dir().join(format!(
-            "updated-tuf-prune-{}-{}",
-            std::process::id(),
-            updated::rand::token().unwrap()
-        ));
+        let guard = tempfile::tempdir().unwrap();
+        let datastore = guard.path().to_path_buf();
         for identity in [&active, &stale] {
             let dir = datastore.join(identity);
             std::fs::create_dir_all(&dir).unwrap();
@@ -689,9 +678,7 @@ pub async fn resolve_managed_config(
     let embedded = verify_embedded_chain(&bundle)?;
     let live = persisted_assignment(enrollment_state, &embedded.assignment.runtime.install_root);
     let assignment = boot_assignment(embedded, live)?;
-    assignment
-        .runtime
-        .materialize(&assignment.deployment, routing)
+    updated::config::Config::materialize(&assignment.runtime, &assignment.deployment, routing)
         .map_err(Error::Trust)
 }
 
@@ -2066,14 +2053,11 @@ mod bundle_refresh_tests {
     use updated::enrollment::BundlePolicy;
     use updated_contracts::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
 
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "updated-tuf-{label}-{}-{}",
-            std::process::id(),
-            updated::rand::token().unwrap()
-        ));
+    fn scratch(label: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().join(label);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (guard, dir)
     }
 
     /// Mint a repository whose metadata expires in `expiry_days`, and return its directory.
@@ -2140,7 +2124,7 @@ mod bundle_refresh_tests {
     /// from when the bundle was written.
     #[tokio::test]
     async fn a_chain_is_due_for_replacement_once_any_role_nears_its_expiry() {
-        let tmp = scratch("bundle-expiry");
+        let (_tmp, tmp) = scratch("bundle-expiry");
         let fresh = minted(&tmp.join("fresh"), 365).await;
         let fresh = bundle_from(&fresh);
         assert!(
@@ -2172,7 +2156,7 @@ mod bundle_refresh_tests {
     /// be the pinned root, or a rotation the pinned root itself signed.
     #[tokio::test]
     async fn a_refreshed_root_must_be_the_pinned_root_or_a_rotation_it_signed() {
-        let tmp = scratch("bundle-root");
+        let (_tmp, tmp) = scratch("bundle-root");
         let repo_dir = tmp.join("repo");
         let keys = repo::generate_keys(&tmp.join("keys")).await.unwrap();
         repo::init(&repo_dir, &keys, 365).await.unwrap();
@@ -2260,14 +2244,11 @@ mod integrity_tests {
     use std::path::{Path, PathBuf};
     use tough::{ExpirationEnforcement, FilesystemTransport, Limits, RepositoryLoader};
 
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "updated-tuf-{label}-{}-{}",
-            std::process::id(),
-            updated::rand::token().unwrap()
-        ));
+    fn scratch(label: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().join(label);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (guard, dir)
     }
 
     async fn minted(tmp: &Path) -> PathBuf {
@@ -2329,7 +2310,7 @@ mod integrity_tests {
     /// raise no trust alarm.
     #[tokio::test]
     async fn tampered_metadata_is_a_trust_failure_not_a_retryable_transport_blip() {
-        let tmp = scratch("integrity");
+        let (_tmp, tmp) = scratch("integrity");
         let repo_dir = minted(&tmp).await;
 
         // A clean repository loads, so the failures below are about the tampering only.

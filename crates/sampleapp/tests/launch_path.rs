@@ -28,11 +28,11 @@ use updated::provider::BundleStore;
 const PRODUCT: &str = "app";
 const PLATFORM: &str = "test-platform";
 
-fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("sampleapp-launch-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
-    path
+/// A private root for one test, removed when the returned guard drops.
+fn scratch() -> (tempfile::TempDir, PathBuf) {
+    let guard = tempfile::tempdir().unwrap();
+    let path = guard.path().to_path_buf();
+    (guard, path)
 }
 
 /// Stage and install a release whose payload is the real `sampleapp` binary plus the
@@ -70,8 +70,8 @@ fn install_release(
             },
         )
         .unwrap();
-    let resolved = store.resolve(&staged.id).unwrap();
-    (store, staged.id, resolved)
+    let resolved = store.resolve(&staged).unwrap();
+    (store, staged, resolved)
 }
 
 fn free_port() -> u16 {
@@ -137,7 +137,7 @@ fn await_ready_line(child: &mut Child) -> String {
 /// its own bundled configuration by relative path and comes up.
 #[test]
 fn the_real_application_starts_from_the_launch_cwd_the_provider_resolves() {
-    let root = scratch("starts");
+    let (_tmp, root) = scratch();
     let (store, id, resolved) = install_release(&root, "1.4.2");
 
     // The launch cwd must be the writable workspace, never the content-addressed tree:
@@ -162,7 +162,7 @@ fn the_real_application_starts_from_the_launch_cwd_the_provider_resolves() {
 /// perfectly good release and re-download it forever).
 #[test]
 fn what_the_application_writes_into_its_cwd_never_condemns_its_release() {
-    let root = scratch("drift");
+    let (_tmp, root) = scratch();
     let (_store, id, resolved) = install_release(&root, "2.0.0");
 
     let port = free_port();

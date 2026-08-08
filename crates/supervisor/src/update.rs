@@ -1527,97 +1527,18 @@ mod tests {
         }
     }
 
-    struct MemoryStore {
-        installed: Installed,
-        journal: Option<Transaction>,
-        active: updated::bundle::ReleaseId,
-        rejected: Vec<String>,
-        /// Simulate a state directory that has gone unwritable (ENOSPC, a read-only remount).
-        fail_reject: bool,
-    }
-
-    impl MemoryStore {
-        fn new(previous: updated::bundle::ReleaseId) -> Self {
-            Self {
-                installed: Installed::Present(Box::new(InstalledState::confirmed(
-                    test_lineage(),
-                    previous.clone(),
-                    "previous-archive".into(),
-                    Box::new(reconciler_release()),
-                ))),
-                journal: None,
-                active: previous,
-                rejected: Vec::new(),
-                fail_reject: false,
-            }
-        }
-    }
-
-    impl Store for MemoryStore {
-        fn installed(&self) -> Installed {
-            match &self.installed {
-                Installed::Present(state) => Installed::Present(state.clone()),
-                Installed::Missing => Installed::Missing,
-                Installed::Invalid => Installed::Invalid,
-            }
-        }
-        fn journal(&self) -> io::Result<Option<Transaction>> {
-            Ok(self.journal.clone())
-        }
-        fn install_journal(&self) -> io::Result<Option<updated::install::InstallTransaction>> {
-            Ok(None)
-        }
-        fn active_release(&self) -> io::Result<Option<updated::bundle::ReleaseId>> {
-            Ok(Some(self.active.clone()))
-        }
-        fn is_rejected(&self, _: &updated::state::RepositoryLineage, _: &str) -> bool {
-            false
-        }
-        fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
-            self.installed = Installed::Present(Box::new(state.clone()));
-            Ok(())
-        }
-        fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
-            self.journal = Some(tx.clone());
-            Ok(())
-        }
-        fn clear_journal(&mut self) -> io::Result<()> {
-            self.journal = None;
-            Ok(())
-        }
-        fn write_install_journal(
-            &mut self,
-            _: &updated::install::InstallTransaction,
-        ) -> io::Result<()> {
-            Ok(())
-        }
-        fn clear_install_journal(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-        fn reject(
-            &mut self,
-            _: &updated::state::RepositoryLineage,
-            digest: &str,
-        ) -> io::Result<()> {
-            if self.fail_reject {
-                return Err(io::Error::other("injected rejection write failure"));
-            }
-            self.rejected.push(digest.into());
-            Ok(())
-        }
-        fn clear_rejection(
-            &mut self,
-            _: &updated::state::RepositoryLineage,
-            _: &str,
-        ) -> io::Result<()> {
-            Ok(())
-        }
-        fn verify_release(&self, _: &updated::bundle::ReleaseId) -> io::Result<()> {
-            Ok(())
-        }
-        fn point_active(&mut self, release: &updated::bundle::ReleaseId) -> io::Result<()> {
-            self.active = release.clone();
-            Ok(())
+    /// A store holding `previous` as the confirmed installed release, which is what every
+    /// transaction test starts from.
+    fn store_with(previous: updated::bundle::ReleaseId) -> MemStore {
+        MemStore {
+            installed: Some(InstalledState::confirmed(
+                test_lineage(),
+                previous.clone(),
+                "previous-archive".into(),
+                Box::new(reconciler_release()),
+            )),
+            active: Some(previous),
+            ..MemStore::default()
         }
     }
 
@@ -1729,7 +1650,7 @@ mod tests {
     async fn the_transaction_gate_is_the_same_healthcheck_operation_under_the_attempt_id() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        let mut store = MemoryStore::new(previous.clone());
+        let mut store = store_with(previous.clone());
         let mut tower = FakeTower::default();
 
         let outcome = apply_update(
@@ -1763,7 +1684,7 @@ mod tests {
     async fn failed_process_stop_preserves_recovery_evidence_and_never_activates() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        let mut store = MemoryStore::new(previous.clone());
+        let mut store = store_with(previous.clone());
         let mut provider = FakeTower {
             fail_process_stop: true,
             ..Default::default()
@@ -1783,7 +1704,7 @@ mod tests {
         // Never `Err`: that maps to the fatal branch, which abandons the update with the
         // application drained. The single recovery path is a clean restart.
         assert!(matches!(outcome, Outcome::RollbackPending));
-        assert_eq!(store.active, previous);
+        assert_eq!(store.active, Some(previous));
         assert_eq!(provider.activations, 0);
         assert!(
             store.journal.is_some(),
@@ -1795,7 +1716,7 @@ mod tests {
     async fn a_transient_healthcheck_failure_is_retried_by_the_agent() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        let mut store = MemoryStore::new(previous);
+        let mut store = store_with(previous);
         let mut provider = FakeTower {
             fail_first_healthcheck: true,
             ..Default::default()
@@ -1879,7 +1800,7 @@ mod tests {
     async fn a_gate_that_never_reaches_the_reconciler_rolls_back_without_rejecting() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        let mut store = MemoryStore::new(previous);
+        let mut store = store_with(previous);
         let mut provider = FakeTower {
             healthcheck_failure: Some(io::ErrorKind::StorageFull),
             ..Default::default()
@@ -1911,7 +1832,7 @@ mod tests {
     async fn a_failed_activation_records_the_rejection_before_deferring_to_recovery() {
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        let mut store = MemoryStore::new(previous);
+        let mut store = store_with(previous);
         let mut tower = FakeTower {
             fail_first_activation: true,
             ..Default::default()
@@ -1931,7 +1852,10 @@ mod tests {
         // The candidate activated then failed: it is rejected and the rollback journal is durable
         // before we hand off to boot recovery. There is no in-process rollback to fail.
         assert!(matches!(outcome, Outcome::RollbackPending));
-        assert_eq!(store.rejected, ["archive-two"]);
+        assert_eq!(
+            store.rejected,
+            std::collections::HashSet::from([test_lineage().rejection_key("archive-two")])
+        );
         assert!(
             store
                 .journal
@@ -1949,7 +1873,7 @@ mod tests {
         // the one outcome the post-drain half must be incapable of producing.
         let previous = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        let mut store = MemoryStore::new(previous.clone());
+        let mut store = store_with(previous.clone());
         store.fail_reject = true;
         let mut tower = FakeTower {
             fail_first_activation: true,
@@ -1983,7 +1907,7 @@ mod tests {
     #[tokio::test]
     async fn reconciler_only_revision_uses_the_normal_transaction() {
         let application_release = release("1.0.0", "one");
-        let mut store = MemoryStore::new(application_release.clone());
+        let mut store = store_with(application_release.clone());
         let mut tower = FakeTower::default();
         let mut revised = reconciler_release();
         revised.release = release("2.0.0", "reconciler-two");
@@ -2001,7 +1925,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(outcome, Outcome::Committed));
-        let Installed::Present(installed) = store.installed else {
+        let Some(installed) = store.installed else {
             panic!("the reconciler revision must commit installed state");
         };
         assert_eq!(installed.release, application_release);

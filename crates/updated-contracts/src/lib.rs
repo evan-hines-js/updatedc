@@ -69,7 +69,9 @@ mod dependency_isolation {
 
     #[test]
     fn contracts_never_depend_on_the_node_runtime() {
-        assert!(!dependency_names(CONTRACT_MANIFEST).any(|name| name == "updated"));
+        assert!(
+            !foundation::manifest::shipped_dependency_names(CONTRACT_MANIFEST).contains(&"updated")
+        );
     }
 
     #[test]
@@ -105,28 +107,12 @@ mod dependency_isolation {
             "updatec-demo",
         ];
         for (package, manifest) in PRODUCTION_MANIFESTS {
-            for dependency in dependency_names(manifest) {
+            for dependency in foundation::manifest::shipped_dependency_names(manifest) {
                 assert!(
                     !FORBIDDEN.contains(&dependency),
                     "production package {package} must not depend on {dependency}"
                 );
             }
         }
-    }
-
-    fn dependency_names(manifest: &str) -> impl Iterator<Item = &str> {
-        let mut in_dependencies = false;
-        manifest.lines().filter_map(move |line| {
-            let line = line.trim();
-            if line.starts_with('[') {
-                in_dependencies = line.contains("dependencies");
-                return None;
-            }
-            if !in_dependencies || line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let name = line.split(['=', '.', ' ']).next()?.trim();
-            (!name.is_empty()).then_some(name)
-        })
     }
 }

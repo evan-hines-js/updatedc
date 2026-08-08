@@ -34,4 +34,3 @@ k8s-openapi = { workspace = true }
 # Tests mint a per-node keypair to sign the health reports readiness is verified against — the
 # same aws-lc-rs ECDSA path a real node's telemetry signing and the control-plane pin use.
 aws-lc-rs = { workspace = true }
-hex = { workspace = true }

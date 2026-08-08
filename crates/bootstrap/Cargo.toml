@@ -33,3 +33,7 @@ libc.workspace = true
 # handles, Job Objects, anonymous pipes for the inherited control channel, and the
 # console-stop handler.
 windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }
+
+[dev-dependencies]
+# Test-only: unique, self-cleaning scratch directories. Never linked into the guardian.
+tempfile.workspace = true

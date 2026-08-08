@@ -104,15 +104,15 @@ mod tests {
     use super::*;
 
     /// A supervisor stand-in that catches the graceful stop and exits on it.
-    fn graceful_binary(name: &str) -> std::path::PathBuf {
+    fn graceful_binary(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("guardian-stop-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("supervisor");
         std::fs::write(&path, "#!/bin/sh\ntrap 'exit 7' TERM\nsleep 60 &\nwait\n").unwrap();
         std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).unwrap();
-        path
+        (guard, path)
     }
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
         // The graceful request goes through `ContainedChild`, the same reap-aware abstraction as
         // the hard kill, so no raw PID is ever signalled from here. If it were lost, this would
         // fall through to the grace expiry and hard-kill instead.
-        let binary = graceful_binary("graceful");
+        let (_tmp, binary) = graceful_binary("graceful");
         let dir = binary.parent().unwrap();
         let mut sup = Supervisor::launch(
             &binary,
@@ -143,7 +143,7 @@ mod tests {
     fn stopping_an_already_reaped_supervisor_signals_nothing() {
         // Once `exited()` has reaped the leader its PID is the kernel's to reassign; a stop after
         // that must be a no-op, not a signal aimed at whatever now holds that number.
-        let binary = graceful_binary("reaped");
+        let (_tmp, binary) = graceful_binary("reaped");
         let dir = binary.parent().unwrap();
         let mut sup = Supervisor::launch(
             &binary,

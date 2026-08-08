@@ -101,16 +101,16 @@ pub fn mark_rejected_supervisor(state_dir: &Path, candidate: &Path) -> std::io::
 mod tests {
     use super::*;
 
-    fn dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("guardian-record-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+    fn dir(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let d = guard.path().join(name);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        (guard, d)
     }
 
     #[test]
     fn desired_supervisor_pointer_round_trips() {
-        let d = dir("desired");
+        let (_tmp, d) = dir("desired");
         assert!(desired_supervisor(&d).unwrap().is_none());
         let p = d.join("supervisors/deadbeef/supervisor");
         set_desired_supervisor(&d, &p).unwrap();
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn corrupt_pointer_is_an_error_not_first_boot() {
-        let d = dir("corrupt-desired");
+        let (_tmp, d) = dir("corrupt-desired");
         std::fs::write(d.join(DESIRED_FILE), b"not-a-pointer\n").unwrap();
         assert_eq!(
             desired_supervisor(&d).unwrap_err().kind(),
@@ -132,7 +132,7 @@ mod tests {
         // The supervisor tells the instance it read from one written mid-boot by comparing bytes,
         // so two exits must never produce identical content — including two exits with the same
         // code, which is the common case (a crash-looping app).
-        let d = dir("marker-identity");
+        let (_tmp, d) = dir("marker-identity");
         let path = d.join(control::SERVICE_EXITED_MARKER_FILE);
         mark_service_exited(&d, 7).unwrap();
         let first = std::fs::read_to_string(&path).unwrap();
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn markers_are_written_for_the_supervisor_to_interpret() {
-        let d = dir("markers");
+        let (_tmp, d) = dir("markers");
         mark_service_exited(&d, 0).unwrap();
         assert!(d.join(control::SERVICE_EXITED_MARKER_FILE).exists());
         let bad = d.join("supervisors/badc0de/supervisor");
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn marker_write_failures_are_reported() {
-        let d = dir("marker-errors");
+        let (_tmp, d) = dir("marker-errors");
         std::fs::create_dir(d.join(control::SERVICE_EXITED_MARKER_FILE)).unwrap();
         assert!(mark_service_exited(&d, 1).is_err());
         std::fs::create_dir(d.join(control::REJECTED_SUPERVISOR_FILE)).unwrap();

@@ -39,7 +39,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use kube::api::{Api, Patch, PatchParams};
 use kube::Client;
-use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use updatec::{S3Destination, UpdateGroup};
 use updated_tuf::repo::{self, PublishTarget};
@@ -87,7 +86,7 @@ enum Command {
     PublishProviderSet(ProviderSetArgs),
 }
 
-/// The release repository backend, shared by both subcommands. AWS credentials come from
+/// The release repository backend, shared by every subcommand. AWS credentials come from
 /// the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment.
 #[derive(Args, Debug)]
 struct Backend {
@@ -971,63 +970,160 @@ fn ensure_keys_dir_is_empty(dir: &Path) -> Result<(), Error> {
     .into())
 }
 
-/// The name every `trust-root` staging directory starts with, inside `--keys-dir`. Only this
-/// command creates entries under this prefix, which is what makes sweeping them safe.
-const STAGING_PREFIX: &str = ".trust-root.pending.";
+/// The staging stem `trust-root` mints its role key set under, inside `--keys-dir`.
+const ROLE_KEYS_STEM: &str = "trust-root";
 
-/// The name a staging directory is renamed to the moment its repository is published, before any
-/// step of the delivery that can fail. It shares no prefix with `STAGING_PREFIX`, so the keys a
-/// half-finished `commit` leaves behind — the only copy a live trust root has — are outside what
-/// `sweep_stale_staging` removes, and an automated re-run cannot destroy them.
-const PUBLISHED_PREFIX: &str = ".trust-root.published.";
+/// One piece of private key material staged on its way to the operator, and the crash-consistency
+/// protocol both key ceremonies deliver material with — written once, so the two cannot drift.
+///
+/// The protocol has five steps and every one of them is load bearing:
+///
+/// 1. **Sweep.** A mint first removes anything left under `.<stem>.pending.` in the same
+///    directory. `Drop` covers every failure the process survives, but a signal does not go
+///    through it: a Ctrl-C or a runner timeout during the S3 leg of a ceremony kills the process
+///    outright and leaves private key material on disk. The emptiness pre-flights look only at the
+///    delivery names, so without the sweep each interrupted run left one more, against the
+///    documented promise that an operator never has to hand-delete key material. Sweeping is safe
+///    on two counts: *provenance* — only this tool writes under the prefix, so an entry is its own
+///    abandoned staging; and *value* — a run still under the pending prefix never reached `commit`
+///    and so published nothing, because step 4 renames out of the prefix before anything that can
+///    fail. Those are keys of a root that never existed.
+/// 2. **Mint under a name this process picks.** `<stem>.pending.<pid>.<nanos>`, created
+///    exclusively by the caller's mint, so no file or directory another local principal planted
+///    can be adopted into a fresh root.
+/// 3. **Drop removes it.** A ceremony is mint-then-publish and the publish is allowed to fail for
+///    routine reasons (S3 transients, a generation guard aborting on another publisher). Such a
+///    failure delivers nothing, so the identical re-run mints again and completes the ceremony.
+/// 4. **Publish the name before anything fallible.** The moment the repository is live this
+///    material is the only copy of a LIVE root's keys, so it is renamed to `.<stem>.published.` —
+///    a prefix step 1 does not sweep — before the delivery moves that can fail. Under the pending
+///    name, the next automated re-run swept away the live root's keys.
+/// 5. **Deliver.** Ceremony-specific, and the one part that differs: `trust-root` moves five role
+///    keys into `--keys-dir`, `rotate-root` moves one successor key to `--new-key-out`.
+struct PendingKeyMaterial {
+    /// The directory the staging entry lives in; also the namespace the sweep scans.
+    dir: PathBuf,
+    /// Names the `.<stem>.pending.`/`.<stem>.published.` prefixes.
+    stem: String,
+    /// Where the material is right now: the pending name, or the published one after `publish`.
+    staged: PathBuf,
+    committed: bool,
+}
 
-/// Remove the staging directories of `trust-root` runs that died before they could clean up.
-///
-/// `PendingRoleKeys` drops its staging directory on every failure the process survives, but a
-/// signal does not go through `Drop`: a Ctrl-C at the terminal or a runner timeout during the S3
-/// publish — the long part of the ceremony — kills the process outright and leaves a directory of
-/// five private keys behind. `ensure_keys_dir_is_empty` looks only at the `ROLE_KEYS` basenames,
-/// so those directories were invisible to it and accumulated one per interrupted run, against a
-/// documented promise that an operator never has to hand-delete key material.
-///
-/// Sweeping them is safe on the two counts that matter. *Provenance:* the prefix is one only this
-/// command writes under, so an entry here is this tool's own abandoned staging and nothing else.
-/// *Value:* those keys signed nothing an agent can see — a run under this prefix did not reach
-/// `commit` and so published no repository, because `commit` renames the directory to
-/// `PUBLISHED_PREFIX` before it can fail; the keys are of a trust root that never existed. Concurrent
-/// `trust-root` runs against one `--keys-dir` are not a supported configuration (they race for the
-/// same five destination paths regardless), so the sweep does not coordinate with them.
-fn sweep_stale_staging(dir: &Path) -> Result<(), Error> {
+impl PendingKeyMaterial {
+    /// Sweep abandoned staging (step 1) and name a fresh, private staging path (step 2). The
+    /// caller mints its material at [`Self::path`]; until it does, dropping this guard is a no-op
+    /// on a path that does not exist.
+    fn stage(dir: &Path, stem: &str, command: &'static str) -> Result<Self, Error> {
+        sweep_stale_staging(dir, stem, command)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let staged = dir.join(format!(
+            "{}{}.{nonce}",
+            pending_prefix(stem),
+            std::process::id()
+        ));
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            stem: stem.to_string(),
+            staged,
+            committed: false,
+        })
+    }
+
+    /// Where the material is: the staging path before [`Self::publish`], the published one after.
+    fn path(&self) -> &Path {
+        &self.staged
+    }
+
+    /// Step 4: take the material out of the swept namespace, because what it holds is now the only
+    /// copy of a live root's keys. Called first thing in a `commit`, before any delivery step that
+    /// can fail; the caller wraps the error with what the operator must do about it.
+    fn publish(&mut self) -> Result<(), Error> {
+        self.committed = true;
+        let suffix = self
+            .staged
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let pending = pending_prefix(&self.stem);
+        let suffix = suffix.strip_prefix(&pending).unwrap_or(&suffix).to_string();
+        let published = self
+            .dir
+            .join(format!("{}{suffix}", published_prefix(&self.stem)));
+        std::fs::rename(&self.staged, &published).map_err(|error| {
+            format!(
+                "renaming the staged key material {} to {}: {error}",
+                self.staged.display(),
+                published.display()
+            )
+        })?;
+        self.staged = published;
+        Ok(())
+    }
+}
+
+impl Drop for PendingKeyMaterial {
+    /// Step 3. Whatever was minted — a directory of five keys or a single key file — goes with the
+    /// process unless it was published.
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = remove_staged(&self.staged);
+        }
+    }
+}
+
+/// The staging prefix: what a mint names its material under, and the one namespace the sweep
+/// removes from.
+fn pending_prefix(stem: &str) -> String {
+    format!(".{stem}.pending.")
+}
+
+/// The name staged material is renamed to the moment its repository is published, before any step
+/// of the delivery that can fail. It shares no prefix with the pending name, so the material a
+/// half-finished `commit` leaves behind — the only copy a live trust root has — is outside what
+/// the sweep removes, and an automated re-run cannot destroy it.
+fn published_prefix(stem: &str) -> String {
+    format!(".{stem}.published.")
+}
+
+/// Remove one staged entry, whichever shape the ceremony minted.
+fn remove_staged(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Step 1 of [`PendingKeyMaterial`]: remove the staged material of runs that died before they
+/// could clean up. Concurrent runs of one ceremony against one directory are not a supported
+/// configuration (they race for the same destination paths regardless), so the sweep does not
+/// coordinate with them.
+fn sweep_stale_staging(dir: &Path, stem: &str, command: &str) -> Result<(), Error> {
+    let pending = pending_prefix(stem);
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("reading --keys-dir {}: {error}", dir.display()).into()),
+        Err(error) => return Err(format!("reading {}: {error}", dir.display()).into()),
     };
     for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("reading --keys-dir {}: {error}", dir.display()))?;
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(STAGING_PREFIX)
-        {
+        let entry = entry.map_err(|error| format!("reading {}: {error}", dir.display()))?;
+        if !entry.file_name().to_string_lossy().starts_with(&pending) {
             continue;
         }
         let path = entry.path();
-        let removed = match entry.file_type() {
-            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
-            _ => std::fs::remove_file(&path),
-        };
-        removed.map_err(|error| {
+        remove_staged(&path).map_err(|error| {
             format!(
-                "removing {}, the staging directory an interrupted `trust-root` left behind: \
-                 {error}",
+                "removing {}, the key material an interrupted `{command}` left behind: {error}",
                 path.display()
             )
         })?;
         eprintln!(
-            "removed {}: private keys staged by a `trust-root` that was interrupted before it \
-             published, so they are keys of a trust root that never existed",
+            "removed {}: private key material staged by a `{command}` that was interrupted before \
+             it published, so it is the material of a root that never existed",
             path.display()
         );
     }
@@ -1037,23 +1133,17 @@ fn sweep_stale_staging(dir: &Path) -> Result<(), Error> {
 /// The five role keys of a fresh trust root, minted into a private staging directory inside
 /// `--keys-dir` and moved into place only once the new repository has been published.
 ///
-/// This is the `PendingRootKey` pattern applied to the bootstrap, and it buys the same two
-/// properties. *Crash consistency:* the bootstrap is mint-then-publish and the publish is allowed
-/// to fail for routine reasons (S3 transients, a truncated upload), which leaves the operator
-/// holding a `--keys-dir` they must not have to hand-clear of private key material; dropping this
-/// guard removes the staging directory, so the identical re-run mints again and completes the
-/// bootstrap. A signal (Ctrl-C, a runner timeout) does not run `Drop` and does leave the staging
-/// directory behind — `sweep_stale_staging`, which every mint runs first, removes it, so the
-/// re-run is still the whole of the recovery. *No adoption:* the staging directory is created exclusively under a name this
-/// process picks, and `repo::generate_keys` creates every key with `create_new`, so no file
-/// another local principal planted — before the run or during it — can end up signed into the new
-/// root. The emptiness of `--keys-dir` is checked here, after every S3 round trip, and again at
-/// commit, so the check and the mint are not separated by seconds of network wall clock.
+/// The staging protocol is [`PendingKeyMaterial`]'s; what this adds is the bootstrap's own
+/// delivery — five role keys into `--keys-dir` — and its own no-adoption rule: the staging
+/// directory is created exclusively under a name this process picks, and `repo::generate_keys`
+/// creates every key with `create_new`, so no file another local principal planted, before the run
+/// or during it, can end up signed into the new root. The emptiness of `--keys-dir` is checked
+/// here, after every S3 round trip, and again at commit, so the check and the mint are not
+/// separated by seconds of network wall clock.
 struct PendingRoleKeys {
-    staged: PathBuf,
+    material: PendingKeyMaterial,
     destination: PathBuf,
     keys: repo::Keys,
-    committed: bool,
 }
 
 impl PendingRoleKeys {
@@ -1062,33 +1152,23 @@ impl PendingRoleKeys {
         tokio::fs::create_dir_all(destination)
             .await
             .map_err(|error| format!("creating --keys-dir {}: {error}", destination.display()))?;
-        // A run killed by a signal cannot clean up after itself; the next one does it for it.
-        sweep_stale_staging(destination)?;
+        let material = PendingKeyMaterial::stage(destination, ROLE_KEYS_STEM, "trust-root")?;
         ensure_keys_dir_is_empty(destination)?;
 
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or_default();
-        let staged = destination.join(format!("{STAGING_PREFIX}{}.{nonce}", std::process::id()));
         // Exclusive: a directory another principal pre-planted at this name is a hard error, not
         // a place this ceremony mints into.
-        std::fs::create_dir(&staged)
-            .map_err(|error| format!("staging fresh role keys at {}: {error}", staged.display()))?;
-        // `Drop` cannot cover the mint itself — the guard does not exist until the keys do — so a
-        // failed mint sweeps its own staging directory here.
-        let keys = match repo::generate_keys(&staged).await {
-            Ok(keys) => keys,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&staged);
-                return Err(error.into());
-            }
-        };
+        std::fs::create_dir(material.path()).map_err(|error| {
+            format!(
+                "staging fresh role keys at {}: {error}",
+                material.path().display()
+            )
+        })?;
+        // Dropping `material` from here on removes whatever the mint managed to write.
+        let keys = repo::generate_keys(material.path()).await?;
         Ok(Self {
-            staged,
+            material,
             destination: destination.to_path_buf(),
             keys,
-            committed: false,
         })
     }
 
@@ -1101,61 +1181,36 @@ impl PendingRoleKeys {
     /// appeared at the destination since the pre-flight check, the staged set is kept and named
     /// rather than clobbered.
     fn commit(mut self) -> Result<(), Error> {
-        self.committed = true;
-        // The repository is published, so this directory holds the only copy of a live trust
-        // root's role keys. Take it out of the swept namespace before anything that can fail: a
-        // `commit` that aborts half way (the emptiness pre-flight below, a rename onto a full
-        // disk) deliberately leaves the remaining keys here, and under the `.pending.` name the
-        // next `trust-root` run in this `--keys-dir` would sweep them away as abandoned staging.
-        let suffix = self
-            .staged
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let suffix = suffix.strip_prefix(STAGING_PREFIX).unwrap_or(&suffix);
-        let published = self.destination.join(format!("{PUBLISHED_PREFIX}{suffix}"));
-        std::fs::rename(&self.staged, &published).map_err(|error| {
+        self.material.publish().map_err(|error| {
             format!(
-                "the repository was initialized and published, but renaming its staging directory \
-                 {} to {}: {error}. The role keys are in {} — that is the only copy, so move them \
-                 somewhere safe and load them into Vault before running `trust-root` again in this \
-                 --keys-dir.",
-                self.staged.display(),
-                published.display(),
-                self.staged.display()
+                "the repository was initialized and published, but {error}. The role keys are in \
+                 {} — that is the only copy, so move them somewhere safe and load them into Vault \
+                 before running `trust-root` again in this --keys-dir.",
+                self.material.path().display()
             )
         })?;
-        self.staged = published;
         ensure_keys_dir_is_empty(&self.destination).map_err(|error| {
             format!(
                 "{error}\nThe repository WAS initialized and published. Its role keys are in {} \
                  — that is the only copy, so move them somewhere safe and load them into Vault.",
-                self.staged.display()
+                self.material.path().display()
             )
         })?;
         for name in ROLE_KEYS {
-            std::fs::rename(self.staged.join(name), self.destination.join(name)).map_err(
+            std::fs::rename(self.material.path().join(name), self.destination.join(name)).map_err(
                 |error| {
                     format!(
                         "the repository was initialized and published, but moving role key \
-                         {name} to {}: {error}. The remaining keys are in {} — move them \
-                         somewhere safe and load them into Vault.",
+                     {name} to {}: {error}. The remaining keys are in {} — move them \
+                     somewhere safe and load them into Vault.",
                         self.destination.display(),
-                        self.staged.display()
+                        self.material.path().display()
                     )
                 },
             )?;
         }
-        let _ = std::fs::remove_dir(&self.staged);
+        let _ = std::fs::remove_dir(self.material.path());
         Ok(())
-    }
-}
-
-impl Drop for PendingRoleKeys {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_dir_all(&self.staged);
-        }
     }
 }
 
@@ -1183,31 +1238,19 @@ fn ensure_new_key_out_is_free(path: &Path) -> Result<(), Error> {
 /// The successor root key, minted into a private staging file next to `--new-key-out` and moved
 /// there only once the rotated root has been published.
 ///
-/// This is what makes the ceremony — the one that answers a suspected root-key disclosure —
-/// retryable without trusting a file on disk. The rotation is mint-then-publish and the publish
-/// is allowed to fail for routine reasons (the generation guard aborts when another publisher
-/// moved the prefix; S3 has transients). Such a failure uploads nothing, so the root is *not*
-/// rotated, and dropping this guard removes the staged key: `--new-key-out` is still free and the
-/// identical re-run mints a fresh successor and completes the ceremony. A signal (Ctrl-C, a runner
-/// timeout) does not run `Drop` and does leave the staged key on disk — `sweep_stale_successors`,
-/// which every mint runs first, removes it, so the re-run is still the whole of the recovery. The
-/// operator never has to hand-delete private key material, and no path exists by which a key the
-/// ceremony did not mint reaches the new root.
+/// The staging protocol is [`PendingKeyMaterial`]'s; what this adds is the rotation's own
+/// delivery. It is what makes the ceremony — the one that answers a suspected root-key disclosure
+/// — retryable without trusting a file on disk: a publish that fails uploads nothing, so the root
+/// is *not* rotated, the guard's drop removes the staged key, `--new-key-out` is still free, and
+/// the identical re-run mints a fresh successor and completes the ceremony. No path exists by
+/// which a key the ceremony did not mint reaches the new root.
 struct PendingRootKey {
-    staged: PathBuf,
+    material: PendingKeyMaterial,
     destination: PathBuf,
-    committed: bool,
 }
 
-/// The staging name a `rotate-root` successor key carries while the rotation may still be
-/// abandoned, and the name it is renamed to the moment the rotated root is published. They share
-/// no prefix, so the key a half-finished `commit` leaves behind — the standby of a LIVE root — is
-/// outside what `sweep_stale_successors` removes.
-fn successor_prefixes(stem: &str) -> (String, String) {
-    (format!(".{stem}.pending."), format!(".{stem}.published."))
-}
-
-/// The `--new-key-out` file name a successor key's staging names are derived from.
+/// The staging stem a `rotate-root` successor key is named under: the `--new-key-out` file name,
+/// so two rotations writing different successor paths in one directory do not sweep each other.
 fn successor_stem(destination: &Path) -> String {
     destination
         .file_name()
@@ -1215,69 +1258,22 @@ fn successor_stem(destination: &Path) -> String {
         .unwrap_or_else(|| "root-successor".to_string())
 }
 
-/// Remove the staged successor keys of `rotate-root` runs that died before they could clean up.
-///
-/// `PendingRootKey` drops its staging file on every failure the process survives, but a signal
-/// does not go through `Drop`: a Ctrl-C or a runner timeout during `checkout.publish` — the long
-/// leg of the ceremony — kills the process outright and leaves a private root key on disk.
-/// `ensure_new_key_out_is_free` inspects only `--new-key-out` itself, so each interrupted run
-/// left one more, against the documented promise that an operator never has to hand-delete key
-/// material.
-///
-/// Only a run that never published is swept: `commit` renames the file out of this prefix before
-/// anything that can fail, so an entry still under it signed no root any node can see.
-fn sweep_stale_successors(destination: &Path, stem: &str) -> Result<(), Error> {
-    let (pending, _) = successor_prefixes(stem);
-    let dir = destination.parent().unwrap_or_else(|| Path::new("."));
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("reading {}: {error}", dir.display()).into()),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("reading {}: {error}", dir.display()))?;
-        if !entry.file_name().to_string_lossy().starts_with(&pending) {
-            continue;
-        }
-        let path = entry.path();
-        std::fs::remove_file(&path).map_err(|error| {
-            format!(
-                "removing {}, the successor key an interrupted `rotate-root` left behind: {error}",
-                path.display()
-            )
-        })?;
-        eprintln!(
-            "removed {}: a successor key staged by a `rotate-root` that was interrupted before it              published, so it was signed into no root",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
 impl PendingRootKey {
     /// Mint a fresh ed25519 key into a staging file. `repo::generate_root_key` creates it
     /// exclusively at mode 0600, so a name another principal pre-planted is a hard error here
     /// rather than an adoption.
     async fn mint(destination: &Path) -> Result<Self, Error> {
-        let stem = successor_stem(destination);
-        // A run killed by a signal cannot clean up after itself; the next one does it for it.
-        sweep_stale_successors(destination, &stem)?;
-        let (pending, _) = successor_prefixes(&stem);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or_default();
-        let staged = destination.with_file_name(format!("{pending}{}.{nonce}", std::process::id()));
-        repo::generate_root_key(&staged).await?;
+        let dir = destination.parent().unwrap_or_else(|| Path::new("."));
+        let material = PendingKeyMaterial::stage(dir, &successor_stem(destination), "rotate-root")?;
+        repo::generate_root_key(material.path()).await?;
         Ok(Self {
-            staged,
+            material,
             destination: destination.to_path_buf(),
-            committed: false,
         })
     }
 
     fn path(&self) -> &Path {
-        &self.staged
+        self.material.path()
     }
 
     /// Move the staged key to `--new-key-out`. Called only after the rotated root is published,
@@ -1285,56 +1281,30 @@ impl PendingRootKey {
     /// since the pre-flight check, the staged file is kept and named rather than clobbered or
     /// deleted.
     fn commit(mut self) -> Result<(), Error> {
-        self.committed = true;
-        // The root is published, so this file is the successor of a LIVE root. Take it out of the
-        // swept namespace before anything that can fail: a `commit` that aborts half way leaves
-        // the key here deliberately, and under the `.pending.` name the next `rotate-root` in this
-        // directory would remove it as abandoned staging.
-        let stem = successor_stem(&self.destination);
-        let (pending, published_prefix) = successor_prefixes(&stem);
-        let suffix = self
-            .staged
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let suffix = suffix.strip_prefix(&pending).unwrap_or(&suffix).to_string();
-        let published = self
-            .staged
-            .with_file_name(format!("{published_prefix}{suffix}"));
-        std::fs::rename(&self.staged, &published).map_err(|error| {
+        self.material.publish().map_err(|error| {
             format!(
-                "the root was rotated and published, but renaming its staged successor key {} to                  {}: {error}. The key is at {} — move it somewhere safe and load it into Vault as                  the new standby.",
-                self.staged.display(),
-                published.display(),
-                self.staged.display()
+                "the root was rotated and published, but {error}. The key is at {} — move it \
+                 somewhere safe and load it into Vault as the new standby.",
+                self.material.path().display()
             )
         })?;
-        self.staged = published;
         ensure_new_key_out_is_free(&self.destination).map_err(|error| {
             format!(
                 "{error}\nThe root WAS rotated and published. The successor key is at {} — move \
                  it somewhere safe and load it into Vault as the new standby.",
-                self.staged.display()
+                self.material.path().display()
             )
         })?;
-        std::fs::rename(&self.staged, &self.destination).map_err(|error| {
+        std::fs::rename(self.material.path(), &self.destination).map_err(|error| {
             format!(
                 "the root was rotated and published, but moving the successor key to {}: {error}. \
                  The key is at {} — move it somewhere safe and load it into Vault as the new \
                  standby.",
                 self.destination.display(),
-                self.staged.display()
+                self.material.path().display()
             )
         })?;
         Ok(())
-    }
-}
-
-impl Drop for PendingRootKey {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_file(&self.staged);
-        }
     }
 }
 
@@ -1390,18 +1360,17 @@ impl RoleVersions {
     async fn live(store: &dyn ObjectStore, destination: &S3Destination) -> Result<Self, Error> {
         let mut versions = Self::default();
         for (slot, name) in TOP_LEVEL_METADATA.iter().enumerate() {
-            let key =
-                ObjectPath::from(object_key(&destination.prefix, &format!("metadata/{name}")));
+            let key = updatec::object_key(&destination.prefix, &format!("metadata/{name}"));
             let bytes = match store.get(&key).await {
                 Ok(result) => result.bytes().await?,
                 Err(object_store::Error::NotFound { .. }) => continue,
                 Err(error) => return Err(error.into()),
             };
-            versions.0[slot] = Some(document_version(&bytes));
+            versions.0[slot] = Some(updatec::runtime::signed_version(&bytes).unwrap_or(0));
         }
         // The versioned copies carry their version in the object name, so the floor is read from
         // the listing without fetching any of them.
-        let prefix = ObjectPath::from(object_key(&destination.prefix, "metadata"));
+        let prefix = updatec::object_key(&destination.prefix, "metadata");
         let mut listing = store.list(Some(&prefix));
         while let Some(entry) = listing.next().await {
             if let Some(filename) = entry?.location.filename() {
@@ -1417,7 +1386,9 @@ impl RoleVersions {
         let mut versions = Self::default();
         for (slot, name) in TOP_LEVEL_METADATA.iter().enumerate() {
             match tokio::fs::read(metadata_dir.join(name)).await {
-                Ok(bytes) => versions.0[slot] = Some(document_version(&bytes)),
+                Ok(bytes) => {
+                    versions.0[slot] = Some(updatec::runtime::signed_version(&bytes).unwrap_or(0))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
             }
@@ -1500,14 +1471,6 @@ fn describe_version(version: Option<u64>) -> String {
     }
 }
 
-/// The version a signed TUF document declares; zero when it is unreadable.
-fn document_version(bytes: &[u8]) -> u64 {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()
-        .and_then(|document| document.pointer("/signed/version")?.as_u64())
-        .unwrap_or(0)
-}
-
 /// Mirror every metadata object under `<prefix>/metadata/` into `metadata_dir` so the TUF
 /// editor can load the current generation and bump from it.
 async fn download_metadata(
@@ -1515,7 +1478,7 @@ async fn download_metadata(
     destination: &S3Destination,
     metadata_dir: &Path,
 ) -> Result<(), Error> {
-    let prefix = ObjectPath::from(object_key(&destination.prefix, "metadata"));
+    let prefix = updatec::object_key(&destination.prefix, "metadata");
     let mut listing = store.list(Some(&prefix));
     while let Some(entry) = listing.next().await {
         let meta = entry?;
@@ -1527,16 +1490,6 @@ async fn download_metadata(
         tokio::fs::write(metadata_dir.join(filename), &payload).await?;
     }
     Ok(())
-}
-
-/// Join a repository prefix and a sub-path into a normalized S3 key, dropping empties so a
-/// bucket-root prefix does not produce a leading slash.
-fn object_key(prefix: &str, rest: &str) -> String {
-    [prefix.trim_matches('/'), rest]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// Build the deterministic application archive. A directory is bundled as-is; a single file
@@ -1572,14 +1525,11 @@ mod tests {
     use object_store::memory::InMemory;
     use updated_tuf::repo;
 
-    fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "updatectl-{label}-{}-{}",
-            std::process::id(),
-            updated::rand::token().unwrap()
-        ));
+    fn scratch(label: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().join(label);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (guard, dir)
     }
 
     fn destination(prefix: &str) -> S3Destination {
@@ -1674,7 +1624,7 @@ mod tests {
     /// place. It must be resolved against the signed metadata in hand, before anything is signed.
     #[tokio::test]
     async fn a_provider_set_resolves_its_reconciler_against_the_signed_metadata_before_signing() {
-        let root = scratch("provider-set-resolve");
+        let (_tmp, root) = scratch("provider-set-resolve");
         let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
         let origin = root.join("origin");
         repo::init(&origin, &keys, 365).await.unwrap();
@@ -1741,7 +1691,7 @@ mod tests {
     /// checkout must refuse to publish over a generation it never saw, uploading nothing.
     #[tokio::test]
     async fn a_republish_refuses_a_generation_it_did_not_check_out() {
-        let root = scratch("concurrent");
+        let (_tmp, root) = scratch("concurrent");
         let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
         let origin = root.join("origin");
         repo::init(&origin, &keys, 365).await.unwrap();
@@ -1811,7 +1761,7 @@ mod tests {
     /// a concurrent publisher's signed targets exactly as if there were no guard at all.
     #[tokio::test]
     async fn a_root_rotation_does_not_blind_the_concurrent_publish_guard() {
-        let root = scratch("rotated-generation");
+        let (_tmp, root) = scratch("rotated-generation");
         let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
         let origin = root.join("origin");
         repo::init(&origin, &keys, 365).await.unwrap();
@@ -1888,7 +1838,7 @@ mod tests {
     /// signed by it — the command refuses instead, before anything is minted, signed, or uploaded.
     #[test]
     fn trust_root_refuses_a_keys_dir_that_already_holds_a_role_key() {
-        let dir = scratch("trust-root-keys");
+        let (_tmp, dir) = scratch("trust-root-keys");
         assert!(ensure_keys_dir_is_empty(&dir).is_ok(), "an empty dir mints");
 
         std::fs::write(dir.join("targets.pk8"), b"leaked").unwrap();
@@ -1914,7 +1864,8 @@ mod tests {
     /// `--keys-dir` for the operator to hand-delete.
     #[tokio::test]
     async fn an_interrupted_trust_root_leaves_no_key_and_is_completed_by_an_identical_re_run() {
-        let keys_dir = scratch("trust-root-retry").join("keys");
+        let (_tmp, scratch_dir) = scratch("trust-root-retry");
+        let keys_dir = scratch_dir.join("keys");
 
         // Attempt one: the keys are staged, then the publish fails and uploads nothing. Dropping
         // the guard — what the process exit does — removes the whole staging directory.
@@ -1924,7 +1875,7 @@ mod tests {
                 pending.keys().roots.len() == 2 && pending.keys().targets.exists(),
                 "the full role set is minted into the staging directory"
             );
-            pending.staged.clone()
+            pending.material.path().to_path_buf()
         };
         assert!(!staged.exists(), "the failed attempt removed its staging");
         for name in ROLE_KEYS {
@@ -1938,7 +1889,7 @@ mod tests {
         let pending = PendingRoleKeys::mint(&keys_dir)
             .await
             .expect("the re-run is not blocked by the interrupted attempt");
-        let staged = pending.staged.clone();
+        let staged = pending.material.path().to_path_buf();
         pending.commit().unwrap();
         assert!(!staged.exists(), "the staging directory is cleaned up");
         for name in ROLE_KEYS {
@@ -1963,9 +1914,13 @@ mod tests {
     /// `trust-root` sweeps it: the bootstrap is not blocked and nothing is left over.
     #[tokio::test]
     async fn a_staging_directory_left_by_a_killed_run_is_swept_by_the_next() {
-        let keys_dir = scratch("trust-root-stale-staging").join("keys");
+        let (_tmp, scratch_dir) = scratch("trust-root-stale-staging");
+        let keys_dir = scratch_dir.join("keys");
         std::fs::create_dir_all(&keys_dir).unwrap();
-        let stale = keys_dir.join(format!("{STAGING_PREFIX}4242.1700000000000000000"));
+        let stale = keys_dir.join(format!(
+            "{}4242.1700000000000000000",
+            pending_prefix(ROLE_KEYS_STEM)
+        ));
         std::fs::create_dir(&stale).unwrap();
         std::fs::write(stale.join("root.pk8"), b"orphaned").unwrap();
 
@@ -1977,7 +1932,8 @@ mod tests {
             "the abandoned key material is removed, not accumulated"
         );
         assert_ne!(
-            pending.staged, stale,
+            pending.material.path(),
+            stale,
             "this run staged somewhere of its own"
         );
         pending.commit().unwrap();
@@ -2005,7 +1961,7 @@ mod tests {
                 path.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with(PUBLISHED_PREFIX)
+                    .starts_with(&published_prefix(ROLE_KEYS_STEM))
             })
             .collect();
         assert_eq!(found.len(), 1, "exactly one preserved directory: {found:?}");
@@ -2018,7 +1974,8 @@ mod tests {
     /// its own emptiness check), so an automated retry destroyed the live root's online role keys.
     #[tokio::test]
     async fn keys_a_failed_commit_preserved_survive_the_next_runs_sweep() {
-        let keys_dir = scratch("trust-root-preserved").join("keys");
+        let (_tmp, scratch_dir) = scratch("trust-root-preserved");
+        let keys_dir = scratch_dir.join("keys");
         std::fs::create_dir_all(&keys_dir).unwrap();
 
         // The publish landed; delivery then trips over a role key that appeared under it.
@@ -2035,15 +1992,21 @@ mod tests {
 
         // The identical automated re-run. It aborts on the planted key, and must not have taken
         // the published root's keys with it on the way there.
-        std::fs::create_dir(keys_dir.join(format!("{STAGING_PREFIX}4242.1700000000000000000")))
-            .unwrap();
+        std::fs::create_dir(keys_dir.join(format!(
+            "{}4242.1700000000000000000",
+            pending_prefix(ROLE_KEYS_STEM)
+        )))
+        .unwrap();
         assert!(
             PendingRoleKeys::mint(&keys_dir).await.is_err(),
             "a role key in --keys-dir still blocks a fresh bootstrap"
         );
         assert!(
             !keys_dir
-                .join(format!("{STAGING_PREFIX}4242.1700000000000000000"))
+                .join(format!(
+                    "{}4242.1700000000000000000",
+                    pending_prefix(ROLE_KEYS_STEM)
+                ))
                 .exists(),
             "abandoned pre-publish staging is still swept"
         );
@@ -2061,7 +2024,8 @@ mod tests {
     /// adopted: before the mint it is refused, and after it the delivery refuses to clobber it.
     #[tokio::test]
     async fn a_key_planted_in_the_mint_window_is_never_adopted_into_the_fresh_root() {
-        let keys_dir = scratch("trust-root-planted").join("keys");
+        let (_tmp, scratch_dir) = scratch("trust-root-planted");
+        let keys_dir = scratch_dir.join("keys");
         std::fs::create_dir_all(&keys_dir).unwrap();
 
         let pending = PendingRoleKeys::mint(&keys_dir).await.unwrap();
@@ -2109,7 +2073,7 @@ mod tests {
     /// and every node silently refused the older metadata forever.
     #[tokio::test]
     async fn a_half_deleted_repository_is_still_live_and_still_sets_the_version_floor() {
-        let root = scratch("half-deleted");
+        let (_tmp, root) = scratch("half-deleted");
         let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
         let origin = root.join("origin");
         repo::init(&origin, &keys, 365).await.unwrap();
@@ -2146,10 +2110,7 @@ mod tests {
 
         // The unversioned root.json disappears; timestamp.json keeps serving the fleet.
         store
-            .delete(&ObjectPath::from(object_key(
-                &dest.prefix,
-                "metadata/root.json",
-            )))
+            .delete(&updatec::object_key(&dest.prefix, "metadata/root.json"))
             .await
             .unwrap();
 
@@ -2173,10 +2134,10 @@ mod tests {
         // that carry the versions the fleet has actually accepted. Reading unversioned names alone
         // collapsed the floor to the root's version here and re-signed the replacement below them.
         store
-            .delete(&ObjectPath::from(object_key(
+            .delete(&updatec::object_key(
                 &dest.prefix,
                 "metadata/timestamp.json",
-            )))
+            ))
             .await
             .unwrap();
 
@@ -2198,7 +2159,7 @@ mod tests {
     /// the answer is already in hand, instead of stalling a node at recovery time.
     #[tokio::test]
     async fn deploy_resolves_the_pinned_provider_set_against_the_checked_out_metadata() {
-        let root = scratch("provider-set-ref");
+        let (_tmp, root) = scratch("provider-set-ref");
         let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
         let origin = root.join("origin");
         repo::init(&origin, &keys, 365).await.unwrap();
@@ -2288,20 +2249,6 @@ mod tests {
         assert!(error.contains("64-character hex"), "{error}");
     }
 
-    #[test]
-    fn object_key_normalizes_prefix_and_drops_empties() {
-        // Only prefixes `s3_store` actually accepts: it requires an already-normalized, non-empty,
-        // confined prefix, so a `/p/` case here proved nothing about any reachable input — the
-        // store rejects that shape long before a key is ever joined.
-        assert_eq!(object_key("routing", "metadata"), "routing/metadata");
-        assert_eq!(
-            object_key("a/b", "metadata/root.json"),
-            "a/b/metadata/root.json"
-        );
-        // An empty sub-path must not leave a trailing slash.
-        assert_eq!(object_key("a/b", ""), "a/b");
-    }
-
     /// An emergency override must be self-clearing. The deploy patch therefore states
     /// `emergencyCorrection` on every publish rather than only when it is set — a merge patch that
     /// omitted the field would leave a previous `true` in place, exempting every later release of
@@ -2332,7 +2279,7 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_requires_the_online_keys_but_not_the_root_keys() {
-        let dir = scratch("keys");
+        let (_tmp, dir) = scratch("keys");
         for key in ["targets.pk8", "snapshot.pk8", "timestamp.pk8"] {
             std::fs::write(dir.join(key), b"x").unwrap();
         }
@@ -2349,7 +2296,7 @@ mod tests {
     /// stumble over.
     #[tokio::test]
     async fn an_interrupted_root_rotation_leaves_no_key_and_is_completed_by_an_identical_re_run() {
-        let root = scratch("rotate-retry");
+        let (_tmp, root) = scratch("rotate-retry");
         let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
         let origin = root.join("origin");
         repo::init(&origin, &keys, 365).await.unwrap();
@@ -2394,17 +2341,14 @@ mod tests {
             .unwrap();
         pending.commit().unwrap();
         let published = store
-            .get(&ObjectPath::from(object_key(
-                &dest.prefix,
-                "metadata/root.json",
-            )))
+            .get(&updatec::object_key(&dest.prefix, "metadata/root.json"))
             .await
             .unwrap()
             .bytes()
             .await
             .unwrap();
         assert_eq!(
-            document_version(&published),
+            updatec::runtime::signed_version(&published).unwrap_or(0),
             2,
             "the retry published the rotated root"
         );
@@ -2425,7 +2369,7 @@ mod tests {
     /// nothing is signed or uploaded.
     #[tokio::test]
     async fn a_pre_existing_file_at_new_key_out_is_never_adopted_as_root_key_material() {
-        let root = scratch("rotate-planted");
+        let (_tmp, root) = scratch("rotate-planted");
 
         // A key of the attacker's own making, at exactly the mode a minted key carries.
         let planted = root.join("planted.pk8");
@@ -2462,7 +2406,7 @@ mod tests {
     /// handling, and `publish_repository` exactly as the binary uses them.
     #[tokio::test]
     async fn s3_round_trip_publishes_downloads_and_rotates() {
-        let root = scratch("s3");
+        let (_tmp, root) = scratch("s3");
         let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
         let origin = root.join("origin");
         repo::init(&origin, &keys, 365).await.unwrap();

@@ -53,7 +53,7 @@ Internet access is required on the first run to pull crates and these pinned ima
   macOS-specific bit is `scripts/demo.sh`'s Ansible playbook, which is Linux-only (apt,
   systemd, `/etc/hosts`) — on macOS use `scripts/demo-local.sh`.
 - **Magnolia requires `linux-x86_64`.** The real Magnolia CMS nodes (author/publisher) and the
-  manual "Upgrade Magnolia" VM are only available when the cluster's platform is x86_64 — the
+  manual Magnolia VM are only available when the cluster's platform is x86_64 — the
   install provider fetches an x86_64 JRE. On **Apple Silicon (arm64)** the demo detects that
   Magnolia isn't published and **runs everything except Magnolia**. To see Magnolia and the
   manual VM upgrade, **run the whole demo on an x86_64 Linux box** (an x86_64 Docker host).
@@ -138,10 +138,11 @@ SSH user able to run Docker (root or the `docker` group), and `rsync`.
 
 ## 3. Optional: the real out-of-cluster VM (manual Magnolia node)
 
-The "Upgrade Magnolia" button in the UI rolls the **manual** Magnolia node. That node is a
+The `magnolia-manual` UpdateGroup owns the **manual** Magnolia node. That node is a
 **real VM outside Kubernetes** — installed by the shipped Ansible role (`deploy/ansible`),
 enrolled with the same control plane, and fronted by the `updated-healthproxy` reconciler.
-Click the button and *our agent on the VM* performs the real custom in-place upgrade v1 → v2.
+Patch that group's deployment and *our agent on the VM* performs the real custom in-place
+upgrade v1 → v2.
 
 This part is **entirely optional and guarded**: if it isn't configured, or the VM isn't
 reachable over passwordless SSH, the demo skips it and continues.

@@ -8,18 +8,17 @@ use std::path::{Path, PathBuf};
 use tough::{Repository, RepositoryLoader, TargetName};
 use updated_tuf::repo::{self, Keys, PublishTarget};
 
-fn scratch(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "updated-tuf-{label}-{}-{}",
-        std::process::id(),
-        updated::rand::token().unwrap()
-    ));
+fn scratch(label: &str) -> (tempfile::TempDir, PathBuf) {
+    let guard = tempfile::tempdir().unwrap();
+    let dir = guard.path().join(label);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    (guard, dir)
 }
 
 /// A minted repository plus its keys, and the pinned v1 root bytes captured at init.
 struct Fixture {
+    /// Owns the scratch tree; every path below lives inside it and dies with the fixture.
+    _guard: tempfile::TempDir,
     tmp: PathBuf,
     repo_dir: PathBuf,
     keys: Keys,
@@ -28,7 +27,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(label: &str) -> Self {
-        let tmp = scratch(label);
+        let (_guard, tmp) = scratch(label);
         let repo_dir = tmp.join("repo");
         let keys = repo::generate_keys(&tmp.join("keys")).await.unwrap();
         repo::init(&repo_dir, &keys, 365).await.unwrap();
@@ -36,6 +35,7 @@ impl Fixture {
             .await
             .unwrap();
         Fixture {
+            _guard,
             tmp,
             repo_dir,
             keys,

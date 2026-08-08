@@ -15,6 +15,7 @@
 
 pub mod durable;
 pub mod log;
+pub mod manifest;
 pub mod platform;
 pub mod process;
 pub mod time;
@@ -26,17 +27,7 @@ mod dependency_isolation {
 
     #[test]
     fn depends_only_on_system_bindings() {
-        let mut in_deps = false;
-        for line in MANIFEST.lines() {
-            let line = line.trim();
-            if line.starts_with('[') {
-                in_deps = line.contains("dependencies");
-                continue;
-            }
-            if !in_deps || line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let name = line.split(['=', '.', ' ']).next().unwrap_or("").trim();
+        for name in crate::manifest::shipped_dependency_names(MANIFEST) {
             assert!(
                 ALLOWED.contains(&name),
                 "foundation must not depend on {name:?}"

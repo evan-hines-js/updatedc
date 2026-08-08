@@ -1,6 +1,8 @@
 ---
 # Build the agent from source on the target (native binaries, no cross-compile) and run it as
-# a systemd service that enrolls with the control plane.
+# a systemd service that enrolls with the control plane. This is the ONE way an agent is
+# installed on a host — production fleet (install-agent.yml) and demo (demo.yml) alike; the
+# demo only supplies different variables.
 
 - name: Install build and runtime dependencies
   ansible.builtin.apt:
@@ -24,9 +26,10 @@
 
 - name: Synchronize the updatedc source
   become: false
+  when: updated_build_dir != updatedc_source
   ansible.posix.synchronize:
-    src: "{{ updatedc_source | default(updated_source) }}/"
-    dest: "{{ ansible_env.HOME }}/updatedc-src/"
+    src: "{{ updatedc_source }}/"
+    dest: "{{ updated_build_dir }}/"
     delete: false
     rsync_opts:
       - "--exclude=target"
@@ -38,27 +41,28 @@
     . "{{ ansible_env.HOME }}/.cargo/env" &&
     cargo build --release -p bootstrap -p supervisor
   args:
-    chdir: "{{ ansible_env.HOME }}/updatedc-src"
+    chdir: "{{ updated_build_dir }}"
 
 - name: Install the agent binaries
   ansible.builtin.copy:
     remote_src: true
-    src: "{{ ansible_env.HOME }}/updatedc-src/target/release/{{ item }}"
+    src: "{{ updated_build_dir }}/target/release/{{ item }}"
     dest: "/usr/local/bin/{{ item }}"
     mode: "0755"
   loop:
     - bootstrap
     - supervisor
 
-# ── Reachability shim (demo only) ─────────────────────────────────────────────
-# In production the agent points straight at the real gateway URL. For the local kind demo the
-# gateway lives in-cluster, exposed on the laptop's LAN, so map its in-cluster hostnames to a
-# local socat forward — the agent then uses the identical config the in-cluster pods use.
+# ── Reachability (demo only) ──────────────────────────────────────────────────
+# In production the agent points straight at the real gateway URL. For a kind demo the gateway
+# lives in-cluster: the co-located demo publishes it on this host's port 80 through nginx, and the
+# LAN-VM demo forwards to the laptop with socat. Either way the agent keeps the identical config
+# the in-cluster pods use — only /etc/hosts changes.
 - name: Resolve in-cluster gateway names locally (demo)
-  when: updated_demo_shim_host is defined
+  when: updated_gateway_local_names | bool
   ansible.builtin.blockinfile:
     path: /etc/hosts
-    marker: "# {mark} updated demo gateway shim"
+    marker: "# {mark} updated demo gateway names"
     block: "127.0.0.1 updatec-gateway release-default"
 
 - name: Forward the gateway to the laptop (demo)

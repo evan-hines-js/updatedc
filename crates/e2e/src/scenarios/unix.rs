@@ -150,7 +150,3 @@ pub(crate) fn key_perms(ctx: &Ctx) -> R {
     ok("TUF role keys are owner-only (0600)");
     Ok(())
 }
-
-// ===========================================================================
-// 10. Crash at every update boundary; a fresh supervisor recovers each time.
-// ===========================================================================

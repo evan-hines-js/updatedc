@@ -240,8 +240,8 @@ impl Ctx {
             fips_feature,
         ]
         .concat();
-        cargo(&self.root, None, &crypto_cdn)?;
-        cargo(&self.root, None, &["build", "--release", "-p", "bootstrap"])?;
+        cargo(&self.root, &crypto_cdn)?;
+        cargo(&self.root, &["build", "--release", "-p", "bootstrap"])?;
         // Same package, env and features as every versioned supervisor fixture; only the
         // staged name differs.
         self.build_and_stage(
@@ -880,12 +880,9 @@ fn spawn_grouped(cmd: &mut Command) -> R<Grouped> {
 
 // -------------------------------- subprocess --------------------------------
 
-fn cargo(root: &Path, env: Option<(&str, &str)>, args: &[&str]) -> R {
+fn cargo(root: &Path, args: &[&str]) -> R {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.current_dir(root).args(args);
-    if let Some((k, v)) = env {
-        cmd.env(k, v);
-    }
     run(&mut cmd)
 }
 

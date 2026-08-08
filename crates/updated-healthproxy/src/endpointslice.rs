@@ -59,8 +59,37 @@ impl EndpointSliceLb {
 impl LoadBalancer for EndpointSliceLb {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String> {
         let name = self.slice_name();
-        let members = self.resolved.lock().await.resolve(members).await;
-        let slice = build_slice(&self.service, &name, &self.port_name, self.port, &members);
+        // ONE family rule for the whole reconcile: the majority of the members that HAVE a family.
+        //
+        // Configured literals answer it, and they answer it for both halves — names are resolved
+        // into that family and the slice is typed as it — because the literals are the operator's
+        // stated intent and are immune to the resolver's own RFC 6724 ordering. A single name that
+        // answers only in the minority family therefore cannot flip the slice and evict every
+        // member that was configured correctly.
+        //
+        // An inventory of nothing but hostnames — the documented member form for out-of-cluster
+        // VMs — has no literal to ask, so the resolved addresses answer instead. Defaulting that
+        // case to IPv4 typed an IPv6-only fleet's slice against every address in it and programmed
+        // zero endpoints, every cycle, with nothing misconfigured anywhere: for a load balancer an
+        // empty backend set is a total outage, not a fail-closed default.
+        let configured = family_majority(members);
+        let members = self
+            .resolved
+            .lock()
+            .await
+            .resolve(members, configured.unwrap_or(AddressType::Ipv4))
+            .await;
+        let family = configured
+            .or_else(|| family_majority(&members))
+            .unwrap_or(AddressType::Ipv4);
+        let slice = build_slice(
+            &self.service,
+            &name,
+            &self.port_name,
+            self.port,
+            &members,
+            family,
+        );
         // A single slice is one address family; any member of another family was dropped from
         // it (fail closed). Surface that misconfiguration rather than silently under-routing.
         let kept = slice.endpoints.len();
@@ -232,7 +261,7 @@ impl NameResolver {
     /// it starts where the last one stopped ([`NameResolver::cursor`]), so a blackholed leading
     /// name costs its own members' fallback and not the permanent disappearance of every name
     /// behind it.
-    pub(crate) async fn resolve(&mut self, members: &[Member]) -> Vec<Member> {
+    async fn resolve(&mut self, members: &[Member], preferred: AddressType) -> Vec<Member> {
         use futures::stream::StreamExt;
         let hostnames: Vec<usize> = members
             .iter()
@@ -240,9 +269,6 @@ impl NameResolver {
             .filter(|(_, member)| AddressType::of(&member.address) == AddressType::Fqdn)
             .map(|(index, _)| index)
             .collect();
-        // Every name is resolved into the same family the rest of the inventory already uses, so a
-        // dual-stack name cannot be typed out of the slice it belongs in (see [`preferred_family`]).
-        let preferred = preferred_family(members);
         // The whole pass is bounded by its share of the reconcile deadline, so the apply that
         // programs the slice always gets the rest — at any inventory size, and without the width
         // having to grow past what the runtime can run at once.
@@ -473,15 +499,19 @@ fn pick_address(
         .map(|address| address.to_string())
 }
 
-/// The family hostname members are resolved into: the family the inventory's *literal* members
-/// already use, by majority, ties and an all-hostname inventory going IPv4.
+/// The address family a set of members is, by majority of the members that have one, ties going
+/// IPv4. `None` when not one member is an IP literal — the set has nothing to say about family.
 ///
-/// The same rule and the same tie-break as [`slice_address_type`], deliberately: a hostname resolved
-/// into the family the slice will be typed as is a member that actually routes, and one resolved
-/// into the other family is a member that is silently dropped. Deriving it from the literals only —
-/// never from this cycle's resolution results — is what makes it stable: the preference cannot
-/// itself depend on the resolver order it exists to neutralize.
-fn preferred_family(members: &[Member]) -> AddressType {
+/// The ONE family rule. The reconcile asks it of the configured inventory first, and only of the
+/// resolved addresses when the inventory had no literal to answer with; both halves of the decision
+/// (which family names resolve into, and how the slice is typed) come from that single answer, so
+/// they cannot drift apart.
+///
+/// Hostnames are never counted — a name has no family until it answers, and counting the answer is
+/// what would let the resolver's ordering, rather than the operator, choose the slice's family.
+/// Only the two IP families are candidates: [`NameResolver::resolve`] turns every hostname into a
+/// literal or drops it, and kube-proxy does not route `FQDN` slices.
+fn family_majority(members: &[Member]) -> Option<AddressType> {
     let (mut ipv4, mut ipv6) = (0usize, 0usize);
     for member in members {
         match AddressType::of(&member.address) {
@@ -490,10 +520,10 @@ fn preferred_family(members: &[Member]) -> AddressType {
             AddressType::Fqdn => {}
         }
     }
-    if ipv6 > ipv4 {
-        AddressType::Ipv6
-    } else {
-        AddressType::Ipv4
+    match (ipv4, ipv6) {
+        (0, 0) => None,
+        (_, ipv6) if ipv6 > ipv4 => Some(AddressType::Ipv6),
+        _ => Some(AddressType::Ipv4),
     }
 }
 
@@ -533,20 +563,21 @@ fn lookup_budget(deadline: Instant, now: Instant) -> Duration {
 /// tested without a cluster.
 ///
 /// An EndpointSlice is single-address-typed, so a mixed inventory (IPv4 plus IPv6 members) cannot
-/// go in one slice: it is partitioned to one family ([`slice_address_type`]) and any member of
-/// another family is dropped, i.e. left out of rotation (fail closed). Such a mix is a
-/// misconfiguration; the reconcile loop logs the drop.
+/// go in one slice: it is partitioned to `address_type` — the reconcile's one [`family_majority`]
+/// decision, passed in rather than re-derived here — and any member of another family is dropped,
+/// i.e. left out of rotation (fail closed). Such a mix is a misconfiguration; the reconcile loop
+/// logs the drop.
 ///
 /// Members reach here as IP literals — [`NameResolver::resolve`] has already turned any hostname into
 /// one — because kube-proxy does not route `FQDN` slices.
-pub fn build_slice(
+fn build_slice(
     service: &str,
     slice_name: &str,
     port_name: &str,
     port: u16,
     members: &[Member],
+    address_type: AddressType,
 ) -> EndpointSlice {
-    let address_type = slice_address_type(members);
     let endpoints = members
         .iter()
         .filter(|member| AddressType::of(&member.address) == address_type)
@@ -629,26 +660,6 @@ impl AddressType {
     }
 }
 
-/// The one family the slice is typed as: the family the most members share, so a mixed inventory
-/// keeps its largest partition and drops the rest rather than emitting a mismatched endpoint. Ties
-/// break IPv4 → IPv6 for a deterministic slice. An empty inventory types as IPv4 (an empty slice,
-/// draining everything — fail closed).
-///
-/// Only the two IP families are candidates: [`NameResolver::resolve`] has already turned every hostname
-/// into a literal (kube-proxy does not route `FQDN` slices) or dropped it, so typing a slice FQDN
-/// would produce a slice that is accepted and then silently routes nothing.
-fn slice_address_type(members: &[Member]) -> AddressType {
-    let ipv6 = members
-        .iter()
-        .filter(|member| AddressType::of(&member.address) == AddressType::Ipv6)
-        .count();
-    if ipv6 * 2 > members.len() {
-        AddressType::Ipv6
-    } else {
-        AddressType::Ipv4
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,7 +678,14 @@ mod tests {
             member("agent-0", "10.0.0.1", true),
             member("agent-1", "10.0.0.2", false),
         ];
-        let slice = build_slice("vm-db", "vm-db-updated", "http", 5432, &members);
+        let slice = build_slice(
+            "vm-db",
+            "vm-db-updated",
+            "http",
+            5432,
+            &members,
+            family_majority(&members).unwrap_or(AddressType::Ipv4),
+        );
 
         assert_eq!(slice.address_type, "IPv4");
         let labels = slice.metadata.labels.unwrap();
@@ -744,10 +762,14 @@ mod tests {
         // the member OUT of rotation rather than produce a slice that is accepted and routes
         // nothing.
         let mut resolver = NameResolver::new();
-        let members = block_on(resolver.resolve(&[member("db", "vm-db.invalid.example", true)]));
+        let inventory = [member("db", "vm-db.invalid.example", true)];
+        let members = block_on(resolver.resolve(
+            &inventory,
+            family_majority(&inventory).unwrap_or(AddressType::Ipv4),
+        ));
         assert!(members.is_empty(), "a never-resolved member is dropped");
 
-        let slice = build_slice("s", "s-updated", "http", 80, &members);
+        let slice = build_slice("s", "s-updated", "http", 80, &members, AddressType::Ipv4);
         assert_eq!(slice.address_type, "IPv4");
         assert!(slice.endpoints.is_empty());
     }
@@ -770,13 +792,16 @@ mod tests {
         );
 
         // This lookup genuinely fails (`.invalid` never resolves) — the member must survive it.
-        let resolved = block_on(resolver.resolve(&members));
+        let resolved = block_on(resolver.resolve(
+            &members,
+            family_majority(&members).unwrap_or(AddressType::Ipv4),
+        ));
         assert_eq!(
             resolved,
             vec![member("db", "10.0.0.7", true)],
             "a checker-side DNS failure must not drain a healthy node"
         );
-        let slice = build_slice("s", "s-updated", "http", 80, &resolved);
+        let slice = build_slice("s", "s-updated", "http", 80, &resolved, AddressType::Ipv4);
         assert_eq!(slice.endpoints.len(), 1);
     }
 
@@ -910,7 +935,10 @@ mod tests {
         let held = Arc::clone(&resolver.permits)
             .try_acquire_many_owned(u32::try_from(crate::NAME_LOOKUP_CONCURRENCY).unwrap())
             .expect("a fresh resolver reserves the whole half-pool");
-        let resolved = block_on(resolver.resolve(&members));
+        let resolved = block_on(resolver.resolve(
+            &members,
+            family_majority(&members).unwrap_or(AddressType::Ipv4),
+        ));
         assert_eq!(
             resolved,
             vec![member("db", "10.0.0.7", true)],
@@ -924,7 +952,10 @@ mod tests {
         // Only meaningful where `localhost` really resolves; where it does not, the fallback path
         // above is all this environment can show.
         if block_on(tokio::net::lookup_host(("localhost", 0))).is_ok() {
-            let resolved = block_on(resolver.resolve(&members));
+            let resolved = block_on(resolver.resolve(
+                &members,
+                family_majority(&members).unwrap_or(AddressType::Ipv4),
+            ));
             assert_eq!(resolved.len(), 1);
             assert_ne!(
                 resolved[0].address, "10.0.0.7",
@@ -952,7 +983,10 @@ mod tests {
             Some("10.0.0.2".to_string())
         );
 
-        let resolved = block_on(resolver.resolve(&members));
+        let resolved = block_on(resolver.resolve(
+            &members,
+            family_majority(&members).unwrap_or(AddressType::Ipv4),
+        ));
         assert_eq!(
             resolved,
             vec![
@@ -965,8 +999,8 @@ mod tests {
 
     /// The exact inventory from the report: two IPv4 literals and one dual-stack hostname whose AAAA
     /// the resolver hands back first (RFC 6724 sorting on a host with global IPv6). Taking the first
-    /// answer types that member IPv6, `slice_address_type` still types the slice IPv4 by majority,
-    /// and `build_slice` drops the member — a node that publishes fresh, healthy, correctly-signed
+    /// answer types that member IPv6, the inventory's family is IPv4 by majority, and `build_slice`
+    /// drops the member — a node that publishes fresh, healthy, correctly-signed
     /// reports and receives zero traffic forever, with no transition ever logged for it.
     #[test]
     fn a_dual_stack_hostname_resolves_into_the_inventorys_family_and_stays_in_rotation() {
@@ -975,7 +1009,7 @@ mod tests {
             member("db-b", "10.0.0.2", true),
             member("db-c", "vm-dbc.internal", true),
         ];
-        let preferred = preferred_family(&members);
+        let preferred = family_majority(&members).unwrap_or(AddressType::Ipv4);
         assert_eq!(preferred, AddressType::Ipv4);
 
         // The resolver's answer for vm-dbc.internal, AAAA first.
@@ -990,7 +1024,7 @@ mod tests {
             members[1].clone(),
             member("db-c", "10.0.0.3", true),
         ];
-        let slice = build_slice("vm-db", "vm-db-updated", "http", 5432, &resolved);
+        let slice = build_slice("vm-db", "vm-db-updated", "http", 5432, &resolved, preferred);
         assert_eq!(slice.address_type, "IPv4");
         assert_eq!(
             slice.endpoints.len(),
@@ -1028,26 +1062,87 @@ mod tests {
             pick_address(only_v6.into_iter(), AddressType::Ipv4),
             Some("fd00::7".to_string())
         );
+        // And that ONE off-family member is all that is lost: the family is decided from the
+        // literals before resolution, so it cannot enter the count and flip the slice onto the
+        // minority — which would evict the three correctly-configured IPv6 members instead.
+        let inventory = [
+            member("a", "fd00::1", true),
+            member("b", "fd00::2", true),
+            member("c", "fd00::3", true),
+            member("d", "10.0.0.1", true),
+            member("e", "10.0.0.2", true),
+            member("f", "vm-f.internal", true),
+        ];
+        let family = family_majority(&inventory).unwrap_or(AddressType::Ipv4);
+        assert_eq!(family, AddressType::Ipv6);
+        let resolved: Vec<Member> = inventory[..5]
+            .iter()
+            .cloned()
+            .chain([member("f", "10.0.0.3", true)])
+            .collect();
+        let slice = build_slice("s", "s-updated", "http", 80, &resolved, family);
+        assert_eq!(slice.address_type, "IPv6");
+        assert_eq!(
+            slice.endpoints.len(),
+            3,
+            "the off-family hostname is the member dropped, never the IPv6 majority"
+        );
         assert_eq!(pick_address(std::iter::empty(), AddressType::Ipv4), None);
 
         // An IPv6-majority inventory resolves its hostnames IPv6, matching how the slice is typed.
         assert_eq!(
-            preferred_family(&[
+            family_majority(&[
                 member("a", "fd00::1", true),
                 member("b", "fd00::2", true),
                 member("c", "10.0.0.1", true),
                 member("d", "vm-d.internal", true),
             ]),
-            AddressType::Ipv6
+            Some(AddressType::Ipv6)
         );
-        // Ties and an all-hostname inventory go IPv4, the same tie-break the slice type uses.
+        // A tie goes IPv4.
         assert_eq!(
-            preferred_family(&[member("a", "fd00::1", true), member("b", "10.0.0.1", true)]),
-            AddressType::Ipv4
+            family_majority(&[member("a", "fd00::1", true), member("b", "10.0.0.1", true)]),
+            Some(AddressType::Ipv4)
         );
+    }
+
+    /// An all-hostname inventory — the documented member form for out-of-cluster VMs — on an
+    /// IPv6-only fleet. Nothing is misconfigured: every name answers AAAA and only AAAA. Typing the
+    /// slice from the pre-resolution inventory reads that as a tie, types it IPv4, and `build_slice`
+    /// then drops every single member: the Service is programmed with an empty endpoint set on
+    /// every cycle, which for a load balancer is a total outage, not a fail-closed default.
+    #[test]
+    fn an_all_hostname_inventory_is_typed_by_what_its_names_actually_answer() {
+        let inventory = [
+            member("a", "vm-a.internal", true),
+            member("b", "vm-b.internal", true),
+            member("c", "vm-c.internal", true),
+        ];
+        // Nothing in the inventory has a family, so it cannot answer; resolution falls back to the
+        // IPv4 preference, which only decides which answer to take from a name that has both.
+        assert_eq!(family_majority(&inventory), None);
+        let preferred = family_majority(&inventory).unwrap_or(AddressType::Ipv4);
         assert_eq!(
-            preferred_family(&[member("a", "vm-a.internal", true)]),
-            AddressType::Ipv4
+            pick_address(["fd00::1".parse().unwrap()].into_iter(), preferred),
+            Some("fd00::1".to_string()),
+            "a name that answers only AAAA still resolves to what it has"
+        );
+
+        let resolved = [
+            member("a", "fd00::1", true),
+            member("b", "fd00::2", true),
+            member("c", "fd00::3", true),
+        ];
+        let family = family_majority(&inventory)
+            .or_else(|| family_majority(&resolved))
+            .unwrap_or(AddressType::Ipv4);
+        assert_eq!(family, AddressType::Ipv6);
+        let slice = build_slice("vm-db", "vm-db-updated", "http", 5432, &resolved, family);
+        assert_eq!(slice.address_type, "IPv6");
+        assert_eq!(
+            slice.endpoints.len(),
+            3,
+            "every member of a correctly-configured IPv6 fleet must stay in rotation"
         );
     }
 }

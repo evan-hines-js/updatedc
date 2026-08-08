@@ -165,20 +165,11 @@ mod dependency_isolation {
 
     #[test]
     fn only_platform_binding_crates_are_allowed() {
-        let mut in_deps = false;
-        for line in MANIFEST.lines() {
-            let line = line.trim();
-            if line.starts_with('[') {
-                in_deps = line.contains("dependencies");
-                continue;
-            }
-            if !in_deps || line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let name = line.split(['=', '.', ' ']).next().unwrap_or("").trim();
-            if name.is_empty() {
-                continue;
-            }
+        // `[dev-dependencies]` is not read: it is compiled only into this crate's own test
+        // binaries and never links into the shipped guardian. That, and every other question of
+        // what a manifest makes a crate ship, is answered in one place for all three crates that
+        // enforce a dependency rule.
+        for name in foundation::manifest::shipped_dependency_names(MANIFEST) {
             assert!(
                 ALLOWED.contains(&name),
                 "bootstrap must not depend on {name:?}; only platform binding crates \

@@ -2,6 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Fail with the tool's name rather than mid-provision inside a command substitution,
+# where `set -euo pipefail` kills the run with no diagnostic. The digest tool is
+# coreutils `sha256sum` here and in every container job below — one spelling only.
+for command in kind kubectl docker curl openssl awk sha256sum cargo; do
+  command -v "$command" >/dev/null || { echo "FAIL: missing required command: $command" >&2; exit 2; }
+done
 . "$ROOT/scripts/lib/publish-fuzz-plan.sh"
 FUZZ_ROUNDS=${UPDATEC_FUZZ_ROUNDS:-1}
 while (( $# > 0 )); do
@@ -601,13 +607,20 @@ spec:
 YAML
 echo "waiting for all five real agent towers to reach their assigned versions"
 kubectl -n updated-system rollout status statefulset/agent --timeout=240s
+# The `UpdateAgent` name pod `agent-<ordinal>` enrolls under. Read from the single definition of
+# that derivation (`resource_name`, crates/updatec-demo/src/setup.rs) — the same one the pods
+# themselves use through `updatec-demo agent-name` — never re-derived here. Derived once for all
+# five ordinals, in assignment position: a substitution in *argument* position would not abort
+# under `set -e` on failure, and would hand kubectl an empty resource name.
 agent_resource_name() {
-  nonce=$(printf 'agent-%s' "$1" | shasum -a 256 | awk '{print $1}')
-  registration=$(printf %s "$nonce" | shasum -a 256 | awk '{print $1}')
-  printf 'agent-%s\n' "${registration%${registration#????????????????????????}}"
+  cargo run -q -p updatec-demo -- agent-name "agent-$1"
 }
+declare -a AGENT_RESOURCES
 for ordinal in 0 1 2 3 4; do
-  resource="$(agent_resource_name "$ordinal")"
+  AGENT_RESOURCES[ordinal]="$(agent_resource_name "$ordinal")"
+done
+for ordinal in 0 1 2 3 4; do
+  resource="${AGENT_RESOURCES[ordinal]}"
   identity="$(kubectl -n updated-system get updateagent "$resource" -o jsonpath='{.spec.identity.kind}')"
   [[ "$identity" == enrolled ]] || {
     echo "FAIL: agent-$ordinal registered with identity '$identity', expected enrolled" >&2
@@ -638,7 +651,7 @@ echo "all five empty agents enrolled online and cold-installed the network assig
 # supervisor sees the short lifetime immediately, calls /renew with that current identity, installs
 # the replacement atomically, and exits once so the guardian rebuilds every authenticated client.
 ROTATION_AGENT=agent-4
-ROTATION_RESOURCE="$(agent_resource_name 4)"
+ROTATION_RESOURCE="${AGENT_RESOURCES[4]}"
 ROTATION_STATE=/var/lib/updated/guardian
 ROTATION_DIR="$WORK/certificate-rotation"
 mkdir -p "$ROTATION_DIR"
@@ -665,9 +678,9 @@ openssl x509 -req -in "$ROTATION_DIR/agent.csr" \
 pod_uid_before="$(kubectl -n updated-system get pod "$ROTATION_AGENT" -o jsonpath='{.metadata.uid}')"
 restart_before="$(kubectl -n updated-system get pod "$ROTATION_AGENT" \
   -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-key_before="$(shasum -a 256 "$ROTATION_DIR/agent.key" | awk '{print $1}')"
-original_cert="$(shasum -a 256 "$ROTATION_DIR/original.crt" | awk '{print $1}')"
-short_cert="$(shasum -a 256 "$ROTATION_DIR/short.crt" | awk '{print $1}')"
+key_before="$(sha256sum "$ROTATION_DIR/agent.key" | awk '{print $1}')"
+original_cert="$(sha256sum "$ROTATION_DIR/original.crt" | awk '{print $1}')"
+short_cert="$(sha256sum "$ROTATION_DIR/short.crt" | awk '{print $1}')"
 [[ "$short_cert" != "$original_cert" ]]
 process_pid() {
   local process="$1"
@@ -725,7 +738,7 @@ renewed=false
 for attempt in $(seq 1 90); do
   kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
     cat "$ROTATION_STATE/agent.crt" >"$ROTATION_DIR/renewed.crt"
-  renewed_cert="$(shasum -a 256 "$ROTATION_DIR/renewed.crt" | awk '{print $1}')"
+  renewed_cert="$(sha256sum "$ROTATION_DIR/renewed.crt" | awk '{print $1}')"
   supervisor_after="$(process_pid supervisor 2>/dev/null || true)"
   if [[ "$renewed_cert" != "$short_cert" && -n "$supervisor_after" \
       && "$supervisor_after" != "$supervisor_before" ]]; then
@@ -746,7 +759,7 @@ restart_after="$(kubectl -n updated-system get pod "$ROTATION_AGENT" \
 application_after="$(process_pid app)"
 kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
   cat "$ROTATION_STATE/agent.key" >"$ROTATION_DIR/renewed.key"
-key_after="$(shasum -a 256 "$ROTATION_DIR/renewed.key" | awk '{print $1}')"
+key_after="$(sha256sum "$ROTATION_DIR/renewed.key" | awk '{print $1}')"
 [[ "$pod_uid_after" == "$pod_uid_before" ]]
 [[ "$restart_after" == "$restart_before" ]]
 [[ "$application_after" == "$application_before" ]]
@@ -787,11 +800,11 @@ kubectl_log_contains deployment/updatec-gateway \
 echo "agent-4 renewed its certificate with no pod/container/app restart and retained mTLS access"
 
 for ordinal in 0 1; do
-  kubectl -n updated-system patch updateagent "$(agent_resource_name "$ordinal")" --type merge \
+  kubectl -n updated-system patch updateagent "${AGENT_RESOURCES[ordinal]}" --type merge \
     -p '{"spec":{"labels":{"updated.dev/role":"edge"}}}'
 done
 for ordinal in 2 3; do
-  kubectl -n updated-system patch updateagent "$(agent_resource_name "$ordinal")" --type merge \
+  kubectl -n updated-system patch updateagent "${AGENT_RESOURCES[ordinal]}" --type merge \
     -p '{"spec":{"labels":{"updated.dev/role":"batch"}}}'
 done
 echo "dynamic enrollments registered; waiting for group assignments"
@@ -1019,7 +1032,7 @@ for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
     else
       patch="[{\"op\":\"replace\",\"path\":\"/spec/labels\",\"value\":{\"updated.dev/role\":\"$selected_role\"}}]"
     fi
-    resource="$(agent_resource_name "$index")"
+    resource="${AGENT_RESOURCES[index]}"
     kubectl -n updated-system patch updateagent "$resource" --type=json -p "$patch" >/dev/null
     echo "fuzz generation $round plan: agent-$index -> $selected_role -> $selected_version"
   done
@@ -1029,7 +1042,7 @@ for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
   # instead of misreporting a correctly converged agent as broken.
   expected=""
   for index in 0 1 2 3 4; do
-    resource="$(agent_resource_name "$index")"
+    resource="${AGENT_RESOURCES[index]}"
     applied_role="$(kubectl -n updated-system get updateagent "$resource" \
       -o jsonpath='{.spec.labels.updated\.dev/role}')"
     case "$applied_role" in
@@ -1079,8 +1092,8 @@ for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
   verify_fleet "verify-fuzz-$round" "$expected"
 done
 
-# Reuse the macOS publisher fuzzer's failure sequence: select an unlaunchable
-# newest artifact, prove every node rolls back to its exact predecessor, then let
+# The shared fuzz plan's failure sequence (scripts/lib/publish-fuzz-plan.sh): select
+# an unlaunchable newest artifact, prove every node rolls back to its predecessor, then let
 # the control plane choose a valid recovery. All three routes are changed so this
 # also exercises simultaneous independent rejection state across the 2/2/1 fleet.
 echo "fleet fuzz fault: assigning intentionally unlaunchable 18.0.0"

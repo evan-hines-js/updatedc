@@ -112,7 +112,7 @@ try {
         args = @('--addr', "127.0.0.1:$appPort")
         repository = @{metadata_limit=1048576; target_limit=536870912; transport_timeout_seconds=30}
         storage = @{inactive_releases=2; inactive_providers=2; inactive_supervisors=1; inactive_bytes=1073741824; inactive_repository_caches=2}
-        timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; retry_after_seconds=300; refresh_retry_seconds=5; confirmation_window_seconds=120; supervisor_check_interval_seconds=3600}
+        timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; supervisor_check_interval_seconds=3600}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `

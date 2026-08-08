@@ -260,8 +260,8 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             effect_names
                 .iter()
                 // Markers are `{id}-{phase}`; the id is dashless hex, so the phase is
-                // everything after the first `-`. Match it exactly — a plain `ends_with`
-                // would let `{id}-pre-drain` also count as a `drain` effect.
+                // everything after the first `-`. Exactly one marker per phase is the
+                // idempotency claim: a replayed phase must not leave a second effect.
                 .filter(|name| name.split_once('-').map(|(_, tail)| tail) == Some(*phase))
                 .count()
                 == 1

@@ -19,6 +19,7 @@ pub mod join;
 pub mod publisher;
 pub(crate) mod rollout;
 pub mod runtime;
+pub mod served;
 pub mod subscription;
 pub mod window;
 
@@ -181,7 +182,6 @@ pub struct TimeoutsSpec {
     pub health_grace_seconds: u64,
     pub health_successes: u32,
     pub health_interval_seconds: u64,
-    pub retry_after_seconds: u64,
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
     pub supervisor_check_interval_seconds: u64,
@@ -259,7 +259,6 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                     health_grace_seconds: value.runtime.timeouts.health_grace_seconds,
                     health_successes: value.runtime.timeouts.health_successes,
                     health_interval_seconds: value.runtime.timeouts.health_interval_seconds,
-                    retry_after_seconds: value.runtime.timeouts.retry_after_seconds,
                     refresh_retry_seconds: value.runtime.timeouts.refresh_retry_seconds,
                     confirmation_window_seconds: value.runtime.timeouts.confirmation_window_seconds,
                     supervisor_check_interval_seconds: value
@@ -1028,9 +1027,9 @@ fn publication_digest(targets: &[PublicationTarget]) -> String {
 
 /// Join a store `prefix` with a `relative` object path into a normalized object key, dropping any
 /// empty segment (an empty prefix, or one with surrounding slashes). The single place this
-/// prefix+relative join is expressed, shared by the gateway's content handlers and the operator's
-/// publication and telemetry reads.
-pub(crate) fn object_key(prefix: &str, relative: &str) -> object_store::path::Path {
+/// prefix+relative join is expressed, shared by the gateway's content handlers, the operator's
+/// publication and telemetry reads, and `updatectl`'s reads back out of the same bucket.
+pub fn object_key(prefix: &str, relative: &str) -> object_store::path::Path {
     object_store::path::Path::from(
         [prefix.trim_matches('/'), relative]
             .into_iter()
@@ -1081,6 +1080,23 @@ mod tests {
             rollout_windows: vec![],
             calendar: vec![],
         }
+    }
+
+    #[test]
+    fn object_key_normalizes_prefix_and_drops_empties() {
+        // Only prefixes the S3 store actually accepts: it requires an already-normalized,
+        // non-empty, confined prefix, so a `/p/` case here would prove nothing about any reachable
+        // input.
+        assert_eq!(
+            object_key("routing", "metadata").as_ref(),
+            "routing/metadata"
+        );
+        assert_eq!(
+            object_key("a/b", "metadata/root.json").as_ref(),
+            "a/b/metadata/root.json"
+        );
+        // An empty sub-path must not leave a trailing slash.
+        assert_eq!(object_key("a/b", "").as_ref(), "a/b");
     }
 
     #[test]
@@ -1148,7 +1164,6 @@ mod tests {
                 health_grace_seconds: 30,
                 health_successes: 2,
                 health_interval_seconds: 1,
-                retry_after_seconds: 60,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,
@@ -1182,7 +1197,6 @@ mod tests {
                 health_grace_seconds: 30,
                 health_successes: 2,
                 health_interval_seconds: 1,
-                retry_after_seconds: 60,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,

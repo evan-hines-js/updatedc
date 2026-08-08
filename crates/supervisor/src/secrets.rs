@@ -179,17 +179,7 @@ impl SecretManager {
         deployment: &str,
         references: &[SecretReference],
     ) -> Result<SecretBundle, String> {
-        self.fetch_with_timeout(deployment, references, FETCH_TIMEOUT)
-            .await
-    }
-
-    async fn fetch_with_timeout(
-        &self,
-        deployment: &str,
-        references: &[SecretReference],
-        timeout: std::time::Duration,
-    ) -> Result<SecretBundle, String> {
-        with_fetch_timeout(timeout, self.fetch_unbounded(deployment, references)).await
+        with_fetch_timeout(FETCH_TIMEOUT, self.fetch_unbounded(deployment, references)).await
     }
 
     async fn fetch_unbounded(

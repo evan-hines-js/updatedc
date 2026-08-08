@@ -13,13 +13,6 @@ die() {
   exit 1
 }
 
-# Value of a required environment variable, or die naming the one that is missing.
-require_env() {
-  local name="$1" value="${!1:-}"
-  [[ -n "$value" ]] || die "missing required environment variable $name"
-  printf '%s' "$value"
-}
-
 # Append one tab-separated audit line (phase, attempt, event) under the install root, so a
 # reexec deployment is as observable as the demo's stop/start one (both read a lifecycle receipt).
 # Strictly best-effort: a phase is never failed because its audit line could not be written.

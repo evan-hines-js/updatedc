@@ -428,16 +428,17 @@ mod tests {
         assert!(!forward.recovery_pending(Phase::RolledBack));
     }
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("tx-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+    fn tmp(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join(name);
         std::fs::create_dir_all(&d).unwrap();
-        d.join("update.tx")
+        let path = d.join("update.tx");
+        (dir, path)
     }
 
     #[test]
     fn journal_round_trips_and_absent_is_none() {
-        let path = tmp("journal");
+        let (_dir, path) = tmp("journal");
         assert_eq!(read(&path).unwrap(), None, "absent journal reads as None");
 
         write(&path, &tx()).unwrap();
@@ -453,7 +454,7 @@ mod tests {
 
     #[test]
     fn obsolete_or_unknown_journal_shapes_are_rejected() {
-        let path = tmp("strict-schema");
+        let (_dir, path) = tmp("strict-schema");
         std::fs::write(
             &path,
             br#"{"previous_release":{"version":"1","manifest_sha256":"a"},"candidate_release":{"version":"2","manifest_sha256":"b"},"candidate_archive_sha256":"c","legacy":true}"#,
@@ -469,8 +470,7 @@ mod tests {
     fn unreadable_journal_is_an_error_not_absent() {
         // A read error that is *not* NotFound (here, the path is a directory) must
         // propagate, never be mistaken for an absent journal.
-        let d = std::env::temp_dir().join(format!("tx-{}-isdir", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        assert!(read(&d).is_err());
+        let d = tempfile::tempdir().unwrap();
+        assert!(read(d.path()).is_err());
     }
 }

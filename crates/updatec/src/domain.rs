@@ -174,13 +174,17 @@ pub fn plan_reconcile(
     }
 
     // Every deployment body the control plane still has, by identity — quarantined pins and the
-    // retained bodies of deleted groups included (see `rollout::retire_deleted_groups`). One index,
-    // built once, so "where is this node?" is answered the same way here as in `assign_nodes`.
-    let bodies: HashMap<String, &DesiredDeployment> = admitted
-        .values()
-        .flat_map(|state| std::iter::once(&state.current).chain(state.previous.iter()))
-        .filter_map(|deployment| Some((crate::deployment_identity(deployment)?, deployment)))
-        .collect();
+    // retained bodies of deleted groups included, because the held states were restored just above.
+    // Built by the one function `assign_nodes` builds its index with, so "where is this node?" is
+    // answered identically here and there.
+    let mut bodies = crate::rollout::bodies_by_identity(admitted.values());
+    // The repository default is a body nodes are published with too, so it belongs in the index
+    // that answers "which body is this node actually on?". Without it a withheld node last routed
+    // to `default` had no recoverable placement at all, and the carry-forward reached for the
+    // CURRENT default instead — the swap the withholding exists to prevent.
+    if let Some(identity) = crate::deployment_identity(&default) {
+        bodies.insert(identity, &default);
+    }
 
     // A node whose group has not been admitted even once has no deployment of its own to publish.
     // It must NOT simply be left out: publication replaces the whole target set, so omitting a node
@@ -201,13 +205,36 @@ pub fn plan_reconcile(
         // that group, so the durable routing kept saying so and the node could never be moved
         // until the broken group was fixed. Relabelling is the ordinary remediation for a
         // quarantined group; it must work.
+        //
+        // A node still selected by a quarantined group with a REAL selector is not in
+        // `rollout.node_deployments` at all (it was withheld above), so clause 1 already carries
+        // it. The second clause exists only for the group quarantined for an EMPTY selector, which
+        // no node can be matched against: its nodes fell to `default` and were handed the
+        // repository default, so nothing but their last routing says they belong to it. Testing
+        // membership by the last routing alone also caught the node whose `role=edge` label was
+        // REMOVED — the label-removal form of the same remediation — and pinned it to the broken
+        // group forever, since republishing it there kept the durable routing saying so.
         let last = observed.routing.get(node).filter(|last| {
             !rollout.node_deployments.contains_key(node)
-                || (group == crate::DEFAULT_GROUP && desired.quarantined.contains_key(*last))
+                || (group == crate::DEFAULT_GROUP
+                    && desired
+                        .quarantined
+                        .get(*last)
+                        .is_some_and(|selector| selector.is_empty()))
         });
         let carried = match last {
-            Some(last) if last == crate::DEFAULT_GROUP => Some((last.clone(), default.clone())),
-            Some(last) if admitted.contains_key(last) => {
+            // A WITHHELD node stays withheld, whatever it was last routed to. It is republished
+            // with the exact body the last generation recorded for it, looked up by identity —
+            // never the current `default_deployment`. Reaching for the current default here undid
+            // the withholding above for every node that happened to be on `default`: a group
+            // quarantined before it was ever admitted (typo'd digest, bad `maxUnavailable`,
+            // reserved name) moved its machines to a different application and install root in one
+            // signed, unstaged, ungated generation — precisely because the group was broken. The
+            // index carries the repository default, so the ordinary case (a default unchanged
+            // since the node was published) carries forward unchanged; a default that HAS changed
+            // is not reconstructible from the recorded identity, so the generation faults closed
+            // and the last publication stays live rather than the node being swapped or dropped.
+            Some(last) if quarantined.contains_key(node) || admitted.contains_key(last) => {
                 let deployment = placed_deployment(observed.assignments.get(node), &bodies)
                     .ok_or_else(|| PlanError::UnknownPlacement {
                         node: node.clone(),
@@ -215,6 +242,11 @@ pub fn plan_reconcile(
                     })?;
                 Some((last.clone(), deployment))
             }
+            // A node whose group is merely waiting on its first admission, last routed to the
+            // pseudo-group `default`, is withheld by nothing: it has no group deployment of its
+            // own and no gate to freeze, so it keeps following the repository default — the
+            // fleet-wide switch — exactly as it did before its group existed.
+            Some(last) if last == crate::DEFAULT_GROUP => Some((last.clone(), default.clone())),
             _ => None,
         };
         match carried {
@@ -785,6 +817,142 @@ mod tests {
         .expect("the relabel is plannable");
         assert_eq!(planned.publication.node_groups["n1"], "core");
         assert_eq!(planned.routing["n1"], "core");
+    }
+
+    /// The label-REMOVAL form of the same remediation: the operator strips `role=edge` off the
+    /// node instead of relabelling it into another group, so it selects nothing and falls to
+    /// `default`. Carrying it forward on the LAST routing alone republished it under the broken
+    /// group, which rewrote the durable routing to say `edge` again — a pin only fixing or
+    /// deleting the group could release. It takes the ungated repository default, like any other
+    /// node that matches nothing.
+    #[test]
+    fn a_node_whose_group_label_was_removed_falls_to_the_repository_default() {
+        let pinned = AdmittedDeployment {
+            current: deployment("edge-v1"),
+            previous: Vec::new(),
+        };
+        let held = BTreeMap::from([("edge".to_string(), pinned.clone())]);
+        let admitted = BTreeMap::from([("edge".to_string(), pinned)]);
+        let routing = BTreeMap::from([("n1".to_string(), "edge".to_string())]);
+        let assignments = BTreeMap::from([(
+            "n1".to_string(),
+            crate::deployment_identity(&deployment("edge-v1")).unwrap(),
+        )]);
+        // The node carries no labels at all now, so `edge`'s real selector no longer matches it.
+        let nodes = vec![ResolvedNode {
+            name: "n1".into(),
+            labels: BTreeMap::new(),
+        }];
+        let repository = repository();
+        let planned = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &quarantined(&[("edge", "edge")]),
+                held: &held,
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                public_keys: &HashMap::new(),
+                admitted: &admitted,
+                routing: &routing,
+                assignments: &assignments,
+                now: chrono::Utc::now(),
+            },
+        )
+        .expect("removing the label is plannable");
+        assert_eq!(planned.publication.node_groups["n1"], crate::DEFAULT_GROUP);
+        assert_eq!(planned.routing["n1"], crate::DEFAULT_GROUP);
+    }
+
+    /// The case the carry-forward's quarantine arm exists for: a group quarantined for an EMPTY
+    /// selector matches no agent, so its nodes resolve to `default` and are handed the repository
+    /// default like any unmatched node. Only their last routing says they belong to it, so that is
+    /// what has to hold them on the group's pinned deployment.
+    #[test]
+    fn a_node_of_a_group_quarantined_for_an_empty_selector_keeps_its_pinned_deployment() {
+        let pinned = AdmittedDeployment {
+            current: deployment("edge-v1"),
+            previous: Vec::new(),
+        };
+        let held = BTreeMap::from([("edge".to_string(), pinned.clone())]);
+        let admitted = BTreeMap::from([("edge".to_string(), pinned)]);
+        let routing = BTreeMap::from([("n1".to_string(), "edge".to_string())]);
+        let assignments = BTreeMap::from([(
+            "n1".to_string(),
+            crate::deployment_identity(&deployment("edge-v1")).unwrap(),
+        )]);
+        let quarantined = BTreeMap::from([("edge".to_string(), BTreeMap::new())]);
+        let planned = plan(
+            &BTreeMap::new(),
+            &quarantined,
+            &held,
+            &admitted,
+            &routing,
+            &assignments,
+        )
+        .expect("an empty-selector quarantine is survivable");
+        assert_eq!(planned.publication.node_groups["n1"], "edge");
+        assert_eq!(planned.routing["n1"], "edge");
+    }
+
+    /// A group quarantined before it was ever admitted — a typo'd digest, a bad `maxUnavailable`,
+    /// the reserved name — has no pin, and its machines may still be on the pseudo-group
+    /// `default`. Withholding them from the ungated default swap and then handing them the CURRENT
+    /// `default_deployment` from the carry-forward is the same swap by another door: a different
+    /// application and install root, fleet-wide, in one signed generation, taken precisely because
+    /// the group is broken. Withheld means withheld: republish the body they are recorded on, or
+    /// fault the generation and leave the last publication live.
+    #[test]
+    fn a_withheld_node_last_routed_to_default_never_takes_the_current_default() {
+        let default = DesiredDeployment::try_from(repository().default_deployment).unwrap();
+        let routing = BTreeMap::from([("n1".to_string(), crate::DEFAULT_GROUP.to_string())]);
+        // The node is recorded on the default body the last generation published, and `edge` is
+        // quarantined with no pin at all (`held`/`admitted` empty). It is republished on exactly
+        // that body, unchanged.
+        let assignments = BTreeMap::from([(
+            "n1".to_string(),
+            crate::deployment_identity(&default).unwrap(),
+        )]);
+        let planned = plan(
+            &BTreeMap::new(),
+            &quarantined(&[("edge", "edge")]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &routing,
+            &assignments,
+        )
+        .expect("a quarantine over unchanged default routing is survivable");
+        assert_eq!(planned.publication.node_groups["n1"], crate::DEFAULT_GROUP);
+        assert_eq!(
+            planned.publication.node_assignments["n1"],
+            crate::deployment_identity(&default).unwrap(),
+            "the withheld node keeps the body it was published with"
+        );
+
+        // Now the operator also edits `default_deployment`, so the node's recorded body is one the
+        // control plane no longer has. The generation faults closed — the node is neither swapped
+        // onto the new default nor dropped from the plan.
+        let stale = BTreeMap::from([(
+            "n1".to_string(),
+            crate::deployment_identity(&deployment("previous-default")).unwrap(),
+        )]);
+        let error = plan(
+            &BTreeMap::new(),
+            &quarantined(&[("edge", "edge")]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &routing,
+            &stale,
+        )
+        .expect_err("a withheld node whose body is gone must not be swapped onto the new default");
+        assert!(
+            matches!(error, PlanError::UnknownPlacement { ref node, .. } if node == "n1"),
+            "unexpected error: {error:?}"
+        );
     }
 
     /// A node relabelled INTO a group is deliberately held on its OLD group's deployment while it

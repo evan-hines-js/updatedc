@@ -232,7 +232,6 @@ fn run() -> R {
     let cmd = Sup::new(&ctx, &dir, srv, "app", appcmd(&unplaced, &["--addr", svc]))
         .cold_install()
         .ordered_install_fallback()
-        .readiness_health(svc)
         .check_interval("1s")
         .health_grace("2s")
         // A short confirmation window (default is 120s) so a committed update confirms quickly

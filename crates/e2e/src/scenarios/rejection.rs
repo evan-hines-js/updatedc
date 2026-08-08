@@ -16,9 +16,6 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
         Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
             .check_interval("1s")
             .health_grace("1s")
-            // Deliberately much shorter than the observation below. This is the generic
-            // transient retry delay, not permission to retry proven-bad content.
-            .retry_after("1s")
             .readiness_health(svc)
             .guardian()
     };
@@ -81,7 +78,3 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     ok("a crashing release was rejected on recovery and NOT reapplied after a restart");
     Ok(())
 }
-
-// ===========================================================================
-// 6. A supervisor crash re-adopts the running app instead of restarting it.
-// ===========================================================================

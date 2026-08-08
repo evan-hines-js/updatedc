@@ -38,4 +38,4 @@ rustls = { workspace = true }
 rcgen = { workspace = true, features = ["x509-parser"] }
 x509-parser = { workspace = true }
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true

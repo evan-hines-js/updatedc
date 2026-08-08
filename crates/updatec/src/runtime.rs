@@ -306,7 +306,9 @@ async fn store_published_version(
         Err(object_store::Error::NotFound { .. }) => return Ok(None),
         Err(e) => return Err(StorageError(format!("probing published metadata: {e}"))),
     };
-    published_timestamp_version(&bytes).map(Some)
+    signed_version(&bytes)
+        .ok_or_else(|| StorageError("published timestamp.json has no signed.version".into()))
+        .map(Some)
 }
 
 /// The ONE rollback guard, asked before a pass signs anything: would the metadata this replica is
@@ -350,13 +352,19 @@ async fn refuse_generation_rollback(
     Ok(())
 }
 
-/// The `signed.version` of a published `timestamp.json`.
-fn published_timestamp_version(bytes: &[u8]) -> Result<u64, StorageError> {
-    let document: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| StorageError(format!("parsing published timestamp.json: {e}")))?;
-    document["signed"]["version"]
+/// The generation a signed TUF role document declares, or `None` if the bytes are not a role
+/// document with a `signed.version`.
+///
+/// The one extractor. Two guards ask this question of the same objects in the same bucket for the
+/// same reason — never publish below what the store already serves: this module's rollback guard,
+/// and `updatectl`'s republish guard. They differ only in what an unreadable document means to
+/// them (a hard error here, a zero there), which is the caller's decision to make, not a reason
+/// for a second parser.
+pub fn signed_version(bytes: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .pointer("/signed/version")?
         .as_u64()
-        .ok_or_else(|| StorageError("published timestamp.json has no signed.version".into()))
 }
 
 /// The finalizer that keeps a deleted [`UpdateRepository`] in `Terminating` until its published
@@ -2227,13 +2235,15 @@ async fn publish_resource_statuses(
         // "rolling" and a deployment-NAME comparison for "held" — reported a group Ready while a
         // change to its digest, arguments, or resolved inputs was still unadmitted, because the
         // planner deliberately compares the whole desired deployment and this did not.
-        let condition = match group_progress
-            .get(&name)
-            .copied()
-            // A group the planner did not decide has no admitted deployment at all: it is waiting
-            // on its inputs or a prerequisite, so nothing of it is published.
-            .unwrap_or(crate::rollout::GroupProgress::Held)
-        {
+        // Every group reaching here has a verdict: `reconcile_once` retained `group_resources` to
+        // exactly the non-quarantined groups, and the planner decides one for every planned group
+        // — a group waiting on its inputs or a prerequisite is classified `Held`, not omitted. A
+        // group with none is one this pass cannot speak for, so its status is left as it stands
+        // rather than given a locally invented verdict.
+        let Some(progress) = group_progress.get(&name).copied() else {
+            continue;
+        };
+        let condition = match progress {
             crate::rollout::GroupProgress::Held => failed_condition(
                 group.metadata.generation,
                 "Held",
@@ -2920,7 +2930,6 @@ mod lease_tests {
                         health_grace_seconds: 30,
                         health_successes: 2,
                         health_interval_seconds: 1,
-                        retry_after_seconds: 60,
                         refresh_retry_seconds: 5,
                         confirmation_window_seconds: 120,
                         supervisor_check_interval_seconds: 3600,

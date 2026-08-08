@@ -37,7 +37,8 @@ statically linked guardian.
 
 - `foundation` — dependency-isolated durability, process containment, time, platform, and logging
   mechanisms.
-- `control` — frozen guardian/supervisor wire protocol and version negotiation.
+- `control` — frozen guardian/supervisor wire protocol; compatibility is a fail-closed equality
+  check on the one protocol major.
 - `bootstrap` — permanent guardian, application ownership, supervisor replacement, and
   OS-specific process control.
 - `windows-service` plus `deploy/systemd`, `deploy/launchd`, and `deploy/windows` — adapters from
@@ -63,12 +64,10 @@ bytes never become executable.
   paths.
 - `updated-contracts` — strict artifact, enrollment, and signed telemetry protocols shared across
   the node/control-plane boundary.
-- `update-client` — shared “select, authenticate, download, and stage” use case.
 
-The supervisor owns policy and sequencing. `updated` supplies durable node mechanisms;
-`updated-contracts` owns data that crosses process or trust boundaries. `update-client` is the
-acquisition boundary shared by front ends; it intentionally stops before activation and process
-ownership.
+The supervisor owns policy and sequencing, including selecting, authenticating, downloading, and
+staging a candidate. `updated` supplies durable node mechanisms; `updated-contracts` owns data that
+crosses process or trust boundaries.
 
 ## 3. Trust and artifact distribution
 
@@ -197,7 +196,6 @@ They should not become dependencies of production crates.
 | `updated` | Node runtime; identity; distribution | node-local mechanisms and adapters |
 | `updated-contracts` | Cross-system boundaries | versioned protocols and validation |
 | `updated-tuf` | Trust and distribution | shared client/publisher library |
-| `update-client` | Node update runtime | application use case |
 | `supervisor` | Node update runtime | production runtime |
 | `updatec` | Fleet control plane; gateway | production runtime and library |
 | `updated-healthproxy` | Traffic membership | production runtime and adapters |
@@ -219,7 +217,7 @@ and the complete signed `NodeReport` protocol. It also owns their pure validatio
 node, trust, and health-membership code consume those contracts directly.
 
 `updated` retains only node-local private-key operations, HTTP/TLS, persistence, installation,
-journals, and the `MaterializeRuntime` adapter that turns a validated managed-runtime contract into
+journals, and the materialization that turns a validated managed-runtime contract into
 node-local paths and durations. Do not add serialized control-plane types or pure wire validation
 back to `updated`.
 

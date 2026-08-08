@@ -327,12 +327,9 @@ fn run_supervisor(
 
     // If an application is already running (a supervisor crash-relaunch, or a candidate
     // activation over the previous supervisor's app), hand its PID to the new supervisor
-    // so it adopts rather than launching a duplicate.
-    let app_pid = if service.is_running() {
-        service.pid()
-    } else {
-        None
-    };
+    // so it adopts rather than launching a duplicate. A held PID *is* a running application —
+    // one accessor, no second way to ask.
+    let app_pid = service.pid();
 
     let mut sup = match Supervisor::launch(
         &binary,
@@ -902,8 +899,6 @@ mod tests {
 
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::ffi::OsString;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A scripted supervisor control link: poll/read/exit results are queues consumed
     /// front-to-back; sent responses and stop calls are captured for assertions.
@@ -973,29 +968,13 @@ mod tests {
         }
     }
 
-    /// A fake application process that starts cleanly and never crashes.
-    struct FakeProc;
-    impl crate::sys::Process for FakeProc {
-        fn pid(&self) -> u32 {
-            4242
-        }
-        fn poll_exit(&mut self) -> Option<i32> {
-            None
-        }
-        fn stop(&mut self, _grace: Duration) {}
-    }
-    fn fake_spawn(_spec: &control::CommandSpec) -> std::io::Result<Box<dyn crate::sys::Process>> {
-        Ok(Box::new(FakeProc))
-    }
+    use crate::sys::{fake_spawn, fake_spec};
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let d =
-            std::env::temp_dir().join(format!("guardian-test-{}-{tag}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+    fn temp_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let d = guard.path().join(tag);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        (guard, d)
     }
 
     fn cfg(state_dir: PathBuf, initial: Option<PathBuf>) -> Config {
@@ -1011,12 +990,7 @@ mod tests {
     }
 
     fn spec() -> control::CommandSpec {
-        control::CommandSpec {
-            program: OsString::from("/opt/app"),
-            args: vec![],
-            env: vec![],
-            cwd: None,
-        }
+        fake_spec("/opt/app")
     }
 
     fn rejected_marker(c: &Config) -> Option<String> {
@@ -1043,27 +1017,12 @@ mod tests {
 
     #[test]
     fn exit_zero_is_rolled_up_unchanged_by_service_policy() {
-        let state_dir = temp_dir("exit-zero");
+        let (_tmp, state_dir) = temp_dir("exit-zero");
 
         assert_eq!(roll_up_service_exit(&state_dir, 0).unwrap(), 0);
         assert!(state_dir
             .join(control::SERVICE_EXITED_MARKER_FILE)
             .is_file());
-    }
-
-    /// A fake application that has already exited with code 9.
-    struct ExitedProc;
-    impl crate::sys::Process for ExitedProc {
-        fn pid(&self) -> u32 {
-            4243
-        }
-        fn poll_exit(&mut self) -> Option<i32> {
-            Some(9)
-        }
-        fn stop(&mut self, _grace: Duration) {}
-    }
-    fn exited_spawn(_spec: &control::CommandSpec) -> std::io::Result<Box<dyn crate::sys::Process>> {
-        Ok(Box::new(ExitedProc))
     }
 
     #[test]
@@ -1072,9 +1031,13 @@ mod tests {
         // cycle must re-report the exit — and must do so before it reads the supervisor pointer,
         // because the same failing state directory that lost the marker also fails that read and
         // would starve the retry forever. A dead application also means nothing may be launched.
-        let c = cfg(temp_dir("pending-exit"), None); // no committed pointer: the read would fail
-        let mut service = Service::with_process(App::with_spawn(exited_spawn));
-        service.launch(&spec(), Duration::ZERO).unwrap();
+        let (_tmp, state_dir) = temp_dir("pending-exit");
+        let c = cfg(state_dir, None); // no committed pointer: the read would fail
+        let mut service = Service::with_process(App::with_spawn(fake_spawn));
+        // An application that has already exited with code 9.
+        service
+            .launch(&fake_spec("exit:9"), Duration::ZERO)
+            .unwrap();
 
         for _ in 0..3 {
             assert!(
@@ -1096,7 +1059,7 @@ mod tests {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let state_dir = temp_dir("exit-marker-unwritable");
+        let (_tmp, state_dir) = temp_dir("exit-marker-unwritable");
         std::fs::set_permissions(&state_dir, PermissionsExt::from_mode(0o500)).unwrap();
         let rolled = roll_up_service_exit(&state_dir, 9);
         std::fs::set_permissions(&state_dir, PermissionsExt::from_mode(0o700)).unwrap();
@@ -1110,7 +1073,8 @@ mod tests {
 
     #[test]
     fn dispatch_launch_starts_the_app_and_replies_launched() {
-        let c = cfg(temp_dir("launch"), None);
+        let (_tmp, state_dir) = temp_dir("launch");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         let mut app = Service::with_process(App::with_spawn(fake_spawn));
         let mut state = activation(None, true);
@@ -1120,7 +1084,8 @@ mod tests {
 
     #[test]
     fn dispatch_stop_replies_ok() {
-        let c = cfg(temp_dir("stop"), None);
+        let (_tmp, state_dir) = temp_dir("stop");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         let mut app = Service::with_process(App::with_spawn(fake_spawn));
         let mut state = activation(None, true);
@@ -1130,7 +1095,8 @@ mod tests {
 
     #[test]
     fn traffic_requests_drive_the_guardian_probe_state_machine() {
-        let c = cfg(temp_dir("traffic-state"), None);
+        let (_tmp, state_dir) = temp_dir("traffic-state");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         let probes = ProbeMachine::new();
         let mut app = Service::new(probes.clone());
@@ -1157,7 +1123,8 @@ mod tests {
 
     #[test]
     fn dispatch_replace_stages_the_candidate_and_replies_ok() {
-        let c = cfg(temp_dir("replace"), None);
+        let (_tmp, state_dir) = temp_dir("replace");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         let mut app = Service::with_process(App::none());
         let mut state = activation(None, true);
@@ -1176,7 +1143,8 @@ mod tests {
 
     #[test]
     fn dispatch_replace_rejects_paths_outside_content_addressed_staging() {
-        let c = cfg(temp_dir("replace-invalid"), None);
+        let (_tmp, state_dir) = temp_dir("replace-invalid");
+        let c = cfg(state_dir, None);
         let outside = c.state_dir.join("arbitrary-supervisor");
         std::fs::write(&outside, b"candidate").unwrap();
         let mut sup = FakeLink::new();
@@ -1196,7 +1164,8 @@ mod tests {
 
     #[test]
     fn dispatch_ready_with_the_matching_nonce_begins_confirmation() {
-        let c = cfg(temp_dir("ready-ok"), None);
+        let (_tmp, state_dir) = temp_dir("ready-ok");
+        let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
@@ -1221,7 +1190,8 @@ mod tests {
 
     #[test]
     fn dispatch_ready_with_a_wrong_nonce_does_not_commit() {
-        let c = cfg(temp_dir("ready-wrong"), None);
+        let (_tmp, state_dir) = temp_dir("ready-wrong");
+        let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
@@ -1250,7 +1220,8 @@ mod tests {
 
     #[test]
     fn dispatch_ready_when_already_committed_does_not_re_commit() {
-        let c = cfg(temp_dir("ready-committed"), None);
+        let (_tmp, state_dir) = temp_dir("ready-committed");
+        let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
@@ -1276,7 +1247,8 @@ mod tests {
         // fails with `Closed` on the very poll that would otherwise observe the exit. Treating
         // that as a channel fault discarded the staged replacement — self-update silently never
         // activated, and the old supervisor came back every time.
-        let c = cfg(temp_dir("closed-after-replace"), None);
+        let (_tmp, state_dir) = temp_dir("closed-after-replace");
+        let c = cfg(state_dir, None);
         let staged = staged_candidate(&c, 0x22);
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true); // ReplaceSupervisor arrives
@@ -1298,7 +1270,8 @@ mod tests {
         // Same Unix readable-with-hangup read failure, seen while gating a candidate: the
         // rejection marker is what stops the supervisor re-selecting and re-staging the same
         // content-addressed bytes forever, so it must be written on this path too.
-        let c = cfg(temp_dir("closed-candidate"), None);
+        let (_tmp, state_dir) = temp_dir("closed-candidate");
+        let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/dead/supervisor");
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true); // readable-with-hangup, nothing to read
@@ -1317,7 +1290,8 @@ mod tests {
         // either way, so its rejection must be recorded here too — otherwise the committed
         // supervisor re-selects the same release, re-stages the same content-addressed bytes and
         // hands them off again, forever, with nothing on disk saying it failed.
-        let c = cfg(temp_dir("dropped-candidate"), None);
+        let (_tmp, state_dir) = temp_dir("dropped-candidate");
+        let c = cfg(state_dir, None);
         let cand = staged_candidate(&c, 0xa1);
         std::fs::remove_file(&cand).unwrap();
         let mut app = Service::with_process(App::none());
@@ -1338,7 +1312,8 @@ mod tests {
     fn a_running_supervisor_that_loses_its_channel_is_stopped() {
         // A live supervisor without a usable channel would spin `poll_readable` at 100% forever.
         // It is stopped and relaunched on a fresh one; the application is untouched.
-        let c = cfg(temp_dir("channel-lost"), None);
+        let (_tmp, state_dir) = temp_dir("channel-lost");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true);
         sup.stays_alive = true; // still running when the read fails, and stays that way
@@ -1352,7 +1327,8 @@ mod tests {
 
     #[test]
     fn a_candidate_that_loses_its_channel_while_running_is_rejected() {
-        let c = cfg(temp_dir("channel-lost-candidate"), None);
+        let (_tmp, state_dir) = temp_dir("channel-lost-candidate");
+        let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/mute/supervisor");
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true);
@@ -1370,7 +1346,8 @@ mod tests {
 
     #[test]
     fn a_hello_that_fails_rejects_a_candidate_and_only_backs_off_a_committed_supervisor() {
-        let c = cfg(temp_dir("hello-candidate"), None);
+        let (_tmp, state_dir) = temp_dir("hello-candidate");
+        let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/mismatch/supervisor");
         let mut sup = FakeLink::new();
         sup.hello_ok = false;
@@ -1381,7 +1358,8 @@ mod tests {
         ));
         assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
 
-        let c = cfg(temp_dir("hello-committed"), None);
+        let (_tmp, state_dir) = temp_dir("hello-committed");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         sup.hello_ok = false;
         assert!(matches!(
@@ -1393,7 +1371,8 @@ mod tests {
 
     #[test]
     fn serve_rejects_a_candidate_that_never_signals_ready_before_the_deadline() {
-        let mut c = cfg(temp_dir("timeout"), None);
+        let (_tmp, state_dir) = temp_dir("timeout");
+        let mut c = cfg(state_dir, None);
         c.ready_timeout = Duration::ZERO; // the deadline is already past on the first poll.
         let cand = PathBuf::from("/state/supervisors/slow/supervisor");
         let mut sup = FakeLink::new();
@@ -1414,7 +1393,8 @@ mod tests {
     #[test]
     fn serve_rejects_a_candidate_that_exits_before_signalling_ready() {
         let cand = PathBuf::from("/state/supervisors/dead/supervisor");
-        let c = cfg(temp_dir("preexit"), None);
+        let (_tmp, state_dir) = temp_dir("preexit");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         sup.exited.push_back(true); // exits before any Ready
         let mut app = Service::with_process(App::none());
@@ -1426,7 +1406,8 @@ mod tests {
     #[test]
     fn serve_rejects_a_candidate_that_exits_during_confirmation() {
         let cand = PathBuf::from("/state/supervisors/good/supervisor");
-        let c = cfg(temp_dir("postready"), None);
+        let (_tmp, state_dir) = temp_dir("postready");
+        let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
         sup.readable.borrow_mut().push_back(true);
@@ -1453,7 +1434,8 @@ mod tests {
     #[test]
     fn serve_commits_only_after_the_confirmation_window() {
         let cand = PathBuf::from("/state/supervisors/stable/supervisor");
-        let mut c = cfg(temp_dir("confirmed"), None);
+        let (_tmp, state_dir) = temp_dir("confirmed");
+        let mut c = cfg(state_dir, None);
         c.confirm_timeout = Duration::ZERO;
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
@@ -1480,7 +1462,8 @@ mod tests {
         // boot launches as the committed supervisor, ungated and unconfirmed.
         use std::os::unix::fs::PermissionsExt;
         let cand = PathBuf::from("/state/supervisors/unsynced/supervisor");
-        let mut c = cfg(temp_dir("commit-unsynced"), None);
+        let (_tmp, state_dir) = temp_dir("commit-unsynced");
+        let mut c = cfg(state_dir, None);
         c.confirm_timeout = Duration::ZERO;
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
@@ -1515,7 +1498,8 @@ mod tests {
     #[test]
     fn exit_at_confirmation_deadline_loses_to_liveness_check() {
         let cand = PathBuf::from("/state/supervisors/racy/supervisor");
-        let mut c = cfg(temp_dir("confirmation-race"), None);
+        let (_tmp, state_dir) = temp_dir("confirmation-race");
+        let mut c = cfg(state_dir, None);
         c.confirm_timeout = Duration::ZERO;
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
@@ -1533,7 +1517,8 @@ mod tests {
 
     #[test]
     fn serve_never_lets_the_deadline_reject_an_ordinary_committed_supervisor() {
-        let mut c = cfg(temp_dir("committed"), None);
+        let (_tmp, state_dir) = temp_dir("committed");
+        let mut c = cfg(state_dir, None);
         c.ready_timeout = Duration::ZERO;
         let mut sup = FakeLink::new();
         sup.exited.push_back(true); // a plain committed supervisor that crashes
@@ -1548,7 +1533,7 @@ mod tests {
 
     #[test]
     fn seed_preserves_an_existing_desired_pointer() {
-        let state = temp_dir("seed-existing");
+        let (_tmp, state) = temp_dir("seed-existing");
         let initial = state.join("initial-supervisor");
         std::fs::write(&initial, b"initial").unwrap();
         let c = cfg(state, Some(initial));
@@ -1564,7 +1549,7 @@ mod tests {
 
     #[test]
     fn seed_records_the_initial_supervisor_when_none_exists() {
-        let dir = temp_dir("seed-fresh");
+        let (_tmp, dir) = temp_dir("seed-fresh");
         let initial = dir.join("supervisor");
         std::fs::write(&initial, b"binary").unwrap();
         let c = cfg(dir, Some(initial.clone()));
@@ -1580,7 +1565,7 @@ mod tests {
         // Regression for the seeded-initial brick: a node that seeded via `--supervisor` and then
         // had the flag removed on a later restart (before ever self-updating) must still validate
         // its committed pointer — via the durable seeded record, not the live flag.
-        let dir = temp_dir("seed-flag-dropped");
+        let (_tmp, dir) = temp_dir("seed-flag-dropped");
         let initial = dir.join("supervisor");
         std::fs::write(&initial, b"binary").unwrap();
         // First boot: flag present, seeds the pointer + the durable seeded record.
@@ -1594,22 +1579,21 @@ mod tests {
 
     #[test]
     fn seed_fails_with_no_pointer_and_no_initial() {
-        let c = cfg(temp_dir("seed-none"), None);
+        let (_tmp, state_dir) = temp_dir("seed-none");
+        let c = cfg(state_dir, None);
         assert!(seed_desired_supervisor(&c).is_err());
     }
 
     #[test]
     fn seed_fails_when_the_initial_supervisor_does_not_exist() {
-        let c = cfg(
-            temp_dir("seed-missing"),
-            Some(PathBuf::from("/no/such/supervisor")),
-        );
+        let (_tmp, state_dir) = temp_dir("seed-missing");
+        let c = cfg(state_dir, Some(PathBuf::from("/no/such/supervisor")));
         assert!(seed_desired_supervisor(&c).is_err());
     }
 
     #[test]
     fn seed_never_overwrites_a_corrupt_committed_pointer() {
-        let state = temp_dir("seed-corrupt");
+        let (_tmp, state) = temp_dir("seed-corrupt");
         let initial = state.join("initial-supervisor");
         std::fs::write(&initial, b"initial").unwrap();
         std::fs::write(state.join("desired-supervisor"), b"corrupt\n").unwrap();

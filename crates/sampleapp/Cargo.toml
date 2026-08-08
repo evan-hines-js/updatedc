@@ -26,3 +26,4 @@ socket2 = "0.5"
 # The launch-path regression test resolves a real signed bundle through the same
 # provider the supervisor uses, then execs this crate's real binary against it.
 updated = { path = "../updated" }
+tempfile.workspace = true

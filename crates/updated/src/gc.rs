@@ -208,18 +208,12 @@ fn tree_bytes(root: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp() -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "updated-gc-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
+    fn temp() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root");
         fs::create_dir_all(&path).unwrap();
-        path
+        (dir, path)
     }
 
     fn release(version: &str, byte: u8) -> ReleaseId {
@@ -231,7 +225,7 @@ mod tests {
 
     #[test]
     fn protected_releases_survive_even_when_limits_are_zero() {
-        let root = temp();
+        let (_dir, root) = temp();
         let protected = release("1.0.0", 1);
         let stale = release("2.0.0", 2);
         for item in [&protected, &stale] {
@@ -250,7 +244,7 @@ mod tests {
 
     #[test]
     fn rollback_predecessor_consumes_inactive_retention_budget() {
-        let root = temp();
+        let (_dir, root) = temp();
         let active = release("1.0.0", 1);
         let predecessor = release("0.9.0", 2);
         let stale_a = release("2.0.0", 3);
@@ -275,7 +269,7 @@ mod tests {
 
     #[test]
     fn generic_pruning_ignores_files_and_symlinks() {
-        let root = temp();
+        let (_dir, root) = temp();
         fs::create_dir(root.join("stale")).unwrap();
         fs::write(root.join("stale/data"), b"bytes").unwrap();
         fs::write(root.join("unknown-file"), b"keep").unwrap();
@@ -306,7 +300,7 @@ mod tests {
     /// *running* application's state. One observation of absence must decide nothing.
     #[test]
     fn a_transiently_absent_release_does_not_cost_its_workspace_its_scratch() {
-        let root = temp();
+        let (_dir, root) = temp();
         let id = release("1.0.0", 1);
         let (work_dir, release_dir) = workspace_pair(&root, &id);
         let work = root.join("work");
@@ -332,7 +326,7 @@ mod tests {
 
     #[test]
     fn a_workspace_is_reaped_once_its_release_has_stayed_gone() {
-        let root = temp();
+        let (_dir, root) = temp();
         let id = release("1.0.0", 1);
         let (work_dir, release_dir) = workspace_pair(&root, &id);
         let kept = release("2.0.0", 2);
@@ -354,7 +348,7 @@ mod tests {
 
     #[test]
     fn a_release_that_returns_restarts_the_orphan_clock() {
-        let root = temp();
+        let (_dir, root) = temp();
         let id = release("1.0.0", 1);
         let (work_dir, release_dir) = workspace_pair(&root, &id);
         let work = root.join("work");
@@ -373,7 +367,7 @@ mod tests {
 
     #[test]
     fn reaping_ignores_files_and_symlinks_under_work() {
-        let root = temp();
+        let (_dir, root) = temp();
         let work = root.join("work");
         let versions = root.join("versions");
         fs::create_dir_all(&work).unwrap();

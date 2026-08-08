@@ -62,10 +62,13 @@ impl App {
         }
     }
 
-    pub fn is_running(&mut self) -> bool {
-        self.proc.as_mut().is_some_and(|p| p.poll_exit().is_none())
-    }
-
+    /// The PID of the process the guardian holds, and so also the ONE answer to "is an
+    /// application running" — `Some` exactly when one is held.
+    ///
+    /// Deliberately does NOT poll: polling the [`Process`] port here would observe — and on Unix
+    /// reap and tear down the group of — a spontaneous exit whose code this method has nowhere to
+    /// put, silently dropping the one thing [`poll_exit`](App::poll_exit) exists to roll up. The
+    /// exit clears the process there, so this answers `None` from the next call onwards.
     pub fn pid(&self) -> Option<u32> {
         self.proc.as_ref().map(|p| p.pid())
     }
@@ -87,48 +90,12 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-
-    /// A fake process whose behaviour is encoded in the spec's program: `exit:N` has
-    /// already exited with code `N`; anything else runs until stopped.
-    struct Fake {
-        exit: Option<i32>,
-    }
-
-    impl Process for Fake {
-        fn pid(&self) -> u32 {
-            4242
-        }
-        fn poll_exit(&mut self) -> Option<i32> {
-            self.exit
-        }
-        fn stop(&mut self, _grace: Duration) {
-            self.exit.get_or_insert(137);
-        }
-    }
-
-    fn fake_spawn(spec: &CommandSpec) -> io::Result<Box<dyn Process>> {
-        let exit = spec
-            .program
-            .to_str()
-            .and_then(|s| s.strip_prefix("exit:"))
-            .and_then(|n| n.parse().ok());
-        Ok(Box::new(Fake { exit }))
-    }
+    use crate::sys::{fake_spawn, fake_spec as spec};
 
     fn app() -> App {
         App {
             spawn: fake_spawn,
             proc: None,
-        }
-    }
-
-    fn spec(program: &str) -> CommandSpec {
-        CommandSpec {
-            program: OsString::from(program),
-            args: vec![],
-            env: vec![],
-            cwd: None,
         }
     }
 
@@ -140,16 +107,16 @@ mod tests {
         app.launch(&spec("exit:7"), GRACE).unwrap();
         assert_eq!(app.poll_exit(), Some(7), "the crash surfaces its exit code");
         assert_eq!(app.poll_exit(), None, "and only once — it is then cleared");
-        assert!(!app.is_running());
+        assert!(app.pid().is_none());
     }
 
     #[test]
     fn an_intentional_stop_is_not_an_exit_event() {
         let mut app = app();
         app.launch(&spec("run-forever"), GRACE).unwrap();
-        assert!(app.is_running());
+        assert!(app.pid().is_some());
         app.stop(GRACE);
-        assert!(!app.is_running());
+        assert!(app.pid().is_none());
         assert_eq!(app.poll_exit(), None, "a stopped app has no exit event");
     }
 
@@ -167,7 +134,7 @@ mod tests {
         // A relaunch stops the previous process first (it is taken and stopped), leaving a
         // single running process — never a leaked duplicate.
         app.launch(&spec("run-forever"), GRACE).unwrap();
-        assert!(app.is_running());
+        assert!(app.pid().is_some());
         assert_eq!(app.pid(), Some(4242));
     }
 }
@@ -232,10 +199,10 @@ mod unix_tests {
     }
 
     /// A fresh path for the helper application to report through.
-    fn fresh_path(tag: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("guardian-app-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        path
+    fn fresh_path(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let path = guard.path().join(tag);
+        (guard, path)
     }
 
     fn reported_pid(path: &Path) -> libc::pid_t {
@@ -278,7 +245,7 @@ mod unix_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(code, Some(3), "the guardian sees the app's real exit code");
-        assert!(!app.is_running());
+        assert!(app.pid().is_none());
     }
 
     #[test]
@@ -290,9 +257,9 @@ mod unix_tests {
             Duration::from_secs(1),
         )
         .unwrap();
-        assert!(app.is_running());
+        assert!(app.pid().is_some());
         app.stop(Duration::from_secs(2));
-        assert!(!app.is_running());
+        assert!(app.pid().is_none());
         assert_eq!(app.poll_exit(), None, "a stopped app has no exit event");
     }
 
@@ -303,8 +270,8 @@ mod unix_tests {
         // SIGKILLs every worker mid-drain, silently truncating a multi-second configured grace to
         // however long the leader took to notice the signal.
         crate::sys::ignore_sigpipe();
-        let reported = fresh_path("early-leader-exit.pid");
-        let finished = fresh_path("early-leader-exit.done");
+        let (_reported_tmp, reported) = fresh_path("early-leader-exit.pid");
+        let (_finished_tmp, finished) = fresh_path("early-leader-exit.done");
         let grace = Duration::from_secs(10);
         let mut app = App::none();
         app.launch(&launcher_app(&reported, &finished), Duration::from_secs(1))
@@ -332,7 +299,7 @@ mod unix_tests {
         // — live processes the guardian can no longer signal. That is reachable in a plain
         // update: a launcher-style app whose leader exits while its workers keep serving.
         crate::sys::ignore_sigpipe();
-        let reported = fresh_path("observed-exit");
+        let (_reported_tmp, reported) = fresh_path("observed-exit");
         let mut app = App::none();
         app.launch(&forking_app(&reported, "exit 5"), Duration::from_secs(1))
             .unwrap();
@@ -355,13 +322,13 @@ mod unix_tests {
         // The application never outlives the guardian. `PR_SET_PDEATHSIG` promises that for the
         // leader alone (and only on Linux), so dropping the handle is what has to end the group.
         crate::sys::ignore_sigpipe();
-        let reported = fresh_path("dropped");
+        let (_reported_tmp, reported) = fresh_path("dropped");
         let mut app = App::none();
         app.launch(&forking_app(&reported, "sleep 30"), Duration::from_secs(1))
             .unwrap();
         let worker = reported_pid(&reported);
         let leader = app.pid().unwrap() as libc::pid_t;
-        assert!(app.is_running());
+        assert!(app.pid().is_some());
 
         drop(app);
 
