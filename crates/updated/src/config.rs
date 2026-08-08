@@ -62,63 +62,66 @@ pub struct RepositorySource {
     pub mtls: crate::tls::Identity,
 }
 
-pub trait MaterializeRuntime {
-    /// The launch spec and probes derived from this runtime. The single construction path
-    /// for [`Application`] — used both when the config is first materialized and when a
-    /// running supervisor reconciles a control-plane reassignment (which may change the
-    /// launch args or health checks independently of the release version).
-    fn application(&self) -> Application;
-    fn storage(&self) -> Storage;
-    fn timeouts(&self) -> Timeouts;
-    fn materialize(&self, deployment: &str, routing: Routing) -> Result<Config, String>;
+impl Application {
+    /// The launch spec and probes the signed runtime carries. The single construction path for
+    /// [`Application`] — used both when the config is first materialized and when a running
+    /// supervisor reconciles a control-plane reassignment (which may change the launch args or
+    /// health checks independently of the release version).
+    pub fn from_runtime(runtime: &ManagedRuntime) -> Application {
+        Application {
+            mode: runtime.mode,
+            product: runtime.product.clone(),
+            channel: runtime.channel.clone(),
+            install_root: runtime.install_root.clone(),
+            args: runtime.args.clone(),
+            secrets: runtime.secrets.clone(),
+            inputs: runtime.inputs.clone(),
+        }
+    }
 }
 
-impl MaterializeRuntime for ManagedRuntime {
-    fn application(&self) -> Application {
-        Application {
-            mode: self.mode,
-            product: self.product.clone(),
-            channel: self.channel.clone(),
-            install_root: self.install_root.clone(),
-            args: self.args.clone(),
-            secrets: self.secrets.clone(),
-            inputs: self.inputs.clone(),
-        }
-    }
-
-    /// The inactive-material retention bounds this runtime signs. Single construction path
-    /// for [`Storage`], shared by materialization and steady-state reassignment.
-    fn storage(&self) -> Storage {
+impl Storage {
+    /// The inactive-material retention bounds the signed runtime carries. Single construction
+    /// path, shared by materialization and steady-state reassignment.
+    pub fn from_runtime(runtime: &ManagedRuntime) -> Storage {
         Storage {
-            inactive_releases: self.storage.inactive_releases,
-            inactive_providers: self.storage.inactive_providers,
-            inactive_supervisors: self.storage.inactive_supervisors,
-            inactive_bytes: self.storage.inactive_bytes,
-            inactive_repository_caches: self.storage.inactive_repository_caches,
+            inactive_releases: runtime.storage.inactive_releases,
+            inactive_providers: runtime.storage.inactive_providers,
+            inactive_supervisors: runtime.storage.inactive_supervisors,
+            inactive_bytes: runtime.storage.inactive_bytes,
+            inactive_repository_caches: runtime.storage.inactive_repository_caches,
         }
     }
+}
 
-    /// The cadence and health-gate windows this runtime signs. Single construction path for
-    /// [`Timeouts`], shared by materialization and steady-state reassignment.
-    fn timeouts(&self) -> Timeouts {
+impl Timeouts {
+    /// The cadence and health-gate windows the signed runtime carries. Single construction path,
+    /// shared by materialization and steady-state reassignment.
+    pub fn from_runtime(runtime: &ManagedRuntime) -> Timeouts {
         Timeouts {
-            check_interval: Duration::from_secs(self.timeouts.check_interval_seconds),
-            health_grace: Duration::from_secs(self.timeouts.health_grace_seconds),
-            health_successes: self.timeouts.health_successes,
-            health_interval: Duration::from_secs(self.timeouts.health_interval_seconds),
-            retry_after: Duration::from_secs(self.timeouts.retry_after_seconds),
-            refresh_retry: Duration::from_secs(self.timeouts.refresh_retry_seconds),
-            confirmation_window: Duration::from_secs(self.timeouts.confirmation_window_seconds),
+            check_interval: Duration::from_secs(runtime.timeouts.check_interval_seconds),
+            health_grace: Duration::from_secs(runtime.timeouts.health_grace_seconds),
+            health_successes: runtime.timeouts.health_successes,
+            health_interval: Duration::from_secs(runtime.timeouts.health_interval_seconds),
+            refresh_retry: Duration::from_secs(runtime.timeouts.refresh_retry_seconds),
+            confirmation_window: Duration::from_secs(runtime.timeouts.confirmation_window_seconds),
             supervisor_check_interval: Duration::from_secs(
-                self.timeouts.supervisor_check_interval_seconds,
+                runtime.timeouts.supervisor_check_interval_seconds,
             ),
             // Carried through as-is; see [`Timeouts::drain_hold`] for what each value means.
-            drain_hold: self.timeouts.drain_hold_seconds.map(Duration::from_secs),
+            drain_hold: runtime.timeouts.drain_hold_seconds.map(Duration::from_secs),
         }
     }
+}
 
-    fn materialize(&self, deployment: &str, routing: Routing) -> Result<Config, String> {
-        self.validate()?;
+impl Config {
+    /// The whole local configuration one signed runtime materializes into.
+    pub fn materialize(
+        runtime: &ManagedRuntime,
+        deployment: &str,
+        routing: Routing,
+    ) -> Result<Config, String> {
+        runtime.validate()?;
         // The release root is NOT materialized here. `TrustedRepository::assigned` writes the root
         // it actually pins, into the per-assignment datastore, from the assignment it just
         // verified. Writing a second copy from here — out of a config that may have come from an
@@ -126,9 +129,9 @@ impl MaterializeRuntime for ManagedRuntime {
         Ok(Config {
             deployment: deployment.to_owned(),
             routing,
-            application: self.application(),
-            storage: self.storage(),
-            timeouts: self.timeouts(),
+            application: Application::from_runtime(runtime),
+            storage: Storage::from_runtime(runtime),
+            timeouts: Timeouts::from_runtime(runtime),
         })
     }
 }
@@ -191,8 +194,6 @@ pub struct Timeouts {
     /// `health_successes > 1` proves health over time, not a 100 ms burst. Ignored
     /// when `health_successes` is 1.
     pub health_interval: Duration,
-    /// How often a health-check-failed release is retried (not permanently blocked).
-    pub retry_after: Duration,
     /// Backoff base for retrying a transient metadata transport failure.
     pub refresh_retry: Duration,
     /// How long a just-committed update stays unconfirmed. A crash within it reverts the
@@ -218,7 +219,6 @@ impl Default for Timeouts {
             health_grace: Duration::from_secs(10),
             health_successes: 1,
             health_interval: Duration::from_secs(1),
-            retry_after: Duration::from_secs(300),
             refresh_retry: Duration::from_secs(5),
             confirmation_window: Duration::from_secs(120),
             supervisor_check_interval: Duration::from_secs(3600),

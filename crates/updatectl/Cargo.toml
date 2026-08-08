@@ -15,7 +15,7 @@ kube.workspace = true
 object_store.workspace = true
 semver.workspace = true
 serde_json.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 tokio.workspace = true
 # Reused so CI publication uses the exact same bundle format, TUF authoring, S3
 # object layout, and CRD types as the operator — one code path, no drift.

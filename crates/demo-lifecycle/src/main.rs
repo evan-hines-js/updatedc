@@ -10,18 +10,15 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+/// The provider execution timeout the demo signs into its provider set, owned by this crate's
+/// library so the fixture's budget and the value the demo publishes are one constant.
+use demo_lifecycle::PROVIDER_TIMEOUT_MS;
 use foundation::durable;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate; this fixture
 /// answers exactly the operations the supervisor invokes.
-use updated_contracts::reconciler::Operation;
+use updated_contracts::reconciler::{attempt, Operation};
 
 type Error = Box<dyn std::error::Error>;
-
-/// The provider execution timeout the demo signs into its provider set (`--provider-timeout-ms`).
-/// The supervisor bounds the *entire* hook invocation by it, so one `apply` — every fixed step
-/// plus BOTH dwells — must finish inside it or a healthy release is killed mid-apply and the
-/// cohort rolls back.
-const PROVIDER_TIMEOUT_MS: u64 = 15_000;
 
 /// Wall time an update `apply` spends outside its two dwells: one second each in `preflight`,
 /// `prepare`, `drain` and `start`, plus two seconds for the filesystem work of the remaining
@@ -268,7 +265,7 @@ impl Deployment {
     }
 
     fn start(&self) -> Result<(), Error> {
-        if self.attempt == "boot" {
+        if self.attempt == attempt::BOOT {
             // Cold install and ordinary restart have no update transaction. Materialize any
             // provider-owned steady state that an update's activate/finalize phases would have
             // produced, without overwriting an existing deployment on restart.
@@ -591,11 +588,9 @@ mod tests {
 
     #[test]
     fn cold_boot_start_does_not_require_an_update_activation() {
-        let root = std::env::temp_dir().join(format!(
-            "updated-demo-lifecycle-cold-boot-{}",
-            std::process::id()
-        ));
-        let mut deployment = deployment(root.clone(), Operation::Apply, "boot");
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
+        let mut deployment = deployment(root.clone(), Operation::Apply, attempt::BOOT);
         deployment.reason = "install".into();
         fs::create_dir_all(&deployment.live).unwrap();
 
@@ -608,8 +603,6 @@ mod tests {
         )
         .unwrap();
         required_file(&deployment.live.join("change-ticket.receipt")).unwrap();
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -617,10 +610,8 @@ mod tests {
         // The supervisor stops the managed process before it invokes the activation hook and only
         // relaunches it afterwards, so nothing is listening while `verify` runs. Verification must
         // come from durable live state, or every update fails and rolls back.
-        let root = std::env::temp_dir().join(format!(
-            "updated-demo-lifecycle-verify-{}",
-            std::process::id()
-        ));
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
         let deployment = deployment(root.clone(), Operation::Apply, "T");
         fs::create_dir_all(&deployment.effects).unwrap();
         fs::create_dir_all(&deployment.live).unwrap();
@@ -638,8 +629,6 @@ mod tests {
         .unwrap();
 
         deployment.verify().unwrap();
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -648,10 +637,8 @@ mod tests {
         // activation, which re-invokes `apply` under the same attempt id — replays `prepare` with
         // the candidate already in `live`. Re-copying then would leave `rollback` restoring the
         // candidate's bytes as if they were the predecessor's.
-        let root = std::env::temp_dir().join(format!(
-            "updated-demo-lifecycle-backup-{}",
-            std::process::id()
-        ));
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
         let deployment = deployment(root.clone(), Operation::Apply, "T");
         fs::create_dir_all(&deployment.effects).unwrap();
         fs::create_dir_all(&deployment.live).unwrap();
@@ -666,16 +653,12 @@ mod tests {
 
         deployment.rollback().unwrap();
         expect(&deployment.live.join("application.war"), "1.0.0").unwrap();
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn steady_state_verification_does_not_require_transaction_markers() {
-        let root = std::env::temp_dir().join(format!(
-            "updated-demo-lifecycle-periodic-{}",
-            std::process::id()
-        ));
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
         let live = root.join("live");
         fs::create_dir_all(&live).unwrap();
         fs::write(
@@ -695,7 +678,5 @@ mod tests {
         )
         .unwrap();
         required_file(&deployment.live.join("change-ticket.receipt")).unwrap();
-
-        fs::remove_dir_all(root).unwrap();
     }
 }

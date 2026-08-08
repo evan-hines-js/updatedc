@@ -83,7 +83,6 @@ pub struct ManagedTimeouts {
     pub health_grace_seconds: u64,
     pub health_successes: u32,
     pub health_interval_seconds: u64,
-    pub retry_after_seconds: u64,
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
     pub supervisor_check_interval_seconds: u64,
@@ -156,7 +155,6 @@ impl ManagedRuntime {
             || self.timeouts.health_grace_seconds == 0
             || self.timeouts.health_successes == 0
             || self.timeouts.health_interval_seconds == 0
-            || self.timeouts.retry_after_seconds == 0
             || self.timeouts.refresh_retry_seconds == 0
             || self.timeouts.confirmation_window_seconds == 0
             || self.timeouts.supervisor_check_interval_seconds == 0
@@ -175,10 +173,6 @@ impl ManagedRuntime {
             (
                 "timeouts.health_interval_seconds",
                 self.timeouts.health_interval_seconds,
-            ),
-            (
-                "timeouts.retry_after_seconds",
-                self.timeouts.retry_after_seconds,
             ),
             (
                 "timeouts.confirmation_window_seconds",
@@ -355,7 +349,6 @@ mod tests {
                 health_grace_seconds: 30,
                 health_successes: 2,
                 health_interval_seconds: 1,
-                retry_after_seconds: 60,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,
@@ -394,7 +387,7 @@ mod tests {
         type SetSeconds = fn(&mut ManagedRuntime, u64);
         // The report-cadence fields are absent deliberately: they answer to the tighter,
         // freshness-derived ceiling instead (see below).
-        let fields: [(&str, SetSeconds); 7] = [
+        let fields: [(&str, SetSeconds); 6] = [
             ("transport_timeout", |r, v| {
                 r.repository.transport_timeout_seconds = v
             }),
@@ -405,7 +398,6 @@ mod tests {
                 r.timeouts.health_successes = 1;
                 r.timeouts.health_interval_seconds = v;
             }),
-            ("retry_after", |r, v| r.timeouts.retry_after_seconds = v),
             ("confirmation_window", |r, v| {
                 r.timeouts.confirmation_window_seconds = v
             }),
@@ -803,7 +795,6 @@ mod tests {
             for bounded in [
                 "health_grace_seconds",
                 "health_interval_seconds",
-                "retry_after_seconds",
                 "confirmation_window_seconds",
                 "supervisor_check_interval_seconds",
                 "drain_hold_seconds",

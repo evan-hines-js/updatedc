@@ -79,24 +79,8 @@ pub(crate) async fn serve(
     let path = words.next().unwrap_or_default();
     let (status, content_type, body) = match (method, path) {
         ("GET", "/") => ("200 OK", "text/html; charset=utf-8", demo.page()),
-        ("GET", "/state") => match demo.version().await {
-            Ok(version) => (
-                "200 OK",
-                "application/json",
-                serde_json::json!({
-                    "version": version.trim(),
-                    "color": if version.trim() == "2.0.0" { "green" } else { "red" }
-                })
-                .to_string(),
-            ),
-            Err(error) => json_error("503 Service Unavailable", error),
-        },
         ("GET", "/fleet") => match demo.fleet_for_ui().await {
-            Ok(nodes) => (
-                "200 OK",
-                "application/json",
-                serde_json::to_string(&nodes)?,
-            ),
+            Ok(nodes) => ("200 OK", "application/json", serde_json::to_string(&nodes)?),
             Err(error) => json_error("503 Service Unavailable", error),
         },
         ("GET", "/groups") => match demo.groups().await {
@@ -164,31 +148,6 @@ pub(crate) async fn serve(
                 Err(error) => json_error("409 Conflict", error),
             }
         }
-        ("POST", "/update") => match request_body(request)
-            .and_then(|body| {
-                serde_json::from_str::<ReleaseRequest>(body).map_err(|error| error.to_string())
-            })
-        {
-            Ok(release) => match demo.apply(&release).await {
-                Ok(()) => (
-                    "202 Accepted",
-                    "application/json",
-                    serde_json::json!({"status": "submitted to Kubernetes; waiting for the operator"})
-                        .to_string(),
-                ),
-                Err(error) => json_error("500 Internal Server Error", error),
-            },
-            Err(error) => json_error("400 Bad Request", error),
-        },
-        ("POST", "/magnolia/upgrade") => match demo.upgrade_magnolia_manual().await {
-            Ok(()) => (
-                "202 Accepted",
-                "application/json",
-                serde_json::json!({"status": "manual Magnolia upgrade to v2 requested"})
-                    .to_string(),
-            ),
-            Err(error) => json_error("500 Internal Server Error", error),
-        },
         ("GET", "/healthz") => ("200 OK", "text/plain", "ok".into()),
         _ => ("404 Not Found", "text/plain", "not found".into()),
     };
@@ -198,13 +157,6 @@ pub(crate) async fn serve(
     );
     stream.write_all(response.as_bytes()).await?;
     Ok(())
-}
-
-pub(crate) fn request_body(request: &str) -> Result<&str, String> {
-    request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .ok_or_else(|| "request body is missing".into())
 }
 
 pub(crate) fn query_value(path: &str, name: &str) -> Option<String> {

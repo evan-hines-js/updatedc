@@ -215,7 +215,7 @@ async fn apply_install(
                 // uninstallable: reject the app version so ordered fallback descends to one whose
                 // provider set is good, rather than crash-looping on a version we can never bring up.
                 match stage_providers(opts, &repo, store, None).await {
-                    Ok((providers, _)) => break (prepared, providers),
+                    Ok(providers) => break (prepared, providers),
                     Err(crate::selection::ProviderStagingError::Unusable {
                         message,
                         version_bound: true,

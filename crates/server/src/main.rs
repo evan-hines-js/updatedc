@@ -593,28 +593,28 @@ where
         }
         return Ok(());
     }
-    // A `Range: bytes=N-` header means tough is resuming a download.
-    let range = head.lines().skip(1).find_map(|l| {
-        let l = l.to_ascii_lowercase();
-        l.strip_prefix("range:").map(|v| v.trim().to_owned())
+    // A `Range` header means a client is resuming (or slicing) a download. Which values are legal
+    // is the gateway's grammar, called rather than restated.
+    let header_value = head.lines().skip(1).find_map(|line| {
+        let lowered = line.to_ascii_lowercase();
+        lowered
+            .strip_prefix("range:")
+            .map(|value| value.trim().to_owned())
     });
-    let range_start = match range.as_deref() {
+    let range = match header_value
+        .as_deref()
+        .map(updatec::served::parse_range_value)
+    {
         None => None,
-        Some(value) => match value
-            .strip_prefix("bytes=")
-            .and_then(|value| value.strip_suffix('-'))
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            Some(start) => Some(start),
-            None => {
-                respond_status(&mut stream, 400, b"malformed range").await;
-                return Ok(());
-            }
-        },
+        Some(Some(range)) => Some(range),
+        Some(None) => {
+            respond_status(&mut stream, 400, b"malformed range").await;
+            return Ok(());
+        }
     };
 
     match open_repository_file(root, path) {
-        Some(file) => respond_file(&mut stream, tokio::fs::File::from_std(file), range_start).await,
+        Some(file) => respond_file(&mut stream, tokio::fs::File::from_std(file), range).await,
         None => respond_status(&mut stream, 404, b"not found").await,
     }
     Ok(())
@@ -697,26 +697,10 @@ where
     }
     body.truncate(content_length);
     // A report travels as a signed DSSE envelope, exactly as the k8s gateway stores it — that is
-    // what a consumer verifies against the node's pinned key. Parsing the body as a bare report
-    // rejected every genuine agent write with "malformed report" and left this handler storing
-    // nothing at all.
-    let Ok(envelope) = serde_json::from_slice::<updated_contracts::telemetry::Envelope>(&body)
-    else {
+    // what a consumer verifies against the node's pinned key. The acceptance rule is the gateway's
+    // own, called rather than restated, so the dev CDN accepts exactly the reports production does.
+    if updated_contracts::telemetry::accept_report_envelope(&body, node).is_none() {
         respond_status(stream, 400, b"malformed report envelope").await;
-        return Ok(());
-    };
-    if envelope.payload_type != updated_contracts::telemetry::REPORT_PAYLOAD_TYPE
-        || envelope.signatures.len() > updated_contracts::telemetry::Envelope::MAX_SIGNATURES
-    {
-        respond_status(stream, 400, b"malformed report envelope").await;
-        return Ok(());
-    }
-    let Some(report) = updated_contracts::telemetry::report_payload_unverified(&envelope) else {
-        respond_status(stream, 400, b"malformed report").await;
-        return Ok(());
-    };
-    if report.node != node || !report.is_wellformed() {
-        respond_status(stream, 400, b"report node mismatch").await;
         return Ok(());
     }
     let dest = root.join(updated_contracts::telemetry::report_object_key(node));
@@ -750,26 +734,20 @@ const SERVED_NAMESPACES: [&str; 3] = [
     updated_contracts::telemetry::REPORT_NAMESPACE,
 ];
 
-/// Map a request path to a file inside `root`, rejecting traversal. Slashes are
-/// allowed (TUF target paths are nested); `..` components and absolute escapes
-/// are not.
+/// Map a request path to a file inside `root`. Which request paths name a repository object is
+/// the gateway's grammar ([`updatec::served::repository_object`]), shared so this dev CDN serves
+/// exactly the requests production serves — nested target paths yes, traversal, empty and
+/// dot-leading segments, query strings and percent-escapes no. What is added here is the local
+/// half: the namespaces this server publishes, and opening the file without letting a symlink
+/// swap move the bytes out from under the validated path.
 fn open_repository_file(root: &Path, path: &str) -> Option<std::fs::File> {
-    let path = path.split('?').next().unwrap_or(path);
-    let mut out = root.to_path_buf();
-    let mut parts = path
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".");
-    let namespace = parts.next()?;
-    if !SERVED_NAMESPACES.contains(&namespace) {
+    let object = updatec::served::repository_object(path)?;
+    if !SERVED_NAMESPACES.contains(&object.namespace) {
         return None;
     }
-    out.push(namespace);
-    for part in parts {
-        // Confined path safety is the one shared guard; a served repository file additionally
-        // rejects any dot-leading segment (no `.`/`..` climb and no hidden files).
-        if !updated_contracts::path::is_safe_component(part) || part.starts_with('.') {
-            return None;
-        }
+    let mut out = root.to_path_buf();
+    out.push(object.namespace);
+    for part in object.relative.split('/') {
         out.push(part);
     }
     // Open before validating and compare stable file identities afterward. If an attacker
@@ -787,8 +765,11 @@ fn open_repository_file(root: &Path, path: &str) -> Option<std::fs::File> {
     Some(file)
 }
 
-async fn respond_file<S>(stream: &mut S, mut file: tokio::fs::File, range_start: Option<u64>)
-where
+async fn respond_file<S>(
+    stream: &mut S,
+    mut file: tokio::fs::File,
+    range: Option<updatec::served::ByteRange>,
+) where
     S: AsyncWrite + Unpin,
 {
     // The canonical repository opener admits regular files only. Metadata is read from
@@ -798,25 +779,24 @@ where
         return;
     };
     let length = metadata.len();
-    if range_start.is_some_and(|start| start >= length) {
+    // Where a range lands over these bytes — including the RFC's clamping of a bounded end past
+    // the last byte and of an over-long suffix — is the shared grammar's answer, not a second one.
+    let placed = range.map(|range| range.resolve(length));
+    if let Some(None) = placed {
         let hdr = format!(
             "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{length}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         let _ = write_with_timeout(stream, hdr.as_bytes()).await;
         return;
     }
-    let start = range_start;
-    let (header, offset, count) = match start {
-        Some(start) => {
-            let remaining = length - start;
+    let (header, offset, count) = match placed.flatten() {
+        Some((start, count)) => {
             let hdr = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\n\
-                 Content-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                length.saturating_sub(1),
-                length,
-                remaining
+                 Content-Range: bytes {start}-{}/{length}\r\nContent-Length: {count}\r\nConnection: close\r\n\r\n",
+                start + count - 1,
             );
-            (hdr, start, remaining)
+            (hdr, start, count)
         }
         _ => {
             let hdr = format!(
@@ -874,8 +854,11 @@ where
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
-        416 => "Range Not Satisfiable",
+        411 => "Length Required",
+        413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let hdr = format!(
@@ -932,7 +915,8 @@ mod tests {
 
     #[test]
     fn resolve_allows_nested_target_paths() {
-        let root = std::env::temp_dir().join(format!("server-resolve-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
         std::fs::create_dir_all(root.join("targets/products")).unwrap();
         std::fs::create_dir_all(root.join("metadata")).unwrap();
         std::fs::write(root.join("targets/products/app"), b"target").unwrap();
@@ -953,7 +937,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn repository_open_rejects_symlinks_that_escape_the_root() {
-        let root = serve_root("escaping-symlink");
+        let (_tmp, root) = serve_root("escaping-symlink");
         let outside = root.parent().unwrap().join("server-outside-target");
         std::fs::write(&outside, b"outside").unwrap();
         std::os::unix::fs::symlink(&outside, root.join("targets/escape")).unwrap();
@@ -976,20 +960,21 @@ mod tests {
         String::from_utf8_lossy(&out).into_owned()
     }
 
-    fn serve_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("server-serve-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    fn serve_root(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let root = guard.path().join(name);
         std::fs::create_dir_all(root.join("targets")).unwrap();
         std::fs::create_dir_all(root.join("metadata")).unwrap();
         std::fs::write(root.join("targets/app"), b"0123456789").unwrap();
-        std::fs::canonicalize(root).unwrap()
+        let root = std::fs::canonicalize(root).unwrap();
+        (guard, root)
     }
 
     #[tokio::test]
     async fn a_directory_is_not_a_body() {
         // `File::open` on a directory succeeds on Unix and stats non-zero, which would
         // otherwise answer 200 with a Content-Length and then zero bytes.
-        let root = serve_root("dir");
+        let (_tmp, root) = serve_root("dir");
         let response = get(&root, "GET /metadata HTTP/1.1\r\n\r\n").await;
         assert!(
             response.starts_with("HTTP/1.1 404"),
@@ -999,7 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_body_matches_the_declared_content_length() {
-        let root = serve_root("exact");
+        let (_tmp, root) = serve_root("exact");
         let response = get(&root, "GET /targets/app HTTP/1.1\r\n\r\n").await;
         let (head, body) = response.split_once("\r\n\r\n").unwrap();
         let declared: usize = head
@@ -1018,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_resume_serves_exactly_the_remaining_bytes() {
-        let root = serve_root("resume");
+        let (_tmp, root) = serve_root("resume");
         let response = get(
             &root,
             "GET /targets/app HTTP/1.1\r\nRange: bytes=4-\r\n\r\n",
@@ -1029,16 +1014,41 @@ mod tests {
         assert!(response.ends_with("456789"), "got: {response:?}");
     }
 
+    /// A bounded and a suffix range are what production serves; while this server open-coded its
+    /// own range parser it answered both with a 400, so no run ever exercised production's rule.
+    #[tokio::test]
+    async fn bounded_and_suffix_ranges_are_served_the_way_the_gateway_serves_them() {
+        let (_tmp, root) = serve_root("range-shapes");
+        for (header, expected_range, body) in [
+            ("bytes=0-3", "bytes 0-3/10", "0123"),
+            ("bytes=8-99", "bytes 8-9/10", "89"),
+            ("bytes=-3", "bytes 7-9/10", "789"),
+            ("bytes=-99", "bytes 0-9/10", "0123456789"),
+        ] {
+            let response = get(
+                &root,
+                &format!("GET /targets/app HTTP/1.1\r\nRange: {header}\r\n\r\n"),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 206"), "got: {response:?}");
+            assert!(
+                response.contains(&format!("Content-Range: {expected_range}")),
+                "{header} got: {response:?}"
+            );
+            assert!(response.ends_with(body), "{header} got: {response:?}");
+        }
+    }
+
     #[tokio::test]
     async fn unsupported_methods_are_rejected() {
-        let root = serve_root("method");
+        let (_tmp, root) = serve_root("method");
         let response = get(&root, "POST /targets/app HTTP/1.1\r\n\r\n").await;
         assert!(response.starts_with("HTTP/1.1 405"), "got: {response:?}");
     }
 
     #[tokio::test]
     async fn malformed_ranges_are_rejected() {
-        let root = serve_root("bad-range");
+        let (_tmp, root) = serve_root("bad-range");
         let response = get(
             &root,
             "GET /targets/app HTTP/1.1\r\nRange: bytes=wat\r\n\r\n",
@@ -1049,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_range_at_eof_is_unsatisfiable() {
-        let root = serve_root("eof-range");
+        let (_tmp, root) = serve_root("eof-range");
         let response = get(
             &root,
             "GET /targets/app HTTP/1.1\r\nRange: bytes=10-\r\n\r\n",
@@ -1064,7 +1074,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_headers_are_rejected() {
-        let root = serve_root("large-header");
+        let (_tmp, root) = serve_root("large-header");
         let request = format!(
             "GET /targets/app HTTP/1.1\r\nX-Fill: {}\r\n\r\n",
             "x".repeat(16 * 1024)
@@ -1083,7 +1093,7 @@ mod tests {
             report_is_authentic_and_fresh, report_object_key, sign_report, NodeReport,
         };
 
-        let root = serve_root("telemetry-roundtrip");
+        let (_tmp, root) = serve_root("telemetry-roundtrip");
         let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
         let key =
@@ -1121,7 +1131,7 @@ mod tests {
     /// as long as it likes; 128 of those wedge the accept loop. The overall deadline ends it.
     #[tokio::test(start_paused = true)]
     async fn a_slow_reader_cannot_hold_a_connection_past_the_overall_deadline() {
-        let root = serve_root("slow-reader");
+        let (_tmp, root) = serve_root("slow-reader");
         // Larger than a slow reader can drain within the deadline at this rate.
         std::fs::write(root.join("targets/big"), vec![7u8; 4 << 20]).unwrap();
 
@@ -1180,12 +1190,8 @@ mod tests {
 
     #[test]
     fn publisher_lock_excludes_other_publishers() {
-        let dir = std::env::temp_dir().join(format!(
-            "updated-server-lock-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().to_path_buf();
 
         let first = lock_publisher(&dir).unwrap();
         let second = OpenOptions::new()
@@ -1233,7 +1239,6 @@ mod tests {
                 health_grace_seconds: 30,
                 health_successes: 2,
                 health_interval_seconds: 1,
-                retry_after_seconds: 60,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,
@@ -1249,9 +1254,8 @@ mod tests {
     /// end deletes the other publisher's staging file out from under it.
     #[test]
     fn assignment_staging_waits_for_the_publisher_lock() {
-        let root =
-            std::env::temp_dir().join(format!("server-publish-staging-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().to_path_buf();
         let repo_dir = root.join("repo");
         let keys_dir = root.join("keys");
         std::fs::create_dir_all(&repo_dir).unwrap();

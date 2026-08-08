@@ -36,6 +36,51 @@ pub trait Process: Send {
     fn stop(&mut self, grace: Duration);
 }
 
+/// The one fake [`Process`] the crate's tests drive [`App`](crate::app::App),
+/// [`Service`](crate::service::Service) and the guardian's dispatch paths with. Its
+/// behaviour is encoded in the spec's program by [`fake_spawn`]: `exit:N` has already
+/// exited with code `N`; anything else runs until stopped, and stopping it exits it the
+/// way a real adapter's hard kill does.
+#[cfg(test)]
+pub(crate) struct FakeProcess {
+    exit: Option<i32>,
+}
+
+#[cfg(test)]
+impl Process for FakeProcess {
+    fn pid(&self) -> u32 {
+        4242
+    }
+    fn poll_exit(&mut self) -> Option<i32> {
+        self.exit
+    }
+    fn stop(&mut self, _grace: Duration) {
+        self.exit.get_or_insert(137);
+    }
+}
+
+/// The [`spawn`] factory's test twin: a [`FakeProcess`] scripted by `spec.program`.
+#[cfg(test)]
+pub(crate) fn fake_spawn(spec: &control::CommandSpec) -> std::io::Result<Box<dyn Process>> {
+    let exit = spec
+        .program
+        .to_str()
+        .and_then(|s| s.strip_prefix("exit:"))
+        .and_then(|n| n.parse().ok());
+    Ok(Box::new(FakeProcess { exit }))
+}
+
+/// A bare command spec naming `program`, which [`fake_spawn`] reads as its script.
+#[cfg(test)]
+pub(crate) fn fake_spec(program: &str) -> control::CommandSpec {
+    control::CommandSpec {
+        program: program.into(),
+        args: vec![],
+        env: vec![],
+        cwd: None,
+    }
+}
+
 /// Set by the platform stop-signal handler (SIGTERM/SIGINT on Unix, a console close event
 /// on Windows). The guardian polls it to shut down cleanly on either target.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);

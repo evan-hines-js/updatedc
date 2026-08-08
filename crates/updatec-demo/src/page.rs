@@ -1,3 +1,6 @@
+/// The served page. `{{COHORT_COUNT}}` is substituted by [`crate::Demo::page`] from the fleet
+/// layout, so the counter and the progress bar cannot count against a denominator the fleet no
+/// longer has.
 pub(crate) const PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -354,7 +357,7 @@ async function refreshFleet() {
           : (brokenActive || validActive || converging) ? 'pending'
           : 'baseline';
         const pool = node.inLoadBalancer ? 'IN' : 'OUT';
-        const probe = `readyz ${node.readyzProbeMillis}ms${node.probeNote ? ' · ' + node.probeNote : ''}`;
+        const probe = node.probeNote ?? 'ready';
         return `<article class="node service-cell ${cell}" title="${label} · ${pool === 'IN' ? 'in load balancer' : 'out of load balancer'} · version ${node.version ?? 'unreachable'} · ${node.selectedGroup ?? 'pending'} · ${probe}"><span class="pool">${pool}</span></article>`;
       }).join('');
       return `<article class="node group ${state}">
@@ -397,9 +400,9 @@ async function refreshChaos() {
     const state = await fetch('/chaos', {cache: 'no-store'}).then(r => r.json());
     chaosStatus.textContent = state.error ? `failed: ${state.error}`
       : state.complete ? `PASS — fleet converged onto ${state.goodVersion}`
-      : state.running ? `epoch ${state.epoch} · loop ${state.loopNumber} · seed ${state.seed} · ${state.completedNodes}/${16} cohorts exercised`
+      : state.running ? `epoch ${state.epoch} · loop ${state.loopNumber} · seed ${state.seed} · ${state.completedNodes}/{{COHORT_COUNT}} cohorts exercised`
       : `ready · next run chooses a random seed`;
-    progressFill.style.width = `${Math.min(100, state.completedNodes / 16 * 100)}%`;
+    progressFill.style.width = `${Math.min(100, state.completedNodes / {{COHORT_COUNT}} * 100)}%`;
     events.textContent = state.events.length ? state.events.join('\n') : 'not started';
     events.scrollTop = events.scrollHeight;
   } catch (_) { chaosStatus.textContent = 'reading scenario state…'; }

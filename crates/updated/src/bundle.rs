@@ -80,12 +80,6 @@ pub struct ExpectedBundle<'a> {
     pub platform: &'a str,
 }
 
-#[derive(Debug)]
-pub struct StagedRelease {
-    pub id: ReleaseId,
-    pub archive_sha256: String,
-}
-
 /// Build the canonical deterministic application archive from a prepared release tree.
 /// `source` must not itself contain `manifest.json`; the publisher generates it from the
 /// exact files that will be archived.
@@ -190,9 +184,7 @@ pub fn create_bundle_from_source(
 impl BundleManifest {
     pub(crate) fn parse(bytes: &[u8], expected: &ExpectedBundle<'_>) -> io::Result<Self> {
         let manifest: Self = serde_json::from_slice(bytes).map_err(invalid)?;
-        if manifest.schema != MANIFEST_SCHEMA {
-            return Err(invalid("unsupported bundle manifest schema"));
-        }
+        manifest.validate_shape()?;
         if manifest.product != expected.product
             || manifest.version != expected.version
             || manifest.platform != expected.platform
@@ -201,10 +193,11 @@ impl BundleManifest {
                 "bundle manifest disagrees with authenticated metadata",
             ));
         }
-        manifest.validate_shape()?;
         Ok(manifest)
     }
 
+    /// The one place a manifest's own well-formedness is decided — schema included. Every reader
+    /// goes through here, so no caller restates a check that could drift from it.
     fn validate_shape(&self) -> io::Result<()> {
         if self.schema != MANIFEST_SCHEMA {
             return Err(invalid("unsupported bundle manifest schema"));
@@ -249,13 +242,18 @@ impl BundleManifest {
     }
 }
 
-/// Resolve a committed release's manifest and entrypoint by identity, *without* re-hashing
-/// the tree. The manifest's own bytes are bound to the release id (their digest must equal
-/// `id.manifest_sha256`), so this proves we are pointing at the release we committed — it
-/// trusts the already-verified tree rather than re-reading every file. Use on the
-/// steady-state path (launching the committed release); use [`read_release`] where
-/// untrusted or freshly written bytes must be fully re-verified.
-pub(crate) fn read_manifest(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, PathBuf)> {
+/// Resolve a release by identity and re-hash every manifested file against its manifest.
+///
+/// Two bindings, and both are load-bearing. The manifest's own bytes are bound to the release id
+/// (their digest must equal `id.manifest_sha256`), which proves this is the release that was
+/// committed; then the tree is re-hashed against that manifest, which proves the bytes on disk are
+/// still the ones it names.
+///
+/// The re-hash is NOT skipped for an already-committed release: ingest-time verification is not an
+/// execution-time trust boundary (see `crate::provider`), so every launch and every pre-refresh
+/// integrity check pays for it deliberately. There is one read path for a release, and it is this
+/// one.
+pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, PathBuf)> {
     id.validate()?;
     let directory = root.join(id.directory_name());
     let directory_meta = fs::symlink_metadata(&directory)?;
@@ -265,23 +263,12 @@ pub(crate) fn read_manifest(root: &Path, id: &ReleaseId) -> io::Result<(BundleMa
     let bytes = fs::read(directory.join(MANIFEST_FILE))?;
     let manifest: BundleManifest = serde_json::from_slice(&bytes).map_err(invalid)?;
     manifest.validate_shape()?;
-    if manifest.schema != MANIFEST_SCHEMA
-        || manifest.version != id.version
-        || !digests_match(&sha256_bytes(&bytes), &id.manifest_sha256)
+    if manifest.version != id.version || !digests_match(&sha256_bytes(&bytes), &id.manifest_sha256)
     {
         return Err(invalid("release identity does not match its manifest"));
     }
+    verify_tree(&directory, &manifest)?;
     let entrypoint = directory.join(&manifest.entrypoint);
-    Ok((manifest, entrypoint))
-}
-
-/// Like [`read_manifest`], but also re-hashes every manifested file against the manifest.
-/// This is the fail-closed check applied to bytes *entering* the trusted set — freshly
-/// extracted downloads and a candidate at its activation/commit moment. A committed,
-/// already-verified release is not re-hashed again on the steady-state launch path.
-pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleManifest, PathBuf)> {
-    let (manifest, entrypoint) = read_manifest(root, id)?;
-    verify_tree(&root.join(id.directory_name()), &manifest)?;
     Ok((manifest, entrypoint))
 }
 
@@ -390,7 +377,7 @@ pub(crate) fn stage_bundle(
     versions_root: &Path,
     expected: &ExpectedBundle<'_>,
     limits: &BundleLimits,
-) -> Result<StagedRelease, InstallError> {
+) -> Result<ReleaseId, InstallError> {
     let archive_meta = fs::symlink_metadata(archive)?;
     if !archive_meta.is_file() {
         // The downloaded archive is written by this node, so anything but a regular file here is
@@ -406,7 +393,6 @@ pub(crate) fn stage_bundle(
     }
     ensure_real_directory(staging_root)?;
     ensure_real_directory(versions_root)?;
-    let archive_sha256 = sha256_file(archive)?;
     let stage = Stage::create(staging_root)?;
     let (manifest, bytes) = extract(archive, stage.path(), expected, limits)?;
     let id = manifest.id(&bytes);
@@ -419,7 +405,7 @@ pub(crate) fn stage_bundle(
         // matches the authenticated manifest. Do not let local drift become trusted just
         // because the same release is downloaded again.
         if read_release(versions_root, &id).is_ok() {
-            return Ok(StagedRelease { id, archive_sha256 });
+            return Ok(id);
         }
         // It drifted. The archive is not to blame — the bytes in `stage` were just verified
         // member-by-member against the authenticated manifest — so this is never a rejection.
@@ -444,7 +430,7 @@ pub(crate) fn stage_bundle(
     // Re-verify the freshly published tree against its manifest. Every member was hashed on the
     // way in, so a mismatch here is the device, not the release.
     read_release(versions_root, &id).map_err(InstallError::Storage)?;
-    Ok(StagedRelease { id, archive_sha256 })
+    Ok(id)
 }
 
 /// Attempt directories and their owner files share this prefix. Everything else in a staging root
@@ -720,7 +706,10 @@ fn extract(
             .create_new(true)
             .open(&destination)
             .map_err(classify_collision)?;
-        let (bytes, digest) = if path == MANIFEST_FILE {
+        // The manifest is read into memory and kept — it is not one of the members it declares, so
+        // it has no declared digest to check here, and the digest that identifies it is computed
+        // once from these same bytes by `manifest.id`.
+        if path == MANIFEST_FILE {
             if size > MANIFEST_BYTES_LIMIT {
                 return Err(archive_verdict("bundle manifest exceeds size limit"));
             }
@@ -732,9 +721,11 @@ fn extract(
                 return Err(archive_verdict("truncated bundle member"));
             }
             file.write_all(&bytes)?;
-            let digest = sha256_bytes(&bytes);
-            (Some(bytes), digest)
-        } else {
+            file.sync_all()?;
+            manifest_bytes = Some(bytes);
+            continue;
+        }
+        let digest = {
             let mut context = Context::new(&SHA256);
             let mut written = 0u64;
             let mut buffer = [0u8; 64 * 1024];
@@ -752,16 +743,12 @@ fn extract(
             if written != size {
                 return Err(archive_verdict("truncated bundle member"));
             }
-            (None, hex::encode(context.finish().as_ref()))
+            hex::encode(context.finish().as_ref())
         };
         file.sync_all()?;
-        if path == MANIFEST_FILE {
-            manifest_bytes = bytes;
-        } else {
-            // Never an overwrite: `create_new` above is the single place a colliding member is
-            // caught, and it already refused this entry if anything occupied the destination.
-            extracted.insert(path, (size, digest));
-        }
+        // Never an overwrite: `create_new` above is the single place a colliding member is
+        // caught, and it already refused this entry if anything occupied the destination.
+        extracted.insert(path, (size, digest));
     }
     let bytes = manifest_bytes.ok_or_else(|| archive_verdict("bundle manifest is missing"))?;
     let manifest = BundleManifest::parse(&bytes, expected).map_err(InstallError::Archive)?;
@@ -965,16 +952,16 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
 
-    fn root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("bundle-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
+    fn root(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
         fs::create_dir_all(&path).unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
     fn deterministic_bundle_round_trips_to_an_immutable_release() {
-        let root = root("roundtrip");
+        let (_dir, root) = root("roundtrip");
         let source = root.join("source");
         fs::create_dir_all(source.join("bin")).unwrap();
         fs::create_dir_all(source.join("config")).unwrap();
@@ -1007,17 +994,17 @@ mod tests {
             &BundleLimits::default(),
         )
         .unwrap();
-        let dir = root.join("versions").join(staged.id.directory_name());
+        let dir = root.join("versions").join(staged.directory_name());
         assert_eq!(
             fs::read(dir.join("config/release.toml")).unwrap(),
             b"version = \"2.0.0\"\n"
         );
-        let (_, entrypoint) = read_release(&root.join("versions"), &staged.id).unwrap();
+        let (_, entrypoint) = read_release(&root.join("versions"), &staged).unwrap();
         assert_eq!(entrypoint, dir.join("bin/app"));
 
         // The committed tree is only trusted while it still matches the authenticated manifest.
         fs::write(dir.join("undeclared"), b"drift").unwrap();
-        assert!(read_release(&root.join("versions"), &staged.id).is_err());
+        assert!(read_release(&root.join("versions"), &staged).is_err());
     }
 
     fn sample_archive(root: &Path, version: &str) -> PathBuf {
@@ -1037,7 +1024,7 @@ mod tests {
         archive
     }
 
-    fn stage(archive: &Path, staging: &Path, versions: &Path, version: &str) -> StagedRelease {
+    fn stage(archive: &Path, staging: &Path, versions: &Path, version: &str) -> ReleaseId {
         stage_bundle(
             archive,
             staging,
@@ -1059,7 +1046,7 @@ mod tests {
     /// attempt last made progress.
     #[test]
     fn an_interrupted_stage_is_reclaimed_by_the_next_one() {
-        let root = root("stage-leak");
+        let (_dir, root) = root("stage-leak");
         let staging = root.join("staging");
         let archive = sample_archive(&root, "1.0.0");
 
@@ -1080,10 +1067,7 @@ mod tests {
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 4);
 
         let staged = stage(&archive, &staging, &root.join("versions"), "1.0.0");
-        assert!(root
-            .join("versions")
-            .join(staged.id.directory_name())
-            .is_dir());
+        assert!(root.join("versions").join(staged.directory_name()).is_dir());
         // The successful stage renamed its directory away and no abandoned attempt survives it.
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }
@@ -1093,7 +1077,7 @@ mod tests {
     /// and neither's live tree is touched by the other's sweep.
     #[test]
     fn concurrent_attempts_are_isolated_rather_than_serialized() {
-        let root = root("stage-concurrent");
+        let (_dir, root) = root("stage-concurrent");
         let staging = root.join("staging");
         let versions = root.join("versions");
         fs::create_dir_all(&staging).unwrap();
@@ -1113,13 +1097,13 @@ mod tests {
         // A whole staging run overlapping a live attempt likewise succeeds.
         let archive = sample_archive(&root, "1.0.0");
         let staged = stage(&archive, &staging, &versions, "1.0.0");
-        assert!(versions.join(staged.id.directory_name()).is_dir());
+        assert!(versions.join(staged.directory_name()).is_dir());
         assert!(held.path().join("in-flight").is_file());
 
         // And the live attempt's leftovers go away once it is itself gone.
         drop(held);
         let staged = stage(&archive, &staging, &versions, "1.0.0");
-        assert!(versions.join(staged.id.directory_name()).is_dir());
+        assert!(versions.join(staged.directory_name()).is_dir());
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }
 
@@ -1130,7 +1114,7 @@ mod tests {
     /// is locked and reclaimed on its own once it is not.
     #[test]
     fn an_owner_file_is_published_only_once_it_is_locked() {
-        let root = root("stage-claim");
+        let (_dir, root) = root("stage-claim");
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
 
@@ -1174,7 +1158,7 @@ mod tests {
     /// someone else. `bundle.download` — the archive being staged FROM — lives here.
     #[test]
     fn the_sweep_leaves_the_rest_of_the_staging_root_alone() {
-        let root = root("stage-neighbours");
+        let (_dir, root) = root("stage-neighbours");
         let staging = root.join("staging");
         let versions = root.join("versions");
         fs::create_dir_all(&staging).unwrap();
@@ -1182,7 +1166,7 @@ mod tests {
         fs::copy(sample_archive(&root, "1.0.0"), &archive).unwrap();
 
         let staged = stage(&archive, &staging, &versions, "1.0.0");
-        assert!(versions.join(staged.id.directory_name()).is_dir());
+        assert!(versions.join(staged.directory_name()).is_dir());
         assert!(archive.is_file(), "the download being staged from survives");
     }
 
@@ -1190,7 +1174,7 @@ mod tests {
     /// descended into — a symlink there must never be followed out of the staging root.
     #[test]
     fn hostile_entries_under_an_attempt_name_are_discarded_not_followed() {
-        let root = root("stage-hostile");
+        let (_dir, root) = root("stage-hostile");
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("stage-stray.owner"), b"not a lock file").unwrap();
@@ -1223,7 +1207,7 @@ mod tests {
     /// durably and never expires. Only evidence about the archive itself is `Archive`.
     #[test]
     fn staging_failures_are_never_a_verdict_on_the_release_bytes() {
-        let root = root("stage-verdict");
+        let (_dir, root) = root("stage-verdict");
         let staging = root.join("staging");
         let versions = root.join("versions");
         let archive = sample_archive(&root, "1.0.0");
@@ -1308,24 +1292,24 @@ mod tests {
     /// authenticated manifest, so they are exactly the repair.
     #[test]
     fn a_drifted_committed_release_is_repaired_by_the_next_stage() {
-        let root = root("stage-repair");
+        let (_dir, root) = root("stage-repair");
         let staging = root.join("staging");
         let versions = root.join("versions");
         let archive = sample_archive(&root, "1.0.0");
 
         let staged = stage(&archive, &staging, &versions, "1.0.0");
-        let committed = versions.join(staged.id.directory_name());
+        let committed = versions.join(staged.directory_name());
         // Two shapes of drift: an undeclared extra file, and a declared member whose bytes
         // changed. Both make `read_release` refuse the committed tree.
         fs::write(committed.join("undeclared"), b"planted").unwrap();
         // The committed member is mode 0o555, so replace it rather than write through it.
         fs::remove_file(committed.join("bin/app")).unwrap();
         fs::write(committed.join("bin/app"), b"tampered").unwrap();
-        assert!(read_release(&versions, &staged.id).is_err());
+        assert!(read_release(&versions, &staged).is_err());
 
         let repaired = stage(&archive, &staging, &versions, "1.0.0");
-        assert_eq!(repaired.id, staged.id, "same content address");
-        read_release(&versions, &repaired.id).expect("the drifted tree was replaced, not trusted");
+        assert_eq!(repaired, staged, "same content address");
+        read_release(&versions, &repaired).expect("the drifted tree was replaced, not trusted");
         assert!(!committed.join("undeclared").exists());
         assert_eq!(fs::read(committed.join("bin/app")).unwrap(), b"executable");
         // Nothing of the repairing attempt is left behind in staging.
@@ -1338,14 +1322,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_at_the_destination_is_repaired_by_the_next_stage() {
-        let root = root("stage-dangling");
+        let (_dir, root) = root("stage-dangling");
         let staging = root.join("staging");
         let versions = root.join("versions");
         let archive = sample_archive(&root, "1.0.0");
 
         // Stage once to learn the content address, then put a link to nowhere in its place.
         let staged = stage(&archive, &staging, &versions, "1.0.0");
-        let committed = versions.join(staged.id.directory_name());
+        let committed = versions.join(staged.directory_name());
         let nowhere = root.join("nowhere");
         fs::remove_dir_all(&committed).unwrap();
         std::os::unix::fs::symlink(&nowhere, &committed).unwrap();
@@ -1356,8 +1340,8 @@ mod tests {
         );
 
         let repaired = stage(&archive, &staging, &versions, "1.0.0");
-        assert_eq!(repaired.id, staged.id, "same content address");
-        read_release(&versions, &repaired.id).expect("the link was replaced by the verified tree");
+        assert_eq!(repaired, staged, "same content address");
+        read_release(&versions, &repaired).expect("the link was replaced by the verified tree");
         assert!(
             !fs::symlink_metadata(&committed)
                 .unwrap()
@@ -1397,7 +1381,7 @@ mod tests {
     /// and the ordered fallback never runs.
     #[test]
     fn colliding_archive_entries_are_a_verdict_on_the_bytes() {
-        let root = root("collision");
+        let (_dir, root) = root("collision");
         let staging = root.join("staging");
         let versions = root.join("versions");
         let expected = ExpectedBundle {

@@ -18,7 +18,6 @@ shift
 protocol=
 attempt=unknown
 root=
-state_dir=
 candidate=
 predecessor=
 
@@ -28,8 +27,11 @@ while (($#)); do
     --attempt-id) attempt=$2; shift 2 ;;
     --reason) shift 2 ;;
     --install-root) root=$2; shift 2 ;;
-    --state-dir) state_dir=$2; shift 2 ;;
     --candidate) candidate=$2; shift 2 ;;
+    # This reconciler keeps no cross-invocation state of its own: HAProxy's own runtime
+    # tree under `--install-root` is the whole state. Accept and discard the agent's
+    # scratch directory.
+    --state-dir) shift 2 ;;
     --candidate-version) shift 2 ;;
     --input-file | --output-file) shift 2 ;;
     --predecessor) predecessor=$2; shift 2 ;;
@@ -42,7 +44,6 @@ done
 
 [[ $protocol == 1 ]] || die "unsupported reconciler protocol '$protocol'"
 [[ -n $root ]] || die "missing --install-root"
-[[ -n $state_dir ]] || die "missing --state-dir"
 runtime="$root/runtime"
 
 audit "$root" "$operation" "$attempt" started

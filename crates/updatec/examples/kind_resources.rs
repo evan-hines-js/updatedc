@@ -29,7 +29,6 @@ fn runtime() -> RuntimeSpec {
             health_grace_seconds: 30,
             health_successes: 2,
             health_interval_seconds: 1,
-            retry_after_seconds: 5,
             refresh_retry_seconds: 2,
             confirmation_window_seconds: 2,
             supervisor_check_interval_seconds: 3600,

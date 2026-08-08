@@ -13,6 +13,9 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// be called at any time without racing an in-flight [`atomic_write`].
 const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 
+/// The prefix [`install_executable`] stages under, and the one it sweeps.
+const EXECUTABLE_TEMP_PREFIX: &str = ".executable-";
+
 /// Who may read a durable file once it is committed. Every file this module creates commits to
 /// exactly one of these at `open(2)`/`CreateFileW` time — permissions are never widened and then
 /// narrowed, and no caller ever chmods (or `icacls`es) afterwards, which is the property that
@@ -158,14 +161,6 @@ fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn create(path: &Path, _visibility: Visibility) -> io::Result<File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-}
-
 fn create_temp_with(
     dir: &Path,
     prefix: &str,
@@ -303,7 +298,12 @@ pub fn committed_unsynced(error: &io::Error) -> bool {
 /// staged by an elevated installer step remains launchable by the service.
 pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
     let dir = parent_dir(target);
-    let (mut tmp, tmp_path) = create_temp_managed(dir, ".executable-")?;
+    // Reap the leftover an earlier crash between the copy and the rename would have left HERE.
+    // The prefix is private to this function, so no caller could ever sweep it; staging directories
+    // are content-addressed and re-entered on every retry of the same candidate, so without this
+    // the orphans accumulate one per crash and nothing prunes them.
+    sweep_stale_temps(dir, EXECUTABLE_TEMP_PREFIX);
+    let (mut tmp, tmp_path) = create_temp_managed(dir, EXECUTABLE_TEMP_PREFIX)?;
     let staged = File::open(source)
         .and_then(|mut source| io::copy(&mut source, &mut tmp))
         .and_then(|_| tmp.sync_all());
@@ -342,15 +342,19 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
     }
 }
 
-/// Best-effort removal of stale temp files left behind when a crash or power loss struck
-/// between an [`atomic_write`]/[`install_executable`]/[`create_temp_managed`] and its rename —
-/// the `<prefix>…-….tmp` sibling is then an orphan no one will ever finish. Sweeps `dir`
-/// for files whose name starts with `prefix` and ends with `.tmp`, removing only those whose
-/// age is known to have reached [`STALE_TEMP_AGE`] — anything newer, and anything whose age
-/// cannot be determined, is spared so a temp an in-flight writer still owns is never yanked.
+/// Best-effort removal of stale staging leftovers — the ONE sweeper for every
+/// `<prefix>…-….tmp` orphan this workspace can leave behind when a crash or power loss strikes
+/// between staging and the rename that commits it: an [`atomic_write`], an [`install_executable`],
+/// a bare [`create_temp_managed`], or a staged *directory* such as a signed metadata generation.
 ///
-/// Purely hygiene: a directory-read or unlink failure is ignored (a stray temp is inert —
-/// the sequence/pid/nanos naming means it can never collide with a real committed file),
+/// Sweeps `dir` for entries whose name starts with `prefix` and ends with `.tmp`, removing only
+/// those whose age is known to have reached [`STALE_TEMP_AGE`]. Files are unlinked; directories are
+/// removed whole, since a `.tmp` directory under a staging prefix is a half-built stage and nothing
+/// else. Anything newer, and anything whose age cannot be determined, is spared, so a stage an
+/// in-flight writer still owns is never yanked.
+///
+/// Purely hygiene: a directory-read or removal failure is ignored (a stray stage is inert —
+/// the sequence/pid/nanos naming means it can never collide with a real committed path),
 /// so this returns the count removed rather than a `Result`.
 pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
     let now = SystemTime::now();
@@ -366,8 +370,10 @@ pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
         }
         // Only a *known* age past the threshold proves abandonment. An unreadable mtime, or
         // one in the future because the clock stepped backwards under an in-flight writer,
-        // leaves the age unknown — spare the temp rather than yank a file someone still owns.
+        // leaves the age unknown — spare the stage rather than yank one someone still owns.
         // A spared orphan is inert and the next sweep, once the clock settles, reaps it.
+        // (A directory's mtime advances as files are written into it, so a stage being filled
+        // right now reads as fresh for exactly as long as it is being filled.)
         let provably_stale = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -377,7 +383,13 @@ pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
         if !provably_stale {
             continue;
         }
-        if fs::remove_file(entry.path()).is_ok() {
+        let path = entry.path();
+        let gone = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            fs::remove_dir_all(&path).is_ok()
+        } else {
+            fs::remove_file(&path).is_ok()
+        };
+        if gone {
             removed += 1;
         }
     }
@@ -475,17 +487,17 @@ pub fn sync_tree(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn dir(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("foundation-durable-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+    fn dir(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let d = guard.path().join(name);
         fs::create_dir_all(&d).unwrap();
-        d
+        (guard, d)
     }
 
     #[test]
     fn atomic_write_replaces_the_whole_file() {
-        let p = dir("replace").join("state");
+        let (_guard, d) = dir("replace");
+        let p = d.join("state");
         atomic_write(&p, ".test-", b"first").unwrap();
         atomic_write(&p, ".test-", b"second-longer").unwrap();
         assert_eq!(fs::read(p).unwrap(), b"second-longer");
@@ -500,7 +512,7 @@ mod tests {
         // on a failed commit; rolling back a pointer that moved rejects the binary the next boot
         // launches as the committed supervisor.
         use std::os::unix::fs::PermissionsExt;
-        let d = dir("unsynced");
+        let (_guard, d) = dir("unsynced");
         let p = d.join("pointer");
         atomic_write_managed(&p, ".test-", b"old").unwrap();
         // Write and search but not read: creating and renaming the temp still works, opening the
@@ -561,7 +573,7 @@ mod tests {
 
     #[test]
     fn executable_install_uses_the_canonical_durable_path() {
-        let root = dir("executable");
+        let (_guard, root) = dir("executable");
         let source = root.join("download");
         let target = root.join("supervisor");
         fs::write(&source, b"verified bytes").unwrap();
@@ -584,7 +596,7 @@ mod tests {
         // The point of `remove_path` is that the caller does not get to assume the shape of what
         // it is clearing: a plain unlink fails on a directory on every platform, which would turn
         // "discard this garbage and carry on" into a failure repeated on every attempt forever.
-        let d = dir("remove-path");
+        let (_guard, d) = dir("remove-path");
 
         let file = d.join("garbage");
         fs::write(&file, b"not evidence").unwrap();
@@ -607,7 +619,7 @@ mod tests {
     fn remove_path_unlinks_a_symlink_without_touching_its_target() {
         // Following the link would delete a tree that merely happened to be pointed at — the
         // garbage is the link itself.
-        let d = dir("remove-symlink");
+        let (_guard, d) = dir("remove-symlink");
         let target = d.join("real");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("keep"), b"precious").unwrap();
@@ -640,7 +652,7 @@ mod tests {
     fn durable_operations_on_a_bare_relative_path_report_success() {
         // A relative `application.state` makes every derived path bare; a committed write
         // reported as Err drives callers into bogus crash recovery.
-        let d = dir("relative");
+        let (_guard, d) = dir("relative");
         struct RestoreDir(std::path::PathBuf);
         impl Drop for RestoreDir {
             fn drop(&mut self) {
@@ -655,25 +667,40 @@ mod tests {
         assert!(!d.join("bare.state").exists());
     }
 
+    /// Both entry kinds a writer stages, in one sweeper: individual temp files, and whole staged
+    /// directories (a signed metadata generation is staged as one). A sweeper that only unlinks
+    /// files leaves an abandoned staged directory behind forever, accumulating one per crash —
+    /// which is why the publisher grew a second copy of this function once already.
     #[test]
-    fn sweep_removes_stale_temps_but_spares_fresh_and_unrelated_files() {
-        let d = dir("sweep");
+    fn sweep_removes_stale_temps_of_both_kinds_but_spares_fresh_and_unrelated_entries() {
+        let (_guard, d) = dir("sweep");
         // A committed file and an unrelated `.tmp` (wrong prefix) must survive.
         fs::write(d.join("state"), b"committed").unwrap();
         fs::write(d.join("other-9-9-9.tmp"), b"not ours").unwrap();
         // A fresh temp under our prefix is an in-flight write — spare it.
         fs::write(d.join(".guardian-1-2-3.tmp"), b"in flight").unwrap();
-        // An aged temp under our prefix is a crash leftover — reap it.
+        let in_flight_stage = d.join(".guardian-generation-live.tmp");
+        fs::create_dir(&in_flight_stage).unwrap();
+        // An aged temp under our prefix is a crash leftover — reap it, file or directory.
+        let aged = SystemTime::now() - (STALE_TEMP_AGE + Duration::from_secs(1));
         let stale = d.join(".guardian-4-5-6.tmp");
         fs::write(&stale, b"orphan").unwrap();
-        let aged = SystemTime::now() - (STALE_TEMP_AGE + Duration::from_secs(1));
         filetime_set(&stale, aged);
+        let stale_stage = d.join(".guardian-generation-dead.tmp");
+        fs::create_dir(&stale_stage).unwrap();
+        fs::write(stale_stage.join("timestamp.json"), b"{}").unwrap();
+        filetime_set(&stale_stage, aged);
 
-        assert_eq!(sweep_stale_temps(&d, ".guardian-"), 1);
+        assert_eq!(sweep_stale_temps(&d, ".guardian-"), 2);
         assert!(d.join("state").exists());
         assert!(d.join("other-9-9-9.tmp").exists());
         assert!(d.join(".guardian-1-2-3.tmp").exists());
+        assert!(in_flight_stage.exists(), "an in-flight stage was yanked");
         assert!(!stale.exists());
+        assert!(
+            !stale_stage.exists(),
+            "an abandoned staged directory survived the sweep"
+        );
     }
 
     /// A node whose clock steps backwards (RTC ran fast, then NTP corrected it) leaves temps
@@ -682,7 +709,7 @@ mod tests {
     /// out from under it and every retry fails the same way.
     #[test]
     fn sweep_spares_temps_whose_age_is_unknown() {
-        let d = dir("sweep-future-mtime");
+        let (_guard, d) = dir("sweep-future-mtime");
         let in_flight = d.join(".guardian-7-8-9.tmp");
         fs::write(&in_flight, b"in flight").unwrap();
         filetime_set(&in_flight, SystemTime::now() + Duration::from_secs(600));
@@ -691,10 +718,17 @@ mod tests {
         assert!(in_flight.exists());
     }
 
-    /// Backdate a file's mtime without pulling in a dependency: reopening and rewriting
-    /// would only refresh it, so set it directly through `File::set_times`.
+    /// Backdate an entry's mtime without pulling in a dependency: reopening and rewriting
+    /// would only refresh it, so set it directly through `File::set_times`. A directory cannot be
+    /// opened for writing, so it is backdated through a read handle.
     fn filetime_set(path: &Path, when: SystemTime) {
         let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
+        if path.is_dir() {
+            File::open(path)
+                .and_then(|handle| handle.set_times(times))
+                .expect("backdate staged directory");
+            return;
+        }
         File::options()
             .write(true)
             .open(path)
@@ -705,7 +739,7 @@ mod tests {
 
     #[test]
     fn temp_creation_only_retries_collisions() {
-        let d = dir("collision");
+        let (_guard, d) = dir("collision");
         let mut attempts = 0;
         let _ = create_temp_with(&d, ".test-", |path| {
             attempts += 1;
@@ -725,7 +759,7 @@ mod tests {
     fn sync_tree_flushes_nested_directories() {
         // sync_tree must descend into every real subdirectory without erroring; a tree with
         // nested dirs (bin/, lib/sub/) exercises the recursive descent.
-        let d = dir("sync-tree");
+        let (_guard, d) = dir("sync-tree");
         fs::create_dir_all(d.join("bin")).unwrap();
         fs::create_dir_all(d.join("lib/sub")).unwrap();
         fs::write(d.join("bin/app"), b"exe").unwrap();
@@ -739,7 +773,7 @@ mod tests {
         // A published artifact is world-readable the instant it exists; nothing repairs a mode
         // after the fact, so the unix and Windows paths agree on who may read what.
         use std::os::unix::fs::PermissionsExt;
-        let d = dir("visibility");
+        let (_guard, d) = dir("visibility");
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let (_f, managed) = create_temp_managed(&d, ".state-").unwrap();
         assert_eq!(mode(&managed), 0o600);
@@ -761,7 +795,7 @@ mod tests {
         // works purely by inheritance. A protected (`D:P`) DACL discards inherited ACEs, so a
         // state file written by an elevated operator CLI would be unreadable and unreplaceable
         // by the service, with no grant able to repair it. Only secrets are protected.
-        let d = dir("managed");
+        let (_guard, d) = dir("managed");
         let (_file, path) = create_temp_managed(&d, ".state-").unwrap();
         assert!(
             !dacl_sddl(&path).starts_with("D:P"),
@@ -787,7 +821,7 @@ mod tests {
         // supplied at creation — to the temp, before any byte is written, and preserved by the
         // rename; without it the file inherits `%ProgramData%`'s `BUILTIN\Users: Read` and every
         // local user can read a node's private key.
-        let d = dir("private");
+        let (_guard, d) = dir("private");
         let path = d.join("secret");
         atomic_write(&path, ".key-", b"k").unwrap();
         let sddl = dacl_sddl(&path);

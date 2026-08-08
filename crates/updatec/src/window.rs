@@ -46,9 +46,12 @@ impl From<chrono::Weekday> for Weekday {
 /// whose day rule matches the calendar day and whose time-of-day span contains the moment.
 ///
 /// Day rule (evaluated per UTC date):
-/// - Empty `weekdays` **and** empty `dates`: every day (a pure daily maintenance window).
-/// - Otherwise the day matches if it is one of `dates`, or its weekday is in `weekdays`
-///   and passes the `intervalWeeks` phase.
+/// - Empty `weekdays`: every day (a pure daily maintenance window). `intervalWeeks`/`anchorWeek`
+///   have no weekday to phase and are rejected by [`RolloutWindow::validate`].
+/// - Otherwise the day matches if its weekday is in `weekdays` and passes the `intervalWeeks`
+///   phase.
+///
+/// One-off dated windows are not written here: they are [`CalendarEntry`], which expires.
 ///
 /// Time-of-day span: `[start, end)` in UTC `HH:MM`. Defaults span the whole day
 /// (`00:00`–`24:00`). If `end <= start` the span wraps past midnight into the following
@@ -56,22 +59,19 @@ impl From<chrono::Weekday> for Weekday {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutWindow {
-    /// Weekdays (UTC) the window recurs on, e.g. `[sunday]`. Empty (with empty `dates`)
-    /// means every day.
+    /// Weekdays (UTC) the window recurs on, e.g. `[sunday]`. Empty means every day.
     #[serde(default)]
     pub weekdays: Vec<Weekday>,
     /// Recur only every Nth week. With `weekdays: [sunday]` and `intervalWeeks: 2` this is
-    /// "every other Sunday". Omitted or `1` means weekly. Requires `anchorWeek` when > 1.
+    /// "every other Sunday". Omitted or `1` means weekly. Requires `anchorWeek` and a non-empty
+    /// `weekdays` when > 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_weeks: Option<u32>,
     /// UTC date (`YYYY-MM-DD`) whose ISO-week is an "on" week, anchoring the `intervalWeeks`
-    /// phase. Any day within the intended on-week works. Required when `intervalWeeks > 1`.
+    /// phase. Any day within the intended on-week works. Required when `intervalWeeks > 1`, and
+    /// only meaningful alongside `weekdays`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_week: Option<String>,
-    /// Specific UTC calendar dates (`YYYY-MM-DD`) the window is active on, unioned with the
-    /// weekday rule.
-    #[serde(default)]
-    pub dates: Vec<String>,
     /// Daily span start, UTC `HH:MM`, inclusive. Default `00:00`.
     #[serde(default = "default_start")]
     pub start: String,
@@ -98,7 +98,6 @@ impl Default for RolloutWindow {
             weekdays: Vec::new(),
             interval_weeks: None,
             anchor_week: None,
-            dates: Vec::new(),
             start: default_start(),
             end: default_end(),
         }
@@ -262,19 +261,11 @@ impl RolloutWindow {
 
     /// Whether `date` (UTC) is one this window's day rule selects, ignoring time of day.
     fn is_active_day(&self, date: NaiveDate) -> bool {
-        // Explicit dates are a straight union with the weekday rule.
-        if self
-            .dates
-            .iter()
-            .filter_map(|raw| parse_date(raw))
-            .any(|listed| listed == date)
-        {
-            return true;
-        }
         if self.weekdays.is_empty() {
-            // Empty weekdays means "every day" only when no dates narrowed the window;
-            // otherwise the window is date-list-only and this date was not in it.
-            return self.dates.is_empty();
+            // The pure daily window. A week phase has nothing to select here, so carrying one is
+            // invalid (`validate`) and — like every other unusable window — never opens, rather
+            // than silently widening an every-other-week gate into a daily one.
+            return !self.has_week_phase();
         }
         if !self.weekdays.contains(&date.weekday().into()) {
             return false;
@@ -294,16 +285,14 @@ impl RolloutWindow {
     /// window still fails safe (never opens) so a typo freezes rollouts rather than
     /// silently rolling on a schedule the operator did not mean.
     pub fn validate(&self) -> Result<(), String> {
+        if self.weekdays.is_empty() && self.has_week_phase() {
+            return Err("intervalWeeks/anchorWeek require weekdays".into());
+        }
         if parse_minute(&self.start).is_none() {
             return Err(format!("start {:?} is not a UTC HH:MM time", self.start));
         }
         if parse_minute(&self.end).is_none() {
             return Err(format!("end {:?} is not a UTC HH:MM time", self.end));
-        }
-        for raw in &self.dates {
-            if parse_date(raw).is_none() {
-                return Err(format!("date {raw:?} is not a UTC YYYY-MM-DD date"));
-            }
         }
         if matches!(self.interval_weeks, Some(n) if n > 1) {
             match self.anchor_week.as_deref() {
@@ -322,6 +311,11 @@ impl RolloutWindow {
             }
         }
         Ok(())
+    }
+
+    /// Whether the window asks for an every-Nth-week phase. Only meaningful with `weekdays`.
+    fn has_week_phase(&self) -> bool {
+        matches!(self.interval_weeks, Some(n) if n > 1) || self.anchor_week.is_some()
     }
 }
 
@@ -480,34 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_dates_union_with_weekdays() {
-        let w = RolloutWindow {
-            weekdays: vec![Weekday::Sunday],
-            dates: vec!["2026-07-20".into()], // a Monday
-            ..window()
-        };
-        assert!(
-            w.is_active(at("2026-07-19T12:00:00Z")),
-            "Sunday via weekday rule"
-        );
-        assert!(
-            w.is_active(at("2026-07-20T12:00:00Z")),
-            "Monday via explicit date"
-        );
-        assert!(!w.is_active(at("2026-07-21T12:00:00Z")), "Tuesday: neither");
-    }
-
-    #[test]
-    fn date_only_window_does_not_match_every_day() {
-        let w = RolloutWindow {
-            dates: vec!["2026-12-25".into()],
-            ..window()
-        };
-        assert!(w.is_active(at("2026-12-25T12:00:00Z")));
-        assert!(!w.is_active(at("2026-12-26T12:00:00Z")));
-    }
-
-    #[test]
     fn empty_schedule_is_a_daily_window() {
         let w = RolloutWindow {
             start: "01:00".into(),
@@ -571,6 +537,40 @@ mod tests {
     }
 
     #[test]
+    fn a_week_phase_without_weekdays_is_rejected_and_never_opens() {
+        // The every-other-week gate an operator writes without weekdays used to short-circuit on
+        // the empty-weekdays fast path and open EVERY day — a maintenance gate silently widened
+        // into a daily one, failing open. It is a validation error, and it fails closed.
+        let biweekly = RolloutWindow {
+            interval_weeks: Some(2),
+            anchor_week: Some("2026-07-19".into()),
+            start: "02:00".into(),
+            end: "04:00".into(),
+            ..window()
+        };
+        assert!(biweekly.validate().is_err());
+        for day in 0i64..14 {
+            let now = at("2026-07-19T02:30:00Z") + Duration::days(day);
+            assert!(!biweekly.is_active(now), "must not open at {now}");
+        }
+        // An anchor alone is the same mistake and is caught the same way.
+        let anchored = RolloutWindow {
+            anchor_week: Some("2026-07-19".into()),
+            ..window()
+        };
+        assert!(anchored.validate().is_err());
+        assert!(!anchored.is_active(at("2026-07-19T02:30:00Z")));
+        // Naming the weekdays makes the same phase legal, and it then opens on its own week only.
+        let named = RolloutWindow {
+            weekdays: vec![Weekday::Sunday],
+            ..biweekly
+        };
+        assert!(named.validate().is_ok());
+        assert!(named.is_active(at("2026-07-19T02:30:00Z")));
+        assert!(!named.is_active(at("2026-07-26T02:30:00Z")));
+    }
+
+    #[test]
     fn an_anchor_with_no_representable_week_is_rejected_and_never_opens() {
         // Normalising a date to its week's Monday PANICS below `NaiveDate::MIN + 6 days` rather
         // than saturating, and `is_active` runs on the reconcile task for every set on every pass:
@@ -623,8 +623,8 @@ mod tests {
 
     #[test]
     fn empty_schedule_daily_window_never_blocks_across_the_week() {
-        // No weekdays and no dates => every day, and the default span is the full day: the
-        // window is open at every hour of every day.
+        // No weekdays => every day, and the default span is the full day: the window is open at
+        // every hour of every day.
         let w = window();
         let base = at("2026-07-13T00:00:00Z");
         for hour in 0i64..(24 * 7) {
@@ -677,10 +677,6 @@ mod tests {
                 interval_weeks: Some(2), // missing anchorWeek
                 ..window()
             },
-            RolloutWindow {
-                dates: vec!["not-a-date".into()],
-                ..window()
-            },
         ];
         let base = at("2026-07-13T00:00:00Z");
         for hour in 0i64..(24 * 7) {
@@ -697,7 +693,6 @@ mod tests {
             anchor_week: Some("2026-07-19".into()),
             start: "02:00".into(),
             end: "04:00".into(),
-            ..Default::default()
         };
         assert!(w.validate().is_ok());
     }

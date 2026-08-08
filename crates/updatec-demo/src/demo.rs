@@ -3,7 +3,6 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Client, ResourceExt};
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -13,10 +12,7 @@ use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub(crate) struct Demo {
-    pub(crate) application_url: String,
-    pub(crate) release: ReleaseRequest,
     pub(crate) publisher: KubernetesPublisher,
-    pub(crate) http: reqwest::Client,
     pub(crate) chaos: Arc<Mutex<ChaosState>>,
     pub(crate) chaos_task: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     /// `DEMO_DISABLE_CHAOS`: when set, skip the injected disruption — no pod SIGKILLs, no
@@ -64,39 +60,11 @@ pub(crate) struct Demo {
 
 impl Demo {
     pub(crate) async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let application_path = required("DEMO_APPLICATION_PATH")?;
-        let application_sha256 = required("DEMO_APPLICATION_SHA256")?;
-        let provider_path = required("DEMO_PROVIDER_PATH")?;
-        let provider_sha256 = required("DEMO_PROVIDER_SHA256")?;
-        let patch = serde_json::json!({
-            "spec": {
-                "defaultDeployment": {
-                    "name": "default",
-                    "application": {
-                        "path": application_path,
-                        "sha256": application_sha256
-                    },
-                    "providerSet": {
-                        "path": provider_path,
-                        "sha256": provider_sha256
-                    }
-                }
-            }
-        });
-        let release = ReleaseRequest::green();
         Ok(Self {
-            application_url: env::var("DEMO_APPLICATION_URL")
-                .unwrap_or_else(|_| "http://agent-4.agents:8080".into()),
-            release,
             publisher: KubernetesPublisher {
                 namespace: env::var("DEMO_NAMESPACE").unwrap_or_else(|_| "updated-system".into()),
-                repository: env::var("DEMO_REPOSITORY").unwrap_or_else(|_| "default".into()),
-                patch,
                 client: Client::try_default().await?,
             },
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
-                .build()?,
             chaos: Arc::new(Mutex::new(ChaosState::default())),
             chaos_task: Arc::new(Mutex::new(None)),
             chaos_disabled: matches!(
@@ -126,26 +94,6 @@ impl Demo {
             readiness: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             readiness_fresh_at: Arc::new(StdMutex::new(Instant::now())),
         })
-    }
-
-    pub(crate) async fn apply(
-        &self,
-        requested: &ReleaseRequest,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if requested != &self.release {
-            return Err("release declaration does not match the advertised signed target".into());
-        }
-        self.publisher.publish().await
-    }
-
-    pub(crate) async fn version(&self) -> Result<String, reqwest::Error> {
-        self.http
-            .get(format!("{}/version", self.application_url))
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await
     }
 
     pub(crate) async fn fleet(&self) -> Result<Vec<FleetNode>, Box<dyn std::error::Error>> {
@@ -191,9 +139,8 @@ impl Demo {
                 kind,
                 healthy,
                 in_load_balancer,
-                // The watch carries no probe timing; keep the field for the UI, zeroed, and note
-                // an OUT node's source so a tooltip still distinguishes it from a slow probe.
-                readyz_probe_millis: 0,
+                // Note an OUT node's source so a tooltip distinguishes a real not-ready from a
+                // stalled watch.
                 probe_note: (!in_load_balancer).then(|| {
                     if stale {
                         "readiness unknown (watch stalled) — failing closed".to_string()
@@ -816,14 +763,14 @@ impl Demo {
         }
 
         let mut converged = false;
-        // Budget is 240s of *admitting* time, not wall-clock. A frozen set admits no new
+        // Budget is [`DEMO_CONVERGE_TIMEOUT_SECS`] of *admitting* time, not wall-clock. A frozen set admits no new
         // rollout, so its time cannot count against convergence — and a freeze being added or
         // lifted resets the clock so the fleet always gets a full window once the gate reopens.
         // Without this, a release-gate freeze (a normal operator action) would time the loop out
         // and stop it entirely.
         let mut attempt = 0usize;
         let mut was_frozen = false;
-        while attempt < 240 {
+        while attempt < DEMO_CONVERGE_TIMEOUT_SECS {
             let frozen = self.any_set_frozen().await;
             if frozen || frozen != was_frozen {
                 attempt = 0;
@@ -865,7 +812,7 @@ impl Demo {
         }
         if !converged {
             return Err(format!(
-                "fleet did not converge onto {converge_version} within 240 seconds"
+                "fleet did not converge onto {converge_version} within {DEMO_CONVERGE_TIMEOUT_SECS} seconds"
             )
             .into());
         }
@@ -926,8 +873,9 @@ impl Demo {
     ///
     /// `updatectl deploy` patches the application ref but not the deployment *identity*, so we
     /// bump it to `group@version` here — the throttle counts a member settled only once every
-    /// one of its agents reports exactly that identity, healthy. Backend (bucket/endpoint/
-    /// prefix/keys) + AWS creds come from the `UPDATECTL_*`/`AWS_*` env the demo pod carries.
+    /// one of its agents reports exactly that identity, healthy. The repository it publishes into
+    /// is the layout's one release-repository location — the same one every group's signed
+    /// `releaseRepository` resolves out of — and the AWS creds come from the pod's `AWS_*` env.
     async fn deploy_group(
         &self,
         group: &str,
@@ -941,29 +889,26 @@ impl Demo {
             .trim()
             .to_owned();
         let source = source.to_str().ok_or("non-UTF-8 source path")?;
-        // Backend defaults match the demo's in-cluster MinIO; the signing keys live on the
-        // shared release-repository PVC the bootstrap wrote them to. AWS creds come from the
-        // pod env. Every value is overridable via `UPDATECTL_*` for a real CDN.
-        let bucket = env::var("UPDATECTL_BUCKET").unwrap_or_else(|_| "updates".into());
-        let prefix = env::var("UPDATECTL_PREFIX").unwrap_or_else(|_| "releases".into());
-        let endpoint =
-            env::var("UPDATECTL_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".into());
-        let region = env::var("UPDATECTL_REGION").unwrap_or_else(|_| "us-east-1".into());
-        let keys_dir = env::var("UPDATECTL_KEYS_DIR")
-            .unwrap_or_else(|_| data.join("release-keys").to_string_lossy().into_owned());
+        // Where this publishes is not a second, overridable opinion: it is the demo's one release
+        // repository (`DEMO_RELEASE_*`), the location signed into every group's
+        // `releaseRepository`. Overriding one side alone published targets into a bucket the
+        // groups' signed repository does not name, so every agent failed to resolve the target it
+        // had just been assigned. The signing keys live on the shared release-repository PVC the
+        // bootstrap wrote them to.
+        let keys_dir = data.join("release-keys").to_string_lossy().into_owned();
         let mut command = tokio::process::Command::new("/usr/local/bin/updatectl");
         command.args([
             "deploy",
             "--keys-dir",
             &keys_dir,
             "--bucket",
-            &bucket,
+            DEMO_RELEASE_BUCKET,
             "--prefix",
-            &prefix,
+            DEMO_RELEASE_PREFIX,
             "--endpoint",
-            &endpoint,
+            DEMO_RELEASE_ENDPOINT,
             "--region",
-            &region,
+            DEMO_RELEASE_REGION,
             "--namespace",
             &self.publisher.namespace,
             "--group",
@@ -1003,47 +948,6 @@ impl Demo {
                 }}})),
             )
             .await?;
-        Ok(())
-    }
-
-    /// Roll the single manual Magnolia node from v1 to v2 — the "Upgrade Magnolia" button.
-    /// The operator observes the changed desired state, signs it, and the node runs the real
-    /// custom, in-place upgrade (back the JCR up to another disk, reuse the repository, restore
-    /// on failure). Idempotent: clicking again while it is already on v2 is a no-op.
-    pub(crate) async fn upgrade_magnolia_manual(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let data = PathBuf::from(
-            env::var("DEMO_REPOSITORY_DATA").unwrap_or_else(|_| "/release-data".into()),
-        );
-        let platform = std::fs::read_to_string(data.join("platform"))?
-            .trim()
-            .to_owned();
-        let path = format!("products/magnolia/stable/2.0.0/{platform}/app");
-        let sha256 = output(
-            Command::new("/usr/local/bin/server").args([
-                "target-sha256",
-                "--repo",
-                data.join("repository")
-                    .to_str()
-                    .ok_or("non-UTF-8 repo path")?,
-                "--name",
-                &path,
-            ]),
-        )?;
-        self.publisher
-            .groups()
-            .patch(
-                MAGNOLIA_MANUAL_GROUP,
-                &PatchParams::default(),
-                &Patch::Merge(serde_json::json!({"spec":{"deployment":{
-                    "name": format!("{MAGNOLIA_MANUAL_GROUP}@2.0.0"),
-                    "application":{"path":path,"sha256":sha256.trim()}
-                }}})),
-            )
-            .await?;
-        self.event(
-            "manual Magnolia upgrade to v2 requested (custom in-place, backup + restore)".into(),
-        )
-        .await;
         Ok(())
     }
 
@@ -1168,9 +1072,9 @@ impl Demo {
     /// app, or restore Magnolia's in-place JCR from its backup disk.
     ///
     /// Two bounded targets, so it exercises recovery without ever breaching availability:
-    ///   * Fleet pods — only pods already *draining* (out of the load balancer), and at most
-    ///     [`DEMO_CHAOS_MAX_GROUPS_PER_SET`] cohort group per set, so the set's other group
-    ///     keeps serving and no serving pod is ever removed.
+    ///   * Fleet pods — only pods already *draining* (out of the load balancer), and exactly one
+    ///     cohort group per set, so the set's other group keeps serving and no serving pod is
+    ///     ever removed ([`DEMO_UPTIME_MARGIN`] is the floor this leaves).
     ///   * The controller — some rounds also crash the updatec operator, which reloads its
     ///     persisted admitted-deployment state and resumes the rollout where it left off.
     pub(crate) async fn inject_chaos(&self, seed: u64) {
@@ -1221,10 +1125,11 @@ impl Demo {
             // At most one cohort group per set: pick a single group and take all of its
             // already-draining pods, leaving every other group in the set untouched.
             let cohorts: Vec<usize> = groups.keys().copied().collect();
-            for _ in 0..DEMO_CHAOS_MAX_GROUPS_PER_SET.min(cohorts.len()) {
-                let cohort = cohorts[(splitmix64(&mut rng) as usize) % cohorts.len()];
-                victims.extend(groups[&cohort].iter().cloned());
+            if cohorts.is_empty() {
+                continue;
             }
+            let cohort = cohorts[(splitmix64(&mut rng) as usize) % cohorts.len()];
+            victims.extend(groups[&cohort].iter().cloned());
         }
         if victims.is_empty() {
             self.event(format!(
@@ -1295,7 +1200,9 @@ impl Demo {
         }
     }
 
+    /// The served page, with the one value it cannot compute for itself — how many cohorts the
+    /// fleet has — filled in from the layout that defines it.
     pub(crate) fn page(&self) -> String {
-        PAGE.to_owned()
+        PAGE.replace("{{COHORT_COUNT}}", &DEMO_COHORT_COUNT.to_string())
     }
 }

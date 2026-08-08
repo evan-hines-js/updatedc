@@ -195,10 +195,6 @@ impl ContainedChild {
         {
             windows::request_stop(self.child.id())
         }
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(())
-        }
     }
 
     /// Stop the whole tree: ask gracefully, wait out `grace`, then kill it and give the reap
@@ -256,14 +252,6 @@ impl ContainedChild {
         #[cfg(windows)]
         {
             self.job.terminate()
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            if self.reaped {
-                Ok(())
-            } else {
-                self.child.kill()
-            }
         }
     }
 }

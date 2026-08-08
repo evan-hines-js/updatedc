@@ -23,7 +23,7 @@ pub(crate) fn spawn_load_generator(demo: Demo) {
     tokio::spawn(async move {
         // Per-set instant the pool first became full; a set starts counting once it has
         // held a full pool continuously for LOAD_STEADY_GRACE (baseline reached).
-        let expected_per_set = 2 * DEMO_COHORT_SIZE;
+        let expected_per_set = DEMO_GROUPS_PER_SET * DEMO_COHORT_SIZE;
         let mut full_since: Vec<Option<Instant>> = vec![None; DEMO_SET_COUNT];
         loop {
             if let Ok(ready) = refresher.ready_endpoints().await {

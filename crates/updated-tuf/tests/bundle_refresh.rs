@@ -12,14 +12,11 @@ use updated::enrollment::BundlePolicy;
 use updated_contracts::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
 use updated_tuf::{repo, EmbeddedChainPolicy};
 
-fn scratch(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "updated-tuf-{label}-{}-{}",
-        std::process::id(),
-        updated::rand::token().unwrap()
-    ));
+fn scratch(label: &str) -> (tempfile::TempDir, PathBuf) {
+    let guard = tempfile::tempdir().unwrap();
+    let dir = guard.path().join(label);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    (guard, dir)
 }
 
 /// The newest published copy of a role document; a consistent-snapshot repository writes the
@@ -84,7 +81,6 @@ fn assignment(install_root: &Path) -> updated_contracts::assignment::RepositoryA
                 health_grace_seconds: 5,
                 health_successes: 1,
                 health_interval_seconds: 1,
-                retry_after_seconds: 5,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 5,
                 supervisor_check_interval_seconds: 5,
@@ -204,7 +200,7 @@ fn bundle_for(repo_dir: &Path, published: &Published) -> EnrollmentBundle {
 
 #[tokio::test]
 async fn a_refresh_may_not_move_the_node_onto_another_agents_assignment() {
-    let tmp = scratch("bundle-pin-assignment");
+    let (_tmp, tmp) = scratch("bundle-pin-assignment");
     let install_root = tmp.join("install");
     let routing = Routing::author(&tmp).await;
     let published = routing
@@ -237,7 +233,7 @@ async fn a_refresh_may_not_move_the_node_onto_another_agents_assignment() {
 
 #[tokio::test]
 async fn a_refresh_may_not_move_where_routing_is_read_from() {
-    let tmp = scratch("bundle-pin-routing-base");
+    let (_tmp, tmp) = scratch("bundle-pin-routing-base");
     let install_root = tmp.join("install");
     let routing = Routing::author(&tmp).await;
     let current = bundle_for(
@@ -289,7 +285,7 @@ async fn a_refresh_may_not_move_where_routing_is_read_from() {
 /// nothing was fetched.
 #[tokio::test]
 async fn a_refresh_may_not_fast_forward_the_pinned_root_version() {
-    let tmp = scratch("bundle-root-fast-forward");
+    let (_tmp, tmp) = scratch("bundle-root-fast-forward");
     let install_root = tmp.join("install");
     let routing = Routing::author(&tmp).await;
     let empty_origin = tmp.join("empty-origin");
@@ -349,7 +345,7 @@ fn role_version(document: &str) -> u64 {
 /// Every signature and digest verifies, so only a version floor on the other three roles refuses it.
 #[tokio::test]
 async fn a_refresh_may_not_roll_the_repository_generation_back() {
-    let tmp = scratch("bundle-generation-rollback");
+    let (_tmp, tmp) = scratch("bundle-generation-rollback");
     let install_root = tmp.join("install");
     let routing = Routing::author(&tmp).await;
     let withdrawn = bundle_for(
@@ -391,7 +387,7 @@ async fn a_refresh_may_not_roll_the_repository_generation_back() {
 
 #[tokio::test]
 async fn a_refresh_may_not_move_the_nodes_install_root() {
-    let tmp = scratch("bundle-pin-install-root");
+    let (_tmp, tmp) = scratch("bundle-pin-install-root");
     let pinned = tmp.join("install");
     let routing = Routing::author(&tmp).await;
     let current = bundle_for(
@@ -448,7 +444,7 @@ fn root_version(bundle: &EnrollmentBundle) -> u64 {
 /// verify each against the one before it.
 #[tokio::test]
 async fn a_refresh_walks_the_published_roots_to_catch_a_lagging_pin_up() {
-    let tmp = scratch("bundle-root-catch-up");
+    let (_tmp, tmp) = scratch("bundle-root-catch-up");
     let install_root = tmp.join("install");
     let routing = Routing::author(&tmp).await;
     let current = served_from(

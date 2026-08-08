@@ -8,3 +8,6 @@ license.workspace = true
 foundation = { path = "../foundation" }
 updated-contracts = { path = "../updated-contracts" }
 ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -55,12 +55,8 @@ fn policy() -> DefaultPolicy {
 
 #[tokio::test]
 async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
-    let tmp = std::env::temp_dir().join(format!(
-        "updated-tuf-offline-{}-{}",
-        std::process::id(),
-        updated::rand::token().unwrap()
-    ));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let tmp = scratch.path().to_path_buf();
     let repo_dir = tmp.join("routing");
     let keys = repo::generate_keys(&tmp.join("routing-keys"))
         .await
@@ -94,7 +90,6 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             health_grace_seconds: 5,
             health_successes: 1,
             health_interval_seconds: 1,
-            retry_after_seconds: 5,
             refresh_retry_seconds: 5,
             confirmation_window_seconds: 5,
             supervisor_check_interval_seconds: 5,
@@ -318,7 +313,6 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("digest mismatch"), "{error}");
-    let _ = std::fs::remove_dir_all(tmp);
 }
 
 /// The file `resolve_assignment` writes IS this node's live boot config: the next boot launches the
@@ -329,12 +323,8 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
 /// assignment and a failure that is never retryable.
 #[tokio::test]
 async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_config() {
-    let tmp = std::env::temp_dir().join(format!(
-        "updated-tuf-commit-{}-{}",
-        std::process::id(),
-        updated::rand::token().unwrap()
-    ));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let tmp = scratch.path().to_path_buf();
     let repo_dir = tmp.join("routing");
     let keys = repo::generate_keys(&tmp.join("routing-keys"))
         .await
@@ -391,7 +381,6 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
                     health_grace_seconds: 5,
                     health_successes: 1,
                     health_interval_seconds: 1,
-                    retry_after_seconds: 5,
                     refresh_retry_seconds: 5,
                     confirmation_window_seconds: 5,
                     supervisor_check_interval_seconds: 5,
@@ -491,14 +480,12 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
             "a rejected {expected} left its staging file behind"
         );
     }
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[tokio::test]
 async fn publish_then_verify_and_download() {
-    let tmp = std::env::temp_dir().join(format!("updated-tuf-rt-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let tmp = scratch.path().to_path_buf();
 
     let (repo_dir, keys, target_path) = author(&tmp).await;
 
@@ -572,7 +559,9 @@ async fn publish_then_verify_and_download() {
     assert_eq!(selected.version, "1.0.0");
 
     let staged_path = tmp.join("staged");
-    repo.stage_release(&selected, &staged_path).await.unwrap();
+    repo.download_target(&selected.target, &staged_path)
+        .await
+        .unwrap();
     assert_eq!(std::fs::read(&staged_path).unwrap(), b"hello-app-1.0.0");
 
     let out = tmp.join("downloaded");
@@ -742,8 +731,6 @@ async fn publish_then_verify_and_download() {
     let current = replaced.all_targets();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].path, "assignments/agents/current.json");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// A download killed mid-stream — SIGKILL from the guardian, a reboot, power loss — leaves its
@@ -753,12 +740,8 @@ async fn publish_then_verify_and_download() {
 /// bundle-sized orphan per attempt until the install root fills and every update fails.
 #[tokio::test]
 async fn downloading_reclaims_staging_temps_orphaned_by_an_earlier_interrupted_download() {
-    let tmp = std::env::temp_dir().join(format!(
-        "updated-tuf-target-sweep-{}-{}",
-        std::process::id(),
-        updated::rand::token().unwrap()
-    ));
-    std::fs::create_dir_all(&tmp).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let tmp = scratch.path().to_path_buf();
     let (repo_dir, _keys, target_path) = author(&tmp).await;
     let repo = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds"))
         .await
@@ -808,6 +791,4 @@ async fn downloading_reclaims_staging_temps_orphaned_by_an_earlier_interrupted_d
         unrelated.is_dir(),
         "the sweep touches only its own staging temps"
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }

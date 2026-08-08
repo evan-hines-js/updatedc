@@ -28,13 +28,13 @@ It brings up **everything** on that one host:
    (`demo_ingress`).
 4. **a co-located out-of-cluster agent** — a real agent on this same host, outside kind, that
    enrolls with the in-cluster control plane and becomes the **manual Magnolia node**. It
-   resolves `updatec-gateway`/`release-default` to `127.0.0.1` (nginx) — no socat, no LAN-IP
-   (`demo_colocated_agent`).
+   resolves `updatec-gateway`/`release-default` to `127.0.0.1` (nginx) — no socat, no LAN-IP.
+   It is the same `updated_agent` role a production fleet uses, with demo variables.
 5. **the demo layer** — fleet scale, groups/sets, per-set services + ingress, the reconciler,
    and labeling the co-located agent into the manual group (`demo_app`, via `updatec-demo setup`).
 
-Click **Upgrade Magnolia** in the UI and the operator publishes v2 to the CDN; the co-located
-agent on this same host rolls the real in-place Magnolia upgrade.
+The co-located agent holds the manual group at its published baseline; a rollout published to
+that group with `updatectl deploy` rolls the real in-place Magnolia upgrade on this same host.
 
 ---
 
@@ -69,11 +69,13 @@ ansible-playbook -i inventory.ini install-agent.yml \
 
 | Var | Required | Meaning |
 |-----|----------|---------|
-| `updatedc_source` | yes | Path to the `updatedc` workspace on the control node; rsync'd to the target and built there (native binaries, no cross-compile). The former `updated_source` name remains a compatibility alias. |
+| `updatedc_source` | yes | Path to the `updatedc` workspace on the control node; rsync'd to the target and built there (native binaries, no cross-compile). |
 | `updated_enrollment_url` | — | Control-plane enrollment endpoint, HTTPS (default `https://updatec-gateway`). |
 | `updated_enrollment_client_cert` / `_client_key` / `_ca` | yes | base64 PEM of the fleet client certificate, its key, and the fleet CA — the mTLS identity (cert-manager issues these; there is no shared secret). |
 | `updated_hostname` | — | Stable identity the control plane addresses the node by (default: inventory name). Written verbatim as `name` in `/etc/updated/bootstrap.toml`; the gateway mints it as the node's certificate CN and creates the `UpdateAgent` object under exactly this string. |
-| `updated_demo_shim_host` / `updated_demo_shim_port` | — | **Demo only.** When set, the role points the in-cluster gateway names at a local `socat` forward to `host:port` — used by `updatec-demo` to reach the kind gateway exposed on the laptop's LAN. Omit in production. |
+| `updated_build_dir` | — | Where the source is built on the target (default `~/updatedc-src`). Set it equal to `updatedc_source` — as `demo.yml` does — to build a checkout that already lives on the target in place, skipping the rsync. |
+| `updated_gateway_local_names` | — | **Demo only.** Point `updatec-gateway`/`release-default` at `127.0.0.1` in `/etc/hosts` (defaults to true whenever `updated_demo_shim_host` is set). |
+| `updated_demo_shim_host` / `updated_demo_shim_port` | — | **Demo only.** When set, the role adds a local `socat` forward to `host:port` behind those names — used by `updatec-demo` to reach the kind gateway exposed on the laptop's LAN. Omit in production. |
 
 ## What it installs
 

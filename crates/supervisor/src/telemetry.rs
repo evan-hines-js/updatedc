@@ -42,8 +42,11 @@ pub struct RunningState<'a> {
     pub healthy: bool,
     /// Latest successful opaque node-state fingerprint, when one is currently publishable.
     pub fingerprint: Option<&'a updated_contracts::telemetry::Fingerprint>,
-    /// Validated outputs emitted by the exact running archive.
-    pub outputs: Option<&'a OutputManifest>,
+    /// Where installed archives live, and the manifest digest identifying the running one — the
+    /// two inputs [`load_outputs`] needs. The outputs themselves are read here, not by the caller,
+    /// so the rule that only a settled report carries them is enforced in exactly one place.
+    pub install_root: &'a std::path::Path,
+    pub manifest_sha256: &'a str,
 }
 
 /// Read and validate the running archive's bounded output manifest. A missing file means the
@@ -116,7 +119,12 @@ pub async fn report_running_state(
         state.healthy,
     );
     report.fingerprint = state.fingerprint.cloned();
-    report.outputs = state.healthy.then(|| state.outputs.cloned()).flatten();
+    // Outputs describe what the running archive settled on, so an unsettled node has none to
+    // publish — and no reason to pay the read. One gate, at the one place that attaches them.
+    report.outputs = state
+        .healthy
+        .then(|| load_outputs(state.install_root, state.manifest_sha256))
+        .flatten();
     // Signed with the node's per-node key so the throttle and the health proxy can verify authenticity
     // end-to-end, rather than trusting the write hop.
     let body = match sign_report(&report, key).and_then(|envelope| {

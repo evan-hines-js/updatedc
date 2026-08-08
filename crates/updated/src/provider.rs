@@ -8,9 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::bundle::{
-    self, BundleLimits, BundleManifest, ExpectedBundle, InstallError, ReleaseId, StagedRelease,
-};
+use crate::bundle::{self, BundleLimits, BundleManifest, ExpectedBundle, InstallError, ReleaseId};
 use crate::config::Paths;
 
 /// A release store rooted at `versions/` plus its `staging/` scratch and the `work/` root that
@@ -86,7 +84,7 @@ impl BundleStore {
         &self,
         archive: &Path,
         expected: &ExpectedBundle<'_>,
-    ) -> Result<StagedRelease, InstallError> {
+    ) -> Result<ReleaseId, InstallError> {
         bundle::stage_bundle(
             archive,
             &self.staging,
@@ -244,11 +242,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("provider-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
+    fn scratch(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
         fs::create_dir_all(&path).unwrap();
-        path
+        (dir, path)
     }
 
     fn store(root: &Path) -> BundleStore {
@@ -284,7 +282,7 @@ mod tests {
 
     #[test]
     fn install_hands_off_a_filepath_and_resolve_round_trips_the_release() {
-        let root = scratch("roundtrip");
+        let (_dir, root) = scratch("roundtrip");
         let source = root.join("source");
         fs::create_dir_all(source.join("bin")).unwrap();
         fs::write(source.join("bin/app"), b"the entrypoint").unwrap();
@@ -317,19 +315,16 @@ mod tests {
             )
             .unwrap();
 
-        let resolved = provider.resolve(&staged.id).unwrap();
+        let resolved = provider.resolve(&staged).unwrap();
         assert_eq!(resolved.product, "demo");
-        assert_eq!(resolved.cwd, provider.workspace(&staged.id));
-        assert_eq!(
-            resolved.program,
-            provider.location(&staged.id).join("bin/app")
-        );
+        assert_eq!(resolved.cwd, provider.workspace(&staged));
+        assert_eq!(resolved.program, provider.location(&staged).join("bin/app"));
         assert!(resolved.program.exists());
     }
 
     #[test]
     fn resolving_an_uninstalled_release_fails_closed() {
-        let root = scratch("unknown");
+        let (_dir, root) = scratch("unknown");
         let provider = store(&root);
         let missing = ReleaseId {
             version: "9.9.9".into(),
@@ -340,7 +335,7 @@ mod tests {
 
     #[test]
     fn resolving_a_provider_with_post_install_drift_fails_closed() {
-        let root = scratch("provider-drift");
+        let (_dir, root) = scratch("provider-drift");
         let source = root.join("source");
         fs::create_dir_all(source.join("bin")).unwrap();
         fs::write(source.join("bin/app"), b"trusted").unwrap();
@@ -371,14 +366,14 @@ mod tests {
                 },
             )
             .unwrap();
-        let installed_entrypoint = provider.location(&staged.id).join("bin/app");
+        let installed_entrypoint = provider.location(&staged).join("bin/app");
         fs::rename(
             &installed_entrypoint,
             installed_entrypoint.with_extension("trusted"),
         )
         .unwrap();
         fs::write(installed_entrypoint, b"tampered").unwrap();
-        assert!(provider.resolve(&staged.id).is_err());
+        assert!(provider.resolve(&staged).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -387,7 +382,7 @@ mod tests {
     /// supervisor then condemned, re-downloaded and relaunched it on every check tick.
     #[test]
     fn an_application_writing_to_its_working_directory_leaves_the_release_verifiable() {
-        let root = scratch("workspace-drift");
+        let (_dir, root) = scratch("workspace-drift");
         let platform = foundation::platform::platform_key();
         let archive = archive(&root, "demo", "1.2.3", &platform);
         let provider = store(&root);
@@ -402,16 +397,16 @@ mod tests {
             )
             .unwrap();
 
-        let resolved = provider.resolve(&staged.id).unwrap();
-        assert_ne!(resolved.cwd, provider.location(&staged.id));
+        let resolved = provider.resolve(&staged).unwrap();
+        assert_ne!(resolved.cwd, provider.location(&staged));
         assert!(resolved.cwd.is_dir());
         // Exactly what an ordinary application does: a log file, a pid file, a scratch subtree.
         fs::write(resolved.cwd.join("app.log"), b"started").unwrap();
         fs::create_dir_all(resolved.cwd.join(".cache/objects")).unwrap();
 
-        bundle::verify_release(&root.join("versions"), &staged.id).unwrap();
+        bundle::verify_release(&root.join("versions"), &staged).unwrap();
         // And the scratch survives the relaunch that verification no longer forces.
-        let relaunch = provider.resolve(&staged.id).unwrap();
+        let relaunch = provider.resolve(&staged).unwrap();
         assert_eq!(relaunch.cwd, resolved.cwd);
         assert_eq!(fs::read(relaunch.cwd.join("app.log")).unwrap(), b"started");
         let _ = fs::remove_dir_all(root);
@@ -419,7 +414,7 @@ mod tests {
 
     #[test]
     fn a_workspace_outlives_its_release_no_longer_than_the_release_itself() {
-        let root = scratch("workspace-reap");
+        let (_dir, root) = scratch("workspace-reap");
         let platform = foundation::platform::platform_key();
         let provider = store(&root);
         let mut ids = Vec::new();
@@ -435,8 +430,8 @@ mod tests {
                     },
                 )
                 .unwrap();
-            provider.resolve(&staged.id).unwrap();
-            ids.push(staged.id);
+            provider.resolve(&staged).unwrap();
+            ids.push(staged);
         }
         assert!(provider.workspace(&ids[0]).is_dir());
 
@@ -465,7 +460,7 @@ mod tests {
     /// with status 2 if it cannot — died on every launch and failed the boot health gate.
     #[test]
     fn a_release_reads_its_own_bundled_files_relative_to_the_launch_directory() {
-        let root = scratch("workspace-bundled-files");
+        let (_dir, root) = scratch("workspace-bundled-files");
         let platform = foundation::platform::platform_key();
         let archive = archive(&root, "demo", "1.2.3", &platform);
         let provider = store(&root);
@@ -480,7 +475,7 @@ mod tests {
             )
             .unwrap();
 
-        let resolved = provider.resolve(&staged.id).unwrap();
+        let resolved = provider.resolve(&staged).unwrap();
         // Exactly the read the sampleapp performs from its working directory.
         assert_eq!(
             fs::read_to_string(resolved.cwd.join("config/release.toml")).unwrap(),
@@ -506,7 +501,7 @@ mod tests {
     /// program to do to its own config, and it must not reach the content-addressed tree.
     #[test]
     fn rewriting_a_bundled_file_in_the_workspace_leaves_the_release_verifiable() {
-        let root = scratch("workspace-bundled-rewrite");
+        let (_dir, root) = scratch("workspace-bundled-rewrite");
         let platform = foundation::platform::platform_key();
         let archive = archive(&root, "demo", "1.2.3", &platform);
         let provider = store(&root);
@@ -521,20 +516,20 @@ mod tests {
             )
             .unwrap();
 
-        let resolved = provider.resolve(&staged.id).unwrap();
+        let resolved = provider.resolve(&staged).unwrap();
         fs::write(
             resolved.cwd.join("config/release.toml"),
             b"version = \"rewritten\"\n",
         )
         .unwrap();
-        bundle::verify_release(&root.join("versions"), &staged.id).unwrap();
+        bundle::verify_release(&root.join("versions"), &staged).unwrap();
         assert_eq!(
-            fs::read_to_string(provider.location(&staged.id).join("config/release.toml")).unwrap(),
+            fs::read_to_string(provider.location(&staged).join("config/release.toml")).unwrap(),
             "version = \"1.2.3\"\n"
         );
         // And the relaunch keeps what the application wrote rather than reinstating the bundled
         // copy over it.
-        let relaunch = provider.resolve(&staged.id).unwrap();
+        let relaunch = provider.resolve(&staged).unwrap();
         assert_eq!(
             fs::read_to_string(relaunch.cwd.join("config/release.toml")).unwrap(),
             "version = \"rewritten\"\n"

@@ -238,16 +238,6 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
 
-    let fixture = dir.join("drain-grace-fixture");
-    let lifecycle = vec![
-        std::env::current_exe()
-            .map_err(str_err)?
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        fixture.display().to_string(),
-        "drain-grace".into(),
-    ];
     let mut cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
         .check_interval("1s")
         .health_grace("2s")
@@ -258,7 +248,6 @@ pub(crate) fn zero_downtime_stop_start(ctx: &Ctx) -> R {
         // hold length excuses a request sent to a node that was still advertising Ready.
         .drain_hold("1s")
         .guardian_probes(probes)
-        .lifecycle(lifecycle)
         .guardian()?;
     let _sup = Proc::spawn("supervisor", &mut cmd)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
@@ -708,7 +697,3 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
     ok("one node rolled back locally while its group peer remained committed at 2.0.0");
     Ok(())
 }
-
-// ===========================================================================
-// 2. A tampered pinned root is rejected at load (fail closed).
-// ===========================================================================

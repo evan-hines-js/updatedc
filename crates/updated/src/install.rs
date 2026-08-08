@@ -180,16 +180,17 @@ mod tests {
         );
     }
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("itx-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+    fn tmp(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join(name);
         std::fs::create_dir_all(&d).unwrap();
-        d.join("install.json")
+        let path = d.join("install.json");
+        (dir, path)
     }
 
     #[test]
     fn journal_round_trips_and_absent_is_none() {
-        let path = tmp("journal");
+        let (_dir, path) = tmp("journal");
         assert_eq!(read(&path).unwrap(), None, "absent journal reads as None");
         write(&path, &tx()).unwrap();
         assert_eq!(
@@ -203,7 +204,7 @@ mod tests {
 
     #[test]
     fn unknown_journal_shapes_are_rejected() {
-        let path = tmp("strict-schema");
+        let (_dir, path) = tmp("strict-schema");
         std::fs::write(
             &path,
             br#"{"id":"x","release":{"version":"1","manifest_sha256":"a"},"legacy":true}"#,

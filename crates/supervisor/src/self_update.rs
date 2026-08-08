@@ -34,30 +34,17 @@ impl SelfUpdateState {
         self.next_check = until;
     }
 
-    /// Reject the candidate supervisor at `path` (which the guardian just rolled back).
-    /// The path is content-addressed — `supervisors/<hash>/supervisor` — so its parent
-    /// directory names the hash to suppress, terminating a bad-release loop.
+    /// Suppress the candidate supervisor with content hash `hash` (which the guardian just rolled
+    /// back), terminating a bad-release loop. The caller extracts the hash from the marker's
+    /// content-addressed `supervisors/<hash>/<binary>` path — once, up front, so that "the marker
+    /// is not evidence" and "the rejection did not reach disk" are never the same test.
     ///
     /// Every way of failing is an error, never a warning: the caller clears the guardian's marker
     /// on the strength of this returning `Ok`, and the marker is the only other record that the
-    /// candidate was ever rejected. A swallowed failure — an unwritable rejections file, or a path
-    /// with no hash component to key on — would lose the hash and let `check` re-select, re-stage
-    /// and re-trial the identical bad release on the next cycle, forever.
-    pub(crate) fn reject_candidate(&mut self, path: &Path) -> io::Result<()> {
-        let hash = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|h| h.to_str())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "rejected supervisor {} is not a content-addressed \
-                         supervisors/<hash>/<binary> path",
-                        path.display()
-                    ),
-                )
-            })?;
+    /// candidate was ever rejected. A swallowed failure — an unwritable rejections file — would
+    /// lose the hash and let `check` re-select, re-stage and re-trial the identical bad release on
+    /// the next cycle, forever.
+    pub(crate) fn reject_candidate(&mut self, hash: &str) -> io::Result<()> {
         self.rejected.reject(hash).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -113,8 +100,11 @@ impl SelfUpdateState {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(supervisor_filename());
         let download = with_suffix(&path, ".download");
-        repo.stage_release(selected, &download).await?;
-        verify_file(&download, &selected.sha256)?;
+        // The download is the verification: `download_target` streams through the TUF target
+        // reader, which enforces this target's declared length and sha256 byte by byte and
+        // errors out rather than yield unverified data. Re-hashing the staged file here proved
+        // the same digest a second time, and the application/provider path never did.
+        repo.download_target(&selected.target, &download).await?;
         foundation::durable::install_executable(&path, &download)?;
         let _ = std::fs::remove_file(&download);
         log(&format!(
@@ -132,7 +122,7 @@ impl SelfUpdateState {
             }
             Err(msg) => {
                 // The handoff itself failed — a control-channel error, or a guardian too
-                // old to advertise CAP_REPLACE_SUPERVISOR_V1. The guardian never judged
+                // old to know the REPLACE_SUPERVISOR tag. The guardian never judged
                 // these bytes (its ReplaceSupervisor dispatch always accepts and only
                 // rejects later, at the readiness gate), so do NOT reject them: that would
                 // permanently block a good release. Keep the current version and retry next
@@ -207,11 +197,11 @@ fn supervisor_filename() -> &'static str {
 mod tests {
     use super::*;
 
-    fn dir(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("self-update-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+    fn dir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let path = guard.path().join(name);
         std::fs::create_dir_all(&path).unwrap();
-        path
+        (guard, path)
     }
 
     fn state(dir: &Path) -> SelfUpdateState {
@@ -225,11 +215,9 @@ mod tests {
 
     #[test]
     fn a_recorded_rejection_suppresses_the_candidate() {
-        let d = dir("recorded");
+        let (_guard, d) = dir("recorded");
         let mut state = state(&d);
-        state
-            .reject_candidate(&d.join("supervisors").join(HASH).join("supervisor"))
-            .unwrap();
+        state.reject_candidate(HASH).unwrap();
         assert!(state.rejected.is_rejected(HASH));
         assert!(
             Rejections::load(&d.join("supervisor-rejected"))
@@ -244,14 +232,10 @@ mod tests {
         // The caller clears the guardian's marker on the strength of `Ok`. A swallowed failure
         // would lose the only two records of the bad candidate at once, and `check` would
         // re-select, re-stage and re-trial the identical release forever.
-        let d = dir("unrecordable");
+        let (_guard, d) = dir("unrecordable");
         let mut state = state(&d);
-        // A path with no content-addressed hash component: nothing to key the rejection on.
-        assert!(state.reject_candidate(Path::new("supervisor")).is_err());
         // The rejections file can no longer be written.
         std::fs::remove_dir_all(&d).unwrap();
-        assert!(state
-            .reject_candidate(&d.join("supervisors").join(HASH).join("supervisor"))
-            .is_err());
+        assert!(state.reject_candidate(HASH).is_err());
     }
 }

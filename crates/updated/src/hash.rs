@@ -1,7 +1,6 @@
-//! Content-identity of a file on disk: its streaming SHA-256, plus the single
-//! "do these bytes match the digest we trust?" check the whole tower gates on
-//! before it executes or commits an application binary — the supervisor and the
-//! one-shot updater share one implementation so the trust boundary cannot drift.
+//! Content-identity of bytes: the streaming and in-memory SHA-256 the whole tower
+//! digests with, and the one case-insensitive digest comparison it comes to verdicts
+//! with — a single implementation each, so the trust boundary cannot drift.
 
 use std::io::{self, Read};
 use std::path::Path;
@@ -71,33 +70,19 @@ pub fn digests_match(got: &str, expected: &str) -> bool {
     got.eq_ignore_ascii_case(expected)
 }
 
-/// Verify the file at `path` hashes to `expected`: propagate a read error, and
-/// report a mismatch as an error naming both digests. Callers use this on the
-/// commit/execute path where drifted or tampered bytes must fail closed.
-pub fn verify_file(path: &Path, expected: &str) -> io::Result<()> {
-    let got = sha256_file(path)?;
-    if digests_match(&got, expected) {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "binary hash {got} != expected {expected}"
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("updated-hash-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        p
+    fn tmp(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(name);
+        (dir, p)
     }
 
     #[test]
     fn file_and_byte_hashing_agree_on_known_bytes() {
-        let f = tmp("known");
+        let (_dir, f) = tmp("known");
         std::fs::write(&f, b"the exact bytes").unwrap();
         // Pin the actual digest: a hasher returning a constant, or one that stopped
         // reading the file body, would not produce this exact hex.
@@ -109,18 +94,8 @@ mod tests {
 
         // Streaming-file and in-memory hashing are the same content-identity.
         assert_eq!(sha256_bytes(b"the exact bytes"), want);
-        verify_file(&f, &want).unwrap();
-        verify_file(&f, &want.to_uppercase()).unwrap(); // case-insensitive
         assert!(digests_match(&want, &want.to_uppercase()));
         assert!(!digests_match(&want, &"0".repeat(64)));
-
-        assert!(verify_file(&f, &"0".repeat(64)).is_err());
         let _ = std::fs::remove_file(&f);
-    }
-
-    #[test]
-    fn missing_file_is_error_for_verify() {
-        let f = tmp("absent");
-        assert!(verify_file(&f, &"0".repeat(64)).is_err());
     }
 }

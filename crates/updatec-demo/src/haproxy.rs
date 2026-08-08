@@ -19,6 +19,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Execution ceiling signed into the `haproxy-lifecycle` provider set. The supervisor bounds the
+/// WHOLE hook invocation by it, and this reconciler is the shell program in `scripts/haproxy`:
+/// a config validation (`haproxy -c`) plus a SIGUSR2 master-worker re-exec, both sub-second, with
+/// room for a cold install unpacking the bundle on a loaded demo cluster. It is deliberately not
+/// the Rust lifecycle fixture's `PROVIDER_TIMEOUT_MS`, which is sized by that fixture's own dwell
+/// arithmetic — two unrelated programs whose budgets only ever coincided by accident.
+const HAPROXY_PROVIDER_TIMEOUT_MS: u64 = 30_000;
+
 /// A backend server the HAProxy `fleet` section pre-declares: its control-plane node name (the
 /// key its NodeReport is written under and the name the healthproxy flips state for) and the
 /// in-cluster address HAProxy proxies to.
@@ -169,6 +177,7 @@ pub(crate) fn publish_haproxy_bundles(
     platform: &str,
 ) -> Result<HaproxyRelease, Box<dyn std::error::Error>> {
     // 1. The provider set: the reconciler that owns the HAProxy process on every node.
+    let repository = release_repository_flags();
     let provider = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
@@ -180,14 +189,12 @@ pub(crate) fn publish_haproxy_bundles(
              cp /usr/local/share/haproxy/lib.sh /tmp/hap-provider/bin/lib.sh; \
              chmod 0755 /tmp/hap-provider/bin/lifecycle; \
              art=$(updatectl publish-provider-artifact --keys-dir /data/release-keys \
-               --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
-               --product haproxy-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
+               {repository} --product haproxy-lifecycle --version 1.0.0 --entrypoint bin/lifecycle \
                --source /tmp/hap-provider --platform {platform}); \
              set -- $art; \
              set_out=$(updatectl publish-provider-set --keys-dir /data/release-keys \
-               --bucket updates --prefix releases --endpoint http://minio:9000 --region us-east-1 \
-               --id haproxy-lifecycle --provider-path \"$1\" --provider-sha256 \"$2\" \
-               --provider-timeout-ms 15000); \
+               {repository} --id haproxy-lifecycle --provider-path \"$1\" --provider-sha256 \"$2\" \
+               --provider-timeout-ms {HAPROXY_PROVIDER_TIMEOUT_MS}); \
              printf 'set %s\\n' \"$(echo $set_out | awk '{{print $NF}}')\""
         ),
     ]))?;
@@ -224,6 +231,7 @@ fn publish_haproxy_app(
     version: &str,
     servers: &[BackendServer],
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let repository = release_repository_flags();
     let cfg = haproxy_cfg(version, servers);
     let seed = format!("haproxy-seed-{version}");
     apply_json(&serde_json::json!({
@@ -258,9 +266,8 @@ fn publish_haproxy_app(
         "-c",
         &format!(
             "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
-             updatectl deploy --keys-dir /data/release-keys --bucket updates --prefix releases \
-             --endpoint http://minio:9000 --region us-east-1 --namespace updated-system \
-             --group {seed} --product haproxy --channel stable --version {version} \
+             updatectl deploy --keys-dir /data/release-keys {repository} \
+             --namespace updated-system --group {seed} --product haproxy --channel stable --version {version} \
              --entrypoint bin/launch --platform {platform} --source /tmp/hap-app"
         ),
     ]))?;
@@ -313,26 +320,6 @@ fn pipe_into_release_server(command: &str, stdin: &str) -> Result<(), Box<dyn st
     Ok(())
 }
 
-/// The MinIO release repository the HAProxy bundles live in, pinned to the MinIO root
-/// `bootstrap_minio_release_repo` minted onto the shared release PVC.
-fn minio_release_repository(release_root: &str) -> serde_json::Value {
-    serde_json::json!({
-        "metadataUrl": "http://minio:9000/updates/releases/metadata/",
-        "targetsUrl": "http://minio:9000/updates/releases/targets/",
-        "rootJson": release_root,
-    })
-}
-
-/// The seed group's deployment: a full clone of the fully-valid `edge` deployment (so every
-/// CRD-required field is present) with only its release repository pointed at MinIO. Its selector
-/// matches nothing, so no node adopts it; `updatectl deploy` overwrites its `application` and the
-/// published bundle's product/entrypoint come from the deploy flags, so the runtime here is unused.
-fn seed_deployment(edge: &serde_json::Value, release_root: &str) -> serde_json::Value {
-    let mut deployment = edge["spec"]["deployment"].clone();
-    deployment["releaseRepository"] = minio_release_repository(release_root);
-    deployment
-}
-
 /// The real `haproxy` UpdateGroup's deployment: clone `edge` (for CRD-field completeness), then
 /// override everything that makes it a HAProxy node — the app bundle, the HAProxy lifecycle
 /// provider set, the MinIO repo, the HAProxy product, `provider-managed` mode, an empty arg list
@@ -368,7 +355,6 @@ fn haproxy_group_deployment(
         "healthGraceSeconds": 12,
         "healthSuccesses": 1,
         "healthIntervalSeconds": 1,
-        "retryAfterSeconds": 2,
         "refreshRetrySeconds": 1,
         "confirmationWindowSeconds": 3,
         "supervisorCheckIntervalSeconds": 3600

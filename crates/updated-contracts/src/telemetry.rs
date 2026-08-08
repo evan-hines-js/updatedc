@@ -194,7 +194,7 @@ pub const MAX_REPORT_ENVELOPE_BYTES: usize = 64 * 1024;
 
 /// What one signed envelope costs on top of the output manifest it carries, worst case: base64
 /// expands the whole report payload by 4/3 with padding, and on top of that sit the envelope's JSON
-/// scaffolding, the payload type, the base64 signature and keyid, and every report field that is
+/// scaffolding, the payload type, the base64 signature, and every report field that is
 /// not the manifest (node and deployment identities, two digests, the timestamp, the fingerprint).
 /// Reserved generously — the cost of reserving too much is a slightly smaller manifest allowance,
 /// the cost of reserving too little is a node that can never publish.
@@ -370,13 +370,22 @@ impl NodeReport {
         }
     }
 
-    /// Whether [`NodeReport::archive_sha256`] is a shape a reader may act on: a SHA-256 hex
-    /// digest, or empty for a node that has not completed its first install. Anything else is a
-    /// malformed record — a truncated, re-encoded, or hand-written digest — and a reader that
-    /// joined on it would attribute a running node to bytes it cannot name. Checked inside the
-    /// trust gate so no consumer has to remember to.
+    /// Whether this report is a shape a reader may act on.
+    ///
+    /// The schema first: a record of a version this build does not know is not a report it may
+    /// interpret, whatever the rest of it says. It is checked HERE, in the one predicate both the
+    /// write gate ([`accept_report_envelope`]) and the read gate ([`report_is_authentic_and_fresh`])
+    /// run, because the two must agree. A skewed record the writer accepts and every reader then
+    /// discards strands the node: it reads as silent to the rollout throttle and drains out of the
+    /// load balancer, with a 200 telling the writer all is well.
+    ///
+    /// Then the fields. [`NodeReport::archive_sha256`] must be a SHA-256 hex digest, or empty for a
+    /// node that has not completed its first install. Anything else is a malformed record — a
+    /// truncated, re-encoded, or hand-written digest — and a reader that joined on it would
+    /// attribute a running node to bytes it cannot name.
     pub fn is_wellformed(&self) -> bool {
-        !self.node.is_empty()
+        self.schema == Self::SCHEMA
+            && !self.node.is_empty()
             && !self.deployment.is_empty()
             && self.reported_at_ms > 0
             && (self.version.is_empty() == self.archive_sha256.is_empty())
@@ -444,8 +453,6 @@ impl Envelope {
 pub struct Signature {
     /// Standard base64 of the ASN.1 DER ECDSA signature.
     pub sig: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub keyid: String,
 }
 
 /// The DSSE pre-authentication encoding — the exact bytes a signature commits to:
@@ -487,24 +494,39 @@ pub fn sign_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Envelope, St
         payload_type: REPORT_PAYLOAD_TYPE.to_string(),
         signatures: vec![Signature {
             sig: b64.encode(signature.as_ref()),
-            keyid: report.node.clone(),
         }],
     })
 }
 
-/// Decode an envelope's payload WITHOUT verifying its signature.
+/// The one write-side acceptance gate for a report envelope: the rule every hop that *stores* a
+/// report applies before it stores it.
 ///
-/// Named to be unmistakable, because skipping the signature is almost never what a caller wants. It
-/// exists for the write hop: the gateway authorizes a report by the mTLS leaf that presented it and
-/// needs only to confirm the envelope is well formed and names the node it is being filed under. The
-/// signature is end-to-end evidence for whoever later reads those bytes back, and every *consumer*
-/// must go through [`report_is_authentic_and_fresh`] instead.
-pub fn report_payload_unverified(envelope: &Envelope) -> Option<NodeReport> {
+/// Returns the decoded report only when the body is an envelope of the report payload type, carries
+/// no more than [`Envelope::MAX_SIGNATURES`] signatures, decodes to a report that is well formed
+/// (which includes carrying this build's [`NodeReport::SCHEMA`] — the same predicate every reader
+/// applies, so a record no reader can use is never stored), and names `node` — the node the caller
+/// is filing it under. The signature is deliberately NOT
+/// verified here, and this is the only function that decodes a payload without checking it: a writer
+/// hop authorizes by the transport identity that presented the bytes, and the signature is
+/// end-to-end evidence for the consumers that later read them back, every one of which must go
+/// through [`report_is_authentic_and_fresh`] instead.
+///
+/// It lives here, beside the envelope types, because the production gateway and the dev CDN both
+/// enforce it and must enforce the *same* thing: maintained as two copies, a tightening on one side
+/// silently makes the test path accept what production refuses, or the reverse.
+pub fn accept_report_envelope(body: &[u8], node: &str) -> Option<NodeReport> {
+    let envelope: Envelope = serde_json::from_slice(body).ok()?;
+    if envelope.payload_type != REPORT_PAYLOAD_TYPE
+        || envelope.signatures.len() > Envelope::MAX_SIGNATURES
+    {
+        return None;
+    }
     use base64::Engine as _;
     let payload = base64::engine::general_purpose::STANDARD
         .decode(&envelope.payload)
         .ok()?;
-    serde_json::from_slice(&payload).ok()
+    let report: NodeReport = serde_json::from_slice(&payload).ok()?;
+    (report.node == node && report.is_wellformed()).then_some(report)
 }
 
 /// Whether `point` is a well-formed uncompressed SEC1 P-256 point: `0x04` followed by two 32-byte
@@ -570,10 +592,7 @@ pub fn report_is_authentic_and_fresh(
     }
 
     let report: NodeReport = serde_json::from_slice(&payload).ok()?;
-    let usable = report.schema == NodeReport::SCHEMA
-        && report.is_wellformed()
-        && report.node == expected_node
-        && report.is_fresh(now_ms);
+    let usable = report.is_wellformed() && report.node == expected_node && report.is_fresh(now_ms);
 
     usable.then_some(report)
 }
@@ -625,8 +644,6 @@ mod tests {
         assert_eq!(report.archive_sha256, DIGEST);
         assert!(report.healthy);
         assert_eq!(envelope.payload_type, REPORT_PAYLOAD_TYPE);
-        // The signature is keyed to the node so an operator can tell whose it is at a glance.
-        assert_eq!(envelope.signatures[0].keyid, "agent-9");
     }
 
     #[test]
@@ -888,6 +905,77 @@ mod tests {
         assert!(report_is_authentic_and_fresh(&envelope, "agent-9", &point, 0).is_none());
     }
 
+    /// The one write-side gate both storing hops call. It must accept a genuine envelope filed under
+    /// its own node and refuse everything a stored record could strand a reader with.
+    #[test]
+    fn the_write_gate_accepts_only_a_wellformed_envelope_filed_under_its_own_node() {
+        let (pkcs8, _) = keypair();
+        let envelope = sign_report(&report(), &pkcs8).unwrap();
+        let body = serde_json::to_vec(&envelope).unwrap();
+
+        assert_eq!(
+            accept_report_envelope(&body, "agent-9").map(|report| report.node),
+            Some("agent-9".to_string())
+        );
+        assert!(
+            accept_report_envelope(&body, "agent-8").is_none(),
+            "a report must not be storable under another node's name"
+        );
+        assert!(accept_report_envelope(b"not json", "agent-9").is_none());
+
+        // Wrong payload type: an envelope this node legitimately signed for something else.
+        let mut retyped = envelope.clone();
+        retyped.payload_type = "application/vnd.updated.something-else+json".into();
+        assert!(
+            accept_report_envelope(&serde_json::to_vec(&retyped).unwrap(), "agent-9").is_none()
+        );
+
+        // A stuffed signature list is refused at the door, not left for every reader to pay for.
+        let mut stuffed = envelope.clone();
+        stuffed.signatures = std::iter::repeat_n(
+            Signature {
+                sig: b64().encode([0u8; 72]),
+            },
+            Envelope::MAX_SIGNATURES + 1,
+        )
+        .collect();
+        assert!(
+            accept_report_envelope(&serde_json::to_vec(&stuffed).unwrap(), "agent-9").is_none()
+        );
+
+        // A payload that parses but is not well formed: the reader-side shape gate, applied on write.
+        let malformed = sign_report(
+            &{
+                let mut report = report();
+                report.archive_sha256 = "deadbeef".into();
+                report
+            },
+            &pkcs8,
+        )
+        .unwrap();
+        assert!(
+            accept_report_envelope(&serde_json::to_vec(&malformed).unwrap(), "agent-9").is_none()
+        );
+
+        // A schema every reader will discard. Storing it answered 200 while the rollout throttle
+        // and the health proxy both dropped the record, so a node mid-fleet-upgrade read as silent
+        // and drained out of rotation permanently — the exact stranding this gate exists to refuse
+        // at the door, where the writer still learns about it.
+        let skewed = sign_report(
+            &{
+                let mut report = report();
+                report.schema = NodeReport::SCHEMA + 1;
+                report
+            },
+            &pkcs8,
+        )
+        .unwrap();
+        assert!(
+            accept_report_envelope(&serde_json::to_vec(&skewed).unwrap(), "agent-9").is_none(),
+            "the write gate must enforce the schema every reader enforces"
+        );
+    }
+
     #[test]
     fn an_envelope_stuffed_with_signatures_is_refused_before_any_verification() {
         let (pkcs8, point) = keypair();
@@ -896,7 +984,6 @@ mod tests {
         envelope.signatures = (0..Envelope::MAX_SIGNATURES)
             .map(|_| Signature {
                 sig: b64().encode([0u8; 72]),
-                keyid: String::new(),
             })
             .chain(std::iter::once(genuine))
             .collect();

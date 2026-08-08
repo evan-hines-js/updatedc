@@ -23,5 +23,8 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 fips = ["updated/fips"]

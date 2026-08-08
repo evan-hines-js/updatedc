@@ -45,7 +45,6 @@ pub struct Sup {
     drain_hold: Option<String>,
     health_successes: u32,
     confirmation_window: Option<String>,
-    retry_after: Option<String>,
     /// The signed lifecycle reconciler every fixture runs. Not optional: `new` always installs
     /// the default `accept-managed` fixture, and a scenario only ever swaps in its own.
     lifecycle_command: Vec<String>,
@@ -99,7 +98,6 @@ impl Sup {
             drain_hold: None,
             health_successes: 1,
             confirmation_window: None,
-            retry_after: None,
             lifecycle_command,
             supervisor_check_interval: None,
             ready_timeout: None,
@@ -125,7 +123,7 @@ impl Sup {
         self
     }
     /// Install the cross-platform Rust lifecycle fixture. It implements the whole lifecycle
-    /// protocol and performs one HTTP observation for `verify` and `periodic`.
+    /// protocol and, on the `healthcheck` operation, fails unless `http://{svc}/healthz` answers.
     pub fn readiness_health(self, svc: &str) -> Self {
         let executable = std::env::current_exe()
             .expect("the e2e lifecycle fixture must have a current executable");
@@ -166,10 +164,6 @@ impl Sup {
     }
     pub fn confirmation_window(mut self, s: &str) -> Self {
         self.confirmation_window = Some(s.into());
-        self
-    }
-    pub fn retry_after(mut self, s: &str) -> Self {
-        self.retry_after = Some(s.into());
         self
     }
     /// Install this fixture's reconciler. A fixture configures its reconciler exactly once: two
@@ -318,8 +312,8 @@ impl Sup {
             .map_err(str_err)?;
         Ok(updated::state::ProviderRelease {
             product,
-            release: staged.id,
-            archive_sha256: staged.archive_sha256,
+            release: staged,
+            archive_sha256: crate::harness::sha256_hex(&download)?,
             args: signed_args,
             timeout_millis: 5000,
         })
@@ -414,7 +408,6 @@ impl Sup {
                 health_grace_seconds: seconds(self.health_grace.as_ref(), 10)?,
                 health_successes: self.health_successes,
                 health_interval_seconds: 1,
-                retry_after_seconds: seconds(self.retry_after.as_ref(), 300)?,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: seconds(self.confirmation_window.as_ref(), 120)?,
                 supervisor_check_interval_seconds: seconds(
@@ -520,7 +513,7 @@ impl Sup {
                 },
             )
             .map_err(str_err)?;
-        updated::bundle::write_active(&paths.active_release, &staged.id).map_err(str_err)?;
+        updated::bundle::write_active(&paths.active_release, &staged).map_err(str_err)?;
         let lineage = updated::state::RepositoryLineage::from_metadata_url(&format!(
             "{}metadata/",
             self.repository_base_url
@@ -532,8 +525,8 @@ impl Sup {
         let command = self.lifecycle_command.clone();
         let installed = updated::state::InstalledState::confirmed(
             lineage,
-            staged.id,
-            staged.archive_sha256,
+            staged,
+            crate::harness::sha256_hex(&paths.download)?,
             Box::new(self.stage_seed_provider(&paths, "lifecycle", &command)?),
         );
         updated::state::write_installed(&paths.state, &installed).map_err(str_err)

@@ -61,13 +61,7 @@ pub(crate) async fn stage_providers(
     repo: &TrustedRepository,
     store: &mut dyn Store,
     ordered_current: Option<&str>,
-) -> Result<
-    (
-        updated::state::ProviderRelease,
-        Option<updated_tuf::TargetReference>,
-    ),
-    ProviderStagingError,
-> {
+) -> Result<updated::state::ProviderRelease, ProviderStagingError> {
     use ProviderStagingError::Transient;
     // Until the provider set's origin is known, no failure can be blamed on an application version.
     let unusable = |message: String| ProviderStagingError::Unusable {
@@ -182,14 +176,15 @@ pub(crate) async fn stage_providers(
         })?;
     let release = updated::state::ProviderRelease {
         product: product.to_string(),
-        release: staged_bundle.id,
+        release: staged_bundle,
         archive_sha256: sha,
         args: provider.args,
         timeout_millis: provider.timeout_millis,
     };
-    // Returned so the caller can confirm the application it goes on to prepare is the same version
-    // this set was resolved for — the two selections are independent and can drift apart.
-    Ok((release, selected_provider_ref))
+    // The staged reconciler, as the caller must record it: this value is what the update
+    // transaction commits alongside the application release, so the pair activate and roll back
+    // together.
+    Ok(release)
 }
 
 /// Select, authorize, download, and apply the newest application target, if any.
@@ -216,7 +211,7 @@ pub(crate) async fn check_application(
     // Provider-only deployment revisions reconcile here as well. Staging is
     // content-addressed and side-effect free; no lifecycle phase runs until an app
     // transaction consumes this exact resolved provider.
-    let (reconciler, staged_for) = match stage_providers(opts, repo, store, ordered_current).await {
+    let reconciler = match stage_providers(opts, repo, store, ordered_current).await {
         Ok(staged) => staged,
         Err(error) => {
             warn(&error.to_string());
@@ -255,21 +250,6 @@ pub(crate) async fn check_application(
             return AppOutcome::Unchanged;
         }
     };
-
-    // The providers were staged from one selection and the application from another. Those two
-    // selections can disagree: preparing the application records a rejection for a malformed
-    // bundle and descends, so the version that emerged here may sit below the one whose provider
-    // set is on disk. Committing that pair would run a release against another version's signed
-    // hooks. Nothing has been mutated yet, so retry on the next tick — by then the rejection is
-    // durable and both selections agree.
-    if prepared.provider_set != staged_for {
-        warn(&format!(
-            "the staged provider set does not belong to the selected application {}; re-resolving \
-             both on the next check",
-            prepared.version
-        ));
-        return AppOutcome::Unchanged;
-    }
 
     // Crossing repository lineages may legitimately select the exact bytes already
     // running (notably when a freshly enrolled node joins its first group). That is a

@@ -16,13 +16,20 @@ pub(crate) const DEMO_COHORT_SIZE: usize = 2;
 /// these spread across this many DISTINCT sets (one group each) — never draining a set — and
 /// the next starts the instant one settles, so the pipeline stays full across set order.
 pub(crate) const DEMO_FLEET_CONCURRENCY: u32 = 4;
-/// Cohort groups the single chaos mechanism may disrupt per set per round. Bounded to ONE so
-/// the set's other group is always untouched; combined with chaos only ever deleting pods that
-/// are already draining (out of the load balancer), a set never drops below its serving floor.
-pub(crate) const DEMO_CHAOS_MAX_GROUPS_PER_SET: usize = 1;
 /// How long a generation may take to fully settle. Generous, because the chaos mechanism also
 /// crashes the controller (recovering only after lease expiry), which stretches rollouts.
 pub(crate) const DEMO_SETTLE_TIMEOUT_SECS: usize = 900;
+/// How long the convergence that closes an epoch may spend *admitting* (a frozen set's time does
+/// not count) before it is called failed.
+pub(crate) const DEMO_CONVERGE_TIMEOUT_SECS: usize = 240;
+/// The ceiling an automated driver waits one whole epoch out under. An epoch queues every cohort
+/// in a single generation (`Demo::select_generation` hands them all over, then `None`), so it is
+/// that generation's settle budget plus the convergence that closes the epoch, with a minute of
+/// slack for the patches and polling in between. Derived rather than written down: a driver
+/// capped below the budget it drives reports "did not converge" for a run that is still healthy
+/// and well inside its own documented ceiling.
+pub(crate) const DEMO_EPOCH_TIMEOUT_SECS: usize =
+    DEMO_SETTLE_TIMEOUT_SECS + DEMO_CONVERGE_TIMEOUT_SECS + 60;
 
 /// Canonical fleet-chaos seed. `exercise` pass 1 (and the one-shot `e2e` verification) use it
 /// verbatim; later soak passes derive a distinct, reproducible seed from it (see
@@ -59,10 +66,11 @@ pub(crate) fn external_ordinal(index: usize) -> usize {
 /// the live demo by the shipped ansible role (`deploy/ansible`), which builds the agent on the
 /// VM and runs it as a systemd service pointed, via a `socat`/`/etc/hosts` shim, at the
 /// in-cluster gateway exposed on the laptop's LAN. It enrolls, installs Magnolia, and becomes
-/// **the manual Magnolia node** — the one the "Upgrade Magnolia" button rolls (no in-cluster
-/// pod stands in for it). Also appears as a real endpoint the reconciler programs. Optional and
+/// **the manual Magnolia node** — managed by its own UpdateGroup ([`MAGNOLIA_MANUAL_GROUP`]), with
+/// no in-cluster pod standing in for it. Also appears as a real endpoint the reconciler programs. Optional and
 /// guarded: skipped unless `DEMO_EXTERNAL_VM` (e.g. `root@10.0.0.206`) is set AND passwordless
-/// SSH works. The `-manual-` in the name is what the UI reads as the Magnolia role.
+/// SSH works. Its Magnolia role reaches the UI as an explicit backend field (`FleetNode::kind`),
+/// not by anything reading this name.
 pub(crate) const DEMO_EXTERNAL_VM_HOSTNAME: &str = "magnolia-manual-vm";
 pub(crate) const DEMO_EXTERNAL_VM_COHORT: &str = "external-vm";
 /// LAN port `kubectl port-forward` publishes the in-cluster gateway on for the VM to reach.
@@ -80,7 +88,20 @@ pub(crate) const MAGNOLIA_COHORTS: [(&str, &str, &str, usize); 2] = [
     ("author", "author", "magnoliaAuthor", 2),
     ("publisher", "public", "magnoliaPublic", 2),
 ];
-pub(crate) const DEMO_MAGNOLIA_TOTAL: usize = 4;
+/// Total in-cluster Magnolia pods — derived from the cohort table above, like every other total
+/// in this file, so changing a cohort's replicas cannot silently under-reserve cluster capacity
+/// (this feeds [`DEMO_REQUIRED_POD_CAPACITY`]).
+pub(crate) const DEMO_MAGNOLIA_TOTAL: usize = magnolia_total();
+
+const fn magnolia_total() -> usize {
+    let mut total = 0;
+    let mut index = 0;
+    while index < MAGNOLIA_COHORTS.len() {
+        total += MAGNOLIA_COHORTS[index].3;
+        index += 1;
+    }
+    total
+}
 
 /// The updated-managed HAProxy tier: a StatefulSet of this many HAProxy pods, each an ordinary
 /// `updated` agent that installs HAProxy from a signed tarball bundle (never a bespoke image) and
@@ -92,13 +113,10 @@ pub(crate) const DEMO_HAPROXY_REPLICAS: usize = 2;
 /// The cohort label the HAProxy pods carry and the `haproxy` UpdateGroup selects on. Outside the
 /// per-set/fleet throttle and the pod-kill chaos, exactly like the Magnolia tier.
 pub(crate) const DEMO_HAPROXY_COHORT: &str = "haproxy";
-/// Name prefix for the per-node HAProxy UpdateGroups (`haproxy-0`, `haproxy-1`) that roll the tier
-/// from 1.0.0 → 2.0.0. Each group selects a single HAProxy node, and one concurrency-1
-/// `UpdateGroupSet` over the two rolls them ONE AT A TIME behind the front Service — the sample-app
-/// set machinery reused so the reexec is genuinely zero-downtime (never both nodes at once).
+/// The single HAProxy UpdateGroup that rolls the tier from 1.0.0 → 2.0.0. It owns both HAProxy
+/// nodes with `maxUnavailable: 1`, so the group itself caps the tier to ONE node rolling at a time
+/// behind the front Service — genuinely zero-downtime, with no synthetic set/group split.
 pub(crate) const DEMO_HAPROXY_GROUP: &str = "haproxy";
-/// The group-metadata label the HAProxy `UpdateGroupSet` selects its two single-node member groups
-/// on, so the set caps them to one rolling at a time.
 /// The HAProxy `backend` section whose server membership the HAProxy-mode healthproxy programs
 /// from signed CDN health (`set server <backend>/<node> state ready|drain`).
 pub(crate) const DEMO_HAPROXY_BACKEND: &str = "fleet";
@@ -113,12 +131,12 @@ pub(crate) const DEMO_HAPROXY_V1: &str = "1.0.0";
 pub(crate) const DEMO_HAPROXY_V2: &str = "2.0.0";
 /// Annotation on the `haproxy` UpdateGroup carrying the pre-published 2.0.0 target the e2e upgrade
 /// patches in — so the bytes are signed and in the store up front and the upgrade is a pure group
-/// patch (like the manual-Magnolia button), never a live publish.
+/// patch, never a live publish.
 pub(crate) const DEMO_HAPROXY_NEXT_PATH_ANNOTATION: &str = "demo.updated.dev/next-path";
 pub(crate) const DEMO_HAPROXY_NEXT_SHA_ANNOTATION: &str = "demo.updated.dev/next-sha256";
-/// The group the "Upgrade Magnolia" button rolls from v1 to v2 — the out-of-cluster VM
-/// ([`DEMO_EXTERNAL_VM_HOSTNAME`]). Nothing rolls it automatically; it holds its baseline until
-/// an operator clicks the button, then runs the real custom in-place upgrade on the VM.
+/// The group that manages the out-of-cluster VM ([`DEMO_EXTERNAL_VM_HOSTNAME`]) — a node with no
+/// Kubernetes pod behind it, held at its baseline by the same mechanism as every in-cluster
+/// cohort. Nothing rolls it: it is the demo's proof that management is not pod-shaped.
 pub(crate) const MAGNOLIA_MANUAL_GROUP: &str = "magnolia-manual";
 /// Extra pods the HAProxy tier consumes: the HAProxy replicas plus the one HAProxy-mode
 /// healthproxy Deployment that programs their backend membership.
@@ -128,11 +146,11 @@ pub(crate) const DEMO_REQUIRED_POD_CAPACITY: usize =
 
 /// Serving pods a set is guaranteed to keep while it rolls: total pods minus the pods of the
 /// at-most-one group the per-set cap lets roll (`gps - 1` groups). Chaos never enters this
-/// floor because it only deletes pods that are ALREADY draining (out of the load balancer), so
-/// it cannot reduce serving capacity. Must stay `>= 1` for 100% uptime — a compile error here
-/// means the layout would drain a set.
-pub(crate) const DEMO_UPTIME_MARGIN: usize =
-    (DEMO_GROUPS_PER_SET - DEMO_CHAOS_MAX_GROUPS_PER_SET) * DEMO_COHORT_SIZE;
+/// floor because it disrupts exactly that one group (`Demo::inject_chaos` picks a single group
+/// per set) and only deletes pods that are ALREADY draining (out of the load balancer), so it
+/// cannot reduce serving capacity. Must stay `>= 1` for 100% uptime — a compile error here means
+/// the layout would drain a set.
+pub(crate) const DEMO_UPTIME_MARGIN: usize = (DEMO_GROUPS_PER_SET - 1) * DEMO_COHORT_SIZE;
 // Written as "the groups that are NOT rolling", which is what the floor actually is. Subtracting
 // the rolling groups from the total the other way around yields the *rolling* count — a value that
 // is `>= 1` whenever the cohort is non-empty, so the assertion held no matter how the layout was
@@ -231,6 +249,29 @@ pub(crate) const DEMO_REPORT_URL: &str = "https://updatec-gateway";
 /// controller reads them back through. Pointing this at the bucket root instead would 404 every
 /// report and silently drain the whole fleet, so it must track the demo repository's spec.
 pub(crate) const DEMO_HEALTH_CDN: &str = "http://minio:9000/updates/routing";
+
+/// The demo's release repository in the in-cluster MinIO — the ONE place its location is written
+/// down. Everything that publishes into it (`updatectl` inside the release-server pod, and the
+/// demo's own `updatectl deploy`) and everything that resolves out of it (each group's signed
+/// `releaseRepository`) is built from these, so a publish cannot land somewhere the signed
+/// repository does not name.
+pub(crate) const DEMO_RELEASE_ENDPOINT: &str = "http://minio:9000";
+pub(crate) const DEMO_RELEASE_BUCKET: &str = "updates";
+pub(crate) const DEMO_RELEASE_PREFIX: &str = "releases";
+pub(crate) const DEMO_RELEASE_REGION: &str = "us-east-1";
+
+/// The flags every `updatectl` invocation addresses that repository with.
+pub(crate) fn release_repository_flags() -> String {
+    format!(
+        "--bucket {DEMO_RELEASE_BUCKET} --prefix {DEMO_RELEASE_PREFIX} \
+         --endpoint {DEMO_RELEASE_ENDPOINT} --region {DEMO_RELEASE_REGION}"
+    )
+}
+
+/// The URL a group's signed `releaseRepository` resolves `namespace` (`metadata`/`targets`) from.
+pub(crate) fn release_repository_url(namespace: &str) -> String {
+    format!("{DEMO_RELEASE_ENDPOINT}/{DEMO_RELEASE_BUCKET}/{DEMO_RELEASE_PREFIX}/{namespace}/")
+}
 
 /// In-cluster base URL of the ingress the synthetic load test drives. Each set's traffic
 /// enters at `<base>/set-<n>/…`; the ingress routes it to that set's Service, whose selector

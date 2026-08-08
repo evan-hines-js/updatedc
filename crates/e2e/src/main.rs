@@ -106,16 +106,6 @@ fn run_lifecycle_fixture() -> R {
         }
         return fail("Magnolia healthcheck ran before migration finalized");
     }
-    let fail_once_phase = mode.strip_prefix("fail-first-");
-    let fail_once = fail_once_phase == Some(phase)
-        && std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(root.join(format!("{phase}-failure-injected")))
-            .is_ok();
-    if fail_once {
-        return fail(format!("injected one-shot {phase} failure"));
-    }
     let fail_phase = mode.strip_prefix("fail-");
     let fail_start_and_rollback = mode == "fail-apply-and-rollback"
         && (phase == "rollback" || (phase == "apply" && candidate_version == "2.0.0"));
@@ -144,10 +134,6 @@ fn run_lifecycle_fixture() -> R {
     if mode == "accept-managed" {
         // The guardian guarantees the child is alive whenever this provider is invoked. This
         // fixture deliberately has no additional application policy.
-        return Ok(());
-    }
-    // Draining is entirely agent-owned now; the provider has no drain operation.
-    if mode == "drain-grace" {
         return Ok(());
     }
     // The mixed-artifact scenario uses the Magnolia adapter only while the

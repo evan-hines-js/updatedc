@@ -61,7 +61,6 @@
       "health_grace_seconds": 30,
       "health_successes": 2,
       "health_interval_seconds": 1,
-      "retry_after_seconds": 60,
       "refresh_retry_seconds": 5,
       "confirmation_window_seconds": 120,
       "supervisor_check_interval_seconds": 3600,

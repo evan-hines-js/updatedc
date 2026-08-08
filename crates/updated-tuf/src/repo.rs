@@ -151,9 +151,11 @@ impl Scratch {
             .await
             .map_err(|e| err("creating publish staging directory", e))?;
         let swept = dir.clone();
-        tokio::task::spawn_blocking(move || sweep_stale_staging(&swept))
-            .await
-            .map_err(|e| err("sweeping publish staging", e))?;
+        tokio::task::spawn_blocking(move || {
+            foundation::durable::sweep_stale_temps(&swept, STAGE_PREFIX)
+        })
+        .await
+        .map_err(|e| err("sweeping publish staging", e))?;
         Ok(Self(dir))
     }
 
@@ -162,53 +164,10 @@ impl Scratch {
     }
 }
 
-/// The one prefix every publish staging temp carries, so the sweep can recognize its own.
+/// The one prefix every publish staging entry carries — files (one per repository object) and the
+/// whole signed metadata *generation*, which is staged as a directory — so the shared sweep
+/// recognizes its own.
 const STAGE_PREFIX: &str = ".publish-";
-
-/// A staging entry untouched for at least this long is an abandoned crash leftover, not one a
-/// publish is mid-way through — [`sweep_stale_staging`] spares anything newer, so it can run at
-/// the start of a publish without racing one already in flight.
-const STALE_STAGE_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Discard every `<STAGE_PREFIX>*.tmp` leftover in `.publish/` that no live publish can still own.
-///
-/// This is the only sweep `.publish/` gets, and it must handle both entry kinds a publish stages:
-/// individual files (one per repository object) and the whole signed metadata *generation*, which
-/// is staged as a directory. `foundation::durable::sweep_stale_temps` only unlinks files, so a
-/// crashed publish's generation directory would survive it forever and accumulate one per crash.
-///
-/// Purely hygiene, like the sweep it replaces: every failure is ignored, since the unique naming
-/// means a stray staging entry can never collide with a published path.
-fn sweep_stale_staging(dir: &Path) {
-    let now = std::time::SystemTime::now();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(STAGE_PREFIX) || !name.ends_with(".tmp") {
-            continue;
-        }
-        // A directory's mtime advances as roles are written into it, so an in-flight generation
-        // reads as fresh for exactly as long as it is being filled.
-        let recently_written = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age < STALE_STAGE_AGE);
-        if recently_written {
-            continue;
-        }
-        let path = entry.path();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-}
 
 /// Stage a file that is destined for the published repository.
 ///
@@ -877,8 +836,9 @@ async fn publish_release(
 ///
 /// Keyed on fresh randomness rather than the process id: two publishes inside one process would
 /// otherwise stage into the same directory, and each would delete and republish the other's signed
-/// generation. It carries [`STAGE_PREFIX`] and the `.tmp` suffix so [`sweep_stale_staging`]
-/// reclaims it if this process dies before it can be removed.
+/// generation. It carries [`STAGE_PREFIX`] and the `.tmp` suffix so the shared
+/// `foundation::durable::sweep_stale_temps` reclaims it — directory and all — if this process
+/// dies before it can be removed.
 fn generation_stage(scratch: &Scratch) -> Result<PathBuf> {
     let token = updated::rand::token().map_err(|e| err("naming metadata staging", e))?;
     Ok(scratch
@@ -1153,19 +1113,16 @@ mod tests {
         assert!(validate_target_name("products/app/stable/1.0/linux/app\\evil").is_err());
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "updated-tuf-{name}-{}-{}",
-            std::process::id(),
-            updated::rand::token().unwrap()
-        ));
+    fn scratch(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (guard, dir)
     }
 
     #[tokio::test]
     async fn a_published_file_is_world_readable_and_leaves_no_staging_behind() {
-        let repo = scratch("publish-file");
+        let (_tmp, repo) = scratch("publish-file");
         let dir = repo.join("metadata");
         std::fs::create_dir_all(&dir).unwrap();
         let staging = Scratch::open(&repo).await.unwrap();
@@ -1205,7 +1162,7 @@ mod tests {
     /// would leave it, is swept by the next publish instead of being published.
     #[tokio::test]
     async fn publish_staging_never_lands_inside_the_published_tree() {
-        let root = scratch("publish-staging-outside");
+        let (_tmp, root) = scratch("publish-staging-outside");
         let repo_dir = root.join("repo");
         let keys = generate_keys(&root.join("keys")).await.unwrap();
         init(&repo_dir, &keys, 365).await.unwrap();
@@ -1256,7 +1213,6 @@ mod tests {
             }
         }
         assert!(!orphan.exists(), "an abandoned staging temp must be swept");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Two publishes in one process must not share a staging directory. Keyed on the process id
@@ -1264,7 +1220,7 @@ mod tests {
     /// whichever finished first would delete the other's roles out from under it.
     #[tokio::test]
     async fn each_publish_stages_its_generation_under_a_name_no_other_can_pick() {
-        let root = scratch("generation-stage-name");
+        let (_tmp, root) = scratch("generation-stage-name");
         let scratch_dir = Scratch::open(&root).await.unwrap();
         let first = generation_stage(&scratch_dir).unwrap();
         let second = generation_stage(&scratch_dir).unwrap();
@@ -1275,61 +1231,6 @@ mod tests {
             "the name must not be process-keyed: {name}"
         );
         assert!(name.starts_with(STAGE_PREFIX) && name.ends_with(".tmp"));
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// A publish stages individual objects as files *and* a whole signed generation as a
-    /// directory. `foundation::durable::sweep_stale_temps` only unlinks files, so the crash
-    /// leftover the sweep exists for — an abandoned generation — would otherwise survive every
-    /// later publish and accumulate one copy per crash.
-    #[test]
-    fn the_publish_sweep_reclaims_abandoned_generations_as_well_as_files() {
-        let root = scratch("publish-sweep-kinds");
-        let dir = root.join(".publish");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let aged =
-            std::time::SystemTime::now() - (STALE_STAGE_AGE + std::time::Duration::from_secs(60));
-        let backdate = |path: &Path| {
-            // A directory cannot be opened for writing; `set_times` works on a read handle.
-            let file = if path.is_dir() {
-                std::fs::File::open(path).unwrap()
-            } else {
-                std::fs::File::options().write(true).open(path).unwrap()
-            };
-            file.set_times(std::fs::FileTimes::new().set_modified(aged))
-                .unwrap();
-        };
-
-        // Abandoned: a staged object and a whole staged generation.
-        let stale_file = dir.join(format!("{STAGE_PREFIX}1-2-3.tmp"));
-        std::fs::write(&stale_file, b"orphan").unwrap();
-        backdate(&stale_file);
-        let stale_generation = dir.join(format!("{STAGE_PREFIX}generation-dead.tmp"));
-        std::fs::create_dir(&stale_generation).unwrap();
-        std::fs::write(stale_generation.join("timestamp.json"), b"{}").unwrap();
-        backdate(&stale_generation);
-
-        // In flight (fresh), and not ours (wrong prefix) — both must survive.
-        let live_generation = dir.join(format!("{STAGE_PREFIX}generation-live.tmp"));
-        std::fs::create_dir(&live_generation).unwrap();
-        let unrelated = dir.join("keys-9-9-9.tmp");
-        std::fs::write(&unrelated, b"not ours").unwrap();
-        backdate(&unrelated);
-
-        sweep_stale_staging(&dir);
-
-        assert!(!stale_file.exists(), "an abandoned staged object survived");
-        assert!(
-            !stale_generation.exists(),
-            "an abandoned staged generation survived the sweep"
-        );
-        assert!(
-            live_generation.exists(),
-            "an in-flight generation was yanked"
-        );
-        assert!(unrelated.exists());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Regression: a published object's access is decided once, by the staging primitive it is
@@ -1343,7 +1244,7 @@ mod tests {
     async fn every_published_metadata_role_and_target_object_is_world_readable() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = scratch("published-modes");
+        let (_tmp, root) = scratch("published-modes");
         let repo_dir = root.join("repo");
         let keys = generate_keys(&root.join("keys")).await.unwrap();
         init(&repo_dir, &keys, 365).await.unwrap();
@@ -1385,7 +1286,6 @@ mod tests {
                 );
             }
         }
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A kill during publication can leave a target object truncated at its content-addressed
@@ -1394,7 +1294,7 @@ mod tests {
     /// signs and every retry lands on it again.
     #[tokio::test]
     async fn republishing_repairs_a_truncated_target_object() {
-        let root = scratch("truncated-target");
+        let (_tmp, root) = scratch("truncated-target");
         let repo_dir = root.join("repo");
         let keys = generate_keys(&root.join("keys")).await.unwrap();
         init(&repo_dir, &keys, 365).await.unwrap();
@@ -1430,16 +1330,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&object).unwrap(), b"complete release bytes");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
     #[test]
     fn signing_keys_must_be_owner_only_regular_files() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("updated-key-check-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = tempfile::tempdir().unwrap();
+        let dir = guard.path().to_path_buf();
         let key = dir.join("root.pk8");
         std::fs::write(&key, b"key").unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();

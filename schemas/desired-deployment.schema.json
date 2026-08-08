@@ -192,7 +192,6 @@
         "health_grace_seconds",
         "health_successes",
         "health_interval_seconds",
-        "retry_after_seconds",
         "refresh_retry_seconds",
         "confirmation_window_seconds",
         "supervisor_check_interval_seconds"
@@ -218,11 +217,6 @@
         },
         "health_successes": { "type": "integer", "minimum": 1 },
         "health_interval_seconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2592000
-        },
-        "retry_after_seconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000

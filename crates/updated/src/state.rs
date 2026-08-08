@@ -292,16 +292,17 @@ mod tests {
     use super::*;
     use crate::testing::provider;
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("state-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+    fn tmp(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join(name);
         std::fs::create_dir_all(&d).unwrap();
-        d.join("installed.json")
+        let path = d.join("installed.json");
+        (dir, path)
     }
 
     #[test]
     fn round_trips() {
-        let path = tmp("ok");
+        let (_dir, path) = tmp("ok");
         write_installed(
             &path,
             &InstalledState {
@@ -341,14 +342,14 @@ mod tests {
 
     #[test]
     fn obsolete_records_are_rejected_instead_of_migrated() {
-        let path = tmp("obsolete");
+        let (_dir, path) = tmp("obsolete");
         std::fs::write(&path, br#"{"version":"1.0.0","sha256":"aa"}"#).unwrap();
         assert!(matches!(read_installed(&path), Installed::Invalid));
     }
 
     #[test]
     fn unknown_fields_are_rejected_instead_of_silently_ignored() {
-        let path = tmp("unknown-field");
+        let (_dir, path) = tmp("unknown-field");
         std::fs::write(
             &path,
             br#"{"version":"1.0.0","sha256":"aa","pending":null,"retired":true}"#,
@@ -359,24 +360,21 @@ mod tests {
 
     #[test]
     fn missing_is_not_invalid() {
-        assert!(matches!(
-            read_installed(&tmp("missing")),
-            Installed::Missing
-        ));
+        let (_dir, path) = tmp("missing");
+        assert!(matches!(read_installed(&path), Installed::Missing));
     }
 
     #[test]
     fn corrupt_is_invalid_not_missing() {
-        let path = tmp("corrupt");
+        let (_dir, path) = tmp("corrupt");
         std::fs::write(&path, b"{not json").unwrap();
         assert!(matches!(read_installed(&path), Installed::Invalid));
 
         // A read error that is *not* NotFound (here, the path is a directory) must also
         // fail closed as Invalid — only a genuine NotFound is the legitimate first-install
         // case, so the NotFound guard must not be widened to catch every error.
-        let dir = std::env::temp_dir().join(format!("state-{}-isdir", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(matches!(read_installed(&dir), Installed::Invalid));
+        let isdir = tempfile::tempdir().unwrap();
+        assert!(matches!(read_installed(isdir.path()), Installed::Invalid));
     }
 
     #[test]
@@ -432,7 +430,7 @@ mod tests {
 
     #[test]
     fn enrollment_is_one_way_and_survives_missing_installed_state() {
-        let path = tmp("enrollment");
+        let (_dir, path) = tmp("enrollment");
         enroll(&path).unwrap();
         assert!(matches!(read_enrollment(&path), EnrollmentState::Present));
         assert_eq!(

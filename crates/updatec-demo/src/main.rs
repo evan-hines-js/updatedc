@@ -1,8 +1,8 @@
 //! Presentation-only UI for the real `updatec` operator path.
 //!
-//! The service can patch one `UpdateRepository`; it cannot sign or write the
-//! publication bucket. The operator observes that desired-state change, signs a
-//! complete routing generation, uploads it, and the managed agent consumes it.
+//! The service observes the fleet and drives releases through the real `updatectl deploy` — it
+//! signs nothing itself and holds no key: `updatectl` signs a complete routing generation, uploads
+//! it, and the managed agent consumes it. What this binary serves is the view of that happening.
 
 use std::env;
 use std::net::SocketAddr;
@@ -30,10 +30,6 @@ pub(crate) use server::*;
 pub(crate) use setup::*;
 pub(crate) use state::*;
 
-pub(crate) fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    env::var(name).map_err(|_| format!("missing {name}").into())
-}
-
 #[tokio::main]
 pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
     updated::tls::install_crypto_provider();
@@ -52,11 +48,21 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return exercise_existing_cluster(passes).await;
         }
         Some("reset") => return reset_demo(),
+        // The one place anything — Rust, shell, or Ansible — learns the enrollment name a host
+        // asserts. `resource_name` is the single definition; this prints it so nothing outside
+        // this binary re-implements the derivation.
+        Some("agent-name") => {
+            let hostname = env::args()
+                .nth(2)
+                .ok_or("agent-name needs a hostname: `updatec-demo agent-name <hostname>`")?;
+            println!("{}", resource_name(&hostname));
+            return Ok(());
+        }
         Some("serve") | None => {}
         Some(command) => {
             return Err(format!(
                 "unknown command {command:?}; use start, setup, e2e [--exit], \
-                 exercise [passes], serve, or reset"
+                 exercise [passes], serve, agent-name <hostname>, or reset"
             )
             .into())
         }
@@ -85,6 +91,9 @@ pub(crate) async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::agent_resource_name;
 
+    /// Golden vectors for the derivation every consumer now reads out of this binary
+    /// (`updatec-demo agent-name`). Changing it renames every node in the demo and the kind
+    /// e2e at once, so it must be a deliberate edit, not a refactoring accident.
     #[test]
     fn demo_agent_names_match_dynamic_enrollment_names() {
         assert_eq!(agent_resource_name(0), "agent-53fa7c16911537893c54970e");

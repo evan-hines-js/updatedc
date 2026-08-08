@@ -32,7 +32,8 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     // rejection is still asserted directly below (the second never binds a port — it is refused
     // before launching the application — so reusing the first's address is safe).
     let second_cmd = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
-        .health_grace("1s")
+        .health_grace("2s")
+        .readiness_health(svc)
         .guardian()?;
     let second = Service::spawn("supervisor-2", &second_cmd);
     if !second.wait_for_log("already owns this install", EVENT_TIMEOUT) {
@@ -53,7 +54,3 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     ok("a second supervisor on the same install was refused by the instance lock");
     Ok(())
 }
-
-// ===========================================================================
-// 5. A health-check-failed release stays rejected across a restart.
-// ===========================================================================

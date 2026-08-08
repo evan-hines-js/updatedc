@@ -101,3 +101,79 @@ impl Store for FileStore {
         write_active(&self.paths.active_release, release)
     }
 }
+
+/// The crate's one in-memory [`Store`], for tests that drive boot recovery and the update
+/// transaction across simulated boots without touching a filesystem. There is exactly one so the
+/// two paths cannot be tested against two different notions of what the durable layer does —
+/// rejections really are keyed by lineage here, and the install journal really is modelled.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemStore {
+    pub(crate) installed: Option<InstalledState>,
+    pub(crate) journal: Option<Transaction>,
+    pub(crate) install_journal: Option<InstallTransaction>,
+    pub(crate) active: Option<ReleaseId>,
+    pub(crate) rejected: std::collections::HashSet<String>,
+    /// Simulate a state directory that has gone unwritable (ENOSPC, a read-only remount).
+    pub(crate) fail_reject: bool,
+}
+
+#[cfg(test)]
+impl Store for MemStore {
+    fn installed(&self) -> Installed {
+        match &self.installed {
+            Some(state) => Installed::Present(Box::new(state.clone())),
+            None => Installed::Missing,
+        }
+    }
+    fn journal(&self) -> io::Result<Option<Transaction>> {
+        Ok(self.journal.clone())
+    }
+    fn install_journal(&self) -> io::Result<Option<InstallTransaction>> {
+        Ok(self.install_journal.clone())
+    }
+    fn active_release(&self) -> io::Result<Option<ReleaseId>> {
+        Ok(self.active.clone())
+    }
+    fn is_rejected(&self, lineage: &RepositoryLineage, digest: &str) -> bool {
+        self.rejected.contains(&lineage.rejection_key(digest))
+    }
+    fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
+        self.installed = Some(state.clone());
+        Ok(())
+    }
+    fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
+        self.journal = Some(tx.clone());
+        Ok(())
+    }
+    fn clear_journal(&mut self) -> io::Result<()> {
+        self.journal = None;
+        Ok(())
+    }
+    fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
+        self.install_journal = Some(tx.clone());
+        Ok(())
+    }
+    fn clear_install_journal(&mut self) -> io::Result<()> {
+        self.install_journal = None;
+        Ok(())
+    }
+    fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+        if self.fail_reject {
+            return Err(io::Error::other("injected rejection write failure"));
+        }
+        self.rejected.insert(lineage.rejection_key(digest));
+        Ok(())
+    }
+    fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+        self.rejected.remove(&lineage.rejection_key(digest));
+        Ok(())
+    }
+    fn verify_release(&self, _: &ReleaseId) -> io::Result<()> {
+        Ok(())
+    }
+    fn point_active(&mut self, release: &ReleaseId) -> io::Result<()> {
+        self.active = Some(release.clone());
+        Ok(())
+    }
+}

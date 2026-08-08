@@ -131,10 +131,6 @@ impl Service {
         Some(code)
     }
 
-    pub fn is_running(&mut self) -> bool {
-        self.process.is_running()
-    }
-
     pub fn pid(&self) -> Option<u32> {
         self.process.pid()
     }
@@ -154,44 +150,7 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sys::Process;
-
-    /// A fake process whose behaviour is encoded in the spec's program, as in
-    /// [`crate::app`]'s tests: `exit:N` has already exited with code `N`; anything else
-    /// runs until stopped.
-    struct Fake {
-        exit: Option<i32>,
-    }
-
-    impl Process for Fake {
-        fn pid(&self) -> u32 {
-            7
-        }
-
-        fn poll_exit(&mut self) -> Option<i32> {
-            self.exit
-        }
-
-        fn stop(&mut self, _grace: Duration) {}
-    }
-
-    fn fake_spawn(spec: &CommandSpec) -> std::io::Result<Box<dyn Process>> {
-        let exit = spec
-            .program
-            .to_str()
-            .and_then(|s| s.strip_prefix("exit:"))
-            .and_then(|n| n.parse().ok());
-        Ok(Box::new(Fake { exit }))
-    }
-
-    fn spec(program: &str) -> CommandSpec {
-        CommandSpec {
-            program: program.into(),
-            args: vec![],
-            env: vec![],
-            cwd: None,
-        }
-    }
+    use crate::sys::{fake_spawn, fake_spec as spec};
 
     #[test]
     fn the_service_machine_owns_process_exit_and_probe_failure_together() {

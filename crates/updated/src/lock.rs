@@ -41,27 +41,20 @@ mod tests {
 
     #[test]
     fn one_owner_at_a_time() {
-        let dir = std::env::temp_dir().join(format!("lock-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("x.lock");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.lock");
         let first = InstanceLock::acquire(&path).unwrap();
         assert!(InstanceLock::acquire(&path).is_err());
         drop(first);
         assert!(InstanceLock::acquire(&path).is_ok());
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn creates_the_lock_parent_for_a_cold_install() {
-        let dir = std::env::temp_dir().join(format!(
-            "cold-lock-test-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
-        ));
-        let path = dir.join("missing/state/installed.json.lock");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing/state/installed.json.lock");
         let lock = InstanceLock::acquire(&path).unwrap();
         assert!(path.is_file());
         drop(lock);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

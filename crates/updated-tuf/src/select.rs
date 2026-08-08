@@ -284,14 +284,6 @@ impl TrustedRepository {
             provider_set: None,
         })
     }
-
-    pub async fn stage_release(
-        &self,
-        selected: &SelectedRelease,
-        destination: &std::path::Path,
-    ) -> Result<(), crate::Error> {
-        self.download_target(&selected.target, destination).await
-    }
 }
 
 #[cfg(test)]
@@ -486,7 +478,6 @@ mod provider_binding {
                 health_grace_seconds: 1,
                 health_successes: 1,
                 health_interval_seconds: 1,
-                retry_after_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,
@@ -497,12 +488,9 @@ mod provider_binding {
 
     /// Author the repo and return a repository loaded with an assignment that pins app 2.0.0
     /// as the head (its provider set B), with ordered fallback opted in.
-    async fn repo_with_assignment(fallback: bool) -> TrustedRepository {
-        let tmp = std::env::temp_dir().join(format!(
-            "updated-provider-binding-{}-{}",
-            std::process::id(),
-            updated::rand::token().unwrap()
-        ));
+    async fn repo_with_assignment(fallback: bool) -> (tempfile::TempDir, TrustedRepository) {
+        let guard = tempfile::tempdir().unwrap();
+        let tmp = guard.path().to_path_buf();
         let repo_dir = tmp.join("repo");
         let keys = repo::generate_keys(&tmp.join("keys")).await.unwrap();
         repo::init(&repo_dir, &keys, 365).await.unwrap();
@@ -567,7 +555,7 @@ mod provider_binding {
             release_root: serde_json::json!({}),
             runtime: runtime(),
         });
-        repository
+        (guard, repository)
     }
 
     fn policy() -> DefaultPolicy {
@@ -608,7 +596,7 @@ mod provider_binding {
     // the assignment head's B. This is the app+provider-as-one-unit rollback.
     #[tokio::test]
     async fn ordered_fallback_descends_to_the_app_versions_own_provider_set() {
-        let repo = repo_with_assignment(true).await;
+        let (_tmp, repo) = repo_with_assignment(true).await;
         let selected = repo
             .assigned_application(&policy(), None, |_| {}, |_, version| version == "2.0.0")
             .unwrap()
@@ -630,7 +618,7 @@ mod provider_binding {
     // provider sets the moment a provider-set-only assignment revision is published.
     #[tokio::test]
     async fn first_install_at_head_defers_providers_to_the_assignment_like_every_other_node() {
-        let repo = repo_with_assignment(true).await;
+        let (_tmp, repo) = repo_with_assignment(true).await;
         let selected = repo
             .assigned_application(&policy(), None, |_| {}, |_, _| false)
             .unwrap()
@@ -649,7 +637,7 @@ mod provider_binding {
     // WITHOUT an app change: `provider_set` is `None`, and the supervisor uses the assignment's.
     #[tokio::test]
     async fn established_node_defers_providers_to_the_assignment_for_provider_only_updates() {
-        let repo = repo_with_assignment(false).await;
+        let (_tmp, repo) = repo_with_assignment(false).await;
         let selected = repo
             .assigned_application(&policy(), Some("1.0.0"), |_| {}, |_, _| false)
             .unwrap()

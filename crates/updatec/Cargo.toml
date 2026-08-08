@@ -31,7 +31,6 @@ tokio-rustls = { workspace = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -42,13 +41,16 @@ updated-tuf = { path = "../updated-tuf" }
 # library). Its CSR parse verifies the self-signature, so reading the key to pin it and signing it
 # share one proof-of-possession check.
 rcgen = { workspace = true, features = ["x509-parser"] }
-tempfile = "3"
+tempfile.workspace = true
 # The mTLS data listener reads the verified leaf's Common Name to authorize per-node telemetry
 # writes (the trusted identity, vs the node's self-claimed path); join tests also introspect leaves.
 x509-parser = { workspace = true }
 
 [dev-dependencies]
 base64.workspace = true
+# Only the `crdgen` example renders the CRDs as YAML; nothing in the shipped library or binary
+# does, so it links against the example alone.
+serde_yaml.workspace = true
 # Collect a request body in the fake apiserver `crate::tests::apiserver` serves `kube::Client` from.
 http-body-util = "0.1"
 # Drive Axum routers directly in gateway tests via `ServiceExt::oneshot`, no socket needed.

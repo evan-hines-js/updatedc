@@ -9,9 +9,11 @@
 //!
 //! ## Negotiation (the extensible layer)
 //!
-//! The guardian sends [`Hello`]; the supervisor chooses the highest shared major and
-//! uses only advertised capabilities. Unknown requests receive
-//! [`Response::Unsupported`].
+//! The guardian sends [`Hello`]; the supervisor requires a shared protocol major and
+//! fails closed without one. That is the whole of it — every operation in a given major
+//! is mandatory, so there is no second, per-feature negotiation to disagree with it.
+//! Skew *inside* a major is additive only: a request tag the peer has never heard of is
+//! answered [`Response::Unsupported`] rather than negotiated away in advance.
 //!
 //! ## Platform-native strings
 //!
@@ -123,23 +125,6 @@ pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 const MAX_ITEMS: u32 = 65_536;
 const MAX_STR_UNITS: u32 = 1 << 20;
 
-pub const CAP_LAUNCH_APP_V1: u16 = 1;
-pub const CAP_STOP_APP: u16 = 2;
-pub const CAP_REPLACE_SUPERVISOR_V1: u16 = 3;
-pub const CAP_READY: u16 = 4;
-pub const CAP_TRAFFIC_STATE: u16 = 5;
-pub const CAP_FAIL_APPLICATION: u16 = 6;
-
-/// Everything the current guardian build advertises.
-const CURRENT_CAPS: &[u16] = &[
-    CAP_LAUNCH_APP_V1,
-    CAP_STOP_APP,
-    CAP_REPLACE_SUPERVISOR_V1,
-    CAP_READY,
-    CAP_TRAFFIC_STATE,
-    CAP_FAIL_APPLICATION,
-];
-
 /// A supervisor readiness nonce: 16 random bytes minted per supervisor launch and
 /// echoed in [`Request::Ready`], correlating readiness with the exact candidate.
 pub type Nonce = [u8; 16];
@@ -156,28 +141,17 @@ const TAG_ERROR: u8 = 0x82;
 const TAG_LAUNCHED: u8 = 0x83;
 const TAG_UNSUPPORTED: u8 = 0x84;
 
-/// The guardian's opening message: what protocol majors and capabilities it offers.
+/// The guardian's opening message: the protocol major it speaks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
-    pub majors: Vec<u16>,
-    pub capabilities: Vec<u16>,
-}
-
-/// The negotiated result on the supervisor side: the set of capabilities the peer
-/// guardian advertised. Negotiation fails closed unless a protocol major is shared, but
-/// the specific major is not retained — every feature decision goes through
-/// [`Capabilities::supports`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Capabilities {
-    caps: Vec<u16>,
+    pub major: u16,
 }
 
 impl Hello {
     /// The current build's advertisement (guardian side).
     pub fn current() -> Hello {
         Hello {
-            majors: vec![PROTOCOL_MAJOR],
-            capabilities: CURRENT_CAPS.to_vec(),
+            major: PROTOCOL_MAJOR,
         }
     }
 
@@ -186,8 +160,7 @@ impl Hello {
         w.write_all(&MAGIC)?;
         w.write_all(&[FRAMING_VERSION])?;
         let mut body = Vec::new();
-        put_u16_list(&mut body, &self.majors);
-        put_u16_list(&mut body, &self.capabilities);
+        put_u16(&mut body, self.major);
         write_frame(w, &body)?;
         Ok(())
     }
@@ -206,34 +179,18 @@ impl Hello {
         }
         let body = read_frame(r)?;
         let mut at = 0usize;
-        let majors = get_u16_list(&body, &mut at)?;
-        let capabilities = get_u16_list(&body, &mut at)?;
-        Ok(Hello {
-            majors,
-            capabilities,
-        })
+        let major = get_u16(&body, &mut at)?;
+        end_of_frame(&body, at)?;
+        Ok(Hello { major })
     }
 
-    /// Negotiate from the supervisor's supported majors, choosing the highest shared
-    /// one. `None` means no common major — an upgrade needs a bridge supervisor.
-    pub fn negotiate(&self, supported_majors: &[u16]) -> Option<Capabilities> {
-        // Require a shared protocol major, failing closed (`None`) when there is none.
-        // The chosen value itself is not retained; capabilities carry every decision.
-        self.majors
-            .iter()
-            .copied()
-            .filter(|m| supported_majors.contains(m))
-            .max()?;
-        Some(Capabilities {
-            caps: self.capabilities.clone(),
-        })
-    }
-}
-
-impl Capabilities {
-    /// Whether the guardian advertised `cap` (e.g. [`CAP_LAUNCH_APP_V1`]).
-    pub fn supports(&self, cap: u16) -> bool {
-        self.caps.contains(&cap)
+    /// Whether this build can talk to the peer that sent this hello. Equality on one constant,
+    /// fail-closed: there is exactly one protocol major, every operation in it is mandatory, and
+    /// the guardian and the supervisor are shipped and updated as one tower — a build that meets a
+    /// different major refuses to proceed rather than guessing which half of the protocol it
+    /// shares. This is the ONE compatibility decision in the protocol.
+    pub fn compatible(&self) -> bool {
+        self.major == PROTOCOL_MAJOR
     }
 }
 
@@ -382,19 +339,18 @@ fn get_u16(buf: &[u8], at: &mut usize) -> Result<u16> {
     Ok(u16::from_be_bytes(slice.try_into().unwrap()))
 }
 
-fn put_u16_list(out: &mut Vec<u8>, items: &[u16]) {
-    put_u32(out, items.len() as u32);
-    for &v in items {
-        put_u16(out, v);
+/// Every writer below enforces exactly the bound its reader rejects on. Asymmetry here is
+/// not a missing nicety: an over-long list or string still fits in a legal sub-[`MAX_FRAME`]
+/// frame, so it would encode fine and the peer would answer `Malformed` — which the
+/// guardian's serve loop reads as a channel fault, stopping and relaunching a healthy
+/// supervisor that then sends the same message again, forever. Refusing at encode time
+/// turns that loop into one bounded local error.
+fn put_count(out: &mut Vec<u8>, len: usize, what: &'static str) -> Result<()> {
+    if len as u64 > MAX_ITEMS as u64 {
+        return Err(Error::Malformed(what));
     }
-}
-
-fn get_u16_list(buf: &[u8], at: &mut usize) -> Result<Vec<u16>> {
-    let n = get_u32(buf, at)?;
-    if n > MAX_ITEMS {
-        return Err(Error::Malformed("list exceeds MAX_ITEMS"));
-    }
-    (0..n).map(|_| get_u16(buf, at)).collect()
+    put_u32(out, len as u32);
+    Ok(())
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -410,10 +366,14 @@ fn get_u32(buf: &[u8], at: &mut usize) -> Result<u32> {
     Ok(u32::from_be_bytes(slice.try_into().unwrap()))
 }
 
-fn put_os(out: &mut Vec<u8>, s: &OsStr) {
+fn put_os(out: &mut Vec<u8>, s: &OsStr) -> Result<()> {
     let (unit_count, bytes) = os_units(s);
+    if unit_count > MAX_STR_UNITS {
+        return Err(Error::Malformed("string exceeds MAX_STR_UNITS"));
+    }
     put_u32(out, unit_count);
     out.extend_from_slice(&bytes);
+    Ok(())
 }
 
 fn get_os(buf: &[u8], at: &mut usize) -> Result<OsString> {
@@ -433,9 +393,13 @@ fn get_os(buf: &[u8], at: &mut usize) -> Result<OsString> {
     Ok(s)
 }
 
-fn put_str(out: &mut Vec<u8>, s: &str) {
+fn put_str(out: &mut Vec<u8>, s: &str) -> Result<()> {
+    if s.len() as u64 > MAX_STR_UNITS as u64 {
+        return Err(Error::Malformed("string exceeds MAX_STR_UNITS"));
+    }
     put_u32(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
+    Ok(())
 }
 
 fn get_str(buf: &[u8], at: &mut usize) -> Result<String> {
@@ -456,11 +420,12 @@ fn get_str(buf: &[u8], at: &mut usize) -> Result<String> {
     Ok(s)
 }
 
-fn put_list(out: &mut Vec<u8>, items: &[OsString]) {
-    put_u32(out, items.len() as u32);
+fn put_list(out: &mut Vec<u8>, items: &[OsString]) -> Result<()> {
+    put_count(out, items.len(), "list exceeds MAX_ITEMS")?;
     for item in items {
-        put_os(out, item);
+        put_os(out, item)?;
     }
+    Ok(())
 }
 
 fn get_list(buf: &[u8], at: &mut usize) -> Result<Vec<OsString>> {
@@ -482,21 +447,22 @@ fn get_nonce(buf: &[u8], at: &mut usize) -> Result<Nonce> {
     Ok(slice.try_into().unwrap())
 }
 
-fn put_spec(out: &mut Vec<u8>, spec: &CommandSpec) {
-    put_os(out, &spec.program);
-    put_list(out, &spec.args);
-    put_u32(out, spec.env.len() as u32);
+fn put_spec(out: &mut Vec<u8>, spec: &CommandSpec) -> Result<()> {
+    put_os(out, &spec.program)?;
+    put_list(out, &spec.args)?;
+    put_count(out, spec.env.len(), "env exceeds MAX_ITEMS")?;
     for (k, v) in &spec.env {
-        put_os(out, k);
-        put_os(out, v);
+        put_os(out, k)?;
+        put_os(out, v)?;
     }
     match &spec.cwd {
         Some(cwd) => {
             out.push(1);
-            put_os(out, cwd);
+            put_os(out, cwd)?;
         }
         None => out.push(0),
     }
+    Ok(())
 }
 
 fn get_spec(buf: &[u8], at: &mut usize) -> Result<CommandSpec> {
@@ -532,21 +498,31 @@ fn get_spec(buf: &[u8], at: &mut usize) -> Result<CommandSpec> {
 }
 
 // ── message encode/decode ────────────────────────────────────────────────────────
-// Decoders read the fields they know and ignore any trailing bytes, so a future build
-// can append optional fields without breaking an older reader (forward-compat).
+
+/// Every decoder ends here: a frame that carries a byte more than its message needs is malformed,
+/// not tolerable. There is one protocol major and one shipped tower, so trailing bytes are never a
+/// newer peer's optional field — they are a truncation, a desync, or a peer writing a message this
+/// build cannot mean. The same rule the signed contracts apply with `deny_unknown_fields`.
+fn end_of_frame(body: &[u8], at: usize) -> Result<()> {
+    if at == body.len() {
+        Ok(())
+    } else {
+        Err(Error::Malformed("trailing bytes after message"))
+    }
+}
 
 impl Request {
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         match self {
             Request::Launch(spec) => {
                 out.push(TAG_LAUNCH);
-                put_spec(&mut out, spec);
+                put_spec(&mut out, spec)?;
             }
             Request::Stop => out.push(TAG_STOP),
             Request::ReplaceSupervisor(path) => {
                 out.push(TAG_REPLACE);
-                put_os(&mut out, path);
+                put_os(&mut out, path)?;
             }
             Request::Ready(nonce) => {
                 out.push(TAG_READY);
@@ -558,7 +534,7 @@ impl Request {
             }
             Request::ApplicationFailed => out.push(TAG_FAIL_APPLICATION),
         }
-        out
+        Ok(out)
     }
 
     fn decode(buf: &[u8]) -> Result<Request> {
@@ -569,20 +545,25 @@ impl Request {
             TAG_STOP => Request::Stop,
             TAG_REPLACE => Request::ReplaceSupervisor(get_os(body, &mut at)?),
             TAG_READY => Request::Ready(get_nonce(body, &mut at)?),
-            TAG_TRAFFIC_STATE => match body.first() {
-                Some(0) => Request::TrafficReady(false),
-                Some(1) => Request::TrafficReady(true),
-                _ => return Err(Error::Malformed("bad traffic-ready discriminant")),
-            },
+            TAG_TRAFFIC_STATE => {
+                at += 1;
+                match body.first() {
+                    Some(0) => Request::TrafficReady(false),
+                    Some(1) => Request::TrafficReady(true),
+                    _ => return Err(Error::Malformed("bad traffic-ready discriminant")),
+                }
+            }
             TAG_FAIL_APPLICATION => Request::ApplicationFailed,
             other => return Err(Error::UnknownTag(other)),
         };
+        end_of_frame(body, at)?;
         Ok(req)
     }
 
-    /// Write this request as one frame (supervisor side).
+    /// Write this request as one frame (supervisor side). Fails without writing anything
+    /// if the message violates a wire bound the reader would reject.
     pub fn write(&self, w: &mut impl Write) -> Result<()> {
-        write_frame(w, &self.encode())
+        write_frame(w, &self.encode()?)
     }
 
     /// Read one request frame (guardian side). `Err(UnknownTag)` on an operation this
@@ -593,13 +574,13 @@ impl Request {
 }
 
 impl Response {
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         match self {
             Response::Ok => out.push(TAG_OK),
             Response::Error(msg) => {
                 out.push(TAG_ERROR);
-                put_str(&mut out, msg);
+                put_str(&mut out, msg)?;
             }
             Response::Launched { pid } => {
                 out.push(TAG_LAUNCHED);
@@ -607,7 +588,7 @@ impl Response {
             }
             Response::Unsupported => out.push(TAG_UNSUPPORTED),
         }
-        out
+        Ok(out)
     }
 
     fn decode(buf: &[u8]) -> Result<Response> {
@@ -622,12 +603,14 @@ impl Response {
             TAG_UNSUPPORTED => Response::Unsupported,
             other => return Err(Error::UnknownTag(other)),
         };
+        end_of_frame(body, at)?;
         Ok(resp)
     }
 
-    /// Write this response as one frame (guardian side).
+    /// Write this response as one frame (guardian side). Fails without writing anything
+    /// if the message violates a wire bound the reader would reject.
     pub fn write(&self, w: &mut impl Write) -> Result<()> {
-        write_frame(w, &self.encode())
+        write_frame(w, &self.encode()?)
     }
 
     /// Read one response frame (supervisor side).
@@ -744,28 +727,18 @@ mod tests {
     }
 
     #[test]
-    fn handshake_negotiates_the_shared_major_and_capabilities() {
+    fn the_handshake_round_trips_and_admits_only_this_build_s_major() {
         let mut wire = Vec::new();
         Hello::current().write(&mut wire).unwrap();
         let hello = Hello::read(&mut &wire[..]).unwrap();
         assert_eq!(hello, Hello::current());
-        let caps = hello.negotiate(&[1]).expect("shared major 1");
-        assert!(caps.supports(CAP_LAUNCH_APP_V1));
-        assert!(caps.supports(CAP_REPLACE_SUPERVISOR_V1));
-        assert!(!caps.supports(0xFFFF));
-    }
-
-    #[test]
-    fn negotiation_without_a_shared_major_fails_closed() {
-        let hello = Hello {
-            majors: vec![2, 3],
-            capabilities: vec![CAP_LAUNCH_APP_V1],
-        };
-        assert!(hello.negotiate(&[1]).is_none());
-        assert!(
-            hello.negotiate(&[1, 2, 3]).is_some(),
-            "a shared major negotiates"
-        );
+        assert!(hello.compatible());
+        // Any other major fails closed: one major exists, and every operation in it is mandatory.
+        assert!(!Hello {
+            major: PROTOCOL_MAJOR + 1
+        }
+        .compatible());
+        assert!(!Hello { major: 0 }.compatible());
     }
 
     #[test]
@@ -782,16 +755,6 @@ mod tests {
             Hello::read(&mut &bad[..]),
             Err(Error::Incompatible(_))
         ));
-    }
-
-    #[test]
-    fn trailing_bytes_are_tolerated_as_future_optional_fields() {
-        let launch = Request::Launch(spec());
-        let mut payload = launch.encode();
-        payload.extend_from_slice(b"a future optional field");
-        let mut framed = (payload.len() as u32).to_be_bytes().to_vec();
-        framed.extend_from_slice(&payload);
-        assert_eq!(Request::read(&mut &framed[..]).unwrap(), launch);
     }
 
     #[test]
@@ -832,11 +795,34 @@ mod tests {
     }
 
     #[test]
-    fn max_frame_is_exactly_four_mib() {
-        // The cap is part of the wire contract; a drifted arithmetic constant would let
-        // a peer negotiate a different ceiling than the other side enforces.
-        assert_eq!(MAX_FRAME, 4 * 1024 * 1024);
-        assert_eq!(MAX_FRAME, 4_194_304);
+    fn a_frame_with_trailing_bytes_is_malformed() {
+        // Nothing is deployed and there is one protocol major, so a byte past the end of a message
+        // is never a newer peer's optional field: it is a desync or a peer writing something this
+        // build cannot mean. Both decoders refuse it, the same rule `deny_unknown_fields` applies
+        // to the signed contracts — one answer to unknown trailing data, not two.
+        let mut body = Request::Stop.encode().unwrap();
+        body.push(0xff);
+        assert!(matches!(
+            Request::decode(&body),
+            Err(Error::Malformed("trailing bytes after message"))
+        ));
+
+        let mut body = Response::Launched { pid: 7 }.encode().unwrap();
+        body.push(0);
+        assert!(matches!(
+            Response::decode(&body),
+            Err(Error::Malformed("trailing bytes after message"))
+        ));
+
+        // Including the handshake, where a tolerant reader would have silently accepted a peer
+        // offering a list of majors this build does not have the machinery to choose among.
+        let mut wire = MAGIC.to_vec();
+        wire.push(FRAMING_VERSION);
+        write_frame(&mut wire, &[0, PROTOCOL_MAJOR as u8, 0, 2]).unwrap();
+        assert!(matches!(
+            Hello::read(&mut &wire[..]),
+            Err(Error::Malformed("trailing bytes after message"))
+        ));
     }
 
     #[test]
@@ -883,27 +869,52 @@ mod tests {
         // The item caps are inclusive: a list of exactly MAX_ITEMS must decode, so a
         // `>=` boundary bug that rejected the largest legal list is caught.
         let mut buf = Vec::new();
-        put_u16_list(&mut buf, &vec![7u16; MAX_ITEMS as usize]);
-        let mut at = 0;
-        assert_eq!(
-            get_u16_list(&buf, &mut at).unwrap().len(),
-            MAX_ITEMS as usize
-        );
-
-        let mut buf = Vec::new();
-        put_list(&mut buf, &vec![OsString::new(); MAX_ITEMS as usize]);
+        put_list(&mut buf, &vec![OsString::new(); MAX_ITEMS as usize]).unwrap();
         let mut at = 0;
         assert_eq!(get_list(&buf, &mut at).unwrap().len(), MAX_ITEMS as usize);
 
         let mut s = spec();
         s.env = vec![(OsString::new(), OsString::new()); MAX_ITEMS as usize];
         let mut buf = Vec::new();
-        put_spec(&mut buf, &s);
+        put_spec(&mut buf, &s).unwrap();
         let mut at = 0;
         assert_eq!(
             get_spec(&buf, &mut at).unwrap().env.len(),
             MAX_ITEMS as usize
         );
+    }
+
+    #[test]
+    fn a_writer_refuses_exactly_what_the_reader_would_reject() {
+        // An asymmetric bound is not a cosmetic problem: an over-long env or string still
+        // fits in a legal frame, so it would encode, and the guardian would read it as
+        // Malformed — a channel fault, which stops and relaunches a healthy supervisor that
+        // then sends the identical message again. The write must fail locally instead.
+        let mut over = spec();
+        over.env = vec![(OsString::new(), OsString::new()); MAX_ITEMS as usize + 1];
+        assert!(matches!(
+            Request::Launch(over).write(&mut Vec::new()),
+            Err(Error::Malformed(_))
+        ));
+
+        let mut over = spec();
+        over.program = OsString::from("a".repeat(MAX_STR_UNITS as usize + 1));
+        assert!(matches!(
+            Request::Launch(over).write(&mut Vec::new()),
+            Err(Error::Malformed(_))
+        ));
+
+        let mut over = spec();
+        over.args = vec![OsString::new(); MAX_ITEMS as usize + 1];
+        assert!(matches!(
+            Request::Launch(over).write(&mut Vec::new()),
+            Err(Error::Malformed(_))
+        ));
+
+        assert!(matches!(
+            Response::Error("e".repeat(MAX_STR_UNITS as usize + 1)).write(&mut Vec::new()),
+            Err(Error::Malformed(_))
+        ));
     }
 
     /// A reader whose peer sent `sent` and then stalled forever, with a read timeout set —
@@ -955,12 +966,12 @@ mod tests {
         let big = "a".repeat(MAX_STR_UNITS as usize);
 
         let mut buf = Vec::new();
-        put_str(&mut buf, &big);
+        put_str(&mut buf, &big).unwrap();
         let mut at = 0;
         assert_eq!(get_str(&buf, &mut at).unwrap(), big);
 
         let mut buf = Vec::new();
-        put_os(&mut buf, OsStr::new(&big));
+        put_os(&mut buf, OsStr::new(&big)).unwrap();
         let mut at = 0;
         assert_eq!(get_os(&buf, &mut at).unwrap(), OsString::from(&big));
     }

@@ -10,6 +10,8 @@
 #                           base64 PEM of the fleet client cert, its key, and the fleet CA (the
 #                           mTLS identity — cert-manager issues it; no shared secret)
 #   updated_hostname        stable identity the control plane addresses this node by
+# Optional:
+#   updated_build_dir       where to build on the target (default ~/updatedc-src)
 # Optional demo-only vars (kind gateway exposed on the laptop's LAN):
 #   updated_demo_shim_host / updated_demo_shim_port
 - name: Install the updated agent

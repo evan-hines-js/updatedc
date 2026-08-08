@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{
-    with_suffix, Application, MaterializeRuntime, Paths, Routing, Storage, Timeouts,
-};
+use updated::config::{with_suffix, Application, Paths, Routing, Storage, Timeouts};
 use updated::env;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate, and shared with
 /// every reconciler implementation in this workspace.
@@ -44,7 +42,7 @@ use self_update::*;
 use store::*;
 use update::*;
 
-use updated::hash::{sha256_file, verify_file};
+use updated::hash::sha256_file;
 use updated_tuf::select::{target_sha, SelectedRelease};
 use updated_tuf::{DefaultPolicy, TrustedRepository};
 
@@ -88,25 +86,13 @@ impl Options {
             || self.application.mode != runtime.mode
             || self.application.secrets != runtime.secrets
             || self.application.inputs != runtime.inputs;
-        let boot_install_root = self.application.install_root.clone();
-        self.application = runtime.application();
-        // `install_root` is a BOOT-time property: `self.paths` (versions, staging, active release,
-        // installed state, journal, rejections, provider trees) was derived from it once and is not
-        // recomputed here. Adopting a new root without those would leave every path pointing into
-        // the old tree while the assignment claims the new one — installs, rollback evidence, and
-        // the running binary silently disagreeing. Moving a node's install root is a migration, so
-        // keep the root this process booted with and let a restart pick up the new one.
-        if self.application.install_root != boot_install_root {
-            warn(&format!(
-                "the assignment moves the install root to {}; keeping {} until this supervisor \
-                 restarts, since every resolved path derives from the boot-time root",
-                self.application.install_root.display(),
-                boot_install_root.display()
-            ));
-            self.application.install_root = boot_install_root;
-        }
-        self.timeouts = BoundedTimeouts::new(runtime.timeouts());
-        self.storage = runtime.storage();
+        // `install_root` needs no reconciliation: `TrustedRepository::assigned` fails closed on
+        // any assignment whose root is not exactly the one this process resolved its paths from
+        // (`usable_as_boot_config`), so an assignment that reaches here can only carry the boot
+        // root. Moving a node's install root is a migration, done by restarting on a new config.
+        self.application = Application::from_runtime(runtime);
+        self.timeouts = BoundedTimeouts::new(Timeouts::from_runtime(runtime));
+        self.storage = Storage::from_runtime(runtime);
         // The supervisor's OWN update rides the same assignment: its channel and cadence are the
         // application's, seeded once at `parse_args` from the boot-time config. Reconcile them here
         // too, or a node the control plane moves from `stable` to `canary` keeps selecting the
@@ -167,6 +153,18 @@ struct HealthWatch {
 /// Consecutive failed periodic probes that mean the managed application is dead rather than
 /// briefly unwell. Only ever counted against a process past its start grace.
 const MAX_LIVENESS_FAILURES: u32 = 3;
+
+/// Everything the 12-hourly identity tick may spend on the control loop, end to end.
+///
+/// Sized by the health path, not by the work. The tick runs inline on the single loop that also
+/// emits the rollout heartbeat, and the healthproxy drains a node whose report is older than
+/// [`updated_contracts::telemetry::REPORT_FRESHNESS`], so the whole tick has to stay well inside
+/// that window or the renewal walk causes the drain it is meant to protect. Its own network legs
+/// are bounded independently and generously (a 60s control-plane deadline twice, plus a 30s root
+/// catch-up walk), which against a gateway that accepts connections and then trickles bytes adds
+/// up to more than two missed heartbeats; this is the bound that makes that impossible. Timing out
+/// is cheap — the whole check is simply retried on the next 12h tick.
+const IDENTITY_TICK_DEADLINE: Duration = Duration::from_secs(20);
 
 impl HealthWatch {
     /// Start watching an application that has ALREADY passed a health gate (the boot gate), so
@@ -763,6 +761,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|pem| updated::csr::key_pem_to_pkcs8_der(&pem).ok()),
     };
     let mut fingerprints = fingerprint::Tracker::new(Instant::now());
+    // The last repository this node resolved. Kept across cycles so the heartbeat has something to
+    // report off even on a cycle that could not reach the control plane: the report endpoint and
+    // the metadata endpoint fail independently, and a node that cannot refresh is exactly the node
+    // whose silence would be misread as death.
+    let mut last_repo: Option<TrustedRepository> = None;
     loop {
         // An unconfirmed update that ran its whole window without crashing is confirmed.
         let confirm_due = pending
@@ -783,20 +786,23 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let now = Instant::now();
-        // Wake when the confirmation window ends even if the update interval is longer.
-        let app_wait = if let Some(p) = pending.as_ref() {
-            if confirm_failed {
-                // The window has already elapsed, so `window_remaining` is zero and the
-                // wait would fall to its 100ms floor: a confirm that cannot be persisted (a
-                // full or read-only state dir) would re-attempt — and re-warn — ten times a
-                // second for as long as the fault lasts. Retry on the normal cadence.
-                opts.timeouts.check_interval
-            } else {
-                window_remaining(p, opts.timeouts.confirmation_window, now_unix())
+        // The cycle clock always bounds the wait — it is the node's report cadence, and a sleep
+        // longer than it is a report older than it. The confirmation window only ever shortens it,
+        // so the confirm above happens the moment the window ends even when the cycle is longer.
+        let mut app_wait = loop_state.next_app_check.saturating_duration_since(now);
+        if let Some(p) = pending.as_ref() {
+            if !confirm_failed {
+                // When the confirm has already failed the window remaining is zero, and letting it
+                // set the wait would drop it to its 100ms floor: a confirm that cannot be persisted
+                // (a full or read-only state dir) would re-attempt — and re-warn — ten times a
+                // second for as long as the fault lasts. The cycle cadence alone then paces it.
+                app_wait = app_wait.min(window_remaining(
+                    p,
+                    opts.timeouts.confirmation_window,
+                    now_unix(),
+                ));
             }
-        } else {
-            loop_state.next_app_check.saturating_duration_since(now)
-        };
+        }
         let mut wait = app_wait.min(self_update.due_in(now));
         wait = wait.min(health.next_probe.saturating_duration_since(now));
         wait = wait.min(
@@ -825,12 +831,34 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                         .steady_identity(&opts.identity_renewal.state_dir)
                     {
                         Ok(mtls) => {
-                            updated::enrollment::renew_node_material_if_due(
-                                &bootstrap,
-                                &opts.identity_renewal.state_dir,
-                                &updated_tuf::EmbeddedChainPolicy::new(mtls),
+                            // ONE deadline over the whole tick, not per network leg. The tick runs
+                            // inline on this loop — the same loop that emits the heartbeat below —
+                            // and the healthproxy drains a node whose report is older than
+                            // REPORT_FRESHNESS (60s). Its three exchanges are each bounded
+                            // independently (60s + 30s + 60s), which sums to two and a half missed
+                            // heartbeats against a gateway that accepts connections and then
+                            // trickles: the walk would cause exactly the drain its own deadline
+                            // was sized to prevent. Timing out costs nothing — the whole check is
+                            // retried in 12h — so it is bounded well inside that window instead.
+                            match tokio::time::timeout(
+                                IDENTITY_TICK_DEADLINE,
+                                updated::enrollment::renew_node_material_if_due(
+                                    &bootstrap,
+                                    &opts.identity_renewal.state_dir,
+                                    &updated_tuf::EmbeddedChainPolicy::new(mtls),
+                                ),
                             )
                             .await
+                            {
+                                Ok(renewal) => renewal,
+                                Err(_) => Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    format!(
+                                        "node material renewal exceeded {}s on this control loop",
+                                        IDENTITY_TICK_DEADLINE.as_secs()
+                                    ),
+                                )),
+                            }
                         }
                         Err(error) => Err(error),
                     };
@@ -906,277 +934,293 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let self_due = self_update.due(now);
-        let app_due = application_check_due(pending.is_some(), now, loop_state.next_app_check);
-        if !self_due && !app_due {
+        let cycle = cycle_due(pending.is_some(), now, loop_state.next_app_check);
+        if !self_due && !cycle.due {
             continue;
         }
-
-        if let updated::state::Installed::Present(installed) = store.installed() {
-            if let Err(error) =
-                updated::bundle::verify_release(&opts.paths.versions, &installed.release)
-            {
-                fingerprints.restart_after_deployment(Instant::now());
-                // Out of rotation before the bytes under the running application are repaired — the
-                // repair stops and replaces it. With NO drain hold: these bytes failed integrity
-                // verification, and every second of a configured hold is a second they keep
-                // executing, which is the one thing this arm exists to end. Best effort, like the
-                // stop below: a guardian that cannot be reached must not keep tampered bytes
-                // running.
-                let _ = withdraw_from_traffic(&mut app, DrainHold::None).await;
-                let _ = app::stop_runtime(&mut app);
-                let repaired_from = repair_committed_bundle(&opts, &mut store)
-                    .await
-                    .map_err(|repair| {
-                        format!(
-                            "committed application bundle changed on disk ({error}); stopped it before repository access and no signed repair was applicable: {repair}"
-                        )
-                    })?;
-                current = match store.installed() {
-                    updated::state::Installed::Present(state) => Some(state.release.version),
-                    _ => None,
-                };
-                // Re-derive the in-memory confirmation intent from the record the repair just
-                // wrote, exactly like every other divergence site. The repair CARRIES an in-flight
-                // update's `pending` forward, so blanking it here would leave a durable `pending`
-                // this process can never confirm (only `confirm_due` -> `confirm_update`, off this
-                // local, clears it) — and the first ordinary crash days later would be read by
-                // `boot::confirm_or_revert` as an exit inside the confirmation window: a revert to
-                // the predecessor plus a permanent rejection of a release that had long since
-                // proven itself.
-                pending = installed_pending(&store);
-                // The SAME converge the runtime-relaunch path below runs, for the same reason: in
-                // provider-managed mode neither the stop above nor the launch below touches the
-                // application — the reconciler owns it — so `apply` is the only step that puts the
-                // repaired bytes into service. Without it the tampered image would keep running and
-                // the next probe would restore its readiness. NOT best effort: unlike the guardian
-                // stop, a converge that fails would leave the old image serving, so it propagates
-                // and this supervisor exits withdrawn, leaving boot recovery to converge and launch
-                // the repaired release.
-                converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
-                    format!("converging the environment onto the repaired bundle: {error}")
-                })?;
-                app.launch(&opts)?;
-                health.relaunched(&opts.timeouts);
-                // Take the repaired bundle through a LATER tick rather than falling through to the
-                // update check on this one: the check is legitimately due against the repaired
-                // release, but reaching it here would run a second withdraw-and-drain inside the
-                // same tick — this time paying the full configured hold — right after the repair
-                // deliberately skipped it.
-                //
-                // On the normal cadence, and deferring the self-update check with it, for the same
-                // reason the secrets arm below does: `check` is the only thing that advances the
-                // self-update clock and this `continue` skips it, so scheduling the next tick
-                // immediately would leave `self_due` true forever and collapse `wait` to its 100 ms
-                // floor. Drift that survives a repair (a reconciler `apply` writing into the
-                // content-addressed release directory) would then re-run withdraw + stop + a full
-                // TUF refresh and re-download + converge + launch ten times a second, forever.
-                let retry = jitter(opts.timeouts.check_interval, REPORT_CADENCE_JITTER_PERCENT);
-                loop_state.next_app_check = Instant::now() + retry;
-                self_update.defer(Instant::now() + retry);
-                // Report BEFORE leaving the tick. The heartbeat below is the node's only report
-                // writer and it runs only on ticks where a check is due — exactly the ticks this
-                // arm ends early — so skipping it silences the node completely for as long as the
-                // drift recurs, and one `REPORT_FRESHNESS` later the health proxy drains a node
-                // whose last word was stale rather than untrue. Reported not-settled, which is
-                // simply what `relaunched` just made true: this node was withdrawn from rotation
-                // and restarted onto repaired bytes, and it publishes settled again through the
-                // ordinary path as soon as a tick verifies clean and observes it ready.
-                //
-                // Off the repository the repair itself resolved, so this costs no second refresh.
-                // The predecessor fallback has none — it runs when the control plane is
-                // unreachable, which is also when there is nothing to report to.
-                if let Some(repo) = &repaired_from {
-                    heartbeat
-                        .emit(
-                            &opts,
-                            repo,
-                            &store,
-                            current.as_deref(),
-                            false,
-                            fingerprints.current(),
-                        )
-                        .await;
-                }
-                continue;
-            }
-        }
-
-        // Resolve the agent document afresh, then load its release repository.
-        // One verified result serves application and self checks this cycle, and a
-        // control-plane reassignment therefore takes effect without process restart.
-        let repo = match TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
-            .await
-        {
-            Ok(repo) => repo,
-            Err(e) => {
-                loop_state.refresh_failures = loop_state.refresh_failures.saturating_add(1);
-                let base = if e.is_retryable() {
-                    opts.timeouts.refresh_retry
-                } else {
-                    opts.timeouts.check_interval
-                };
-                let retry = network_backoff(base, loop_state.refresh_failures);
-                match &e {
-                updated_tuf::Error::Transport(_) => warn(&format!(
-                    "TUF refresh failed ({e}); retrying in {}s",
-                    retry.as_secs()
-                )),
-                updated_tuf::Error::Trust(_) => error(&format!(
-                    "TUF refresh failed a trust check ({e}); not updating (fail closed), rechecking in {}s",
-                    retry.as_secs()
-                )),
-                updated_tuf::Error::Local(_) => error(&format!(
-                    "TUF refresh failed locally ({e}); not updating, rechecking in {}s",
-                    retry.as_secs()
-                )),
-            }
-                loop_state.next_app_check =
-                    Instant::now() + jitter(retry, REPORT_CADENCE_JITTER_PERCENT);
-                self_update.defer(Instant::now() + retry);
-                continue;
-            }
-        };
-        loop_state.refresh_failures = 0;
-
-        // Reconcile the managed runtime onto the one live source before acting on version or
-        // provider changes. `check_application` reconciles the version and provider set; the
-        // rest of the runtime — launch args, health URLs, cadence, retention — is signed into
-        // the same assignment and can change on a control-plane reassignment with no version
-        // bump. Applying it here keeps every launch on the current launch spec.
-        if let Some(assignment) = repo.assignment() {
-            let secrets_changed = match opts
-                .secrets
-                .reconcile(&assignment.deployment, &assignment.runtime.secrets)
-                .await
-            {
-                Ok(changed) => changed,
-                Err(error) => {
-                    warn(&format!(
-                        "assigned secrets could not be reconciled; keeping the running application and retrying: {error}"
-                    ));
-                    let retry = jitter(opts.timeouts.refresh_retry, REPORT_CADENCE_JITTER_PERCENT);
-                    loop_state.next_app_check = Instant::now() + retry;
-                    // Defer the self-update check too. It is due right after boot and is only
-                    // advanced by `check` below — which this `continue` skips — so leaving it alone
-                    // collapses `wait` to its 100 ms floor and turns a failing secrets endpoint into
-                    // every node in the fleet re-running a TUF refresh and a secrets fetch ten times
-                    // a second, against the control plane that is already unwell.
-                    self_update.defer(Instant::now() + retry);
-                    continue;
-                }
-            };
-            opts.deployment = assignment.deployment.clone();
-            let relaunch = opts.apply_runtime(&assignment.runtime) || secrets_changed;
-            if relaunch {
-                // The runtime changed under the running process. A live process cannot have its
-                // argv or environment rewritten, so stop it, converge the environment on the new
-                // runtime, and relaunch onto it.
-                log("assignment runtime changed; converging the environment and relaunching the application onto it");
-                fingerprints.restart_after_deployment(Instant::now());
-                // Leave rotation first, exactly as the update transaction does and through the same
-                // sequence: the converge below is the reconciler `apply` that reconfigures or
-                // restarts a provider-managed application, and there is no guardian stop in that
-                // mode to withdraw readiness as a side effect. Readiness comes back only through
-                // the ordinary observed-healthy path after `relaunched` re-arms probing, so a
-                // failure anywhere below leaves this node withdrawn.
-                withdraw_from_traffic(&mut app, DrainHold::configured(&opts))
-                    .await
-                    .map_err(|error| {
-                        format!("withdrawing from traffic to apply a new runtime: {error}")
-                    })?;
-                app::stop_runtime(&mut app).map_err(|error| {
-                    format!("stopping the application to apply a new runtime: {error}")
-                })?;
-                // The SAME converge the boot path runs, for the same reason and through the same
-                // function: resolved `inputs` reach the reconciler only as `--input-file` on a
-                // lifecycle invocation, so a revision that changes them takes effect here or not
-                // at all — relaunching the application alone would stop and start it for nothing.
-                converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
-                    format!("converging the environment onto the new runtime: {error}")
-                })?;
-                app.launch(&opts).map_err(|error| {
-                    format!("relaunching the application with the new launch spec: {error}")
-                })?;
-                // Re-gate readiness from scratch — under the configured start grace, since this
-                // process has not passed a health gate — and let the next tick drive the
-                // version/provider reconciliation against the freshly relaunched, correctly-
-                // configured process.
-                health.relaunched(&opts.timeouts);
-                loop_state.next_app_check = Instant::now();
-                continue;
-            }
-        }
-
-        // Self-update first: on an accepted handoff this process exits.
-        if self_due {
-            self_update
-                .check(&opts.supervisor_update, &repo, &mut app.guardian)
-                .await;
-        }
-
-        if app_due {
+        if cycle.due {
+            // Advance the cycle clock ONCE, up front. This is the node's report cadence as much as
+            // its update cadence, and the early exits below only ever replace this baseline with
+            // their own retry.
             loop_state.next_app_check = Instant::now()
                 + jitter(opts.timeouts.check_interval, REPORT_CADENCE_JITTER_PERCENT);
-            match check_application(&opts, &repo, &mut store, &mut app, || {
-                fingerprints.restart_after_deployment(Instant::now());
-            })
-            .await
-            {
-                AppOutcome::Upgraded { version } => {
-                    current = Some(version);
-                    // The commit recorded the update as unconfirmed; pick it up so its
-                    // window is watched and a crash is caught on the next boot.
+        }
+        // The cycle's work, as ONE expression. Every early exit inside leaves the block, not the
+        // tick, so the heartbeat below is reached however the cycle ends — no `continue` added here
+        // later can spend the node's freshness budget in silence.
+        let flow: Result<TickFlow, Box<dyn std::error::Error>> = async {
+            if let updated::state::Installed::Present(installed) = store.installed() {
+                if let Err(error) =
+                    updated::bundle::verify_release(&opts.paths.versions, &installed.release)
+                {
+                    fingerprints.restart_after_deployment(Instant::now());
+                    // Out of rotation before the bytes under the running application are repaired — the
+                    // repair stops and replaces it. With NO drain hold: these bytes failed integrity
+                    // verification, and every second of a configured hold is a second they keep
+                    // executing, which is the one thing this arm exists to end. Best effort, like the
+                    // stop below: a guardian that cannot be reached must not keep tampered bytes
+                    // running.
+                    let _ = withdraw_from_traffic(&mut app, DrainHold::None).await;
+                    let _ = app::stop_runtime(&mut app);
+                    let repaired_from = repair_committed_bundle(&opts, &mut store)
+                        .await
+                        .map_err(|repair| {
+                            format!(
+                                "committed application bundle changed on disk ({error}); stopped it before repository access and no signed repair was applicable: {repair}"
+                            )
+                        })?;
+                    current = match store.installed() {
+                        updated::state::Installed::Present(state) => Some(state.release.version),
+                        _ => None,
+                    };
+                    // Re-derive the in-memory confirmation intent from the record the repair just
+                    // wrote, exactly like every other divergence site. The repair CARRIES an in-flight
+                    // update's `pending` forward, so blanking it here would leave a durable `pending`
+                    // this process can never confirm (only `confirm_due` -> `confirm_update`, off this
+                    // local, clears it) — and the first ordinary crash days later would be read by
+                    // `boot::confirm_or_revert` as an exit inside the confirmation window: a revert to
+                    // the predecessor plus a permanent rejection of a release that had long since
+                    // proven itself.
                     pending = installed_pending(&store);
-                    garbage_collect(&opts, &store);
-                    // The transaction replaced the process. Everything this watch holds —
-                    // the failure count, the last observation, the probe deadline set
-                    // earlier in this same tick — describes the process that was just
-                    // stopped, so re-arm as at every other launch site rather than judging
-                    // a freshly started release on its predecessor's record.
+                    // The SAME converge the runtime-relaunch path below runs, for the same reason: in
+                    // provider-managed mode neither the stop above nor the launch below touches the
+                    // application — the reconciler owns it — so `apply` is the only step that puts the
+                    // repaired bytes into service. Without it the tampered image would keep running and
+                    // the next probe would restore its readiness. NOT best effort: unlike the guardian
+                    // stop, a converge that fails would leave the old image serving, so it propagates
+                    // and this supervisor exits withdrawn, leaving boot recovery to converge and launch
+                    // the repaired release.
+                    converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
+                        format!("converging the environment onto the repaired bundle: {error}")
+                    })?;
+                    app.launch(&opts)?;
                     health.relaunched(&opts.timeouts);
-                }
-                AppOutcome::Unchanged => {}
-                AppOutcome::RestartForRecovery => {
-                    // A post-activation failure left a durable rollback journal. Terminate this
-                    // disposable supervisor cleanly; the guardian relaunches it and boot recovery
-                    // performs the rollback (the single rollback path). The guardian keeps the
-                    // application alive across the restart.
-                    log("update failed after activation; restarting so boot recovery rolls back");
-                    return Ok(());
-                }
-                AppOutcome::Fatal(message) => {
-                    return Err(exit_for_relaunch(
-                        "the update transaction requires boot recovery",
-                        &message,
-                    ));
+                    // Take the repaired bundle through a LATER tick rather than falling through to the
+                    // update check on this one: the check is legitimately due against the repaired
+                    // release, but reaching it here would run a second withdraw-and-drain inside the
+                    // same tick — this time paying the full configured hold — right after the repair
+                    // deliberately skipped it.
+                    //
+                    // On the normal cadence, and deferring the self-update check with it, for the same
+                    // reason the secrets arm below does: `check` is the only thing that advances the
+                    // self-update clock and this early exit skips it, so scheduling the next cycle
+                    // immediately would leave `self_due` true forever and collapse `wait` to its 100 ms
+                    // floor. Drift that survives a repair (a reconciler `apply` writing into the
+                    // content-addressed release directory) would then re-run withdraw + stop + a full
+                    // TUF refresh and re-download + converge + launch ten times a second, forever.
+                    let retry = jitter(opts.timeouts.check_interval, REPORT_CADENCE_JITTER_PERCENT);
+                    loop_state.next_app_check = Instant::now() + retry;
+                    self_update.defer(Instant::now() + retry);
+                    // Hand the repository the repair resolved to the heartbeat below. That report is
+                    // the node's only word about itself, and this arm is one of the paths that ends a
+                    // cycle early — under drift that survives the repair (the arm's own stated case) a
+                    // silent cycle would drain the node one `REPORT_FRESHNESS` later for a reason no
+                    // reader can see. It reports not-settled, which is simply what `relaunched` just
+                    // made true.
+                    //
+                    // The predecessor fallback resolves no repository — it runs when the control plane
+                    // is unreachable — so the heartbeat then reports off the last one this node saw.
+                    if let Some(repo) = repaired_from {
+                        last_repo = Some(repo);
+                    }
+                    return Ok(TickFlow::Next);
                 }
             }
-        }
 
-        // The rollout heartbeat, emitted after acting on the current assignment. Every path that
-        // leaves this tick early emits it first (see the integrity arm above) — see [`Heartbeat`].
+            // Resolve the agent document afresh, then load its release repository.
+            // One verified result serves application and self checks this cycle, and a
+            // control-plane reassignment therefore takes effect without process restart.
+            let resolved = match TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
+                .await
+            {
+                Ok(repo) => repo,
+                Err(e) => {
+                    loop_state.refresh_failures = loop_state.refresh_failures.saturating_add(1);
+                    let base = if e.is_retryable() {
+                        opts.timeouts.refresh_retry
+                    } else {
+                        opts.timeouts.check_interval
+                    };
+                    let retry = network_backoff(base, loop_state.refresh_failures);
+                    match &e {
+                    updated_tuf::Error::Transport(_) => warn(&format!(
+                        "TUF refresh failed ({e}); retrying in {}s",
+                        retry.as_secs()
+                    )),
+                    updated_tuf::Error::Trust(_) => error(&format!(
+                        "TUF refresh failed a trust check ({e}); not updating (fail closed), rechecking in {}s",
+                        retry.as_secs()
+                    )),
+                    updated_tuf::Error::Local(_) => error(&format!(
+                        "TUF refresh failed locally ({e}); not updating, rechecking in {}s",
+                        retry.as_secs()
+                    )),
+                }
+                    loop_state.next_app_check =
+                        Instant::now() + jitter(retry, REPORT_CADENCE_JITTER_PERCENT);
+                    self_update.defer(Instant::now() + retry);
+                    return Ok(TickFlow::Next);
+                }
+            };
+            // The one place a resolved repository is remembered, so the heartbeat at the end of the
+            // cycle can report off it however this cycle ends.
+            last_repo = Some(resolved);
+            let repo = last_repo.as_ref().expect("stored on the line above");
+            loop_state.refresh_failures = 0;
+
+            // Reconcile the managed runtime onto the one live source before acting on version or
+            // provider changes. `check_application` reconciles the version and provider set; the
+            // rest of the runtime — launch args, health URLs, cadence, retention — is signed into
+            // the same assignment and can change on a control-plane reassignment with no version
+            // bump. Applying it here keeps every launch on the current launch spec.
+            if let Some(assignment) = repo.assignment() {
+                let secrets_changed = match opts
+                    .secrets
+                    .reconcile(&assignment.deployment, &assignment.runtime.secrets)
+                    .await
+                {
+                    Ok(changed) => changed,
+                    Err(error) => {
+                        warn(&format!(
+                            "assigned secrets could not be reconciled; keeping the running application and retrying: {error}"
+                        ));
+                        let retry = jitter(opts.timeouts.refresh_retry, REPORT_CADENCE_JITTER_PERCENT);
+                        loop_state.next_app_check = Instant::now() + retry;
+                        // Defer the self-update check too. It is due right after boot and is only
+                        // advanced by `check` below — which this early exit skips — so leaving it alone
+                        // collapses `wait` to its 100 ms floor and turns a failing secrets endpoint into
+                        // every node in the fleet re-running a TUF refresh and a secrets fetch ten times
+                        // a second, against the control plane that is already unwell.
+                        self_update.defer(Instant::now() + retry);
+                        return Ok(TickFlow::Next);
+                    }
+                };
+                opts.deployment = assignment.deployment.clone();
+                let relaunch = opts.apply_runtime(&assignment.runtime) || secrets_changed;
+                if relaunch {
+                    // The runtime changed under the running process. A live process cannot have its
+                    // argv or environment rewritten, so stop it, converge the environment on the new
+                    // runtime, and relaunch onto it.
+                    log("assignment runtime changed; converging the environment and relaunching the application onto it");
+                    fingerprints.restart_after_deployment(Instant::now());
+                    // Leave rotation first, exactly as the update transaction does and through the same
+                    // sequence: the converge below is the reconciler `apply` that reconfigures or
+                    // restarts a provider-managed application, and there is no guardian stop in that
+                    // mode to withdraw readiness as a side effect. Readiness comes back only through
+                    // the ordinary observed-healthy path after `relaunched` re-arms probing, so a
+                    // failure anywhere below leaves this node withdrawn.
+                    withdraw_from_traffic(&mut app, DrainHold::configured(&opts))
+                        .await
+                        .map_err(|error| {
+                            format!("withdrawing from traffic to apply a new runtime: {error}")
+                        })?;
+                    app::stop_runtime(&mut app).map_err(|error| {
+                        format!("stopping the application to apply a new runtime: {error}")
+                    })?;
+                    // The SAME converge the boot path runs, for the same reason and through the same
+                    // function: resolved `inputs` reach the reconciler only as `--input-file` on a
+                    // lifecycle invocation, so a revision that changes them takes effect here or not
+                    // at all — relaunching the application alone would stop and start it for nothing.
+                    converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
+                        format!("converging the environment onto the new runtime: {error}")
+                    })?;
+                    app.launch(&opts).map_err(|error| {
+                        format!("relaunching the application with the new launch spec: {error}")
+                    })?;
+                    // Re-gate readiness from scratch — under the configured start grace, since this
+                    // process has not passed a health gate — and let the next tick drive the
+                    // version/provider reconciliation against the freshly relaunched, correctly-
+                    // configured process.
+                    health.relaunched(&opts.timeouts);
+                    loop_state.next_app_check = Instant::now();
+                    return Ok(TickFlow::Next);
+                }
+            }
+
+            // Self-update first: on an accepted handoff this process exits.
+            if self_due {
+                self_update
+                    .check(&opts.supervisor_update, repo, &mut app.guardian)
+                    .await;
+            }
+
+            if cycle.updates {
+                match check_application(&opts, repo, &mut store, &mut app, || {
+                    fingerprints.restart_after_deployment(Instant::now());
+                })
+                .await
+                {
+                    AppOutcome::Upgraded { version } => {
+                        current = Some(version);
+                        // The commit recorded the update as unconfirmed; pick it up so its
+                        // window is watched and a crash is caught on the next boot.
+                        pending = installed_pending(&store);
+                        garbage_collect(&opts, &store);
+                        // The transaction replaced the process. Everything this watch holds —
+                        // the failure count, the last observation, the probe deadline set
+                        // earlier in this same tick — describes the process that was just
+                        // stopped, so re-arm as at every other launch site rather than judging
+                        // a freshly started release on its predecessor's record.
+                        health.relaunched(&opts.timeouts);
+                    }
+                    AppOutcome::Unchanged => {}
+                    AppOutcome::RestartForRecovery => {
+                        // A post-activation failure left a durable rollback journal. Terminate this
+                        // disposable supervisor cleanly; the guardian relaunches it and boot recovery
+                        // performs the rollback (the single rollback path). The guardian keeps the
+                        // application alive across the restart.
+                        log("update failed after activation; restarting so boot recovery rolls back");
+                        return Ok(TickFlow::Exit);
+                    }
+                    AppOutcome::Fatal(message) => {
+                        return Err(exit_for_relaunch(
+                            "the update transaction requires boot recovery",
+                            &message,
+                        ));
+                    }
+                }
+            }
+
+            Ok(TickFlow::Next)
+        }
+        .await;
+        // THE report writer: one per cycle, reached on every path. Reported off the last repository
+        // this node resolved, so a cycle that ended early still says what the node is running
+        // instead of going silent. `settled` is false while an update is unconfirmed — the
+        // confirmation window surfaces as "acted, not yet settled", never as staleness.
         heartbeat
             .emit(
                 &opts,
-                &repo,
+                last_repo.as_ref(),
                 &store,
                 current.as_deref(),
                 pending.is_none() && health.last_ready.unwrap_or(false),
                 fingerprints.current(),
             )
             .await;
+        match flow? {
+            TickFlow::Next => {}
+            TickFlow::Exit => return Ok(()),
+        }
     }
 }
 
-/// The rollout heartbeat's per-process inputs, so the one emitter can be called from every path
-/// that ends a tick.
+/// How one cycle of the control loop ended.
+enum TickFlow {
+    /// Go around again.
+    Next,
+    /// Leave this supervisor process; the guardian relaunches it.
+    Exit,
+}
+
+/// The rollout heartbeat's per-process inputs.
 ///
-/// There is exactly one report writer in the supervisor, and it is the only thing that keeps this
-/// node inside `REPORT_FRESHNESS` at the health proxy. Any tick that returns to the top without
-/// reaching it spends the node's freshness budget; a fault that recurs every tick (drift that
-/// survives a repair) spends it to zero and the node is drained for a reason no reader can see.
-/// Bundling the inputs here is what makes emitting from the early-exit paths a call rather than a
-/// copy of the block.
+/// There is exactly one report writer in the supervisor and exactly one call to it — at the end of
+/// every cycle, outside the block that does the cycle's work, so no early exit can reach the top of
+/// the loop without it. That report is the only thing keeping this node inside `REPORT_FRESHNESS`
+/// at the health proxy: a cycle that ends in silence spends the node's freshness budget, and a
+/// fault that recurs every cycle (drift that survives a repair, an unconfirmed update) spends it to
+/// zero and the node is drained for a reason no reader can see.
 struct Heartbeat {
     client: reqwest::Client,
     /// The node identity reports are keyed by; absent on a node with no derivable identity, which
@@ -1195,23 +1239,24 @@ impl Heartbeat {
     /// control plane hold a pair's second member until the first has genuinely completed. Keyed off
     /// the current assignment's report URL, so adding or removing telemetry just starts or stops
     /// the heartbeat.
+    ///
+    /// `repo` is the last repository this node resolved — `None` only before the first successful
+    /// resolution, when there is no assignment and so no report target yet.
     async fn emit(
         &self,
         opts: &Options,
-        repo: &TrustedRepository,
+        repo: Option<&TrustedRepository>,
         store: &dyn Store,
         version: Option<&str>,
         settled: bool,
         fingerprint: Option<&updated_contracts::telemetry::Fingerprint>,
     ) {
-        let Some(assignment) = repo.assignment() else {
+        let Some(assignment) = repo.and_then(|repo| repo.assignment()) else {
             return;
         };
+        let repo = repo.expect("an assignment came from a repository");
         let archive_sha256 = installed_archive_sha256(store);
         let manifest_sha256 = installed_manifest_sha256(store);
-        let outputs = settled
-            .then(|| telemetry::load_outputs(&opts.paths.install_root, &manifest_sha256))
-            .flatten();
         telemetry::report_running_state(
             &self.client,
             assignment.report_url.as_deref(),
@@ -1223,7 +1268,8 @@ impl Heartbeat {
                 archive_sha256: &archive_sha256,
                 healthy: settled,
                 fingerprint,
-                outputs: outputs.as_ref(),
+                install_root: &opts.paths.install_root,
+                manifest_sha256: &manifest_sha256,
             },
             self.signing_key.as_deref(),
         )
@@ -1322,7 +1368,7 @@ async fn repair_from_assignment(
     .await
     .map_err(|error| format!("preparing the signed repair: {error}"))?
     .ok_or("the signed assignment contains no installable application")?;
-    let (providers, _) = selection::stage_providers(opts, &repo, store, None)
+    let providers = selection::stage_providers(opts, &repo, store, None)
         .await
         .map_err(|error| format!("staging the providers for the repair: {error}"))?;
     // A repair replaces drifted BYTES; it does not decide an in-flight update. When it lands back
@@ -1818,14 +1864,12 @@ fn execute_boot_plan(
         // marker is only ever cleared here), leaving the node permanently unbootable, so they are
         // discarded with a warning and the marker is cleared.
         //
-        // The shape is checked HERE, before the write is attempted, rather than by classifying the
-        // error afterwards: `reject_candidate` reports a missing path component and a component
-        // that is not a digest with two different kinds (`InvalidData` and, through
-        // `Rejections::reject`, `InvalidInput`), and `InvalidInput` is a kind a failing write could
-        // also carry. Deciding the question up front keeps "malformed marker" and "the rejection
-        // did not reach disk" from ever being the same test.
-        if rejected_supervisor_hash(path).is_some() {
-            self_update.reject_candidate(path)?;
+        // The shape is decided HERE, before the write is attempted, and `reject_candidate` takes
+        // the extracted hash rather than re-deriving it: a failing write reports `InvalidInput`
+        // for a bad key too, so classifying the error afterwards would make "malformed marker"
+        // and "the rejection did not reach disk" the same test.
+        if let Some(hash) = rejected_supervisor_hash(path) {
+            self_update.reject_candidate(hash)?;
         } else {
             warn(&format!(
                 "discarding an unusable rejected-supervisor marker: {} is not a content-addressed \
@@ -1867,10 +1911,11 @@ fn apply_store_plan(
 /// The candidate hash a rejected-supervisor marker names, or `None` when the marker's bytes are
 /// not a content-addressed `supervisors/<hash>/<binary>` path.
 ///
-/// The same extraction `SelfUpdateState::reject_candidate` performs, plus the very predicate
-/// `Rejections::reject` validates with — [`updated::reject::is_rejection_key`], called rather than
-/// restated, so this accepts exactly the markers that path would accept however that grammar moves.
-/// Every marker it turns down would have failed there with no hash recorded anyway.
+/// The one place that extraction happens; the hash it yields is what `reject_candidate` records.
+/// It applies the very predicate `Rejections::reject` validates with — [`updated::reject::is_rejection_key`],
+/// called rather than restated — so this accepts exactly the markers that path would accept
+/// however that grammar moves. Every marker it turns down would have failed there with no hash
+/// recorded anyway.
 fn rejected_supervisor_hash(path: &std::path::Path) -> Option<&str> {
     let hash = path.parent()?.file_name()?.to_str()?;
     updated::reject::is_rejection_key(hash).then_some(hash)
@@ -1946,8 +1991,27 @@ fn confirm_update(store: &mut dyn Store) -> bool {
 
 // ============================ application updates ============================
 
-fn application_check_due(pending: bool, now: Instant, next_check: Instant) -> bool {
-    !pending && now >= next_check
+/// What one wake of the control loop owes, decided before any work is done.
+///
+/// A pending confirmation suppresses the update *check*, never the cycle. The cycle ends in the
+/// node's only report, and a node that goes silent for the whole confirmation window is drained out
+/// of load-balancer rotation immediately after every successful update — read as stale rather than
+/// as "acted, not yet settled", which is the distinction `settled` exists to publish.
+#[derive(Debug, PartialEq, Eq)]
+struct Cycle {
+    /// The cycle clock fired: refresh the repository, reconcile the assignment, and report.
+    due: bool,
+    /// This cycle may also start a new application update. False while an update is unconfirmed:
+    /// one rollout step at a time.
+    updates: bool,
+}
+
+fn cycle_due(pending: bool, now: Instant, next_check: Instant) -> Cycle {
+    let due = now >= next_check;
+    Cycle {
+        due,
+        updates: due && !pending,
+    }
 }
 
 fn log(msg: &str) {
@@ -1963,78 +2027,10 @@ fn error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use crate::store::MemStore;
     use updated::bundle::ReleaseId;
-    use updated::install::InstallTransaction;
     use updated::state::{Installed, InstalledState, RepositoryLineage};
-    use updated::transaction::{Phase, Transaction};
-
-    /// A durable-store double that keeps everything in memory, so the counter-persistence loop can
-    /// be driven across simulated boots without touching the filesystem.
-    #[derive(Default)]
-    struct MemStore {
-        installed: Option<InstalledState>,
-        journal: Option<Transaction>,
-        install_journal: Option<InstallTransaction>,
-        active: Option<ReleaseId>,
-        rejected: HashSet<String>,
-    }
-
-    impl Store for MemStore {
-        fn installed(&self) -> Installed {
-            match &self.installed {
-                Some(state) => Installed::Present(Box::new(state.clone())),
-                None => Installed::Missing,
-            }
-        }
-        fn journal(&self) -> io::Result<Option<Transaction>> {
-            Ok(self.journal.clone())
-        }
-        fn install_journal(&self) -> io::Result<Option<InstallTransaction>> {
-            Ok(self.install_journal.clone())
-        }
-        fn active_release(&self) -> io::Result<Option<ReleaseId>> {
-            Ok(self.active.clone())
-        }
-        fn is_rejected(&self, lineage: &RepositoryLineage, digest: &str) -> bool {
-            self.rejected.contains(&lineage.rejection_key(digest))
-        }
-        fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
-            self.installed = Some(state.clone());
-            Ok(())
-        }
-        fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
-            self.journal = Some(tx.clone());
-            Ok(())
-        }
-        fn clear_journal(&mut self) -> io::Result<()> {
-            self.journal = None;
-            Ok(())
-        }
-        fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
-            self.install_journal = Some(tx.clone());
-            Ok(())
-        }
-        fn clear_install_journal(&mut self) -> io::Result<()> {
-            self.install_journal = None;
-            Ok(())
-        }
-        fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
-            self.rejected.insert(lineage.rejection_key(digest));
-            Ok(())
-        }
-        fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
-            self.rejected.remove(&lineage.rejection_key(digest));
-            Ok(())
-        }
-        fn verify_release(&self, _: &ReleaseId) -> io::Result<()> {
-            Ok(())
-        }
-        fn point_active(&mut self, release: &ReleaseId) -> io::Result<()> {
-            self.active = Some(release.clone());
-            Ok(())
-        }
-    }
+    use updated::transaction::Phase;
 
     fn release(version: &str, digest: &str) -> ReleaseId {
         ReleaseId {
@@ -2179,28 +2175,69 @@ mod tests {
     }
 
     #[test]
-    fn the_integrity_repair_reports_before_it_ends_its_tick() {
+    fn an_unconfirmed_update_still_owes_a_report() {
+        // The regression. A cycle is due on its own clock; a pending confirmation withholds only
+        // the update check inside it. Suppressing the whole cycle silenced the node for the entire
+        // confirmation window — twice REPORT_FRESHNESS with the shipped defaults — right after
+        // every successful update, so the health proxy drained the node it had just upgraded and
+        // the rollout throttle read "stale" where the truth was "acted, not yet settled".
+        let now = Instant::now();
+        assert_eq!(
+            cycle_due(true, now, now),
+            Cycle {
+                due: true,
+                updates: false
+            },
+            "a pending confirmation withholds the update check, never the cycle or its report"
+        );
+        assert_eq!(
+            cycle_due(false, now, now),
+            Cycle {
+                due: true,
+                updates: true
+            }
+        );
+        let later = now + Duration::from_secs(1);
+        assert_eq!(
+            cycle_due(false, now, later),
+            Cycle {
+                due: false,
+                updates: false
+            },
+            "before the clock fires nothing is owed"
+        );
+    }
+
+    #[test]
+    fn the_cycle_has_exactly_one_report_writer_and_no_way_around_it() {
         // The node's report freshness is what keeps it in rotation, and the loop has exactly ONE
-        // report writer, reached only on ticks where a check is due. The integrity arm ends exactly
-        // those ticks early, so under drift that survives the repair — the arm's own stated case —
-        // a repair path that does not report leaves the node silent for as long as the drift
-        // recurs, and it is drained one REPORT_FRESHNESS later. Asserted structurally because the
-        // condition is "this early exit is not silent", which no value the loop returns expresses.
+        // report writer. Several paths end a cycle early (a failed refresh, a relaunch, an
+        // integrity repair under drift that survives it); each one that reached the top of the loop
+        // without reporting spent the node's freshness budget and drained it one REPORT_FRESHNESS
+        // later, for a reason no reader could see. The structure that makes that impossible is the
+        // cycle body being an expression whose early exits leave the block, not the tick, with the
+        // single emit after it — so this asserts the structure, which is the invariant.
         let source = include_str!("main.rs");
         let emitter = concat!("telemetry::report_", "running_state(");
         assert_eq!(
             source.matches(emitter).count(),
             1,
-            "reports must have exactly one writer, so every path that needs one calls Heartbeat::emit"
+            "reports must have exactly one writer"
         );
-        let arm = source
-            .find("let repaired_from = repair_committed_bundle")
-            .expect("the in-loop integrity repair");
-        let tail = &source[arm..];
-        let ends = tail.find("continue;").expect("the arm ends its tick");
+        assert_eq!(
+            source.matches("heartbeat\n            .emit(").count(),
+            1,
+            "and exactly one call site, at the end of the cycle"
+        );
+        let block = source
+            .find("let flow: Result<TickFlow")
+            .expect("the cycle body is one expression");
+        let tail = &source[block..];
+        let emit = tail.find(".emit(").expect("the cycle ends in a report");
         assert!(
-            tail[..ends].contains("heartbeat"),
-            "the integrity repair must emit a heartbeat before leaving the tick"
+            !tail[..emit].contains("\n            continue;")
+                && !tail[..emit].contains("\n        continue;"),
+            "nothing inside the cycle body may reach the top of the loop; early exits return TickFlow"
         );
     }
 
@@ -2512,6 +2549,20 @@ mod tests {
     }
 
     #[test]
+    fn the_identity_tick_cannot_stall_the_loop_into_a_health_drain() {
+        // The tick runs inline on the loop that emits the heartbeat, so its bound is a health
+        // property: a stall anywhere near REPORT_FRESHNESS drains a healthy node out of rotation.
+        // Its own network legs are bounded only individually (60s + 30s + 60s), which is why one
+        // deadline over the whole tick exists at all.
+        assert!(
+            IDENTITY_TICK_DEADLINE * 2 < updated_contracts::telemetry::REPORT_FRESHNESS,
+            "an identity tick of {IDENTITY_TICK_DEADLINE:?} is not well inside the {:?} freshness \
+             window the healthproxy drains on",
+            updated_contracts::telemetry::REPORT_FRESHNESS
+        );
+    }
+
+    #[test]
     fn a_marker_is_forwarded_for_rejection_exactly_when_the_rejection_record_would_take_it() {
         // Regression: `execute_boot_plan` decides up front whether a rejected-supervisor marker
         // names a candidate worth recording, and `SelfUpdateState::reject_candidate` then hands
@@ -2521,7 +2572,8 @@ mod tests {
         // They cannot disagree by construction now (both go through
         // `updated::reject::is_rejection_key`); this pins that they agree in behaviour too.
         let digest: String = std::iter::repeat_n('a', 64).collect();
-        let path = std::env::temp_dir().join(format!("marker-agreement-{}", std::process::id()));
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("marker-agreement");
         for candidate in [
             digest.clone(),
             format!("{digest}:{digest}"),

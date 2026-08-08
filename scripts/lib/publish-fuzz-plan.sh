@@ -1,8 +1,9 @@
 #!/bin/sh
 
-# Shared release classification for the macOS publisher fuzzer and Kind fleet
-# fuzzer. Keep artifact selection and corrupt-candidate construction here so the
-# two environments exercise the same update sequence.
+# Shared release classification for the two fuzzing environments: the Kind fleet
+# fuzzer (scripts/kind-updatec-e2e.sh) and the container release server
+# (crates/updatec/e2e/release-server.sh). Keep artifact selection and
+# corrupt-candidate construction here so both exercise the same update sequence.
 publish_fuzz_artifact() {
   version=$1
   checksum=$(printf '%s\n' "$version" | awk -F. '{

@@ -249,21 +249,28 @@ stateDiagram-v2
     Finalize --> Commit: InstalledState = CONFIRMED + Pending(rollback image)
     Commit --> [*]
 
-    Preflight --> RejectedBeforeActivation: deterministic pre-activation failure
-    Stop --> RejectedBeforeActivation
-    Prepare --> Deferred: transient pre-activation failure (no reject)
-    Drain --> Deferred
+    Preflight --> TransactionError: pre-drain failure (Err → AppOutcome::Fatal)
+    Prepare --> TransactionError
+    TransactionError --> [*]: supervisor ends, guardian relaunches, boot recovery reconciles
 
-    Activate --> RollbackPending: any post-activation failure
+    Stop --> RollbackPending: any failure once readiness is withdrawn
+    Activate --> RollbackPending
     Start --> RollbackPending
     Health --> RollbackPending
     Finalize --> RollbackPending
     RollbackPending --> [*]: reject candidate, leave rollback journal, terminate supervisor
 ```
 
-- **Outcomes** (`Outcome`): `Committed`, `RollbackPending`, `RejectedBeforeActivation`, `Deferred`.
-- **Before activation**, failures that are the provider's fault (Preflight/Stop) **reject** the
-  candidate bytes; transient ones (Prepare/Drain) just **defer** (retry later, no reject).
+- **Outcomes** (`Outcome`, `crates/supervisor/src/update.rs`): exactly `Committed` and
+  `RollbackPending`. There is no third variant: everything that is not one of those two is an
+  `Err` out of `apply_update`.
+- **Before readiness is withdrawn** (Preflight/Prepare/pre-drain) nothing has changed yet, so a
+  failure simply propagates as `Err`. `selection.rs` maps it to `AppOutcome::Fatal`: this
+  disposable supervisor ends, the guardian relaunches it, and boot recovery reconciles whatever
+  journal phase was durable. No rejection is recorded — the candidate is retried.
+- **Once readiness is withdrawn** the drained window begins and `switch_over` returns `Outcome`
+  rather than `io::Result<Outcome>` — a type-level guarantee that no failure past that point can
+  escape as `Err` and abandon the node out of rotation.
 - **After activation**, any failure rejects the candidate, leaves the durable rollback journal in
   place, and returns `RollbackPending`. There is **no in-process rollback**: the supervisor
   terminates cleanly (`AppOutcome::RestartForRecovery`), the guardian relaunches it — keeping the

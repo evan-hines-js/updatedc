@@ -11,18 +11,11 @@
 
 use std::path::Path;
 
-use control::{
-    Capabilities, CommandSpec, Hello, Nonce, Request, Response, CONTROL_ENV, READY_NONCE_ENV,
-};
+use control::{CommandSpec, Hello, Nonce, Request, Response, CONTROL_ENV, READY_NONCE_ENV};
 
-/// The protocol majors this supervisor build can speak.
-const SUPPORTED_MAJORS: &[u16] = &[control::PROTOCOL_MAJOR];
-
-/// A connection to the guardian, plus the negotiated capabilities and this launch's
-/// readiness nonce.
+/// A connection to the guardian and this launch's readiness nonce.
 pub(crate) struct Guardian {
     conn: Conn,
-    caps: Capabilities,
     ready_nonce: Nonce,
     /// The application the guardian is running, as this connection knows it: seeded from the
     /// launch environment (a supervisor crash-relaunch or a candidate activation hands the live
@@ -49,15 +42,15 @@ impl Guardian {
         let mut conn = Conn::inherit()?;
         let hello =
             Hello::read(conn.reader()).map_err(|e| format!("reading guardian hello: {e}"))?;
-        let caps = hello.negotiate(SUPPORTED_MAJORS).ok_or_else(|| {
-            format!(
-                "no shared control-protocol major (guardian offers {:?}, supervisor speaks {:?})",
-                hello.majors, SUPPORTED_MAJORS
-            )
-        })?;
+        if !hello.compatible() {
+            return Err(format!(
+                "control-protocol major mismatch (guardian speaks {}, supervisor speaks {})",
+                hello.major,
+                control::PROTOCOL_MAJOR
+            ));
+        }
         Ok(Guardian {
             conn,
-            caps,
             ready_nonce,
             app_pid: adopted_app_pid(),
             ready_signalled: false,
@@ -79,24 +72,9 @@ impl Guardian {
     ) -> Guardian {
         Guardian {
             conn: Conn { stream },
-            caps: Hello::current()
-                .negotiate(SUPPORTED_MAJORS)
-                .expect("this build negotiates with itself"),
             ready_nonce: [0u8; 16],
             app_pid,
             ready_signalled: false,
-        }
-    }
-
-    /// Refuse to use an operation the guardian did not advertise. For today's single
-    /// protocol major this is always satisfied, but it is what lets a newer supervisor
-    /// run under an older guardian: it detects a missing capability instead of hanging
-    /// on a request the guardian will never answer.
-    fn require(&self, capability: u16, what: &str) -> Result<(), String> {
-        if self.caps.supports(capability) {
-            Ok(())
-        } else {
-            Err(format!("the guardian does not support {what}"))
         }
     }
 
@@ -114,8 +92,6 @@ impl Guardian {
     /// PID. A `Channel` error means the control channel failed (e.g. a SIGKILLed guardian);
     /// a `Refused` error means the guardian answered but the launch itself failed.
     pub(crate) fn launch(&mut self, spec: &CommandSpec) -> Result<u32, GuardianError> {
-        self.require(control::CAP_LAUNCH_APP_V1, "LAUNCH")
-            .map_err(GuardianError::Refused)?;
         match self.exchange(&Request::Launch(spec.clone()))? {
             Response::Launched { pid } => {
                 self.app_pid = Some(pid);
@@ -140,8 +116,6 @@ impl Guardian {
     /// probes an application that does not exist), or still be running the very bytes a repair
     /// just replaced, with `active == installed` afterwards so drift enforcement never corrects it.
     pub(crate) fn stop(&mut self) -> Result<(), GuardianError> {
-        self.require(control::CAP_STOP_APP, "STOP")
-            .map_err(GuardianError::Refused)?;
         self.app_pid = None;
         self.expect_ok(&Request::Stop, "STOP")
     }
@@ -149,22 +123,16 @@ impl Guardian {
     /// Publish the application traffic state exposed by the guardian's stable probe
     /// endpoint. False is sent before drain; true only after health verification.
     pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), GuardianError> {
-        self.require(control::CAP_TRAFFIC_STATE, "TRAFFIC_STATE")
-            .map_err(GuardianError::Refused)?;
         self.expect_ok(&Request::TrafficReady(ready), "TRAFFIC_STATE")
     }
 
     pub(crate) fn application_failed(&mut self) -> Result<(), GuardianError> {
-        self.require(control::CAP_FAIL_APPLICATION, "FAIL_APPLICATION")
-            .map_err(GuardianError::Refused)?;
         self.expect_ok(&Request::ApplicationFailed, "FAIL_APPLICATION")
     }
 
     /// Hand off to a staged replacement supervisor at `path`; the guardian relaunches
     /// from it under a readiness gate after this supervisor exits.
     pub(crate) fn replace_supervisor(&mut self, path: &Path) -> Result<(), GuardianError> {
-        self.require(control::CAP_REPLACE_SUPERVISOR_V1, "REPLACE_SUPERVISOR")
-            .map_err(GuardianError::Refused)?;
         self.expect_ok(
             &Request::ReplaceSupervisor(path.as_os_str().to_os_string()),
             "REPLACE_SUPERVISOR",
@@ -189,11 +157,7 @@ impl Guardian {
             return ReadySignalled(());
         }
         self.ready_signalled = true;
-        let sent = match self.require(control::CAP_READY, "READY") {
-            Ok(()) => self.expect_ok(&Request::Ready(self.ready_nonce), "READY"),
-            Err(unsupported) => Err(GuardianError::Refused(unsupported)),
-        };
-        if let Err(error) = sent {
+        if let Err(error) = self.expect_ok(&Request::Ready(self.ready_nonce), "READY") {
             crate::warn(&format!(
                 "could not signal readiness to the guardian: {error}"
             ));
@@ -235,8 +199,8 @@ impl ReadySignalled {
 }
 
 /// Why a guardian request failed, distinguished by fault attribution. `Refused` is a real
-/// operation failure the managed candidate owns (a bad launch spec, a missing capability, an
-/// unexpected reply). `Channel` is a control-channel transport failure — a SIGKILLed guardian,
+/// operation failure the managed candidate owns (a bad launch spec, an operation this guardian
+/// build does not implement, an unexpected reply). `Channel` is a control-channel transport failure — a SIGKILLed guardian,
 /// a broken pipe, a closed or malformed frame — which is NEVER the candidate's fault. It maps to
 /// `io::ErrorKind::ConnectionReset` so the update path can let it drive boot recovery (which
 /// retries) instead of permanently rejecting a healthy release.
@@ -781,12 +745,11 @@ mod channel_tests {
 mod marker_tests {
     use super::*;
 
-    fn dir(name: &str) -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("supervisor-markers-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+    fn dir(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let guard = tempfile::tempdir().unwrap();
+        let path = guard.path().join(name);
         std::fs::create_dir_all(&path).unwrap();
-        path
+        (guard, path)
     }
 
     /// Stand in for the guardian's writes (`bootstrap::record`): a self-identifying service-exit
@@ -819,7 +782,7 @@ mod marker_tests {
     fn a_marker_survives_until_its_claim_is_explicitly_cleared() {
         // Reading must NOT consume: the evidence has to outlive the boot's durable writes, so a
         // crash between them re-derives the same recovery rather than losing it.
-        let state = dir("service-exit");
+        let (_guard, state) = dir("service-exit");
         write_markers(&state, "/state/supervisors/abc/supervisor");
 
         let mut evidence = Evidence::read(Some(&state)).unwrap();
@@ -848,7 +811,7 @@ mod marker_tests {
         // so it can record a fresh spontaneous exit at any point in that window. Clearing must
         // erase only the instance this boot actually read; the new one is the next boot's
         // evidence, and losing it would let a crashed candidate be confirmed.
-        let state = dir("rewritten");
+        let (_guard, state) = dir("rewritten");
         write_markers(&state, "/state/supervisors/abc/supervisor");
         let mut evidence = Evidence::read(Some(&state)).unwrap();
 
@@ -876,7 +839,7 @@ mod marker_tests {
         // instance it took — which means a process death in that window parks an instance beside
         // the marker path. Reading is the only way to reach a marker, so reading restores it: an
         // exit whose rollback never committed must not be lost to a crash mid-clear.
-        let state = dir("interrupted-clear");
+        let (_guard, state) = dir("interrupted-clear");
         write_markers(&state, "/state/supervisors/abc/supervisor");
         let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
         let content = std::fs::read_to_string(&marker).unwrap();
@@ -894,7 +857,7 @@ mod marker_tests {
         // The parked instance is only ever evidence nobody has read, so a marker that has since
         // landed on the path is at least as new: it wins, and the stale copy is dropped rather
         // than renamed over it.
-        let state = dir("interrupted-clear-superseded");
+        let (_guard, state) = dir("interrupted-clear-superseded");
         write_markers(&state, "/state/supervisors/abc/supervisor");
         let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
         std::fs::rename(&marker, taken_path(&marker)).unwrap();
@@ -922,7 +885,7 @@ mod marker_tests {
         // would fail identically on every subsequent boot and the node could not start at all
         // without a human deleting the file. Unparseable evidence is no evidence — warn, drop it,
         // and boot.
-        let state = dir("malformed");
+        let (_guard, state) = dir("malformed");
         for garbage in [&b"one\ntwo\n"[..], b"", b"   \n", &[0xff, 0xfe][..]] {
             std::fs::write(state.join(control::REJECTED_SUPERVISOR_FILE), garbage).unwrap();
             let evidence = Evidence::read(Some(&state)).unwrap();
@@ -953,7 +916,7 @@ mod marker_tests {
         // Discarding garbage follows the same instance rule as clearing evidence: only the exact
         // bytes that were read are removed, so a real marker the guardian wrote in the meantime
         // survives to be acted on.
-        let state = dir("malformed-rewritten");
+        let (_guard, state) = dir("malformed-rewritten");
         let path = state.join(control::REJECTED_SUPERVISOR_FILE);
         std::fs::write(&path, b"one\ntwo\n").unwrap();
         let claim = Marker::rejected_supervisor(&state)
@@ -973,7 +936,7 @@ mod marker_tests {
         // The guardian stamps each exit uniquely, so the mid-boot rewrite check cannot be defeated
         // by two markers that happen to have the same length and land in the same clock tick —
         // which was every pair of them when the marker's content was empty.
-        let state = dir("distinct-exits");
+        let (_guard, state) = dir("distinct-exits");
         write_markers(&state, "/state/supervisors/abc/supervisor");
         let first = Marker::service_exit(&state).claim().unwrap().unwrap();
         write_markers(&state, "/state/supervisors/abc/supervisor");
