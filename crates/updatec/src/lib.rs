@@ -13,9 +13,11 @@ use updated_contracts::artifact::TargetReference as ExactTarget;
 use updated_contracts::assignment::RepositoryAssignment as DesiredDeployment;
 use updated_contracts::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
 
+pub mod alerts;
 pub(crate) mod domain;
 pub mod gateway;
 pub mod join;
+pub mod metrics;
 pub mod publisher;
 pub(crate) mod rollout;
 pub mod runtime;
@@ -287,6 +289,12 @@ pub struct UpdateGroupStatus {
     pub observed_generation: Option<i64>,
     pub matched_agents: Option<u32>,
     pub published_digest: Option<String>,
+    /// How many of this group's agents the operator is holding (`UpdateAgent.spec.hold`). A
+    /// forgotten hold must be a visible condition, not a mystery, so the count is projected here
+    /// on every reconcile. Serialized even when `None`: this status travels as a merge patch, and
+    /// the explicit null is what deletes a stale count when a writer (quarantine, failure) cannot
+    /// compute one.
+    pub held_agents: Option<u32>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
 }
@@ -336,6 +344,26 @@ pub struct UpdateGroupSetSpec {
     /// intersection: when both are set, the set must satisfy both. See [`CalendarEntry`].
     #[serde(default)]
     pub calendar: Vec<CalendarEntry>,
+    /// How many distinct nodes must independently prove a staged deployment bad — attempt it and
+    /// roll themselves back, as their signed reports already show — before the deployment is
+    /// HALTED: no further node is moved to it, anywhere in the fleet, until a deployment with a
+    /// different identity is staged. Defaults to one.
+    ///
+    /// The verdict is FLEET-WIDE per deployment identity — a body proven bad must not reach a
+    /// sibling set, or a group no set governs, through a second door — so the effective threshold
+    /// for an identity is the TIGHTEST `maxRegressions` among all sets whose members name it
+    /// (default one when none does). The halt is a planner verdict recomputed from evidence each
+    /// reconcile, never stored state, and republishing the identical body cannot clear it —
+    /// corrected bytes have a new digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_regressions: Option<u32>,
+    /// How long a member group may sit in `staging` with no node newly settled before the
+    /// `RolloutStuck` condition is raised on it. Defaults to 3600 seconds. Alerting policy only —
+    /// it gates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub stuck_after_seconds: Option<u64>,
 }
 
 impl UpdateGroupSetSpec {
@@ -392,8 +420,25 @@ pub struct UpdateGroupSetStatus {
     /// an emergency override is never silently permanent.
     #[serde(default)]
     pub emergency: Vec<String>,
+    /// Deployments HALTED for this set by the regression verdict: enough distinct nodes proved
+    /// each one bad (attempted it and rolled themselves back). No further node is moved to a
+    /// halted deployment in any member group; nodes already on it are left where they are. An
+    /// array, not a map, so a JSON merge patch replaces it wholesale and a cleared halt cannot
+    /// linger.
+    #[serde(default)]
+    pub halted: Vec<HaltedDeployment>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
+}
+
+/// One deployment the regression verdict has halted for a set, with the evidence that halted it.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HaltedDeployment {
+    /// The deployment's operator-facing name.
+    pub deployment: String,
+    /// Distinct nodes whose signed reports prove they attempted this deployment and rolled back.
+    pub evidence: u32,
 }
 
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -417,6 +462,24 @@ pub struct UpdateAgentSpec {
     /// does not need to be a Kubernetes Node, Pod, or workload.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Freeze this node on exactly the body its recorded assignment names — a hardware swap is
+    /// scheduled, do not move it. A held node keeps its group membership for accounting but is
+    /// excluded from admission: it neither advances to a staged deployment nor releases a rollout
+    /// slot, and its recorded body is republished verbatim. If that body can no longer be resolved,
+    /// planning fails closed for this node exactly as the quarantine carry-forward does — a hold
+    /// can never silently become a move. Clearing it returns the node to normal admission on the
+    /// next reconcile.
+    #[serde(default)]
+    pub hold: bool,
+    /// Take this node out of load-balancer rotation gracefully, without stopping the application.
+    /// A cordoned node is published to the healthproxy's endpoint projection as drained regardless
+    /// of its report — the same drained state a stale report produces — while the application
+    /// keeps running, the node keeps reporting, and the supervisor stays entirely unaware. Rollout
+    /// accounting treats it as absent (like a departed node) rather than unhealthy, so a cordon
+    /// neither eats the group's availability budget nor wedges an in-flight rollout. Orthogonal to
+    /// [`hold`](Self::hold): a node can be held but serving, or cordoned but updatable.
+    #[serde(default)]
+    pub cordon: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -471,6 +534,14 @@ pub struct UpdateAgentStatus {
     pub reported_version: Option<String>,
     /// Whether the node last reported itself settled and healthy on its assignment.
     pub reported_ready: Option<bool>,
+    /// Mirror of `spec.hold`, written as an explicit bool every reconcile (a merge patch that
+    /// omitted it would leave a cleared hold reading `true` forever). Surfaced so a forgotten hold
+    /// is a visible condition, not a mystery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<bool>,
+    /// Mirror of `spec.cordon`, written as an explicit bool for the same merge-patch reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cordoned: Option<bool>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
 }
@@ -548,7 +619,7 @@ pub struct UpdateRepositoryStatus {
     pub conditions: Vec<ResourceCondition>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceCondition {
     #[serde(rename = "type")]
@@ -1046,6 +1117,11 @@ pub fn object_key(prefix: &str, relative: &str) -> object_store::path::Path {
 /// response allocate without limit. Generous relative to any legitimate document.
 pub(crate) const OBJECT_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
 
+// The projection's shared wire bound is the same ceiling, so the writer's read-compare probe and
+// the healthproxy's fetch accept exactly the same documents.
+const _: () =
+    assert!(updated_contracts::endpoints::MAX_PROJECTION_BYTES as u64 == OBJECT_BYTES_LIMIT);
+
 /// Read one object fully into memory, refusing anything larger than [`OBJECT_BYTES_LIMIT`]. The
 /// size is checked from the store's own metadata before a byte is buffered, so an oversized object
 /// costs a `head`-equivalent rather than the allocation. The single bounded read every
@@ -1079,6 +1155,8 @@ mod tests {
             max_concurrent,
             rollout_windows: vec![],
             calendar: vec![],
+            max_regressions: None,
+            stuck_after_seconds: None,
         }
     }
 

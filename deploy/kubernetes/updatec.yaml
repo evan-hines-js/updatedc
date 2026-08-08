@@ -158,7 +158,7 @@ spec:
             - {name: gateway-tls, mountPath: /etc/gateway-tls, readOnly: true}
             # The fleet CA *with its private key*, so the /enroll handler can sign a node's CSR into
             # a per-node client cert the mTLS listener accepts. Holding the CA key here widens the
-            # gateway's blast radius; see docs/group-enrollment-design.md.
+            # gateway's blast radius.
             - {name: issuing-ca, mountPath: /etc/issuing-ca, readOnly: true}
       volumes:
         - name: tmp

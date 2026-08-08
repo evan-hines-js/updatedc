@@ -1042,6 +1042,8 @@ async fn register_enrollment(
                 registration_sha256: Some(registration_sha256.clone()),
                 public_key: Some(public_key),
             },
+            hold: false,
+            cordon: false,
             labels: repository.spec.enrollment.labels.clone(),
         },
     );
@@ -1873,6 +1875,10 @@ fn repository_key(prefix: &str, request_path: &str) -> Option<ObjectPath> {
     // The grammar — which paths name a repository object — is `crate::served`'s, shared with the
     // dev CDN so the two servers an agent cannot tell apart accept exactly the same requests.
     let object = crate::served::repository_object(request_path)?;
+    // The endpoint projection (`endpoints/`) is deliberately NOT served here: this is the mTLS
+    // data listener, and the healthproxy — the projection's one reader — holds no fleet client
+    // certificate. It reads the projection from the CDN/object store base, where the dev CDN
+    // serves it beside the telemetry namespace.
     if !matches!(object.namespace, "metadata" | "targets") {
         return None;
     }
@@ -1938,6 +1944,8 @@ mod tests {
                     public_key: public_key.map(str::to_owned),
                 },
                 labels: Default::default(),
+                hold: false,
+                cordon: false,
             },
         )
     }
@@ -2479,6 +2487,8 @@ mod tests {
                     public_key: Some(TEST_LEAF_KEY.into()),
                 },
                 labels: Default::default(),
+                hold: false,
+                cordon: false,
             },
         )
     }

@@ -1,7 +1,7 @@
 //! The node reconciler protocol vocabulary.
 //!
-//! Every release carries one signed node reconciler, invoked as ordinary argv (see
-//! `LIFECYCLE_PROVIDER.md`). The protocol has exactly four operations and three reserved
+//! Every release carries one signed node reconciler, invoked as ordinary argv.
+//! The protocol has exactly four operations and three reserved
 //! attempt identities, and this module is their single definition: the supervisor that
 //! *invokes* a reconciler, and every reconciler implementation in this workspace that
 //! *answers* one, name them from here. A second spelling of `healthcheck` — a reconciler

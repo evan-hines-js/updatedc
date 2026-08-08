@@ -597,6 +597,23 @@ pub fn report_is_authentic_and_fresh(
     usable.then_some(report)
 }
 
+/// The report an envelope CLAIMS to carry, decoded without verifying any signature or freshness.
+///
+/// For OBSERVABILITY only, never a trust decision: [`report_is_authentic_and_fresh`] remains the
+/// one gate anything acting on a report goes through. This exists so a metric can say WHY a node
+/// was drained — "its report aged out" versus "its report is unusable" — which requires reading a
+/// timestamp off a document the gate has already refused.
+pub fn unverified_report(envelope: &Envelope) -> Option<NodeReport> {
+    use base64::Engine as _;
+    if envelope.payload_type != REPORT_PAYLOAD_TYPE {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(&envelope.payload)
+        .ok()?;
+    serde_json::from_slice(&payload).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

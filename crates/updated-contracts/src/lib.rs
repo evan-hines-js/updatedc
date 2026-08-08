@@ -11,6 +11,7 @@
 
 pub mod artifact;
 pub mod assignment;
+pub mod endpoints;
 pub mod enrollment;
 pub mod path;
 pub mod reconciler;

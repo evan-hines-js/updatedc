@@ -13,6 +13,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !matches!(mode.as_str(), "controller" | "serve") || std::env::args().nth(2).is_some() {
         return Err("usage: updatec <controller|serve>".into());
     }
+    // Controller-only settings, each off by default, configured the way every other updatec
+    // setting is — environment variables, not a second (argv) configuration surface:
+    // UPDATED_METRICS_ADDRESS — serve GET /metrics on this address.
+    // UPDATED_ALERT_URL — POST condition transitions to this webhook.
+    // UPDATED_ALERT_TOKEN_FILE — bearer-token file for the webhook, re-read per delivery.
+    let metrics_address: Option<std::net::SocketAddr> = std::env::var("UPDATED_METRICS_ADDRESS")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|e| format!("UPDATED_METRICS_ADDRESS: {e}"))
+        })
+        .transpose()?;
+    let alert_url = std::env::var("UPDATED_ALERT_URL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let alert_token_file: Option<std::path::PathBuf> = std::env::var("UPDATED_ALERT_TOKEN_FILE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Into::into);
     let client = kube::Client::try_default().await?;
     let namespace = std::env::var("UPDATED_NAMESPACE").unwrap_or_else(|_| "updated-system".into());
     let repository = std::env::var("UPDATED_REPOSITORY").unwrap_or_else(|_| "default".into());
@@ -76,6 +97,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = std::env::var("UPDATED_STATE_DIR").unwrap_or_else(|_| "/var/lib/updatec".into());
     let identity =
         std::env::var("HOSTNAME").unwrap_or_else(|_| format!("updatec-{}", std::process::id()));
+    // The metrics listener: plain HTTP, cluster-internal, read-only, off unless asked for. It
+    // reads the snapshot the loop below writes after each pass — scrape-time projection, no
+    // sampling loop.
+    let metrics: updatec::metrics::SharedMetrics = std::sync::Arc::default();
+    if let Some(address) = metrics_address {
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            if let Err(error) = updatec::metrics::serve(address, metrics).await {
+                tracing::error!(%error, "metrics listener failed");
+            }
+        });
+    }
+    // The one alert sink: unset means conditions-only.
+    let sink = match alert_url {
+        Some(url) => Some(std::sync::Arc::new(
+            updatec::alerts::AlertSink::new(url, alert_token_file)
+                .map_err(|error| format!("UPDATED_ALERT_URL: {error}"))?,
+        )),
+        None => None,
+    };
+    let mut hooks = updatec::runtime::ReconcileHooks::new(sink);
     loop {
         match updatec::runtime::acquire_or_renew_lease(
             client.clone(),
@@ -86,62 +128,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         {
             Ok(true) => {}
+            // Not the leader, or the lease op itself failed: this replica reconciles nothing, so
+            // the failure streak it was carrying belongs to a leadership epoch that is over. The
+            // streak counts CONSECUTIVE failed passes — `ReconcileFailing` exists to tell a loop
+            // that is not converging apart from one ordinary transient — and carrying it across
+            // the gap let a single failed pass minutes or hours later reach the threshold and
+            // page, while another replica had meanwhile reconciled cleanly and cleared the
+            // condition on every set.
             Ok(false) => {
+                hooks.consecutive_failures = 0;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
             Err(error) => {
+                hooks.consecutive_failures = 0;
                 tracing::error!(%error, "leader lease operation failed");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
         }
-        let reconciliation = updatec::runtime::reconcile_once(
-            client.clone(),
-            &namespace,
-            &repository,
-            std::path::Path::new(&state),
-            &public_url,
-            &identity,
-        );
-        tokio::pin!(reconciliation);
-        loop {
-            tokio::select! {
-                result = &mut reconciliation => {
-                    match result {
-                        Ok(digest) => tracing::info!(%digest, "desired state reconciled"),
-                        Err(error) => {
-                            // Full detail (which may name the bucket/endpoint/object key) goes to the
-                            // operator log only; the CR status gets a generic category so a reader with
-                            // `get` on the CRs learns nothing about the storage backend.
-                            tracing::error!(%error, "reconciliation failed; last publication remains active");
-                            let status_message =
-                                updatec::runtime::generic_failure_status(error.as_ref());
-                            if let Err(status_error) = updatec::runtime::record_repository_failure(
-                                client.clone(), &namespace, &repository, status_message,
-                            ).await {
-                                tracing::error!(%status_error, "recording repository failure status failed");
+        // The future borrows `hooks` mutably, so it is scoped: the failure handling below needs
+        // `hooks` again, which is only possible once the (finished or cancelled) future is dropped.
+        let result = {
+            let reconciliation = updatec::runtime::reconcile_once(
+                client.clone(),
+                &namespace,
+                &repository,
+                std::path::Path::new(&state),
+                &public_url,
+                &identity,
+                &mut hooks,
+            );
+            tokio::pin!(reconciliation);
+            loop {
+                tokio::select! {
+                    result = &mut reconciliation => break Some(result),
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        match updatec::runtime::acquire_or_renew_lease(
+                            client.clone(), &namespace, "updatec-publisher", &identity,
+                        ).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!("publisher lease lost; cancelling reconciliation");
+                                break None;
                             }
-                        }
-                    }
-                    break;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-                    match updatec::runtime::acquire_or_renew_lease(
-                        client.clone(), &namespace, "updatec-publisher", &identity,
-                    ).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::warn!("publisher lease lost; cancelling reconciliation");
-                            break;
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "publisher lease renewal failed; cancelling reconciliation");
-                            break;
+                            Err(error) => {
+                                tracing::error!(%error, "publisher lease renewal failed; cancelling reconciliation");
+                                break None;
+                            }
                         }
                     }
                 }
             }
+        };
+        match result {
+            Some(Ok(outcome)) => {
+                tracing::info!(digest = %outcome.digest, "desired state reconciled");
+                if let Some(snapshot) = outcome.snapshot {
+                    metrics.write().expect("metrics lock").last = Some(snapshot);
+                }
+            }
+            Some(Err(error)) => {
+                // Full detail (which may name the bucket/endpoint/object key) goes to the
+                // operator log only; the CR status gets a generic category so a reader with
+                // `get` on the CRs learns nothing about the storage backend.
+                tracing::error!(%error, "reconciliation failed; last publication remains active");
+                metrics
+                    .write()
+                    .expect("metrics lock")
+                    .reconcile_failures_total += 1;
+                let status_message = updatec::runtime::generic_failure_status(error.as_ref());
+                if let Err(status_error) = updatec::runtime::record_repository_failure(
+                    client.clone(),
+                    &namespace,
+                    &repository,
+                    status_message,
+                )
+                .await
+                {
+                    tracing::error!(%status_error, "recording repository failure status failed");
+                }
+                if let Err(status_error) = updatec::runtime::record_reconcile_failing(
+                    client.clone(),
+                    &namespace,
+                    &mut hooks,
+                )
+                .await
+                {
+                    tracing::error!(%status_error, "recording ReconcileFailing on group sets failed");
+                }
+            }
+            // A cancelled pass (lost lease) is a follower outcome, not a failure — and it ends
+            // this replica's leadership epoch, so the streak resets with it for the same reason
+            // the non-leader arms above reset it.
+            None => hooks.consecutive_failures = 0,
         }
         // Poll for desired-state changes once per second so a freshly patched
         // rollout is republished promptly and the fleet starts converging fast.

@@ -141,8 +141,6 @@ authenticate the archive through TUF
   → commit, or reactivate and reject the predecessor
 ```
 
-See [WALKTHROUGH.md](WALKTHROUGH.md) for a five-minute code tour.
-
 ## Fleet management with `updatec`
 
 `updatec` is the reference Kubernetes control plane. It maps nodes' control-plane labels
@@ -168,8 +166,7 @@ generates its durable private key locally, and sends only a CSR. The control pla
 the CSR subject, sets the certificate identity from that validated name, pins the public
 key on the `UpdateAgent`, and returns the per-node certificate plus the signed enrollment
 bundle. The shared credential is used only to enroll; all routing, repository, secrets,
-and telemetry requests use the minted per-node identity. See the
-[enrollment design](docs/group-enrollment-design.md).
+and telemetry requests use the minted per-node identity.
 
 **Throttled rollouts.** An `UpdateGroupSet` never advances more than
 `maxConcurrent` members at once (default `members − 1`), holding the rest until the
@@ -189,9 +186,8 @@ backend in service — and the load-balancer backend is pluggable (EndpointSlice
 or HAProxy later) behind one health→membership core.
 
 Control-plane authors targeting a different orchestrator should start with the normative
-[control-plane API contract](CONTROLPLANE_API_CONTRACT.md) and its [JSON Schemas](schemas).
-Installation, CRD examples, trust bootstrapping, verification, and recovery are documented
-in the authoritative [Kubernetes operator guide](deploy/kubernetes/README.md).
+[JSON Schemas](schemas) — the wire contract integrators write against. Installation
+manifests live under [deploy/kubernetes](deploy/kubernetes).
 
 ## Guarantees
 
@@ -232,8 +228,7 @@ Every deployment carries an immutable, signed node-reconciler bundle. The agent 
 delivery, verification of bytes, durable ordering, retries, deadlines, containment,
 cancellation, rollback journaling, scheduling, and telemetry. The bundle supplies all
 application-specific behavior through one executable accepting exactly four operations:
-`apply`, `healthcheck`, `rollback`, and `inspect` (see
-[LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md)).
+`apply`, `healthcheck`, `rollback`, and `inspect`.
 
 `healthcheck` is the one readiness gate. It performs one observation and exits zero only when the
 observed release is acceptable; the agent retries it to the signed success threshold within the
@@ -254,8 +249,6 @@ signed reconciler artifact digest in the node's DSSE report. The reconciler owns
 stability of those bytes; stdout is fingerprint data and diagnostics belong on stderr. Empty
 output, non-zero exit, cancellation, exceeding the five-minute agent ceiling, or output beyond 64
 KiB omits the fingerprint rather than attesting incomplete state.
-
-See [LIFECYCLE_PROVIDER.md](LIFECYCLE_PROVIDER.md) for copyable Bash and PowerShell templates.
 
 ## Bootstrap and enrollment
 
@@ -324,7 +317,7 @@ child crash is observed directly by the guardian and rolls up the tower immediat
 application-specific acceptance and steady-state evidence comes from the signed reconciler's
 `healthcheck` operation; the node configuration contains no HTTP health language.
 
-Platform templates and permission guidance are in [deploy/README.md](deploy/README.md).
+Platform templates (systemd, launchd, Windows service) live under [deploy/](deploy).
 
 ## Durable application layout
 
@@ -471,16 +464,16 @@ is for development and for control planes built on other orchestrators.
 
 ## Documentation
 
-- [System walkthrough](WALKTHROUGH.md)
-- [Control-plane API contract](CONTROLPLANE_API_CONTRACT.md)
-- [Kubernetes operator guide](deploy/kubernetes/README.md)
-- [Single-path mTLS + CSR enrollment](docs/group-enrollment-design.md)
+- [JSON Schemas](schemas) — the normative wire contract
+- [Reference bootstrap](deploy/bootstrap.toml)
+- Proposed designs: [observability](docs/observability-design.md),
+  [regression response](docs/regression-response-design.md),
+  [alerting](docs/alerting-design.md),
+  [node controls](docs/node-controls-design.md)
 - Node decommission: delete the node's `UpdateAgent` object. The gateway checks enrolled
   membership on every request, so a deleted or re-homed agent stops being served bundles,
   secrets, and routing immediately — even while its unexpired leaf certificate still
   authenticates. There is no tombstone artifact.
-- [Deployment adapters](deploy/README.md)
-- [Reference bootstrap](deploy/bootstrap.toml)
 
 ## License
 
