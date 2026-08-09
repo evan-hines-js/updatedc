@@ -61,6 +61,11 @@ pub(crate) struct AttemptSeed {
     /// Whether a report with an update TRANSACTION in flight on the target was observed
     /// ([`NodeReport::updating`]): the transaction genuinely ran.
     ///
+    /// A supervisor older than schema 6 cannot assert `updating`, and the compatibility window
+    /// admits its reports with the field defaulting FALSE — so a pre-6 node's rollbacks produce
+    /// no evidence until it upgrades. Strictly weaker evidence during a fleet upgrade, never a
+    /// false verdict.
+    ///
     /// Two shapes are rejected by this flag, and both mint a fleet-wide halt without it. A node
     /// that merely FETCHED the assignment reports settled on it while running the old archive —
     /// the supervisor stamps the assignment it resolved even on a tick that installed nothing.

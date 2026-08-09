@@ -91,6 +91,16 @@ pub struct ManagedTimeouts {
 }
 
 impl RepositoryAssignment {
+    /// Desired-state contracts evolve under the OPPOSITE rule from report contracts (see
+    /// `docs/wire-compatibility-design.md`). The readers here are the nodes themselves, and a
+    /// node receives its new supervisor THROUGH this very document — so a reader window cannot
+    /// exist (an old node cannot be taught to read a schema it predates), and bumping this number
+    /// strands every not-yet-upgraded node unable to parse the assignment that would have
+    /// delivered its upgrade: a fleet-wide deadlock with no in-band cure. The WRITER carries the
+    /// obligation instead: the control plane must not publish a new schema until every supported
+    /// node in the fleet runs a supervisor that reads it. In practice that means preferring a new
+    /// OPTIONAL field under the unchanged schema number over a bump, and bumping only as a
+    /// deliberate act behind a verified fleet floor.
     pub const SCHEMA: u32 = 3;
 
     /// Validate the complete signed contract before a publisher signs it or a node acts on it.

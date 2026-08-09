@@ -10,6 +10,10 @@ pub struct AgentDocument {
 }
 
 impl AgentDocument {
+    /// Read by nodes, like [`crate::assignment::RepositoryAssignment`]: the writer-restraint rule
+    /// in `docs/wire-compatibility-design.md` applies — the control plane must never emit a new
+    /// schema ahead of the fleet floor, because the node that cannot read this document cannot
+    /// receive the upgrade that would teach it to.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != 1 {
             return Err(format!("unsupported agent document schema {}", self.schema));
