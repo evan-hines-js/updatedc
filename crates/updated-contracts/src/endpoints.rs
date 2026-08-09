@@ -58,6 +58,14 @@ pub struct EndpointProjection {
 impl EndpointProjection {
     pub const SCHEMA: u32 = 1;
 
+    /// The oldest projection schema every reader still accepts — the same reader-window policy as
+    /// [`crate::telemetry::NodeReport::MIN_SUPPORTED_SCHEMA`] (see
+    /// `docs/wire-compatibility-design.md`), and it matters MORE here because this document fails
+    /// OPEN: a reader refusing a schema it should still understand does not drain a fleet, it
+    /// silently RELEASES every cordon. Fields added within the window carry defaults chosen so an
+    /// old document reads as it always did.
+    pub const MIN_SUPPORTED_SCHEMA: u32 = 1;
+
     pub fn new(drained: BTreeSet<String>) -> Self {
         Self {
             schema: Self::SCHEMA,
@@ -76,7 +84,7 @@ impl EndpointProjection {
     /// the one thing the fail-open design is not allowed to do.
     pub fn parse(bytes: &[u8]) -> Option<BTreeSet<String>> {
         let projection = serde_json::from_slice::<Self>(bytes).ok()?;
-        if projection.schema != Self::SCHEMA {
+        if !(Self::MIN_SUPPORTED_SCHEMA..=Self::SCHEMA).contains(&projection.schema) {
             return None;
         }
         Some(

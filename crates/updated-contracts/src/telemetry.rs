@@ -229,11 +229,17 @@ pub enum OutputValue {
 
 impl OutputManifest {
     pub const SCHEMA: u32 = 1;
+    /// Manifests ride inside node reports, so they answer to the same reader window as
+    /// [`NodeReport::MIN_SUPPORTED_SCHEMA`] and the same field-default rule — an exact-schema
+    /// gate here would fail a whole report over the manifest it carries.
+    pub const MIN_SUPPORTED_SCHEMA: u32 = 1;
     pub const MAX_VALUES: usize = 64;
     pub const MAX_STRING_BYTES: usize = 4 * 1024;
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != Self::SCHEMA || self.values.len() > Self::MAX_VALUES {
+        if !(Self::MIN_SUPPORTED_SCHEMA..=Self::SCHEMA).contains(&self.schema)
+            || self.values.len() > Self::MAX_VALUES
+        {
             return Err("node output manifest schema or value count is invalid".into());
         }
         for (name, value) in &self.values {
@@ -343,6 +349,13 @@ pub struct NodeReport {
     /// update was attempted" from `!healthy` alone mints rollback evidence out of an ordinary
     /// readiness blip. Never true together with [`NodeReport::healthy`]: settled means the
     /// confirmation window is closed.
+    ///
+    /// Added in schema 6, so it defaults for reports the compatibility window still admits from
+    /// older supervisors — and the default is the FAIL-SAFE reading: absent means "no transaction
+    /// was ever observed", which proves nothing to the regression verdict. A pre-6 node's
+    /// rollbacks therefore produce no halt evidence until it upgrades — strictly weaker evidence,
+    /// never a false verdict and never a drained fleet.
+    #[serde(default)]
     pub updating: bool,
     /// Milliseconds since the Unix epoch when the node wrote this report (see [`now_ms`]). A
     /// reader ages the report against this so a node that dies without writing a not-ready
@@ -361,6 +374,26 @@ pub struct NodeReport {
 
 impl NodeReport {
     pub const SCHEMA: u32 = 6;
+
+    /// The oldest report schema every reader still accepts — the reader-side half of the wire
+    /// compatibility policy (see `docs/wire-compatibility-design.md`).
+    ///
+    /// A fleet never upgrades atomically, and its readers upgrade FIRST by construction: nodes
+    /// receive their new supervisor through this very system, so the control plane and healthproxy
+    /// that will read schema-N reports are running before any node can write one. What a bare
+    /// `schema == SCHEMA` gate did to that ordering was catastrophic: the moment a reader
+    /// upgraded, every not-yet-upgraded node's reports failed verification — the healthproxy
+    /// DRAINED the entire healthy fleet and every rollout stalled — and the only cure was the
+    /// node upgrade the stalled system was now unable to deliver.
+    ///
+    /// So readers accept the window `[MIN_SUPPORTED_SCHEMA, SCHEMA]`, writers always write
+    /// `SCHEMA`, and every field added since `MIN_SUPPORTED_SCHEMA` MUST carry a serde default
+    /// chosen in the fail-safe direction, documented at the field (`updating`: absent means
+    /// "proves nothing"). The exact bytes a `MIN_SUPPORTED_SCHEMA` supervisor signs are locked by
+    /// `a_previous_schema_report_still_verifies`, so a defaultless field cannot land while the
+    /// window still claims to cover the old shape. Raising this floor is a deliberate act in its
+    /// own commit, made only when no supported fleet still runs the older supervisor.
+    pub const MIN_SUPPORTED_SCHEMA: u32 = 5;
 
     /// A report of a node that is NOT mid-transaction. [`NodeReport::updating`] is set by the one
     /// writer that knows (the supervisor's heartbeat, from its own unconfirmed-update journal);
@@ -407,7 +440,7 @@ impl NodeReport {
     /// one signed report asserting simultaneously that a rollout has completed and that the
     /// transaction behind it is still in flight.
     pub fn is_wellformed(&self) -> bool {
-        self.schema == Self::SCHEMA
+        (Self::MIN_SUPPORTED_SCHEMA..=Self::SCHEMA).contains(&self.schema)
             && !self.node.is_empty()
             && !self.deployment.is_empty()
             && self.reported_at_ms > 0
@@ -672,6 +705,72 @@ mod tests {
         let mut report = report();
         mutate(&mut report);
         (sign_report(&report, &pkcs8).unwrap(), point)
+    }
+
+    /// The EXACT BYTES a schema-5 supervisor signs — a literal payload, not a re-serialization of
+    /// the current struct — must verify for as long as [`NodeReport::MIN_SUPPORTED_SCHEMA`] claims
+    /// to cover it. A fleet's readers upgrade before its nodes (nodes receive their supervisor
+    /// THROUGH this system), so the pass where this bound broke drained every not-yet-upgraded
+    /// node out of rotation and stalled the very rollout that would have delivered the upgrade.
+    /// This test is what makes the window real: adding a defaultless field fails it immediately.
+    #[test]
+    fn a_previous_schema_report_still_verifies() {
+        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        // A verbatim schema-5 document: no `updating` field, because schema 5 had none.
+        let payload = format!(
+            concat!(
+                "{{\"schema\":5,\"node\":\"agent-9\",\"deployment\":\"deploy-2\",",
+                "\"assignment_sha256\":\"{assignment}\",\"version\":\"2.0.0\",",
+                "\"archive_sha256\":\"{archive}\",\"healthy\":true,",
+                "\"reported_at_ms\":{now},\"fingerprint\":null,\"outputs\":null}}"
+            ),
+            assignment = OTHER_DIGEST,
+            archive = DIGEST,
+            now = now_ms(),
+        );
+        let (pkcs8, point) = keypair();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8).unwrap();
+        let rng = aws_lc_rs::rand::SystemRandom::new();
+        let signature = key
+            .sign(&rng, &pae(payload.as_bytes(), REPORT_PAYLOAD_TYPE))
+            .unwrap();
+        let envelope = Envelope {
+            payload: b64().encode(payload.as_bytes()),
+            payload_type: REPORT_PAYLOAD_TYPE.to_string(),
+            signatures: vec![Signature {
+                sig: b64().encode(signature.as_ref()),
+            }],
+        };
+        let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
+            .expect("a report from a supervisor inside the compatibility window must verify");
+        assert_eq!(report.schema, 5);
+        assert!(
+            !report.updating,
+            "a field the old schema could not assert defaults to the fail-safe reading"
+        );
+    }
+
+    /// The window has two hard edges: below the floor is a supervisor no release supports, above
+    /// the ceiling is a writer NEWER than this reader — a report it cannot interpret and must not
+    /// guess at (the supported upgrade order is readers first, which makes that shape a fault,
+    /// not a transition).
+    #[test]
+    fn schemas_outside_the_window_are_refused() {
+        for schema in [NodeReport::MIN_SUPPORTED_SCHEMA - 1, NodeReport::SCHEMA + 1] {
+            let (envelope, point) = signed(|report| report.schema = schema);
+            assert!(
+                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                "schema {schema} must be refused"
+            );
+        }
+        for schema in [NodeReport::MIN_SUPPORTED_SCHEMA, NodeReport::SCHEMA] {
+            let (envelope, point) = signed(|report| report.schema = schema);
+            assert!(
+                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_some(),
+                "schema {schema} is inside the window"
+            );
+        }
     }
 
     #[test]
