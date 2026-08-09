@@ -1,311 +1,21 @@
-//! The Windows half of the guardian's operating-system surface: the launched application
-//! process, assigned to a kill-on-close Job Object so it dies with the guardian. The
-//! platform-agnostic guardian core (`app`) calls this; the cfg lives here. (The Windows
-//! control channel and console handler keep their FFI inline where it is inseparable from
-//! the handle logic they wrap.)
+//! The Windows half of the launcher's operating-system surface: the inherited
+//! control-channel pipes, polling, and the console stop handler. The platform-agnostic
+//! launcher core (`supervisor`, `guardian`) calls these; the cfg lives here. The FFI stays
+//! inline where it is inseparable from the handle logic it wraps.
 
-use control::CommandSpec;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::HANDLE;
 
-/// A launched application process, assigned to a kill-on-close Job Object so it dies with
-/// the guardian — never an orphan, never a duplicate. There is no re-adoption across a
-/// guardian restart.
-///
-/// The job holds the whole tree, not just the leader: workers the leader spawns inherit its
-/// membership, so they outlive the leader's own exit and are reachable — and killable — only
-/// through this handle. Every way this handle ends ([`stop`](crate::sys::Process::stop) or a
-/// plain drop) therefore takes the job down with it, which is the same guarantee the Unix
-/// adapter gets from its process group.
-struct Proc {
-    pid: u32,
-    process: HANDLE,
-    job: HANDLE,
-    exited: Option<i32>,
-}
-
-unsafe impl Send for Proc {}
-
-/// Launch the contained application process from `spec` (the [`Process`](crate::sys::Process)
-/// port's Windows adapter factory).
-pub fn spawn(spec: &CommandSpec) -> io::Result<Box<dyn crate::sys::Process>> {
-    Ok(Box::new(Proc::launch(spec)?))
-}
-
-impl Proc {
-    fn launch(spec: &CommandSpec) -> io::Result<Proc> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-        use windows_sys::Win32::System::Threading::{
-            CreateProcessW, ResumeThread, TerminateProcess, CREATE_NEW_PROCESS_GROUP,
-            CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
-        };
-
-        let mut command_line = command_line_utf16(spec);
-        let mut environment = environment_block(spec);
-        let cwd = spec
-            .cwd
-            .as_ref()
-            .map(|c| to_wide_nul(c.as_os_str().encode_wide()));
-
-        // Identical kill-on-close job setup as the portable containment; shared so the two
-        // can never drift. The assign route below (a `CREATE_SUSPENDED` process) is what
-        // differs, so only the setup is shared.
-        let job = foundation::process::create_kill_on_close_job()?;
-
-        unsafe {
-            let mut si: STARTUPINFOW = std::mem::zeroed();
-            si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-            let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-            let cwd_ptr = cwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-            // Create suspended so the process is in the kill-on-close job before it can run
-            // — no window in which a guardian crash could orphan an un-jobbed app.
-            let ok = CreateProcessW(
-                std::ptr::null(),
-                command_line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-                environment.as_mut_ptr() as *mut _,
-                cwd_ptr,
-                &si,
-                &mut pi,
-            );
-            if ok == 0 {
-                let e = io::Error::last_os_error();
-                CloseHandle(job);
-                return Err(e);
-            }
-            if AssignProcessToJobObject(job, pi.hProcess) == 0 {
-                let e = io::Error::last_os_error();
-                TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                CloseHandle(job);
-                return Err(e);
-            }
-            ResumeThread(pi.hThread);
-            CloseHandle(pi.hThread);
-            Ok(Proc {
-                pid: pi.dwProcessId,
-                process: pi.hProcess,
-                job,
-                exited: None,
-            })
-        }
-    }
-
-    /// How many processes are still in the application's job object, or `None` if the job
-    /// could not be queried.
-    ///
-    /// This is the Windows counterpart of the Unix adapter's `group_alive`: it counts the
-    /// whole tree, so a leader that has exited while its workers keep draining still reads as
-    /// active. An exited-but-unclosed leader does not inflate the count — a job's
-    /// `ActiveProcesses` drops as each member terminates, regardless of who still holds a
-    /// handle to it.
-    fn job_active_processes(&self) -> Option<u32> {
-        use windows_sys::Win32::System::JobObjects::{
-            JobObjectBasicAccountingInformation, QueryInformationJobObject,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        };
-        unsafe {
-            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
-            let ok = QueryInformationJobObject(
-                self.job,
-                JobObjectBasicAccountingInformation,
-                &mut info as *mut _ as *mut _,
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            );
-            (ok != 0).then_some(info.ActiveProcesses)
-        }
-    }
-}
-
-impl crate::sys::Process for Proc {
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    fn poll_exit(&mut self) -> Option<i32> {
-        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-        use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-        if self.exited.is_none() {
-            // Decide exited-vs-running by waiting on the process handle (signaled only once
-            // the process has terminated), not by comparing the exit code against 259
-            // (`STILL_ACTIVE`) — an app that genuinely exits with 259 must still be seen as
-            // dead. Only after the handle signals is the exit code meaningful.
-            if unsafe { WaitForSingleObject(self.process, 0) } == WAIT_OBJECT_0 {
-                let mut code = 0u32;
-                if unsafe { GetExitCodeProcess(self.process, &mut code) } != 0 {
-                    self.exited = Some(code as i32);
-                }
-            }
-        }
-        self.exited
-    }
-
-    /// Stop the app: `CTRL_BREAK` to its process group, wait up to `grace` for a clean
-    /// drain/flush, then `TerminateJobObject` as the hard fallback — mirroring the Unix
-    /// `SIGTERM`→wait→`SIGKILL` path so a planned update/stop gets the same graceful window
-    /// on every target rather than an abrupt kill.
-    ///
-    /// The window is the job's, not the leader's. A launcher-style application forwards the
-    /// `CTRL_BREAK` to its workers and its leader exits immediately, and those workers finishing
-    /// their in-flight work are exactly what the operator configured the grace for — so the wait
-    /// ends on the *job* draining, never on the leader's own exit, which would truncate the drain
-    /// to whatever fraction of the window happened to have elapsed and then hand the still-running
-    /// workers straight to the kill-on-close job handle in [`Drop`]. This is the same contract the
-    /// Unix adapter states for its process group.
-    ///
-    /// NOTE: needs Windows CI validation — this host cannot compile or exercise the
-    /// `CREATE_NEW_PROCESS_GROUP` + `CTRL_BREAK_EVENT` interaction.
-    fn stop(&mut self, grace: Duration) {
-        use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        // Stopping is once-only: `App::stop` takes the `Proc` out of the `App` and drops it as
-        // soon as this returns, so there is no second stop to guard against.
-        //
-        // Graceful: the app was spawned `CREATE_NEW_PROCESS_GROUP`, so its process-group id
-        // equals its PID; `CTRL_BREAK` lets it run its shutdown handler. (`CTRL_C` cannot be
-        // targeted at a specific group, so `CTRL_BREAK` is the one usable graceful signal.)
-        // PID-reuse is not a hazard here even if the leader has already exited: we still hold
-        // its process handle, and Windows keeps a PID reserved while any handle to it is open.
-        unsafe {
-            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.pid);
-        }
-        let deadline = Instant::now() + grace;
-        loop {
-            // Latch the leader's exit code if it has one, but never end the window on it.
-            self.poll_exit();
-            match self.job_active_processes() {
-                // The whole tree is gone; the job has nothing left to kill.
-                Some(0) => break,
-                Some(_) => {}
-                // The job could not be queried, so the leader's handle is the only signal we
-                // have left. Falling back to it can truncate a worker drain, but it is better
-                // than spending the entire grace on an app that is already gone.
-                None => {
-                    if self.exited.is_some() {
-                        break;
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                // Hard fallback: kill the whole job.
-                unsafe {
-                    TerminateJobObject(self.job, 1);
-                    WaitForSingleObject(self.process, 5_000);
-                }
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        self.exited.get_or_insert(1);
-    }
-}
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        // Closing the kill-on-close job ends the app: on guardian exit that is intended. For a
-        // `Proc` dropped while the application is still running this is the only thing that
-        // stops it; a completed stop has already drained or terminated the job, so nothing that
-        // was still working is cut short here (bar the query-failed fallback, which has no way
-        // to tell either).
-        unsafe {
-            CloseHandle(self.process);
-            CloseHandle(self.job);
-        }
-    }
-}
-
-fn command_line_utf16(spec: &CommandSpec) -> Vec<u16> {
-    // Build the command line in raw UTF-16 code units, never via `to_string_lossy`: a
-    // `CommandSpec`'s program/args round-trip Windows WTF-16 faithfully (see `control`'s
-    // `os_units`/`os_from_units`), so an unpaired surrogate or other non-UTF-8 code unit in a
-    // valid path must reach `CreateProcessW` intact rather than be replaced with U+FFFD (which
-    // would launch the wrong image or ENOENT). This mirrors the Unix path's raw-bytes fidelity.
-    let mut line: Vec<u16> = Vec::new();
-    quote_arg_into(&mut line, &spec.program);
-    for a in &spec.args {
-        line.push(u16::from(b' '));
-        quote_arg_into(&mut line, a);
-    }
-    to_wide_nul(line.into_iter())
-}
-
-fn quote_arg_into(out: &mut Vec<u16>, arg: &std::ffi::OsStr) {
-    use std::os::windows::ffi::OsStrExt;
-    const SPACE: u16 = b' ' as u16;
-    const TAB: u16 = b'\t' as u16;
-    const QUOTE: u16 = b'"' as u16;
-    const BACKSLASH: u16 = b'\\' as u16;
-    let units: Vec<u16> = arg.encode_wide().collect();
-    if !units.is_empty()
-        && !units
-            .iter()
-            .any(|&u| matches!(u, SPACE | TAB | QUOTE | BACKSLASH))
-    {
-        out.extend_from_slice(&units);
-        return;
-    }
-    out.push(QUOTE);
-    let mut backslashes = 0usize;
-    for &u in &units {
-        match u {
-            BACKSLASH => backslashes += 1,
-            QUOTE => {
-                out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2 + 1));
-                backslashes = 0;
-                out.push(QUOTE);
-            }
-            _ => {
-                out.extend(std::iter::repeat_n(BACKSLASH, backslashes));
-                backslashes = 0;
-                out.push(u);
-            }
-        }
-    }
-    out.extend(std::iter::repeat_n(BACKSLASH, backslashes * 2));
-    out.push(QUOTE);
-}
-
-fn environment_block(spec: &CommandSpec) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    let mut block: Vec<u16> = Vec::new();
-    for (k, v) in &spec.env {
-        block.extend(k.encode_wide());
-        block.push(b'=' as u16);
-        block.extend(v.encode_wide());
-        block.push(0);
-    }
-    block.push(0);
-    if block.len() == 1 {
-        block.push(0);
-    }
-    block
-}
-
-fn to_wide_nul(units: impl Iterator<Item = u16>) -> Vec<u16> {
-    let mut v: Vec<u16> = units.collect();
-    v.push(0);
-    v
-}
-
 // ------------------------------- stop signals -------------------------------
 
-/// A no-op on Windows (there is no `SIGPIPE`); present so the guardian core can call it
+/// A no-op on Windows (there is no `SIGPIPE`); present so the launcher core can call it
 /// unconditionally, keeping its own code free of `cfg`.
 pub fn ignore_sigpipe() {}
 
 /// Install the stop handler: a console close/shutdown event sets the shutdown flag so the
-/// guardian exits cleanly (forwarding the stop down to the application).
+/// launcher stops its agent and exits cleanly.
 pub fn install_shutdown_handler() {
     unsafe {
         windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(handle_ctrl), 1);
@@ -319,9 +29,9 @@ unsafe extern "system" fn handle_ctrl(_ctrl_type: u32) -> windows_sys::Win32::Fo
 
 // ------------------------------ the control channel ------------------------------
 
-/// The guardian's end of the inherited control channel: a duplex pair of anonymous pipes
-/// (Windows anonymous pipes are one-directional). The guardian reads supervisor→guardian
-/// and writes guardian→supervisor; the supervisor inherits the complementary two handles.
+/// The launcher's end of the inherited control channel: a duplex pair of anonymous pipes
+/// (Windows anonymous pipes are one-directional). The launcher reads agent→launcher
+/// and writes launcher→agent; the agent inherits the complementary two handles.
 pub struct Channel {
     read: std::fs::File,
     write: std::fs::File,
@@ -334,16 +44,16 @@ impl Channel {
         use std::os::windows::io::{
             AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
         };
-        // g2s: guardian writes, supervisor reads. s2g: supervisor writes, guardian reads.
+        // g2s: launcher writes, agent reads. s2g: agent writes, launcher reads.
         // Own every handle the instant it exists so a failure part-way through closes them
-        // all on unwind — the guardian relaunches on a loop, so a leak here would compound.
+        // all on unwind — the launcher relaunches on a loop, so a leak here would compound.
         let (g2s_read, g2s_write) = anon_pipe()?;
         let g2s_read = unsafe { OwnedHandle::from_raw_handle(g2s_read as RawHandle) };
         let g2s_write = unsafe { OwnedHandle::from_raw_handle(g2s_write as RawHandle) };
         let (s2g_read, s2g_write) = anon_pipe()?;
         let s2g_read = unsafe { OwnedHandle::from_raw_handle(s2g_read as RawHandle) };
         let s2g_write = unsafe { OwnedHandle::from_raw_handle(s2g_write as RawHandle) };
-        // Each pipe's child-facing handle is inheritable; the guardian's is not.
+        // Each pipe's child-facing handle is inheritable; the launcher's is not.
         set_inherit(g2s_read.as_raw_handle() as HANDLE, true)?;
         set_inherit(g2s_write.as_raw_handle() as HANDLE, false)?;
         set_inherit(s2g_write.as_raw_handle() as HANDLE, true)?;
@@ -398,7 +108,7 @@ impl Channel {
     }
 }
 
-/// How long a single control-channel read or write may stall the guardian's one thread
+/// How long a single control-channel read or write may stall the launcher's one thread
 /// before it gives up on the frame. Mirrors the Unix end's per-operation `SO_RCVTIMEO`/
 /// `SO_SNDTIMEO`.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -445,10 +155,9 @@ fn peek_until_readable(handle: HANDLE, deadline: std::time::Instant) -> Peek {
     }
 }
 
-/// Bounds a blocking pipe read. Without this a supervisor that writes one byte and stops
-/// would block the guardian's only thread inside `read_exact` forever, stranding its
-/// shutdown signal, its application-crash check, and its readiness deadline while it still
-/// owns the application.
+/// Bounds a blocking pipe read. Without this an agent that writes one byte and stops
+/// would block the launcher's only thread inside `read_exact` forever, stranding its
+/// shutdown signal and its readiness deadline.
 struct TimeoutReader<'a>(&'a mut std::fs::File);
 
 impl std::io::Read for TimeoutReader<'_> {
@@ -473,14 +182,14 @@ impl std::io::Read for TimeoutReader<'_> {
 
 /// Bounds a blocking pipe write to the same [`IO_TIMEOUT`] as the read, matching the Unix
 /// channel's `SO_SNDTIMEO`. An anonymous pipe carries no write timeout, and `WriteFile`
-/// blocks once the pipe buffer fills — so a supervisor that stops draining could otherwise
-/// wedge the guardian's only thread inside `send_hello`/`send_response` forever, stranding
-/// the shutdown signal and readiness deadline while it still owns the application.
+/// blocks once the pipe buffer fills — so an agent that stops draining could otherwise
+/// wedge the launcher's only thread inside `send_hello`/`send_response` forever, stranding
+/// the shutdown signal and readiness deadline.
 ///
 /// The bound is enforced by writing each frame chunk on a scratch thread (holding a
-/// duplicated handle) and waiting up to the deadline. On timeout the guardian abandons the
+/// duplicated handle) and waiting up to the deadline. On timeout the launcher abandons the
 /// thread — it unblocks and closes its handle copy if the pipe ever drains or closes — and
-/// reports the stall, which the serve loop treats as a lost supervisor.
+/// reports the stall, which the serve loop treats as a lost agent.
 struct TimeoutWriter<'a>(&'a mut std::fs::File);
 
 impl std::io::Write for TimeoutWriter<'_> {
@@ -539,7 +248,7 @@ fn bounded_pipe_write(handle: HANDLE, buf: &[u8], timeout: Duration) -> io::Resu
         // wrapper rather than the bare `*mut c_void`, which is not `Send`.
         let dup = dup;
         // Adopt the duplicated handle as a File so the write goes through std and the handle
-        // is closed on drop — including when the guardian has already abandoned us.
+        // is closed on drop — including when the launcher has already abandoned us.
         let mut file = unsafe { std::fs::File::from_raw_handle(dup.0) };
         let result = file.write_all(&payload).map(|()| payload.len());
         // The receiver may already be gone (we timed out); ignore the send failure.
@@ -583,74 +292,4 @@ fn set_inherit(handle: HANDLE, inherit: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::{OsStr, OsString};
-
-    fn decode_nul(v: &[u16]) -> String {
-        assert_eq!(v.last(), Some(&0));
-        String::from_utf16(&v[..v.len() - 1]).unwrap()
-    }
-
-    /// The quoted form of one argument, decoded back to a `String` for comparison.
-    fn quote_arg(arg: &OsStr) -> String {
-        let mut out = Vec::new();
-        quote_arg_into(&mut out, arg);
-        String::from_utf16(&out).unwrap()
-    }
-
-    #[test]
-    fn windows_arguments_follow_create_process_quoting_rules() {
-        assert_eq!(quote_arg(OsStr::new("plain")), "plain");
-        assert_eq!(quote_arg(OsStr::new("")), "\"\"");
-        assert_eq!(quote_arg(OsStr::new("two words")), "\"two words\"");
-        assert_eq!(quote_arg(OsStr::new(r#"a\"b"#)), r#""a\\\"b""#);
-        assert_eq!(quote_arg(OsStr::new(r"trail\")), r#""trail\\""#);
-    }
-
-    #[test]
-    fn command_line_contains_program_and_every_argument() {
-        let spec = CommandSpec {
-            program: OsString::from(r"C:\Program Files\app.exe"),
-            args: vec![OsString::from("plain"), OsString::from("two words")],
-            env: vec![],
-            cwd: None,
-        };
-        assert_eq!(
-            decode_nul(&command_line_utf16(&spec)),
-            "\"C:\\Program Files\\app.exe\" plain \"two words\""
-        );
-    }
-
-    #[test]
-    fn environment_block_is_double_nul_terminated() {
-        let empty = CommandSpec {
-            program: OsString::from("app"),
-            args: vec![],
-            env: vec![],
-            cwd: None,
-        };
-        assert_eq!(environment_block(&empty), vec![0, 0]);
-
-        let spec = CommandSpec {
-            env: vec![
-                (OsString::from("A"), OsString::from("one")),
-                (OsString::from("B"), OsString::from("two")),
-            ],
-            ..empty
-        };
-        let expected: Vec<u16> = "A=one\0B=two\0\0".encode_utf16().collect();
-        assert_eq!(environment_block(&spec), expected);
-    }
-
-    #[test]
-    fn wide_strings_receive_exactly_one_terminator() {
-        assert_eq!(
-            to_wide_nul("ab".encode_utf16()),
-            vec![b'a' as u16, b'b' as u16, 0]
-        );
-    }
 }

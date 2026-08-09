@@ -105,11 +105,9 @@ mod error_tests {
 
     fn runtime() -> updated_contracts::assignment::ManagedRuntime {
         updated_contracts::assignment::ManagedRuntime {
-            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
-            args: vec![],
             secrets: vec![],
             inputs: std::collections::BTreeMap::new(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -132,7 +130,6 @@ mod error_tests {
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,
-                drain_hold_seconds: Some(0),
             },
         }
     }
@@ -305,11 +302,9 @@ mod error_tests {
     #[test]
     fn assigned_repositories_have_independent_stable_datastores() {
         let runtime = || updated_contracts::assignment::ManagedRuntime {
-            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
-            args: vec![],
             secrets: vec![],
             inputs: std::collections::BTreeMap::new(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -332,7 +327,6 @@ mod error_tests {
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,
-                drain_hold_seconds: Some(0),
             },
         };
         let assignment = |metadata: &str, targets: &str| RepositoryAssignment {
@@ -379,11 +373,9 @@ mod error_tests {
             },
             release_root: serde_json::json!({}),
             runtime: updated_contracts::assignment::ManagedRuntime {
-                mode: updated_contracts::assignment::RuntimeMode::Managed,
                 product: "app".into(),
                 channel: "stable".into(),
                 install_root: "/app".into(),
-                args: vec![],
                 secrets: vec![],
                 inputs: std::collections::BTreeMap::new(),
                 repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -406,7 +398,6 @@ mod error_tests {
                     refresh_retry_seconds: 1,
                     confirmation_window_seconds: 1,
                     supervisor_check_interval_seconds: 1,
-                    drain_hold_seconds: Some(0),
                 },
             },
         };
@@ -1564,8 +1555,8 @@ const ROUTING_TARGET_LIMIT: u64 = {
         * ((128 + updated_contracts::telemetry::OutputManifest::MAX_STRING_BYTES as u64) * ESCAPED
             + 64);
     let secrets = 64 * (3 * 253 * ESCAPED + 64);
-    // The fields the contract leaves unbounded — `args`, and the embedded `release_root`, whose
-    // size follows the number of signing keys — get one flat megabyte between them. Nothing can
+    // The field the contract leaves unbounded — the embedded `release_root`, whose
+    // size follows the number of signing keys — gets one flat megabyte. Nothing can
     // make that provably sufficient; what it can do is put the failure far outside the shapes a
     // control plane produces, instead of below them.
     inputs + secrets + (1024 * 1024)

@@ -14,7 +14,7 @@ fn temp_dir(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[cfg(unix)]
-fn supervisor_script(tag: &str, body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+fn agent_script(tag: &str, body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let (guard, dir) = temp_dir(tag);
     std::fs::create_dir_all(&dir).unwrap();
@@ -25,7 +25,7 @@ fn supervisor_script(tag: &str, body: &str) -> (tempfile::TempDir, std::path::Pa
 }
 
 #[cfg(unix)]
-fn start_guardian(
+fn start_launcher(
     tag: &str,
     supervisor: &std::path::Path,
 ) -> (tempfile::TempDir, std::process::Child) {
@@ -84,7 +84,7 @@ fn first_boot_without_a_supervisor_fails_closed() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("fatal: no committed supervisor and no --supervisor to seed one"),
+        stderr.contains("fatal: no committed agent and no --supervisor to seed one"),
         "{stderr}"
     );
 }
@@ -104,7 +104,7 @@ fn the_config_path_defaults_so_a_standard_deployment_never_names_it() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("fatal: no committed supervisor and no --supervisor to seed one"),
+        stderr.contains("fatal: no committed agent and no --supervisor to seed one"),
         "{stderr}"
     );
     assert!(
@@ -134,24 +134,24 @@ fn help_prints_the_complete_operator_contract() {
 
 #[cfg(unix)]
 #[test]
-fn guardian_stays_alive_until_sigterm_then_exits_cleanly() {
+fn the_launcher_stays_alive_until_sigterm_then_exits_cleanly() {
     let (_ready_tmp, ready) = temp_dir("steady-ready");
-    let (_script_tmp, supervisor) = supervisor_script(
+    let (_script_tmp, supervisor) = agent_script(
         "steady-supervisor",
         &format!(
             "trap 'exit 0' TERM INT\ntouch '{}'\nwhile :; do sleep 1; done",
             ready.display()
         ),
     );
-    let (_state_tmp, mut child) = start_guardian("steady-state", &supervisor);
+    let (_state_tmp, mut child) = start_launcher("steady-state", &supervisor);
     assert!(
         wait_for_path(&ready, std::time::Duration::from_secs(3)),
-        "supervisor never reached readiness marker"
+        "the agent never reached readiness marker"
     );
     assert_eq!(
         child.try_wait().unwrap(),
         None,
-        "guardian exited before shutdown"
+        "the launcher exited before shutdown"
     );
 
     assert_eq!(
@@ -160,16 +160,16 @@ fn guardian_stays_alive_until_sigterm_then_exits_cleanly() {
     );
     assert!(
         wait_for_exit(&mut child, std::time::Duration::from_secs(3)),
-        "guardian ignored SIGTERM"
+        "the launcher ignored SIGTERM"
     );
     assert_eq!(child.wait().unwrap().code(), Some(0));
 }
 
-/// Spawn a guardian with its stderr captured into a shared buffer, and its crash-loop backoff
+/// Spawn a launcher with its stderr captured into a shared buffer, and its crash-loop backoff
 /// widened so a shutdown deterministically lands inside the backoff sleep. A reader thread
 /// drains the pipe so the child never blocks on a full stderr buffer.
 #[cfg(unix)]
-fn start_guardian_backoff_probe(
+fn start_launcher_backoff_probe(
     tag: &str,
     supervisor: &std::path::Path,
 ) -> (
@@ -183,7 +183,7 @@ fn start_guardian_backoff_probe(
         .args(["--state-dir", state.to_str().unwrap()])
         .args(["--supervisor-config", "/unused/config.toml"])
         .args(["--supervisor", supervisor.to_str().unwrap()])
-        // Ten-minute base backoff (capped to the 5-minute ceiling): the guardian sits in the
+        // Ten-minute base backoff (capped to the 5-minute ceiling): the launcher sits in the
         // sleep essentially the whole time, so the shutdown can never race the brief serve
         // window. The interruption fires within the 25ms poll regardless — nothing waits.
         .env("UPDATED_GUARDIAN_BACKOFF_BASE_MS", "600000")
@@ -225,19 +225,19 @@ fn wait_for_log(
 
 #[cfg(unix)]
 #[test]
-fn supervisor_backoff_is_interrupted_by_shutdown() {
-    // The supervisor exits at once, so the guardian is sitting in a (widened) relaunch backoff.
+fn agent_backoff_is_interrupted_by_shutdown() {
+    // The agent exits at once, so the launcher is sitting in a (widened) relaunch backoff.
     // The proof that shutdown INTERRUPTS the sleep — rather than the sleep elapsing — is the
-    // guardian's own durable log line, emitted only on the cut-short path. No wall-clock margin
+    // launcher's own durable log line, emitted only on the cut-short path. No wall-clock margin
     // is compared anywhere, so no amount of machine load can flake this: the timeouts below are
     // only anti-hang ceilings, orders of magnitude above the real (sub-second) latencies.
-    let (_script_tmp, supervisor) = supervisor_script("failed-supervisor", "exit 7");
-    let (_state_tmp, mut child, log) = start_guardian_backoff_probe("backoff", &supervisor);
+    let (_script_tmp, supervisor) = agent_script("failed-agent", "exit 7");
+    let (_state_tmp, mut child, log) = start_launcher_backoff_probe("backoff", &supervisor);
     let ceiling = std::time::Duration::from_secs(30);
 
     assert!(
-        wait_for_log(&log, "relaunching the supervisor in", ceiling),
-        "guardian never entered a relaunch backoff:\n{}",
+        wait_for_log(&log, "relaunching the agent in", ceiling),
+        "the launcher never entered a relaunch backoff:\n{}",
         log.lock().unwrap()
     );
 
@@ -253,7 +253,7 @@ fn supervisor_backoff_is_interrupted_by_shutdown() {
     );
     assert!(
         wait_for_exit(&mut child, ceiling),
-        "guardian did not exit after its backoff was interrupted"
+        "the launcher did not exit after its backoff was interrupted"
     );
     assert_eq!(child.wait().unwrap().code(), Some(0));
 }

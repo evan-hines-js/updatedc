@@ -4,9 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The installer-owned root of the update tower and the permanent process guardian
-# that owns the managed application. It is deliberately frozen: a mechanism, not a
-# policy holder, so it should almost never need updating.
+# The installer-owned launcher: the one process that decides which agent binary
+# runs. It is deliberately frozen: a mechanism, not a policy holder, so it should
+# almost never need updating.
 #
 # Dependency rule (enforced by `dependency_isolation` in main.rs):
 #   * the only project crates allowed are the frozen `control` protocol and the
@@ -15,7 +15,7 @@ license.workspace = true
 #     config, or update libraries;
 #   * platform BINDING crates are allowed (libc, windows-sys) — they are just
 #     ABI-correct types, constants, and function declarations, and hand-writing
-#     Windows structs/unions/flags would be more likely to make the guardian unsafe
+#     Windows structs/unions/flags would be more likely to make the launcher unsafe
 #     than to keep it stable.
 [[bin]]
 name = "bootstrap"
@@ -29,11 +29,11 @@ foundation = { path = "../foundation" }
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# Only the binding feature sets the guardian actually calls: process creation and
-# handles, Job Objects, anonymous pipes for the inherited control channel, and the
+# Only the binding feature sets the launcher actually calls: process creation and
+# handles, anonymous pipes for the inherited control channel, and the
 # console-stop handler.
 windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }
 
 [dev-dependencies]
-# Test-only: unique, self-cleaning scratch directories. Never linked into the guardian.
+# Test-only: unique, self-cleaning scratch directories. Never linked into the launcher.
 tempfile.workspace = true

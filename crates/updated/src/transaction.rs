@@ -1,6 +1,6 @@
 //! Shared durable update transaction and binary-state decisions.
 //!
-//! The continuously supervised updater uses this journal format and recovery classifier.
+//! The node agent uses this journal format and recovery classifier.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -23,16 +23,17 @@ pub struct Transaction {
     pub candidate_archive_sha256: String,
     pub candidate_repository_lineage: RepositoryLineage,
     /// Recovery must durably reject the candidate before this transaction may be
-    /// cleared. This records policy intent that cannot safely be reconstructed from
-    /// one-shot process-exit markers on a later recovery boot.
+    /// cleared. This records the verdict of whatever judged the candidate — a failed activation, a
+    /// failed health gate — so a later recovery boot, which has no way to re-derive it, still
+    /// applies it.
     pub candidate_rejection_required: bool,
     /// Recovery must replay the operator lifecycle provider before clearing this intent.
     pub lifecycle: Box<ProviderRelease>,
     /// How many consecutive boots have failed to health-gate the restored predecessor during a
-    /// crash-recovered rollback. The supervisor's boot health gate bounds this: once it reaches its
-    /// limit, a predecessor whose bytes can no longer pass the gate stops crash-looping the node and
+    /// crash-recovered rollback. The agent's boot health gate bounds this: once it reaches its
+    /// limit, a predecessor whose bytes can no longer pass the gate stops looping the node and
     /// instead descends via ordered fallback past it. Zero for a forward update; only the rollback
-    /// recovery path increments it. It survives the guardian relaunch precisely because it rides the
+    /// recovery path increments it. It survives the agent relaunch precisely because it rides the
     /// journal, which is what re-derives the rollback on each boot.
     pub rollback_health_failures: u32,
     /// Last state-machine operation known to have completed durably. Recovery replays
@@ -47,15 +48,8 @@ pub enum Phase {
     PreflightCompleted,
     PrepareStarted,
     Prepared,
-    PreDrainStarted,
-    DrainStarted,
-    Drained,
-    StopStarted,
-    Stopped,
     ActivateStarted,
     CandidateActivated,
-    StartStarted,
-    CandidateStarted,
     HealthStarted,
     CandidateHealthy,
     FinalizeStarted,
@@ -63,12 +57,8 @@ pub enum Phase {
     CommitStarted,
     Committed,
     RollbackStarted,
-    RollbackStopStarted,
-    RollbackStopped,
     RollbackActivateStarted,
     PredecessorActivated,
-    RollbackStartStarted,
-    PredecessorStarted,
     RollbackHealthStarted,
     PredecessorHealthy,
     RollbackFinalizeStarted,
@@ -104,12 +94,8 @@ impl Transaction {
         matches!(
             self.phase,
             Phase::RollbackStarted
-                | Phase::RollbackStopStarted
-                | Phase::RollbackStopped
                 | Phase::RollbackActivateStarted
                 | Phase::PredecessorActivated
-                | Phase::RollbackStartStarted
-                | Phase::PredecessorStarted
                 | Phase::RollbackHealthStarted
                 | Phase::PredecessorHealthy
                 | Phase::RollbackFinalizeStarted
@@ -117,8 +103,8 @@ impl Transaction {
         )
     }
 
-    /// Position in the recovery path (0 = rollback just began, 10 = fully rolled back), or `None`
-    /// when the transaction is not on the rollback path at all. This lets a fresh supervisor resume
+    /// Position in the recovery path (0 = rollback just began, 6 = fully rolled back), or `None`
+    /// when the transaction is not on the rollback path at all. This lets a fresh agent resume
     /// after the last durable boundary without re-running an operation already recorded complete.
     pub fn rollback_rank(&self) -> Option<u8> {
         Self::rollback_rank_of(self.phase)
@@ -130,16 +116,12 @@ impl Transaction {
     fn rollback_rank_of(phase: Phase) -> Option<u8> {
         match phase {
             Phase::RollbackStarted => Some(0),
-            Phase::RollbackStopStarted => Some(1),
-            Phase::RollbackStopped => Some(2),
-            Phase::RollbackActivateStarted => Some(3),
-            Phase::PredecessorActivated => Some(4),
-            Phase::RollbackStartStarted => Some(5),
-            Phase::PredecessorStarted => Some(6),
-            Phase::RollbackHealthStarted => Some(7),
-            Phase::PredecessorHealthy => Some(8),
-            Phase::RollbackFinalizeStarted => Some(9),
-            Phase::RolledBack => Some(10),
+            Phase::RollbackActivateStarted => Some(1),
+            Phase::PredecessorActivated => Some(2),
+            Phase::RollbackHealthStarted => Some(3),
+            Phase::PredecessorHealthy => Some(4),
+            Phase::RollbackFinalizeStarted => Some(5),
+            Phase::RolledBack => Some(6),
             _ => None,
         }
     }
@@ -164,16 +146,9 @@ impl Transaction {
             (Phase::PreflightStarted, Phase::PreflightCompleted)
                 | (Phase::PreflightCompleted, Phase::PrepareStarted)
                 | (Phase::PrepareStarted, Phase::Prepared)
-                | (Phase::Prepared, Phase::PreDrainStarted)
-                | (Phase::PreDrainStarted, Phase::DrainStarted)
-                | (Phase::DrainStarted, Phase::Drained)
-                | (Phase::Drained, Phase::StopStarted)
-                | (Phase::StopStarted, Phase::Stopped)
-                | (Phase::Stopped, Phase::ActivateStarted)
+                | (Phase::Prepared, Phase::ActivateStarted)
                 | (Phase::ActivateStarted, Phase::CandidateActivated)
-                | (Phase::CandidateActivated, Phase::StartStarted)
-                | (Phase::StartStarted, Phase::CandidateStarted)
-                | (Phase::CandidateStarted, Phase::HealthStarted)
+                | (Phase::CandidateActivated, Phase::HealthStarted)
                 | (Phase::HealthStarted, Phase::CandidateHealthy)
                 | (Phase::CandidateHealthy, Phase::FinalizeStarted)
                 | (Phase::FinalizeStarted, Phase::Finalized)
@@ -184,13 +159,9 @@ impl Transaction {
             && !matches!(self.phase, Phase::Committed | Phase::RolledBack);
         let rollback = matches!(
             (self.phase, next),
-            (Phase::RollbackStarted, Phase::RollbackStopStarted)
-                | (Phase::RollbackStopStarted, Phase::RollbackStopped)
-                | (Phase::RollbackStopped, Phase::RollbackActivateStarted)
+            (Phase::RollbackStarted, Phase::RollbackActivateStarted)
                 | (Phase::RollbackActivateStarted, Phase::PredecessorActivated)
-                | (Phase::PredecessorActivated, Phase::RollbackStartStarted)
-                | (Phase::RollbackStartStarted, Phase::PredecessorStarted)
-                | (Phase::PredecessorStarted, Phase::RollbackHealthStarted)
+                | (Phase::PredecessorActivated, Phase::RollbackHealthStarted)
                 | (Phase::RollbackHealthStarted, Phase::PredecessorHealthy)
                 | (Phase::PredecessorHealthy, Phase::RollbackFinalizeStarted)
                 | (Phase::RollbackFinalizeStarted, Phase::RolledBack)
@@ -234,11 +205,6 @@ pub fn classify_recovery(
         | Phase::PreflightCompleted
         | Phase::PrepareStarted
         | Phase::Prepared
-        | Phase::PreDrainStarted
-        | Phase::DrainStarted
-        | Phase::Drained
-        | Phase::StopStarted
-        | Phase::Stopped
             if active == Some(&tx.previous_release) =>
         {
             Recovery::NeverSwapped
@@ -345,15 +311,8 @@ mod tests {
             Phase::PreflightCompleted,
             Phase::PrepareStarted,
             Phase::Prepared,
-            Phase::PreDrainStarted,
-            Phase::DrainStarted,
-            Phase::Drained,
-            Phase::StopStarted,
-            Phase::Stopped,
             Phase::ActivateStarted,
             Phase::CandidateActivated,
-            Phase::StartStarted,
-            Phase::CandidateStarted,
             Phase::HealthStarted,
             Phase::CandidateHealthy,
             Phase::FinalizeStarted,
@@ -372,47 +331,43 @@ mod tests {
         transaction.phase = Phase::CandidateHealthy;
         for (phase, rank) in [
             (Phase::RollbackStarted, 0),
-            (Phase::RollbackStopStarted, 1),
-            (Phase::RollbackStopped, 2),
-            (Phase::RollbackActivateStarted, 3),
-            (Phase::PredecessorActivated, 4),
-            (Phase::RollbackStartStarted, 5),
-            (Phase::PredecessorStarted, 6),
-            (Phase::RollbackHealthStarted, 7),
-            (Phase::PredecessorHealthy, 8),
-            (Phase::RollbackFinalizeStarted, 9),
-            (Phase::RolledBack, 10),
+            (Phase::RollbackActivateStarted, 1),
+            (Phase::PredecessorActivated, 2),
+            (Phase::RollbackHealthStarted, 3),
+            (Phase::PredecessorHealthy, 4),
+            (Phase::RollbackFinalizeStarted, 5),
+            (Phase::RolledBack, 6),
         ] {
             transaction.advance(phase).unwrap();
             assert_eq!(transaction.rollback_rank(), Some(rank));
         }
-        assert!(transaction.advance(Phase::PredecessorStarted).is_err());
+        assert!(transaction.advance(Phase::PredecessorActivated).is_err());
     }
 
     #[test]
     fn recovery_pending_is_true_only_for_phases_not_yet_reached() {
-        // Sit the transaction at RollbackStopped (rank 2). Every rollback phase strictly ahead is
-        // pending; the current phase and everything behind it are not — the exact resume gate the
-        // supervisor drives, expressed without a single rank literal.
+        // Sit the transaction at PredecessorActivated (rank 2). Every rollback phase strictly ahead
+        // is pending; the current phase and everything behind it are not — the exact resume gate the
+        // agent drives, expressed without a single rank literal.
         let mut transaction = tx();
         transaction.phase = Phase::CandidateHealthy;
         transaction.advance(Phase::RollbackStarted).unwrap();
-        transaction.advance(Phase::RollbackStopStarted).unwrap();
-        transaction.advance(Phase::RollbackStopped).unwrap();
+        transaction.advance(Phase::RollbackActivateStarted).unwrap();
+        transaction.advance(Phase::PredecessorActivated).unwrap();
 
         // Behind / at the current phase: nothing to replay.
         for done in [
             Phase::RollbackStarted,
-            Phase::RollbackStopStarted,
-            Phase::RollbackStopped,
+            Phase::RollbackActivateStarted,
+            Phase::PredecessorActivated,
         ] {
             assert!(!transaction.recovery_pending(done), "{done:?} already done");
         }
         // Ahead on the rollback path: still pending.
         for pending in [
-            Phase::RollbackActivateStarted,
-            Phase::PredecessorActivated,
-            Phase::RollbackStartStarted,
+            Phase::RollbackHealthStarted,
+            Phase::PredecessorHealthy,
+            Phase::RollbackFinalizeStarted,
             Phase::RolledBack,
         ] {
             assert!(

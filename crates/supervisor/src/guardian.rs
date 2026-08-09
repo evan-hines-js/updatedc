@@ -1,50 +1,38 @@
-//! The supervisor's client for the guardian control channel.
+//! The agent's client for the launcher control channel.
 //!
-//! The guardian — not the supervisor — owns the application. So the supervisor never
-//! spawns, adopts, signals, or reaps it directly: it asks the guardian to, over the
-//! inherited control channel the guardian handed it at launch. This module is the thin
-//! consumer side of the frozen [`control`] protocol; the guardian is the server.
+//! The launcher manages exactly one thing: which agent binary runs. It knows nothing about
+//! workloads — those belong to the release's own reconciler — so this channel carries agent
+//! readiness and agent-candidate handoff and nothing else. This module is the thin consumer side
+//! of the frozen [`control`] protocol; the launcher is the server.
 //!
-//! Each operation is one synchronous request/response exchange. The guardian speaks
+//! Each operation is one synchronous request/response exchange. The launcher speaks
 //! first with a [`Hello`], which [`Guardian::connect`] reads and negotiates before any
-//! request; from then on every read is the response to the supervisor's last request.
+//! request; from then on every read is the response to the agent's last request.
 
 use std::path::Path;
 
-use control::{CommandSpec, Hello, Nonce, Request, Response, CONTROL_ENV, READY_NONCE_ENV};
+use control::{Hello, Nonce, Request, Response, CONTROL_ENV, READY_NONCE_ENV};
 
-/// A connection to the guardian and this launch's readiness nonce.
+/// A connection to the launcher and this launch's readiness nonce.
 pub(crate) struct Guardian {
     conn: Conn,
     ready_nonce: Nonce,
-    /// The application the guardian is running, as this connection knows it: seeded from the
-    /// launch environment (a supervisor crash-relaunch or a candidate activation hands the live
-    /// PID across exec) and kept true by every stop and launch that goes through here. This is the
-    /// supervisor's ONE record of it — [`crate::app::App::pid`] reads it rather than keeping a
-    /// second copy that the two modes' launch paths would drift apart.
-    ///
-    /// The environment variable is fixed at exec time and can only ever be *stale*, so it is read
-    /// exactly once, here. A boot that stops the application before planning — repairing a
-    /// committed bundle that failed local verification — would otherwise still be told one is
-    /// running, and the planner would adopt a PID that no longer exists instead of launching, so
-    /// the boot health gate would probe an application that does not exist.
-    app_pid: Option<u32>,
     /// Whether this launch has already sent `READY`. See [`Guardian::signal_ready`].
     ready_signalled: bool,
 }
 
 impl Guardian {
     /// Connect over the inherited channel and complete the handshake. Fails if the
-    /// guardian did not launch this supervisor (no channel) or the protocols do not
+    /// launcher did not launch this agent (no channel) or the protocols do not
     /// share a major.
     pub(crate) fn connect() -> Result<Guardian, String> {
         let ready_nonce = read_ready_nonce()?;
         let mut conn = Conn::inherit()?;
         let hello =
-            Hello::read(conn.reader()).map_err(|e| format!("reading guardian hello: {e}"))?;
+            Hello::read(conn.reader()).map_err(|e| format!("reading launcher hello: {e}"))?;
         if !hello.compatible() {
             return Err(format!(
-                "control-protocol major mismatch (guardian speaks {}, supervisor speaks {})",
+                "control-protocol major mismatch (launcher speaks {}, agent speaks {})",
                 hello.major,
                 control::PROTOCOL_MAJOR
             ));
@@ -52,35 +40,24 @@ impl Guardian {
         Ok(Guardian {
             conn,
             ready_nonce,
-            app_pid: adopted_app_pid(),
             ready_signalled: false,
         })
     }
 
-    /// The application the guardian is running right now, if any — what the boot planner adopts
-    /// instead of launching a duplicate.
-    pub(crate) fn running_app(&self) -> Option<u32> {
-        self.app_pid
-    }
-
-    /// A connection in the shape [`Guardian::connect`] produces when the guardian handed a live
-    /// application across exec, over a socketpair whose other end the test drives.
+    /// A connection in the shape [`Guardian::connect`] produces, over a socketpair whose other end
+    /// the test drives.
     #[cfg(all(test, unix))]
-    pub(crate) fn for_test(
-        stream: std::os::unix::net::UnixStream,
-        app_pid: Option<u32>,
-    ) -> Guardian {
+    pub(crate) fn for_test(stream: std::os::unix::net::UnixStream) -> Guardian {
         Guardian {
             conn: Conn { stream },
             ready_nonce: [0u8; 16],
-            app_pid,
             ready_signalled: false,
         }
     }
 
     fn exchange(&mut self, req: &Request) -> Result<Response, GuardianError> {
         // A write/read failure on the channel is a transport failure, not a refusal: the
-        // guardian died, the pipe broke, or a frame was truncated. Tag it `Channel` so the
+        // launcher died, the pipe broke, or a frame was truncated. Tag it `Channel` so the
         // update path recovers rather than blaming the candidate.
         req.write(self.conn.writer())
             .map_err(|e| GuardianError::Channel(format!("sending control request: {e}")))?;
@@ -88,50 +65,8 @@ impl Guardian {
             .map_err(|e| GuardianError::Channel(format!("reading control response: {e}")))
     }
 
-    /// Ask the guardian to launch the application from `spec`. Returns the application's
-    /// PID. A `Channel` error means the control channel failed (e.g. a SIGKILLed guardian);
-    /// a `Refused` error means the guardian answered but the launch itself failed.
-    pub(crate) fn launch(&mut self, spec: &CommandSpec) -> Result<u32, GuardianError> {
-        match self.exchange(&Request::Launch(spec.clone()))? {
-            Response::Launched { pid } => {
-                self.app_pid = Some(pid);
-                Ok(pid)
-            }
-            Response::Error(msg) => Err(GuardianError::Refused(format!(
-                "guardian could not launch the application: {msg}"
-            ))),
-            other => Err(GuardianError::Refused(format!(
-                "unexpected reply to LAUNCH: {other:?}"
-            ))),
-        }
-    }
-
-    /// Stop the application (the guardian escalates to a hard kill). Used to quiesce it
-    /// before activating a release during an update.
-    ///
-    /// The PID is forgotten as soon as the stop is asked for, whether or not the answer arrives.
-    /// Relaunching cannot duplicate an application — `bootstrap::app::App::launch` stops whatever
-    /// it is running before it spawns — so the only hazard left is the other direction: *adopting*
-    /// a process this supervisor asked to have stopped. That PID may be gone (the health gate then
-    /// probes an application that does not exist), or still be running the very bytes a repair
-    /// just replaced, with `active == installed` afterwards so drift enforcement never corrects it.
-    pub(crate) fn stop(&mut self) -> Result<(), GuardianError> {
-        self.app_pid = None;
-        self.expect_ok(&Request::Stop, "STOP")
-    }
-
-    /// Publish the application traffic state exposed by the guardian's stable probe
-    /// endpoint. False is sent before drain; true only after health verification.
-    pub(crate) fn traffic_ready(&mut self, ready: bool) -> Result<(), GuardianError> {
-        self.expect_ok(&Request::TrafficReady(ready), "TRAFFIC_STATE")
-    }
-
-    pub(crate) fn application_failed(&mut self) -> Result<(), GuardianError> {
-        self.expect_ok(&Request::ApplicationFailed, "FAIL_APPLICATION")
-    }
-
-    /// Hand off to a staged replacement supervisor at `path`; the guardian relaunches
-    /// from it under a readiness gate after this supervisor exits.
+    /// Hand off to a staged replacement agent at `path`; the launcher relaunches
+    /// from it under a readiness gate after this agent exits.
     pub(crate) fn replace_supervisor(&mut self, path: &Path) -> Result<(), GuardianError> {
         self.expect_ok(
             &Request::ReplaceSupervisor(path.as_os_str().to_os_string()),
@@ -139,18 +74,18 @@ impl Guardian {
         )
     }
 
-    /// Prove this supervisor launch reached readiness (commits a candidate handoff), and hand back
+    /// Prove this agent launch reached readiness (commits a candidate handoff), and hand back
     /// the proof that it was sent.
     ///
-    /// A guardian that will not take the signal is warned about rather than fatal: this supervisor
+    /// A launcher that will not take the signal is warned about rather than fatal: this agent
     /// is already running and there is nothing better to do about it. The token is returned either
     /// way, because it records the *ordering* — that this call has happened — which is what the
     /// waits behind it depend on.
     ///
-    /// At most one `READY` reaches the guardian per launch. Boot recovery signals readiness as
+    /// At most one `READY` reaches the launcher per launch. Boot recovery signals readiness as
     /// soon as it starts waiting out a node-local transient (see `run`), and the boot path then
     /// signals again at its ordinary point; a second frame on the wire would be answered — the
-    /// guardian's dispatch ignores it once the nonce is spent — but the supervisor would be
+    /// launcher's dispatch ignores it once the nonce is spent — but the agent would be
     /// blocked on that exchange for no reason, so the send is made once here instead.
     pub(crate) fn signal_ready(&mut self) -> ReadySignalled {
         if self.ready_signalled {
@@ -159,7 +94,7 @@ impl Guardian {
         self.ready_signalled = true;
         if let Err(error) = self.expect_ok(&Request::Ready(self.ready_nonce), "READY") {
             crate::warn(&format!(
-                "could not signal readiness to the guardian: {error}"
+                "could not signal readiness to the launcher: {error}"
             ));
         }
         ReadySignalled(())
@@ -167,12 +102,12 @@ impl Guardian {
 
     /// The `GuardianError` variant is preserved: a transport failure here is not the
     /// candidate's fault, and callers convert it into `io::ErrorKind::ConnectionReset` so boot
-    /// recovery retries instead of rejecting the release's bytes.
+    /// recovery retries instead of rejecting the candidate's bytes.
     fn expect_ok(&mut self, req: &Request, what: &str) -> Result<(), GuardianError> {
         match self.exchange(req)? {
             Response::Ok => Ok(()),
             Response::Error(msg) => Err(GuardianError::Refused(format!(
-                "guardian rejected {what}: {msg}"
+                "launcher rejected {what}: {msg}"
             ))),
             other => Err(GuardianError::Refused(format!(
                 "unexpected reply to {what}: {other:?}"
@@ -181,29 +116,29 @@ impl Guardian {
     }
 }
 
-/// Proof that this boot has already told the guardian the supervisor is ready. Only
+/// Proof that this boot has already told the launcher the agent is ready. Only
 /// [`Guardian::signal_ready`] can make one — the field is private to this module — so a wait that
 /// demands one cannot be moved back in front of the readiness signal without failing to compile.
 ///
 /// [`crate::secrets::SecretManager::acquire`] is that wait: in front of the signal, an unreachable
-/// secrets endpoint is indistinguishable from a supervisor binary that cannot start, and the
+/// secrets endpoint is indistinguishable from an agent binary that cannot start, and the
 /// candidate's bytes are then rejected by content hash, permanently.
 pub(crate) struct ReadySignalled(());
 
 #[cfg(test)]
 impl ReadySignalled {
-    /// Stand in for the guardian handshake, for tests of the waits that sit behind it.
+    /// Stand in for the launcher handshake, for tests of the waits that sit behind it.
     pub(crate) fn for_test() -> ReadySignalled {
         ReadySignalled(())
     }
 }
 
-/// Why a guardian request failed, distinguished by fault attribution. `Refused` is a real
-/// operation failure the managed candidate owns (a bad launch spec, an operation this guardian
-/// build does not implement, an unexpected reply). `Channel` is a control-channel transport failure — a SIGKILLed guardian,
-/// a broken pipe, a closed or malformed frame — which is NEVER the candidate's fault. It maps to
-/// `io::ErrorKind::ConnectionReset` so the update path can let it drive boot recovery (which
-/// retries) instead of permanently rejecting a healthy release.
+/// Why a launcher request failed, distinguished by fault attribution. `Refused` is a real
+/// operation failure the candidate owns (an operation this launcher build does not implement, an
+/// unexpected reply). `Channel` is a control-channel transport failure — a SIGKILLed launcher, a
+/// broken pipe, a closed or malformed frame — which is NEVER the candidate's fault. It maps to
+/// `io::ErrorKind::ConnectionReset` so a caller can retry instead of permanently rejecting a
+/// healthy release.
 #[derive(Debug)]
 pub(crate) enum GuardianError {
     Channel(String),
@@ -231,37 +166,28 @@ impl From<GuardianError> for std::io::Error {
     }
 }
 
-/// The application PID the guardian handed this supervisor across exec, if any (a supervisor
-/// crash-relaunch or candidate activation). Read once, into [`Guardian::app_pid`], which is the
-/// supervisor's only answer to "is an application running" from then on.
-fn adopted_app_pid() -> Option<u32> {
-    std::env::var(control::APP_PID_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-}
-
-/// The guardian's state directory, from the launch environment.
+/// The launcher's state directory, from the launch environment.
 pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
     std::env::var(control::STATE_DIR_ENV)
         .ok()
         .map(std::path::PathBuf::from)
 }
 
-/// One marker file the guardian writes for the supervisor: evidence about the launch that just
-/// ended, which the supervisor turns into a rollback or a rejection.
+/// One marker file the launcher writes for the agent: evidence about the agent launch that just
+/// ended, which the agent turns into a durable rejection.
 ///
 /// A marker is only ever obtained as a [`Claim`] — a specific *instance* of the file, pinned to
 /// the bytes that were read — and a claim is the only thing that can erase one. Three hazards are
 /// unrepresentable as a result:
 ///
 /// * Consuming evidence by reading it. A crash or ENOSPC between the unlink and the durable write
-///   the marker implies would erase the only record that the application died inside its
-///   confirmation window, and the next boot would confirm the bad update instead of reverting it.
-///   Re-deriving evidence after a crash is idempotent; re-creating deleted evidence is impossible.
-/// * Erasing evidence nobody read. Boot reconciliation runs while the guardian still owns the live
-///   application, so the guardian can write a *fresh* marker at any point during it. Clearing "the
-///   marker file" would silently swallow that one; clearing a claim touches only the instance
-///   whose contents drove this boot's decisions, and leaves a newer instance for the next boot.
+///   the marker implies would erase the only record that a candidate agent failed its readiness
+///   gate, and the next boot would re-stage the same bad bytes. Re-deriving evidence after a crash
+///   is idempotent; re-creating deleted evidence is impossible.
+/// * Erasing evidence nobody read. The launcher can write a *fresh* marker at any point during
+///   boot reconciliation. Clearing "the marker file" would silently swallow that one; clearing a
+///   claim touches only the instance whose contents drove this boot's decisions, and leaves a
+///   newer instance for the next boot.
 /// * Being wedged by garbage. A marker whose bytes are not evidence — a truncated write from
 ///   outside this tower, an operator's stray `echo`, a directory at the path — is DISCARDED with a
 ///   warning rather than failing the boot: failing would repeat identically on every subsequent
@@ -274,14 +200,13 @@ struct Marker {
 /// proof of reading that [`Claim::clear`] requires; consuming one is what makes clearing happen at
 /// most once, for at most that instance.
 ///
-/// The *contents* are the instance identity, and nothing else: the guardian writes markers through
+/// The *contents* are the instance identity, and nothing else: the launcher writes markers through
 /// `foundation::durable::atomic_write_managed`, but filesystem metadata cannot tell two writes
 /// apart portably (on Windows NTFS tunneling restores the creation time across the temp+rename,
 /// modification time has ~15 ms granularity, and the length of a fixed-shape marker never varies).
-/// So each marker's content is made self-identifying at the writer instead: the service-exit marker
-/// carries a fresh per-exit stamp, and the rejected-supervisor marker carries the candidate's path
-/// — which is precisely the evidence, so two instances with identical bytes say the same thing and
-/// have the same durable consequence.
+/// So the marker's content is made self-identifying at the writer instead: the rejected-supervisor
+/// marker carries the candidate's path — which is precisely the evidence, so two instances with
+/// identical bytes say the same thing and have the same durable consequence.
 pub(crate) struct Claim {
     path: std::path::PathBuf,
     content: String,
@@ -307,7 +232,7 @@ fn restore_taken(taken: &Path, marker: &Path) {
     };
     if let Err(error) = restored {
         crate::warn(&format!(
-            "could not restore the guardian marker {}: {error}",
+            "could not restore the launcher marker {}: {error}",
             marker.display()
         ));
     }
@@ -326,7 +251,7 @@ fn recover_interrupted_clear(marker: &Path) {
 
 fn warn_unusable(path: &Path, why: &str) {
     crate::warn(&format!(
-        "guardian marker {} {why}; discarding it — it carries no evidence",
+        "launcher marker {} {why}; discarding it — it carries no evidence",
         path.display()
     ));
 }
@@ -342,7 +267,7 @@ fn discard(path: &Path, why: &str) -> Option<Claim> {
     warn_unusable(path, why);
     if let Err(error) = foundation::durable::remove_path(path) {
         crate::warn(&format!(
-            "could not remove the unusable guardian marker {}: {error}",
+            "could not remove the unusable launcher marker {}: {error}",
             path.display()
         ));
     }
@@ -350,16 +275,8 @@ fn discard(path: &Path, why: &str) -> Option<Claim> {
 }
 
 impl Marker {
-    /// The managed service exited spontaneously. Any exit, including zero, invalidates an
-    /// unconfirmed release and requires boot reconciliation.
-    fn service_exit(state_dir: &Path) -> Marker {
-        Marker {
-            path: state_dir.join(control::SERVICE_EXITED_MARKER_FILE),
-        }
-    }
-
-    /// A candidate supervisor failed its readiness gate; its staged path is the marker's content,
-    /// and this supervisor records the rejection so the candidate is never staged again.
+    /// A candidate agent failed its readiness gate; its staged path is the marker's content,
+    /// and this agent records the rejection so the candidate is never staged again.
     fn rejected_supervisor(state_dir: &Path) -> Marker {
         Marker {
             path: state_dir.join(control::REJECTED_SUPERVISOR_FILE),
@@ -408,15 +325,14 @@ impl Claim {
     /// derived from it — a synthesized rollback journal, a recorded rejection — has been
     /// committed; the claim is consumed, so it cannot be cleared twice.
     ///
-    /// If the bytes on disk are no longer the ones that were read, the guardian wrote a new marker
+    /// If the bytes on disk are no longer the ones that were read, the launcher wrote a new marker
     /// while this boot was reconciling: that instance's evidence has been read by nobody, so it
     /// is left for the next boot.
     /// The instance is taken off the marker path in ONE atomic step (a rename) before its bytes are
     /// compared, so this call can only ever destroy the instance it took. Comparing in place and
-    /// then unlinking the *path* — the shape this replaced — left a window between the two calls:
-    /// the guardian owns the live application throughout boot reconciliation, and a marker it
-    /// renamed into place inside that window was unlinked with its evidence read by nobody, which
-    /// is precisely how a service exit gets lost and a crashed candidate confirmed.
+    /// then unlinking the *path* leaves a window between the two calls in which a marker the
+    /// launcher renamed into place is unlinked with its evidence read by nobody — which is
+    /// precisely how a rejected candidate gets re-staged forever.
     fn clear(self) -> std::io::Result<()> {
         let taken = taken_path(&self.path);
         match std::fs::rename(&self.path, &taken) {
@@ -438,7 +354,7 @@ impl Claim {
             return foundation::durable::remove_file(&taken);
         }
         crate::log(&format!(
-            "guardian marker {} was rewritten during boot reconciliation; leaving the new one \
+            "launcher marker {} was rewritten during boot reconciliation; leaving the new one \
              for the next boot",
             self.path.display()
         ));
@@ -453,31 +369,29 @@ impl Claim {
         warn_unusable(&self.path, why);
         if let Err(error) = self.clear() {
             crate::warn(&format!(
-                "could not remove the unusable guardian marker: {error}"
+                "could not remove the unusable launcher marker: {error}"
             ));
         }
     }
 }
 
-/// Everything the guardian left behind for this boot, read once, up front, and cleared one claim
-/// at a time as each implied intent becomes durable.
+/// Everything the launcher left behind for this boot, read once, up front, and cleared once the
+/// intent it implies becomes durable.
 ///
 /// There is no way to reach a marker except through here, and no way to clear one except by
 /// surrendering the claim that read it — so "cleared a marker whose consequence never committed"
 /// and "cleared a marker nobody read" are both off the table by construction rather than by call
 /// ordering.
 pub(crate) struct Evidence {
-    service_exit: Option<Claim>,
     rejected_supervisor: Option<(Claim, std::path::PathBuf)>,
 }
 
 impl Evidence {
-    /// Read both markers. `state_dir` is `None` when this supervisor was not launched by a
-    /// guardian, in which case there is never any evidence.
+    /// Read the marker. `state_dir` is `None` when this agent was not launched by a launcher, in
+    /// which case there is never any evidence.
     pub(crate) fn read(state_dir: Option<&Path>) -> std::io::Result<Evidence> {
         let Some(state_dir) = state_dir else {
             return Ok(Evidence {
-                service_exit: None,
                 rejected_supervisor: None,
             });
         };
@@ -488,7 +402,7 @@ impl Evidence {
                     Some(path) => Some((claim, path)),
                     // A rejected-supervisor marker that does not name exactly one candidate path
                     // cannot reject anything. Discarding it costs at most one re-staging of a
-                    // candidate the guardian will reject again (and record again, legibly);
+                    // candidate the launcher will reject again (and record again, legibly);
                     // failing the boot on it would fail every boot after it, forever.
                     None => {
                         claim.discard_corrupt("does not name exactly one candidate path");
@@ -499,29 +413,15 @@ impl Evidence {
             None => None,
         };
         Ok(Evidence {
-            service_exit: Marker::service_exit(state_dir).claim()?,
             rejected_supervisor,
         })
     }
 
-    /// Whether the managed service exited spontaneously under the previous supervisor.
-    pub(crate) fn service_exited(&self) -> bool {
-        self.service_exit.is_some()
-    }
-
-    /// The staged path of a candidate supervisor the guardian rejected at its readiness gate.
+    /// The staged path of a candidate agent the launcher rejected at its readiness gate.
     pub(crate) fn rejected_supervisor(&self) -> Option<&Path> {
         self.rejected_supervisor
             .as_ref()
             .map(|(_, path)| path.as_path())
-    }
-
-    /// Drop the service-exit evidence, now that the rollback or rejection it implied is durable.
-    pub(crate) fn clear_service_exit(&mut self) -> std::io::Result<()> {
-        match self.service_exit.take() {
-            Some(claim) => claim.clear(),
-            None => Ok(()),
-        }
     }
 
     /// Drop the rejected-supervisor evidence, now that the candidate's hash is durably rejected.
@@ -535,7 +435,7 @@ impl Evidence {
 
 fn read_ready_nonce() -> Result<Nonce, String> {
     let hex = std::env::var(READY_NONCE_ENV).map_err(|_| {
-        format!("{READY_NONCE_ENV} not set; the supervisor must be launched by the guardian")
+        format!("{READY_NONCE_ENV} not set; the agent must be launched by the launcher")
     })?;
     parse_nonce(&hex).ok_or_else(|| format!("{READY_NONCE_ENV} is not 32 hex digits"))
 }
@@ -582,14 +482,14 @@ impl Conn {
             .ok()
             .and_then(|v| v.parse().ok())
             .ok_or_else(|| format!("{CONTROL_ENV} is not a valid descriptor"))?;
-        // Safety: the guardian created this socketpair end and handed us its number
+        // Safety: the launcher created this socketpair end and handed us its number
         // across exec; nothing else owns it.
         let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        // The guardian cleared FD_CLOEXEC so this endpoint would survive *our* exec. Re-arm
+        // The launcher cleared FD_CLOEXEC so this endpoint would survive *our* exec. Re-arm
         // it now that we own it, so it stops here: nothing we launch is a party to the
         // control protocol, and a descendant of the operator's lifecycle provider holding this
-        // fd could drive the guardian directly — a single `Stop` frame would take the
-        // application down with no crash recorded and nothing to relaunch it.
+        // fd could drive the launcher directly — a handoff frame would swap the agent binary
+        // out from under this node.
         set_cloexec(fd).map_err(|e| format!("securing the control channel endpoint: {e}"))?;
         Ok(Conn { stream })
     }
@@ -637,19 +537,19 @@ impl Conn {
         let w: usize = w
             .parse()
             .map_err(|_| format!("{CONTROL_ENV} write handle is not a number"))?;
-        // Safety: the guardian created these anonymous-pipe ends and handed us their
+        // Safety: the launcher created these anonymous-pipe ends and handed us their
         // inheritable handle values across spawn; nothing else owns them.
         let conn = Conn {
             reader: unsafe { std::fs::File::from_raw_handle(r as RawHandle) },
             writer: unsafe { std::fs::File::from_raw_handle(w as RawHandle) },
         };
-        // The guardian marked these ends inheritable so they would survive *our* spawn. Clear
+        // The launcher marked these ends inheritable so they would survive *our* spawn. Clear
         // it now that we own them, so the channel stops here: nothing we launch is a party to
         // the control protocol, and a descendant of the operator's lifecycle provider holding
-        // these handles could drive the guardian directly — a single `Stop` frame would take
-        // the application down with no crash recorded and nothing to relaunch it. This is the
-        // exact counterpart of the unix arm's FD_CLOEXEC re-arm; bootstrap cannot do it for us,
-        // because the flag travels with the handle into this process.
+        // these handles could drive the launcher directly — a handoff frame would swap the agent
+        // binary out from under this node. This is the exact counterpart of the unix arm's
+        // FD_CLOEXEC re-arm; the launcher cannot do it for us, because the flag travels with the
+        // handle into this process.
         for handle in [r as RawHandle, w as RawHandle] {
             clear_inherit(handle)
                 .map_err(|e| format!("securing the control channel endpoint: {e}"))?;
@@ -666,20 +566,21 @@ impl Conn {
     }
 }
 
-/// Answer one request the way the guardian would, so the exchange under test completes. Shared
-/// with [`crate::app`], whose provider-managed launch path is one such exchange.
+/// Answer one request the way the launcher would, and hand it back, so the exchange under test
+/// completes and the frame it put on the wire can be asserted on.
 #[cfg(all(test, unix))]
-pub(crate) fn answering(
+fn answering(
     mut peer: std::os::unix::net::UnixStream,
     response: Response,
-) -> std::thread::JoinHandle<()> {
+) -> std::thread::JoinHandle<Request> {
     std::thread::spawn(move || {
-        Request::read(&mut peer).expect("one request");
+        let request = Request::read(&mut peer).expect("one request");
         response.write(&mut peer).expect("one response");
+        request
     })
 }
 
-/// The connection's own bookkeeping, driven over a real socketpair with a stand-in guardian
+/// The connection's own bookkeeping, driven over a real socketpair with a stand-in launcher
 /// answering one request. Unix-only because the channel endpoint is: on Windows it is a pair of
 /// anonymous pipe handles, and the state under test lives above that split.
 #[cfg(all(test, unix))]
@@ -688,56 +589,57 @@ mod channel_tests {
     use std::os::unix::net::UnixStream;
 
     #[test]
-    fn an_acknowledged_stop_forgets_the_application_the_guardian_was_running() {
-        // Regression: the answer to "is an application running" was the launch environment, fixed
-        // at exec time and never updated. A boot that stopped the child to repair a committed
-        // bundle that failed local verification therefore still saw it running, and the planner
-        // adopted a PID that no longer existed — nothing was ever launched, and the boot health
-        // gate probed an application that did not exist.
+    fn a_handoff_puts_the_candidate_path_on_the_wire() {
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
         let peer = answering(theirs, Response::Ok);
-        let mut guardian = Guardian::for_test(ours, Some(4321));
-        assert_eq!(guardian.running_app(), Some(4321));
+        let mut guardian = Guardian::for_test(ours);
 
-        guardian.stop().expect("the guardian acknowledges STOP");
+        guardian
+            .replace_supervisor(Path::new("/state/supervisors/abc/updated-agent"))
+            .expect("the launcher accepts the handoff");
 
-        assert_eq!(guardian.running_app(), None);
-        peer.join().expect("the stand-in guardian");
+        assert_eq!(
+            peer.join().expect("the stand-in launcher"),
+            Request::ReplaceSupervisor("/state/supervisors/abc/updated-agent".into())
+        );
     }
 
     #[test]
-    fn an_unanswered_stop_forgets_the_application_too() {
-        // The guardian answers STOP with Ok unconditionally, so the only stop that fails is one
-        // whose channel died — a SIGKILLed guardian, a broken pipe. Keeping the PID through that
-        // was justified as "otherwise we launch a second application", which the guardian makes
-        // impossible (its `App::launch` stops whatever it is running first). What keeping it
-        // actually bought was ADOPTING a process this boot asked to have stopped: dead, or alive
-        // on the bytes a repair just replaced, and with active == installed nothing corrects it.
+    fn readiness_is_signalled_at_most_once_per_launch() {
+        // Boot recovery signals as soon as it starts waiting out a node-local transient, and the
+        // boot path signals again at its ordinary point. A second frame would be answered — the
+        // launcher ignores a spent nonce — but this agent would block on an exchange for nothing.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let peer = answering(theirs, Response::Ok);
+        let mut guardian = Guardian::for_test(ours);
+
+        guardian.signal_ready();
+        guardian.signal_ready();
+
+        assert_eq!(
+            peer.join().expect("the stand-in launcher"),
+            Request::Ready([0u8; 16]),
+            "exactly one READY reached the launcher"
+        );
+    }
+
+    #[test]
+    fn a_dead_channel_is_a_transport_failure_not_a_refusal() {
+        // The distinction the whole error type exists for: a candidate agent must never be
+        // rejected by content hash because the launcher's socket died.
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
         drop(theirs);
-        let mut guardian = Guardian::for_test(ours, Some(4321));
+        let mut guardian = Guardian::for_test(ours);
 
-        assert!(guardian.stop().is_err(), "the channel is gone");
+        let error = guardian
+            .replace_supervisor(Path::new("/state/supervisors/abc/updated-agent"))
+            .expect_err("the channel is gone");
 
-        assert_eq!(guardian.running_app(), None);
-    }
-
-    #[test]
-    fn a_launch_records_the_application_it_started() {
-        let (ours, theirs) = UnixStream::pair().expect("socketpair");
-        let peer = answering(theirs, Response::Launched { pid: 77 });
-        let mut guardian = Guardian::for_test(ours, None);
-
-        let spec = CommandSpec {
-            program: "/bin/true".into(),
-            args: Vec::new(),
-            env: Vec::new(),
-            cwd: None,
-        };
-        assert!(matches!(guardian.launch(&spec), Ok(77)));
-
-        assert_eq!(guardian.running_app(), Some(77));
-        peer.join().expect("the stand-in guardian");
+        assert!(matches!(error, GuardianError::Channel(_)));
+        assert_eq!(
+            std::io::Error::from(error).kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
     }
 }
 
@@ -752,23 +654,11 @@ mod marker_tests {
         (guard, path)
     }
 
-    /// Stand in for the guardian's writes (`bootstrap::record`): a self-identifying service-exit
-    /// stamp — the exit code plus a per-exit nonce — and the candidate path.
+    /// Stand in for the launcher's write (`launcher::record`): the rejected candidate's path.
     fn write_markers(state: &Path, candidate: &str) {
-        static EXIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let stamp = format!(
-            "1 {:032x}",
-            EXIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        foundation::durable::atomic_write_managed(
-            &state.join(control::SERVICE_EXITED_MARKER_FILE),
-            ".guardian-",
-            stamp.as_bytes(),
-        )
-        .unwrap();
         foundation::durable::atomic_write_managed(
             &state.join(control::REJECTED_SUPERVISOR_FILE),
-            ".guardian-",
+            ".launcher-",
             candidate.as_bytes(),
         )
         .unwrap();
@@ -781,53 +671,48 @@ mod marker_tests {
     #[test]
     fn a_marker_survives_until_its_claim_is_explicitly_cleared() {
         // Reading must NOT consume: the evidence has to outlive the boot's durable writes, so a
-        // crash between them re-derives the same recovery rather than losing it.
-        let (_guard, state) = dir("service-exit");
+        // crash between them re-derives the same rejection rather than losing it.
+        let (_guard, state) = dir("rejected-supervisor");
         write_markers(&state, "/state/supervisors/abc/supervisor");
 
         let mut evidence = Evidence::read(Some(&state)).unwrap();
-        assert!(evidence.service_exited());
         assert_eq!(
             evidence.rejected_supervisor(),
             Some(Path::new("/state/supervisors/abc/supervisor"))
         );
         assert!(
-            Evidence::read(Some(&state)).unwrap().service_exited(),
+            Evidence::read(Some(&state))
+                .unwrap()
+                .rejected_supervisor()
+                .is_some(),
             "a re-read still sees the marker"
         );
 
-        evidence.clear_service_exit().unwrap();
         evidence.clear_rejected_supervisor().unwrap();
-        assert!(!exists(&state, control::SERVICE_EXITED_MARKER_FILE));
         assert!(!exists(&state, control::REJECTED_SUPERVISOR_FILE));
         // Consumed: a second clear is a no-op, not a second unlink of whatever is there now.
-        evidence.clear_service_exit().unwrap();
         evidence.clear_rejected_supervisor().unwrap();
     }
 
     #[test]
     fn a_marker_written_during_reconciliation_is_never_cleared_unread() {
-        // The guardian still owns the live application while the supervisor reconciles its boot,
-        // so it can record a fresh spontaneous exit at any point in that window. Clearing must
-        // erase only the instance this boot actually read; the new one is the next boot's
-        // evidence, and losing it would let a crashed candidate be confirmed.
+        // The launcher can reject a fresh candidate at any point while this boot reconciles.
+        // Clearing must erase only the instance this boot actually read; the new one is the next
+        // boot's evidence, and losing it would let the same bad bytes be staged again.
         let (_guard, state) = dir("rewritten");
         write_markers(&state, "/state/supervisors/abc/supervisor");
         let mut evidence = Evidence::read(Some(&state)).unwrap();
 
-        // The guardian writes new markers mid-boot (a fresh file renamed into place).
+        // The launcher writes a new marker mid-boot (a fresh file renamed into place).
         write_markers(&state, "/state/supervisors/def/supervisor");
 
-        evidence.clear_service_exit().unwrap();
         evidence.clear_rejected_supervisor().unwrap();
         assert!(
-            exists(&state, control::SERVICE_EXITED_MARKER_FILE),
+            exists(&state, control::REJECTED_SUPERVISOR_FILE),
             "the marker written during reconciliation must survive"
         );
-        let next = Evidence::read(Some(&state)).unwrap();
-        assert!(next.service_exited());
         assert_eq!(
-            next.rejected_supervisor(),
+            Evidence::read(Some(&state)).unwrap().rejected_supervisor(),
             Some(Path::new("/state/supervisors/def/supervisor")),
             "the next boot sees the newer candidate, not the one already handled"
         );
@@ -837,17 +722,20 @@ mod marker_tests {
     fn an_interrupted_clear_gives_the_instance_it_took_back() {
         // Clearing takes the marker off its path with one rename so it can only ever destroy the
         // instance it took — which means a process death in that window parks an instance beside
-        // the marker path. Reading is the only way to reach a marker, so reading restores it: an
-        // exit whose rollback never committed must not be lost to a crash mid-clear.
+        // the marker path. Reading is the only way to reach a marker, so reading restores it: a
+        // rejection that never committed must not be lost to a crash mid-clear.
         let (_guard, state) = dir("interrupted-clear");
         write_markers(&state, "/state/supervisors/abc/supervisor");
-        let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
+        let marker = state.join(control::REJECTED_SUPERVISOR_FILE);
         let content = std::fs::read_to_string(&marker).unwrap();
         std::fs::rename(&marker, taken_path(&marker)).unwrap();
 
         let evidence = Evidence::read(Some(&state)).unwrap();
 
-        assert!(evidence.service_exited(), "the taken instance is restored");
+        assert!(
+            evidence.rejected_supervisor().is_some(),
+            "the taken instance is restored"
+        );
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), content);
         assert!(!taken_path(&marker).exists());
     }
@@ -859,23 +747,24 @@ mod marker_tests {
         // than renamed over it.
         let (_guard, state) = dir("interrupted-clear-superseded");
         write_markers(&state, "/state/supervisors/abc/supervisor");
-        let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
+        let marker = state.join(control::REJECTED_SUPERVISOR_FILE);
         std::fs::rename(&marker, taken_path(&marker)).unwrap();
         write_markers(&state, "/state/supervisors/def/supervisor");
         let newest = std::fs::read_to_string(&marker).unwrap();
 
-        assert!(Evidence::read(Some(&state)).unwrap().service_exited());
+        assert!(Evidence::read(Some(&state))
+            .unwrap()
+            .rejected_supervisor()
+            .is_some());
 
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), newest);
         assert!(!taken_path(&marker).exists());
     }
 
     #[test]
-    fn no_guardian_state_dir_means_no_evidence() {
+    fn no_launcher_state_dir_means_no_evidence() {
         let mut evidence = Evidence::read(None).unwrap();
-        assert!(!evidence.service_exited());
         assert!(evidence.rejected_supervisor().is_none());
-        evidence.clear_service_exit().unwrap();
         evidence.clear_rejected_supervisor().unwrap();
     }
 
@@ -899,11 +788,11 @@ mod marker_tests {
         // Not even a regular file: same rule, and the boot still proceeds. A non-empty directory
         // is the hard case — unlinking one fails on every platform — and it must be REMOVED, not
         // merely tolerated, or every future boot repeats the same discard warning forever.
-        let marker = state.join(control::SERVICE_EXITED_MARKER_FILE);
+        let marker = state.join(control::REJECTED_SUPERVISOR_FILE);
         std::fs::create_dir(&marker).unwrap();
         std::fs::write(marker.join("stray"), b"not evidence").unwrap();
         let evidence = Evidence::read(Some(&state)).unwrap();
-        assert!(!evidence.service_exited());
+        assert!(evidence.rejected_supervisor().is_none());
         assert!(
             !marker.exists(),
             "a directory at the marker path must be discarded like any other garbage, so the \
@@ -914,7 +803,7 @@ mod marker_tests {
     #[test]
     fn a_corrupt_marker_rewritten_mid_boot_is_left_for_the_next_boot() {
         // Discarding garbage follows the same instance rule as clearing evidence: only the exact
-        // bytes that were read are removed, so a real marker the guardian wrote in the meantime
+        // bytes that were read are removed, so a real marker the launcher wrote in the meantime
         // survives to be acted on.
         let (_guard, state) = dir("malformed-rewritten");
         let path = state.join(control::REJECTED_SUPERVISOR_FILE);
@@ -929,25 +818,5 @@ mod marker_tests {
             Evidence::read(Some(&state)).unwrap().rejected_supervisor(),
             Some(Path::new("/state/supervisors/def/supervisor"))
         );
-    }
-
-    #[test]
-    fn two_service_exits_with_the_same_shape_are_distinct_instances() {
-        // The guardian stamps each exit uniquely, so the mid-boot rewrite check cannot be defeated
-        // by two markers that happen to have the same length and land in the same clock tick —
-        // which was every pair of them when the marker's content was empty.
-        let (_guard, state) = dir("distinct-exits");
-        write_markers(&state, "/state/supervisors/abc/supervisor");
-        let first = Marker::service_exit(&state).claim().unwrap().unwrap();
-        write_markers(&state, "/state/supervisors/abc/supervisor");
-        let second = Marker::service_exit(&state).claim().unwrap().unwrap();
-        assert_ne!(first.content, second.content);
-        first.clear().unwrap();
-        assert!(
-            exists(&state, control::SERVICE_EXITED_MARKER_FILE),
-            "clearing the instance that was read must not erase the newer exit"
-        );
-        second.clear().unwrap();
-        assert!(!exists(&state, control::SERVICE_EXITED_MARKER_FILE));
     }
 }

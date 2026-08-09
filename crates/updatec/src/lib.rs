@@ -125,13 +125,9 @@ pub struct ReleaseRepositorySpec {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSpec {
-    #[serde(default)]
-    pub mode: RuntimeModeSpec,
     pub product: String,
     pub channel: String,
     pub install_root: String,
-    #[serde(default)]
-    pub args: Vec<String>,
     #[serde(default)]
     pub secrets: Vec<SecretReferenceSpec>,
     pub repository: RepositoryLimitsSpec,
@@ -152,14 +148,6 @@ pub struct SecretReferenceSpec {
     /// is labelled.
     pub secret: String,
     pub key: String,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum RuntimeModeSpec {
-    #[default]
-    Managed,
-    ProviderManaged,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -188,11 +176,6 @@ pub struct TimeoutsSpec {
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
     pub supervisor_check_interval_seconds: u64,
-    /// Upper bound (seconds) on the managed drain hold; `None` or `0` = no hold (stop immediately),
-    /// `Some(n)` = wait up to `n`. Never an indefinite wait. See
-    /// [`updated_contracts::assignment::ManagedTimeouts::drain_hold_seconds`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drain_hold_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -224,16 +207,9 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
             },
             release_root,
             runtime: updated_contracts::assignment::ManagedRuntime {
-                mode: match value.runtime.mode {
-                    RuntimeModeSpec::Managed => updated_contracts::assignment::RuntimeMode::Managed,
-                    RuntimeModeSpec::ProviderManaged => {
-                        updated_contracts::assignment::RuntimeMode::ProviderManaged
-                    }
-                },
                 product: value.runtime.product,
                 channel: value.runtime.channel,
                 install_root: value.runtime.install_root.into(),
-                args: value.runtime.args,
                 secrets: value
                     .runtime
                     .secrets
@@ -268,7 +244,6 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                         .runtime
                         .timeouts
                         .supervisor_check_interval_seconds,
-                    drain_hold_seconds: value.runtime.timeouts.drain_hold_seconds,
                 },
             },
         };
@@ -1221,11 +1196,9 @@ mod tests {
 
     pub(crate) fn managed_runtime() -> updated_contracts::assignment::ManagedRuntime {
         updated_contracts::assignment::ManagedRuntime {
-            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
-            args: vec![],
             secrets: vec![],
             inputs: BTreeMap::new(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -1248,18 +1221,15 @@ mod tests {
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,
-                drain_hold_seconds: Some(0),
             },
         }
     }
 
     pub(crate) fn runtime_spec() -> RuntimeSpec {
         RuntimeSpec {
-            mode: RuntimeModeSpec::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
-            args: vec![],
             secrets: vec![],
             repository: RepositoryLimitsSpec {
                 metadata_limit: 1_048_576,
@@ -1281,7 +1251,6 @@ mod tests {
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,
-                drain_hold_seconds: Some(0),
             },
         }
     }

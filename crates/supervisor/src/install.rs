@@ -1,13 +1,13 @@
 //! First-install as a first-class, journaled operation.
 //!
-//! Cold install has a *different meaning* than an update: there is no predecessor to drain,
-//! stop, or roll back to. It is `prepare -> place -> commit`, driven through the durable
-//! [`updated::install`] journal so a crash at any boundary is completed idempotently on the
-//! next boot instead of leaving the node wedged (enrollment consumed, nothing installed).
+//! Cold install has a *different meaning* than an update: there is no predecessor to roll back
+//! to. It is `prepare -> place -> commit`, driven through the durable [`updated::install`] journal
+//! so a crash at any boundary is completed idempotently on the next boot instead of leaving the
+//! node wedged (enrollment consumed, nothing installed).
 //!
-//! Placement is uniform across every mode: the versioned active pointer places the release, and
-//! the app is launched fresh. The public `apply --reason install` operation performs any
-//! application-specific first-install convergence before launch.
+//! Placement is the versioned active pointer and nothing else. Bringing the release into service
+//! is the public `apply --reason install` operation, which the boot path runs once this has
+//! committed.
 
 use super::*;
 

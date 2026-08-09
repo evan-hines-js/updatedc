@@ -467,6 +467,104 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     Ok(())
 }
 
+/// The double-execution window, as a first-class scenario: crash the agent after a successful
+/// forward `apply` but before its checkpoint lands, so recovery MUST invoke `apply` again. This is
+/// the exact case the protocol's execution contract makes the hook author's obligation, so it gets
+/// its own named proof rather than riding inside the boundary sweep: the replay carries the SAME
+/// attempt id, the fixture's attempt-keyed marker makes the effect exactly-once, and the machine
+/// still converges to the committed candidate.
+pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
+    // Disjoint from the provider-hang range (23300..) and the health-failure range (22300..).
+    let srv = "127.0.0.1:23400";
+    let svc = "127.0.0.1:23450";
+    let dir = ctx.work.join("apply-replay");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let app = dir.join(format!("app{}", ctx.exe));
+    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
+    let server = ctx.serve(&dir, srv)?;
+    let fixture = dir.join("lifecycle-fixture");
+    let fixture_command = vec![
+        std::env::current_exe()
+            .map_err(str_err)?
+            .display()
+            .to_string(),
+        "--lifecycle-fixture".into(),
+        fixture.display().to_string(),
+    ];
+    let mut command = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+        .check_interval("1s")
+        .health_grace(HEALTH_GRACE)
+        .lifecycle(fixture_command)
+        .guardian()?;
+    // One-shot crash exactly between the successful apply hook and its durable checkpoint.
+    command.env(updated::env::CHAOS_POINT, "candidate-lifecycle-applied");
+    let tower = Proc::spawn("apply-replay", &mut command)?;
+    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = tower.captured_log();
+        drop(tower);
+        drop(server);
+        kill_stray(&dir.join("install"));
+        return fail(format!(
+            "the replay case never began its update transaction; log:\n{log}"
+        ));
+    }
+    let crash_seen = tower.wait_for_log(
+        "CHAOS: exiting at boundary \"candidate-lifecycle-applied\"",
+        RECOVERY_TIMEOUT,
+    );
+    let state_path = dir.join("install/state/installed.json");
+    let journal_path = dir.join("install/state/transaction.json");
+    let durable = wait_until(RECOVERY_TIMEOUT, || {
+        matches!(
+            updated::state::read_installed(&state_path),
+            updated::state::Installed::Present(ref state)
+                if state.release.version == "2.0.0"
+        ) && !journal_path.exists()
+    });
+    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
+    let applies: Vec<&str> = attempts
+        .lines()
+        .filter_map(|line| line.strip_prefix("apply\t"))
+        .collect();
+    let ids: std::collections::HashSet<&str> = applies.iter().copied().collect();
+    // At least two invocations — the one the crash interrupted and its recovery replay — and
+    // every one under the same attempt id, or replay identity is broken.
+    let replayed_under_one_id = applies.len() >= 2 && ids.len() == 1;
+    let apply_markers = std::fs::read_dir(fixture.join("effects"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .split_once('-')
+                .map(|(_, tail)| tail == "apply")
+                .unwrap_or(false)
+        })
+        .count();
+    let effect_exactly_once = apply_markers == 1;
+    let log = tower.captured_log();
+    drop(tower);
+    drop(server);
+    kill_stray(&dir.join("install"));
+    if !crash_seen || !durable || !replayed_under_one_id || !effect_exactly_once {
+        return fail(format!(
+            "the apply replay was not exactly-once (crash_seen={crash_seen}, durable={durable}, \
+             replayed_under_one_id={replayed_under_one_id} ({} applies, {} ids), \
+             effect_exactly_once={effect_exactly_once} ({apply_markers} markers)); \
+             attempts:\n{attempts}\nlog:\n{log}",
+            applies.len(),
+            ids.len(),
+        ));
+    }
+    ok("a crashed apply was replayed under the same attempt id and its effect landed exactly once");
+    Ok(())
+}
+
 pub(crate) fn provider_apply_failure(ctx: &Ctx) -> R {
     provider_failure_case(ctx, "apply", 0)
 }

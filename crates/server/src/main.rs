@@ -1217,11 +1217,9 @@ mod tests {
     fn managed_runtime() -> updated_contracts::assignment::ManagedRuntime {
         use updated_contracts::assignment::*;
         ManagedRuntime {
-            mode: RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
-            args: vec![],
             secrets: vec![],
             inputs: Default::default(),
             repository: ManagedRepositoryLimits {
@@ -1244,7 +1242,6 @@ mod tests {
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,
-                drain_hold_seconds: Some(0),
             },
         }
     }

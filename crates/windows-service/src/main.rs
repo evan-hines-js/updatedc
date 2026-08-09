@@ -2,15 +2,13 @@
 //!
 //! The service owns only the bootstrap, and owns it as a contained tree: it is spawned into a
 //! kill-on-close job object, so a bootstrap can never outlive the service process that reports
-//! its state to the SCM. That is what keeps the single-guardian invariant true across the SCM's
-//! recovery restarts — a second service process would otherwise launch a second guardian over
+//! its state to the SCM. That is what keeps the single-launcher invariant true across the SCM's
+//! recovery restarts — a second service process would otherwise launch a second launcher over
 //! the same state directory.
 //!
 //! It reports a bootstrap that exits on its own to the SCM as a service failure — restarts are
 //! the SCM's recovery actions, not a second loop in here — and translates SERVICE_CONTROL_STOP
-//! into CTRL_BREAK for the bootstrap's process group. The supervisor puts the managed
-//! application in a different process group, so service maintenance never sends the application
-//! a console event.
+//! into CTRL_BREAK for the bootstrap's process group.
 
 #[cfg(not(windows))]
 fn main() {
@@ -48,7 +46,6 @@ mod windows {
         /// wrapper never needs to know where a node's config lives.
         supervisor_config: Option<OsString>,
         supervisor: OsString,
-        probe_address: Option<OsString>,
     }
 
     pub fn main() {
@@ -86,16 +83,14 @@ mod windows {
     }
 
     /// Every flag here takes a value, and a flag without one is an error — including the
-    /// optional `--supervisor-config` and `--probe-address`. Treating a valueless flag as
-    /// "not given" would silently fall back to the bootstrap's defaults (its canonical config
-    /// path, no probe listener) while the SCM reports SERVICE_RUNNING, making this wrapper
-    /// weaker than the bootstrap it fronts, which rejects the same input.
+    /// optional `--supervisor-config`. Treating a valueless flag as "not given" would silently
+    /// fall back to the bootstrap's canonical config path while the SCM reports SERVICE_RUNNING,
+    /// making this wrapper weaker than the bootstrap it fronts, which rejects the same input.
     fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
         let mut bootstrap = None;
         let mut state_dir = None;
         let mut supervisor_config = None;
         let mut supervisor = None;
-        let mut probe_address = None;
         fn value(it: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString, String> {
             it.next().ok_or_else(|| format!("{flag} needs a value"))
         }
@@ -108,7 +103,6 @@ mod windows {
                     supervisor_config = Some(value(&mut it, "--supervisor-config")?)
                 }
                 "--supervisor" => supervisor = Some(value(&mut it, "--supervisor")?),
-                "--probe-address" => probe_address = Some(value(&mut it, "--probe-address")?),
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
@@ -117,7 +111,6 @@ mod windows {
             state_dir: state_dir.ok_or("--state-dir <path> is required")?,
             supervisor_config,
             supervisor: supervisor.ok_or("--supervisor <path> is required")?,
-            probe_address,
         })
     }
 
@@ -132,8 +125,8 @@ mod windows {
         STATUS.store(handle, Ordering::SeqCst);
         report(SERVICE_START_PENDING, 0, 5_000, NO_ERROR);
         // Accept SHUTDOWN as well as STOP. Without it the SCM sends nothing on an OS restart: the
-        // tower is killed outright, skipping the drain and the clean application stop that a
-        // requested stop performs — the one moment a graceful shutdown matters most.
+        // launcher and its agent are killed outright, skipping the clean agent stop a requested
+        // stop performs — the one moment a graceful shutdown matters most.
         report(
             SERVICE_RUNNING,
             SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
@@ -143,7 +136,7 @@ mod windows {
         // Report the outcome to the SCM, not just to stderr: `sc failure`/`sc failureflag`
         // recovery actions (see deploy/windows/install-selfupdate-supervisor.bat) fire only
         // on a STOPPED report carrying a non-zero exit code. Reporting a clean stop after a
-        // failure leaves the whole tower down with the SCM believing all is well.
+        // failure leaves the whole stack down with the SCM believing all is well.
         let exit = run_service();
         if let Err(e) = &exit {
             eprintln!("selfupdate-service: {e}");
@@ -166,12 +159,12 @@ mod windows {
         _event_data: *mut c_void,
         _context: *mut c_void,
     ) -> u32 {
-        // An OS shutdown is handled exactly like a stop: drain and stop the tower cleanly.
+        // An OS shutdown is handled exactly like a stop: stop the launcher cleanly.
         if control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN {
             STOP.store(true, Ordering::SeqCst);
             // The hint must cover the FULL stop: the grace period AND the hard kill and reap that
             // follow it. Reporting exactly the grace tells the SCM the service is late at the very
-            // moment it is doing the right thing, and it kills the tower mid-drain.
+            // moment it is doing the right thing, and it kills the launcher mid-stop.
             report(
                 SERVICE_STOP_PENDING,
                 0,
@@ -264,11 +257,8 @@ mod windows {
         if let Some(config) = &args.supervisor_config {
             command.arg("--supervisor-config").arg(config);
         }
-        if let Some(address) = &args.probe_address {
-            command.arg("--probe-address").arg(address);
-        }
         // Contained: the bootstrap and everything below it belong to a kill-on-close job object
-        // this process owns, so the tower can never survive the service process that reports its
+        // this process owns, so it can never survive the service process that reports its
         // state to the SCM. A service has no console, so the bootstrap is given one — that is what
         // makes `request_stop`'s graceful break addressable at all.
         ContainedChild::spawn_in_new_console(command)
@@ -331,12 +321,10 @@ mod windows {
 
         #[test]
         fn trailing_optional_flag_is_rejected() {
-            for flag in ["--supervisor-config", "--probe-address"] {
-                let mut args = REQUIRED.to_vec();
-                args.push(flag);
-                let err = parse_from(argv(&args)).unwrap_err();
-                assert_eq!(err, format!("{flag} needs a value"));
-            }
+            let mut args = REQUIRED.to_vec();
+            args.push("--supervisor-config");
+            let err = parse_from(argv(&args)).unwrap_err();
+            assert_eq!(err, "--supervisor-config needs a value");
         }
 
         #[test]
@@ -348,16 +336,11 @@ mod windows {
         #[test]
         fn full_command_line_parses() {
             let mut args = REQUIRED.to_vec();
-            args.extend([
-                "--supervisor-config",
-                "c.toml",
-                "--probe-address",
-                "1.2.3.4:9",
-            ]);
+            args.extend(["--supervisor-config", "c.toml"]);
             let parsed = parse_from(argv(&args)).expect("parses");
             assert_eq!(parsed.bootstrap, OsString::from("b.exe"));
             assert_eq!(parsed.supervisor_config, Some(OsString::from("c.toml")));
-            assert_eq!(parsed.probe_address, Some(OsString::from("1.2.3.4:9")));
+            assert_eq!(parsed.supervisor, OsString::from("s.exe"));
         }
     }
 }

@@ -62,17 +62,11 @@
         "product",
         "channel",
         "install_root",
-        "args",
         "repository",
         "storage",
         "timeouts"
       ],
       "properties": {
-        "mode": {
-          "description": "Omitted means `managed`. A `provider-managed` runtime must not declare application secrets.",
-          "enum": ["managed", "provider-managed"],
-          "default": "managed"
-        },
         "product": {
           "description": "One safe path component: non-empty, not `.` or `..`, and containing no `/`, `\\`, `:`, or control character.",
           "type": "string",
@@ -84,10 +78,6 @@
           "description": "Absolute install root on the node.",
           "type": "string",
           "pattern": "^(/|[A-Za-z]:[\\\\/])"
-        },
-        "args": {
-          "type": "array",
-          "items": { "type": "string" }
         },
         "secrets": {
           "description": "Omitted means none. Environment names must be unique across the array.",
@@ -229,12 +219,6 @@
         "supervisor_check_interval_seconds": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 2592000
-        },
-        "drain_hold_seconds": {
-          "description": "Omitted means no drain hold.",
-          "type": "integer",
-          "minimum": 0,
           "maximum": 2592000
         }
       }

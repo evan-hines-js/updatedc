@@ -39,7 +39,6 @@ pub struct Sup {
     product: String,
     pub install_root: PathBuf,
     seed_binary: PathBuf,
-    args: Vec<String>,
     check_interval: Option<String>,
     health_grace: Option<String>,
     drain_hold: Option<String>,
@@ -92,7 +91,6 @@ impl Sup {
             product: product.into(),
             install_root: dir.join("install"),
             seed_binary,
-            args: command.into_iter().skip(1).collect(),
             check_interval: None,
             health_grace: None,
             drain_hold: None,
@@ -384,11 +382,9 @@ impl Sup {
                 .map_err(|error| error.to_string())
         };
         let runtime = updated_contracts::assignment::ManagedRuntime {
-            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: self.product.clone(),
             channel: "stable".into(),
             install_root: self.install_root.clone(),
-            args: self.args.clone(),
             secrets: self.secrets.clone(),
             inputs: std::collections::BTreeMap::new(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -414,7 +410,6 @@ impl Sup {
                     self.supervisor_check_interval.as_ref(),
                     3600,
                 )?,
-                drain_hold_seconds: Some(seconds(self.drain_hold.as_ref(), 0)?),
             },
         };
         std::fs::write(

@@ -454,11 +454,9 @@ mod provider_binding {
 
     fn runtime() -> updated_contracts::assignment::ManagedRuntime {
         updated_contracts::assignment::ManagedRuntime {
-            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
-            args: vec![],
             secrets: vec![],
             inputs: std::collections::BTreeMap::new(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -481,7 +479,6 @@ mod provider_binding {
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,
-                drain_hold_seconds: Some(0),
             },
         }
     }

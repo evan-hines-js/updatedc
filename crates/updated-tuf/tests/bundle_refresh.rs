@@ -57,11 +57,9 @@ fn assignment(install_root: &Path) -> updated_contracts::assignment::RepositoryA
         },
         release_root: serde_json::json!({}),
         runtime: updated_contracts::assignment::ManagedRuntime {
-            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: install_root.to_path_buf(),
-            args: vec![],
             secrets: vec![],
             inputs: std::collections::BTreeMap::new(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -84,7 +82,6 @@ fn assignment(install_root: &Path) -> updated_contracts::assignment::RepositoryA
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 5,
                 supervisor_check_interval_seconds: 5,
-                drain_hold_seconds: Some(0),
             },
         },
     }
