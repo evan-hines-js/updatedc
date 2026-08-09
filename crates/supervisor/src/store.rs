@@ -49,9 +49,7 @@ impl FileStore {
     pub(crate) fn open(paths: Paths) -> io::Result<Self> {
         std::fs::create_dir_all(&paths.versions)?;
         std::fs::create_dir_all(&paths.staging)?;
-        if let Some(parent) = paths.state.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        std::fs::create_dir_all(&paths.state_dir)?;
         let rejected = Rejections::load(&paths.rejected)?;
         Ok(Self { paths, rejected })
     }
@@ -59,7 +57,7 @@ impl FileStore {
 
 impl Store for FileStore {
     fn installed(&self) -> Installed {
-        read_installed(&self.paths.state)
+        read_installed(&self.paths.installed)
     }
     fn journal(&self) -> io::Result<Option<Transaction>> {
         transaction::read(&self.paths.journal)
@@ -74,7 +72,7 @@ impl Store for FileStore {
         self.rejected.is_rejected(&lineage.rejection_key(digest))
     }
     fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
-        write_installed(&self.paths.state, state)
+        write_installed(&self.paths.installed, state)
     }
     fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
         transaction::write(&self.paths.journal, tx)

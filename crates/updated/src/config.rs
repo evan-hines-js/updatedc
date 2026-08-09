@@ -242,7 +242,12 @@ pub struct Paths {
     pub work: PathBuf,
     pub active_release: PathBuf,
     pub download: PathBuf,
-    pub state: PathBuf,
+    /// The durable-state directory itself. Every record below that lives directly in it is also
+    /// named here as a file path; new records join it via this field, never by taking a `.parent()`
+    /// of one of the files.
+    pub state_dir: PathBuf,
+    /// The installed-releases record, `state_dir/installed.json`.
+    pub installed: PathBuf,
     pub datastore: PathBuf,
     pub routing_datastore: PathBuf,
     pub assignment: PathBuf,
@@ -285,7 +290,8 @@ impl Paths {
             work: install_root.join("work"),
             active_release: install_root.join("active-release"),
             download: install_root.join("staging/bundle.download"),
-            state: state_dir.join("installed.json"),
+            installed: state_dir.join("installed.json"),
+            state_dir: state_dir.clone(),
             datastore: state_dir.join("tuf"),
             routing_datastore: state_dir.join("routing-tuf"),
             assignment: persisted_assignment_path(enrollment_state),

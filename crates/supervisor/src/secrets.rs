@@ -14,9 +14,10 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// a control-plane outage does not bring the whole fleet back on the same boundary.
 const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Where the digest of the launched bundle lives, beside the rest of the supervisor's state.
-fn launched_path(state: &std::path::Path) -> std::path::PathBuf {
-    state.join("secrets-launched")
+/// Where the digest of the launched bundle lives: in the durable-state directory, beside the
+/// installed record and the transaction journals.
+fn launched_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("secrets-launched")
 }
 
 #[derive(Default, serde::Deserialize, PartialEq, Eq)]
@@ -131,8 +132,8 @@ impl SecretManager {
     /// launch, so a rotation that landed while this supervisor was down is otherwise invisible —
     /// [`Self::reconcile`] would compare the rotated bundle against itself and report no change,
     /// and the application would run on revoked credentials indefinitely.
-    pub(crate) fn record_launched(&self, state: &std::path::Path) {
-        let path = launched_path(state);
+    pub(crate) fn record_launched(&self, state_dir: &std::path::Path) {
+        let path = launched_path(state_dir);
         if let Err(error) = foundation::durable::atomic_write_managed(
             &path,
             "secrets-launched",
@@ -147,8 +148,8 @@ impl SecretManager {
 
     /// Whether a process launched under the recorded digest still holds these values. An
     /// unreadable record answers false: relaunching is the safe direction.
-    pub(crate) fn launched_with_current(&self, state: &std::path::Path) -> bool {
-        std::fs::read_to_string(launched_path(state))
+    pub(crate) fn launched_with_current(&self, state_dir: &std::path::Path) -> bool {
+        std::fs::read_to_string(launched_path(state_dir))
             .is_ok_and(|recorded| recorded == self.digest())
     }
 
@@ -384,6 +385,28 @@ mod tests {
             Some("value")
         );
         server.join().expect("the stand-in control plane");
+    }
+
+    #[test]
+    fn the_launched_record_round_trips_through_the_real_state_layout() {
+        // Locked against the resolved layout, not a bare tempdir: this record once joined
+        // "secrets-launched" onto `Paths.installed` — a *file* — so every write failed with
+        // ENOTDIR, the record never existed, and every adoption relaunched the application.
+        let root = tempfile::tempdir().unwrap();
+        let paths = updated::config::Paths::resolve(root.path(), root.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(&paths.installed, "{}").unwrap();
+
+        let manager = SecretManager::new(&routing("/srv/local-repository"), &[]).unwrap();
+        assert!(
+            !manager.launched_with_current(&paths.state_dir),
+            "no record yet"
+        );
+        manager.record_launched(&paths.state_dir);
+        assert!(
+            manager.launched_with_current(&paths.state_dir),
+            "the record written at launch is the one adoption reads back"
+        );
     }
 
     #[test]

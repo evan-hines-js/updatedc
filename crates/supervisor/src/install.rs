@@ -97,7 +97,7 @@ pub(crate) async fn ensure_installed(
 
     match (
         store.installed(),
-        updated::state::read_enrollment(&opts.paths.state),
+        updated::state::read_enrollment(&opts.paths.installed),
     ) {
         (updated::state::Installed::Missing, updated::state::EnrollmentState::Missing) => {
             match apply_install(opts, store).await? {
@@ -333,10 +333,10 @@ async fn place_and_commit(
     // the authoritative installed record, record the terminal phase, and clear the journal.
     // Enrollment is one-way (`create_new`); a resume that already consumed it skips this.
     if matches!(
-        updated::state::read_enrollment(&opts.paths.state),
+        updated::state::read_enrollment(&opts.paths.installed),
         updated::state::EnrollmentState::Missing
     ) {
-        updated::state::enroll(&opts.paths.state)?;
+        updated::state::enroll(&opts.paths.installed)?;
     }
     // Commit the head *provisional*: it has never launched, let alone proven healthy. If it turns
     // out to be a broken assigned head (crashes or wedges before its first passing gate) the boot

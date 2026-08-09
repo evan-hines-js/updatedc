@@ -254,7 +254,7 @@ fn usage() {
 
 async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // One owner protects the shared binary, state, journal, and staging paths.
-    let _lock = updated::lock::InstanceLock::acquire(&with_suffix(&opts.paths.state, ".lock"))
+    let _lock = updated::lock::InstanceLock::acquire(&with_suffix(&opts.paths.installed, ".lock"))
         .map_err(|e| format!("another supervisor already owns this install: {e}"))?;
 
     // Watch for a stop/restart signal; when it fires the supervisor exits. It does NOT
