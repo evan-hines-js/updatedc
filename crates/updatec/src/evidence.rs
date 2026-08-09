@@ -25,8 +25,12 @@ use updated_contracts::telemetry::NodeReport;
 /// the predecessor look identical in one pass, and deriving the verdict from one snapshot halted
 /// the documented recovery path itself. This log is observational memory only, never a stored
 /// verdict: the halt remains recomputed from the reports each pass, and losing the log (a leader
-/// change, a restart) merely re-derives the evidence from the fresh attempt sequences the
-/// still-contained nodes keep producing.
+/// change, a restart) re-derives the evidence from the attempt sequences the fleet keeps producing
+/// — but only FORWARD. A node already back on its pre-attempt archive re-proves nothing while it
+/// sits there; its next record opens when it moves again. Lost memory therefore weakens the
+/// verdict for as long as it takes further nodes to attempt and roll back, which is why the only
+/// thing that drops memory is [`prune`](ObservationLog::prune), and only for what has genuinely
+/// left the system.
 ///
 /// "Has ever reported" lives here for the same reason and not one of its own: it is a fact about
 /// the past that a single pass's store read cannot establish. Re-deriving it from the reports
@@ -200,21 +204,22 @@ impl ObservationLog {
             .filter(|seed| seed.attempted && seed.archive == archive)
     }
 
-    /// Drop memory about nodes that left the fleet, and attempt records for assignment identities
-    /// no generation still names — so the log stays bounded by the fleet and its live deployments
-    /// rather than growing with history.
-    pub(crate) fn prune(
-        &mut self,
-        nodes: impl Fn(&str) -> bool,
-        live_identities: &HashSet<String>,
-    ) {
-        self.settled.retain(|node, _| nodes(node));
-        self.reported.retain(|node| nodes(node));
-        self.attempts.retain(|node, attempts| {
-            if !nodes(node) {
-                return false;
-            }
-            attempts.retain(|identity, _| live_identities.contains(identity));
+    /// Forget nodes that left the FLEET — the apiserver's full agent list, not the planned
+    /// subset. Pruning on the planned nodes destroyed a QUARANTINED agent's memory: its record's
+    /// entire content is the pre-movement state this call destroys, unrecoverable from any later
+    /// report, so a node quarantined mid-containment lost its rollback proof over a status
+    /// condition. The caller is `reconcile_once`, the one place the full fleet is known.
+    pub fn prune_nodes(&mut self, fleet: impl Fn(&str) -> bool) {
+        self.settled.retain(|node, _| fleet(node));
+        self.reported.retain(|node| fleet(node));
+        self.attempts.retain(|node, _| fleet(node));
+    }
+
+    /// Forget attempt records for assignment identities no generation still names, so the log is
+    /// bounded by the live deployments. Owned by the planner, which computes that set each pass.
+    pub(crate) fn prune_identities(&mut self, live: &HashSet<String>) {
+        self.attempts.retain(|_, attempts| {
+            attempts.retain(|identity, _| live.contains(identity));
             !attempts.is_empty()
         });
     }
@@ -231,7 +236,8 @@ mod tests {
 
     /// The report shapes a node can legally emit, as the trust gate admits them. `healthy` and
     /// `updating` are never both true (`is_wellformed` refuses the combination), and an archive is
-    /// hex or empty (pre-first-install).
+    /// hex or empty (pre-first-install) — an empty archive carries an empty version and cannot be
+    /// healthy, because a node that has installed nothing is running nothing it can name.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct Shape {
         assignment: char,
@@ -240,16 +246,24 @@ mod tests {
         updating: bool,
     }
 
+    /// The report a shape stands for — and the assertion that the shape is one the trust gate
+    /// actually admits. The alphabet's whole claim is that it is the legal language; a shape
+    /// `report_is_authentic_and_fresh` would drop before `observe` ever saw it (the only path into
+    /// this module in production) is not coverage, it is a fixture proving nothing.
     fn report_of(shape: Shape) -> NodeReport {
         let mut report = NodeReport::new(
             "n",
             "d",
             hex(shape.assignment),
-            "1.0.0",
+            if shape.archive.is_some() { "1.0.0" } else { "" },
             shape.archive.map(hex).unwrap_or_default(),
             shape.healthy,
         );
         report.updating = shape.updating;
+        assert!(
+            report.is_wellformed(),
+            "the alphabet must stay inside what the trust gate admits: {shape:?}"
+        );
         report
     }
 
@@ -265,13 +279,9 @@ mod tests {
     /// 3. the queried `archive` is exactly the departure point's archive — the node is back on
     ///    what it ran before the movement, so it did not commit.
     fn model_rolled_back(history: &[Shape], target: char, archive: char) -> bool {
-        let departure = history
-            .iter()
-            .enumerate()
-            .filter(|(_, shape)| {
-                shape.healthy && shape.archive.is_some() && shape.assignment != target
-            })
-            .next_back();
+        let departure = history.iter().enumerate().rfind(|(_, shape)| {
+            shape.healthy && shape.archive.is_some() && shape.assignment != target
+        });
         let Some((index, departed_from)) = departure else {
             return false;
         };
@@ -299,9 +309,10 @@ mod tests {
     /// and the sequence semantics its documentation promises: a readiness blip minting an attempt,
     /// a merely-fetched tick erasing an origin, a committed movement's record resurrected a
     /// retarget later. This fuzz drives random legal report sequences through the log and asserts
-    /// it agrees with the declarative model at EVERY step for EVERY (target, archive) pair, then
-    /// asserts coverage: every shape kind was emitted and both verdict directions (a rollback
-    /// proven, and a proof closed by a later settle) actually occurred — so "all sequences" is
+    /// it agrees with the declarative model at EVERY step for EVERY (target, archive) pair, that a
+    /// SELECTIVE prune moves nothing outside its stated bound, then asserts coverage: every shape
+    /// kind was emitted, both verdict directions (a rollback proven, and a proof closed by a later
+    /// settle) actually occurred, and some prune actually forgot something — so "all sequences" is
     /// proven exercised, not hoped.
     #[test]
     fn the_log_agrees_with_the_declarative_model_on_every_step_of_every_sequence() {
@@ -332,10 +343,19 @@ mod tests {
                     updating: false,
                 });
             }
+            // Pre-first-install: nothing installed, so no archive and no version, and a node
+            // running nothing is not healthy — `is_wellformed` refuses every other empty-archive
+            // combination, so these two are the whole of that corner of the language.
             alphabet.push(Shape {
                 assignment,
                 archive: None,
-                healthy: true,
+                healthy: false,
+                updating: true,
+            });
+            alphabet.push(Shape {
+                assignment,
+                archive: None,
+                healthy: false,
                 updating: false,
             });
         }
@@ -343,11 +363,14 @@ mod tests {
         let mut shapes_seen: HashSet<Shape> = HashSet::new();
         let mut proofs_seen = 0usize;
         let mut closures_seen = 0usize;
+        let mut selective_prunes_that_forgot = 0usize;
         let live: HashSet<String> = identities.iter().map(|&c| hex(c)).collect();
+        let node = "n".to_string();
 
         for seed in 0..64u64 {
             let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
             let mut log = ObservationLog::new();
+            log.note_reported(std::iter::once(&node));
             let mut history: Vec<Shape> = Vec::new();
             let mut previous: HashMap<(char, char), bool> = HashMap::new();
             for _ in 0..200 {
@@ -357,7 +380,8 @@ mod tests {
                 log.observe("n", &report_of(shape));
                 // Pruning with every identity live must be a no-op on the verdicts: it is the
                 // fleet/lineage bound, never part of the evidence rule.
-                log.prune(|_| true, &live);
+                log.prune_nodes(|_| true);
+                log.prune_identities(&live);
                 for &target in &identities {
                     for &archive in &archives {
                         let expected = model_rolled_back(&history, target, archive);
@@ -374,6 +398,45 @@ mod tests {
                         }
                     }
                 }
+                // SELECTIVE pruning — the shape production actually calls it with (the fleet, and
+                // the identities some generation still names) — checked against the exact bound it
+                // is allowed to enforce: memory goes for a node outside the fleet, and records go
+                // for an identity nothing names, and NOTHING ELSE moves. A prune that dropped a
+                // live node's record on a live identity would silently clear a fleet-wide halt, and
+                // pruning with everything live (above) is the one configuration that cannot show
+                // it. Run on a CLONE so the sequence the model is checked against keeps its memory.
+                let in_fleet = rng.pick(2) == 0;
+                let named: HashSet<String> = identities
+                    .iter()
+                    .filter(|_| rng.pick(2) == 0)
+                    .map(|&c| hex(c))
+                    .collect();
+                let mut pruned = log.clone();
+                pruned.prune_nodes(|pruned_node| in_fleet && pruned_node == node);
+                pruned.prune_identities(&named);
+                assert_eq!(
+                    pruned.has_reported("n"),
+                    in_fleet,
+                    "seed {seed}: 'has ever reported' is bounded by the fleet and nothing else"
+                );
+                for &target in &identities {
+                    for &archive in &archives {
+                        let before = log.rolled_back("n", &hex(target), &hex(archive)).is_some();
+                        let after = pruned
+                            .rolled_back("n", &hex(target), &hex(archive))
+                            .is_some();
+                        let survives = before && in_fleet && named.contains(&hex(target));
+                        assert_eq!(
+                            after, survives,
+                            "seed {seed}: prune(in_fleet {in_fleet}, named {named:?}) changed the \
+                             verdict for target {target} archive {archive} beyond its bound; \
+                             history {history:?}"
+                        );
+                        if before && !after {
+                            selective_prunes_that_forgot += 1;
+                        }
+                    }
+                }
             }
         }
         for shape in &alphabet {
@@ -386,6 +449,10 @@ mod tests {
         assert!(
             closures_seen > 0,
             "no proof was ever closed by a later settle — the stale-record class is untested"
+        );
+        assert!(
+            selective_prunes_that_forgot > 0,
+            "no selective prune ever dropped a proof — the bound assertion above is vacuous"
         );
     }
 
@@ -422,13 +489,13 @@ mod tests {
 
         // The identity leaves every generation: the record goes with it.
         let only_a: HashSet<String> = [hex('a')].into();
-        log.prune(|_| true, &only_a);
+        log.prune_identities(&only_a);
         assert!(log.rolled_back("n", &hex('b'), &hex('1')).is_none());
 
         // The node leaves the fleet: everything about it goes.
         log.observe("n", &settled);
         log.observe("n", &moving);
-        log.prune(|_| false, &only_a);
+        log.prune_nodes(|_| false);
         assert!(!log.has_reported("n"));
         assert!(log.rolled_back("n", &hex('b'), &hex('1')).is_none());
     }

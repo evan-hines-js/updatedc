@@ -76,6 +76,12 @@ pub struct GroupNodes {
     /// across passes rather than re-read, so an unreadable store lowers `fresh` (which raises the
     /// alert) instead of lowering this too (which would clear it).
     pub observable: usize,
+    /// Nodes this group selects that the operator has frozen (`UpdateAgent.spec.hold`), projected
+    /// onto the group's own status. Counted from the group this pass's LABELS select, exactly like
+    /// every other count here — never from the published routing, which for a held node still names
+    /// the group it was last published under: relabelling a held node made the group whose rollout
+    /// the hold is actually wedging report zero held agents while an unrelated group reported one.
+    pub held: usize,
     /// The admitted deployment identity `on_target` counts toward, when the group has one.
     pub target: Option<String>,
 }
@@ -649,7 +655,10 @@ pub(crate) fn plan_rollouts(
         .chain(desired.values())
         .filter_map(crate::deployment_identity)
         .collect();
-    attempts.prune(|node| node_groups.contains_key(node), &live_identities);
+    // Only the IDENTITY half of the log's bound lives here: node retirement is pruned by
+    // `reconcile_once` against the FULL fleet, because the planned nodes exclude quarantined
+    // agents and forgetting one's memory over a status condition destroyed its rollback proof.
+    attempts.prune_identities(&live_identities);
     let halts = regression_halts(
         sets,
         &plans,
@@ -824,6 +833,10 @@ pub(crate) fn plan_rollouts(
                         .filter(|node| {
                             public_keys.contains_key(node.as_str()) && attempts.has_reported(node)
                         })
+                        .count(),
+                    held: nodes
+                        .iter()
+                        .filter(|node| holds.contains(node.as_str()))
                         .count(),
                     target,
                 },

@@ -292,7 +292,9 @@ pub struct UpdateGroupStatus {
     pub published_digest: Option<String>,
     /// How many of this group's agents the operator is holding (`UpdateAgent.spec.hold`). A
     /// forgotten hold must be a visible condition, not a mystery, so the count is projected here
-    /// on every reconcile. Serialized even when `None`: this status travels as a merge patch, and
+    /// on every reconcile, from the planner's own membership ([`rollout::GroupNodes::held`]) — the
+    /// group this pass's labels select, never the group the last publication routed the node to.
+    /// Serialized even when `None`: this status travels as a merge patch, and
     /// the explicit null is what deletes a stale count when a writer (quarantine, failure) cannot
     /// compute one.
     pub held_agents: Option<u32>,

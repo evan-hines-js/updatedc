@@ -40,7 +40,7 @@ already aggregates every fact a node is allowed to assert.
 
 - `updatec_reconcile_timestamp_seconds`, `updatec_reconcile_duration_seconds`,
   `updatec_reconcile_failures_total` — is the loop alive and converging.
-- `updatec_generation{deployment=...}` — the published generation, per deployment identity.
+- `updatec_generation{deployment=...}` — the published generation, labeled per deployment name.
 - `updatec_group_progress{group=...,state=...} 1` — one-hot projection of the planner verdict
   (staging, held, settled, unobservable). Quarantine is not a planner verdict — a quarantined
   group is not planned at all — so it is reported by `updatec_quarantined_groups` and by the
