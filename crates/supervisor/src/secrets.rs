@@ -14,12 +14,6 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// a control-plane outage does not bring the whole fleet back on the same boundary.
 const RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Where the digest of the launched bundle lives: in the durable-state directory, beside the
-/// installed record and the transaction journals.
-fn launched_path(state_dir: &std::path::Path) -> std::path::PathBuf {
-    state_dir.join("secrets-launched")
-}
-
 #[derive(Default, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SecretBundle {
@@ -28,9 +22,11 @@ struct SecretBundle {
     values: BTreeMap<String, String>,
 }
 
-/// The supervisor's only secrets owner. It holds the one authenticated client, validates every
-/// bundle against the signed assignment, and publishes a new environment only after the whole
-/// bundle has arrived and passed validation.
+/// The agent's only secrets owner. It holds the one authenticated client, validates every bundle
+/// against the signed assignment, and publishes new values only after the whole bundle has arrived
+/// and passed validation. Those values reach the release exactly one way: the environment of every
+/// reconciler invocation (`update::apply_reconciler_environment`). They never touch this agent's
+/// disk, an argv, a manifest, or a log.
 pub(crate) struct SecretManager {
     endpoint: Option<String>,
     client: Option<reqwest::Client>,
@@ -39,11 +35,11 @@ pub(crate) struct SecretManager {
 
 impl SecretManager {
     /// Build the client for `routing`. Deliberately synchronous, because this runs during argument
-    /// parsing — before the supervisor has even connected to the guardian, which holds a candidate
-    /// supervisor to a readiness deadline from the moment it launches it. A fetch here would make
-    /// an unreachable control plane look like a candidate that cannot start, and a candidate that
+    /// parsing — before the agent has even connected to the launcher, which holds a candidate agent
+    /// to a readiness deadline from the moment it launches it. A fetch here would make an
+    /// unreachable control plane look like a candidate that cannot start, and a candidate that
     /// misses that deadline is rejected by content hash *permanently*. Acquiring the bundle is
-    /// [`Self::acquire`], which the supervisor runs behind its readiness signal.
+    /// [`Self::acquire`], which the agent runs behind its readiness signal.
     pub(crate) fn new(routing: &Routing, references: &[SecretReference]) -> Result<Self, String> {
         let (endpoint, client) = if routing.is_local() {
             (None, None)
@@ -78,13 +74,13 @@ impl SecretManager {
         })
     }
 
-    /// Hold this boot until the assigned bundle is in hand, retrying rather than failing. The
-    /// application launches with these values in its environment and must never start without
-    /// them, so giving up would mean launching an application that cannot work; and returning an
-    /// error would leave an already-installed, already-verified application down until a human
+    /// Hold this boot until the assigned bundle is in hand, retrying rather than failing. Every
+    /// reconciler invocation carries these values in its environment, so a hook that ran without
+    /// them would converge the machine onto credentials it does not have; and returning an error
+    /// would leave an already-installed, already-verified release unreconciled until a human
     /// noticed. So the honest behaviour is to keep asking — which is affordable only because
-    /// [`ReadySignalled`] proves the guardian has already been told this supervisor started, so the
-    /// wait is attributed to the control plane rather than to this supervisor's bytes.
+    /// [`ReadySignalled`] proves the launcher has already been told this agent started, so the
+    /// wait is attributed to the control plane rather than to this agent's bytes.
     ///
     /// Returns false when a stop was requested instead: an unbounded wait must stay abandonable, or
     /// a SIGTERM arriving during a control-plane outage is answered by nothing at all until the
@@ -107,59 +103,21 @@ impl SecretManager {
                 "fetching the assigned secrets failed ({error}); retrying in {}s",
                 backoff.as_secs()
             ));
-            if crate::app::sleep_interruptible(backoff, shutdown).await {
+            if crate::schedule::sleep_interruptible(backoff, shutdown).await {
                 return false;
             }
         }
         true
     }
 
-    /// The digest of the values currently held, as recorded beside the installed state when the
-    /// application is launched with them.
-    fn digest(&self) -> String {
-        let mut hasher = updated::hash::Sha256Hasher::new();
-        for (name, value) in &self.current.values {
-            hasher.update(name.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(value.as_bytes());
-            hasher.update(b"\0");
-        }
-        hasher.finish_hex()
-    }
-
-    /// Record the values the application was just launched with. A later supervisor that adopts
-    /// that still-running process compares against this: the process's environment was fixed at its
-    /// launch, so a rotation that landed while this supervisor was down is otherwise invisible —
-    /// [`Self::reconcile`] would compare the rotated bundle against itself and report no change,
-    /// and the application would run on revoked credentials indefinitely.
-    pub(crate) fn record_launched(&self, state_dir: &std::path::Path) {
-        let path = launched_path(state_dir);
-        if let Err(error) = foundation::durable::atomic_write_managed(
-            &path,
-            "secrets-launched",
-            self.digest().as_bytes(),
-        ) {
-            crate::warn(&format!(
-                "recording the launched secret generation failed ({error}); the next adoption \
-                 relaunches the application to be sure it holds current values"
-            ));
-        }
-    }
-
-    /// Whether a process launched under the recorded digest still holds these values. An
-    /// unreadable record answers false: relaunching is the safe direction.
-    pub(crate) fn launched_with_current(&self, state_dir: &std::path::Path) -> bool {
-        std::fs::read_to_string(launched_path(state_dir))
-            .is_ok_and(|recorded| recorded == self.digest())
-    }
-
     pub(crate) fn values(&self) -> &BTreeMap<String, String> {
         &self.current.values
     }
 
-    /// Fetch and atomically adopt the bundle for `references`. Returns true only when the child
-    /// environment changed; the server's generation is metadata, never trusted as the sole change
-    /// detector.
+    /// Fetch and atomically adopt the bundle for `references`. Returns true only when the VALUES
+    /// changed — the server's generation is metadata, never trusted as the sole change detector —
+    /// which is what makes the caller re-run `apply --reason restart` so the release picks the
+    /// rotated values up.
     pub(crate) async fn reconcile(
         &mut self,
         deployment: &str,
@@ -387,25 +345,26 @@ mod tests {
         server.join().expect("the stand-in control plane");
     }
 
-    #[test]
-    fn the_launched_record_round_trips_through_the_real_state_layout() {
-        // Locked against the resolved layout, not a bare tempdir: this record once joined
-        // "secrets-launched" onto `Paths.installed` — a *file* — so every write failed with
-        // ENOTDIR, the record never existed, and every adoption relaunched the application.
-        let root = tempfile::tempdir().unwrap();
-        let paths = updated::config::Paths::resolve(root.path(), root.path());
-        std::fs::create_dir_all(&paths.state_dir).unwrap();
-        std::fs::write(&paths.installed, "{}").unwrap();
-
-        let manager = SecretManager::new(&routing("/srv/local-repository"), &[]).unwrap();
+    #[tokio::test]
+    async fn only_a_change_in_the_values_themselves_is_a_rotation() {
+        // `reconcile`'s answer is what makes the loop re-run `apply --reason restart`, so it must
+        // track the VALUES: a re-issued bundle carrying a fresh generation but the same secrets is
+        // not a rotation, and re-converging the whole fleet on one would be a self-inflicted
+        // restart storm.
+        let mut manager = SecretManager::new(&routing("/srv/local-repository"), &[]).unwrap();
         assert!(
-            !manager.launched_with_current(&paths.state_dir),
-            "no record yet"
+            !manager.reconcile("deployment", &[]).await.unwrap(),
+            "an empty assignment against empty values changes nothing"
         );
-        manager.record_launched(&paths.state_dir);
+
+        manager.current = SecretBundle {
+            deployment: "deployment".into(),
+            generation: "one".into(),
+            values: BTreeMap::from([("TOKEN".into(), "value".into())]),
+        };
         assert!(
-            manager.launched_with_current(&paths.state_dir),
-            "the record written at launch is the one adoption reads back"
+            manager.reconcile("deployment", &[]).await.unwrap(),
+            "dropping the last assigned secret is a change the release must be told about"
         );
     }
 

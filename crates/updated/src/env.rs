@@ -1,22 +1,17 @@
 //! Environment variable names the update tower still uses, in one place.
 //!
-//! The program that *sets* a variable and the program that *reads* it — the
-//! supervisor, managed application, and tests — all
-//! reference these constants instead of string literals, so a rename can never desync
-//! them. All share the `UPDATED_` prefix.
+//! The program that *sets* a variable and the program that *reads* it — the agent and its tests —
+//! reference these constants instead of string literals, so a rename can never desync them. All
+//! share the `UPDATED_` prefix.
 //!
-//! The guardian⇄supervisor launch contract (the control-channel endpoint, the
-//! readiness nonce, the state directory) lives in the frozen `control` crate, not
-//! here — the guardian depends on nothing in this crate.
-
-// ── supervisor → managed application ───────────────────────────────────────────
-
-/// Root of the managed installation.
-pub const INSTALL_ROOT: &str = "UPDATED_INSTALL_ROOT";
+//! The launcher⇄agent launch contract (the control-channel endpoint, the readiness nonce, the
+//! state directory) lives in the frozen `control` crate, not here — the launcher depends on
+//! nothing in this crate. A reconciler is told everything it needs on argv, under a cleared
+//! environment, so nothing in this file crosses that boundary.
 
 // ── test-only fault injection ──────────────────────────────────────────────────
 
-/// Transaction boundary at which the supervisor should crash, for recovery tests.
+/// Transaction boundary at which the agent should crash, for recovery tests.
 pub const CHAOS_POINT: &str = "UPDATED_CHAOS_POINT";
 
 #[cfg(test)]
@@ -25,11 +20,9 @@ mod tests {
 
     #[test]
     fn every_var_is_prefixed() {
-        for var in [INSTALL_ROOT, CHAOS_POINT] {
-            assert!(
-                var.starts_with("UPDATED_"),
-                "{var} must use the UPDATED_ prefix"
-            );
-        }
+        assert!(
+            CHAOS_POINT.starts_with("UPDATED_"),
+            "{CHAOS_POINT} must use the UPDATED_ prefix"
+        );
     }
 }

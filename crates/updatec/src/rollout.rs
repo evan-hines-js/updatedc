@@ -1854,11 +1854,9 @@ mod tests {
 
     fn runtime() -> updated_contracts::assignment::ManagedRuntime {
         updated_contracts::assignment::ManagedRuntime {
-            mode: updated_contracts::assignment::RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/opt/app".into(),
-            args: vec![],
             secrets: vec![],
             inputs: BTreeMap::new(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -1881,7 +1879,6 @@ mod tests {
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
                 supervisor_check_interval_seconds: 1,
-                drain_hold_seconds: Some(0),
             },
         }
     }
@@ -5272,7 +5269,7 @@ mod tests {
         ]);
         // Same deployment NAME, different resolved body.
         let mut changed = deployment_named("v0");
-        changed.runtime.args = vec!["--flag".into()];
+        changed.runtime.channel = "canary".into();
         groups.get_mut("g").unwrap().deployment = changed.clone();
         let plan = plan_rollouts(
             &sets,

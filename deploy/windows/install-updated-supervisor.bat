@@ -13,10 +13,10 @@ set "SUPERVISOR=C:\Program Files\updated\supervisor.exe"
 
 :: The native wrapper registers directly with SCM, restarts the bootstrap after a
 :: crash, and translates SERVICE_CONTROL_STOP into a targeted CTRL_BREAK event.
-:: The bootstrap launches the application in a separate process group so it does not
-:: receive that console event directly; the bootstrap then shuts it down cleanly.
-:: A later service start launches a fresh guardian and application process.
-set "BINPATH=\"%WRAPPER%\" --bootstrap \"%BOOTSTRAP%\" --state-dir \"%STATEDIR%\" --supervisor \"%SUPERVISOR%\" --probe-address 127.0.0.1:9090"
+:: The launcher shuts the agent down cleanly on that event; workload processes
+:: belong to each release's reconciler hooks and are never signalled here.
+:: A later service start launches a fresh launcher and agent.
+set "BINPATH=\"%WRAPPER%\" --bootstrap \"%BOOTSTRAP%\" --state-dir \"%STATEDIR%\" --supervisor \"%SUPERVISOR%\""
 sc.exe create "%SERVICE%" binPath= "%BINPATH%" start= auto DisplayName= "Self-updating supervisor"
 if errorlevel 1 exit /b %errorlevel%
 sc.exe description "%SERVICE%" "Native SCM host for the installer-owned self-update bootstrap"

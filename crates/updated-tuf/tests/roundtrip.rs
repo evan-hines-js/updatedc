@@ -66,11 +66,9 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let root_text = std::fs::read_to_string(repo_dir.join("metadata/root.json")).unwrap();
     let root: serde_json::Value = serde_json::from_str(&root_text).unwrap();
     let runtime = updated_contracts::assignment::ManagedRuntime {
-        mode: updated_contracts::assignment::RuntimeMode::Managed,
         product: "offline-app".into(),
         channel: "stable".into(),
         install_root: tmp.join("install"),
-        args: vec!["serve".into()],
         secrets: vec![],
         inputs: std::collections::BTreeMap::new(),
         repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -93,7 +91,6 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             refresh_retry_seconds: 5,
             confirmation_window_seconds: 5,
             supervisor_check_interval_seconds: 5,
-            drain_hold_seconds: Some(0),
         },
     };
     let assignment = updated_contracts::assignment::RepositoryAssignment {
@@ -220,7 +217,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         .await
         .unwrap();
     assert_eq!(config.application.product, "offline-app");
-    assert_eq!(config.application.args, vec!["serve".to_string()]);
+    assert!(config.application.secrets.is_empty());
 
     // A signed agent document may carry its configuration digest in any case — the contract admits
     // it and the network path accepts it — so the enrollment path must resolve the same node on the
@@ -255,16 +252,18 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             .unwrap();
     assert_eq!(uppercase_config.application.product, "offline-app");
 
-    // Boot configuration — the managed process's arguments, and which secret populates which
-    // environment variable — is read before any network fetch and cannot be verified at that
-    // moment, so it comes only from the enrollment directory. A document planted under
-    // `install_root` (recoverable state the guardian and supervisor churn through) must have no
-    // say in how the application is launched.
+    // Boot configuration — which secret populates which environment variable when the release's
+    // reconciler runs — is read before any network fetch and cannot be verified at that moment,
+    // so it comes only from the enrollment directory. A document planted under `install_root`
+    // (recoverable state the agent churns through) must have no say in what the reconciler is
+    // handed.
     let planted = config.application.install_root.join("state");
     std::fs::create_dir_all(&planted).unwrap();
     let mut hostile: serde_json::Value =
         serde_json::from_str(&bundle.initial.managed_configuration).unwrap();
-    hostile["runtime"]["args"] = serde_json::json!(["--exfiltrate"]);
+    hostile["runtime"]["secrets"] = serde_json::json!([
+        {"environment": "EXFILTRATED", "secret": "production-database", "key": "password"}
+    ]);
     std::fs::write(
         planted.join("repository-assignment.json"),
         serde_json::to_vec(&hostile).unwrap(),
@@ -273,10 +272,9 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
         .await
         .unwrap();
-    assert_eq!(
-        config.application.args,
-        vec!["serve".to_string()],
-        "install_root state must not choose the managed process's arguments"
+    assert!(
+        config.application.secrets.is_empty(),
+        "install_root state must not choose which secrets reach the reconciler"
     );
 
     // The same document in the enrollment directory — where the update loop persists it, beside
@@ -289,7 +287,8 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
         .await
         .unwrap();
-    assert_eq!(config.application.args, vec!["--exfiltrate".to_string()]);
+    assert_eq!(config.application.secrets.len(), 1);
+    assert_eq!(config.application.secrets[0].environment, "EXFILTRATED");
     std::fs::remove_file(updated::config::persisted_assignment_path(
         &enrollment_state,
     ))
@@ -357,11 +356,9 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
             },
             release_root: root.clone(),
             runtime: updated_contracts::assignment::ManagedRuntime {
-                mode: updated_contracts::assignment::RuntimeMode::Managed,
                 product: "app".into(),
                 channel: "stable".into(),
                 install_root: install.to_path_buf(),
-                args: vec![],
                 secrets: vec![],
                 inputs: std::collections::BTreeMap::new(),
                 repository: updated_contracts::assignment::ManagedRepositoryLimits {
@@ -384,7 +381,6 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
                     refresh_retry_seconds: 5,
                     confirmation_window_seconds: 5,
                     supervisor_check_interval_seconds: 5,
-                    drain_hold_seconds: Some(0),
                 },
             },
         }

@@ -3395,11 +3395,9 @@ mod lease_tests {
                     sha256: "2".repeat(64),
                 },
                 runtime: crate::RuntimeSpec {
-                    mode: crate::RuntimeModeSpec::Managed,
                     product: "app".into(),
                     channel: "stable".into(),
                     install_root: "/opt/app".into(),
-                    args: vec![],
                     secrets: vec![],
                     repository: crate::RepositoryLimitsSpec {
                         metadata_limit: 1_048_576,
@@ -3421,7 +3419,6 @@ mod lease_tests {
                         refresh_retry_seconds: 5,
                         confirmation_window_seconds: 120,
                         supervisor_check_interval_seconds: 3600,
-                        drain_hold_seconds: Some(0),
                     },
                 },
             },

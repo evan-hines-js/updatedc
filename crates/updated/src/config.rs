@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use updated_contracts::assignment::{ManagedRuntime, RuntimeMode, SecretReference};
+use updated_contracts::assignment::{ManagedRuntime, SecretReference};
 
 /// Fully verified, materialized runtime configuration.
 #[derive(Debug)]
@@ -65,15 +65,13 @@ pub struct RepositorySource {
 impl Application {
     /// The launch spec and probes the signed runtime carries. The single construction path for
     /// [`Application`] — used both when the config is first materialized and when a running
-    /// supervisor reconciles a control-plane reassignment (which may change the launch args or
-    /// health checks independently of the release version).
+    /// supervisor reconciles a control-plane reassignment (which may change the declared secrets
+    /// or health checks independently of the release version).
     pub fn from_runtime(runtime: &ManagedRuntime) -> Application {
         Application {
-            mode: runtime.mode,
             product: runtime.product.clone(),
             channel: runtime.channel.clone(),
             install_root: runtime.install_root.clone(),
-            args: runtime.args.clone(),
             secrets: runtime.secrets.clone(),
             inputs: runtime.inputs.clone(),
         }
@@ -108,8 +106,6 @@ impl Timeouts {
             supervisor_check_interval: Duration::from_secs(
                 runtime.timeouts.supervisor_check_interval_seconds,
             ),
-            // Carried through as-is; see [`Timeouts::drain_hold`] for what each value means.
-            drain_hold: runtime.timeouts.drain_hold_seconds.map(Duration::from_secs),
         }
     }
 }
@@ -163,13 +159,10 @@ impl Default for Storage {
 /// The program being kept current.
 #[derive(Debug)]
 pub struct Application {
-    pub mode: RuntimeMode,
     pub product: String,
     pub channel: String,
     /// Root containing active-release, immutable versions, staging, and durable state.
     pub install_root: PathBuf,
-    /// Arguments appended to the manifest-owned entrypoint.
-    pub args: Vec<String>,
     pub secrets: Vec<SecretReference>,
     pub inputs: std::collections::BTreeMap<String, updated_contracts::telemetry::OutputValue>,
 }
@@ -201,11 +194,6 @@ pub struct Timeouts {
     pub confirmation_window: Duration,
     /// How often to check for a supervisor release.
     pub supervisor_check_interval: Duration,
-    /// Ceiling on the managed drain hold — how long to wait, after readiness is withdrawn, for the
-    /// load balancer to drop this node before stopping the running release. `None` or
-    /// `Some(Duration::ZERO)` = no hold (stop immediately); `Some(n)` = wait up to `n`. Never an
-    /// indefinite wait. See [`ManagedTimeouts::drain_hold_seconds`].
-    pub drain_hold: Option<Duration>,
 }
 
 impl Default for Timeouts {
@@ -223,7 +211,6 @@ impl Default for Timeouts {
             confirmation_window: Duration::from_secs(120),
             supervisor_check_interval: Duration::from_secs(3600),
             // No hold by default: a deployment opts into the drain hold explicitly.
-            drain_hold: Some(Duration::ZERO),
         }
     }
 }

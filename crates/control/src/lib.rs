@@ -1,29 +1,25 @@
-//! Versioned guardian⇄supervisor control protocol. The std-only crate is shared by
+//! Versioned launcher⇄agent control protocol. The std-only crate is shared by
 //! both processes so framing and compatibility rules cannot drift.
 //!
 //! ## Framing (the hard-to-change layer)
 //!
 //! Every channel opens with [`MAGIC`] and [`FRAMING_VERSION`]. Each message is
 //! `[u32 length BE][u8 tag][body]`, with `length` capped at [`MAX_FRAME`] and every
-//! string/list length-prefixed and bounded.
+//! string length-prefixed and bounded.
 //!
 //! ## Negotiation (the extensible layer)
 //!
-//! The guardian sends [`Hello`]; the supervisor requires a shared protocol major and
+//! The launcher sends [`Hello`]; the agent requires a shared protocol major and
 //! fails closed without one. That is the whole of it — every operation in a given major
 //! is mandatory, so there is no second, per-feature negotiation to disagree with it.
 //! Skew *inside* a major is additive only: a request tag the peer has never heard of is
 //! answered [`Response::Unsupported`] rather than negotiated away in advance.
-//!
-//! ## Platform-native strings
-//!
-//! [`CommandSpec`] preserves raw Unix bytes and Windows UTF-16/WTF-16 code units.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Identifies an `updated` guardian control channel. Fixed forever.
+/// Identifies an `updated` launcher control channel. Fixed forever.
 pub const MAGIC: [u8; 4] = *b"UGRD";
 /// Version of the framing layer itself (length-prefix + preamble rules).
 pub const FRAMING_VERSION: u8 = 1;
@@ -47,41 +43,31 @@ pub const DEFAULT_BOOTSTRAP_CONFIG: &str = r"C:\Program Files\updated\bootstrap.
 /// The inherited control-channel endpoint: a file-descriptor number on Unix, a handle
 /// value on Windows.
 pub const CONTROL_ENV: &str = "UPDATED_CONTROL";
-/// Hex of the nonce the supervisor must echo in [`Request::Ready`] to prove *this*
+/// Hex of the nonce the agent must echo in [`Request::Ready`] to prove *this*
 /// launch reached readiness.
 pub const READY_NONCE_ENV: &str = "UPDATED_READY_NONCE";
-/// Set to the running application's PID when the guardian launches a supervisor while
-/// it already owns a running app (a supervisor crash-relaunch, or a candidate activation).
-/// The new supervisor adopts that app instead of launching a duplicate; absent means no
-/// app is running yet, so the supervisor launches one. The guardian owns the process, so
-/// the PID is authoritative — no identity handshake is needed.
-pub const APP_PID_ENV: &str = "UPDATED_APP_PID";
-/// The guardian's state directory, so the supervisor knows where to stage a
-/// replacement supervisor binary (`<state>/supervisors/<id>/`).
+/// The launcher's state directory, so the agent knows where to stage a
+/// replacement agent binary (`<state>/supervisors/<id>/`).
 pub const STATE_DIR_ENV: &str = "UPDATED_STATE_DIR";
 
-/// Filename, under the state directory, the guardian touches when it rolls up any
-/// spontaneous managed-service exit. The supervisor consumes it during recovery. This
-/// is shared durable layout, not a wire message.
-pub const SERVICE_EXITED_MARKER_FILE: &str = "service-exited";
-/// Filename, under the state directory, into which the guardian writes the path of a
-/// replacement supervisor that failed its readiness gate (so the guardian rolled the
-/// `desired-supervisor` pointer back). The supervisor reads it on recovery and records
-/// the *rejection* — the guardian keeps no rejection set of its own, only this one dumb
-/// marker; deciding what it means is the supervisor's job.
+/// Filename, under the state directory, into which the launcher writes the path of a
+/// replacement agent that failed its readiness gate (so the launcher rolled the
+/// `desired-supervisor` pointer back). The agent reads it on recovery and records
+/// the *rejection* — the launcher keeps no rejection set of its own, only this one dumb
+/// marker; deciding what it means is the agent's job.
 pub const REJECTED_SUPERVISOR_FILE: &str = "rejected-supervisor";
 
-/// Filename, under the state directory, holding the path of the COMMITTED supervisor binary — the
-/// one the guardian launches, and the one it rolls back to when a candidate fails its readiness
-/// gate. Shared durable layout, not a wire message: the guardian moves this pointer, and the
-/// supervisor must read it (its staging-cache GC has to know which content-addressed directory is
-/// the guardian's rollback target, or it can delete the binary the guardian is about to need).
+/// Filename, under the state directory, holding the path of the COMMITTED agent binary — the
+/// one the launcher launches, and the one it rolls back to when a candidate fails its readiness
+/// gate. Shared durable layout, not a wire message: the launcher moves this pointer, and the
+/// agent must read it (its staging-cache GC has to know which content-addressed directory is
+/// the launcher's rollback target, or it can delete the binary the launcher is about to need).
 pub const DESIRED_SUPERVISOR_FILE: &str = "desired-supervisor";
 
-/// First line of a supervisor pointer file, naming the frozen format of the rest.
+/// First line of an agent pointer file, naming the frozen format of the rest.
 const SUPERVISOR_POINTER_HEADER: &str = "supervisor-v1";
 
-/// Encode a supervisor pointer file's contents. The path must be valid UTF-8 (state-dir paths are
+/// Encode an agent pointer file's contents. The path must be valid UTF-8 (state-dir paths are
 /// checked for that at startup), so the record stays plain text.
 pub fn encode_supervisor_pointer(target: &Path) -> io::Result<String> {
     let target = target
@@ -90,7 +76,7 @@ pub fn encode_supervisor_pointer(target: &Path) -> io::Result<String> {
     Ok(format!("{SUPERVISOR_POINTER_HEADER}\n{target}\n"))
 }
 
-/// Decode a supervisor pointer file's contents, refusing anything that is not exactly the header
+/// Decode an agent pointer file's contents, refusing anything that is not exactly the header
 /// line followed by one non-empty path.
 fn decode_supervisor_pointer(text: &str) -> io::Result<PathBuf> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_string());
@@ -107,7 +93,7 @@ fn decode_supervisor_pointer(text: &str) -> io::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-/// Read a supervisor pointer file, or `None` when it does not exist yet.
+/// Read an agent pointer file, or `None` when it does not exist yet.
 pub fn read_supervisor_pointer(path: &Path) -> io::Result<Option<PathBuf>> {
     match std::fs::read_to_string(path) {
         Ok(text) => decode_supervisor_pointer(&text).map(Some),
@@ -119,43 +105,37 @@ pub fn read_supervisor_pointer(path: &Path) -> io::Result<Option<PathBuf>> {
 /// The protocol major this build implements.
 pub const PROTOCOL_MAJOR: u16 = 1;
 
-/// Maximum framed message size. A command spec (argv + full environment) is the
-/// largest message and is comfortably under this; the cap only bounds a malformed peer.
+/// Maximum framed message size. A replacement-agent path is the largest message and is
+/// comfortably under this; the cap only bounds a malformed peer.
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
-const MAX_ITEMS: u32 = 65_536;
 const MAX_STR_UNITS: u32 = 1 << 20;
 
-/// A supervisor readiness nonce: 16 random bytes minted per supervisor launch and
+/// An agent readiness nonce: 16 random bytes minted per agent launch and
 /// echoed in [`Request::Ready`], correlating readiness with the exact candidate.
 pub type Nonce = [u8; 16];
 
-const TAG_LAUNCH: u8 = 0x01;
-const TAG_STOP: u8 = 0x02;
 const TAG_REPLACE: u8 = 0x03;
 const TAG_READY: u8 = 0x04;
-const TAG_TRAFFIC_STATE: u8 = 0x05;
-const TAG_FAIL_APPLICATION: u8 = 0x06;
 
 const TAG_OK: u8 = 0x81;
 const TAG_ERROR: u8 = 0x82;
-const TAG_LAUNCHED: u8 = 0x83;
 const TAG_UNSUPPORTED: u8 = 0x84;
 
-/// The guardian's opening message: the protocol major it speaks.
+/// The launcher's opening message: the protocol major it speaks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     pub major: u16,
 }
 
 impl Hello {
-    /// The current build's advertisement (guardian side).
+    /// The current build's advertisement (launcher side).
     pub fn current() -> Hello {
         Hello {
             major: PROTOCOL_MAJOR,
         }
     }
 
-    /// Write the fixed preamble followed by this hello (guardian side).
+    /// Write the fixed preamble followed by this hello (launcher side).
     pub fn write(&self, w: &mut impl Write) -> Result<()> {
         w.write_all(&MAGIC)?;
         w.write_all(&[FRAMING_VERSION])?;
@@ -165,7 +145,7 @@ impl Hello {
         Ok(())
     }
 
-    /// Read and validate the preamble, then the hello (supervisor side).
+    /// Read and validate the preamble, then the hello (agent side).
     pub fn read(r: &mut impl Read) -> Result<Hello> {
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
@@ -186,7 +166,7 @@ impl Hello {
 
     /// Whether this build can talk to the peer that sent this hello. Equality on one constant,
     /// fail-closed: there is exactly one protocol major, every operation in it is mandatory, and
-    /// the guardian and the supervisor are shipped and updated as one tower — a build that meets a
+    /// the launcher and the agent are shipped and updated as one pair — a build that meets a
     /// different major refuses to proceed rather than guessing which half of the protocol it
     /// shares. This is the ONE compatibility decision in the protocol.
     pub fn compatible(&self) -> bool {
@@ -194,48 +174,26 @@ impl Hello {
     }
 }
 
-/// What the supervisor can ask the guardian to do.
+/// What the agent can ask the launcher to do. The launcher manages exactly one thing —
+/// which agent binary runs — so the protocol carries agent-candidate operations and
+/// nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Launch the application from this exact spec.
-    Launch(CommandSpec),
-    /// Stop the application (SIGTERM to its group on Unix; terminate on Windows). Used
-    /// to quiesce it before activating a release during an update — an *intentional*
-    /// exit, which the guardian does not treat as a crash.
-    Stop,
-    /// Hand off to the staged replacement supervisor at this opaque path.
+    /// Hand off to the staged replacement agent at this opaque path.
     ReplaceSupervisor(OsString),
-    /// This supervisor has initialized; the nonce proves it is *this* launch.
+    /// This agent has initialized; the nonce proves it is *this* launch.
     Ready(Nonce),
-    /// Publish whether the verified application should receive external traffic.
-    TrafficReady(bool),
-    /// A sustained application liveness failure; stop it and roll failure to the owner.
-    ApplicationFailed,
 }
 
-/// The guardian's reply to a [`Request`].
+/// The launcher's reply to a [`Request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
-    /// A non-launch request succeeded.
+    /// The request succeeded.
     Ok,
     /// The request failed; the string is a human-readable reason (diagnostics only).
     Error(String),
-    /// Answer to [`Request::Launch`]: the application is running, with this PID.
-    Launched { pid: u32 },
-    /// The guardian does not implement the requested operation.
+    /// The launcher does not implement the requested operation.
     Unsupported,
-}
-
-/// A fully-specified process launch, in platform-native strings. The guardian applies
-/// it verbatim — `program` as the image, `args` as `argv[1..]`, `env` as the complete
-/// environment (nothing inherited but standard I/O), `cwd` if present — and interprets
-/// none of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandSpec {
-    pub program: OsString,
-    pub args: Vec<OsString>,
-    pub env: Vec<(OsString, OsString)>,
-    pub cwd: Option<OsString>,
 }
 
 /// A framing/format fault. Never a reason to change the protocol.
@@ -299,9 +257,8 @@ fn read_frame(r: &mut impl Read) -> Result<Vec<u8>> {
     // Past that first byte the peer has committed to a frame. A stall from here is a
     // *truncated* frame, not an idle channel: the stream is desynced and no later read can
     // resume it, so report it as malformed. Without this a peer that sends one byte and
-    // stops would block a single-threaded reader inside `read_exact` forever — the guardian
-    // would stop servicing its shutdown signal, its application-crash check, and its
-    // readiness deadline, all while holding the application.
+    // stops would block a single-threaded reader inside `read_exact` forever — the launcher
+    // would stop servicing its shutdown signal and its readiness deadline.
     read_framed(r, &mut len[1..])?;
     let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME {
@@ -339,20 +296,6 @@ fn get_u16(buf: &[u8], at: &mut usize) -> Result<u16> {
     Ok(u16::from_be_bytes(slice.try_into().unwrap()))
 }
 
-/// Every writer below enforces exactly the bound its reader rejects on. Asymmetry here is
-/// not a missing nicety: an over-long list or string still fits in a legal sub-[`MAX_FRAME`]
-/// frame, so it would encode fine and the peer would answer `Malformed` — which the
-/// guardian's serve loop reads as a channel fault, stopping and relaunching a healthy
-/// supervisor that then sends the same message again, forever. Refusing at encode time
-/// turns that loop into one bounded local error.
-fn put_count(out: &mut Vec<u8>, len: usize, what: &'static str) -> Result<()> {
-    if len as u64 > MAX_ITEMS as u64 {
-        return Err(Error::Malformed(what));
-    }
-    put_u32(out, len as u32);
-    Ok(())
-}
-
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
@@ -366,6 +309,12 @@ fn get_u32(buf: &[u8], at: &mut usize) -> Result<u32> {
     Ok(u32::from_be_bytes(slice.try_into().unwrap()))
 }
 
+/// Every writer below enforces exactly the bound its reader rejects on. Asymmetry here is
+/// not a missing nicety: an over-long string still fits in a legal sub-[`MAX_FRAME`]
+/// frame, so it would encode fine and the peer would answer `Malformed` — which the
+/// launcher's serve loop reads as a channel fault, stopping and relaunching a healthy
+/// agent that then sends the same message again, forever. Refusing at encode time
+/// turns that loop into one bounded local error.
 fn put_os(out: &mut Vec<u8>, s: &OsStr) -> Result<()> {
     let (unit_count, bytes) = os_units(s);
     if unit_count > MAX_STR_UNITS {
@@ -420,22 +369,6 @@ fn get_str(buf: &[u8], at: &mut usize) -> Result<String> {
     Ok(s)
 }
 
-fn put_list(out: &mut Vec<u8>, items: &[OsString]) -> Result<()> {
-    put_count(out, items.len(), "list exceeds MAX_ITEMS")?;
-    for item in items {
-        put_os(out, item)?;
-    }
-    Ok(())
-}
-
-fn get_list(buf: &[u8], at: &mut usize) -> Result<Vec<OsString>> {
-    let n = get_u32(buf, at)?;
-    if n > MAX_ITEMS {
-        return Err(Error::Malformed("list exceeds MAX_ITEMS"));
-    }
-    (0..n).map(|_| get_os(buf, at)).collect()
-}
-
 fn get_nonce(buf: &[u8], at: &mut usize) -> Result<Nonce> {
     let end = at
         .checked_add(16)
@@ -447,60 +380,10 @@ fn get_nonce(buf: &[u8], at: &mut usize) -> Result<Nonce> {
     Ok(slice.try_into().unwrap())
 }
 
-fn put_spec(out: &mut Vec<u8>, spec: &CommandSpec) -> Result<()> {
-    put_os(out, &spec.program)?;
-    put_list(out, &spec.args)?;
-    put_count(out, spec.env.len(), "env exceeds MAX_ITEMS")?;
-    for (k, v) in &spec.env {
-        put_os(out, k)?;
-        put_os(out, v)?;
-    }
-    match &spec.cwd {
-        Some(cwd) => {
-            out.push(1);
-            put_os(out, cwd)?;
-        }
-        None => out.push(0),
-    }
-    Ok(())
-}
-
-fn get_spec(buf: &[u8], at: &mut usize) -> Result<CommandSpec> {
-    let program = get_os(buf, at)?;
-    let args = get_list(buf, at)?;
-    let env_n = get_u32(buf, at)?;
-    if env_n > MAX_ITEMS {
-        return Err(Error::Malformed("env exceeds MAX_ITEMS"));
-    }
-    let mut env = Vec::with_capacity(env_n as usize);
-    for _ in 0..env_n {
-        let k = get_os(buf, at)?;
-        let v = get_os(buf, at)?;
-        env.push((k, v));
-    }
-    let cwd = match buf.get(*at) {
-        Some(0) => {
-            *at += 1;
-            None
-        }
-        Some(1) => {
-            *at += 1;
-            Some(get_os(buf, at)?)
-        }
-        _ => return Err(Error::Malformed("bad cwd discriminant")),
-    };
-    Ok(CommandSpec {
-        program,
-        args,
-        env,
-        cwd,
-    })
-}
-
 // ── message encode/decode ────────────────────────────────────────────────────────
 
 /// Every decoder ends here: a frame that carries a byte more than its message needs is malformed,
-/// not tolerable. There is one protocol major and one shipped tower, so trailing bytes are never a
+/// not tolerable. There is one protocol major and one shipped pair, so trailing bytes are never a
 /// newer peer's optional field — they are a truncation, a desync, or a peer writing a message this
 /// build cannot mean. The same rule the signed contracts apply with `deny_unknown_fields`.
 fn end_of_frame(body: &[u8], at: usize) -> Result<()> {
@@ -515,11 +398,6 @@ impl Request {
     fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         match self {
-            Request::Launch(spec) => {
-                out.push(TAG_LAUNCH);
-                put_spec(&mut out, spec)?;
-            }
-            Request::Stop => out.push(TAG_STOP),
             Request::ReplaceSupervisor(path) => {
                 out.push(TAG_REPLACE);
                 put_os(&mut out, path)?;
@@ -528,11 +406,6 @@ impl Request {
                 out.push(TAG_READY);
                 out.extend_from_slice(nonce);
             }
-            Request::TrafficReady(ready) => {
-                out.push(TAG_TRAFFIC_STATE);
-                out.push(u8::from(*ready));
-            }
-            Request::ApplicationFailed => out.push(TAG_FAIL_APPLICATION),
         }
         Ok(out)
     }
@@ -541,33 +414,22 @@ impl Request {
         let (&tag, body) = buf.split_first().ok_or(Error::Malformed("empty frame"))?;
         let mut at = 0usize;
         let req = match tag {
-            TAG_LAUNCH => Request::Launch(get_spec(body, &mut at)?),
-            TAG_STOP => Request::Stop,
             TAG_REPLACE => Request::ReplaceSupervisor(get_os(body, &mut at)?),
             TAG_READY => Request::Ready(get_nonce(body, &mut at)?),
-            TAG_TRAFFIC_STATE => {
-                at += 1;
-                match body.first() {
-                    Some(0) => Request::TrafficReady(false),
-                    Some(1) => Request::TrafficReady(true),
-                    _ => return Err(Error::Malformed("bad traffic-ready discriminant")),
-                }
-            }
-            TAG_FAIL_APPLICATION => Request::ApplicationFailed,
             other => return Err(Error::UnknownTag(other)),
         };
         end_of_frame(body, at)?;
         Ok(req)
     }
 
-    /// Write this request as one frame (supervisor side). Fails without writing anything
+    /// Write this request as one frame (agent side). Fails without writing anything
     /// if the message violates a wire bound the reader would reject.
     pub fn write(&self, w: &mut impl Write) -> Result<()> {
         write_frame(w, &self.encode()?)
     }
 
-    /// Read one request frame (guardian side). `Err(UnknownTag)` on an operation this
-    /// build does not know — the guardian answers [`Response::Unsupported`].
+    /// Read one request frame (launcher side). `Err(UnknownTag)` on an operation this
+    /// build does not know — the launcher answers [`Response::Unsupported`].
     pub fn read(r: &mut impl Read) -> Result<Request> {
         Request::decode(&read_frame(r)?)
     }
@@ -582,10 +444,6 @@ impl Response {
                 out.push(TAG_ERROR);
                 put_str(&mut out, msg)?;
             }
-            Response::Launched { pid } => {
-                out.push(TAG_LAUNCHED);
-                put_u32(&mut out, *pid);
-            }
             Response::Unsupported => out.push(TAG_UNSUPPORTED),
         }
         Ok(out)
@@ -597,9 +455,6 @@ impl Response {
         let resp = match tag {
             TAG_OK => Response::Ok,
             TAG_ERROR => Response::Error(get_str(body, &mut at)?),
-            TAG_LAUNCHED => Response::Launched {
-                pid: get_u32(body, &mut at)?,
-            },
             TAG_UNSUPPORTED => Response::Unsupported,
             other => return Err(Error::UnknownTag(other)),
         };
@@ -607,13 +462,13 @@ impl Response {
         Ok(resp)
     }
 
-    /// Write this response as one frame (guardian side). Fails without writing anything
+    /// Write this response as one frame (launcher side). Fails without writing anything
     /// if the message violates a wire bound the reader would reject.
     pub fn write(&self, w: &mut impl Write) -> Result<()> {
         write_frame(w, &self.encode()?)
     }
 
-    /// Read one response frame (supervisor side).
+    /// Read one response frame (agent side).
     pub fn read(r: &mut impl Read) -> Result<Response> {
         Response::decode(&read_frame(r)?)
     }
@@ -672,18 +527,6 @@ fn os_from_units(bytes: &[u8]) -> Result<OsString> {
 mod tests {
     use super::*;
 
-    fn spec() -> CommandSpec {
-        CommandSpec {
-            program: OsString::from("/opt/app/bin/server"),
-            args: vec![OsString::from("--addr"), OsString::from("127.0.0.1:8080")],
-            env: vec![
-                (OsString::from("PATH"), OsString::from("/usr/bin")),
-                (OsString::from("DATABASE_PASSWORD"), OsString::from("abc")),
-            ],
-            cwd: Some(OsString::from("/opt/app")),
-        }
-    }
-
     #[test]
     fn os_string_length_prefix_counts_native_units() {
         // In particular, Windows serializes UTF-16 units as two bytes each. The wire
@@ -707,22 +550,16 @@ mod tests {
 
     #[test]
     fn requests_round_trip() {
-        round_trip_request(Request::Launch(spec()));
-        round_trip_request(Request::Stop);
         round_trip_request(Request::ReplaceSupervisor(OsString::from(
             "/var/lib/app/supervisors/deadbeef/supervisor",
         )));
         round_trip_request(Request::Ready([0xABu8; 16]));
-        round_trip_request(Request::TrafficReady(false));
-        round_trip_request(Request::TrafficReady(true));
-        round_trip_request(Request::ApplicationFailed);
     }
 
     #[test]
     fn responses_round_trip() {
         round_trip_response(Response::Ok);
-        round_trip_response(Response::Error("could not launch: ENOENT".into()));
-        round_trip_response(Response::Launched { pid: 4321 });
+        round_trip_response(Response::Error("could not stage: ENOENT".into()));
         round_trip_response(Response::Unsupported);
     }
 
@@ -758,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tag_surfaces_so_the_guardian_can_answer_unsupported() {
+    fn unknown_tag_surfaces_so_the_launcher_can_answer_unsupported() {
         let mut framed = 1u32.to_be_bytes().to_vec();
         framed.push(0x77);
         assert!(matches!(
@@ -770,22 +607,11 @@ mod tests {
     #[test]
     fn oversized_length_prefix_is_rejected_without_allocating() {
         let mut framed = (u32::MAX).to_be_bytes().to_vec();
-        framed.push(TAG_STOP);
+        framed.push(TAG_READY);
         assert!(matches!(
             Request::read(&mut &framed[..]),
             Err(Error::Malformed(_))
         ));
-    }
-
-    #[test]
-    fn empty_and_absent_cwd_are_distinct() {
-        let mut a = spec();
-        a.cwd = None;
-        let mut b = spec();
-        b.cwd = Some(OsString::new());
-        round_trip_request(Request::Launch(a.clone()));
-        round_trip_request(Request::Launch(b.clone()));
-        assert_ne!(a, b);
     }
 
     #[test]
@@ -800,14 +626,14 @@ mod tests {
         // is never a newer peer's optional field: it is a desync or a peer writing something this
         // build cannot mean. Both decoders refuse it, the same rule `deny_unknown_fields` applies
         // to the signed contracts — one answer to unknown trailing data, not two.
-        let mut body = Request::Stop.encode().unwrap();
+        let mut body = Request::Ready([7u8; 16]).encode().unwrap();
         body.push(0xff);
         assert!(matches!(
             Request::decode(&body),
             Err(Error::Malformed("trailing bytes after message"))
         ));
 
-        let mut body = Response::Launched { pid: 7 }.encode().unwrap();
+        let mut body = Response::Ok.encode().unwrap();
         body.push(0);
         assert!(matches!(
             Response::decode(&body),
@@ -865,49 +691,14 @@ mod tests {
     }
 
     #[test]
-    fn lists_admit_exactly_max_items() {
-        // The item caps are inclusive: a list of exactly MAX_ITEMS must decode, so a
-        // `>=` boundary bug that rejected the largest legal list is caught.
-        let mut buf = Vec::new();
-        put_list(&mut buf, &vec![OsString::new(); MAX_ITEMS as usize]).unwrap();
-        let mut at = 0;
-        assert_eq!(get_list(&buf, &mut at).unwrap().len(), MAX_ITEMS as usize);
-
-        let mut s = spec();
-        s.env = vec![(OsString::new(), OsString::new()); MAX_ITEMS as usize];
-        let mut buf = Vec::new();
-        put_spec(&mut buf, &s).unwrap();
-        let mut at = 0;
-        assert_eq!(
-            get_spec(&buf, &mut at).unwrap().env.len(),
-            MAX_ITEMS as usize
-        );
-    }
-
-    #[test]
     fn a_writer_refuses_exactly_what_the_reader_would_reject() {
-        // An asymmetric bound is not a cosmetic problem: an over-long env or string still
-        // fits in a legal frame, so it would encode, and the guardian would read it as
-        // Malformed — a channel fault, which stops and relaunches a healthy supervisor that
-        // then sends the identical message again. The write must fail locally instead.
-        let mut over = spec();
-        over.env = vec![(OsString::new(), OsString::new()); MAX_ITEMS as usize + 1];
+        // An asymmetric bound is not a cosmetic problem: an over-long string still fits in a
+        // legal frame, so it would encode, and the launcher would read it as Malformed — a
+        // channel fault, which stops and relaunches a healthy agent that then sends the
+        // identical message again. The write must fail locally instead.
+        let over = OsString::from("a".repeat(MAX_STR_UNITS as usize + 1));
         assert!(matches!(
-            Request::Launch(over).write(&mut Vec::new()),
-            Err(Error::Malformed(_))
-        ));
-
-        let mut over = spec();
-        over.program = OsString::from("a".repeat(MAX_STR_UNITS as usize + 1));
-        assert!(matches!(
-            Request::Launch(over).write(&mut Vec::new()),
-            Err(Error::Malformed(_))
-        ));
-
-        let mut over = spec();
-        over.args = vec![OsString::new(); MAX_ITEMS as usize + 1];
-        assert!(matches!(
-            Request::Launch(over).write(&mut Vec::new()),
+            Request::ReplaceSupervisor(over).write(&mut Vec::new()),
             Err(Error::Malformed(_))
         ));
 
@@ -918,7 +709,7 @@ mod tests {
     }
 
     /// A reader whose peer sent `sent` and then stalled forever, with a read timeout set —
-    /// exactly the guardian's socketpair end.
+    /// exactly the launcher's socketpair end.
     #[cfg(unix)]
     fn stalled_peer(sent: &[u8]) -> Result<Vec<u8>> {
         use std::io::Write;
@@ -937,9 +728,8 @@ mod tests {
     #[test]
     fn a_peer_that_stalls_mid_frame_is_malformed_not_a_wedge() {
         // One byte makes the channel readable, so the reader commits to a frame — and then
-        // the peer says nothing more. This must return, not block the guardian's only
-        // thread forever (which would strand its shutdown signal, crash check, and
-        // readiness deadline while it still owns the application).
+        // the peer says nothing more. This must return, not block the launcher's only
+        // thread forever (which would strand its shutdown signal and readiness deadline).
         assert!(
             matches!(stalled_peer(&[0x00]), Err(Error::Malformed(_))),
             "a truncated length prefix is a desynced stream, not an idle channel"
@@ -955,13 +745,13 @@ mod tests {
     #[test]
     fn an_idle_channel_is_a_retryable_io_condition() {
         // Nothing sent at all: the channel is merely quiet and still frame-aligned, so the
-        // reader must not mistake it for a protocol violation and tear the supervisor down.
+        // reader must not mistake it for a protocol violation and tear the agent down.
         assert!(matches!(stalled_peer(&[]), Err(Error::Io(_))));
     }
 
     #[test]
     fn strings_admit_exactly_max_units() {
-        // String caps are inclusive too, counted in native units (bytes on Unix,
+        // String caps are inclusive, counted in native units (bytes on Unix,
         // UTF-16 code units on Windows).
         let big = "a".repeat(MAX_STR_UNITS as usize);
 

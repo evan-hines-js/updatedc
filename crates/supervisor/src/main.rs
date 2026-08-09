@@ -1,5 +1,7 @@
-//! Update policy, transactions, health checks, and rollback for an application owned
-//! by the permanent bootstrap guardian. The supervisor is itself replaceable.
+//! The node agent: a package runner. It pulls signed TUF bundles, activates them through a
+//! durable transaction, and invokes the release's own reconciler hooks — `apply`, `healthcheck`,
+//! `rollback`, `inspect`. It never launches, signals, or holds a PID of any workload. The agent
+//! is itself replaceable, by pointer flip through the launcher.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,13 +11,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use updated::config::{with_suffix, Application, Paths, Routing, Storage, Timeouts};
-use updated::env;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate, and shared with
 /// every reconciler implementation in this workspace.
 use updated_contracts::reconciler::{attempt, Operation};
 use updated_contracts::telemetry::REPORT_CADENCE_JITTER_PERCENT;
 mod acquire;
-mod app;
 mod boot;
 mod domain;
 mod fingerprint;
@@ -30,8 +30,7 @@ mod store;
 mod telemetry;
 mod update;
 
-use app::*;
-use boot::plan_boot;
+use boot::{plan_boot, GateFailure};
 use domain::*;
 use guardian::Guardian;
 use install::ensure_installed;
@@ -46,7 +45,7 @@ use updated::hash::sha256_file;
 use updated_tuf::select::{target_sha, SelectedRelease};
 use updated_tuf::{DefaultPolicy, TrustedRepository};
 
-/// This supervisor build's version, baked in (see `build.rs`). Self-update selection is
+/// This agent build's version, baked in (see `build.rs`). Self-update selection is
 /// by content hash, not this — it is for logs and for distinguishing builds.
 const SELF_VERSION: &str = env!("SUPERVISOR_VERSION");
 
@@ -70,21 +69,17 @@ struct IdentityRenewal {
 
 impl Options {
     /// Reconcile the managed runtime against the live assignment resolved this cycle. The
-    /// runtime (launch args, health checks, cadence, retention) is signed into the SAME
+    /// runtime (health checks, cadence, retention, secrets, inputs) is signed into the SAME
     /// assignment that carries the version and provider set, so a control-plane reassignment
     /// can change it with no version bump. The version/provider are reconciled by
     /// `check_application`; this reconciles everything else onto the one live source.
     ///
-    /// Returns whether the running process is stale on the new runtime — an app running the old
-    /// args, mode, or secrets must be relaunched to pick them up, since a live process's argv and
-    /// environment cannot be rewritten in place. Resolved `inputs` are stale in the other
-    /// direction: they are the reconciler's, delivered as `--input-file`, so the caller answers
-    /// this by running the environment converge (`converge_environment`) before the relaunch —
-    /// without it a changed input would stop and start the application to no effect at all.
+    /// Returns whether the machine is stale on the new runtime — changed secrets or resolved
+    /// `inputs` reach the release only through a reconciler invocation (its environment and its
+    /// `--input-file`), so the caller answers this by running the environment converge
+    /// (`converge_environment`), which is the one thing that can act on them.
     fn apply_runtime(&mut self, runtime: &updated_contracts::assignment::ManagedRuntime) -> bool {
-        let relaunch = self.application.args != runtime.args
-            || self.application.mode != runtime.mode
-            || self.application.secrets != runtime.secrets
+        let converge = self.application.secrets != runtime.secrets
             || self.application.inputs != runtime.inputs;
         // `install_root` needs no reconciliation: `TrustedRepository::assigned` fails closed on
         // any assignment whose root is not exactly the one this process resolved its paths from
@@ -93,30 +88,29 @@ impl Options {
         self.application = Application::from_runtime(runtime);
         self.timeouts = BoundedTimeouts::new(Timeouts::from_runtime(runtime));
         self.storage = Storage::from_runtime(runtime);
-        // The supervisor's OWN update rides the same assignment: its channel and cadence are the
+        // The agent's OWN update rides the same assignment: its channel and cadence are the
         // application's, seeded once at `parse_args` from the boot-time config. Reconcile them here
         // too, or a node the control plane moves from `stable` to `canary` keeps selecting the
         // `supervisor` product from `stable` — and keeps checking on the old cadence — for as long
         // as the process lives, since nothing else ever rewrites these two fields.
         self.supervisor_update.channel = self.application.channel.clone();
         self.supervisor_update.check_interval = self.timeouts.supervisor_check_interval;
-        relaunch
+        converge
     }
 }
 
-/// The supervisor stages a verified release from the reserved `supervisor` product
-/// into the guardian's content-addressed state directory and hands it off for a
+/// The agent stages a verified release from the reserved `supervisor` product
+/// into the launcher's content-addressed state directory and hands it off for a
 /// readiness-gated replacement.
 struct SupervisorUpdate {
     channel: String,
-    /// The guardian's state directory, holding `supervisors/<id>/` staging dirs.
+    /// The launcher's state directory, holding `supervisors/<id>/` staging dirs.
     state_dir: PathBuf,
     check_interval: Duration,
 }
 
-/// Mutable bookkeeping for the update-check loop. The supervisor no longer restarts or
-/// watches the application (the guardian does), so this is just the metadata-refresh
-/// backoff and the next application-update deadline.
+/// Mutable bookkeeping for the update-check loop: the metadata-refresh backoff and the next
+/// application-update and identity deadlines.
 struct LoopState {
     refresh_failures: u32,
     next_app_check: Instant,
@@ -133,26 +127,25 @@ impl LoopState {
     }
 }
 
-/// Steady-state health tracking for the running application: when the next periodic probe is
-/// due, the last observation (what telemetry reports as "settled"), and how many consecutive
-/// failures have been counted against the process that is running *now*.
+/// Steady-state health tracking for the deployed release: when the next `healthcheck` invocation
+/// is due, and the last observation (what the node's report carries as `settled`).
 ///
-/// Every launch outside the loop proves the application healthy before returning — boot and the
+/// Health is the reconciler's answer and nothing else — the agent owns no workload process to
+/// observe — so a probe is an observation, never a verdict that ends this process. Only the boot
+/// gate, inside a confirmation window, turns unhealth into action.
+///
+/// Every converge outside the loop proves the release healthy before returning: boot and the
 /// update transaction both gate on [`update::became_healthy`], which polls for the configured
-/// `health_grace`. A launch the loop performs itself has no such gate, so this type is where that
-/// grace is applied instead: [`HealthWatch::relaunched`] is the single way the loop restarts the
-/// tracking, and it is what keeps a fresh process from being reported dead before it can bind.
+/// `health_grace`. A converge the loop performs itself has no such gate, so this type is where that
+/// grace is applied instead: [`HealthWatch::reconverged`] is the single way the loop restarts the
+/// tracking, and it is what keeps a freshly re-applied release from being reported unready while
+/// the reconciler is still bringing it up.
 struct HealthWatch {
     next_probe: Instant,
-    /// Latest readiness observation, so a report reflects whether the running deployment is
-    /// actually serving. `None` until first sampled, or until a relaunch discards it.
+    /// Latest readiness observation, so a report reflects whether the deployed release is
+    /// actually serving. `None` until first sampled, or until a converge discards it.
     last_ready: Option<bool>,
-    consecutive_failures: u32,
 }
-
-/// Consecutive failed periodic probes that mean the managed application is dead rather than
-/// briefly unwell. Only ever counted against a process past its start grace.
-const MAX_LIVENESS_FAILURES: u32 = 3;
 
 /// Everything the 12-hourly identity tick may spend on the control loop, end to end.
 ///
@@ -167,48 +160,38 @@ const MAX_LIVENESS_FAILURES: u32 = 3;
 const IDENTITY_TICK_DEADLINE: Duration = Duration::from_secs(20);
 
 impl HealthWatch {
-    /// Start watching an application that has ALREADY passed a health gate (the boot gate), so
-    /// the first steady-state probe is one ordinary interval away.
-    fn proven_healthy(timeouts: &Timeouts) -> Self {
+    /// Start watching a release the boot gate has just observed, so the first steady-state probe
+    /// is one ordinary interval away and the report already carries what that gate saw.
+    fn after_boot_gate(timeouts: &Timeouts, ready: bool) -> Self {
         HealthWatch {
             next_probe: Instant::now() + timeouts.health_interval,
-            last_ready: None,
-            consecutive_failures: 0,
+            last_ready: Some(ready),
         }
     }
 
-    /// Re-arm after the loop relaunched the application (a changed launch spec, or repaired
-    /// bytes). Nothing has proven THIS process healthy, so give it the same configured
-    /// `health_grace` every other launch site gets through `became_healthy` before a probe can
-    /// count against it, and drop the failures counted against the process it replaced.
+    /// Re-arm after the loop ran a converge of its own (a runtime reassignment, a secret rotation,
+    /// repaired bytes). Nothing has proven the re-applied release healthy, so give the reconciler
+    /// the same configured `health_grace` every gated converge gets through `became_healthy`
+    /// before a probe is recorded against it.
     ///
-    /// Without the grace the effective start window on a relaunch is
-    /// `MAX_LIVENESS_FAILURES * health_interval` — three seconds with the shipped values — after
-    /// which a perfectly healthy application that is merely still binding is reported to the
-    /// guardian as failed, fleet-wide and simultaneously, on a benign reassignment.
-    fn relaunched(&mut self, timeouts: &Timeouts) {
+    /// Without the grace, a release that is merely still starting is reported unready — fleet-wide
+    /// and simultaneously, on a benign reassignment — and the healthproxy drains every node that
+    /// obeyed the assignment.
+    fn reconverged(&mut self, timeouts: &Timeouts) {
         self.next_probe = Instant::now() + timeouts.health_grace;
         self.last_ready = None;
-        self.consecutive_failures = 0;
     }
 
-    /// Record one periodic observation and schedule the next probe. Returns whether the
-    /// application has now failed its liveness check.
-    fn observed(&mut self, now: Instant, healthy: bool, timeouts: &Timeouts) -> bool {
+    /// Record one periodic observation and schedule the next probe.
+    fn observed(&mut self, now: Instant, healthy: bool, timeouts: &Timeouts) {
         self.next_probe = now + timeouts.health_interval;
         self.last_ready = Some(healthy);
-        if healthy {
-            self.consecutive_failures = 0;
-        } else {
-            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        }
-        self.consecutive_failures >= MAX_LIVENESS_FAILURES
     }
 }
 
 fn main() {
     // The chaos-feature build can enumerate its own transaction boundaries, so the e2e
-    // drives exactly the crossings the supervisor defines instead of a hand-copied list.
+    // drives exactly the crossings the agent defines instead of a hand-copied list.
     #[cfg(feature = "chaos")]
     if let Some(kind) = std::env::args().find(|a| {
         a == "--list-chaos-boundaries"
@@ -257,9 +240,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let _lock = updated::lock::InstanceLock::acquire(&with_suffix(&opts.paths.installed, ".lock"))
         .map_err(|e| format!("another supervisor already owns this install: {e}"))?;
 
-    // Watch for a stop/restart signal; when it fires the supervisor exits. It does NOT
-    // touch the application: the guardian is the service's main process and stops the
-    // app itself on a clean stop.
+    // Watch for a stop/restart signal; when it fires the agent exits. It touches no workload:
+    // whatever the release's reconciler started keeps running, under whatever owns it.
     let shutdown = Arc::new(AtomicBool::new(false));
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -270,7 +252,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut guardian =
-        Guardian::connect().map_err(|e| format!("connecting to the guardian: {e}"))?;
+        Guardian::connect().map_err(|e| format!("connecting to the launcher: {e}"))?;
 
     let mut store = FileStore::open(opts.paths.clone())?;
 
@@ -281,30 +263,21 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // install; there is no first-install branch after it.
     let first_install = ensure_installed(&opts, &mut store).await?;
 
-    // Claim the guardian's markers once, up front.
+    // Claim the launcher's marker once, up front.
     let mut evidence = guardian::Evidence::read(guardian::state_dir().as_deref())?;
 
-    // Whether this boot repaired a damaged committed tree — the one input the crash-attribution
-    // question below needs that no durable record holds. See `Situation::charge_crash_to_release`.
+    // Whether this boot repaired a damaged committed tree. A permanent, hash-keyed rejection may
+    // never be charged to bytes this boot re-downloaded and re-verified, so it is the one input
+    // the boot gate's rejection decision needs that no durable record holds.
     let mut bytes_repaired = false;
 
     // The disk is not trusted merely because it was verified during installation. This
     // check is local and deliberately precedes every repository access. A modified
-    // committed bundle is never launched, even when the network is unavailable.
+    // committed bundle is never converged onto, even when the network is unavailable.
     if let updated::state::Installed::Present(installed) = store.installed() {
         if let Err(error) =
             updated::bundle::verify_release(&opts.paths.versions, &installed.release)
         {
-            // Stopping the application here is what makes the planner LAUNCH the repaired bytes
-            // below: the repair commits a fresh release, which leaves nothing for drift
-            // enforcement to fix, so the acquisition decision rests entirely on whether an
-            // application is still running. The guardian's own record of that is updated by this
-            // stop whether or not the answer arrives, so the freshly-committed release is launched
-            // instead of a process running the corrupt bytes being "adopted" and health-gated as if
-            // it were the repaired one — which nothing downstream would correct, the repair having
-            // left active and installed in agreement. The outcome is therefore ignorable: a stop
-            // the guardian could not answer changes what this boot does, not what it believes.
-            let _ = guardian.stop();
             // The repaired-from repository is of no use on the boot path — there is no loop tick to
             // report for yet, and the ordinary heartbeat starts one refresh later.
             let _repo = repair_committed_bundle(&opts, &mut store)
@@ -314,69 +287,22 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                         "committed application bundle failed local verification ({error}); no signed repair was applicable: {repair}"
                     )
                 })?;
-            // A service exit recorded against a release whose committed tree was found DAMAGED is
-            // evidence about this disk, not about the release — the same reasoning that forbids
-            // `repair_committed_bundle` from rejecting the corrupt archive. Charged to the head it
-            // would permanently blacklist, by archive hash, the bytes this repair just
-            // re-downloaded and re-verified.
-            //
-            // Note what is NOT done here: the claim itself is not surrendered. Erasing it would
-            // disable every other consumer of the exit too — the revert to `pending`'s predecessor
-            // in `boot::confirm_or_revert`, the provisional-head descent below — and a release that
-            // died inside its confirmation window would then be relaunched and, once the window
-            // passed, CONFIRMED, with its rollback target dropped. The exit stays; only the
-            // permanent, hash-keyed rejection it would otherwise drive is withheld, via
-            // `Situation::charge_crash_to_release`. The next boot finds an intact tree and charges
-            // a repeat crash to the release, so this withholding is one boot deep and the descent
-            // still terminates.
+            // The boot gate below may fail on a release whose tree this boot just repaired. That
+            // failure is evidence about this disk, not about the release — the same reasoning that
+            // forbids `repair_committed_bundle` from rejecting the corrupt archive — so it still
+            // drives the revert (reversible) but never the permanent, hash-keyed rejection. One
+            // boot deep: the next boot finds an intact tree, and a release that fails its gate
+            // again is charged for it, so the descent still terminates.
             bytes_repaired = true;
         }
     }
 
     // Gather the whole world into a Situation and let the pure boot planner decide everything:
-    // recovery, drift enforcement, crash rejection, pending confirm/revert, and whether to adopt
-    // the running application or launch a fresh one. Each claim is surrendered — and only then is
-    // its file erased — at the point the durable consequence it implies has landed.
-    let situation = gather_situation(
-        &opts,
-        &store,
-        &guardian,
-        &evidence,
-        first_install,
-        bytes_repaired,
-    )?;
+    // recovery, drift enforcement, journaled rejections, and pending confirmation. The
+    // rejected-agent claim is surrendered — and only then is its file erased — at the point the
+    // durable consequence it implies has landed.
+    let situation = gather_situation(&opts, &store, &evidence)?;
     let mut recovery_transaction = recovery_transaction(&situation);
-    // A *provisional* committed head (`confirmed == false`, never health-proven) that crashed (the
-    // guardian recorded a service exit) with no pending update to revert is a broken assigned head
-    // that a first-install cold-installed. Reject its bytes and restart *before* relaunching
-    // it: the next boot's cold install descends via ordered fallback to the newest healthy release.
-    // A confirmed head that crashes transiently is a no-op here, so it falls through to the normal
-    // relaunch-and-recover path — the single-crash recovery the base e2e relies on.
-    //
-    // The `!first_install` guard is load-bearing: when *this* boot descended and (re)installed a
-    // new head, that head has not launched yet, so a `service_exited` marker on disk is the stale
-    // exit of the *previous* head (which is exactly what drove this descent). Acting on it here
-    // would reject the freshly-installed release before it ever runs — stranding a cold node on an
-    // exhausted descent even though a healthy release was available (the fleet baseline-rejection
-    // bug). A genuine crash of *this* head is caught on the next boot (no longer first_install) or,
-    // if it fails its gate this boot, by the boot health gate below.
-    //
-    // `charge_crash_to_release` rather than `service_exited` for the same reason and with the same
-    // shape: a boot that repaired this head's damaged tree must not reject the bytes it just
-    // re-verified. It relaunches them instead, and a head that crashes again is rejected by the
-    // next boot, which finds the tree intact.
-    if situation.charge_crash_to_release()
-        && recovery_transaction.is_none()
-        && !situation.first_install
-    {
-        if let Installed::Present(state) = &situation.installed {
-            if reject_provisional_head(&mut store, state, "crashed with no pending update")? {
-                // The rejection is durable now, so the claim that drove it can go.
-                evidence.clear_service_exit()?;
-                return Err("provisional head crashed; descending on the next boot".into());
-            }
-        }
-    }
     let defer_recovery_commit = recovery_transaction
         .as_ref()
         .is_some_and(Transaction::is_rollback);
@@ -395,9 +321,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut self_update = SelfUpdateState::load(&opts)?;
 
-    // A confirmation-window crash starts rollback by materializing the same phase journal
+    // A confirmation-window revert starts rollback by materializing the same phase journal
     // used by ordinary activation failures. From this write onward there is exactly one
-    // recovery path, including if this supervisor dies before touching the pointer.
+    // recovery path, including if this agent dies before touching the pointer.
     //
     // The guard is "the journal on disk is not already this transaction", not "there is no
     // journal": a SPENT journal (the update's commit landed, but its terminal write or its
@@ -425,8 +351,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
     // Perform the plan's durable reconciliation (binary, rejections, commit), yielding the
     // still-unconfirmed update (if any) for the loop to confirm once its window passes.
-    // A failure here leaves the journal and every unspent marker claim intact and EXITS (see
-    // `exit_for_relaunch`), so the guardian relaunches this supervisor and boot recovery re-derives
+    // A failure here leaves the journal and the unspent marker claim intact and EXITS (see
+    // `exit_for_relaunch`), so the launcher relaunches this agent and boot recovery re-derives
     // the identical, idempotent reconciliation from that durable evidence — unless the cause is a
     // node-local transient, which `recover_through_transients` waits out instead (see there).
     let mut pending = recover_through_transients(
@@ -434,11 +360,10 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         &TransientRetry::BOOT,
         &mut guardian,
         &shutdown,
-        |guardian| {
+        || {
             execute_boot_plan(
                 &plan,
                 &mut store,
-                guardian,
                 &mut self_update,
                 defer_recovery_commit,
                 recovery_transaction.as_mut(),
@@ -447,41 +372,27 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await?;
-    // The service exit's durable consequence — the synthesized rollback journal above, or the
-    // reconciliation `execute_boot_plan` just committed — has landed, so this boot's claim on it
-    // is spent. (The rejected-supervisor claim is surrendered inside `execute_boot_plan`, at the
-    // instant the candidate's hash becomes durably rejected.) Consuming evidence earlier, as part
-    // of merely *reading* the situation, meant a crash in the gap erased the only record that the
-    // application died inside its confirmation window: the next boot would confirm the bad update
-    // instead of reverting it. Commit first, then consume — and consume only what was read.
-    evidence.clear_service_exit()?;
-    // Restore the predecessor's activation before relaunching it (rollback recovery). A restart
-    // deployment has no live process here (it was stopped); a reload deployment kept it and reloads
-    // it in place — `complete_recovery_activation` resolves that itself.
+    // Restore the predecessor's machine state (rollback recovery): the predecessor's own `apply`,
+    // replayed under the transaction's identity — `complete_recovery_activation` resolves whether
+    // this boot still owes it.
     recover_through_transients(
         "predecessor activation recovery",
         &TransientRetry::BOOT,
         &mut guardian,
         &shutdown,
-        |_| complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut()),
+        || complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut()),
     )
     .await?;
-    if let Some(tx) = recovery_transaction.as_mut() {
-        if tx.recovery_pending(TransactionPhase::RollbackStartStarted) {
-            advance_transaction(&mut store, tx, TransactionPhase::RollbackStartStarted)?;
-        }
-    }
     if pending.is_some() {
         if let Some(v) = current.as_deref() {
             log(&format!(
-                "update {v} is unconfirmed; a crash within its window reverts it"
+                "update {v} is unconfirmed; a failed health gate within its window reverts it"
             ));
         }
     }
 
     log(&format!(
-        "supervisor {SELF_VERSION} (default provider {}) supervising {:?} (product {} channel {}, installed {}, check every {}s)",
-        DefaultProvider::VERSION,
+        "agent {SELF_VERSION} running packages in {:?} (product {} channel {}, installed {}, check every {}s)",
         opts.paths.install_root,
         opts.application.product,
         opts.application.channel,
@@ -489,23 +400,20 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         opts.timeouts.check_interval.as_secs()
     ));
 
-    // Signal *supervisor* readiness to the guardian now that this boot has reconciled its durable
-    // state — BEFORE acquiring the application, fetching its secrets, or gating its health. For a
-    // committed supervisor this is a no-op; for a candidate it begins the guardian's confirmation
-    // window. Signalling here decouples "the supervisor process started successfully" from
-    // everything downstream that depends on the control plane or on the application: neither a
-    // slow-to-start app during a swap nor an unreachable secrets endpoint can blow the guardian's
-    // ready_timeout and get a perfectly good supervisor rejected — and that rejection is by content
-    // hash and never expires.
+    // Signal *agent* readiness to the launcher now that this boot has reconciled its durable
+    // state — BEFORE fetching secrets or gating the release's health. For a committed agent this is
+    // a no-op; for a candidate it begins the launcher's confirmation window. Signalling here
+    // decouples "the agent process started successfully" from everything downstream that depends on
+    // the control plane or on the release: neither a slow reconciler nor an unreachable secrets
+    // endpoint can blow the launcher's ready_timeout and get a perfectly good agent rejected — and
+    // that rejection is by content hash and never expires.
     //
     // The price is real and deliberate: from here the confirmation window runs on its own clock, so
-    // a candidate that spends it waiting for secrets is committed WITHOUT having launched the
-    // application, and the pre-start hook and the boot health gate below both run inside the window
-    // rather than in front of it. That is the trade this ordering buys — commitment attests these
-    // supervisor bytes started and stayed up, not that the control plane was reachable or that the
-    // application it will supervise is healthy. What still holds afterwards is that a supervisor
-    // whose app cannot get healthy EXITS (below), so the guardian relaunches it and, if the exit
-    // lands inside the window, rejects the candidate outright.
+    // a candidate that spends it waiting for secrets is committed WITHOUT having converged the
+    // release, and the boot converge and health gate below both run inside the window rather than
+    // in front of it. That is the trade this ordering buys — commitment attests these agent bytes
+    // started and stayed up, not that the control plane was reachable or that the release is
+    // healthy.
     let ready = guardian.signal_ready();
     #[cfg(all(feature = "chaos", supervisor_chaos_exit_after_ready))]
     {
@@ -513,11 +421,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(137);
     }
 
-    // Acquire the assigned secrets, waiting out a control-plane outage: the application launches
-    // with them in its environment, so it must not start without them. `ready` is the proof that
-    // this wait sits behind the readiness signal — in front of it, an unreachable secrets endpoint
-    // is indistinguishable from a supervisor binary that cannot start, and gets the candidate's
-    // bytes rejected for good.
+    // Acquire the assigned secrets, waiting out a control-plane outage: every reconciler
+    // invocation carries them in its environment, so no hook may run without them. `ready` is the
+    // proof that this wait sits behind the readiness signal — in front of it, an unreachable
+    // secrets endpoint is indistinguishable from an agent binary that cannot start, and gets the
+    // candidate's bytes rejected for good.
     if !opts
         .secrets
         .acquire(
@@ -528,56 +436,42 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
     {
-        log("shutdown requested while waiting for the assigned secrets; exiting (the guardian stops the application)");
+        log("shutdown requested while waiting for the assigned secrets; exiting");
         return Ok(());
     }
 
-    let mut app = match plan.acquire {
-        Acquire::Adopt(pid) => adopt(guardian, &opts, pid)?,
-        // The boot converge is a clean-boot environment step. A boot that is resuming an
-        // interrupted update or rollback (recovery_transaction is Some) must replay only that
-        // transaction's minimal, idempotent steps — injecting a fresh per-boot `apply` there
-        // would run the reconciler outside the transaction. So it fires only on an ordinary
-        // launch, never on a recovery relaunch.
-        Acquire::Launch => launch_after_boot_apply(
-            guardian,
+    // The boot converge: the committed release's own `apply`, so the reconciler brings the machine
+    // onto what this boot just reconciled. A boot that is resuming an interrupted update or
+    // rollback (recovery_transaction is Some) must replay only that transaction's minimal,
+    // idempotent steps — injecting a fresh per-boot `apply` there would run the reconciler outside
+    // the transaction — so it fires only on an ordinary boot.
+    if recovery_transaction.is_none() {
+        converge_environment(
             &opts,
             &store,
-            if recovery_transaction.is_some() {
-                None
-            } else if first_install {
-                Some(LifecycleReason::Install)
+            if first_install {
+                LifecycleReason::Install
             } else {
-                Some(LifecycleReason::Restart)
+                LifecycleReason::Restart
             },
-        )?,
-    };
-    if recovery_transaction
-        .as_ref()
-        .is_some_and(|tx| tx.recovery_pending(TransactionPhase::PredecessorStarted))
-    {
-        Chaos::from_env().crossing(update::boundary::PREDECESSOR_START_APPLIED);
-        let tx = recovery_transaction.as_mut().expect("checked above");
-        advance_transaction(&mut store, tx, TransactionPhase::PredecessorStarted)?;
+        )?;
     }
-
     if let Some(tx) = recovery_transaction.as_mut() {
         if tx.recovery_pending(TransactionPhase::RollbackHealthStarted) {
             advance_transaction(&mut store, tx, TransactionPhase::RollbackHealthStarted)?;
         }
     }
-    // Gate readiness: the application must be healthy before we trust this boot. A crash
-    // would have torn the tower down instead, so an unhealthy result here means the
-    // process is alive but wedged — fail closed. Readiness was signalled long before this gate, so
-    // for a candidate supervisor failing it is an exit *inside* the confirmation window, which the
-    // guardian reads as a candidate that died in its window and rolls back. The lifecycle
-    // provider's verify phase is the application-specific signal.
+    // Gate readiness: the release's own `healthcheck` must pass before this boot is trusted. It is
+    // the only health source — the agent owns no workload process to observe — and readiness was
+    // signalled long before it, so for a candidate agent a failure here is an exit *inside* the
+    // launcher's confirmation window.
+    //
     // During a crash-recovered rollback the predecessor commit is deferred until *after* this gate,
     // so `store.installed()` still holds the CANDIDATE record. Gate the restored predecessor with
-    // ITS OWN lifecycle provider — carried in the recovery transaction from `pending` (the
-    // operator set staged for exactly this rollback) — not the candidate's. Otherwise an update that
-    // revised the lifecycle provider, then failed, would gate the healthy predecessor with the
-    // candidate's policy, reject it, and crash-loop a good release.
+    // ITS OWN lifecycle provider — carried in the recovery transaction from `pending` (the operator
+    // set staged for exactly this rollback) — not the candidate's. Otherwise an update that revised
+    // the lifecycle provider, then failed, would gate the healthy predecessor with the candidate's
+    // hooks, reject it, and crash-loop a good release.
     let installed_state = match store.installed() {
         Installed::Present(installed) => installed,
         _ => return Err("cannot verify a boot without an installed release".into()),
@@ -586,34 +480,29 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // one release with another's hooks.
     let (installed, installed_lifecycle) =
         boot_gate_target(recovery_transaction.as_ref(), &installed_state);
-    let mut tower = DefaultProvider::new(&mut app, &opts, installed_lifecycle.as_ref());
-    let gate = update::became_healthy(&mut tower, attempt::BOOT, &installed, &installed).await;
+    let mut reconciler = ReleaseReconciler::new(&opts, installed_lifecycle.as_ref());
+    let gate = update::became_healthy(&mut reconciler, attempt::BOOT, &installed, &installed).await;
     if let update::Health::Inconclusive(cause) = &gate {
         // No verdict about these bytes: the probes stopped reaching the node reconciler (a corrupt
         // or pruned provider tree, ENOSPC/EACCES/EIO preparing the invocation), so this says more
         // about the disk than about the release. Note it — and then fall through to the SAME
-        // bounded failure path an unhealthy gate takes.
-        //
-        // Why not a non-judging early return, the way `switch_over` answers an inconclusive gate?
-        // Because there is no "try again later" here: nothing is serving. These faults are
-        // deterministic (a provider tree that will not resolve resolves no better on the next
-        // boot), so an early return would relaunch into the identical failure forever with the node
-        // down — precisely what the bound below exists to prevent. Bounded descent to a release the
-        // node can actually run beats an unbounded crash loop, even at the cost of a rejection that
-        // the disk, not the release, earned.
+        // bounded failure path an unhealthy gate takes: these faults are deterministic (a provider
+        // tree that will not resolve resolves no better on the next boot), so treating them as
+        // "try again later" would relaunch into the identical failure forever.
         warn(&format!(
             "the boot readiness gate could not reach the node reconciler ({cause}); treating it as \
              a failed gate so the bounded recovery below still terminates"
         ));
     }
-    if !matches!(gate, update::Health::Ready) {
+    let gate_passed = matches!(gate, update::Health::Ready);
+    if !gate_passed {
         // A crash-recovered rollback whose restored predecessor cannot pass the gate is the
-        // dangerous case: `reject_provisional_head` below would no-op (the still-deferred
-        // `store.installed()` holds the CONFIRMED candidate, not the predecessor), so without a
-        // bound the guardian relaunches, the journal re-derives the identical rollback, and it runs
-        // forever with the node down. Bound it: count failures durably in the journal (which is what
-        // survives the relaunch) and, once the limit is hit, reject the predecessor's bytes and
-        // descend via the same ordered-fallback path a cold install uses.
+        // dangerous case: the still-deferred `store.installed()` holds the CONFIRMED candidate, not
+        // the predecessor, so without a bound the launcher relaunches, the journal re-derives the
+        // identical rollback, and it runs forever with nothing converged. Bound it: count failures
+        // durably in the journal (which is what survives the relaunch) and, once the limit is hit,
+        // reject the predecessor's bytes and descend via the same ordered-fallback path a cold
+        // install uses.
         if let Some(tx) = recovery_transaction.as_mut().filter(|tx| tx.is_rollback()) {
             let predecessor = tx.previous_release.version.clone();
             match bound_unhealthy_rollback(&mut store, tx) {
@@ -630,36 +519,54 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     "recording the unhealthy rollback target failed: {error}"
                 )),
             }
-            app.guardian
-                .application_failed()
-                .map_err(|error| format!("reporting rollback-target health failure: {error}"))?;
             return Err("the rollback target failed its health gate".into());
         }
-        // A still-provisional head that never becomes healthy is a broken assigned head wedged
-        // alive (a crash instead tears the tower down before here — see the service-exit path at
-        // boot gather). Reject its bytes so the next boot's cold install descends via ordered
-        // fallback to the newest healthy release rather than relaunching a head that can't serve.
-        // A confirmed head that fails is a no-op here and left alone for the normal path.
-        if let updated::state::Installed::Present(state) = store.installed() {
-            if let Err(error) =
-                reject_provisional_head(&mut store, &state, "wedged alive without a passing gate")
-            {
-                warn(&format!(
-                    "recording rejection of the failed provisional head failed: {error}"
-                ));
-            }
+        // Otherwise the answer is the committed record's alone: revert inside a confirmation
+        // window, reject a never-proven provisional head, or merely report. See
+        // [`boot::plan_gate_failure`].
+        match store.installed() {
+            Installed::Present(state) => match boot::plan_gate_failure(&state) {
+                GateFailure::Revert => {
+                    if let Err(error) = revert_unconfirmed_head(&mut store, &state, bytes_repaired)
+                    {
+                        return Err(exit_for_relaunch("recording the revert", &error));
+                    }
+                    return Err(
+                        "the unconfirmed release failed its boot health gate; reverting on the \
+                         next boot"
+                            .into(),
+                    );
+                }
+                GateFailure::RejectProvisional => {
+                    if let Err(error) = reject_provisional_head(&mut store, &state) {
+                        return Err(exit_for_relaunch(
+                            "rejecting the failed provisional head",
+                            &error,
+                        ));
+                    }
+                    return Err("the provisional head failed its boot health gate".into());
+                }
+                // A confirmed release that is unhealthy is REPORTED, never reverted locally: the
+                // reconciler owns the workload and may converge it later, and there is no
+                // predecessor image left to revert to. Exiting instead would hand the node to the
+                // init system's restart loop with nothing to fix on the next boot.
+                GateFailure::Report => warn(&format!(
+                    "the committed release {} is unhealthy; reporting it and continuing to \
+                     reconcile",
+                    state.release.version
+                )),
+            },
+            _ => return Err("cannot verify a boot without an installed release".into()),
         }
-        app.guardian
-            .application_failed()
-            .map_err(|error| format!("reporting initial application health failure: {error}"))?;
-        return Err("the managed application failed its initial health check".into());
     }
-    // The head has now proven healthy this boot: confirm it so a later transient crash of this
-    // (proven) head is relaunched and recovered, not rejected as a broken head.
-    if let updated::state::Installed::Present(mut state) = store.installed() {
-        if state.confirm() {
-            if let Err(error) = store.commit_installed(&state) {
-                warn(&format!("confirming the proven head failed: {error}"));
+    // The head has now proven healthy this boot: confirm it so a later transient unhealth of this
+    // (proven) head is reported and reconciled, not rejected as a broken head.
+    if gate_passed {
+        if let updated::state::Installed::Present(mut state) = store.installed() {
+            if state.confirm() {
+                if let Err(error) = store.commit_installed(&state) {
+                    warn(&format!("confirming the proven head failed: {error}"));
+                }
             }
         }
     }
@@ -673,8 +580,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // A crash may have interrupted the rollback between its journal barriers. Once the
-    // predecessor is healthy again, replay the idempotent rollback operation with the same
-    // transaction identity before declaring the recovered tower ready.
+    // predecessor is healthy again, replay the idempotent `rollback` operation with the same
+    // transaction identity before declaring this boot recovered.
     let rollback_incomplete = recovery_transaction
         .as_ref()
         .is_some_and(|tx| tx.recovery_pending(TransactionPhase::RolledBack));
@@ -697,7 +604,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     phase: Operation::Rollback,
                     reason: LifecycleReason::Update,
                     id: &tx.id,
-                    pid: app.pid(),
                     candidate: &tx.previous_release,
                     predecessor: &tx.candidate_release,
                 },
@@ -718,24 +624,19 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // Keep the journal until both release reconciliation and any environmental rollback
-    // have succeeded. If either the wrapper or this supervisor dies, the next boot sees
-    // the same evidence and repeats the idempotent recovery instead of declaring success.
+    // have succeeded. If this agent dies, the next boot sees the same evidence and repeats the
+    // idempotent recovery instead of declaring success.
     if plan.clear_journal || defer_recovery_commit {
         store.clear_journal()?;
     }
     garbage_collect(&opts, &store);
 
-    // Publish application readiness (traffic rotation) only now that the app has passed its health
-    // gate — never route traffic to an app that has not proven healthy. This is distinct from the
-    // guardian *supervisor*-readiness signalled earlier: this one is about the app, that one about
-    // this process being a working supervisor.
-    app.traffic_ready(true)
-        .map_err(|error| format!("publishing initial application readiness: {error}"))?;
-
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
-    // The boot health gate above proved this application healthy, so steady-state probing starts
-    // one interval from here; every relaunch the loop performs re-arms it with the start grace.
-    let mut health = HealthWatch::proven_healthy(&opts.timeouts);
+    // The boot gate is this boot's first observation, whichever way it went: steady-state probing
+    // starts one interval from here, and the node's first report carries what the gate saw rather
+    // than claiming nothing is known. Pool membership follows from that report — the healthproxy is
+    // the only path into rotation, and this agent never touches it directly.
+    let mut health = HealthWatch::after_boot_gate(&opts.timeouts, gate_passed);
     // Rollout telemetry: this node's identity and a client for best-effort reports. Both
     // are inert unless the current assignment carries a report URL; a node without a
     // derivable identity or a failing client simply never reports and updates as usual.
@@ -879,9 +780,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if now >= health.next_probe {
-            // One periodic hook invocation per tick drives readiness and liveness, through the
-            // provider the committed record names *now* — see `probe_steady_target`, which is why
-            // this tick's target exists only inside the call.
+            // One periodic `healthcheck` per tick is the node's whole readiness answer, invoked
+            // through the provider the committed record names *now* — see `probe_steady_target`,
+            // which is why this tick's target exists only inside the call. It is reported, never
+            // acted on: past the confirmation window the reconciler owns the workload, and the
+            // control plane owns what to do about an unhealthy one.
             let healthy = probe_steady_target(&store, |installed, lifecycle| {
                 let healthy = run_lifecycle_command(
                     lifecycle,
@@ -890,7 +793,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                         phase: Operation::Healthcheck,
                         reason: LifecycleReason::Restart,
                         id: attempt::PERIODIC,
-                        pid: app.pid(),
                         candidate: installed,
                         predecessor: installed,
                     },
@@ -908,7 +810,6 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                                 phase: Operation::Inspect,
                                 reason: LifecycleReason::Restart,
                                 id: attempt::FINGERPRINT,
-                                pid: app.pid(),
                                 candidate: installed,
                                 predecessor: installed,
                             },
@@ -921,17 +822,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 healthy
             })?;
-            let failed_liveness = health.observed(now, healthy, &opts.timeouts);
-            app.traffic_ready(healthy)
-                .map_err(|error| format!("publishing application readiness: {error}"))?;
-            if failed_liveness
-                && opts.application.mode == updated_contracts::assignment::RuntimeMode::Managed
-            {
-                app.guardian
-                    .application_failed()
-                    .map_err(|error| format!("reporting application liveness failure: {error}"))?;
-                return Err("the managed application failed its liveness check".into());
-            }
+            health.observed(now, healthy, &opts.timeouts);
         }
         let self_due = self_update.due(now);
         let cycle = cycle_due(pending.is_some(), now, loop_state.next_app_check);
@@ -954,19 +845,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     updated::bundle::verify_release(&opts.paths.versions, &installed.release)
                 {
                     fingerprints.restart_after_deployment(Instant::now());
-                    // Out of rotation before the bytes under the running application are repaired — the
-                    // repair stops and replaces it. With NO drain hold: these bytes failed integrity
-                    // verification, and every second of a configured hold is a second they keep
-                    // executing, which is the one thing this arm exists to end. Best effort, like the
-                    // stop below: a guardian that cannot be reached must not keep tampered bytes
-                    // running.
-                    let _ = withdraw_from_traffic(&mut app, DrainHold::None).await;
-                    let _ = app::stop_runtime(&mut app);
                     let repaired_from = repair_committed_bundle(&opts, &mut store)
                         .await
                         .map_err(|repair| {
                             format!(
-                                "committed application bundle changed on disk ({error}); stopped it before repository access and no signed repair was applicable: {repair}"
+                                "committed application bundle changed on disk ({error}); no signed repair was applicable: {repair}"
                             )
                         })?;
                     current = match store.installed() {
@@ -977,37 +860,33 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // wrote, exactly like every other divergence site. The repair CARRIES an in-flight
                     // update's `pending` forward, so blanking it here would leave a durable `pending`
                     // this process can never confirm (only `confirm_due` -> `confirm_update`, off this
-                    // local, clears it) — and the first ordinary crash days later would be read by
-                    // `boot::confirm_or_revert` as an exit inside the confirmation window: a revert to
-                    // the predecessor plus a permanent rejection of a release that had long since
-                    // proven itself.
+                    // local, clears it) — and the first failed health gate days later would be read
+                    // by the boot gate as an unconfirmed release inside its window: a revert to the
+                    // predecessor plus a permanent rejection of a release that had long since proven
+                    // itself.
                     pending = installed_pending(&store);
-                    // The SAME converge the runtime-relaunch path below runs, for the same reason: in
-                    // provider-managed mode neither the stop above nor the launch below touches the
-                    // application — the reconciler owns it — so `apply` is the only step that puts the
-                    // repaired bytes into service. Without it the tampered image would keep running and
-                    // the next probe would restore its readiness. NOT best effort: unlike the guardian
-                    // stop, a converge that fails would leave the old image serving, so it propagates
-                    // and this supervisor exits withdrawn, leaving boot recovery to converge and launch
-                    // the repaired release.
+                    // The SAME converge the runtime arm below runs, for the same reason: the
+                    // reconciler owns every workload process, so `apply` is the only step that puts
+                    // the repaired bytes into service. Without it the tampered image would keep
+                    // running and the next probe would report it ready. NOT best effort: a converge
+                    // that fails would leave the old image serving, so it propagates and this agent
+                    // exits, leaving boot recovery to converge the repaired release.
                     converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
                         format!("converging the environment onto the repaired bundle: {error}")
                     })?;
-                    app.launch(&opts)?;
-                    health.relaunched(&opts.timeouts);
+                    health.reconverged(&opts.timeouts);
                     // Take the repaired bundle through a LATER tick rather than falling through to the
                     // update check on this one: the check is legitimately due against the repaired
-                    // release, but reaching it here would run a second withdraw-and-drain inside the
-                    // same tick — this time paying the full configured hold — right after the repair
-                    // deliberately skipped it.
+                    // release, but reaching it here would drive a whole update transaction over a
+                    // release the reconciler has only just been asked to converge onto.
                     //
                     // On the normal cadence, and deferring the self-update check with it, for the same
                     // reason the secrets arm below does: `check` is the only thing that advances the
                     // self-update clock and this early exit skips it, so scheduling the next cycle
                     // immediately would leave `self_due` true forever and collapse `wait` to its 100 ms
                     // floor. Drift that survives a repair (a reconciler `apply` writing into the
-                    // content-addressed release directory) would then re-run withdraw + stop + a full
-                    // TUF refresh and re-download + converge + launch ten times a second, forever.
+                    // content-addressed release directory) would then re-run a full TUF refresh,
+                    // re-download and converge ten times a second, forever.
                     let retry = jitter(opts.timeouts.check_interval, REPORT_CADENCE_JITTER_PERCENT);
                     loop_state.next_app_check = Instant::now() + retry;
                     self_update.defer(Instant::now() + retry);
@@ -1015,8 +894,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // the node's only word about itself, and this arm is one of the paths that ends a
                     // cycle early — under drift that survives the repair (the arm's own stated case) a
                     // silent cycle would drain the node one `REPORT_FRESHNESS` later for a reason no
-                    // reader can see. It reports not-settled, which is simply what `relaunched` just
-                    // made true.
+                    // reader can see. It reports not-settled, which is simply what `reconverged`
+                    // just made true.
                     //
                     // The predecessor fallback resolves no repository — it runs when the control plane
                     // is unreachable — so the heartbeat then reports off the last one this node saw.
@@ -1096,42 +975,23 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 opts.deployment = assignment.deployment.clone();
-                let relaunch = opts.apply_runtime(&assignment.runtime) || secrets_changed;
-                if relaunch {
-                    // The runtime changed under the running process. A live process cannot have its
-                    // argv or environment rewritten, so stop it, converge the environment on the new
-                    // runtime, and relaunch onto it.
-                    log("assignment runtime changed; converging the environment and relaunching the application onto it");
+                if opts.apply_runtime(&assignment.runtime) || secrets_changed {
+                    // The runtime changed under the deployed release. Resolved `inputs` reach the
+                    // reconciler only as `--input-file`, and rotated secret values only in its
+                    // environment, so `apply --reason restart` is the one thing that can act on
+                    // either — the agent has no process of its own to reconfigure.
+                    log("assignment runtime changed; converging the environment onto it");
                     fingerprints.restart_after_deployment(Instant::now());
-                    // Leave rotation first, exactly as the update transaction does and through the same
-                    // sequence: the converge below is the reconciler `apply` that reconfigures or
-                    // restarts a provider-managed application, and there is no guardian stop in that
-                    // mode to withdraw readiness as a side effect. Readiness comes back only through
-                    // the ordinary observed-healthy path after `relaunched` re-arms probing, so a
-                    // failure anywhere below leaves this node withdrawn.
-                    withdraw_from_traffic(&mut app, DrainHold::configured(&opts))
-                        .await
-                        .map_err(|error| {
-                            format!("withdrawing from traffic to apply a new runtime: {error}")
-                        })?;
-                    app::stop_runtime(&mut app).map_err(|error| {
-                        format!("stopping the application to apply a new runtime: {error}")
-                    })?;
-                    // The SAME converge the boot path runs, for the same reason and through the same
-                    // function: resolved `inputs` reach the reconciler only as `--input-file` on a
-                    // lifecycle invocation, so a revision that changes them takes effect here or not
-                    // at all — relaunching the application alone would stop and start it for nothing.
+                    // The SAME converge the boot path runs, through the same function. Readiness
+                    // comes back only through the ordinary observed-healthy path once `reconverged`
+                    // re-arms probing, so a converge that fails leaves this node reporting unready.
                     converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
                         format!("converging the environment onto the new runtime: {error}")
                     })?;
-                    app.launch(&opts).map_err(|error| {
-                        format!("relaunching the application with the new launch spec: {error}")
-                    })?;
-                    // Re-gate readiness from scratch — under the configured start grace, since this
-                    // process has not passed a health gate — and let the next tick drive the
-                    // version/provider reconciliation against the freshly relaunched, correctly-
-                    // configured process.
-                    health.relaunched(&opts.timeouts);
+                    // Re-gate readiness from scratch — under the configured start grace, since
+                    // nothing has proven the re-applied release yet — and let the next tick drive
+                    // the version/provider reconciliation against it.
+                    health.reconverged(&opts.timeouts);
                     loop_state.next_app_check = Instant::now();
                     return Ok(TickFlow::Next);
                 }
@@ -1140,12 +1000,12 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // Self-update first: on an accepted handoff this process exits.
             if self_due {
                 self_update
-                    .check(&opts.supervisor_update, repo, &mut app.guardian)
+                    .check(&opts.supervisor_update, repo, &mut guardian)
                     .await;
             }
 
             if cycle.updates {
-                match check_application(&opts, repo, &mut store, &mut app, || {
+                match check_application(&opts, repo, &mut store, || {
                     fingerprints.restart_after_deployment(Instant::now());
                 })
                 .await
@@ -1156,19 +1016,18 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                         // window is watched and a crash is caught on the next boot.
                         pending = installed_pending(&store);
                         garbage_collect(&opts, &store);
-                        // The transaction replaced the process. Everything this watch holds —
-                        // the failure count, the last observation, the probe deadline set
-                        // earlier in this same tick — describes the process that was just
-                        // stopped, so re-arm as at every other launch site rather than judging
-                        // a freshly started release on its predecessor's record.
-                        health.relaunched(&opts.timeouts);
+                        // The transaction converged the machine onto a new release. What this
+                        // watch holds — the last observation, the probe deadline set earlier in
+                        // this same tick — describes the release it replaced, so re-arm as at
+                        // every other converge rather than judging a fresh release on its
+                        // predecessor's record.
+                        health.reconverged(&opts.timeouts);
                     }
                     AppOutcome::Unchanged => {}
                     AppOutcome::RestartForRecovery => {
                         // A post-activation failure left a durable rollback journal. Terminate this
-                        // disposable supervisor cleanly; the guardian relaunches it and boot recovery
-                        // performs the rollback (the single rollback path). The guardian keeps the
-                        // application alive across the restart.
+                        // disposable agent cleanly; the launcher relaunches it and boot recovery
+                        // performs the rollback (the single rollback path).
                         log("update failed after activation; restarting so boot recovery rolls back");
                         return Ok(TickFlow::Exit);
                     }
@@ -1434,16 +1293,16 @@ async fn repair_from_assignment(
 /// (the transaction journal, the unspent marker claims, the rejection records) exactly as it is.
 ///
 /// This is the ONLY response to an unrecoverable boot or update step, and it is deliberately an
-/// exit rather than a wait: the supervisor is disposable, and the guardian — which still owns the
-/// application — relaunches it, so the next boot re-derives the identical, idempotent recovery from
-/// the same evidence. Holding the process alive instead (the shape this replaced) meant a single
-/// failed durable write could pin the node down forever: no exit, so no relaunch, so no next boot,
-/// so the recovery that was supposed to happen "next boot" never did. Replaying an operator hook in
-/// a tight loop is not the alternative hazard it looks like either: the guardian throttles every
+/// exit rather than a wait: the agent is disposable — it holds no workload — and the launcher
+/// relaunches it, so the next boot re-derives the identical, idempotent recovery from the same
+/// evidence. Holding the process alive instead means a single failed durable write pins the node
+/// down forever: no exit, so no relaunch, so no next boot, so the recovery that was supposed to
+/// happen "next boot" never did. Replaying an operator hook in
+/// a tight loop is not the alternative hazard it looks like either: the launcher throttles every
 /// relaunch through one exponential backoff capped at five minutes, and that backoff is rate-
 /// limited precisely so THIS path cannot escape it. An exit from here typically comes after a long
-/// boot — situation gathering, quiesce, activation, an operator hook with an operator-chosen
-/// timeout — so the guardian's "it ran a while, this was a transient crash" reset would otherwise
+/// boot — situation gathering, activation, an operator hook with an operator-chosen timeout — so
+/// the launcher's "it ran a while, this was a transient crash" reset would otherwise
 /// fire on every cycle; it stops resetting past a bounded number of relaunches per hour, and the
 /// loop settles at one replay per five minutes.
 fn exit_for_relaunch(what: &str, cause: &dyn std::fmt::Display) -> Box<dyn std::error::Error> {
@@ -1503,11 +1362,11 @@ async fn recover_through_transients<T>(
     retry: &TransientRetry,
     guardian: &mut Guardian,
     shutdown: &AtomicBool,
-    mut step: impl FnMut(&mut Guardian) -> io::Result<T>,
+    mut step: impl FnMut() -> io::Result<T>,
 ) -> Result<T, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + retry.budget;
     loop {
-        let error = match step(guardian) {
+        let error = match step() {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
@@ -1644,25 +1503,22 @@ fn garbage_collect(opts: &Options, store: &dyn Store) {
 }
 
 /// Reject the bytes of a *provisional* (never-health-proven) cold-installed head so the next
-/// boot's cold install descends via ordered fallback past it. A confirmed head is left untouched.
-/// Returns whether a rejection was actually recorded (i.e. the head was provisional). This is the
-/// single reject rule shared by the two ways a provisional head can prove bad: it crashed last
-/// boot (service exit) or it wedged alive through the boot health gate.
+/// boot's cold install descends via ordered fallback past it.
+///
+/// Called only for a head [`boot::plan_gate_failure`] has already classified provisional: a head
+/// with a predecessor to revert to takes the revert path instead, and a confirmed head is never
+/// rejected for ill health at all.
 fn reject_provisional_head(
     store: &mut FileStore,
     state: &updated::state::InstalledState,
-    why: &str,
-) -> std::io::Result<bool> {
-    if state.confirmed {
-        return Ok(false);
-    }
+) -> std::io::Result<()> {
     store.reject(&state.repository_lineage, &state.archive_sha256)?;
     warn(&format!(
-        "provisional head {} {why}; rejected its bytes so the next cold install descends via \
-         ordered fallback",
+        "provisional head {} never passed a health gate; rejected its bytes so the next cold \
+         install descends via ordered fallback",
         state.release.version
     ));
-    Ok(true)
+    Ok(())
 }
 
 /// How many consecutive boots may fail to health-gate a crash-recovered rollback's predecessor
@@ -1742,35 +1598,78 @@ fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
     confirmation_window_rollback(situation)
 }
 
-/// The rollback owed by the committed record itself: an unconfirmed update whose application died
-/// inside its confirmation window (`service_exited`), or one whose predecessor pointer a previous
-/// boot already restored. Both are the reverts [`boot::plan_boot`] performs off `pending`, and both
-/// must replay the operator's compensating `rollback` for the candidate's machine-state changes.
+/// The rollback owed by the committed record itself, when a previous boot already moved the active
+/// pointer back to `pending.previous_release` but died before the compensating `rollback` and the
+/// final commit. It is the revert [`boot::plan_boot`] completes off `pending`, and it must replay
+/// the operator's `rollback` for the candidate's machine-state changes.
+///
+/// The rejection is NOT re-derived here: the boot that judged the candidate recorded it durably
+/// (see [`revert_unconfirmed_head`]) before the pointer ever moved.
 fn confirmation_window_rollback(situation: &Situation) -> Option<Transaction> {
-    if let Installed::Present(installed) = &situation.installed {
-        if let Some(pending) = &installed.pending {
-            let rollback_started = situation.active.as_ref() == Some(&pending.previous_release);
-            if situation.service_exited || rollback_started {
-                return Some(Transaction {
-                    id: pending.lifecycle_attempt_id.clone(),
-                    previous_release: pending.previous_release.clone(),
-                    previous_archive_sha256: pending.previous_archive_sha256.clone(),
-                    previous_repository_lineage: pending.previous_repository_lineage.clone(),
-                    candidate_release: installed.release.clone(),
-                    candidate_archive_sha256: installed.archive_sha256.clone(),
-                    candidate_repository_lineage: installed.repository_lineage.clone(),
-                    // The rollback is owed either way; the permanent rejection that normally rides
-                    // with it is withheld when this boot repaired the candidate's damaged tree.
-                    // See [`Situation::charge_crash_to_release`].
-                    candidate_rejection_required: situation.charge_crash_to_release(),
-                    lifecycle: pending.lifecycle.clone(),
-                    rollback_health_failures: 0,
-                    phase: TransactionPhase::RollbackStarted,
-                });
-            }
-        }
+    let Installed::Present(installed) = &situation.installed else {
+        return None;
+    };
+    let pending = installed.pending.as_ref()?;
+    if situation.active.as_ref() != Some(&pending.previous_release) {
+        return None;
     }
-    None
+    Some(rollback_of_unconfirmed(installed, pending, false))
+}
+
+/// The rollback transaction that reverts `installed` to the predecessor its `pending` names — the
+/// one shape both the boot gate's revert and the resumption of an interrupted one produce, so a
+/// revert that is decided in one boot and driven by the next cannot describe two different things.
+fn rollback_of_unconfirmed(
+    installed: &updated::state::InstalledState,
+    pending: &Pending,
+    reject_candidate: bool,
+) -> Transaction {
+    Transaction {
+        id: pending.lifecycle_attempt_id.clone(),
+        previous_release: pending.previous_release.clone(),
+        previous_archive_sha256: pending.previous_archive_sha256.clone(),
+        previous_repository_lineage: pending.previous_repository_lineage.clone(),
+        candidate_release: installed.release.clone(),
+        candidate_archive_sha256: installed.archive_sha256.clone(),
+        candidate_repository_lineage: installed.repository_lineage.clone(),
+        candidate_rejection_required: reject_candidate,
+        lifecycle: pending.lifecycle.clone(),
+        rollback_health_failures: 0,
+        phase: TransactionPhase::RollbackStarted,
+    }
+}
+
+/// Record the revert an unconfirmed release earned by failing its boot health gate: a durable
+/// rollback journal, and the candidate's rejection.
+///
+/// Only the intent is written here — the rollback itself is boot recovery's, the single
+/// implementation — so this agent exits and the next boot restores the predecessor's pointer, runs
+/// its `apply`, gates it, and replays the compensating `rollback` from exactly this journal.
+///
+/// `bytes_repaired` is the one thing that withholds the rejection. It is permanent and keyed by
+/// archive hash, so it may never be charged to bytes this same boot re-downloaded and re-verified:
+/// the gate then failed on a tree that no longer exists. The revert is owed either way — it is
+/// reversible — and a release that fails the gate again on the next boot, which finds the tree
+/// intact, is charged for it, so the descent still terminates.
+fn revert_unconfirmed_head(
+    store: &mut dyn Store,
+    installed: &updated::state::InstalledState,
+    bytes_repaired: bool,
+) -> io::Result<()> {
+    let pending = installed
+        .pending
+        .as_ref()
+        .expect("an unconfirmed head has a pending record");
+    let tx = rollback_of_unconfirmed(installed, pending, !bytes_repaired);
+    warn(&format!(
+        "release {} failed its boot health gate inside its confirmation window; reverting to {}",
+        installed.release.version, pending.previous_release.version
+    ));
+    persist_transaction(store, &tx)?;
+    if tx.candidate_rejection_required {
+        store.reject(&installed.repository_lineage, &installed.archive_sha256)?;
+    }
+    Ok(())
 }
 
 fn complete_recovery_activation(
@@ -1785,8 +1684,7 @@ fn complete_recovery_activation(
         return Ok(());
     }
     // Restore the predecessor's machine state through the same reconciler operation used for the
-    // candidate. Managed mode has already stopped the candidate; provider-managed mode never
-    // exposes or manipulates an application PID.
+    // candidate — the predecessor's own `apply`, which is what re-converges whatever it owns.
     run_lifecycle_command(
         tx.lifecycle.as_ref(),
         opts,
@@ -1794,7 +1692,6 @@ fn complete_recovery_activation(
             phase: Operation::Apply,
             reason: LifecycleReason::Update,
             id: &tx.id,
-            pid: None,
             candidate: &tx.previous_release,
             predecessor: &tx.candidate_release,
         },
@@ -1806,16 +1703,13 @@ fn complete_recovery_activation(
 // ============================== boot: gather + execute ==============================
 
 /// Read the whole world the boot planner needs — durable state via the [`Store`] and the
-/// guardian's recovery markers, already claimed into [`guardian::Evidence`] — into one
+/// launcher's rejection marker, already claimed into [`guardian::Evidence`] — into one
 /// [`Situation`]. The shell's single point of input gathering. Reading evidence leaves it on disk;
-/// the boot path clears a claim only once the intent it implies is durable.
+/// the boot path clears the claim only once the intent it implies is durable.
 fn gather_situation(
     opts: &Options,
     store: &dyn Store,
-    guardian: &Guardian,
     evidence: &guardian::Evidence,
-    first_install: bool,
-    bytes_repaired: bool,
 ) -> io::Result<Situation> {
     let active = store.active_release()?;
     let installed = store.installed();
@@ -1824,10 +1718,6 @@ fn gather_situation(
         installed,
         active,
         journal,
-        service_exited: evidence.service_exited(),
-        bytes_repaired,
-        app_running: guardian.running_app(),
-        first_install,
         bad_supervisor: evidence.rejected_supervisor().map(PathBuf::from),
         confirm_window: opts.timeouts.confirmation_window,
         now: now_unix(),
@@ -1839,31 +1729,12 @@ fn gather_situation(
 fn execute_boot_plan(
     plan: &Plan,
     store: &mut dyn Store,
-    guardian: &mut Guardian,
     self_update: &mut SelfUpdateState,
     defer_commit: bool,
     mut recovery: Option<&mut Transaction>,
     evidence: &mut guardian::Evidence,
 ) -> io::Result<Option<Pending>> {
     if let Some(tx) = recovery.as_mut() {
-        if tx.recovery_pending(TransactionPhase::RollbackStopStarted) {
-            advance_transaction(store, tx, TransactionPhase::RollbackStopStarted)?;
-        }
-    }
-    let needs_quiesce = recovery
-        .as_ref()
-        .is_none_or(|tx| tx.recovery_pending(TransactionPhase::RollbackStopped));
-    if plan.quiesce && needs_quiesce {
-        warn("stopping the uncommitted candidate before reconciling its release");
-        stop(guardian)?;
-    }
-    if needs_quiesce && recovery.is_some() {
-        Chaos::from_env().crossing(update::boundary::ROLLBACK_STOP_APPLIED);
-    }
-    if let Some(tx) = recovery.as_mut() {
-        if tx.recovery_pending(TransactionPhase::RollbackStopped) {
-            advance_transaction(store, tx, TransactionPhase::RollbackStopped)?;
-        }
         if tx.recovery_pending(TransactionPhase::RollbackActivateStarted) {
             advance_transaction(store, tx, TransactionPhase::RollbackActivateStarted)?;
         }
@@ -1980,8 +1851,8 @@ fn installed_manifest_sha256(store: &dyn Store) -> String {
 /// `garbage_collect` protects exactly the provider release this record names, so any second copy of
 /// it is a release the collector is free to prune: an in-loop repair commits a different provider
 /// (its own `stage_providers` result), the boot-time copy then named a provider bundle that was
-/// about to disappear, and every periodic probe after it failed to resolve — three of which report
-/// a liveness failure that is terminal for a perfectly healthy tower.
+/// about to disappear, and every periodic probe after it failed to resolve — so a node whose
+/// release was serving perfectly well reported itself unready and was drained out of rotation.
 fn probe_steady_target<T>(
     store: &dyn Store,
     probe: impl FnOnce(&updated::bundle::ReleaseId, &updated::state::ProviderRelease) -> T,
@@ -2150,9 +2021,9 @@ mod tests {
     }
 
     /// A node whose update committed (installed = candidate, pending = predecessor) and whose
-    /// application then died inside the confirmation window, with `journal` still on disk in the
-    /// given phase.
-    fn window_crash(phase: Option<Phase>) -> Situation {
+    /// revert a previous boot began — the active pointer is already back on the predecessor — with
+    /// `journal` still on disk in the given phase.
+    fn interrupted_revert(phase: Option<Phase>) -> Situation {
         let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
@@ -2173,7 +2044,7 @@ mod tests {
         };
         Situation {
             installed: Installed::Present(Box::new(installed)),
-            active: Some(candidate.clone()),
+            active: Some(predecessor.clone()),
             journal: phase.map(|phase| Transaction {
                 id: "attempt".into(),
                 previous_release: predecessor,
@@ -2187,10 +2058,6 @@ mod tests {
                 rollback_health_failures: 0,
                 phase,
             }),
-            service_exited: true,
-            bytes_repaired: false,
-            app_running: None,
-            first_install: false,
             bad_supervisor: None,
             confirm_window: Duration::from_secs(60),
             now: 120,
@@ -2234,7 +2101,7 @@ mod tests {
     #[test]
     fn the_cycle_has_exactly_one_report_writer_and_no_way_around_it() {
         // The node's report freshness is what keeps it in rotation, and the loop has exactly ONE
-        // report writer. Several paths end a cycle early (a failed refresh, a relaunch, an
+        // report writer. Several paths end a cycle early (a failed refresh, a converge, an
         // integrity repair under drift that survives it); each one that reached the top of the loop
         // without reporting spent the node's freshness budget and drained it one REPORT_FRESHNESS
         // later, for a reason no reader could see. The structure that makes that impossible is the
@@ -2264,71 +2131,126 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_repaired_boot_still_owes_the_rollback_but_not_the_rejection() {
-        // Both halves of the attribution rule at the synthesis site. The rollback is owed whether
-        // or not this boot repaired the tree — the candidate's machine-state changes must be
-        // compensated either way — while `candidate_rejection_required`, which is permanent and
-        // keyed by archive hash, is charged only to bytes this boot did not just re-download.
-        let intact = recovery_transaction(&window_crash(None)).expect("the crash owes a rollback");
-        assert!(intact.candidate_rejection_required);
+    /// The committed record of an unconfirmed update, as the boot health gate finds it.
+    fn unconfirmed_head() -> InstalledState {
+        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        InstalledState {
+            repository_lineage: lineage.clone(),
+            release: release("2.0.0", "two"),
+            archive_sha256: "archive-two".into(),
+            lifecycle: provider(),
+            pending: Some(updated::state::Pending {
+                lifecycle_attempt_id: "attempt".into(),
+                previous_release: release("1.0.0", "one"),
+                previous_archive_sha256: "archive-one".into(),
+                previous_repository_lineage: lineage,
+                committed_at: 100,
+                lifecycle: provider(),
+            }),
+            confirmed: true,
+        }
+    }
 
-        let mut situation = window_crash(None);
-        situation.bytes_repaired = true;
-        let repaired = recovery_transaction(&situation)
-            .expect("a repaired boot owes the same rollback; only the rejection is withheld");
-        assert!(repaired.is_rollback());
-        assert_eq!(repaired.previous_release, intact.previous_release);
+    fn store_holding(installed: &InstalledState) -> MemStore {
+        MemStore {
+            installed: Some(installed.clone()),
+            active: Some(installed.release.clone()),
+            ..MemStore::default()
+        }
+    }
+
+    #[test]
+    fn a_failed_gate_inside_the_window_records_a_drivable_revert_and_the_rejection() {
+        // The one local revert left in the agent, at its decision point: the release's
+        // `healthcheck` would not pass at boot while the update was still unconfirmed, so the
+        // candidate is rejected by content hash and a rollback journal is left for the next boot —
+        // the single rollback implementation. Recording the intent rather than performing it here
+        // is what keeps that true.
+        let head = unconfirmed_head();
+        let mut store = store_holding(&head);
+
+        revert_unconfirmed_head(&mut store, &head, false).unwrap();
+
+        let journal = store.journal().unwrap().expect("a durable rollback intent");
+        assert!(journal.is_rollback());
+        assert_eq!(journal.previous_release, release("1.0.0", "one"));
+        assert!(journal.candidate_rejection_required);
+        assert!(journal.recovery_pending(Phase::PredecessorActivated));
+        assert!(journal.recovery_pending(Phase::RolledBack));
+        assert!(store.is_rejected(&head.repository_lineage, "archive-two"));
+    }
+
+    #[test]
+    fn a_repaired_boot_still_owes_the_revert_but_not_the_rejection() {
+        // A rejection is permanent and keyed by archive hash, so it may never be charged to bytes
+        // this same boot re-downloaded and re-verified — the gate failed on a tree that no longer
+        // exists. The revert is owed either way: it is reversible, and the next boot finds an
+        // intact tree and charges a repeat failure to the release.
+        let head = unconfirmed_head();
+        let mut store = store_holding(&head);
+
+        revert_unconfirmed_head(&mut store, &head, true).unwrap();
+
+        let journal = store.journal().unwrap().expect("the revert is still owed");
+        assert!(journal.is_rollback());
+        assert!(!journal.candidate_rejection_required);
         assert!(
-            !repaired.candidate_rejection_required,
+            !store.is_rejected(&head.repository_lineage, "archive-two"),
             "the repair re-verified these bytes; they must not be blacklisted"
         );
     }
 
     #[test]
-    fn a_spent_journal_still_owes_the_confirmation_window_rollback() {
-        // Regression: `switch_over` tolerates a failed `clear_journal`, and a supervisor can die
-        // between `commit_installed` and the journal's terminal write — either way a spent
-        // CommitStarted/Committed journal survives. The application then crashed inside its
-        // window, so the boot plan reverts to the predecessor off `pending`; without a recovery
-        // transaction the reconciler's compensating `rollback` never ran, and the candidate's
-        // machine-state changes (backups, routing, migrations) were left behind on a node reverted
-        // to the predecessor binary. The journal-less path has always synthesized that rollback.
-        let expected =
-            recovery_transaction(&window_crash(None)).expect("the journal-less rollback");
-        assert!(expected.is_rollback());
-        for phase in [Phase::CommitStarted, Phase::Committed] {
-            let derived = recovery_transaction(&window_crash(Some(phase)))
-                .unwrap_or_else(|| panic!("a spent {phase:?} journal still owes a rollback"));
-            assert_eq!(
-                derived, expected,
-                "a spent journal must derive the same rollback the journal-less path does"
-            );
-        }
+    fn a_confirmed_release_that_fails_its_gate_is_only_reported() {
+        // The other half of the policy: a release that has proven itself once is never reverted
+        // locally on a later unhealthy gate. The reconciler owns the workload and may converge it,
+        // there is no predecessor image left, and reverting would fight the assignment — so it is
+        // reported unhealthy and the agent keeps reconciling.
+        let confirmed = InstalledState::confirmed(
+            RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+            release("2.0.0", "two"),
+            "archive-two".into(),
+            provider(),
+        );
+        assert_eq!(boot::plan_gate_failure(&confirmed), GateFailure::Report);
+        assert_eq!(
+            boot::plan_gate_failure(&unconfirmed_head()),
+            GateFailure::Revert
+        );
+        // Whichever way the gate went, it is this boot's first observation and the node's first
+        // report carries it.
+        let timeouts = Timeouts::default();
+        assert_eq!(
+            HealthWatch::after_boot_gate(&timeouts, false).last_ready,
+            Some(false)
+        );
+        assert_eq!(
+            HealthWatch::after_boot_gate(&timeouts, true).last_ready,
+            Some(true)
+        );
     }
 
     #[test]
-    fn a_spent_committed_journal_whose_pointer_moved_derives_a_drivable_rollback() {
-        // The pointer fell back to the predecessor (an in-loop repair of a candidate that failed
-        // local verification) while a spent `Committed` journal was still on disk, and the process
-        // died before `commit_installed`. `classify_recovery` then reads `RestorePredecessor`, but
-        // the phase machine refuses to begin a rollback from `Committed`, so returning that journal
-        // verbatim produced a "recovery" with no rollback rank: every resume gate in
-        // `execute_boot_plan` closed and the plan's reconciliation was silently discarded.
-        let mut situation = window_crash(Some(Phase::Committed));
-        situation.active = Some(release("1.0.0", "one"));
-        situation.service_exited = false;
-
-        let tx = recovery_transaction(&situation)
-            .expect("a spent journal still owes the rollback its pointer already began");
-
-        assert_eq!(
-            tx.rollback_rank(),
-            Some(0),
-            "the recovery must sit on the rollback path, or every resume gate stays closed"
-        );
-        assert!(tx.recovery_pending(Phase::RollbackStopped));
-        assert!(tx.recovery_pending(Phase::PredecessorActivated));
+    fn a_spent_journal_still_derives_a_drivable_revert() {
+        // Regression: `switch_over` tolerates a failed `clear_journal`, and an agent can die
+        // between `commit_installed` and the journal's terminal write — either way a spent
+        // CommitStarted/Committed journal survives. A later boot then finds the pointer already
+        // back on the predecessor (the revert a failed gate began). `classify_recovery` reads
+        // `RestorePredecessor`, but the phase machine refuses to BEGIN a rollback from a terminal
+        // `Committed`, so returning that journal verbatim produced a "recovery" with no rollback
+        // rank: every resume gate closed, the plan's reconciliation was silently discarded, and
+        // the candidate's machine-state changes were never compensated.
+        for phase in [Phase::CommitStarted, Phase::Committed] {
+            let mut tx = recovery_transaction(&interrupted_revert(Some(phase)))
+                .unwrap_or_else(|| panic!("a spent {phase:?} journal still owes the revert"));
+            if !tx.is_rollback() {
+                tx.advance(Phase::RollbackStarted)
+                    .expect("a non-terminal journal is moved onto the rollback path");
+            }
+            assert_eq!(tx.previous_release, release("1.0.0", "one"));
+            assert!(tx.recovery_pending(Phase::PredecessorActivated));
+            assert!(tx.recovery_pending(Phase::RolledBack));
+        }
     }
 
     #[test]
@@ -2336,9 +2258,7 @@ mod tests {
         // Guard the scope of the fix: `NeverSwapped` (here, a completed rollback whose pointer is
         // back on the predecessor) is handled by the boot plan alone, and synthesizing anything
         // from `pending` would re-run the whole rollback machine and double-invoke every hook.
-        let mut situation = window_crash(Some(Phase::RolledBack));
-        situation.active = Some(release("1.0.0", "one"));
-        assert!(recovery_transaction(&situation).is_none());
+        assert!(recovery_transaction(&interrupted_revert(Some(Phase::RolledBack))).is_none());
     }
 
     #[test]
@@ -2413,9 +2333,8 @@ mod tests {
     }
 
     /// The shipped example values from the finding this test pins: a 30s start grace with a 1s
-    /// probe interval. A relaunch the loop performs itself gets that whole grace, or the fourth
-    /// second after a benign reassignment reports a still-binding application to the guardian as
-    /// dead.
+    /// probe interval. A converge the loop performs itself gets that whole grace, or the fourth
+    /// second after a benign reassignment reports a still-starting release as unready.
     fn reassignment_timeouts() -> Timeouts {
         Timeouts {
             health_grace: Duration::from_secs(30),
@@ -2425,56 +2344,187 @@ mod tests {
     }
 
     #[test]
-    fn a_relaunch_arms_the_configured_start_grace_before_the_first_probe() {
+    fn a_converge_arms_the_configured_start_grace_before_the_first_probe() {
         let timeouts = reassignment_timeouts();
-        let mut health = HealthWatch::proven_healthy(&timeouts);
+        let mut health = HealthWatch::after_boot_gate(&timeouts, true);
         assert!(
             health.next_probe <= Instant::now() + timeouts.health_interval,
-            "an application that already passed a health gate is probed one interval later"
+            "a release the boot gate just proved is probed one interval later"
         );
 
-        // The control plane publishes a reassignment that only changes the launch spec; the loop
-        // stops and relaunches the application.
-        let relaunched_at = Instant::now();
-        health.relaunched(&timeouts);
+        // The control plane publishes a reassignment that changes only the runtime; the loop runs
+        // `apply --reason restart` and the reconciler brings the workload back up on its own time.
+        let converged_at = Instant::now();
+        health.reconverged(&timeouts);
         assert!(
-            health.next_probe >= relaunched_at + timeouts.health_grace,
-            "a process the loop just launched has proven nothing, so no probe may count against              it until the configured grace has passed"
+            health.next_probe >= converged_at + timeouts.health_grace,
+            "nothing has proven the re-applied release, so no probe may be recorded against it \
+             until the configured grace has passed"
         );
         assert_eq!(
             health.last_ready, None,
-            "the replaced process's readiness is not the fresh process's readiness"
+            "the previous release's readiness is not the re-applied release's readiness"
         );
     }
 
     #[test]
-    fn a_relaunch_drops_the_failures_counted_against_the_process_it_replaced() {
+    fn an_unhealthy_steady_probe_is_reported_and_never_acted_on() {
+        // Health is the reconciler's answer about a workload this agent does not own, so a
+        // periodic probe only ever moves what the node REPORTS. Past the confirmation window there
+        // is no local response to ill health at all — the control plane decides.
         let timeouts = reassignment_timeouts();
-        let mut health = HealthWatch::proven_healthy(&timeouts);
+        let mut health = HealthWatch::after_boot_gate(&timeouts, true);
         let mut now = Instant::now();
-        // Two failed probes against the OLD process — one short of the liveness verdict.
-        for _ in 0..MAX_LIVENESS_FAILURES - 1 {
-            assert!(!health.observed(now, false, &timeouts));
+        for _ in 0..10 {
+            health.observed(now, false, &timeouts);
+            assert_eq!(health.last_ready, Some(false));
             now += timeouts.health_interval;
         }
-        assert_eq!(health.consecutive_failures, MAX_LIVENESS_FAILURES - 1);
-
-        health.relaunched(&timeouts);
+        health.observed(now, true, &timeouts);
         assert_eq!(
-            health.consecutive_failures, 0,
-            "failures belong to the process that produced them, not to its replacement"
+            health.last_ready,
+            Some(true),
+            "a release the hook brings back reports ready again with no agent intervention"
+        );
+        assert_eq!(health.next_probe, now + timeouts.health_interval);
+    }
+
+    /// Options in the shape [`crate::options::parse_args`] produces, against a local routing
+    /// repository so nothing here reaches the network.
+    fn options() -> Options {
+        use updated::config::{Paths, Routing, Storage};
+        let root = PathBuf::from("/nonexistent/updated-agent-tests");
+        let routing = Routing {
+            root: root.join("enrollment/routing"),
+            base_url: root.join("routing").display().to_string(),
+            assignment: "assignments/agents/agent-test.json".into(),
+            transport_timeout: Duration::from_secs(30),
+            mtls: updated::tls::Identity::new(
+                root.join("client.pem"),
+                root.join("client.key"),
+                root.join("ca.pem"),
+            ),
+        };
+        Options {
+            deployment: "test".into(),
+            secrets: crate::secrets::SecretManager::new(&routing, &[]).expect("a local repository"),
+            paths: Paths::resolve(&root, &root.join("enrollment")),
+            application: Application {
+                product: "app".into(),
+                channel: "stable".into(),
+                install_root: root.clone(),
+                secrets: Vec::new(),
+                inputs: std::collections::BTreeMap::new(),
+            },
+            routing,
+            timeouts: BoundedTimeouts::new(Timeouts::default()),
+            storage: Storage::default(),
+            supervisor_update: SupervisorUpdate {
+                channel: "stable".into(),
+                state_dir: root.join("state"),
+                check_interval: Duration::from_secs(60),
+            },
+            identity_renewal: IdentityRenewal {
+                bootstrap: root.join("bootstrap.toml"),
+                state_dir: root.join("enrollment"),
+            },
+        }
+    }
+
+    fn runtime() -> updated_contracts::assignment::ManagedRuntime {
+        use updated_contracts::assignment::{
+            ManagedRepositoryLimits, ManagedRuntime, ManagedStorage, ManagedTimeouts,
+        };
+        ManagedRuntime {
+            product: "app".into(),
+            channel: "stable".into(),
+            install_root: PathBuf::from("/nonexistent/updated-agent-tests"),
+            secrets: Vec::new(),
+            inputs: std::collections::BTreeMap::new(),
+            repository: ManagedRepositoryLimits {
+                metadata_limit: 1 << 20,
+                target_limit: 512 << 20,
+                transport_timeout_seconds: 30,
+            },
+            storage: ManagedStorage {
+                inactive_releases: 2,
+                inactive_providers: 2,
+                inactive_supervisors: 2,
+                inactive_bytes: 1 << 30,
+                inactive_repository_caches: 2,
+            },
+            timeouts: ManagedTimeouts {
+                check_interval_seconds: 15,
+                health_grace_seconds: 30,
+                health_successes: 2,
+                health_interval_seconds: 1,
+                refresh_retry_seconds: 5,
+                confirmation_window_seconds: 120,
+                supervisor_check_interval_seconds: 3600,
+            },
+        }
+    }
+
+    #[test]
+    fn a_reassignment_converges_exactly_when_the_release_could_observe_the_change() {
+        // The agent owns no process to reconfigure, so the ONLY way a changed secret reference or
+        // a re-resolved input reaches the release is another reconciler invocation — its
+        // environment and its `--input-file`. Answering "no change" on one of those leaves the
+        // node running on values the assignment has replaced; answering "changed" on a cadence
+        // tweak re-applies the whole fleet for nothing.
+        let mut opts = options();
+        assert!(
+            !opts.apply_runtime(&runtime()),
+            "the runtime the options already hold converges nothing"
         );
 
-        // Even once the grace has passed, the fresh process gets the full failure budget before
-        // the supervisor reports it to the guardian and exits.
-        let mut now = health.next_probe;
-        for _ in 0..MAX_LIVENESS_FAILURES - 1 {
-            assert!(!health.observed(now, false, &timeouts));
-            now += timeouts.health_interval;
-        }
+        let mut rotated = runtime();
+        rotated.secrets = vec![updated_contracts::assignment::SecretReference {
+            environment: "API_TOKEN".into(),
+            secret: "service".into(),
+            key: "token".into(),
+        }];
+        assert!(opts.apply_runtime(&rotated), "a new secret reference");
+
+        let mut reinput = rotated.clone();
+        reinput.inputs = std::collections::BTreeMap::from([(
+            "endpoint".to_string(),
+            updated_contracts::telemetry::OutputValue::String {
+                value: "https://service.internal:8200".into(),
+            },
+        )]);
+        assert!(opts.apply_runtime(&reinput), "a re-resolved input");
+
+        let mut cadence = reinput.clone();
+        cadence.timeouts.check_interval_seconds = 60;
         assert!(
-            health.observed(now, false, &timeouts),
-            "past its grace, a genuinely dead application still fails its liveness check"
+            !opts.apply_runtime(&cadence),
+            "a cadence change is picked up without touching the release"
+        );
+        assert_eq!(opts.timeouts.check_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn every_converge_the_loop_runs_is_apply_reason_restart() {
+        // A rotation, a re-resolved input, and a repaired bundle all reach the release the same
+        // way: `apply --reason restart`, which is the reconciler's cue to re-converge whatever it
+        // owns onto the current values. `install` is the first boot's alone.
+        let source = include_str!("main.rs");
+        let loop_body = &source[source
+            .find("let flow: Result<TickFlow")
+            .expect("the cycle body is one expression")..];
+        // Spelled in halves so this assertion does not count itself.
+        let call = concat!("converge_", "environment(&opts, &store,");
+        let restart = concat!(
+            "converge_",
+            "environment(&opts, &store, LifecycleReason::Restart)"
+        );
+        let converges = loop_body.matches(call).count();
+        assert_eq!(converges, 2, "the repair arm and the runtime arm");
+        assert_eq!(
+            loop_body.matches(restart).count(),
+            converges,
+            "every in-loop converge is a restart-reason apply"
         );
     }
 

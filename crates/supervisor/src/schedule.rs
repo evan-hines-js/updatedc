@@ -1,4 +1,5 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
@@ -50,6 +51,51 @@ fn mix(mut seed: u64) -> u64 {
 
 pub(crate) fn network_backoff(base: Duration, failures: u32) -> Duration {
     foundation::time::exponential_backoff(base, failures, 6, Duration::from_secs(15 * 60))
+}
+
+// ------------------------------- async waits --------------------------------
+
+/// Sleep, returning `true` early if shutdown was requested.
+pub(crate) async fn sleep_interruptible(delay: Duration, shutdown: &AtomicBool) -> bool {
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    shutdown.load(Ordering::SeqCst)
+}
+
+/// Resolve when the OS asks the agent to stop.
+#[cfg(unix)]
+pub(crate) async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let mut int = match signal(SignalKind::interrupt()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+}
+#[cfg(windows)]
+pub(crate) async fn wait_for_shutdown_signal() {
+    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
+    let (mut c, mut close, mut down) = match (ctrl_c(), ctrl_close(), ctrl_shutdown()) {
+        (Ok(c), Ok(close), Ok(down)) => (c, close, down),
+        _ => return,
+    };
+    tokio::select! {
+        _ = c.recv() => {}
+        _ = close.recv() => {}
+        _ = down.recv() => {}
+    }
 }
 
 #[cfg(test)]

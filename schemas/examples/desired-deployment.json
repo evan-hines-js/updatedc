@@ -26,11 +26,9 @@
     "signatures": []
   },
   "runtime": {
-    "mode": "managed",
     "product": "web",
     "channel": "stable",
     "install_root": "/opt/web",
-    "args": ["--config", "/etc/web/config.toml"],
     "secrets": [
       {
         "environment": "DATABASE_PASSWORD",
@@ -63,8 +61,7 @@
       "health_interval_seconds": 1,
       "refresh_retry_seconds": 5,
       "confirmation_window_seconds": 120,
-      "supervisor_check_interval_seconds": 3600,
-      "drain_hold_seconds": 0
+      "supervisor_check_interval_seconds": 3600
     }
   }
 }

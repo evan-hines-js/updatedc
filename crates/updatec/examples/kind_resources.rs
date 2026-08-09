@@ -6,11 +6,9 @@ use updatec::*;
 
 fn runtime() -> RuntimeSpec {
     RuntimeSpec {
-        mode: RuntimeModeSpec::Managed,
         product: "app".into(),
         channel: "stable".into(),
         install_root: "/var/lib/updated".into(),
-        args: vec!["--addr".into(), "0.0.0.0:8080".into()],
         secrets: vec![],
         repository: RepositoryLimitsSpec {
             metadata_limit: 1_048_576,
@@ -33,7 +31,6 @@ fn runtime() -> RuntimeSpec {
             confirmation_window_seconds: 2,
             supervisor_check_interval_seconds: 3600,
             // No drain hold for the base fleet (not a zero-downtime rollout scenario).
-            drain_hold_seconds: Some(0),
         },
     }
 }

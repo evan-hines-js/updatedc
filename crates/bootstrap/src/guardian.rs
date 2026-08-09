@@ -1,60 +1,43 @@
-//! The guardian loop.
+//! The launcher loop.
 //!
-//! The guardian owns the application and runs a disposable supervisor over an inherited
-//! control channel. It is transparent to the init system: it forwards a stop signal
-//! *down* to the application, and rolls the application's exit code *up* — when the app
-//! exits on its own, the guardian records the crash, tears the tower down, and exits
-//! with the app's code, and the init system restarts everything fresh. It never keeps
-//! the application alive itself; a crash-looping update is caught on the next start by
-//! the supervisor reading the recorded crash, not by any supervision loop here.
+//! The launcher manages exactly one thing: which agent binary runs. It launches the
+//! agent named by the committed pointer over an inherited control channel, holds a
+//! staged replacement to a readiness deadline and a confirmation window before committing
+//! it, and reverts the pointer — recording a rejection by content hash — when the
+//! replacement fails. It knows nothing about workloads: no process it owns exists besides
+//! the agent, so an agent crash, replacement, or self-update costs nothing but the agent.
 //!
 //! The control loop is single-threaded: `poll` watches the control channel while the same
-//! loop also checks the application process and the shutdown flag. Nothing about the
-//! supervisor, the application, or the release state is touched from anywhere else.
-//!
-//! It is not the only thread in the process, though. When `--probe-address` is set (the
-//! shipped units do set it), [`crate::probe::serve`] spawns a `guardian-probes` accept
-//! thread plus up to `MAX_CONCURRENT_PROBES` short-lived `guardian-probe` threads; they
-//! share [`ProbeMachine`], which is why its state is `Arc`ed atomics with acquire/release
-//! ordering rather than a plain field. On Windows the control channel additionally moves
-//! each write onto a scratch thread so a wedged pipe can be abandoned after a timeout.
-//! Every one of those threads is fatal to the whole tower if it panics (`panic = "abort"`),
-//! so they must stay as small as they are.
+//! loop checks the agent process and the shutdown flag. Nothing about the agent or the
+//! release state is touched from anywhere else. On Windows the control channel additionally
+//! moves each write onto a scratch thread so a wedged pipe can be abandoned after a timeout;
+//! that thread is fatal to the whole process if it panics (`panic = "abort"`), so it must
+//! stay as small as it is.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use control::{Request, Response};
 
 use crate::log::{error, info, warn};
-use crate::probe::Machine as ProbeMachine;
 use crate::record;
-use crate::service::Service;
 use crate::supervisor::{Link, Supervisor};
 
-/// How often the serve loop wakes to re-check the application, the supervisor, and shutdown.
+/// How often the serve loop wakes to re-check the agent and the shutdown flag.
 const SERVE_POLL_MS: i32 = 100;
 
 /// How long a failed control read waits for the peer to become reapable before it is called a
-/// channel fault rather than an ordinary exit. Only ever spent on a supervisor that is already
+/// channel fault rather than an ordinary exit. Only ever spent on an agent that is already
 /// finished with this channel, so it costs nothing on the healthy path. Generous next to the
 /// window it closes: the kernel marks an exited child reapable as it tears the process down,
 /// microseconds after the descriptor close that produced the read failure.
 const EXIT_OBSERVATION_GRACE: Duration = Duration::from_millis(500);
 
-/// How many times the run loop retries recording a service exit before rolling the exit up
-/// without its marker. The marker is what makes the next boot revert an unconfirmed release
-/// that just crashed, so a transient durable-state failure (ENOSPC, EIO) must not lose it —
-/// but the application is already dead by then, and only the guardian's exit lets the init
-/// system restart the tower, so the retries are bounded rather than endless.
-const EXIT_MARKER_ATTEMPTS: u32 = 5;
-
-/// The guardian's configuration, all from the command line — it parses no config file
-/// (that is the supervisor's job; the path is passed through opaquely).
+/// The launcher's configuration, all from the command line — it parses no config file
+/// (that is the agent's job; the path is passed through opaquely).
 pub struct Config {
     pub state_dir: PathBuf,
-    /// Operator config path, passed verbatim to every supervisor launch.
+    /// Operator config path, passed verbatim to every agent launch.
     pub supervisor_config: PathBuf,
     /// Seed for `desired-supervisor` on first boot, if not already recorded.
     pub initial_supervisor: Option<PathBuf>,
@@ -62,21 +45,19 @@ pub struct Config {
     /// How long a replacement must remain alive after proving ready before its
     /// pointer is committed. The predecessor remains authoritative throughout.
     pub confirm_timeout: Duration,
-    /// Grace before hard-killing an application or supervisor during shutdown.
+    /// Grace before hard-killing the agent during shutdown.
     pub stop_grace: Duration,
-    pub probe_address: Option<SocketAddr>,
 }
 
-/// Exponential backoff for relaunching a failed supervisor.
+/// Exponential backoff for relaunching a failed agent.
 ///
-/// A supervisor that runs a healthy stretch before exiting resets it (a transient crash
+/// An agent that runs a healthy stretch before exiting resets it (a transient crash
 /// relaunches promptly). One that keeps exiting immediately — a bricked build that cannot
 /// even start, or that fails closed and cannot roll back — backs off toward the cap and
-/// loops there forever, waiting for its binary to be fixed. The guardian NEVER gives up
-/// and NEVER takes the application down: the app keeps running the entire time.
+/// loops there forever, waiting for its binary to be fixed. The launcher NEVER gives up.
 ///
 /// The reset is rate-limited, and that is what makes the relaunch loop bounded for the case a
-/// duration test alone cannot see: a supervisor that fails *late*. Boot reconciliation can spend
+/// duration test alone cannot see: an agent that fails *late*. Boot reconciliation can spend
 /// well past [`SETTLED`](Self::SETTLED) on an operator lifecycle hook whose timeout the operator
 /// chooses, and then exit for relaunch — so "it ran a while" is true on every cycle of a loop
 /// that is replaying that hook forever. Counting relaunches per [`WINDOW`](Self::WINDOW) closes
@@ -94,7 +75,7 @@ struct Backoff {
 impl Backoff {
     const BASE: Duration = Duration::from_secs(2);
     const CAP: Duration = Duration::from_secs(5 * 60);
-    /// A supervisor that ran at least this long before exiting was not a start-loop.
+    /// An agent that ran at least this long before exiting was not a start-loop.
     const SETTLED: Duration = Duration::from_secs(30);
     /// The span over which relaunches are counted for the reset rate limit.
     const WINDOW: Duration = Duration::from_secs(60 * 60);
@@ -133,12 +114,12 @@ impl Backoff {
             .unwrap_or(Self::BASE)
     }
 
-    /// The delay before the next relaunch, given how long the last supervisor ran. A run that
+    /// The delay before the next relaunch, given how long the last agent ran. A run that
     /// lasted longer than [`SETTLED`](Self::SETTLED) resets the backoff to the base — unless this
     /// is already the [`BURST`](Self::BURST)+1st relaunch of the current
     /// [`WINDOW`](Self::WINDOW), in which case nothing resets it and the delay keeps climbing to
-    /// the cap. That is the guardian's whole bound on relaunch rate; nothing else throttles a
-    /// supervisor that exits to be relaunched.
+    /// the cap. That is the launcher's whole bound on relaunch rate; nothing else throttles an
+    /// agent that exits to be relaunched.
     fn next(&mut self, ran_for: Duration) -> Duration {
         self.next_at(ran_for, Instant::now())
     }
@@ -161,23 +142,20 @@ impl Backoff {
     }
 }
 
-/// What to do after one supervisor lifetime ends.
+/// What to do after one agent lifetime ends.
 enum Cycle {
-    /// Relaunch the committed supervisor.
+    /// Relaunch the committed agent.
     Continue,
     /// Relaunch it, but pause first (crash-loop guard).
     Backoff,
-    /// A stop signal arrived; stop the application and exit.
+    /// A stop signal arrived; exit.
     Stop,
-    /// The supervisor staged a replacement and exited; activate it under a readiness gate.
+    /// The agent staged a replacement and exited; activate it under a readiness gate.
     Activate(PathBuf),
-    /// The service exited on its own — roll its exact exit code up to the init system.
-    ServiceExited(i32),
 }
 
-/// Run the guardian. Returns the process exit code: `0` for a clean stop, or the
-/// service's exact exit code when it exits spontaneously (including zero).
-pub fn run(cfg: &Config) -> Result<i32, String> {
+/// Run the launcher until a stop signal arrives.
+pub fn run(cfg: &Config) -> Result<(), String> {
     crate::sys::ignore_sigpipe();
     crate::sys::install_shutdown_handler();
     std::fs::create_dir_all(&cfg.state_dir)
@@ -189,31 +167,22 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
         info(&format!("swept {swept} stale state temp file(s)"));
     }
     seed_desired_supervisor(cfg)?;
-    let probes = ProbeMachine::new();
-    if let Some(address) = cfg.probe_address {
-        crate::probe::serve(address, probes.clone())?;
-        info(&format!("guardian probes listening on http://{address}"));
-    }
 
-    let mut service = Service::new(probes.clone());
     let mut next: Option<PathBuf> = None; // Some(path) means "activate this candidate"
     let mut backoff = Backoff::new();
-    let mut marker_failures = 0u32;
     while !crate::sys::shutdown_requested() {
         let launched = Instant::now();
-        // A failed supervisor cycle must not take the guardian down with it. By this point the
-        // guardian may own a running, healthy application, and its own exit stops that application
-        // — so a transient durable-state failure (ENOSPC or EIO recording a rejection, an
-        // unwritable state dir) would turn one bad write into a service outage. Log it, back off,
-        // and try the cycle again; the application keeps serving throughout. Startup failures that
-        // genuinely cannot be recovered from happen before this loop, while nothing is running.
+        // A failed agent cycle must not take the launcher down with it. The launcher's own exit
+        // leaves the node with no agent at all until the init system restarts it — into the same
+        // transient durable-state failure (ENOSPC or EIO recording a rejection, an unwritable
+        // state dir) that ended this cycle. Log it, back off, and try the cycle again. Startup
+        // failures that genuinely cannot be recovered from happen before this loop.
         let candidate = next.take();
-        let cycle = match run_supervisor(cfg, &mut service, candidate.clone()) {
+        let cycle = match run_supervisor(cfg, candidate.clone()) {
             Ok(cycle) => cycle,
             Err(error) => {
                 warn(&format!(
-                    "supervisor cycle failed ({error}); the application keeps running and the \
-                     cycle is retried"
+                    "agent cycle failed ({error}); the cycle is retried"
                 ));
                 if let Some(path) = &candidate {
                     reject_dropped_candidate(cfg, path);
@@ -229,10 +198,10 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
             Cycle::Continue => {
                 // A candidate was rejected (bad launch, missed readiness, exited before
                 // confirmation) or a commit was reverted, and we are about to relaunch the
-                // committed supervisor. Advance the SAME backoff here so a candidate that
+                // committed agent. Advance the SAME backoff here so a candidate that
                 // passes `send_hello` but fast-crashes before `Ready` cannot drive an
-                // unthrottled relaunch loop: the guardian is the backstop and must
-                // rate-limit on its own, independent of any supervisor-side policy. Quiet
+                // unthrottled relaunch loop: the launcher is the backstop and must
+                // rate-limit on its own, independent of any agent-side policy. Quiet
                 // (no per-cycle warning) because this is the normal rejection path.
                 if backoff_pause(&mut backoff, launched.elapsed(), false) {
                     break;
@@ -244,105 +213,37 @@ pub fn run(cfg: &Config) -> Result<i32, String> {
                 }
             }
             Cycle::Activate(path) => next = Some(path),
-            Cycle::ServiceExited(code) => match roll_up_service_exit(&cfg.state_dir, code) {
-                Ok(code) => return Ok(code),
-                // Recording the exit is the one durable write whose loss silently converts a
-                // failed update into a confirmed one, so a transient state-dir failure must not
-                // be fatal here either: retry it through the same backoff as every other cycle.
-                // The exit stays observable on the service, so the retried cycle re-reports it
-                // (`run_supervisor` polls before it launches anything) and the write is tried
-                // again. Bounded, unlike a supervisor cycle: the application is already gone, so
-                // every retry is downtime, and only this process's exit lets the init system
-                // restart the tower.
-                Err(e) if marker_failures + 1 < EXIT_MARKER_ATTEMPTS => {
-                    marker_failures += 1;
-                    warn(&format!(
-                        "recording the application's exit failed ({e}); retrying \
-                         ({marker_failures} of {EXIT_MARKER_ATTEMPTS})"
-                    ));
-                    if backoff_pause(&mut backoff, launched.elapsed(), false) {
-                        // A stop arrived mid-retry: the application is already gone, so roll its
-                        // code up now rather than reporting the clean stop it did not have.
-                        return Ok(code);
-                    }
-                }
-                Err(e) => {
-                    error(&format!(
-                        "the application's exit could not be recorded after \
-                         {EXIT_MARKER_ATTEMPTS} attempts ({e}); rolling it up unrecorded — an \
-                         unconfirmed release that just exited may be confirmed rather than \
-                         reverted"
-                    ));
-                    return Ok(code);
-                }
-            },
         }
     }
 
-    // Transparent clean stop: forward it down to the application.
-    info("stop requested; stopping the application and exiting");
-    service.stop(cfg.stop_grace);
-    Ok(0)
+    info("stop requested; exiting");
+    Ok(())
 }
 
-/// Apply the perpetual-service exit policy to a neutral child-process outcome. Keeping
-/// this policy at the guardian boundary makes the process wrapper reusable without
-/// weakening the service contract: every spontaneous exit is durable and unhealthy,
-/// and its exact code—including zero—is returned to the outer lifecycle owner.
-fn roll_up_service_exit(state_dir: &Path, code: i32) -> Result<i32, String> {
-    record::mark_service_exited(state_dir, code)
-        .map_err(|error| format!("recording service exit before restart: {error}"))?;
-    warn(&format!(
-        "application exited (code {code}); rolling it up and letting the init system restart"
-    ));
-    Ok(code)
-}
-
-/// Launch one supervisor (the committed one, or `candidate` for a gated activation) and
-/// serve it until it exits, is replaced, the service exits, or a stop arrives.
-fn run_supervisor(
-    cfg: &Config,
-    service: &mut Service,
-    candidate: Option<PathBuf>,
-) -> Result<Cycle, String> {
-    // A service exit that landed while the guardian was between supervisors (the backoff sleep,
-    // a handoff, or a retry of the exit marker) is only visible here — `poll_exit` runs solely
-    // inside serve. Surface it before anything else this cycle does, so no supervisor is
-    // launched over a dead application and no state-dir failure on the way to launching one can
-    // starve the retry of its marker. Dropping it here would silently discard the exit (the next
-    // `app.launch` reaps the dead proc) and relaunch the bad update instead of rolling it up.
-    if let Some(code) = service.poll_exit() {
-        return Ok(Cycle::ServiceExited(code));
-    }
-
+/// Launch one agent (the committed one, or `candidate` for a gated activation) and
+/// serve it until it exits, is replaced, or a stop arrives.
+fn run_supervisor(cfg: &Config, candidate: Option<PathBuf>) -> Result<Cycle, String> {
     let binary = match &candidate {
         Some(path) => path.clone(),
         None => record::desired_supervisor(&cfg.state_dir)
-            .map_err(|e| format!("reading committed supervisor pointer: {e}"))?
+            .map_err(|e| format!("reading committed agent pointer: {e}"))?
             .ok_or_else(|| {
-                "no committed supervisor recorded and none supplied (--supervisor)".to_string()
+                "no committed agent recorded and none supplied (--supervisor)".to_string()
             })?,
     };
     validate_supervisor_path(cfg, &binary, candidate.is_some())?;
-
-    // If an application is already running (a supervisor crash-relaunch, or a candidate
-    // activation over the previous supervisor's app), hand its PID to the new supervisor
-    // so it adopts rather than launching a duplicate. A held PID *is* a running application —
-    // one accessor, no second way to ask.
-    let app_pid = service.pid();
 
     let mut sup = match Supervisor::launch(
         &binary,
         &cfg.supervisor_config,
         &cfg.state_dir,
-        app_pid,
         cfg.stop_grace,
     ) {
         Ok(sup) => sup,
         Err(e) => {
             if let Some(path) = &candidate {
                 warn(&format!(
-                    "candidate supervisor {} could not be launched ({e}); rejecting",
+                    "candidate agent {} could not be launched ({e}); rejecting",
                     path.display()
                 ));
                 record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|marker| {
@@ -351,14 +252,14 @@ fn run_supervisor(
                 return Ok(Cycle::Continue);
             }
             error(&format!(
-                "cannot launch committed supervisor {}: {e}",
+                "cannot launch committed agent {}: {e}",
                 binary.display()
             ));
             return Ok(Cycle::Backoff);
         }
     };
     info(&format!(
-        "launched supervisor {} (pid {}){}",
+        "launched agent {} (pid {}){}",
         binary.display(),
         sup.pid(),
         if candidate.is_some() {
@@ -367,13 +268,12 @@ fn run_supervisor(
             ""
         }
     ));
-    serve_service(cfg, &mut sup, service, candidate)
+    serve_service(cfg, &mut sup, candidate)
 }
 
 fn serve_service<L: Link>(
     cfg: &Config,
     sup: &mut L,
-    service: &mut Service,
     candidate: Option<PathBuf>,
 ) -> Result<Cycle, String> {
     // When activating, we must see a matching readiness ack before the deadline.
@@ -403,19 +303,19 @@ fn serve_service<L: Link>(
         if sup.poll_readable(SERVE_POLL_MS) {
             match sup.read_request() {
                 Ok(req) => {
-                    if dispatch(cfg, sup, service, req, &mut activation).is_err() {
+                    if dispatch(cfg, sup, req, &mut activation).is_err() {
                         // A response write failed — a partial/timed-out frame may already be on the
                         // wire. Never keep serving this channel: the very next response would land
-                        // after a half-written one and desync the supervisor's frame reader (and on
+                        // after a half-written one and desync the agent's frame reader (and on
                         // Windows an abandoned write thread could interleave bytes). Stop the
-                        // supervisor and relaunch it on a fresh channel rather than trusting the
+                        // agent and relaunch it on a fresh channel rather than trusting the
                         // peer to eventually exit on its own.
                         sup.stop();
                         return conclude(cfg, &mut activation, "could not be written to");
                     }
                 }
-                // Forward compatibility, not a fault: a newer supervisor may send a tag this
-                // guardian has never heard of. Answer `Unsupported` and keep serving — but a
+                // Forward compatibility, not a fault: a newer agent may send a tag this
+                // launcher has never heard of. Answer `Unsupported` and keep serving — but a
                 // failed write here leaves the same half-written frame the dispatch arm above
                 // refuses to serve past, so it ends the channel the same way.
                 Err(control::Error::UnknownTag(_)) => {
@@ -424,15 +324,15 @@ fn serve_service<L: Link>(
                         return conclude(cfg, &mut activation, "could not be written to");
                     }
                 }
-                // Any other read failure ends this supervisor's usefulness, so it ends its
+                // Any other read failure ends this agent's usefulness, so it ends its
                 // lifetime — through the same `conclude` every other ending goes through.
                 //
-                // The common cause is the ordinary one: the supervisor EXITED, and on Unix its
+                // The common cause is the ordinary one: the agent EXITED, and on Unix its
                 // closed socketpair reports readable-with-hangup forever, so the read fails on
                 // the very poll that would otherwise observe the exit. That is not a channel
                 // fault and must not be logged or reported as one.
                 //
-                // A supervisor still RUNNING without a usable channel is the real fault, and it
+                // An agent still RUNNING without a usable channel is the real fault, and it
                 // must not be left running: `poll_readable` would return immediately on every
                 // iteration and pin a core at 100% for as long as it lives.
                 //
@@ -445,7 +345,7 @@ fn serve_service<L: Link>(
                         "exited"
                     } else {
                         warn(&format!(
-                            "the supervisor's control channel is unusable ({error}); stopping it"
+                            "the agent's control channel is unusable ({error}); stopping it"
                         ));
                         sup.stop();
                         "lost its control channel"
@@ -453,12 +353,6 @@ fn serve_service<L: Link>(
                     return conclude(cfg, &mut activation, reason);
                 }
             }
-        }
-
-        // A spontaneous service exit takes priority: roll its exact code up and tear down.
-        if let Some(code) = service.poll_exit() {
-            sup.stop();
-            return Ok(Cycle::ServiceExited(code));
         }
 
         if sup.exited() {
@@ -478,21 +372,21 @@ fn serve_service<L: Link>(
                 .expect("activation has a candidate");
             match record::set_desired_supervisor(&cfg.state_dir, path) {
                 Ok(()) => info(&format!(
-                    "candidate {} survived its confirmation window; committed as the supervisor",
+                    "candidate {} survived its confirmation window; committed as the agent",
                     path.display()
                 )),
                 // The pointer moved and only the fsync proving it durable failed. Rolling back
                 // here would reject a candidate the on-disk pointer already names, so the next
-                // cycle would launch it as the committed supervisor — no readiness gate, no
+                // cycle would launch it as the committed agent — no readiness gate, no
                 // confirmation window — with a rejection marker about itself on disk.
                 Err(e) if foundation::durable::committed_unsynced(&e) => warn(&format!(
-                    "candidate {} is committed as the supervisor, but the commit could not be \
+                    "candidate {} is committed as the agent, but the commit could not be \
                      proved durable: {e}",
                     path.display()
                 )),
                 Err(e) => {
                     error(&format!(
-                        "committing stable supervisor {} failed: {e}; reverting to its predecessor",
+                        "committing stable agent {} failed: {e}; reverting to its predecessor",
                         path.display()
                     ));
                     sup.stop();
@@ -511,18 +405,18 @@ struct ActivationState {
     pending_replace: Option<PathBuf>,
 }
 
-/// End one supervisor's lifetime and decide what the guardian does next. `reason` completes the
-/// sentence "the supervisor/candidate …" in the log line.
+/// End one agent's lifetime and decide what the launcher does next. `reason` completes the
+/// sentence "the agent/candidate …" in the log line.
 ///
-/// EVERY way of leaving [`serve_service`] short of a stop signal or a service exit funnels
-/// through here — the process exited, its channel died, it never signalled ready, its commit
-/// failed — because two obligations must not depend on which of those happened:
+/// EVERY way of leaving [`serve_service`] short of a stop signal funnels through here — the
+/// process exited, its channel died, it never signalled ready, its commit failed — because two
+/// obligations must not depend on which of those happened:
 ///
 ///  * An uncommitted candidate is ALWAYS recorded rejected. Its bytes live in a
-///    content-addressed slot, so a supervisor that is not told the hash failed re-selects it,
+///    content-addressed slot, so an agent that is not told the hash failed re-selects it,
 ///    re-stages it into the same slot, and hands it off again, forever.
 ///  * A staged replacement is ALWAYS activated. Dropping it means self-update silently never
-///    completes: the committed supervisor comes back, re-stages the same candidate, and the
+///    completes: the committed agent comes back, re-stages the same candidate, and the
 ///    same handoff repeats every cycle.
 ///
 /// Rejection is checked first: a candidate that staged a replacement before proving itself is
@@ -539,7 +433,7 @@ fn conclude(cfg: &Config, activation: &mut ActivationState, reason: &str) -> Res
         ));
         record::mark_rejected_supervisor(&cfg.state_dir, path).map_err(|e| {
             format!(
-                "recording rejection of supervisor {} ({reason}): {e}",
+                "recording rejection of agent {} ({reason}): {e}",
                 path.display()
             )
         })?;
@@ -547,16 +441,12 @@ fn conclude(cfg: &Config, activation: &mut ActivationState, reason: &str) -> Res
     }
     if let Some(path) = activation.pending_replace.take() {
         info(&format!(
-            "supervisor {reason} after staging a replacement; activating {}",
+            "agent {reason} after staging a replacement; activating {}",
             path.display()
         ));
         return Ok(Cycle::Activate(path));
     }
-    // The supervisor is gone but the application is fine — the guardian relaunches the
-    // supervisor (with backoff) over the still-running app.
-    warn(&format!(
-        "supervisor {reason} (the application keeps running)"
-    ));
+    warn(&format!("agent {reason}; relaunching it"));
     Ok(Cycle::Backoff)
 }
 
@@ -565,18 +455,17 @@ fn conclude(cfg: &Config, activation: &mut ActivationState, reason: &str) -> Res
 ///
 /// A cycle that fails (`run_supervisor` returning `Err`) is retried rather than fatal, so the
 /// candidate it took is simply gone; without a marker, the always-reject invariant `conclude`
-/// documents would hold for every ending but this one, and the committed supervisor would come
+/// documents would hold for every ending but this one, and the committed agent would come
 /// back, re-select the same release, re-stage the same content-addressed bytes and hand them off
 /// again, forever. `run_supervisor` can only fail before a candidate is committed (every path
 /// after the commit returns `Ok`), so a candidate it dropped is always an uncommitted one.
 ///
-/// A failed marker write is logged, never propagated: the guardian may own a healthy running
-/// application here, and taking the tower down over a durable-state failure is the outcome the
-/// retry loop exists to avoid. The next cycle re-stages and re-rejects, and the write is retried
-/// with it.
+/// A failed marker write is logged, never propagated: taking the launcher down over a
+/// durable-state failure is the outcome the retry loop exists to avoid. The next cycle re-stages
+/// and re-rejects, and the write is retried with it.
 fn reject_dropped_candidate(cfg: &Config, path: &Path) {
     warn(&format!(
-        "candidate {} was dropped by a failed supervisor cycle; rejecting it",
+        "candidate {} was dropped by a failed agent cycle; rejecting it",
         path.display()
     ));
     if let Err(e) = record::mark_rejected_supervisor(&cfg.state_dir, path) {
@@ -591,29 +480,14 @@ fn reject_dropped_candidate(cfg: &Config, path: &Path) {
 fn dispatch<L: Link>(
     cfg: &Config,
     sup: &mut L,
-    service: &mut Service,
     req: Request,
     activation: &mut ActivationState,
 ) -> control::Result<()> {
     let response = match req {
-        Request::Launch(spec) => match service.launch(&spec, cfg.stop_grace) {
-            Ok(pid) => {
-                info(&format!("launched application pid {pid}"));
-                Response::Launched { pid }
-            }
-            Err(e) => {
-                warn(&format!("application launch failed: {e}"));
-                Response::Error(e.to_string())
-            }
-        },
-        Request::Stop => {
-            service.stop(cfg.stop_grace);
-            Response::Ok
-        }
         Request::ReplaceSupervisor(path) => {
-            // The guardian keeps no rejection set: the supervisor is responsible for not
+            // The launcher keeps no rejection set: the agent is responsible for not
             // re-staging a candidate it already knows failed (it read the marker). The
-            // guardian just accepts the handoff and activates it when this supervisor exits.
+            // launcher just accepts the handoff and activates it when this agent exits.
             let path = PathBuf::from(path);
             match validate_supervisor_path(cfg, &path, true) {
                 Ok(()) => {
@@ -637,55 +511,36 @@ fn dispatch<L: Link>(
             }
             Response::Ok
         }
-        Request::TrafficReady(ready) => {
-            // A durable record of each readiness edge. The probe endpoints only reflect
-            // the withdrawal transiently (readiness drops, then returns once the candidate
-            // is healthy), so this log — emitted once per edge, not once per poll — is the
-            // deterministic signal that the guardian drained traffic without ever taking
-            // the live tower down.
-            if service.traffic_ready(ready) {
-                if ready {
-                    info("returned the application to traffic; readiness restored");
-                } else {
-                    info("withdrew the application from traffic; the tower stays live");
-                }
-            }
-            Response::Ok
-        }
-        Request::ApplicationFailed => {
-            service.fail(cfg.stop_grace);
-            Response::Ok
-        }
     };
     sup.send_response(&response)
 }
 
-/// On first boot, record the supplied initial supervisor as the committed one.
+/// On first boot, record the supplied initial agent as the committed one.
 fn seed_desired_supervisor(cfg: &Config) -> Result<(), String> {
     if let Some(committed) = record::desired_supervisor(&cfg.state_dir)
-        .map_err(|e| format!("reading committed supervisor pointer: {e}"))?
+        .map_err(|e| format!("reading committed agent pointer: {e}"))?
     {
         return validate_supervisor_path(cfg, &committed, false);
     }
     let initial = cfg
         .initial_supervisor
         .as_ref()
-        .ok_or("no committed supervisor and no --supervisor to seed one")?;
+        .ok_or("no committed agent and no --supervisor to seed one")?;
     // Durably record the seeded path BEFORE the pointer, so a later boot trusts it flag-free (see
     // `validate_supervisor_path`). A crash between the two just re-seeds identically next boot.
     record::set_seeded_supervisor(&cfg.state_dir, initial)
-        .map_err(|e| format!("recording the seeded supervisor: {e}"))?;
+        .map_err(|e| format!("recording the seeded agent: {e}"))?;
     validate_supervisor_path(cfg, initial, false)?;
     record::set_desired_supervisor(&cfg.state_dir, initial)
-        .map_err(|e| format!("recording the initial supervisor: {e}"))
+        .map_err(|e| format!("recording the initial agent: {e}"))
 }
 
-/// Validate that `path` is a safe supervisor binary to launch (a regular non-symlink file
+/// Validate that `path` is a safe agent binary to launch (a regular non-symlink file
 /// inside the content-addressed staging tree, or the durably-seeded initial path).
 ///
 /// This is a TOCTOU check: the file could in principle be swapped between this validation
 /// and the subsequent `Supervisor::launch`. The window is acceptable and bounded because
-/// the staging tree lives under the guardian's own root-owned `state_dir` — an attacker who
+/// the staging tree lives under the launcher's own root-owned `state_dir` — an attacker who
 /// could rewrite content-addressed paths there already owns the node — and because the path
 /// is content-addressed (`supervisors/<sha256>/…`), so a swap that preserved the hash
 /// directory name would have to preserve the bytes. The check exists to reject
@@ -693,10 +548,10 @@ fn seed_desired_supervisor(cfg: &Config) -> Result<(), String> {
 /// atomically to close the window would buy nothing.
 fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("inspecting supervisor {}: {e}", path.display()))?;
+        .map_err(|e| format!("inspecting agent {}: {e}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(format!(
-            "supervisor {} must be a regular, non-symlink file",
+            "agent {} must be a regular, non-symlink file",
             path.display()
         ));
     }
@@ -719,12 +574,12 @@ fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Resul
         }
     }
     let canonical = std::fs::canonicalize(path)
-        .map_err(|e| format!("canonicalizing supervisor {}: {e}", path.display()))?;
+        .map_err(|e| format!("canonicalizing agent {}: {e}", path.display()))?;
     let root = std::fs::canonicalize(cfg.state_dir.join("supervisors"))
-        .map_err(|e| format!("canonicalizing supervisor staging directory: {e}"))?;
+        .map_err(|e| format!("canonicalizing agent staging directory: {e}"))?;
     let relative = canonical.strip_prefix(&root).map_err(|_| {
         format!(
-            "supervisor {} is outside the managed staging directory",
+            "agent {} is outside the managed staging directory",
             path.display()
         )
     })?;
@@ -738,14 +593,14 @@ fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Resul
         || parts[1].as_os_str() != expected_name
     {
         return Err(format!(
-            "supervisor {} must be supervisors/<64-hex-sha256>/{expected_name}",
+            "agent {} must be supervisors/<64-hex-sha256>/{expected_name}",
             path.display()
         ));
     }
     Ok(())
 }
 
-/// Advance the relaunch backoff and sleep it out before the next supervisor launch.
+/// Advance the relaunch backoff and sleep it out before the next agent launch.
 /// Returns `true` if a stop cut the sleep short (the caller then exits without relaunching).
 ///
 /// Both the crash-loop path (`Cycle::Backoff`) and the candidate-rejection path
@@ -755,10 +610,7 @@ fn validate_supervisor_path(cfg: &Config, path: &Path, candidate: bool) -> Resul
 fn backoff_pause(backoff: &mut Backoff, ran_for: Duration, announce: bool) -> bool {
     let delay = backoff.next(ran_for);
     if announce {
-        warn(&format!(
-            "relaunching the supervisor in {}s (the application keeps running)",
-            delay.as_secs()
-        ));
+        warn(&format!("relaunching the agent in {}s", delay.as_secs()));
     }
     if sleep_interruptible(delay) {
         // Emitted ONLY when shutdown cut the backoff sleep short (never when the sleep
@@ -788,10 +640,8 @@ fn sleep_interruptible(dur: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
-    use crate::probe::State as ProbeState;
 
-    const INSTANT: Duration = Duration::from_millis(10); // a supervisor that died at once
+    const INSTANT: Duration = Duration::from_millis(10); // an agent that died at once
 
     #[test]
     fn backoff_grows_exponentially_and_caps() {
@@ -811,8 +661,8 @@ mod tests {
     #[test]
     fn candidate_rejection_cycles_rate_limit_the_relaunch() {
         // A candidate that passes `send_hello` but fast-crashes before `Ready` returns
-        // `Cycle::Continue`. The guardian must throttle the resulting relaunch itself rather
-        // than trust supervisor policy, so every rejection cycle advances the shared backoff.
+        // `Cycle::Continue`. The launcher must throttle the resulting relaunch itself rather
+        // than trust agent policy, so every rejection cycle advances the shared backoff.
         // A zero base makes the pause a no-op sleep, so the test asserts the advance without
         // a wall-clock delay.
         let mut backoff = Backoff::with_base(Duration::ZERO);
@@ -821,7 +671,7 @@ mod tests {
             // announce = false is exactly the candidate-rejection (Cycle::Continue) path.
             assert!(
                 !backoff_pause(&mut backoff, INSTANT, false),
-                "no shutdown, so the pause completes and the guardian relaunches"
+                "no shutdown, so the pause completes and the launcher relaunches"
             );
             assert_eq!(
                 backoff.consecutive, expected,
@@ -831,19 +681,20 @@ mod tests {
     }
 
     #[test]
-    fn a_supervisor_that_ran_a_while_resets_the_backoff() {
+    fn an_agent_that_ran_a_while_resets_the_backoff() {
         let mut b = Backoff::new();
         b.next(INSTANT);
         b.next(INSTANT);
         b.next(INSTANT); // backed off a few times
-                         // A supervisor that ran past the settle threshold before exiting is a transient
-                         // crash, not a start-loop: the next relaunch is prompt again.
+
+        // An agent that ran past the settle threshold before exiting is a transient crash,
+        // not a start-loop: the next relaunch is prompt again.
         assert_eq!(b.next(Backoff::SETTLED), Duration::from_secs(2));
     }
 
     #[test]
-    fn a_supervisor_that_fails_late_on_every_cycle_still_backs_off() {
-        // The path this bound exists for: the supervisor exits for relaunch AFTER a long boot —
+    fn an_agent_that_fails_late_on_every_cycle_still_backs_off() {
+        // The path this bound exists for: the agent exits for relaunch AFTER a long boot —
         // boot reconciliation replaying an operator lifecycle hook whose timeout the operator
         // chooses can easily outlast SETTLED. "It ran a while" is then true on every cycle, so a
         // duration-only reset would hold the delay at the 2s base forever and the node would
@@ -872,7 +723,7 @@ mod tests {
             "a late-failing relaunch loop reaches the same five-minute cap as a start-loop"
         );
 
-        // A new window starts fresh: a node whose supervisor fails once an hour is not a loop,
+        // A new window starts fresh: a node whose agent fails once an hour is not a loop,
         // and must not be left waiting five minutes to recover.
         assert_eq!(
             b.next_at(long_boot, start + Backoff::WINDOW),
@@ -900,7 +751,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
-    /// A scripted supervisor control link: poll/read/exit results are queues consumed
+    /// A scripted agent control link: poll/read/exit results are queues consumed
     /// front-to-back; sent responses and stop calls are captured for assertions.
     struct FakeLink {
         nonce: control::Nonce,
@@ -958,7 +809,7 @@ mod tests {
             if self.stays_alive {
                 return false;
             }
-            // Script exhaustion is a supervisor exit. This gives every state-machine test
+            // Script exhaustion is an agent exit. This gives every state-machine test
             // a finite fallback: a broken deadline is reported by the assertions instead
             // of hanging the mutation runner forever.
             self.exited.pop_front().unwrap_or(true)
@@ -967,8 +818,6 @@ mod tests {
             self.stops += 1;
         }
     }
-
-    use crate::sys::{fake_spawn, fake_spec};
 
     fn temp_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
         let guard = tempfile::tempdir().unwrap();
@@ -985,12 +834,7 @@ mod tests {
             ready_timeout: Duration::from_secs(30),
             confirm_timeout: Duration::from_secs(30),
             stop_grace: Duration::from_secs(10),
-            probe_address: None,
         }
-    }
-
-    fn spec() -> control::CommandSpec {
-        fake_spec("/opt/app")
     }
 
     fn rejected_marker(c: &Config) -> Option<String> {
@@ -1016,123 +860,15 @@ mod tests {
     }
 
     #[test]
-    fn exit_zero_is_rolled_up_unchanged_by_service_policy() {
-        let (_tmp, state_dir) = temp_dir("exit-zero");
-
-        assert_eq!(roll_up_service_exit(&state_dir, 0).unwrap(), 0);
-        assert!(state_dir
-            .join(control::SERVICE_EXITED_MARKER_FILE)
-            .is_file());
-    }
-
-    #[test]
-    fn a_service_exit_is_re_reported_by_every_cycle_until_it_is_recorded() {
-        // The run loop retries a failed exit-marker write by running the cycle again, so the
-        // cycle must re-report the exit — and must do so before it reads the supervisor pointer,
-        // because the same failing state directory that lost the marker also fails that read and
-        // would starve the retry forever. A dead application also means nothing may be launched.
-        let (_tmp, state_dir) = temp_dir("pending-exit");
-        let c = cfg(state_dir, None); // no committed pointer: the read would fail
-        let mut service = Service::with_process(App::with_spawn(fake_spawn));
-        // An application that has already exited with code 9.
-        service
-            .launch(&fake_spec("exit:9"), Duration::ZERO)
-            .unwrap();
-
-        for _ in 0..3 {
-            assert!(
-                matches!(
-                    run_supervisor(&c, &mut service, None).unwrap(),
-                    Cycle::ServiceExited(9)
-                ),
-                "the exit stays reportable until a cycle records it"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_failed_exit_marker_write_is_reported_rather_than_swallowed() {
-        // The retry only exists because this write can fail. Root bypasses the mode check, so
-        // there is nothing to prove there.
-        use std::os::unix::fs::PermissionsExt;
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        let (_tmp, state_dir) = temp_dir("exit-marker-unwritable");
-        std::fs::set_permissions(&state_dir, PermissionsExt::from_mode(0o500)).unwrap();
-        let rolled = roll_up_service_exit(&state_dir, 9);
-        std::fs::set_permissions(&state_dir, PermissionsExt::from_mode(0o700)).unwrap();
-
-        assert!(
-            rolled.is_err(),
-            "an unrecorded exit is never reported rolled up"
-        );
-        assert!(!state_dir.join(control::SERVICE_EXITED_MARKER_FILE).exists());
-    }
-
-    #[test]
-    fn dispatch_launch_starts_the_app_and_replies_launched() {
-        let (_tmp, state_dir) = temp_dir("launch");
-        let c = cfg(state_dir, None);
-        let mut sup = FakeLink::new();
-        let mut app = Service::with_process(App::with_spawn(fake_spawn));
-        let mut state = activation(None, true);
-        dispatch(&c, &mut sup, &mut app, Request::Launch(spec()), &mut state).unwrap();
-        assert_eq!(sup.responses, vec![Response::Launched { pid: 4242 }]);
-    }
-
-    #[test]
-    fn dispatch_stop_replies_ok() {
-        let (_tmp, state_dir) = temp_dir("stop");
-        let c = cfg(state_dir, None);
-        let mut sup = FakeLink::new();
-        let mut app = Service::with_process(App::with_spawn(fake_spawn));
-        let mut state = activation(None, true);
-        dispatch(&c, &mut sup, &mut app, Request::Stop, &mut state).unwrap();
-        assert_eq!(sup.responses, vec![Response::Ok]);
-    }
-
-    #[test]
-    fn traffic_requests_drive_the_guardian_probe_state_machine() {
-        let (_tmp, state_dir) = temp_dir("traffic-state");
-        let c = cfg(state_dir, None);
-        let mut sup = FakeLink::new();
-        let probes = ProbeMachine::new();
-        let mut app = Service::new(probes.clone());
-        let mut state = activation(None, true);
-        dispatch(
-            &c,
-            &mut sup,
-            &mut app,
-            Request::TrafficReady(true),
-            &mut state,
-        )
-        .unwrap();
-        assert_eq!(probes.state(), ProbeState::Serving);
-        dispatch(
-            &c,
-            &mut sup,
-            &mut app,
-            Request::TrafficReady(false),
-            &mut state,
-        )
-        .unwrap();
-        assert_eq!(probes.state(), ProbeState::Unready);
-    }
-
-    #[test]
     fn dispatch_replace_stages_the_candidate_and_replies_ok() {
         let (_tmp, state_dir) = temp_dir("replace");
         let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
-        let mut app = Service::with_process(App::none());
         let mut state = activation(None, true);
         let candidate = staged_candidate(&c, 0x11);
         dispatch(
             &c,
             &mut sup,
-            &mut app,
             Request::ReplaceSupervisor(candidate.as_os_str().to_owned()),
             &mut state,
         )
@@ -1148,12 +884,10 @@ mod tests {
         let outside = c.state_dir.join("arbitrary-supervisor");
         std::fs::write(&outside, b"candidate").unwrap();
         let mut sup = FakeLink::new();
-        let mut app = Service::with_process(App::none());
         let mut state = activation(None, true);
         dispatch(
             &c,
             &mut sup,
-            &mut app,
             Request::ReplaceSupervisor(outside.into_os_string()),
             &mut state,
         )
@@ -1169,16 +903,8 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
-        let mut app = Service::with_process(App::none());
         let mut state = activation(Some(cand), false);
-        dispatch(
-            &c,
-            &mut sup,
-            &mut app,
-            Request::Ready([7u8; 16]),
-            &mut state,
-        )
-        .unwrap();
+        dispatch(&c, &mut sup, Request::Ready([7u8; 16]), &mut state).unwrap();
         assert!(
             !state.committed,
             "readiness alone must not commit the candidate"
@@ -1195,16 +921,8 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
-        let mut app = Service::with_process(App::none());
         let mut state = activation(Some(cand), false);
-        dispatch(
-            &c,
-            &mut sup,
-            &mut app,
-            Request::Ready([9u8; 16]),
-            &mut state,
-        )
-        .unwrap();
+        dispatch(&c, &mut sup, Request::Ready([9u8; 16]), &mut state).unwrap();
         assert!(!state.committed, "a wrong nonce must not commit");
         assert!(state.ready_since.is_none());
         assert!(
@@ -1225,16 +943,8 @@ mod tests {
         let cand = PathBuf::from("/state/supervisors/abc/supervisor");
         let mut sup = FakeLink::new();
         sup.nonce = [7u8; 16];
-        let mut app = Service::with_process(App::none());
         let mut state = activation(Some(cand), true);
-        dispatch(
-            &c,
-            &mut sup,
-            &mut app,
-            Request::Ready([7u8; 16]),
-            &mut state,
-        )
-        .unwrap();
+        dispatch(&c, &mut sup, Request::Ready([7u8; 16]), &mut state).unwrap();
         assert!(
             record::desired_supervisor(&c.state_dir).unwrap().is_none(),
             "an already-committed serve never re-commits"
@@ -1242,11 +952,11 @@ mod tests {
     }
 
     #[test]
-    fn an_exited_supervisors_closed_channel_still_activates_its_staged_replacement() {
-        // On Unix an exited supervisor leaves its socketpair readable-with-hangup, so the read
+    fn an_exited_agents_closed_channel_still_activates_its_staged_replacement() {
+        // On Unix an exited agent leaves its socketpair readable-with-hangup, so the read
         // fails with `Closed` on the very poll that would otherwise observe the exit. Treating
         // that as a channel fault discarded the staged replacement — self-update silently never
-        // activated, and the old supervisor came back every time.
+        // activated, and the old agent came back every time.
         let (_tmp, state_dir) = temp_dir("closed-after-replace");
         let c = cfg(state_dir, None);
         let staged = staged_candidate(&c, 0x22);
@@ -1256,9 +966,8 @@ mod tests {
         sup.requests
             .push_back(Request::ReplaceSupervisor(staged.clone().into_os_string()));
         sup.exited.push_back(false); // still running when it staged the replacement
-        let mut app = Service::with_process(App::none());
 
-        let cycle = serve_service(&c, &mut sup, &mut app, None).unwrap();
+        let cycle = serve_service(&c, &mut sup, None).unwrap();
         assert!(
             matches!(cycle, Cycle::Activate(path) if path == staged),
             "the staged replacement must still be activated"
@@ -1268,16 +977,15 @@ mod tests {
     #[test]
     fn an_exited_candidates_closed_channel_still_rejects_it() {
         // Same Unix readable-with-hangup read failure, seen while gating a candidate: the
-        // rejection marker is what stops the supervisor re-selecting and re-staging the same
+        // rejection marker is what stops the agent re-selecting and re-staging the same
         // content-addressed bytes forever, so it must be written on this path too.
         let (_tmp, state_dir) = temp_dir("closed-candidate");
         let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/dead/supervisor");
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true); // readable-with-hangup, nothing to read
-        let mut app = Service::with_process(App::none());
 
-        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Continue));
         assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
     }
@@ -1288,16 +996,15 @@ mod tests {
         // the `ReplaceSupervisor` validation and the activation, so `run_supervisor` fails before
         // it can launch anything and the run loop retries the cycle. The candidate is consumed
         // either way, so its rejection must be recorded here too — otherwise the committed
-        // supervisor re-selects the same release, re-stages the same content-addressed bytes and
+        // agent re-selects the same release, re-stages the same content-addressed bytes and
         // hands them off again, forever, with nothing on disk saying it failed.
         let (_tmp, state_dir) = temp_dir("dropped-candidate");
         let c = cfg(state_dir, None);
         let cand = staged_candidate(&c, 0xa1);
         std::fs::remove_file(&cand).unwrap();
-        let mut app = Service::with_process(App::none());
 
         assert!(
-            run_supervisor(&c, &mut app, Some(cand.clone())).is_err(),
+            run_supervisor(&c, Some(cand.clone())).is_err(),
             "a candidate whose staged slot vanished fails the cycle"
         );
         assert!(
@@ -1309,19 +1016,18 @@ mod tests {
     }
 
     #[test]
-    fn a_running_supervisor_that_loses_its_channel_is_stopped() {
-        // A live supervisor without a usable channel would spin `poll_readable` at 100% forever.
-        // It is stopped and relaunched on a fresh one; the application is untouched.
+    fn a_running_agent_that_loses_its_channel_is_stopped() {
+        // A live agent without a usable channel would spin `poll_readable` at 100% forever.
+        // It is stopped and relaunched on a fresh one.
         let (_tmp, state_dir) = temp_dir("channel-lost");
         let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true);
         sup.stays_alive = true; // still running when the read fails, and stays that way
-        let mut app = Service::with_process(App::none());
 
-        let cycle = serve_service(&c, &mut sup, &mut app, None).unwrap();
+        let cycle = serve_service(&c, &mut sup, None).unwrap();
         assert!(matches!(cycle, Cycle::Backoff));
-        assert_eq!(sup.stops, 1, "the supervisor is stopped, not left spinning");
+        assert_eq!(sup.stops, 1, "the agent is stopped, not left spinning");
         assert!(rejected_marker(&c).is_none(), "nothing to reject");
     }
 
@@ -1333,9 +1039,8 @@ mod tests {
         let mut sup = FakeLink::new();
         sup.readable.borrow_mut().push_back(true);
         sup.stays_alive = true;
-        let mut app = Service::with_process(App::none());
 
-        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Continue));
         assert_eq!(
             rejected_marker(&c).as_deref(),
@@ -1345,15 +1050,14 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_that_fails_rejects_a_candidate_and_only_backs_off_a_committed_supervisor() {
+    fn a_hello_that_fails_rejects_a_candidate_and_only_backs_off_a_committed_agent() {
         let (_tmp, state_dir) = temp_dir("hello-candidate");
         let c = cfg(state_dir, None);
         let cand = PathBuf::from("/state/supervisors/mismatch/supervisor");
         let mut sup = FakeLink::new();
         sup.hello_ok = false;
-        let mut app = Service::with_process(App::none());
         assert!(matches!(
-            serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap(),
+            serve_service(&c, &mut sup, Some(cand.clone())).unwrap(),
             Cycle::Continue
         ));
         assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
@@ -1363,7 +1067,7 @@ mod tests {
         let mut sup = FakeLink::new();
         sup.hello_ok = false;
         assert!(matches!(
-            serve_service(&c, &mut sup, &mut app, None).unwrap(),
+            serve_service(&c, &mut sup, None).unwrap(),
             Cycle::Backoff
         ));
         assert!(rejected_marker(&c).is_none());
@@ -1376,11 +1080,10 @@ mod tests {
         c.ready_timeout = Duration::ZERO; // the deadline is already past on the first poll.
         let cand = PathBuf::from("/state/supervisors/slow/supervisor");
         let mut sup = FakeLink::new();
-        let mut app = Service::with_process(App::none());
-        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, Some(cand.clone())).unwrap();
         assert!(
             matches!(cycle, Cycle::Continue),
-            "a timed-out candidate rolls back to the committed supervisor"
+            "a timed-out candidate rolls back to the committed agent"
         );
         assert!(sup.stops >= 1, "the candidate is stopped");
         assert_eq!(
@@ -1397,8 +1100,7 @@ mod tests {
         let c = cfg(state_dir, None);
         let mut sup = FakeLink::new();
         sup.exited.push_back(true); // exits before any Ready
-        let mut app = Service::with_process(App::none());
-        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Continue));
         assert_eq!(rejected_marker(&c).as_deref(), cand.to_str());
     }
@@ -1414,11 +1116,10 @@ mod tests {
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(false); // still running right after readying...
         sup.exited.push_back(true); // ...then exits
-        let mut app = Service::with_process(App::none());
-        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, Some(cand.clone())).unwrap();
         assert!(
             matches!(cycle, Cycle::Continue),
-            "an unconfirmed supervisor rolls back immediately"
+            "an unconfirmed agent rolls back immediately"
         );
         assert!(
             rejected_marker(&c).as_deref() == cand.to_str(),
@@ -1443,8 +1144,7 @@ mod tests {
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(false);
         sup.exited.push_back(true);
-        let mut app = Service::with_process(App::none());
-        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap();
+        let cycle = serve_service(&c, &mut sup, Some(cand.clone())).unwrap();
         assert!(matches!(cycle, Cycle::Backoff));
         assert_eq!(
             record::desired_supervisor(&c.state_dir).unwrap(),
@@ -1459,7 +1159,7 @@ mod tests {
         // The rollback exists for a commit that did NOT happen. A durable write can also fail
         // after its rename — the pointer moved, only the fsync proving it durable failed — and
         // rejecting the candidate then leaves a rejection marker about the exact binary the next
-        // boot launches as the committed supervisor, ungated and unconfirmed.
+        // boot launches as the committed agent, ungated and unconfirmed.
         use std::os::unix::fs::PermissionsExt;
         let cand = PathBuf::from("/state/supervisors/unsynced/supervisor");
         let (_tmp, state_dir) = temp_dir("commit-unsynced");
@@ -1471,19 +1171,18 @@ mod tests {
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(false);
         sup.exited.push_back(true);
-        let mut app = Service::with_process(App::none());
         // Write and search but not read: the pointer's temp+rename still commits, the state
         // directory's own fsync cannot. Root bypasses the check, so there is nothing to prove.
         let root = unsafe { libc::geteuid() } == 0;
         std::fs::set_permissions(&c.state_dir, PermissionsExt::from_mode(0o300)).unwrap();
-        let cycle = serve_service(&c, &mut sup, &mut app, Some(cand.clone()));
+        let cycle = serve_service(&c, &mut sup, Some(cand.clone()));
         std::fs::set_permissions(&c.state_dir, PermissionsExt::from_mode(0o700)).unwrap();
         if root {
             return;
         }
         assert!(
             matches!(cycle.unwrap(), Cycle::Backoff),
-            "a committed supervisor that later exits is relaunched, not rejected"
+            "a committed agent that later exits is relaunched, not rejected"
         );
         assert_eq!(
             record::desired_supervisor(&c.state_dir).unwrap(),
@@ -1506,9 +1205,8 @@ mod tests {
         sup.readable.borrow_mut().push_back(true);
         sup.requests.push_back(Request::Ready([7u8; 16]));
         sup.exited.push_back(true);
-        let mut app = Service::with_process(App::none());
         assert!(matches!(
-            serve_service(&c, &mut sup, &mut app, Some(cand.clone())).unwrap(),
+            serve_service(&c, &mut sup, Some(cand.clone())).unwrap(),
             Cycle::Continue
         ));
         assert_eq!(record::desired_supervisor(&c.state_dir).unwrap(), None);
@@ -1516,17 +1214,16 @@ mod tests {
     }
 
     #[test]
-    fn serve_never_lets_the_deadline_reject_an_ordinary_committed_supervisor() {
+    fn serve_never_lets_the_deadline_reject_an_ordinary_committed_agent() {
         let (_tmp, state_dir) = temp_dir("committed");
         let mut c = cfg(state_dir, None);
         c.ready_timeout = Duration::ZERO;
         let mut sup = FakeLink::new();
-        sup.exited.push_back(true); // a plain committed supervisor that crashes
-        let mut app = Service::with_process(App::none());
-        let cycle = serve_service(&c, &mut sup, &mut app, None).unwrap(); // candidate None ⇒ already committed
+        sup.exited.push_back(true); // a plain committed agent that crashes
+        let cycle = serve_service(&c, &mut sup, None).unwrap(); // candidate None ⇒ already committed
         assert!(
             matches!(cycle, Cycle::Backoff),
-            "a committed supervisor is never rejected by the readiness deadline"
+            "a committed agent is never rejected by the readiness deadline"
         );
         assert!(rejected_marker(&c).is_none());
     }
@@ -1548,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_records_the_initial_supervisor_when_none_exists() {
+    fn seed_records_the_initial_agent_when_none_exists() {
         let (_tmp, dir) = temp_dir("seed-fresh");
         let initial = dir.join("supervisor");
         std::fs::write(&initial, b"binary").unwrap();
@@ -1561,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn a_seeded_supervisor_validates_after_the_flag_is_dropped() {
+    fn a_seeded_agent_validates_after_the_flag_is_dropped() {
         // Regression for the seeded-initial brick: a node that seeded via `--supervisor` and then
         // had the flag removed on a later restart (before ever self-updating) must still validate
         // its committed pointer — via the durable seeded record, not the live flag.
@@ -1585,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_fails_when_the_initial_supervisor_does_not_exist() {
+    fn seed_fails_when_the_initial_agent_does_not_exist() {
         let (_tmp, state_dir) = temp_dir("seed-missing");
         let c = cfg(state_dir, Some(PathBuf::from("/no/such/supervisor")));
         assert!(seed_desired_supervisor(&c).is_err());

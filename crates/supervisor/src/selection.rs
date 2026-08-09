@@ -5,12 +5,12 @@ pub(crate) enum AppOutcome {
         version: String,
     },
     Unchanged,
-    /// The update cannot proceed and cannot be recovered from in this process. The supervisor
-    /// exits non-zero with its durable evidence intact; the guardian relaunches it (throttled by
-    /// its backoff) and boot recovery re-derives the recovery from that evidence.
+    /// The update cannot proceed and cannot be recovered from in this process. The agent exits
+    /// non-zero with its durable evidence intact; the launcher relaunches it (throttled by its
+    /// backoff) and boot recovery re-derives the recovery from that evidence.
     Fatal(String),
     /// A post-activation update failure: the candidate is rejected and its rollback journal is
-    /// durable. This disposable supervisor terminates *cleanly* so the guardian relaunches it and
+    /// durable. This disposable agent terminates *cleanly* so the launcher relaunches it and
     /// boot recovery performs the (single) rollback. Distinct from `Fatal` only in that it is an
     /// expected, planned restart rather than a failure — the exit code is the difference an
     /// operator sees.
@@ -192,7 +192,6 @@ pub(crate) async fn check_application(
     opts: &Options,
     repo: &TrustedRepository,
     store: &mut dyn Store,
-    app: &mut App,
     before_deployment: impl FnOnce(),
 ) -> AppOutcome {
     let assignment = match repo.assignment() {
@@ -296,20 +295,16 @@ pub(crate) async fn check_application(
     // Stop background observers before any lifecycle transaction hook can run.
     before_deployment();
     log(&format!("applying update {from} -> {}", prepared.version));
-    // Drive the transaction over the live-application port; scope the tower so its borrow of
-    // `app` is released before the arms below read `app.pid()`.
-    let outcome = {
-        let mut tower = DefaultProvider::new(app, opts, &reconciler);
-        apply_update(
-            &mut tower,
-            store,
-            &prepared.release,
-            &prepared.archive_sha256,
-            lineage.clone(),
-            reconciler.clone(),
-        )
-        .await
-    };
+    let mut port = ReleaseReconciler::new(opts, &reconciler);
+    let outcome = apply_update(
+        &mut port,
+        store,
+        &prepared.release,
+        &prepared.archive_sha256,
+        lineage.clone(),
+        reconciler.clone(),
+    )
+    .await;
     match outcome {
         Ok(Outcome::Committed) => {
             if let Err(e) = store.clear_rejection(&lineage, &prepared.archive_sha256) {
@@ -318,18 +313,14 @@ pub(crate) async fn check_application(
                     prepared.version
                 ));
             }
-            log(&format!(
-                "upgraded to {} (pid {:?})",
-                prepared.version,
-                app.pid()
-            ));
+            log(&format!("upgraded to {}", prepared.version));
             AppOutcome::Upgraded {
                 version: prepared.version,
             }
         }
         Ok(Outcome::RollbackPending) => {
             // The candidate activated and then failed: it is rejected and its rollback journal is
-            // durable. Terminate so the guardian relaunches us and boot recovery rolls back to the
+            // durable. Terminate so the launcher relaunches us and boot recovery rolls back to the
             // predecessor — the one rollback path.
             warn(&format!(
                 "update to {} failed after activation; restarting to roll back to {from}",

@@ -11,7 +11,9 @@ inferred from Rust types.
 
 Every release carries one signed node reconciler. It may be a Bash or PowerShell script, a native
 binary, or any other executable. The agent authenticates and invokes it but deliberately does not
-interpret application or infrastructure semantics.
+interpret application or infrastructure semantics. The reconciler owns every workload process:
+starting, stopping, draining, and restarting whatever the release runs is its domain behavior
+(typically by driving the operator's init system), and the agent has no other way to touch one.
 
 ## Operations
 
@@ -24,9 +26,37 @@ The public interface has exactly four operations:
 - `inspect` — make one bounded steady-state observation. Non-empty stdout is opaque fingerprint
   material; typed dependency outputs are written to `--output-file`.
 
-The agent owns artifact verification, placement, draining, managed-process stop/start, retry
-cadence, timeouts, durable transaction state, crash replay, and rollout reporting. Those are
-intentionally not reconciler operations.
+The agent owns artifact verification, placement, retry cadence, timeouts, durable transaction
+state, crash replay, and rollout reporting. Those are intentionally not reconciler operations.
+
+## Execution contract
+
+Every operation is invoked **at least once**: the agent journals its intent durably before each
+invocation, and after a crash it cannot know whether an invocation half-ran — so its only correct
+recovery is to invoke again. A replay carries the *same* `--attempt-id` and the same arguments as
+the invocation it repeats. The contract a reconciler must therefore satisfy is:
+
+- Every operation tolerates being run again after any prefix of itself has already happened. The
+  last completed invocation wins; there is no "exactly once".
+- Effects must be keyed to the attempt, never to invocation count. `--attempt-id` is stable across
+  replays of one attempt and never reused by another, so "have I already done this?" is answerable
+  by marking completion under the attempt id.
+- A reconciler that needs multi-step resumability writes its own sub-progress durably under
+  `--state-dir` (its private directory, preserved across replays and boots) and skips completed
+  sub-steps on replay. The agent never interprets that state.
+- Exactly-once *effects* are buildable on top: use `--attempt-id` as the idempotency key and make
+  each effect commit atomically with its completion marker — a same-filesystem rename that is both
+  the effect and the marker, a database transaction that writes the marker row beside the change,
+  or a downstream API's own idempotency token derived from the attempt id. A marker written
+  *after* a non-atomic effect only narrows the duplicate window; it does not close it.
+- `healthcheck` and `inspect` must be observations. The agent is free to repeat them any number of
+  times, including concurrently with steady state; an observation with side effects turns every
+  probe into a mutation replay.
+
+The agent guarantees in return: one operation runs at a time per install root (never two
+concurrently), intent is journaled before every invocation, a crashed transaction is resumed —
+forward via `apply` or compensated via `rollback` — from its last durable checkpoint, and a
+candidate whose attempt is rejected is never retried under a new attempt.
 
 ## Invocation
 
@@ -43,7 +73,6 @@ reconciler OPERATION
   --input-file PATH
   --predecessor PATH
   --predecessor-version VERSION
-  [--managed-pid PID]
   [-- PUBLISHER_ARGUMENTS...]
 ```
 
@@ -113,7 +142,7 @@ while (($#)); do
     --predecessor) predecessor=$2; shift 2 ;;
     --input-file) input_file=$2; shift 2 ;;
     --output-file) output_file=$2; shift 2 ;;
-    --attempt-id|--install-root|--state-dir|--candidate-version|--predecessor-version|--managed-pid)
+    --attempt-id|--install-root|--state-dir|--candidate-version|--predecessor-version)
       shift 2 ;;
     --) shift; break ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -144,10 +173,16 @@ esac
 
 ## Runtime ownership
 
-In `managed` mode the agent owns the application process and performs its internal drain/stop/start
-around `apply` or `rollback`. In `provider-managed` mode the reconciler owns workload processes;
-`apply` and `rollback` must converge them as part of their domain behavior. Both modes use the same
-four-operation interface.
+The reconciler owns workload processes; `apply` and `rollback` must converge them — including any
+drain, stop, start, or restart the workload needs — as part of their domain behavior. The agent
+never holds a workload process, so an agent restart, crash, or self-update can never disturb one.
+
+## Secrets
+
+The values behind the assignment's declared `SecretReference`s are present in every invocation's
+environment, under the reference's `environment` name. They arrive only through the environment —
+never argv, never a file the agent writes — and must not be echoed into the output manifest or
+diagnostic streams.
 
 ## Compatibility
 

@@ -26,12 +26,9 @@ pub struct RepositoryAssignment {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedRuntime {
-    #[serde(default)]
-    pub mode: RuntimeMode,
     pub product: String,
     pub channel: String,
     pub install_root: PathBuf,
-    pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<SecretReference>,
     /// Typed values resolved from prerequisite group outputs. Secret values remain references.
@@ -48,14 +45,6 @@ pub struct SecretReference {
     pub environment: String,
     pub secret: String,
     pub key: String,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RuntimeMode {
-    #[default]
-    Managed,
-    ProviderManaged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -86,8 +75,6 @@ pub struct ManagedTimeouts {
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
     pub supervisor_check_interval_seconds: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drain_hold_seconds: Option<u64>,
 }
 
 impl RepositoryAssignment {
@@ -198,13 +185,7 @@ impl ManagedRuntime {
                 "timeouts.supervisor_check_interval_seconds",
                 self.timeouts.supervisor_check_interval_seconds,
             ),
-        ]
-        .into_iter()
-        .chain(
-            self.timeouts
-                .drain_hold_seconds
-                .map(|hold| ("timeouts.drain_hold_seconds", hold)),
-        ) {
+        ] {
             if seconds > MAX_INTERVAL_SECONDS {
                 return Err(format!(
                     "{field} ({seconds}) exceeds the {MAX_INTERVAL_SECONDS}s maximum"
@@ -251,9 +232,6 @@ impl ManagedRuntime {
         }
         .validate()
         .map_err(|error| format!("managed runtime inputs: {error}"))?;
-        if self.mode == RuntimeMode::ProviderManaged && !self.secrets.is_empty() {
-            return Err("provider-managed runtime cannot declare application secrets".into());
-        }
         let mut environments = std::collections::BTreeSet::new();
         for reference in &self.secrets {
             let valid_environment = !reference.environment.is_empty()
@@ -341,11 +319,9 @@ mod tests {
 
     fn runtime() -> ManagedRuntime {
         ManagedRuntime {
-            mode: RuntimeMode::Managed,
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
-            args: vec![],
             secrets: vec![],
             inputs: BTreeMap::new(),
             repository: ManagedRepositoryLimits {
@@ -368,7 +344,6 @@ mod tests {
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
                 supervisor_check_interval_seconds: 3600,
-                drain_hold_seconds: Some(0),
             },
         }
     }
@@ -403,7 +378,7 @@ mod tests {
         type SetSeconds = fn(&mut ManagedRuntime, u64);
         // The report-cadence fields are absent deliberately: they answer to the tighter,
         // freshness-derived ceiling instead (see below).
-        let fields: [(&str, SetSeconds); 6] = [
+        let fields: [(&str, SetSeconds); 5] = [
             ("transport_timeout", |r, v| {
                 r.repository.transport_timeout_seconds = v
             }),
@@ -420,7 +395,6 @@ mod tests {
             ("supervisor_check_interval", |r, v| {
                 r.timeouts.supervisor_check_interval_seconds = v
             }),
-            ("drain_hold", |r, v| r.timeouts.drain_hold_seconds = Some(v)),
         ];
         for (name, set) in fields {
             let mut at_maximum = runtime();
@@ -510,20 +484,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn runtime_mode_defaults_to_managed() {
-        let value = serde_json::to_value(runtime()).unwrap();
-        let mut object = value.as_object().unwrap().clone();
-        object.remove("mode");
-        let parsed: ManagedRuntime =
-            serde_json::from_value(serde_json::Value::Object(object)).unwrap();
-        assert_eq!(parsed.mode, RuntimeMode::Managed);
-        assert_eq!(
-            serde_json::from_str::<RuntimeMode>("\"provider-managed\"").unwrap(),
-            RuntimeMode::ProviderManaged
-        );
     }
 
     #[test]
@@ -758,12 +718,7 @@ mod tests {
             assert_eq!(schema["properties"]["runtime"]["$ref"], "#/$defs/runtime");
 
             let runtime = &schema["$defs"]["runtime"];
-            assert_object(
-                runtime,
-                &value.runtime,
-                &["mode", "secrets", "inputs"],
-                "runtime",
-            );
+            assert_object(runtime, &value.runtime, &["secrets", "inputs"], "runtime");
             assert_eq!(
                 runtime["properties"]["secrets"]["maxItems"],
                 Value::from(64)
@@ -795,12 +750,7 @@ mod tests {
             // publishes, or an integrator sizes a fleet's cadence against a number that fails
             // closed on every node.
             let timeouts = &schema["$defs"]["timeouts"];
-            assert_object(
-                timeouts,
-                &value.runtime.timeouts,
-                &["drain_hold_seconds"],
-                "timeouts",
-            );
+            assert_object(timeouts, &value.runtime.timeouts, &[], "timeouts");
             for cadence in ["check_interval_seconds", "refresh_retry_seconds"] {
                 assert_eq!(
                     timeouts["properties"][cadence]["maximum"],
@@ -813,7 +763,6 @@ mod tests {
                 "health_interval_seconds",
                 "confirmation_window_seconds",
                 "supervisor_check_interval_seconds",
-                "drain_hold_seconds",
             ] {
                 assert_eq!(
                     timeouts["properties"][bounded]["maximum"],

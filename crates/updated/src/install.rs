@@ -1,7 +1,7 @@
 //! Durable first-install transaction and its recovery classifier.
 //!
 //! Cold install is a first-class operation with a *different meaning* than an update: there
-//! is no predecessor to drain, stop, or roll back to. It is `prepare -> place -> commit`,
+//! is no predecessor to roll back to. It is `prepare -> place -> commit`,
 //! and a failure fails closed (nothing to restore — the node simply retries the install on
 //! the next boot). This module owns that journal in the same shape and spirit as the update
 //! [`crate::transaction`], but without any predecessor or rollback machinery.

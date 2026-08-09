@@ -1,10 +1,9 @@
-//! Launching and supervising the disposable supervisor process.
+//! Launching and supervising the disposable agent process.
 //!
-//! The supervisor is the guardian's only child besides the application. It is
-//! deliberately disposable: the guardian owns the application, so a supervisor may
-//! crash, be replaced, or be updated without the application noticing. The guardian
-//! launches it with an inherited control channel and a readiness nonce, then watches
-//! it — serving its control requests — until it exits or is replaced.
+//! The agent is the launcher's only child. It is deliberately disposable: nothing the
+//! launcher owns depends on it staying up, so it may crash, be replaced, or be updated
+//! freely. The launcher launches it with an inherited control channel and a readiness
+//! nonce, then watches it — serving its control requests — until it exits or is replaced.
 
 use std::io;
 use std::path::Path;
@@ -15,14 +14,14 @@ use foundation::process::ContainedChild;
 
 use crate::rand;
 use crate::sys::Channel;
-use control::{Nonce, Request, Response, APP_PID_ENV, CONTROL_ENV, READY_NONCE_ENV, STATE_DIR_ENV};
+use control::{Nonce, Request, Response, CONTROL_ENV, READY_NONCE_ENV, STATE_DIR_ENV};
 
 const POLL: Duration = Duration::from_millis(100);
 
-/// A launched supervisor and the guardian's end of its control channel. The supervisor is
-/// death-contained ([`ContainedChild`]): a SIGKILLed guardian can never orphan it — on
+/// A launched agent and the launcher's end of its control channel. The agent is
+/// death-contained ([`ContainedChild`]): a SIGKILLed launcher can never orphan it — on
 /// Linux `PR_SET_PDEATHSIG` has the kernel kill it, on Windows the kill-on-close job object
-/// ties its lifetime to the guardian's handle.
+/// ties its lifetime to the launcher's handle.
 pub struct Supervisor {
     child: ContainedChild,
     channel: Channel,
@@ -32,14 +31,12 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// Launch `binary` with an inherited control channel, the operator config path
-    /// (opaque to the guardian), the state directory (for staging replacements), a fresh
-    /// readiness nonce, and — if the guardian already owns a running application —
-    /// its PID, so the new supervisor adopts it instead of launching a duplicate.
+    /// (opaque to the launcher), the state directory (for staging replacements), and a
+    /// fresh readiness nonce.
     pub fn launch(
         binary: &Path,
         config: &Path,
         state_dir: &Path,
-        app_pid: Option<u32>,
         stop_grace: Duration,
     ) -> io::Result<Supervisor> {
         let mut channel = Channel::create()?;
@@ -50,25 +47,16 @@ impl Supervisor {
             .env(CONTROL_ENV, channel.child_env_value())
             .env(READY_NONCE_ENV, rand::to_hex(&nonce))
             .env(STATE_DIR_ENV, state_dir);
-        match app_pid {
-            Some(pid) => {
-                cmd.env(APP_PID_ENV, pid.to_string());
-            }
-            None => {
-                cmd.env_remove(APP_PID_ENV);
-            }
-        }
-        // Death-contain the supervisor so a SIGKILLed guardian can never orphan it — it is
-        // the guardian's disposable child, exactly the "churning tower" case `ContainedChild`
+        // Death-contain the agent so a SIGKILLed launcher can never orphan it — it is
+        // the launcher's disposable child, exactly the "churning tower" case `ContainedChild`
         // exists for. On Linux `arrange_parent_death_signal` adds `PR_SET_PDEATHSIG`; on
-        // Windows the kill-on-close job `ContainedChild` assigns ties the supervisor to the
-        // guardian's handle. The process group a graceful `CTRL_BREAK`/`SIGTERM` needs is
+        // Windows the kill-on-close job `ContainedChild` assigns ties the agent to the
+        // launcher's handle. The process group a graceful `CTRL_BREAK`/`SIGTERM` needs is
         // `ContainedChild`'s own doing on both platforms — see `ContainedChild::request_stop`.
         foundation::process::arrange_parent_death_signal(&mut cmd);
         let child = ContainedChild::spawn(cmd)?;
-        // The supervisor inherited the child end; the guardian drops its copy so it is
-        // the sole holder of the guardian end (and the channel closes when the
-        // supervisor dies).
+        // The agent inherited the child end; the launcher drops its copy so it is
+        // the sole holder of the launcher end (and the channel closes when the agent dies).
         channel.close_child_end();
         Ok(Supervisor {
             child,
@@ -82,13 +70,12 @@ impl Supervisor {
         self.child.id()
     }
 
-    /// Whether the supervisor has exited, sampled now.
+    /// Whether the agent has exited, sampled now.
     pub fn exited(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
-    /// Ask the supervisor to stop and reap it (kill on grace expiry). Never touches the
-    /// application — the guardian owns that separately.
+    /// Ask the agent to stop and reap it (kill on grace expiry).
     ///
     /// Both the graceful request and the hard kill go through [`ContainedChild`], which knows
     /// whether the leader has already been reaped. A raw `kill(pid, …)` here would be the same
@@ -103,7 +90,7 @@ impl Supervisor {
 mod tests {
     use super::*;
 
-    /// A supervisor stand-in that catches the graceful stop and exits on it.
+    /// An agent stand-in that catches the graceful stop and exits on it.
     fn graceful_binary(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let guard = tempfile::tempdir().unwrap();
@@ -126,7 +113,6 @@ mod tests {
             &binary,
             &dir.join("config.toml"),
             dir,
-            None,
             Duration::from_secs(30),
         )
         .unwrap();
@@ -134,7 +120,7 @@ mod tests {
         sup.stop();
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "stop waited out the grace instead of asking the supervisor to exit"
+            "stop waited out the grace instead of asking the agent to exit"
         );
         assert!(sup.exited());
     }
@@ -149,7 +135,6 @@ mod tests {
             &binary,
             &dir.join("config.toml"),
             dir,
-            None,
             Duration::from_secs(30),
         )
         .unwrap();
@@ -161,11 +146,10 @@ mod tests {
     }
 }
 
-/// The guardian's control link to the supervisor it launched — exactly the surface the
+/// The launcher's control link to the agent it launched — exactly the surface the
 /// `serve`/`dispatch` state machine uses. Abstracting it lets the serve loop, its readiness
 /// gate, and every control-request transition be driven by a scripted fake in a unit test,
-/// with no real process, socketpair, or clock (the same discipline the app has via
-/// [`Process`](crate::sys::Process)).
+/// with no real process, socketpair, or clock.
 pub trait Link {
     fn nonce(&self) -> Nonce;
     fn send_hello(&mut self) -> control::Result<()>;

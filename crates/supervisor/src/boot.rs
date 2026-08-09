@@ -48,25 +48,46 @@ pub(crate) fn plan_boot(s: &Situation) -> Plan {
 
     if pending_authoritative {
         if let Some(pending) = &state.pending {
-            confirm_or_revert(&mut plan, s, &state, pending);
+            confirm_if_window_passed(&mut plan, s, &state, pending);
         }
     }
 
-    // A boot that (re)installed this cycle changed the active bytes. Any process the guardian kept
-    // alive is the *previous* release — e.g. a wedged head the cold-install descent just stepped
-    // past — so it must be stopped and the freshly-installed bytes launched. Adopting it would
-    // health-gate the stale process and then reject the release we just installed as if it were the
-    // one that failed, stranding a node on an exhausted descent even though a healthy release was
-    // available. (A crashed head leaves no running process, so this only bites the wedge path.)
-    if s.first_install && s.app_running.is_some() {
-        plan.quiesce = true;
-    }
-    plan.acquire = match s.app_running {
-        Some(pid) if !plan.quiesce => Acquire::Adopt(pid),
-        _ => Acquire::Launch,
-    };
     plan.reject_supervisor = s.bad_supervisor.clone();
     plan
+}
+
+/// What a boot owes when its health gate does not pass — the only local revert path left, and the
+/// reason it is bounded to the confirmation window.
+///
+/// The `healthcheck` hook is the single health source, so a gate failure is the one piece of
+/// evidence this node has about the release it is running. Inside the confirmation window that is
+/// worth a local revert: the predecessor is still on disk, the rollback intent is already recorded,
+/// and the fleet has nothing better to offer. Past it — a CONFIRMED release that has proven itself
+/// once — it is not: the hook may converge later, and a node that reverts itself on every unhealthy
+/// window would fight the reconciler it is supposed to obey. Ill health there is reported and
+/// nothing else (`health.last_ready = false` in the node's report), leaving the decision to the
+/// control plane.
+pub(crate) fn plan_gate_failure(installed: &InstalledState) -> GateFailure {
+    if installed.pending.is_some() {
+        GateFailure::Revert
+    } else if !installed.confirmed {
+        GateFailure::RejectProvisional
+    } else {
+        GateFailure::Report
+    }
+}
+
+/// The three answers to a failed boot health gate. See [`plan_gate_failure`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GateFailure {
+    /// An update is still inside its confirmation window: revert to the predecessor its `pending`
+    /// record names and reject the candidate's bytes.
+    Revert,
+    /// A provisional head that has never proven healthy: reject its bytes so the next boot's cold
+    /// install descends via ordered fallback past it.
+    RejectProvisional,
+    /// A confirmed release: report it unhealthy and keep running. Never reverted locally.
+    Report,
 }
 
 /// A prior supervisor restored the predecessor pointer but crashed before the external rollback and
@@ -122,8 +143,8 @@ fn drives_rollback(tx: &Transaction) -> bool {
 /// warning, by the update's switch-over and by the rollback's finalize), and it stops classifying
 /// benignly the moment the active pointer moves off the release it names — an in-loop repair
 /// falling back to the predecessor, a `repair_from_assignment` installing the assigned release, or
-/// a restored backup. Classified `RestorePredecessor` it produced a boot that planned a quiesce, an
-/// activation and a commit, ran none of them (every gate closed), and cleared the journal anyway:
+/// a restored backup. Classified `RestorePredecessor` it produced a boot that planned an
+/// activation and a commit, ran neither (every gate closed), and cleared the journal anyway:
 /// the node ran one release while the installed record — and every heartbeat derived from it —
 /// named another. It is spent, so the committed record decides instead.
 pub(crate) fn journal_recovery(
@@ -171,21 +192,11 @@ fn reconcile_transaction(
             tx.candidate_release.version
         )),
         Recovery::RestorePredecessor => {
-            // A reload deployment keeps its process across a failed candidate reload, so adopt the
-            // running predecessor rather than stop-starting it (no downtime). A restart deployment
-            // stops the uncommitted candidate and relaunches the predecessor.
-            plan.quiesce = situation.app_running.is_some();
+            // Restore the pointer the interrupted activation displaced. The candidate is rejected
+            // only when the journal says so (`candidate_rejection_required`, written by the
+            // transaction that judged it): an interrupted activation is evidence about this
+            // process, never about the candidate's bytes.
             plan.release = ReleaseFix::Activate(tx.previous_release.clone());
-            if situation.charge_crash_to_release() && !tx.candidate_rejection_required {
-                plan.reject_app.push((
-                    tx.candidate_repository_lineage.clone(),
-                    tx.candidate_archive_sha256.clone(),
-                ));
-                plan.warn(format!(
-                    "recovery: rejected {} after failed activation",
-                    tx.candidate_release.version
-                ));
-            }
             plan.warn(format!(
                 "recovery: restoring predecessor {} after interrupted activation of {}",
                 tx.previous_release.version, tx.candidate_release.version
@@ -214,7 +225,6 @@ fn enforce_installed(plan: &mut Plan, situation: &Situation, installed: &Install
     // The installed release is immutable and remains the authoritative recovery target.
     // The executor re-verifies it at the activation/commit moment before changing
     // active-release; the steady-state pointer match above is trusted without a re-hash.
-    plan.quiesce = situation.app_running.is_some();
     plan.release = ReleaseFix::Activate(installed.release.clone());
     plan.warn(format!(
         "active release drifted; restoring committed {}",
@@ -222,41 +232,16 @@ fn enforce_installed(plan: &mut Plan, situation: &Situation, installed: &Install
     ));
 }
 
-fn confirm_or_revert(
+/// An update that ran its whole confirmation window is settled: clear its rollback intent so the
+/// predecessor can be collected. A window that is still open is left alone — the boot health gate
+/// below decides it, and a failing gate reverts through [`plan_gate_failure`].
+fn confirm_if_window_passed(
     plan: &mut Plan,
     situation: &Situation,
     installed: &InstalledState,
     pending: &Pending,
 ) {
-    if situation.service_exited {
-        // Reload deployments adopt the still-running predecessor; restart deployments stop-start it.
-        plan.quiesce = situation.app_running.is_some();
-        plan.release = ReleaseFix::Activate(pending.previous_release.clone());
-        // The revert is unconditional; the permanent rejection that normally rides with it is not.
-        // See [`Situation::charge_crash_to_release`]: a boot that repaired this release's damaged
-        // tree cannot blame its (re-downloaded, re-verified) bytes for the exit, but it still owes
-        // the predecessor its rollback.
-        if situation.charge_crash_to_release() {
-            plan.reject_app.push((
-                installed.repository_lineage.clone(),
-                installed.archive_sha256.clone(),
-            ));
-        }
-        // Revert to the predecessor carrying its providers (held in `pending`) so the restored
-        // release keeps its crash-watch, readiness gate, and boot converge — see the confirm
-        // branch below, which carries the same three for the forward case.
-        plan.commit = Some(InstalledState::confirmed(
-            pending.previous_repository_lineage.clone(),
-            pending.previous_release.clone(),
-            pending.previous_archive_sha256.clone(),
-            pending.lifecycle.clone(),
-        ));
-        plan.current = Some(pending.previous_release.version.clone());
-        plan.warn(format!(
-            "release {} exited within its confirmation window; reverting to {}",
-            installed.release.version, pending.previous_release.version
-        ));
-    } else if window_passed(pending, situation.confirm_window, situation.now) {
+    if window_passed(pending, situation.confirm_window, situation.now) {
         // Confirming the current install: carry its providers forward unchanged.
         plan.commit = Some(InstalledState::confirmed(
             installed.repository_lineage.clone(),
@@ -306,50 +291,10 @@ mod tests {
             ))),
             active: Some(current),
             journal: None,
-            service_exited: false,
-            bytes_repaired: false,
-            app_running: None,
-            first_install: false,
             bad_supervisor: None,
             confirm_window: Duration::from_secs(60),
             now: 100,
         }
-    }
-
-    #[test]
-    fn a_reinstall_launches_fresh_and_stops_a_kept_alive_stale_process() {
-        // The cold-install descent re-installs a lower release while the guardian is still holding
-        // the wedged head it stepped past. The planner must stop that stale process and launch the
-        // freshly-installed bytes — never adopt it (which would health-gate the wrong version and
-        // reject the release just installed).
-        let mut situation = steady();
-        situation.first_install = true;
-        situation.app_running = Some(4321);
-
-        let plan = plan_boot(&situation);
-
-        assert!(
-            plan.quiesce,
-            "a re-install with a kept-alive process must stop it"
-        );
-        assert_eq!(
-            plan.acquire,
-            Acquire::Launch,
-            "a re-install must launch the freshly-installed bytes, not adopt the stale process"
-        );
-    }
-
-    #[test]
-    fn a_plain_restart_still_adopts_the_running_process() {
-        // Guard the fix's scope: an ordinary supervisor restart (no re-install this boot) must
-        // still adopt the app the guardian legitimately keeps running.
-        let mut situation = steady();
-        situation.app_running = Some(4321);
-
-        let plan = plan_boot(&situation);
-
-        assert!(!plan.quiesce);
-        assert_eq!(plan.acquire, Acquire::Adopt(4321));
     }
 
     #[test]
@@ -364,7 +309,6 @@ mod tests {
         let mut situation = steady();
         let candidate = release("2.0.0", "two");
         situation.active = Some(candidate.clone());
-        situation.service_exited = true;
         situation.journal = Some(Transaction {
             id: "attempt".into(),
             previous_release: release("1.0.0", "one"),
@@ -373,7 +317,7 @@ mod tests {
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
             candidate_repository_lineage: lineage(),
-            candidate_rejection_required: false,
+            candidate_rejection_required: true,
             lifecycle: provider(),
             rollback_health_failures: 0,
             phase: TransactionPhase::CandidateActivated,
@@ -410,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn journaled_rejection_survives_consuming_the_crash_marker() {
+    fn a_journaled_rejection_is_replayed_on_the_rollback_path() {
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut situation = steady();
@@ -423,7 +367,6 @@ mod tests {
             pending: None,
             confirmed: true,
         }));
-        situation.service_exited = false;
         situation.journal = Some(Transaction {
             id: "attempt".into(),
             previous_release: predecessor,
@@ -516,22 +459,15 @@ mod tests {
     /// Every phase of the transaction machine. The `match` is the guard: a phase added to
     /// `updated::transaction::Phase` makes it non-exhaustive and fails the build, so this list —
     /// and the spent-journal property below — cannot fall behind the machine it describes.
-    fn all_phases() -> [TransactionPhase; 30] {
+    fn all_phases() -> [TransactionPhase; 19] {
         use TransactionPhase::*;
         let every = [
             PreflightStarted,
             PreflightCompleted,
             PrepareStarted,
             Prepared,
-            PreDrainStarted,
-            DrainStarted,
-            Drained,
-            StopStarted,
-            Stopped,
             ActivateStarted,
             CandidateActivated,
-            StartStarted,
-            CandidateStarted,
             HealthStarted,
             CandidateHealthy,
             FinalizeStarted,
@@ -539,12 +475,8 @@ mod tests {
             CommitStarted,
             Committed,
             RollbackStarted,
-            RollbackStopStarted,
-            RollbackStopped,
             RollbackActivateStarted,
             PredecessorActivated,
-            RollbackStartStarted,
-            PredecessorStarted,
             RollbackHealthStarted,
             PredecessorHealthy,
             RollbackFinalizeStarted,
@@ -556,15 +488,8 @@ mod tests {
                 | PreflightCompleted
                 | PrepareStarted
                 | Prepared
-                | PreDrainStarted
-                | DrainStarted
-                | Drained
-                | StopStarted
-                | Stopped
                 | ActivateStarted
                 | CandidateActivated
-                | StartStarted
-                | CandidateStarted
                 | HealthStarted
                 | CandidateHealthy
                 | FinalizeStarted
@@ -572,12 +497,8 @@ mod tests {
                 | CommitStarted
                 | Committed
                 | RollbackStarted
-                | RollbackStopStarted
-                | RollbackStopped
                 | RollbackActivateStarted
                 | PredecessorActivated
-                | RollbackStartStarted
-                | PredecessorStarted
                 | RollbackHealthStarted
                 | PredecessorHealthy
                 | RollbackFinalizeStarted
@@ -624,7 +545,7 @@ mod tests {
         // committed bundle corrupt and `repair_from_assignment` installed and activated the
         // assigned release 3.0.0 *before* the journal was read. `classify_recovery` then reads
         // `RestorePredecessor` (active != previous_release), but `RolledBack` is terminal: every
-        // resume gate is closed, so the planned quiesce and activation cannot run. Committing the
+        // resume gate is closed, so the planned activation cannot run. Committing the
         // predecessor record anyway left the node running 3.0.0 while `installed.json` — and every
         // heartbeat off it — named 1.0.0, and the next boot's drift enforcement stopped the healthy
         // application to re-activate the corrupt predecessor.
@@ -657,7 +578,6 @@ mod tests {
             "a journal that cannot run its rollback must not commit that rollback's record"
         );
         assert_eq!(plan.current.as_deref(), Some("3.0.0"));
-        assert!(!plan.quiesce, "the healthy application must not be stopped");
         assert!(plan.clear_journal, "the spent journal is removed");
     }
 
@@ -667,7 +587,7 @@ mod tests {
         // back to the predecessor's pointer but died before `commit_installed`. The spent
         // `Committed` journal then classifies `RestorePredecessor`, and taking it as the recovery
         // produced a transaction with no rollback rank: the executor's resume gates closed, so the
-        // planned quiesce and activation never ran while the journal was cleared anyway — leaving
+        // planned activation never ran while the journal was cleared anyway — leaving
         // the node running the predecessor with the record, and every heartbeat off it, naming the
         // candidate.
         let predecessor = release("1.0.0", "one");
@@ -726,95 +646,90 @@ mod tests {
         );
     }
 
-    /// A head committed as unconfirmed over `1.0.0`, whose application then exited. `now` is past
-    /// the confirmation window, so a boot that failed to read the exit would CONFIRM it.
-    fn crashed_inside_its_window() -> Situation {
-        let predecessor = release("1.0.0", "one");
-        let candidate = release("2.0.0", "two");
-        let mut situation = steady();
-        situation.active = Some(candidate.clone());
-        situation.installed = Installed::Present(Box::new(InstalledState {
+    /// The record of an update that committed over `1.0.0` and is still inside its confirmation
+    /// window: the head, plus the `pending` naming the predecessor it displaced.
+    fn unconfirmed_head() -> InstalledState {
+        InstalledState {
             repository_lineage: lineage(),
-            release: candidate,
+            release: release("2.0.0", "two"),
             archive_sha256: "archive-two".into(),
             lifecycle: provider(),
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
-                previous_release: predecessor,
+                previous_release: release("1.0.0", "one"),
                 previous_archive_sha256: "archive-one".into(),
                 previous_repository_lineage: lineage(),
                 committed_at: 100,
                 lifecycle: provider(),
             }),
             confirmed: true,
-        }));
-        situation.service_exited = true;
+        }
+    }
+
+    #[test]
+    fn a_failed_gate_reverts_only_inside_the_confirmation_window() {
+        // The whole local-revert policy in one place. An unconfirmed update whose healthcheck hook
+        // will not pass its boot gate is reverted to the predecessor `pending` names and its bytes
+        // are rejected — the node has a proven release on disk and nothing better to wait for. The
+        // same failing gate against a CONFIRMED release is reported and nothing else: the hook owns
+        // the workload and may converge later, and a node that reverted itself here would fight the
+        // reconciler it exists to obey (and, past the window, has no predecessor image left).
+        assert_eq!(plan_gate_failure(&unconfirmed_head()), GateFailure::Revert);
+
+        let confirmed = InstalledState::confirmed(
+            lineage(),
+            release("2.0.0", "two"),
+            "archive-two".into(),
+            provider(),
+        );
+        assert_eq!(plan_gate_failure(&confirmed), GateFailure::Report);
+    }
+
+    #[test]
+    fn a_provisional_head_that_never_gets_healthy_is_rejected_so_the_next_boot_descends() {
+        // A cold-installed head has never proven anything, and there is no predecessor to revert
+        // to: rejecting its bytes is what lets the next boot's ordered fallback descend past it
+        // instead of relaunching a release that cannot serve.
+        let provisional = InstalledState::provisional(
+            lineage(),
+            release("2.0.0", "two"),
+            "archive-two".into(),
+            provider(),
+        );
+        assert_eq!(
+            plan_gate_failure(&provisional),
+            GateFailure::RejectProvisional
+        );
+    }
+
+    #[test]
+    fn a_passed_window_confirms_rather_than_reverting() {
+        // The confirm side of the same record: once the window is spent the update is settled and
+        // its rollback intent is dropped, so no later gate failure can revert it.
+        let mut situation = steady();
+        situation.active = Some(release("2.0.0", "two"));
+        situation.installed = Installed::Present(Box::new(unconfirmed_head()));
         situation.now = 10_000;
-        situation
-    }
-
-    #[test]
-    fn a_crash_inside_the_window_reverts_and_rejects_when_the_tree_was_intact() {
-        // The unrepaired side of the attribution rule: nothing damaged this disk, so the exit is
-        // the release's own and it is both reverted and permanently rejected — and never confirmed,
-        // though its window has long passed.
-        let plan = plan_boot(&crashed_inside_its_window());
-
-        assert_eq!(
-            plan.release,
-            ReleaseFix::Activate(release("1.0.0", "one")),
-            "the predecessor must be reactivated"
-        );
-        assert_eq!(
-            plan.commit,
-            Some(InstalledState::confirmed(
-                lineage(),
-                release("1.0.0", "one"),
-                "archive-one".into(),
-                provider(),
-            )),
-            "the predecessor, not the crashed candidate, is what this node runs"
-        );
-        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
-    }
-
-    #[test]
-    fn a_repair_withholds_the_rejection_but_never_the_revert() {
-        // The repaired side: this boot re-downloaded and re-verified `archive-two`, so the exit
-        // cannot be charged to those bytes — but the predecessor is still owed its rollback, and
-        // the crashed head must still NOT be confirmed even with its window passed. Withholding the
-        // exit itself (clearing the marker) is what would confirm it.
-        let mut situation = crashed_inside_its_window();
-        situation.bytes_repaired = true;
 
         let plan = plan_boot(&situation);
 
-        assert_eq!(
-            plan.release,
-            ReleaseFix::Activate(release("1.0.0", "one")),
-            "a repair must not disable the revert"
-        );
+        assert_eq!(plan.release, ReleaseFix::None);
+        assert!(plan.reject_app.is_empty());
         assert_eq!(
             plan.commit,
             Some(InstalledState::confirmed(
                 lineage(),
-                release("1.0.0", "one"),
-                "archive-one".into(),
+                release("2.0.0", "two"),
+                "archive-two".into(),
                 provider(),
-            )),
-            "the crashed head must never be committed as confirmed by a repaired boot"
-        );
-        assert!(
-            plan.reject_app.is_empty(),
-            "a release whose damaged tree this boot repaired must not be blacklisted: {:?}",
-            plan.reject_app
+            ))
         );
     }
 
     #[test]
-    fn a_repair_withholds_the_journal_driven_rejection_but_still_restores_the_predecessor() {
-        // The same rule at the other rejection site: a journal-driven `RestorePredecessor` whose
-        // rejection would be derived from the exit rather than carried in the journal.
+    fn recovery_replays_the_rejection_the_journal_itself_recorded() {
+        // `candidate_rejection_required` is a durable fact recorded by the transaction that judged
+        // the candidate, and recovery replays it whatever else this boot decides.
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut situation = steady();
@@ -827,50 +742,6 @@ mod tests {
             pending: None,
             confirmed: true,
         }));
-        situation.service_exited = true;
-        situation.bytes_repaired = true;
-        situation.journal = Some(Transaction {
-            id: "attempt".into(),
-            previous_release: predecessor.clone(),
-            previous_archive_sha256: "archive-one".into(),
-            previous_repository_lineage: lineage(),
-            candidate_release: candidate,
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_repository_lineage: lineage(),
-            candidate_rejection_required: false,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase: TransactionPhase::RollbackStarted,
-        });
-
-        let plan = plan_boot(&situation);
-
-        assert_eq!(plan.release, ReleaseFix::Activate(predecessor));
-        assert!(
-            plan.reject_app.is_empty(),
-            "the exit describes a repaired tree, not the candidate's bytes: {:?}",
-            plan.reject_app
-        );
-    }
-
-    #[test]
-    fn a_repair_never_suppresses_a_rejection_the_journal_itself_recorded() {
-        // Scope guard: `candidate_rejection_required` is a durable fact recorded by the failed
-        // activation, not an inference from the crash marker, so a repair must not swallow it.
-        let predecessor = release("1.0.0", "one");
-        let candidate = release("2.0.0", "two");
-        let mut situation = steady();
-        situation.active = Some(candidate.clone());
-        situation.installed = Installed::Present(Box::new(InstalledState {
-            repository_lineage: lineage(),
-            release: candidate.clone(),
-            archive_sha256: "archive-two".into(),
-            lifecycle: provider(),
-            pending: None,
-            confirmed: true,
-        }));
-        situation.service_exited = true;
-        situation.bytes_repaired = true;
         situation.journal = Some(Transaction {
             id: "attempt".into(),
             previous_release: predecessor,

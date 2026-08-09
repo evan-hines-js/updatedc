@@ -10,8 +10,7 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/bootstrap \
   --state-dir /var/lib/updated/guardian \
   --supervisor /usr/local/bin/supervisor \
-  --ready-timeout 900 --confirm-timeout 5 \
-  --probe-address 0.0.0.0:9090
+  --ready-timeout 900 --confirm-timeout 5
 Restart=always
 RestartSec=5
 

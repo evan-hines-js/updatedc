@@ -1,33 +1,29 @@
-//! bootstrap — the installer-owned root of the update tower and the permanent process
-//! guardian that owns the managed application.
+//! bootstrap — the installer-owned launcher: the one process that decides which agent
+//! binary runs.
 //!
 //! It is the one program in the system that is meant never to change: a mechanism, not
 //! a policy holder. It speaks no HTTP or TUF, selects no releases, parses no operator
 //! config, and knows nothing of versions, hashes, health, or repository layout. Its whole job
-//! is to own the application process across supervisor generations and to run — and
-//! safely replace — a disposable supervisor that carries all of that policy.
+//! is to run — and safely replace — a disposable agent that carries all of that policy.
 //!
 //! ```text
 //!   init/systemd/SCM
-//!     └── bootstrap (guardian)                     — this crate; frozen, zero project deps
-//!           ├── owns the application  ── process group / Job Object containment
-//!           └── runs a disposable supervisor  ── over an inherited control channel
-//!                 └── supervisor: TUF, update selection, health, rollback (all policy)
+//!     └── bootstrap (launcher)                     — this crate; frozen, zero project deps
+//!           └── runs a disposable agent  ── over an inherited control channel
+//!                 └── agent: TUF, update selection, hooks, health, rollback (all policy)
 //! ```
 //!
-//! Because the guardian never lets go of the application, a supervisor crash, restart,
-//! or self-update never disturbs it. The application never outlives the guardian:
-//! platform process containment tears it down if the guardian exits unexpectedly.
-//! There is only ever one guardian, so there is never a second owner racing to launch
-//! a duplicate.
+//! A self-updating agent must not be able to brick the node, and that is the whole reason
+//! the launcher exists: a replacement agent is held to a readiness deadline and a
+//! confirmation window, and one that fails either has its pointer reverted and its content
+//! hash recorded rejected, so it is never retried. Workload processes belong to the release's
+//! own hooks; the launcher has no means to touch them and no knowledge that they exist.
+//! The operator's init system owns the launcher's own restarts.
 
-mod app;
 mod guardian;
 mod log;
-mod probe;
 mod rand;
 mod record;
-mod service;
 mod supervisor;
 mod sys;
 
@@ -43,14 +39,9 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // The guardian is transparent: it exits with the application's rolled-up exit code
-    // (or 0 for a clean stop), so the init system sees the app's real fate.
-    match guardian::run(&cfg) {
-        Ok(code) => std::process::exit(code),
-        Err(e) => {
-            log::error(&format!("fatal: {e}"));
-            std::process::exit(1);
-        }
+    if let Err(e) = guardian::run(&cfg) {
+        log::error(&format!("fatal: {e}"));
+        std::process::exit(1);
     }
 }
 
@@ -61,7 +52,6 @@ fn parse_args() -> Result<guardian::Config, String> {
     let mut ready_timeout = Duration::from_secs(45);
     let mut confirm_timeout = Duration::from_secs(30);
     let mut stop_grace = Duration::from_secs(10);
-    let mut probe_address = None;
 
     let mut args = std::env::args_os().skip(1);
     while let Some(flag) = args.next() {
@@ -73,16 +63,6 @@ fn parse_args() -> Result<guardian::Config, String> {
             "--ready-timeout" => ready_timeout = next_seconds(&mut args, flag)?,
             "--confirm-timeout" => confirm_timeout = next_seconds(&mut args, flag)?,
             "--stop-grace" => stop_grace = next_seconds(&mut args, flag)?,
-            "--probe-address" => {
-                let value = args.next().ok_or("--probe-address needs an IP:port")?;
-                probe_address = Some(
-                    value
-                        .to_str()
-                        .ok_or("--probe-address must be valid UTF-8")?
-                        .parse()
-                        .map_err(|_| "--probe-address needs an IP:port")?,
-                );
-            }
             "-h" | "--help" => {
                 usage();
                 std::process::exit(0);
@@ -92,7 +72,7 @@ fn parse_args() -> Result<guardian::Config, String> {
     }
 
     let state_dir = state_dir.ok_or("--state-dir is required")?;
-    // The guardian stores content-addressed supervisor paths under the state dir, so it
+    // The launcher stores content-addressed agent paths under the state dir, so it
     // must be a UTF-8 path (its frozen pointer files are text).
     if state_dir.to_str().is_none() {
         return Err("--state-dir must be a valid UTF-8 path".into());
@@ -108,7 +88,6 @@ fn parse_args() -> Result<guardian::Config, String> {
         ready_timeout,
         confirm_timeout,
         stop_grace,
-        probe_address,
     })
 }
 
@@ -133,26 +112,24 @@ fn next_seconds(
 
 fn usage() {
     eprintln!(
-        "bootstrap — the update tower's root and the application's permanent guardian\n\n\
+        "bootstrap — the launcher: which agent binary runs\n\n\
          usage: bootstrap --state-dir <dir> [--supervisor-config <path.toml>] \\\n\
          \x20                [--supervisor <path>] [--ready-timeout <secs>]\n\
-         \x20                [--confirm-timeout <secs>] [--stop-grace <secs>]\n\
-         \x20                [--probe-address <IP:port>]\n\n\
-         --state-dir          where the guardian keeps ownership + supervisor pointers\n\
-         --supervisor-config  operator config, passed verbatim to each supervisor;\n\
+         \x20                [--confirm-timeout <secs>] [--stop-grace <secs>]\n\n\
+         --state-dir          where the launcher keeps its agent pointers\n\
+         --supervisor-config  operator config, passed verbatim to each agent;\n\
          \x20                    defaults to the canonical bootstrap.toml location, so\n\
          \x20                    pass it only for a non-standard layout\n\
-         --supervisor         initial supervisor binary (first boot only; seeds the pointer)\n\
-         --ready-timeout      how long a replacement supervisor has to prove ready (default 45s)\n\
+         --supervisor         initial agent binary (first boot only; seeds the pointer)\n\
+         --ready-timeout      how long a replacement agent has to prove ready (default 45s)\n\
          --confirm-timeout    stability window before committing a replacement (default 30s)\n\
-         --stop-grace         graceful process-stop deadline before a hard kill (default 10s)\n\
-         --probe-address      guardian /livez, /readyz, /startupz listener (disabled by default)"
+         --stop-grace         graceful agent-stop deadline before a hard kill (default 10s)"
     );
 }
 
 #[cfg(test)]
 mod dependency_isolation {
-    //! The guardian's isolation is load-bearing: it must depend only on the frozen
+    //! The launcher's isolation is load-bearing: it must depend only on the frozen
     //! `control` protocol crate and platform binding crates — never on the churning
     //! tower or any behavioral third-party crate. This test reads the manifest so the
     //! rule cannot erode unnoticed.
@@ -166,7 +143,7 @@ mod dependency_isolation {
     #[test]
     fn only_platform_binding_crates_are_allowed() {
         // `[dev-dependencies]` is not read: it is compiled only into this crate's own test
-        // binaries and never links into the shipped guardian. That, and every other question of
+        // binaries and never links into the shipped launcher. That, and every other question of
         // what a manifest makes a crate ship, is answered in one place for all three crates that
         // enforce a dependency rule.
         for name in foundation::manifest::shipped_dependency_names(MANIFEST) {
@@ -187,7 +164,7 @@ mod dependency_isolation {
             .join("\n");
         assert!(
             !code.contains("updated"),
-            "the guardian must never depend on `updated` (which changes constantly)"
+            "the launcher must never depend on `updated` (which changes constantly)"
         );
     }
 }

@@ -306,6 +306,10 @@ fn scenarios() -> Vec<Scenario> {
             persisted_rejection,
         ),
         ("custom provider apply failure rolls back", provider_apply_failure),
+        (
+            "a crashed apply replays under the same attempt id and lands exactly once",
+            apply_replay_converges_exactly_once,
+        ),
         ("custom provider healthcheck failure rolls back", provider_healthcheck_failure),
         ("custom provider rollback failure remains recoverable", provider_rollback_failure),
         ("a wedged provider operation is bounded by its timeout", provider_hook_hangs_are_bounded),

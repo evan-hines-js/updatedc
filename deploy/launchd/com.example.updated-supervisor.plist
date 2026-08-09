@@ -7,21 +7,22 @@
       sudo cp com.example.updated-supervisor.plist /Library/LaunchDaemons/
       sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.updated-supervisor.plist
 
-  launchd is the root PROCESS supervisor: it manages the lifecycle of the tiny,
-  installer-owned BOOTSTRAP. The bootstrap launches the committed supervisor pointer and
-  advances it only after a content-addressed candidate proves it can run; the supervisor manages and
-  updates the application. The update hierarchy terminates at launchd — an
-  OS-maintained root we do not ship:
+  launchd manages the lifecycle of the tiny, installer-owned LAUNCHER (bootstrap).
+  The launcher runs the committed agent pointer and advances it only after a
+  content-addressed candidate proves it can run; the agent deploys releases by
+  invoking each release's own reconciler hooks. The update hierarchy terminates at
+  launchd — an OS-maintained root we do not ship:
 
-    launchd --manages--> bootstrap --activates--> supervisor --journal-updates--> app
+    launchd =manages=> launcher =activates=> agent =invokes=> release hooks
                             |
-                      pointer-swaps the supervisor (readiness-gated); never itself
-      package manager --replaces--> bootstrap/supervisor   (out-of-band alternative)
+                      pointer-swaps the agent (readiness-gated); never itself
+      package manager =replaces=> launcher/agent   (out-of-band alternative)
 
-  The bootstrap runs continuously: when the supervisor stages a self-update and
-  exits, the bootstrap activates the candidate under a readiness gate, committing
-  it or retaining the previous committed pointer. KeepAlive relaunches only the bootstrap,
-  on the rare event that it crashes. The guardian owns the application for its lifetime.
+  The launcher (bootstrap) runs continuously: when the agent stages a self-update
+  and exits, the launcher activates the candidate under a readiness gate, committing
+  it or retaining the previous committed pointer. KeepAlive relaunches only the
+  launcher, on the rare event that it crashes. Workload processes belong to each
+  release's reconciler hooks, never to the launcher or the agent.
 -->
 <plist version="1.0">
 <dict>
@@ -32,9 +33,9 @@
        system LaunchDaemon runs as root, so a misused or leaked release signing
        key would become root code execution on the client. Create `_updated`
        and grant it write access to the state dir under /usr/local/var/updated
-       (which holds content-addressed supervisor candidates, the application
-       binary, version state, and the TUF metadata cache); keep the installer-owned
-       bootstrap and the pinned TUF root in /etc/updated root-owned and
+       (which holds content-addressed agent candidates, installed releases,
+       version state, and the TUF metadata cache); keep the installer-owned
+       launcher and the pinned TUF root in /etc/updated root-owned and
        read-only. -->
   <key>UserName</key>
   <string>_updated</string>
@@ -55,8 +56,6 @@
     <string>60</string>
     <string>--confirm-timeout</string>
     <string>30</string>
-    <string>--probe-address</string>
-    <string>127.0.0.1:9090</string>
   </array>
 
   <key>RunAtLoad</key>

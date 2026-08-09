@@ -5,29 +5,26 @@
 #   systemctl daemon-reload
 #   systemctl enable --now updated-supervisor
 #
-# systemd is the root PROCESS supervisor. It manages the lifecycle of the tiny,
-# installer-owned BOOTSTRAP. The bootstrap launches the committed supervisor pointer and
-# advances it only after a content-addressed candidate proves it can run; the supervisor manages and
-# updates the application. The update hierarchy terminates at systemd — an
-# OS-maintained root we do not ship:
+# systemd manages the lifecycle of the tiny, installer-owned LAUNCHER (bootstrap).
+# The launcher runs the committed agent pointer and advances it only after a
+# content-addressed candidate proves it can run; the agent deploys releases by
+# invoking each release's own reconciler hooks. Workload processes belong to the
+# hooks (typically their own systemd units), never to the launcher or the agent,
+# so this unit's restarts can never disturb a workload:
 #
-#   systemd --manages--> bootstrap --activates--> supervisor --journal-updates--> app
+#   systemd --manages--> launcher --activates--> agent --invokes--> release hooks
 #                            |
-#                      pointer-swaps the supervisor (readiness-gated); never itself
+#                      pointer-swaps the agent (readiness-gated); never itself
 #
-#     package manager --replaces--> bootstrap/supervisor   (out-of-band alternative)
+#     package manager --replaces--> launcher/agent   (out-of-band alternative)
 #
-# The bootstrap runs continuously: when the supervisor stages a self-update and
-# exits, the bootstrap (not systemd) activates the candidate under a readiness
-# gate, committing its path or retaining the previous pointer. systemd only relaunches
-# the bootstrap itself, on the rare event that it crashes.
-#
-# KillMode=process is REQUIRED: on stop/restart systemd signals only the bootstrap,
-# never the supervisor or the application's separate process group. The bootstrap
-# coordinates a clean tower shutdown; the application does not outlive the guardian.
+# The launcher runs continuously: when the agent stages a self-update and exits,
+# the launcher (not systemd) activates the candidate under a readiness gate,
+# committing its path or retaining the previous pointer. systemd only relaunches
+# the launcher itself, on the rare event that it crashes.
 
 [Unit]
-Description=Self-updating supervisor and application (via bootstrap)
+Description=Self-updating release agent (via launcher)
 After=network-online.target
 Wants=network-online.target
 
@@ -40,22 +37,23 @@ Type=simple
 #
 # No --supervisor-config: the bootstrap reads the canonical /etc/updated/bootstrap.toml.
 # Pass it only if this deployment puts the config somewhere else.
-ExecStart=/usr/lib/updated/bootstrap --state-dir /var/lib/updated --supervisor /usr/lib/updated/supervisor --ready-timeout 60 --confirm-timeout 30 --probe-address 127.0.0.1:9090
+ExecStart=/usr/lib/updated/bootstrap --state-dir /var/lib/updated --supervisor /usr/lib/updated/supervisor --ready-timeout 60 --confirm-timeout 30
 
-# Relaunch the bootstrap if it ever crashes. The start-limit defaults stop a
-# crash-looping build after a few tries; each guardian relaunch restores the tower.
+# Relaunch the launcher if it ever crashes. The start-limit defaults stop a
+# crash-looping build after a few tries.
 Restart=always
 RestartSec=2
 
-# Signal only the bootstrap; it coordinates shutdown of the supervisor and application.
+# Signal only the launcher; it coordinates a clean agent shutdown. Workloads are
+# separate units and are not signalled here.
 KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
-# --- Sandboxing (tighten to taste). Supervisor candidates and the application
-#     binary self-update, so they live under the writable state directory (which
-#     also holds the commit journal and the TUF metadata cache). The bootstrap and
-#     the pinned TUF root — the two anchors of trust — stay read-only. ---
+# --- Sandboxing (tighten to taste). Agent candidates and installed releases
+#     live under the writable state directory (which also holds the commit
+#     journal and the TUF metadata cache). The launcher and the pinned TUF root —
+#     the two anchors of trust — stay read-only. ---
 User=updated
 Group=updated
 StateDirectory=updated
