@@ -15,6 +15,7 @@ use updated_contracts::enrollment::{EnrollmentBundle, InitialSignedConfiguration
 
 pub mod alerts;
 pub(crate) mod domain;
+pub mod evidence;
 pub mod gateway;
 pub mod join;
 pub mod metrics;
@@ -1283,7 +1284,7 @@ mod tests {
         }
     }
 
-    fn deployment_spec(id: &str) -> DeploymentSpec {
+    pub(crate) fn deployment_spec(id: &str) -> DeploymentSpec {
         DeploymentSpec {
             name: id.into(),
             report_url: "https://control.example/v1/telemetry".into(),

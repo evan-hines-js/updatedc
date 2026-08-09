@@ -523,7 +523,7 @@ pub async fn run(
     let mut prior_drained: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // The scrape state, updated at the bottom of every cycle; the listener only reads it.
     let shared_metrics: metrics::Shared = Arc::default();
-    if let Some(address) = config.metrics_address.clone() {
+    if let Some(address) = config.metrics_address {
         let served = shared_metrics.clone();
         tokio::spawn(async move {
             if let Err(error) = metrics::serve(address, served).await {
@@ -616,6 +616,10 @@ pub async fn run(
             let prior = previous.insert(member.node.clone(), member.ready);
             let transition = classify_transition(prior, member.ready);
             match transition {
+                Some(Transition::FirstOutOfPool) if drained.contains(&member.node) => eprintln!(
+                    "healthproxy: {} starts out of {} (cordoned by the control plane)",
+                    member.node, config.target()
+                ),
                 Some(Transition::FirstOutOfPool) => eprintln!(
                     "healthproxy: {} starts out of {} (no ready health report yet)",
                     member.node, config.target()
@@ -728,8 +732,9 @@ pub struct Config {
     /// selects which one. `None` ⇒ the EndpointSlice backend (the `service`/`port` fields above).
     pub haproxy: Option<HAProxyTarget>,
     /// When set (`HEALTHPROXY_METRICS_ADDRESS`), serve `GET /metrics` on this address — plain
-    /// HTTP, cluster-internal, read-only, nothing else. Default off.
-    pub metrics_address: Option<String>,
+    /// HTTP, cluster-internal, read-only, nothing else. Default off. Parsed here, once, so a typo
+    /// is a startup error and the bind uses exactly what validation accepted.
+    pub metrics_address: Option<std::net::SocketAddr>,
 }
 
 /// A cluster of HAProxy instances to program from health (see [`haproxy::HAProxyLb`]).
@@ -820,7 +825,6 @@ impl Config {
                 .map(|value| {
                     value
                         .parse::<SocketAddr>()
-                        .map(|address| address.to_string())
                         .map_err(|error| format!("HEALTHPROXY_METRICS_ADDRESS={value:?}: {error}"))
                 })
                 .transpose()?,

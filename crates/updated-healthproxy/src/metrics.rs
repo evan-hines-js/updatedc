@@ -84,9 +84,9 @@ const REQUEST_BYTES_LIMIT: usize = 4096;
 /// Serve `GET /metrics` forever on `address`. Any other request — and any request that does not
 /// finish arriving within a short deadline — is answered 404 (or dropped) and the connection
 /// closed; the listener holds no state and serves nothing else.
-pub async fn serve(address: String, metrics: Shared) -> Result<(), std::io::Error> {
+pub async fn serve(address: std::net::SocketAddr, metrics: Shared) -> Result<(), std::io::Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind(&address).await?;
+    let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!("healthproxy: metrics listener serving /metrics on {address}");
     loop {
         let (mut socket, _) = match listener.accept().await {
@@ -179,7 +179,7 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         drop(listener);
         let served = metrics.clone();
-        let bind = address.clone();
+        let bind: std::net::SocketAddr = address.parse().unwrap();
         tokio::spawn(async move {
             serve(bind, served).await.unwrap();
         });

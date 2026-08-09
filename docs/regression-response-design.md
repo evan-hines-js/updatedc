@@ -34,10 +34,13 @@ stays a statement of running state, not a general data channel.
 ## Verdict
 
 One new field on `UpdateGroupSet`: `maxRegressions` (default 1). During planning, if the number
-of distinct nodes with a `regressed` fact for the staged deployment reaches the threshold, the
-deployment is **halted** for that set:
+of distinct nodes with a `regressed` fact for a staged deployment reaches its threshold — the
+tightest `maxRegressions` among the sets whose members name that deployment identity, defaulting
+to 1 when none does — the deployment is **halted** FLEET-WIDE:
 
-- Admission stops: no further node is moved to the halted deployment, in any group of the set.
+- Admission stops: no further node is moved to the halted deployment, in any group — sibling
+  sets and groups no set governs included; a proven-bad body must not reach anyone through a
+  second door.
   Nodes already on it are left where they are — they contained themselves, and yanking them
   back is the retarget-flap the rollout engine already refuses.
 - The halt is projected into CRD status (`halted`, with the evidence count) and is one of the
