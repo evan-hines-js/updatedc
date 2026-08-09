@@ -1188,13 +1188,21 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // this node resolved, so a cycle that ended early still says what the node is running
         // instead of going silent. `settled` is false while an update is unconfirmed — the
         // confirmation window surfaces as "acted, not yet settled", never as staleness.
+        //
+        // The two reasons a report is unsettled are reported SEPARATELY: `pending.is_some()` is an
+        // update transaction genuinely in flight, while `!last_ready` alone is an ordinary
+        // readiness failure with no update anywhere near it. Only this writer can tell them apart,
+        // and the control plane's rollback evidence needs the first meaning alone.
         heartbeat
             .emit(
                 &opts,
                 last_repo.as_ref(),
                 &store,
                 current.as_deref(),
-                pending.is_none() && health.last_ready.unwrap_or(false),
+                Settlement {
+                    settled: pending.is_none() && health.last_ready.unwrap_or(false),
+                    updating: pending.is_some(),
+                },
                 fingerprints.current(),
             )
             .await;
@@ -1230,15 +1238,29 @@ struct Heartbeat {
     signing_key: Option<Vec<u8>>,
 }
 
+/// What this node can say about its own settlement on the assignment it is acting on: the two
+/// independent facts a report carries, gathered where both are known.
+#[derive(Clone, Copy)]
+struct Settlement {
+    /// The running app is ready AND no update is still unconfirmed.
+    settled: bool,
+    /// An update transaction is committed and its confirmation window is still open.
+    updating: bool,
+}
+
 impl Heartbeat {
     /// Write one best-effort report of what this node is running.
     ///
-    /// `settled` is true only when the running app is ready AND no update is still unconfirmed —
-    /// so a node that has merely *fetched* a new assignment, or is mid-rollout, or was just
-    /// relaunched onto repaired bytes, is never reported as settled on it. That is what lets the
-    /// control plane hold a pair's second member until the first has genuinely completed. Keyed off
-    /// the current assignment's report URL, so adding or removing telemetry just starts or stops
-    /// the heartbeat.
+    /// `state.settled` is true only when the running app is ready AND no update is still
+    /// unconfirmed — so a node that has merely *fetched* a new assignment, or is mid-rollout, or
+    /// was just relaunched onto repaired bytes, is never reported as settled on it. That is what
+    /// lets the control plane hold a pair's second member until the first has genuinely completed.
+    /// Keyed off the current assignment's report URL, so adding or removing telemetry just starts
+    /// or stops the heartbeat.
+    ///
+    /// `state.updating` is the other half of an unsettled report: an update transaction is
+    /// committed and its confirmation window is still open. It is reported rather than inferred
+    /// from `settled`, which is also false for a plain readiness failure.
     ///
     /// `repo` is the last repository this node resolved — `None` only before the first successful
     /// resolution, when there is no assignment and so no report target yet.
@@ -1248,7 +1270,7 @@ impl Heartbeat {
         repo: Option<&TrustedRepository>,
         store: &dyn Store,
         version: Option<&str>,
-        settled: bool,
+        state: Settlement,
         fingerprint: Option<&updated_contracts::telemetry::Fingerprint>,
     ) {
         let Some(assignment) = repo.and_then(|repo| repo.assignment()) else {
@@ -1266,7 +1288,8 @@ impl Heartbeat {
                 assignment_sha256: repo.assignment_sha256().unwrap_or_default(),
                 version: version.unwrap_or_default(),
                 archive_sha256: &archive_sha256,
-                healthy: settled,
+                healthy: state.settled,
+                updating: state.updating,
                 fingerprint,
                 install_root: &opts.paths.install_root,
                 manifest_sha256: &manifest_sha256,

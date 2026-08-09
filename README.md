@@ -466,7 +466,7 @@ is for development and for control planes built on other orchestrators.
 
 - [JSON Schemas](schemas) — the normative wire contract
 - [Reference bootstrap](deploy/bootstrap.toml)
-- Proposed designs: [observability](docs/observability-design.md),
+- Design notes for the shipped controls: [observability](docs/observability-design.md),
   [regression response](docs/regression-response-design.md),
   [alerting](docs/alerting-design.md),
   [node controls](docs/node-controls-design.md)

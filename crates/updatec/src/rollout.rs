@@ -39,24 +39,35 @@ pub struct AdmittedDeployment {
     pub previous: Vec<DesiredDeployment>,
 }
 
-/// Cross-pass observation memory for the regression verdict: which assignments each node has been
-/// SEEN attempting, and what it was running before the attempt began.
+/// Cross-pass observation memory about the FLEET's nodes: which assignments each node has been
+/// SEEN attempting (what it was running before the attempt began), and which nodes have ever
+/// uploaded a report at all.
 ///
-/// The evidence a rollback leaves behind is a report SEQUENCE — `settled=false` on the new
-/// assignment during the confirmation window, then settled again on the pre-attempt archive — and
-/// no single snapshot can carry it: a fleet that rolled back FROM a bad deployment and a fleet the
-/// operator retargeted TO the predecessor look identical in one pass, and deriving the verdict
-/// from one snapshot halted the documented recovery path itself. This log is observational memory
-/// only, never a stored verdict: the halt remains recomputed from the reports each pass, and
-/// losing the log (a leader change, a restart) merely re-derives the evidence from the fresh
-/// attempt sequences the still-contained nodes keep producing.
+/// The evidence a rollback leaves behind is a report SEQUENCE — an update transaction in flight on
+/// the new assignment, then settled again on the pre-attempt archive — and no single snapshot can
+/// carry it: a fleet that rolled back FROM a bad deployment and a fleet the operator retargeted TO
+/// the predecessor look identical in one pass, and deriving the verdict from one snapshot halted
+/// the documented recovery path itself. This log is observational memory only, never a stored
+/// verdict: the halt remains recomputed from the reports each pass, and losing the log (a leader
+/// change, a restart) merely re-derives the evidence from the fresh attempt sequences the
+/// still-contained nodes keep producing.
+///
+/// "Has ever reported" lives here for the same reason and not one of its own: it is a fact about
+/// the past that a single pass's store read cannot establish. Re-deriving it from the reports
+/// readable RIGHT NOW made an object store that stopped answering drive every group's `observable`
+/// count to zero, which clears `ReportsStale` — the alert resolves itself exactly when the whole
+/// fleet goes dark. Remembered, a store outage leaves the count where it was while `fresh` falls,
+/// so the condition fires.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AttemptLog {
+pub struct ObservationLog {
     /// node → target assignment identity → the movement record ([`AttemptSeed`]) opened when the
     /// node was first seen naming that assignment after being settled on a different one.
     attempts: HashMap<String, HashMap<String, AttemptSeed>>,
     /// node → the (assignment, archive) of its most recent settled healthy report.
     settled: HashMap<String, (String, String)>,
+    /// Nodes whose report envelope has been seen in the store at least once, at any age and
+    /// whether or not it verified ([`ObservationLog::has_reported`]).
+    reported: std::collections::HashSet<String>,
 }
 
 /// One observed movement of a node toward a new assignment: where it came from, and whether the
@@ -67,14 +78,19 @@ struct AttemptSeed {
     from: String,
     /// The archive it was settled on before the movement — what a rollback returns it to.
     archive: String,
-    /// Whether an UNSETTLED report on the target was observed: the transaction genuinely ran.
-    /// Without this a node that merely FETCHED the assignment — the supervisor stamps the
-    /// assignment it resolved even on a tick that installed nothing, reporting settled on the new
-    /// assignment while running the old archive — read as an instant "proven rollback".
+    /// Whether a report with an update TRANSACTION in flight on the target was observed
+    /// ([`NodeReport::updating`]): the transaction genuinely ran.
+    ///
+    /// Two shapes are rejected by this flag, and both mint a fleet-wide halt without it. A node
+    /// that merely FETCHED the assignment reports settled on it while running the old archive —
+    /// the supervisor stamps the assignment it resolved even on a tick that installed nothing.
+    /// And a node whose install never started still fails an ordinary readiness probe now and
+    /// then; `healthy == false` alone cannot tell that blip from a transaction, which is why the
+    /// node reports the two separately.
     attempted: bool,
 }
 
-impl AttemptLog {
+impl ObservationLog {
     pub fn new() -> Self {
         Self::default()
     }
@@ -82,13 +98,22 @@ impl AttemptLog {
     /// Fold one node's fresh, verified report into the log.
     ///
     /// A movement record opens at the TRANSITION of the reported assignment — in either report
-    /// shape. The unsettled tick of the transaction is the definitive one (it marks the record
-    /// `attempted`), but a settled report naming a NEW assignment must open the record too: the
-    /// supervisor reports the assignment it RESOLVED, so a tick that fetched the new assignment
-    /// but could not yet install (a transient archive-download failure) reports settled on it
-    /// while still running the old archive — and keying the seed off that report alone erased the
-    /// movement's origin, so the later genuine rollback produced no evidence. A report on the
-    /// assignment the node is already settled on — an ordinary health blip — opens nothing.
+    /// shape. The transaction's own tick is the definitive one (it marks the record `attempted`),
+    /// but a settled report naming a NEW assignment must open the record too: the supervisor
+    /// reports the assignment it RESOLVED, so a tick that fetched the new assignment but could not
+    /// yet install (a transient archive-download failure) reports settled on it while still running
+    /// the old archive — and keying the seed off that report alone erased the movement's origin, so
+    /// the later genuine rollback produced no evidence. A report on the assignment the node is
+    /// already settled on — an ordinary health blip — opens nothing.
+    ///
+    /// A record is CLOSED when the node settles somewhere else, because the movement it describes
+    /// is over. Records only ever being dropped by [`prune`](Self::prune) — which keeps every
+    /// identity some group still names — left a node that had moved toward an identity, committed,
+    /// and later moved away carrying that first movement's state for ever: the next movement
+    /// toward the same identity reused the stale record, so a single merely-fetched tick inherited
+    /// an `attempted` flag and a pre-movement archive from a transaction that had SUCCEEDED, and
+    /// halted a healthy deployment fleet-wide. The same staleness silences genuine evidence in the
+    /// other direction, by remembering an archive the node has long left.
     fn observe(&mut self, node: &str, report: &NodeReport) {
         if !updated_contracts::is_sha256_hex(&report.assignment_sha256) {
             return;
@@ -98,7 +123,7 @@ impl AttemptLog {
                 let seed = AttemptSeed {
                     from: from.clone(),
                     archive: archive.clone(),
-                    attempted: !report.healthy,
+                    attempted: report.updating,
                 };
                 match self
                     .attempts
@@ -110,7 +135,7 @@ impl AttemptLog {
                     // state of this movement) and only upgrades to `attempted` — the merely-fetched
                     // tick must not downgrade a transaction already seen in flight.
                     std::collections::hash_map::Entry::Occupied(mut open) => {
-                        open.get_mut().attempted |= !report.healthy;
+                        open.get_mut().attempted |= report.updating;
                     }
                     std::collections::hash_map::Entry::Vacant(vacant) => {
                         vacant.insert(seed);
@@ -119,9 +144,9 @@ impl AttemptLog {
             }
             // NOT a transition — the merely-fetched tick already moved `settled` onto the target —
             // but the transaction arriving now still proves the movement ran: upgrade the record
-            // opened at the transition. A health blip with NO open record (the ordinary settled
-            // node) upgrades nothing and opens nothing.
-            Some(_) if !report.healthy => {
+            // opened at the transition. A readiness blip with NO transaction in flight upgrades
+            // nothing and opens nothing.
+            Some(_) if report.updating => {
                 if let Some(open) = self
                     .attempts
                     .get_mut(node)
@@ -142,7 +167,41 @@ impl AttemptLog {
                     report.archive_sha256.clone(),
                 ),
             );
+            // Settling is what closes every movement this node is no longer performing — including
+            // the one it just completed toward some earlier identity. The record for the identity
+            // it settled ON is kept: that is the movement still in progress or just finished, and
+            // the rollback verdict is read from exactly it.
+            if let Some(attempts) = self.attempts.get_mut(node) {
+                attempts.retain(|identity, _| identity == &report.assignment_sha256);
+                if attempts.is_empty() {
+                    self.attempts.remove(node);
+                }
+            }
         }
+    }
+
+    /// Remember every node whose report envelope was readable in the store this pass, at any age.
+    ///
+    /// Called with the raw store read rather than the verified reports: the question this answers
+    /// is "would this node's silence be news", which a node settles the first time it uploads
+    /// anything at all.
+    fn note_reported<'a>(&mut self, nodes: impl Iterator<Item = &'a String>) {
+        for node in nodes {
+            if !self.reported.contains(node) {
+                self.reported.insert(node.clone());
+            }
+        }
+    }
+
+    /// Whether this node has EVER been seen with a report envelope in the store — at any age, and
+    /// whether or not it verified. Observability accounting only, never a trust decision (that
+    /// stays [`Observations::report`]): it exists so "has not reported yet" can be told apart from
+    /// "stopped reporting". A node's key is pinned at enrollment, generations before it can fetch
+    /// an assignment and upload anything, so counting a keyed-but-silent node as observable made
+    /// every mass enrollment and every scale-out past `maxUnavailable` raise `ReportsStale` and
+    /// then clear it — the alert-on-a-healthy-rollout the condition is tuned to avoid.
+    fn has_reported(&self, node: &str) -> bool {
+        self.reported.contains(node)
     }
 
     /// The movement record proving `node`, now settled on `identity` running `archive`, ROLLED
@@ -160,15 +219,16 @@ impl AttemptLog {
             .filter(|seed| seed.attempted && seed.archive == archive)
     }
 
-    /// Drop memory that can no longer become evidence: nodes that left the fleet, and attempt
-    /// records for assignment identities no generation still names — so the log stays bounded by
-    /// the fleet and its live deployments rather than growing with history.
+    /// Drop memory about nodes that left the fleet, and attempt records for assignment identities
+    /// no generation still names — so the log stays bounded by the fleet and its live deployments
+    /// rather than growing with history.
     fn prune(
         &mut self,
         nodes: impl Fn(&str) -> bool,
         live_identities: &std::collections::HashSet<String>,
     ) {
         self.settled.retain(|node, _| nodes(node));
+        self.reported.retain(|node| nodes(node));
         self.attempts.retain(|node, attempts| {
             if !nodes(node) {
                 return false;
@@ -209,9 +269,11 @@ pub struct GroupNodes {
     /// availability accounting.
     pub fresh: usize,
     /// Nodes whose silence would be news: they have a pinned public key AND have already uploaded
-    /// a report envelope at least once ([`Observations::has_reported`]), cordoned nodes excluded
+    /// a report envelope at least once ([`ObservationLog::has_reported`]), cordoned nodes excluded
     /// the same way. A freshly enrolled node that has never reported is UNOBSERVED, not stale —
-    /// it is keyed generations before it can fetch an assignment and upload anything.
+    /// it is keyed generations before it can fetch an assignment and upload anything. Remembered
+    /// across passes rather than re-read, so an unreadable store lowers `fresh` (which raises the
+    /// alert) instead of lowering this too (which would clear it).
     pub observable: usize,
     /// The admitted deployment identity `on_target` counts toward, when the group has one.
     pub target: Option<String>,
@@ -444,18 +506,6 @@ impl<'a> Observations<'a> {
         verdict
     }
 
-    /// Whether this node has EVER uploaded a report envelope — presence in the report map, at any
-    /// age. Observability accounting only, never a trust decision (that stays `report`): it exists
-    /// so "has not reported yet" can be told apart from "stopped reporting". A node's key is
-    /// pinned at enrollment, generations before it can fetch an assignment and upload anything, so
-    /// counting a keyed-but-silent node as observable made every mass enrollment and every
-    /// scale-out past `maxUnavailable` raise `ReportsStale` and then clear it — the alert-on-a-
-    /// healthy-rollout the condition is tuned to avoid. Once a node has reported, its envelope
-    /// stays in the store, so a node that genuinely goes silent stays observable and still alerts.
-    fn has_reported(&self, node: &str) -> bool {
-        self.reports.contains_key(node)
-    }
-
     fn verify(&self, node: &str) -> Option<NodeReport> {
         let envelope = self.reports.get(node)?;
         let public_key = self.public_keys.get(node)?;
@@ -610,8 +660,8 @@ impl<'a> Observations<'a> {
 
     /// The nodes of `member` whose signed reports prove they ATTEMPTED `target` and rolled
     /// themselves back. No new channel — this is the report sequence the supervisor already
-    /// publishes: `settled=false` while the attempt is in flight, then the committed archive after
-    /// commit or rollback. `attempts` remembers the first half of that sequence across passes, so
+    /// publishes: `updating=true` while the transaction is in flight, then the committed archive
+    /// after commit or rollback. `attempts` remembers the first half of that sequence across passes, so
     /// a node now settled healthy on exactly `target`'s assignment while running its pre-movement
     /// archive is a proven rollback — and a node that never showed the movement is not, which is
     /// what tells a fleet rolling back FROM a bad target apart from an operator retargeting TO the
@@ -638,7 +688,7 @@ impl<'a> Observations<'a> {
     /// recovery target, halting it fleet-wide with no exit but a brand-new deployment identity.
     fn regressed_nodes(
         &self,
-        attempts: &AttemptLog,
+        attempts: &ObservationLog,
         member: &str,
         target: &DesiredDeployment,
         bodies: &HashMap<String, &DesiredDeployment>,
@@ -743,7 +793,7 @@ pub(crate) fn plan_rollouts(
     sets: &[UpdateGroupSet],
     inputs: RolloutInputs<'_>,
     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-    attempts: &mut AttemptLog,
+    attempts: &mut ObservationLog,
     now: chrono::DateTime<chrono::Utc>,
 ) -> RolloutPlan {
     let RolloutInputs {
@@ -788,6 +838,10 @@ pub(crate) fn plan_rollouts(
             attempts.observe(node, &report);
         }
     }
+    // Which nodes have ever been HEARD FROM is remembered here, off the raw store read: it is the
+    // baseline `ReportsStale` measures freshness against, and re-deriving it from the objects
+    // readable this pass made an unreadable store clear the alert instead of raising it.
+    attempts.note_reported(reports.keys());
     let live_identities: std::collections::HashSet<String> = admitted
         .values()
         .flat_map(|state| std::iter::once(&state.current).chain(state.previous.iter()))
@@ -961,8 +1015,7 @@ pub(crate) fn plan_rollouts(
                     observable: judged
                         .iter()
                         .filter(|node| {
-                            public_keys.contains_key(node.as_str())
-                                && observations.has_reported(node)
+                            public_keys.contains_key(node.as_str()) && attempts.has_reported(node)
                         })
                         .count(),
                     target,
@@ -1200,7 +1253,7 @@ fn named_identities(
 /// desired or admitted deployment); an identity named only by set-less groups takes the default
 /// of one.
 ///
-/// Evidence itself is a report SEQUENCE, remembered across passes by [`AttemptLog`] and read
+/// Evidence itself is a report SEQUENCE, remembered across passes by [`ObservationLog`] and read
 /// through [`Observations::regressed_nodes`], which guards each node by its own movement's origin
 /// — never by the group's `previous` list. The verdict is recomputed from that evidence every
 /// pass, never stored: it clears only when the staged deployment changes, because republishing
@@ -1212,7 +1265,7 @@ fn regression_halts(
     desired: &BTreeMap<String, DesiredDeployment>,
     admitted: &BTreeMap<String, AdmittedDeployment>,
     held: &BTreeMap<String, AdmittedDeployment>,
-    attempts: &AttemptLog,
+    attempts: &ObservationLog,
     observations: &Observations<'_>,
 ) -> BTreeMap<String, (String, usize)> {
     // Every body the control plane still holds, for resolving each movement's ORIGIN — the same
@@ -2025,11 +2078,35 @@ mod tests {
 
     /// A report of a node acting on EXACTLY `deployment`'s assignment while RUNNING `archive` —
     /// the shape a rollback leaves behind when `archive` is the predecessor's.
+    ///
+    /// An unsettled report here is the one an update TRANSACTION produces (`updating`): committed,
+    /// confirmation window still open. The other unsettled shape — a readiness failure with no
+    /// update in flight — is [`report_unready`], and the two are not interchangeable evidence.
     fn report_running(
         node: &str,
         deployment: &DesiredDeployment,
         archive: &str,
         healthy: bool,
+    ) -> (String, Envelope) {
+        report_signed(node, deployment, archive, healthy, !healthy)
+    }
+
+    /// A node whose running application is simply NOT READY — a failed probe, a restart, a reboot
+    /// — with no update transaction anywhere near it. Unsettled, and no evidence of anything.
+    fn report_unready(
+        node: &str,
+        deployment: &DesiredDeployment,
+        archive: &str,
+    ) -> (String, Envelope) {
+        report_signed(node, deployment, archive, false, false)
+    }
+
+    fn report_signed(
+        node: &str,
+        deployment: &DesiredDeployment,
+        archive: &str,
+        healthy: bool,
+        updating: bool,
     ) -> (String, Envelope) {
         let identity = crate::deployment_identity(deployment).unwrap();
         let mut report = NodeReport::new(
@@ -2040,6 +2117,7 @@ mod tests {
             archive,
             healthy,
         );
+        report.updating = updating;
         report.reported_at_ms = test_now().timestamp_millis() as u64;
         let envelope = updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
         (node.into(), envelope)
@@ -2125,7 +2203,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         groups.get_mut("g").unwrap().deployment = deployment_named("v1");
@@ -2143,7 +2221,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(first.node_deployments["n0"].deployment, "v1");
@@ -2169,7 +2247,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(second.node_deployments["n0"].deployment, "v1");
@@ -2206,7 +2284,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         groups.get_mut("g").unwrap().deployment = deployment_named("v1");
@@ -2226,7 +2304,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             let selected: Vec<_> = plan
@@ -2258,7 +2336,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert!(converged
@@ -2298,7 +2376,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         // The one degraded node spends the whole budget, so neither HEALTHY node advances — that is
@@ -2345,7 +2423,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v2");
@@ -2422,7 +2500,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
 
@@ -2465,7 +2543,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             let on_v2 = plan
@@ -2551,7 +2629,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
 
@@ -2613,7 +2691,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v0");
@@ -2661,7 +2739,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(outcome.node_deployments["m-advanced"].deployment, "v1");
@@ -2697,7 +2775,7 @@ mod tests {
                 reports: &reports,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert!(
@@ -2738,7 +2816,7 @@ mod tests {
                 reports: &reports_v0,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
 
@@ -2759,7 +2837,7 @@ mod tests {
                 reports: &reports_v0, // agents still on v0
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         // Exactly one member (the first by name, "a") is admitted to v1; "b" is held at v0.
@@ -2785,7 +2863,7 @@ mod tests {
                 reports: &reports_a_done,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["a"].current.deployment, "v1");
@@ -2831,7 +2909,7 @@ mod tests {
                 reports: &reports_v0,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         let mut groups = all_v1();
@@ -2849,7 +2927,7 @@ mod tests {
                 reports: &reports_v0,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(statuses.sets[0].rolling, vec!["a".to_string()]);
@@ -2874,7 +2952,7 @@ mod tests {
                 reports: &reports_v0,
             },
             &mut failover_admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -2910,7 +2988,7 @@ mod tests {
                 reports: &reports_v0,
             },
             &mut cold_admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(cold_admitted["a"].current.deployment, "v1");
@@ -2992,7 +3070,7 @@ mod tests {
                 reports: &all_v0,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
 
@@ -3016,7 +3094,7 @@ mod tests {
                 reports: &all_v0,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -3080,7 +3158,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert!(
@@ -3159,7 +3237,7 @@ mod tests {
                 reports: &reports_v0(monday),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday, // closed
         );
 
@@ -3180,7 +3258,7 @@ mod tests {
                 reports: &reports_v0(monday),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday, // closed
         );
         assert_eq!(
@@ -3212,7 +3290,7 @@ mod tests {
                 reports: &reports_v0(sunday),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             sunday, // open
         );
         assert_eq!(
@@ -3271,7 +3349,7 @@ mod tests {
                 reports: &reports,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday, // closed
         );
         assert!(plan.sets[0].frozen);
@@ -3306,7 +3384,7 @@ mod tests {
                 ]),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             sunday, // open
         );
         assert!(!plan.sets[0].frozen);
@@ -3340,7 +3418,7 @@ mod tests {
                 reports: &HashMap::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday, // closed
         );
         assert_eq!(admitted["b"].current.deployment, "v9");
@@ -3406,7 +3484,7 @@ mod tests {
                     reports: &HashMap::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             assert_eq!(
@@ -3444,7 +3522,7 @@ mod tests {
                 reports: &HashMap::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -3501,7 +3579,7 @@ mod tests {
                     reports: &reports,
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             assert_eq!(
@@ -3536,7 +3614,7 @@ mod tests {
                 reports: &reports,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(plan.groups["b"], GroupProgress::Settled);
@@ -3596,7 +3674,7 @@ mod tests {
                     reports: &reports_v0,
                 },
                 admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 now,
             )
         };
@@ -3652,7 +3730,7 @@ mod tests {
                 reports: &reports_a_done,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             later,
         );
         assert_eq!(
@@ -3722,7 +3800,7 @@ mod tests {
                     reports: &reports,
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 now,
             )
         };
@@ -3768,7 +3846,7 @@ mod tests {
                     reports: &reports,
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 now,
             )
         };
@@ -3831,7 +3909,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             )
         };
@@ -3882,7 +3960,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -3933,7 +4011,7 @@ mod tests {
                     reports: &reports,
                 },
                 admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             )
         };
@@ -3998,7 +4076,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             *published = published_from(&plan);
@@ -4057,7 +4135,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v2");
@@ -4102,7 +4180,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(outcome.node_deployments["n0"].deployment, "v1");
@@ -4147,7 +4225,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["initialize"].current.deployment, "init-v1");
@@ -4177,7 +4255,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["join"].current.deployment, "join-v1");
@@ -4213,7 +4291,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             )
         };
@@ -4296,7 +4374,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             advanced.push(
@@ -4374,7 +4452,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             published = published_from(&plan);
@@ -4506,7 +4584,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 now,
             )
         };
@@ -4561,7 +4639,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v0");
@@ -4613,7 +4691,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -4694,7 +4772,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday(),
         );
         assert!(
@@ -4745,7 +4823,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday(),
         );
         assert!(plan.sets[0].frozen);
@@ -4791,7 +4869,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday(),
         );
         assert!(
@@ -4836,7 +4914,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             monday(),
         );
         assert!(plan.sets[0].frozen);
@@ -4905,7 +4983,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 monday(),
             )
         };
@@ -4974,7 +5052,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         let on_current = plan
@@ -5029,7 +5107,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             assert_eq!(admitted["g"].current.deployment, "v0");
@@ -5075,7 +5153,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(first.node_deployments["n0"].deployment, "v2");
@@ -5098,7 +5176,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         let on_current = second
@@ -5139,7 +5217,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(admitted["g"].current.deployment, "v0");
@@ -5171,7 +5249,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -5232,7 +5310,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(plan.groups["a"], GroupProgress::Held);
@@ -5311,7 +5389,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -5377,7 +5455,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             assert_eq!(
@@ -5408,7 +5486,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted.clone(),
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             assert_eq!(
@@ -5440,7 +5518,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert!(admitted["b"].previous.is_empty());
@@ -5482,7 +5560,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             assert!(
@@ -5561,7 +5639,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -5628,7 +5706,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
 
@@ -5698,7 +5776,7 @@ mod tests {
                     cordons: &BTreeSet::new(),
                 },
                 &mut admitted,
-                &mut AttemptLog::default(),
+                &mut ObservationLog::default(),
                 test_now(),
             );
             moved.push(
@@ -5759,7 +5837,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert!(
@@ -5806,7 +5884,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -5847,7 +5925,7 @@ mod tests {
                 cordons: &cordons,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -5887,7 +5965,7 @@ mod tests {
                 cordons: &cordons,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert_eq!(
@@ -5930,7 +6008,7 @@ mod tests {
                 cordons: &benched,
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert!(
@@ -5988,7 +6066,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         let counts = &plan.node_counts["g"];
@@ -6029,7 +6107,7 @@ mod tests {
             .collect();
         let keys = pubkeys(&node_groups);
         let sets = [pair_set()];
-        let mut attempts = AttemptLog::new();
+        let mut attempts = ObservationLog::new();
         let mut admitted = BTreeMap::new();
 
         let settled_v0: HashMap<String, Envelope> = ["n0", "n1", "n2"]
@@ -6042,7 +6120,7 @@ mod tests {
                     reports: &HashMap<String, Envelope>,
                     published: &BTreeMap<String, String>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-                    attempts: &mut AttemptLog| {
+                    attempts: &mut ObservationLog| {
             plan_rollouts(
                 &sets,
                 RolloutInputs {
@@ -6087,7 +6165,8 @@ mod tests {
         let mut published = all_on_v0.clone();
         published.insert("n0".to_string(), id(&v1));
 
-        // Pass 2: n0 reports the attempt in flight — settled=false on exactly v1's assignment.
+        // Pass 2: n0 reports the transaction in flight — unsettled and `updating` on exactly v1's
+        // assignment.
         // This is the first half of the sequence a rollback proves itself with.
         let mut reports = settled_v0.clone();
         let (node, envelope) = report_running("n0", &v1, &arch0, false);
@@ -6218,7 +6297,7 @@ mod tests {
             .collect();
         let keys = pubkeys(&node_groups);
         let sets = [pair_set()];
-        let mut attempts = AttemptLog::new();
+        let mut attempts = ObservationLog::new();
         // Mid-rollout: n0 was handed v1 and committed it; n1/n2 still on v0, so `previous`
         // survives and the application-differs guard passes.
         let mut admitted = BTreeMap::from([(
@@ -6235,7 +6314,7 @@ mod tests {
         ]);
         let pass = |reports: &HashMap<String, Envelope>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-                    attempts: &mut AttemptLog| {
+                    attempts: &mut ObservationLog| {
             plan_rollouts(
                 &sets,
                 RolloutInputs {
@@ -6261,8 +6340,9 @@ mod tests {
         ]);
         pass(&reports, &mut admitted, &mut attempts);
 
-        // One unhealthy tick on the assignment and archive n0 is already committed to.
-        let (node, envelope) = report_running("n0", &v1, &arch1, false);
+        // One unhealthy tick on the assignment and archive n0 is already committed to — a
+        // readiness failure with no update transaction in flight.
+        let (node, envelope) = report_unready("n0", &v1, &arch1);
         reports.insert(node, envelope);
         pass(&reports, &mut admitted, &mut attempts);
 
@@ -6298,7 +6378,7 @@ mod tests {
             .map(|node| ((*node).to_string(), "g".to_string()))
             .collect();
         let keys = pubkeys(&node_groups);
-        let mut attempts = AttemptLog::new();
+        let mut attempts = ObservationLog::new();
         let mut admitted = BTreeMap::from([(
             "g".to_string(),
             AdmittedDeployment {
@@ -6313,7 +6393,7 @@ mod tests {
         ]);
         let pass = |reports: &HashMap<String, Envelope>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-                    attempts: &mut AttemptLog| {
+                    attempts: &mut ObservationLog| {
             plan_rollouts(
                 &[],
                 RolloutInputs {
@@ -6387,7 +6467,7 @@ mod tests {
                 cordons: &BTreeSet::new(),
             },
             &mut admitted,
-            &mut AttemptLog::default(),
+            &mut ObservationLog::default(),
             test_now(),
         );
         assert!(!plan.node_deployments.contains_key("n0"));
@@ -6422,7 +6502,7 @@ mod tests {
             ("n2".to_string(), "main".to_string()),
         ]);
         let keys = pubkeys(&node_groups);
-        let mut attempts = AttemptLog::new();
+        let mut attempts = ObservationLog::new();
         let mut admitted = BTreeMap::from([
             (
                 "canary".to_string(),
@@ -6441,7 +6521,7 @@ mod tests {
         let pass = |groups: &BTreeMap<String, ResolvedGroup>,
                     reports: &HashMap<String, Envelope>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-                    attempts: &mut AttemptLog| {
+                    attempts: &mut ObservationLog| {
             plan_rollouts(
                 &[],
                 RolloutInputs {
@@ -6530,7 +6610,7 @@ mod tests {
             .map(|node| ((*node).to_string(), "g".to_string()))
             .collect();
         let keys = pubkeys(&node_groups);
-        let mut attempts = AttemptLog::new();
+        let mut attempts = ObservationLog::new();
         let mut admitted = BTreeMap::from([(
             "g".to_string(),
             AdmittedDeployment {
@@ -6545,7 +6625,7 @@ mod tests {
         ]);
         let pass = |reports: &HashMap<String, Envelope>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-                    attempts: &mut AttemptLog| {
+                    attempts: &mut ObservationLog| {
             plan_rollouts(
                 &[],
                 RolloutInputs {
@@ -6624,7 +6704,7 @@ mod tests {
             .map(|node| ((*node).to_string(), "g".to_string()))
             .collect();
         let keys = pubkeys(&node_groups);
-        let mut attempts = AttemptLog::new();
+        let mut attempts = ObservationLog::new();
         // The post-halt state: the group is retargeted back to v0, and n0 is still pinned on the
         // halted v1 — which is why v1 stays a live body the origin lookup can resolve.
         let mut admitted = BTreeMap::from([(
@@ -6641,7 +6721,7 @@ mod tests {
         ]);
         let pass = |reports: &HashMap<String, Envelope>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-                    attempts: &mut AttemptLog| {
+                    attempts: &mut ObservationLog| {
             plan_rollouts(
                 &[],
                 RolloutInputs {
@@ -6673,7 +6753,7 @@ mod tests {
         reports.insert(node, envelope);
         pass(&reports, &mut admitted, &mut attempts);
         // An ordinary health blip on the recovery target, then healthy again.
-        let (node, envelope) = report_running("n0", &v0, &arch, false);
+        let (node, envelope) = report_unready("n0", &v0, &arch);
         reports.insert(node, envelope);
         pass(&reports, &mut admitted, &mut attempts);
         let (node, envelope) = report_running("n0", &v0, &arch, true);
@@ -6712,7 +6792,7 @@ mod tests {
             .map(|node| ((*node).to_string(), "g".to_string()))
             .collect();
         let keys = pubkeys(&node_groups);
-        let mut attempts = AttemptLog::new();
+        let mut attempts = ObservationLog::new();
         // The quarantined group's pin: present ONLY in `held`, exactly as `plan_rollouts` receives
         // it (the planner pruned it from `admitted`, and `domain::plan_reconcile` restores it only
         // after this returns).
@@ -6724,7 +6804,7 @@ mod tests {
             .collect();
         let pass = |reports: &HashMap<String, Envelope>,
                     admitted: &mut BTreeMap<String, AdmittedDeployment>,
-                    attempts: &mut AttemptLog| {
+                    attempts: &mut ObservationLog| {
             plan_rollouts(
                 &[],
                 RolloutInputs {
@@ -6765,6 +6845,257 @@ mod tests {
             }),
             "an origin body held for a quarantined group still resolves, so the remediated \
              node's rollback is evidence"
+        );
+    }
+
+    /// A movement record describes ONE movement and dies with it. A node that moved to a
+    /// deployment, COMMITTED it, and later moved away must not carry that movement's state into a
+    /// second movement toward the same deployment: records were only ever dropped by `prune`, which
+    /// keeps every identity some group still names, so a canary cycling back and forth kept a
+    /// record marked `attempted` (from a transaction that SUCCEEDED) with a long-stale archive.
+    /// One merely-fetched tick then inherited it and "proved" a rollback, halting fleet-wide a
+    /// deployment a sibling group is settled and healthy on — with no exit but a new digest.
+    #[test]
+    fn a_committed_movement_is_closed_and_cannot_seed_a_later_one() {
+        let hex = |c: char| c.to_string().repeat(64);
+        let v0 = deployment_with_app("v0", &hex('1'));
+        let v1 = deployment_with_app("v1", &hex('2'));
+        let (arch0, arch1) = (hex('1'), hex('2'));
+        let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
+
+        // g is the canary the operator cycles; g2 is settled and healthy on v1 the whole time, so
+        // it both keeps v1 a live identity and is what a fleet-wide halt would freeze.
+        let mut groups = BTreeMap::from([
+            ("g".to_string(), group("g", v0.clone())),
+            ("g2".to_string(), group("g2", v1.clone())),
+        ]);
+        let node_groups: BTreeMap<String, String> = BTreeMap::from([
+            ("n0".to_string(), "g".to_string()),
+            ("n1".to_string(), "g2".to_string()),
+            ("n2".to_string(), "g2".to_string()),
+        ]);
+        let keys = pubkeys(&node_groups);
+        let mut attempts = ObservationLog::new();
+        let mut admitted = BTreeMap::from([
+            ("g".to_string(), admitted(v0.clone())),
+            ("g2".to_string(), admitted(v1.clone())),
+        ]);
+        let pass = |groups: &BTreeMap<String, ResolvedGroup>,
+                    reports: &HashMap<String, Envelope>,
+                    published: &BTreeMap<String, String>,
+                    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+                    attempts: &mut ObservationLog| {
+            plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups,
+                    group_labels: &BTreeMap::new(),
+                    node_groups: &node_groups,
+                    reports,
+                    public_keys: &keys,
+                    published,
+                    held: &BTreeMap::new(),
+                    holds: &BTreeSet::new(),
+                    cordons: &BTreeSet::new(),
+                },
+                admitted,
+                attempts,
+                test_now(),
+            )
+        };
+        let mut published = BTreeMap::from([
+            ("n0".to_string(), id(&v0)),
+            ("n1".to_string(), id(&v1)),
+            ("n2".to_string(), id(&v1)),
+        ]);
+        let mut reports: HashMap<String, Envelope> = HashMap::from([
+            report_running("n0", &v0, &arch0, true),
+            report_running("n1", &v1, &arch1, true),
+            report_running("n2", &v1, &arch1, true),
+        ]);
+        pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+
+        // Movement one: the canary is retargeted to v1, the transaction runs, and it COMMITS —
+        // healthy on v1 running v1's own application.
+        groups.get_mut("g").unwrap().deployment = v1.clone();
+        published.insert("n0".to_string(), id(&v1));
+        let (node, envelope) = report_running("n0", &v1, &arch0, false);
+        reports.insert(node, envelope);
+        pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+        let (node, envelope) = report_running("n0", &v1, &arch1, true);
+        reports.insert(node, envelope);
+        pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+
+        // The canary is cycled back to v0 and settles there. The movement toward v1 is over.
+        groups.get_mut("g").unwrap().deployment = v0.clone();
+        published.insert("n0".to_string(), id(&v0));
+        let (node, envelope) = report_running("n0", &v0, &arch0, true);
+        reports.insert(node, envelope);
+        pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+
+        // Movement two, toward the same v1 — and this time the archive download stalls, so the node
+        // emits exactly ONE report: settled on v1's assignment while still running v0's archive,
+        // with no transaction anywhere in this movement.
+        groups.get_mut("g").unwrap().deployment = v1.clone();
+        let (node, envelope) = report_running("n0", &v1, &arch0, true);
+        reports.insert(node, envelope);
+        let plan = pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+        assert!(
+            plan.halted_groups.is_empty(),
+            "a merely-fetched tick must not inherit a COMMITTED movement's evidence: {:?}",
+            plan.halted_groups
+        );
+        assert_eq!(
+            admitted["g2"].current, v1,
+            "…so the group settled and healthy on v1 keeps moving instead of being frozen \
+             fleet-wide"
+        );
+    }
+
+    /// `attempted` means the update TRANSACTION ran, which only the node can say — it reports it
+    /// beside `healthy` for exactly this reason. Inferring it from `healthy == false` conflated the
+    /// two meanings of an unsettled report: a node whose install never started (a stalled archive
+    /// download, the fleet-wide shape of a CDN outage) still fails an ordinary readiness probe now
+    /// and then, and that blip minted rollback evidence for a transaction that never ran — halting
+    /// the deployment across the whole fleet at the default threshold of one.
+    #[test]
+    fn a_readiness_blip_during_a_stalled_fetch_is_not_rollback_evidence() {
+        let hex = |c: char| c.to_string().repeat(64);
+        let v0 = deployment_with_app("v0", &hex('1'));
+        let v1 = deployment_with_app("v1", &hex('2'));
+        let arch = hex('1');
+        let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
+
+        let groups = BTreeMap::from([("g".to_string(), group("g", v1.clone()))]);
+        let node_groups: BTreeMap<String, String> = ["n0", "n1", "n2"]
+            .iter()
+            .map(|node| ((*node).to_string(), "g".to_string()))
+            .collect();
+        let keys = pubkeys(&node_groups);
+        let mut attempts = ObservationLog::new();
+        let mut admitted = BTreeMap::from([(
+            "g".to_string(),
+            AdmittedDeployment {
+                current: v1.clone(),
+                previous: vec![v0.clone()],
+            },
+        )]);
+        let published = BTreeMap::from([
+            ("n0".to_string(), id(&v1)),
+            ("n1".to_string(), id(&v0)),
+            ("n2".to_string(), id(&v0)),
+        ]);
+        let pass = |reports: &HashMap<String, Envelope>,
+                    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+                    attempts: &mut ObservationLog| {
+            plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &BTreeMap::new(),
+                    node_groups: &node_groups,
+                    reports,
+                    public_keys: &keys,
+                    published: &published,
+                    held: &BTreeMap::new(),
+                    holds: &BTreeSet::new(),
+                    cordons: &BTreeSet::new(),
+                },
+                admitted,
+                attempts,
+                test_now(),
+            )
+        };
+        let mut reports: HashMap<String, Envelope> = HashMap::from([
+            report_running("n0", &v0, &arch, true),
+            report_running("n1", &v0, &arch, true),
+            report_running("n2", &v0, &arch, true),
+        ]);
+        pass(&reports, &mut admitted, &mut attempts);
+
+        // n0 resolves v1 but cannot fetch its archive: it reports settled on v1's assignment while
+        // still running v0's, and nothing is ever installed.
+        let (node, envelope) = report_running("n0", &v1, &arch, true);
+        reports.insert(node, envelope);
+        pass(&reports, &mut admitted, &mut attempts);
+
+        // The running application then fails a readiness probe — no update in flight — and recovers.
+        let (node, envelope) = report_unready("n0", &v1, &arch);
+        reports.insert(node, envelope);
+        pass(&reports, &mut admitted, &mut attempts);
+        let (node, envelope) = report_running("n0", &v1, &arch, true);
+        reports.insert(node, envelope);
+        let plan = pass(&reports, &mut admitted, &mut attempts);
+        assert!(
+            plan.halted_groups.is_empty(),
+            "no transaction ever ran, so there is nothing a rollback could have rolled back \
+             from: {:?}",
+            plan.halted_groups
+        );
+        assert_eq!(
+            plan.node_deployments["n1"], v1,
+            "…and the rollout keeps staging under maxUnavailable"
+        );
+    }
+
+    /// `observable` is what `ReportsStale` measures freshness AGAINST, so it must not be derived
+    /// from the same store read whose failure the alert exists to report. Re-derived each pass, an
+    /// object store that stopped answering drove every group's `observable` to zero along with
+    /// `fresh` — and `observable > 0` gates the condition, so a group that was correctly firing
+    /// went False and delivered a "recovered" webhook at the exact moment the whole fleet went
+    /// dark.
+    #[test]
+    fn an_unreadable_report_store_keeps_nodes_observable_so_staleness_still_fires() {
+        let (groups, node_groups, labels) = three_node_group();
+        let mut admitted = BTreeMap::from([("g".into(), admitted(deployment_named("v0")))]);
+        let published: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| {
+                (
+                    node.clone(),
+                    crate::deployment_identity(&deployment_named("v0")).unwrap(),
+                )
+            })
+            .collect();
+        let mut attempts = ObservationLog::new();
+        let pass = |reports: &HashMap<String, Envelope>,
+                    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+                    attempts: &mut ObservationLog| {
+            plan_rollouts(
+                &[],
+                RolloutInputs {
+                    groups: &groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports,
+                    public_keys: &pubkeys(&node_groups),
+                    published: &published,
+                    held: &BTreeMap::new(),
+                    holds: &BTreeSet::new(),
+                    cordons: &BTreeSet::new(),
+                },
+                admitted,
+                attempts,
+                test_now(),
+            )
+        };
+        // A steady fleet: n0 and n1 report, n2 has never uploaded anything.
+        let reports = HashMap::from([report("n0", "v0", true), report("n1", "v0", true)]);
+        let plan = pass(&reports, &mut admitted, &mut attempts);
+        assert_eq!(plan.node_counts["g"].observable, 2);
+        assert_eq!(plan.node_counts["g"].fresh, 2);
+
+        // The telemetry store stops answering: every per-object read fails, so the pass sees an
+        // empty report map while everything else about the fleet is unchanged.
+        let plan = pass(&HashMap::new(), &mut admitted, &mut attempts);
+        assert_eq!(
+            plan.node_counts["g"].fresh, 0,
+            "nothing is fresh while the store is unreadable"
+        );
+        assert_eq!(
+            plan.node_counts["g"].observable, 2,
+            "but the two nodes known to report stay observable, so the staleness the alert reads \
+             is the whole fleet rather than nothing at all"
         );
     }
 }

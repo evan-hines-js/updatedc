@@ -142,7 +142,10 @@ pub fn rollout_stuck(
 /// [`crate::rollout::GroupNodes::observable`]), so this says "nodes stopped reporting", never
 /// "nodes have not started yet": a keyed node is observable to the apiserver an enrollment before
 /// it can possibly upload anything, and counting those made a mass enrollment or a scale-out
-/// larger than `maxUnavailable` page and then resolve itself.
+/// larger than `maxUnavailable` page and then resolve itself. It is controller MEMORY, not a
+/// re-read of the store, which is what keeps `observable > 0` from being the very thing an
+/// unreadable telemetry store takes away — clearing this condition exactly when the fleet goes
+/// dark.
 pub fn reports_stale(
     generation: Option<i64>,
     fresh: usize,
@@ -410,28 +413,6 @@ impl AlertSink {
 
     /// Deliver one transition: POST, deadline, bounded retry with the shared backoff, then drop.
     async fn deliver(&self, event: &AlertEvent) {
-        let token = match &self.token_file {
-            // FAIL CLOSED on the credential: a configured token must never degrade to an
-            // unauthenticated POST. The delivery is skipped; the condition on the resource remains
-            // the durable record, and the next transition retries with the token the operator has
-            // meanwhile fixed.
-            Some(path) => match tokio::fs::read_to_string(path).await {
-                // An EMPTY read is a credential failure too, not a token: a Secret key set to the
-                // empty string, a key not yet populated, or a truncate-then-write rotation caught
-                // mid-flight all read `Ok("")`, and `bearer_auth("")` builds the perfectly legal
-                // header `Bearer ` — the unauthenticated POST this arm exists to prevent.
-                Ok(token) if token.trim().is_empty() => {
-                    tracing::warn!(path = %path.display(), "alert bearer-token file is empty; skipping this delivery");
-                    return;
-                }
-                Ok(token) => Some(token.trim().to_string()),
-                Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "alert bearer-token file is unreadable; skipping this delivery");
-                    return;
-                }
-            },
-            None => None,
-        };
         let Ok(body) = serde_json::to_vec(event) else {
             return;
         };
@@ -445,6 +426,34 @@ impl AlertSink {
                 ))
                 .await;
             }
+            // The credential is read INSIDE the attempt loop, so a transient failure to read it
+            // costs one attempt and a backoff like any other failure. Read once outside, a
+            // millisecond-wide window — an operator's truncate-then-write rotation — dropped the
+            // transition with zero retries, and the webhook is edge-triggered: the next transition
+            // for that condition is the CLEAR, which pages nobody, so the whole firing period went
+            // unannounced.
+            let token = match &self.token_file {
+                // FAIL CLOSED on the credential: a configured token must never degrade to an
+                // unauthenticated POST. Every attempt is spent on reading it, and the condition on
+                // the resource remains the durable record either way.
+                Some(path) => match tokio::fs::read_to_string(path).await {
+                    // An EMPTY read is a credential failure too, not a token: a Secret key set to
+                    // the empty string, a key not yet populated, or a truncate-then-write rotation
+                    // caught mid-flight all read `Ok("")`, and `bearer_auth("")` builds the
+                    // perfectly legal header `Bearer ` — the unauthenticated POST this arm exists
+                    // to prevent.
+                    Ok(token) if token.trim().is_empty() => {
+                        tracing::warn!(path = %path.display(), "alert bearer-token file is empty; skipping this attempt");
+                        continue;
+                    }
+                    Ok(token) => Some(token.trim().to_string()),
+                    Err(error) => {
+                        tracing::warn!(%error, path = %path.display(), "alert bearer-token file is unreadable; skipping this attempt");
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let mut request = self
                 .client
                 .post(&self.url)
@@ -718,6 +727,35 @@ mod tests {
             "a configured token that reads back empty skips the delivery, exactly as an \
              unreadable one does"
         );
+
+        // …but it spends an ATTEMPT, not the transition. A credential read is as transient as the
+        // POST beside it (an operator's truncate-then-write rotation is milliseconds wide), and the
+        // webhook is edge-triggered: a fire dropped at the first read is never re-sent while the
+        // condition stays True, because the next transition for it is the CLEAR, which pages
+        // nobody. Here the rotation is repaired while the first backoff is still running.
+        let before = hits.load(Ordering::SeqCst);
+        std::fs::write(token_file.path(), "").unwrap();
+        let path = token_file.path().to_path_buf();
+        let repair = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::write(&path, "rotated\n").unwrap();
+        });
+        sink.deliver(&event).await;
+        repair.await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before + 1,
+            "a credential unreadable on the first attempt is retried, not dropped"
+        );
+        {
+            let seen = seen.lock().await;
+            let (token, _) = seen.last().unwrap();
+            assert_eq!(
+                token.as_deref(),
+                Some("Bearer rotated"),
+                "…and the retry carries the token the operator has meanwhile fixed"
+            );
+        }
     }
 
     /// The pending set coalesces to the NEWEST transition per (resource, condition): while the

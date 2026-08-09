@@ -51,6 +51,12 @@ Rollout accounting treats a cordoned node as absent (as departed nodes already a
 unhealthy, so a cordon does not eat the group's availability budget and does not wedge an
 in-flight rollout waiting for a machine the operator deliberately benched.
 
+A cordon must fail SAFE — stay drained — against everything else the reconcile does, so the
+cordoned set is collected from every agent of the repository before quarantine filtering, and the
+projection is published before anything that can fault the generation closed. Otherwise
+quarantining an agent, or any faulted generation, silently released the drain while the agent's
+own `status.cordoned` still read true.
+
 Hold and cordon compose: maintenance is typically `cordon` (drain traffic), then work, then
 uncordon. `hold` is orthogonal — a node can be held but serving, or cordoned but updatable. When
 both are set the two verdicts stay independent: hold decides ROUTING (the node is never moved,
@@ -70,5 +76,5 @@ at most one poll interval.
 
 Planner unit tests: hold excludes from admission and republishes the recorded body, fails
 closed on an unresolvable body, and releases cleanly; cordon projects drained endpoints while
-reports stay fresh, and admission treats the node as absent. The e2e kind flow gains a
-cordon-then-update case asserting traffic drains while the update still lands.
+reports stay fresh, and admission treats the node as absent. (Not yet implemented: an e2e kind
+case asserting traffic drains while the update still lands.)

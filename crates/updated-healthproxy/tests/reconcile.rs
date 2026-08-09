@@ -201,3 +201,64 @@ async fn a_transient_cdn_outage_does_not_drain_a_freshly_healthy_node() {
         "a healthy node must survive a transient CDN outage via its last good report"
     );
 }
+
+/// A store that serves a document this build cannot USE — a truncated object, a 200 error page, or
+/// a control plane one release ahead of this replica — is a failed observation, not a projection
+/// that cordons nobody. Read as an observation it did three harmful things at once: it released
+/// every cordon for the cycle, it replaced the last known good projection so the release outlived
+/// the bad cycle, and it stamped the freshness gauge as current, so nothing was logged or
+/// alertable while benched machines took production traffic again.
+#[tokio::test]
+async fn an_unusable_endpoint_projection_bridges_the_cordons_instead_of_releasing_them() {
+    updated::tls::install_crypto_provider();
+    let body = std::sync::Arc::new(Mutex::new(
+        serde_json::to_string(&updated_contracts::endpoints::EndpointProjection::new(
+            std::collections::BTreeSet::from(["agent-0".to_string()]),
+        ))
+        .unwrap(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let body = body.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let body = body.lock().unwrap().clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 1024];
+                    let _ = sock.read(&mut scratch).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+    }
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let timeout = std::time::Duration::from_secs(2);
+    let mut cache = updated_healthproxy::LastKnownGood::new();
+
+    let (drained, observed) =
+        updated_healthproxy::fetch_drained(&client, &base, timeout, &mut cache).await;
+    assert!(observed, "a usable projection is an observation");
+    assert!(drained.contains("agent-0"));
+
+    // The store now serves a document this build cannot act on. It is not an observation, so the
+    // cordon is bridged from the last known good and the caller can see that it is failing open.
+    *body.lock().unwrap() = serde_json::json!({"schema": 99, "drained": []}).to_string();
+    let (drained, observed) =
+        updated_healthproxy::fetch_drained(&client, &base, timeout, &mut cache).await;
+    assert!(
+        !observed,
+        "an undecodable document must read as a failed observation, so the edge is logged and the \
+         freshness gauge stops advancing"
+    );
+    assert!(
+        drained.contains("agent-0"),
+        "…and the cordon holds from the last usable projection rather than being released"
+    );
+}

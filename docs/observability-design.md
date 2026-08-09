@@ -42,7 +42,9 @@ already aggregates every fact a node is allowed to assert.
   `updatec_reconcile_failures_total` — is the loop alive and converging.
 - `updatec_generation{deployment=...}` — the published generation, per deployment identity.
 - `updatec_group_progress{group=...,state=...} 1` — one-hot projection of the planner verdict
-  (staging, held, settled, quarantined), exactly the states the CRD status shows.
+  (staging, held, settled, unobservable). Quarantine is not a planner verdict — a quarantined
+  group is not planned at all — so it is reported by `updatec_quarantined_groups` and by the
+  group's own failed `Ready` condition, never as a `group_progress` state.
 - `updatec_group_nodes{group=...}` / `updatec_group_nodes_on_target{group=...}` — rollout
   progress as the admission logic counts it, not a re-derivation.
 - `updatec_reports_fresh` / `updatec_reports_stale` — node reports inside/outside
@@ -72,5 +74,5 @@ the path, not to grow the metrics surface.
 ## Testing
 
 Exposition is a pure function of reconciler state: unit-test it as text against constructed
-state, the same way status projection is tested. The e2e kind script scrapes both endpoints once
-after convergence and asserts the settled fleet shape.
+state, the same way status projection is tested. (Not yet implemented: an e2e kind step that
+scrapes both endpoints after convergence and asserts the settled fleet shape.)
