@@ -187,7 +187,8 @@ or HAProxy later) behind one health→membership core.
 
 Control-plane authors targeting a different orchestrator should start with the normative
 [JSON Schemas](schemas) — the wire contract integrators write against. Installation
-manifests live under [deploy/kubernetes](deploy/kubernetes).
+manifests live under [deploy/kubernetes](deploy/kubernetes); the CRDs, namespace, and
+Secrets they presuppose are in the [Kubernetes install guide](docs/kubernetes-install.md).
 
 ## Guarantees
 
@@ -228,7 +229,9 @@ Every deployment carries an immutable, signed node-reconciler bundle. The agent 
 delivery, verification of bytes, durable ordering, retries, deadlines, containment,
 cancellation, rollback journaling, scheduling, and telemetry. The bundle supplies all
 application-specific behavior through one executable accepting exactly four operations:
-`apply`, `healthcheck`, `rollback`, and `inspect`.
+`apply`, `healthcheck`, `rollback`, and `inspect`. The argv contract, the output-manifest
+document, and a copyable Bash template are in the
+[node reconciler protocol](docs/node-reconciler-protocol.md).
 
 `healthcheck` is the one readiness gate. It performs one observation and exits zero only when the
 observed release is acceptable; the agent retries it to the signed success threshold within the
@@ -465,11 +468,15 @@ is for development and for control planes built on other orchestrators.
 ## Documentation
 
 - [JSON Schemas](schemas) — the normative wire contract
+- [Node reconciler protocol](docs/node-reconciler-protocol.md) — the argv and output-manifest
+  contract a release's own reconciler is written against
+- [Kubernetes install guide](docs/kubernetes-install.md) — CRDs, namespace, and Secrets
 - [Reference bootstrap](deploy/bootstrap.toml)
 - Design notes for the shipped controls: [observability](docs/observability-design.md),
   [regression response](docs/regression-response-design.md),
   [alerting](docs/alerting-design.md),
-  [node controls](docs/node-controls-design.md)
+  [node controls](docs/node-controls-design.md),
+  [wire compatibility](docs/wire-compatibility-design.md)
 - Node decommission: delete the node's `UpdateAgent` object. The gateway checks enrolled
   membership on every request, so a deleted or re-homed agent stops being served bundles,
   secrets, and routing immediately — even while its unexpired leaf certificate still

@@ -796,7 +796,7 @@ async fn metadata_expiry(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
 pub struct ReconcileHooks {
     pub alerts: Option<Arc<crate::alerts::AlertSink>>,
     pub progress: crate::alerts::ProgressTracker,
-    /// Cross-pass memory about the fleet's nodes (`rollout::ObservationLog`): which assignments
+    /// Cross-pass memory about the fleet's nodes (`evidence::ObservationLog`): which assignments
     /// each node has been seen attempting, and which nodes have ever reported at all. Losing it (a
     /// restart, a leader change) only delays a halt until the still-contained nodes' report
     /// sequences re-prove it, and re-derives "has reported" from the next readable store listing.
@@ -1211,6 +1211,7 @@ pub async fn reconcile_once(
         groups: group_progress,
         node_counts,
         halted_groups,
+        report_schemas,
     } = outcome;
     let planned = DurableRolloutState {
         admitted: planned_admitted,
@@ -1409,6 +1410,7 @@ pub async fn reconcile_once(
         reports_fresh,
         reports_stale: reports_observable.saturating_sub(reports_fresh),
         quarantined_groups: quarantined_groups.len(),
+        report_schemas,
     };
     Ok(ReconcileOutcome {
         digest: plan.digest,
@@ -2231,6 +2233,10 @@ const READY_CONDITION: &str = "Ready";
 /// A `Ready` [`ResourceCondition`] for `generation`, reporting success (`status: "True"`) or
 /// failure (`status: "False"`). The single place a Ready condition's fields are assembled;
 /// [`ready_condition`] and [`failed_condition`] are the two named entry points.
+/// `alerts::condition` is a deliberate sibling, not a duplicate to merge: the alert constructors
+/// own their transition-time policy (a caller-supplied clock, preserved by `carry_transition`),
+/// while these stamp observation time — and folding one into the other would couple the alert
+/// module's semantics to this file for six lines of struct literal.
 fn condition(
     condition_type: &str,
     ok: bool,
@@ -4101,7 +4107,7 @@ mod wiring_tests {
     /// The in-process store's contents: object key → bytes.
     type Objects = Arc<StdMutex<BTreeMap<String, Vec<u8>>>>;
 
-    /// One in-process S3-compatible store: path-style `/{bucket}/{key}`, GET/PUT/DELETE, the
+    /// One in-process S3-compatible store: path-style `/{bucket}/{key}`, GET and PUT, the
     /// headers `object_store`'s client needs, nothing else.
     async fn s3_endpoint(objects: Objects) -> std::net::SocketAddr {
         async fn handle(
@@ -4532,8 +4538,8 @@ mod wiring_tests {
         hooks.observation_log.observe("n2", &settled);
         assert!(hooks
             .observation_log
-            .rolled_back("n2", &target, &archive)
-            .is_some());
+            .rolled_back("n2", &target)
+            .is_some_and(|seed| seed.archive == archive));
         reconcile_once(
             client,
             "default",
@@ -4552,8 +4558,8 @@ mod wiring_tests {
         assert!(
             hooks
                 .observation_log
-                .rolled_back("n2", &target, &archive)
-                .is_some(),
+                .rolled_back("n2", &target)
+                .is_some_and(|seed| seed.archive == archive),
             "quarantine is a status condition, not a departure: the contained node's rollback \
              proof survives the pass"
         );
@@ -4722,6 +4728,223 @@ mod wiring_tests {
                 "set conditions missing {expected}: {conditions:?}"
             );
         }
+    }
+
+    /// `reconcile_once` bounds the observation log to the LIVE FLEET, and nothing asserted that it
+    /// still calls `prune_nodes` at all: `evidence.rs` proves the routine correct in isolation, and
+    /// the only wiring test touching the log asserts that evidence SURVIVES a pass — which deleting
+    /// the call satisfies too. Unbound, the log grows for the lifetime of a leader reconciling once
+    /// a second across a churning fleet, and a machine returning under a departed name inherits its
+    /// predecessor's settled origin, seeding a movement record from hardware that no longer exists.
+    #[tokio::test]
+    async fn a_departed_agents_memory_is_pruned_by_the_pass_that_stops_selecting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            cluster
+                .agents
+                .push(agent("n2", crate::AgentIdentityKind::Reserved, false));
+        })
+        .await;
+        let state = tmp.path().join("state");
+        let mut hooks = ReconcileHooks::new(None);
+        // n2 carries a complete rollback proof and a "has uploaded something" mark into the pass.
+        let target = crate::deployment_identity(
+            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
+        )
+        .unwrap();
+        let origin = "a".repeat(64);
+        let archive = "b".repeat(64);
+        let mut settled = updated_contracts::telemetry::NodeReport::new(
+            "n2", "origin", &origin, "1.0.0", &archive, true,
+        );
+        hooks.observation_log.observe("n2", &settled);
+        settled.assignment_sha256 = target.clone();
+        settled.healthy = false;
+        settled.updating = true;
+        hooks.observation_log.observe("n2", &settled);
+        settled.healthy = true;
+        settled.updating = false;
+        hooks.observation_log.observe("n2", &settled);
+        hooks
+            .observation_log
+            .note_reported(std::iter::once(&"n2".to_string()));
+
+        reconcile_once(
+            apiserver_for(cluster.clone(), "wiring-test"),
+            "default",
+            "default",
+            &state,
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("the first pass succeeds");
+        assert!(
+            hooks.observation_log.has_reported("n2"),
+            "a member of the fleet keeps its memory"
+        );
+        assert!(hooks.observation_log.rolled_back("n2", &target).is_some());
+
+        // The machine is decommissioned: its UpdateAgent is deleted. Nothing else changes.
+        cluster
+            .lock()
+            .expect("cluster")
+            .agents
+            .retain(|agent| agent.name_any() != "n2");
+        reconcile_once(
+            apiserver_for(cluster.clone(), "wiring-test"),
+            "default",
+            "default",
+            &state,
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("the second pass succeeds");
+        assert!(
+            !hooks.observation_log.has_reported("n2"),
+            "the pass that stopped selecting the node forgot it"
+        );
+        assert!(
+            hooks.observation_log.rolled_back("n2", &target).is_none(),
+            "including its rollback proof, so a same-name replacement starts from nothing"
+        );
+    }
+
+    /// The halt's whole PROJECTION was unreached by the wiring harness: the set fixture's
+    /// `maxRegressions` was inert (no pinned key, no telemetry object), so the log stayed empty and
+    /// `plan_rollouts` always took the `halts.is_empty()` fast path — the set test only ever proved
+    /// a `DeploymentHalted` of status False. A fleet-wide freeze could therefore be published as
+    /// invisible on every CR, with a rollout silently stopped and nothing naming the cause.
+    #[tokio::test]
+    async fn a_fleet_wide_halt_reaches_both_the_set_and_the_group_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            cluster.groups[0].metadata.labels =
+                Some(BTreeMap::from([("tier".to_string(), "edge".to_string())]));
+            let mut set = UpdateGroupSet::new(
+                "edge-set",
+                crate::UpdateGroupSetSpec {
+                    selector: crate::LabelSelector {
+                        match_labels: BTreeMap::from([("tier".to_string(), "edge".to_string())]),
+                    },
+                    max_concurrent: None,
+                    rollout_windows: Vec::new(),
+                    calendar: Vec::new(),
+                    // One rejecting node is a fleet verdict here.
+                    max_regressions: Some(1),
+                    stuck_after_seconds: Some(90),
+                },
+            );
+            set.metadata.namespace = Some("default".into());
+            cluster.sets.push(set);
+        })
+        .await;
+        let state = tmp.path().join("state");
+        let mut hooks = ReconcileHooks::new(None);
+        // Pass one admits edge-v1, so it is the ORIGIN body the movement's guard resolves against.
+        reconcile_once(
+            apiserver_for(cluster.clone(), "wiring-test"),
+            "default",
+            "default",
+            &state,
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("the first pass admits the group's deployment");
+
+        // The operator stages a genuinely different release: a new application target, which is
+        // what makes a rollback distinguishable at all.
+        let mut next = crate::tests::deployment_spec("edge-v2");
+        next.application.sha256 = "3".repeat(64);
+        cluster
+            .lock()
+            .expect("cluster")
+            .groups
+            .iter_mut()
+            .for_each(|group| group.spec.deployment = next.clone());
+        let v1 = crate::deployment_identity(
+            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
+        )
+        .unwrap();
+        let v2 =
+            crate::deployment_identity(&crate::DesiredDeployment::try_from(next).unwrap()).unwrap();
+        // n1's report sequence: settled on edge-v1, a transaction toward edge-v2 in flight, then
+        // settled back on edge-v2's assignment still running edge-v1's archive — a rollback.
+        let archive = "1".repeat(64);
+        let mut report = updated_contracts::telemetry::NodeReport::new(
+            "n1", "edge-v1", &v1, "1.0.0", &archive, true,
+        );
+        hooks.observation_log.observe("n1", &report);
+        report.assignment_sha256 = v2.clone();
+        report.healthy = false;
+        report.updating = true;
+        hooks.observation_log.observe("n1", &report);
+        report.healthy = true;
+        report.updating = false;
+        hooks.observation_log.observe("n1", &report);
+
+        reconcile_once(
+            apiserver_for(cluster.clone(), "wiring-test"),
+            "default",
+            "default",
+            &state,
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("the second pass succeeds with the deployment halted");
+
+        let cluster = cluster.lock().expect("cluster");
+        let condition = |patch: &serde_json::Value, name: &str| -> serde_json::Value {
+            patch["status"]["conditions"]
+                .as_array()
+                .expect("conditions")
+                .iter()
+                .find(|condition| condition["type"] == name)
+                .expect("the condition is published")
+                .clone()
+        };
+        let set_patch = cluster
+            .status_patches
+            .iter()
+            .rev()
+            .find(|(path, _)| path.ends_with("/updategroupsets/edge-set/status"))
+            .expect("the set's status was written");
+        assert_eq!(
+            set_patch.1["status"]["halted"],
+            serde_json::json!([{"deployment": "edge-v2", "evidence": 1}]),
+            "the set names the halted body and its evidence: {}",
+            set_patch.1
+        );
+        assert_eq!(
+            condition(&set_patch.1, "DeploymentHalted")["status"],
+            "True",
+            "{}",
+            set_patch.1
+        );
+        let group_patch = cluster
+            .status_patches
+            .iter()
+            .rev()
+            .find(|(path, _)| path.ends_with("/updategroups/edge/status"))
+            .expect("the group's status was written");
+        assert_eq!(
+            condition(&group_patch.1, "DeploymentHalted")["status"],
+            "True",
+            "a set-less group learns of a halt the same way, so this is the one place it is \
+             ever visible: {}",
+            group_patch.1
+        );
     }
 
     /// A hold is accounted to the group the node's LABELS select, not to the group its last

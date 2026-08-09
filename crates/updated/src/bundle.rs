@@ -11,6 +11,15 @@ use crate::hash::{digests_match, sha256_bytes, sha256_file};
 use updated_contracts::is_sha256_hex;
 
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
+/// The bundle manifest is a DESIRED-STATE contract in the sense `docs/wire-compatibility-design.md`
+/// defines: the publisher writes it and the NODE reads it, so no reader window can save a node that
+/// predates the shape (and `deny_unknown_fields` below means an added field is no cheaper than a
+/// bump). Restraint here is stricter than for the assignment, not looser: a manifest this node
+/// cannot accept surfaces as [`InstallError::Archive`] — a verdict on the BYTES — which is recorded
+/// as a durable, never-expiring rejection keyed by digest. Publishing a shape ahead of the fleet
+/// floor therefore makes every not-yet-upgraded node permanently refuse every new bundle, the one
+/// carrying its own supervisor included, and reverting the publisher does not heal them: the
+/// rejections outlive it, and only fresh bytes can be offered again.
 pub(crate) const MANIFEST_SCHEMA: u32 = 1;
 const MANIFEST_BYTES_LIMIT: u64 = 4 << 20;
 

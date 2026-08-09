@@ -24,13 +24,14 @@ use updated_contracts::telemetry::NodeReport;
 /// carry it: a fleet that rolled back FROM a bad deployment and a fleet the operator retargeted TO
 /// the predecessor look identical in one pass, and deriving the verdict from one snapshot halted
 /// the documented recovery path itself. This log is observational memory only, never a stored
-/// verdict: the halt remains recomputed from the reports each pass, and losing the log (a leader
-/// change, a restart) re-derives the evidence from the attempt sequences the fleet keeps producing
-/// — but only FORWARD. A node already back on its pre-attempt archive re-proves nothing while it
-/// sits there; its next record opens when it moves again. Lost memory therefore weakens the
-/// verdict for as long as it takes further nodes to attempt and roll back, which is why the only
-/// thing that drops memory is [`prune`](ObservationLog::prune), and only for what has genuinely
-/// left the system.
+/// verdict: the halt remains recomputed from these observations each pass — a body whose identity
+/// changes is unhalted at once, and a node that moves takes its own evidence with it — and losing
+/// the log (a leader change, a restart) re-derives the evidence from the attempt sequences the
+/// fleet keeps producing — but only FORWARD. A node already back on its pre-attempt archive
+/// re-proves nothing while it sits there; its next record opens when it moves again. Lost memory
+/// therefore weakens the verdict for as long as it takes further nodes to attempt and roll back,
+/// which is why the only things that drop memory are `prune_nodes` and `prune_identities`, and
+/// only for what has genuinely left the system.
 ///
 /// "Has ever reported" lives here for the same reason and not one of its own: it is a fact about
 /// the past that a single pass's store read cannot establish. Re-deriving it from the reports
@@ -64,7 +65,8 @@ pub(crate) struct AttemptSeed {
     /// A supervisor older than schema 6 cannot assert `updating`, and the compatibility window
     /// admits its reports with the field defaulting FALSE — so a pre-6 node's rollbacks produce
     /// no evidence until it upgrades. Strictly weaker evidence during a fleet upgrade, never a
-    /// false verdict.
+    /// false verdict. The per-schema node counts in the metrics exposition
+    /// (`updatec_report_schema`) are what makes that population visible while it lasts.
     ///
     /// Two shapes are rejected by this flag, and both mint a fleet-wide halt without it. A node
     /// that merely FETCHED the assignment reports settled on it while running the old archive —
@@ -73,10 +75,25 @@ pub(crate) struct AttemptSeed {
     /// then; `healthy == false` alone cannot tell that blip from a transaction, which is why the
     /// node reports the two separately.
     attempted: bool,
+    /// Whether the node has since been seen COME TO REST back on [`AttemptSeed::archive`] while
+    /// settled on this target: the second half of the sequence, and the completed proof.
+    ///
+    /// Remembered rather than re-read from the node's current report every pass, because the
+    /// halt is a standing verdict about BYTES and a report is a perishable fact about one
+    /// machine. Re-deriving the proof from a live report meant one contained node going quiet
+    /// for longer than `REPORT_FRESHNESS` — a rollback restarts the app and often reboots the
+    /// host, so this is the ordinary case, not an exotic one — dropped the evidence count below
+    /// `maxRegressions` and UN-HALTED the proven-bad deployment for that pass, admitting another
+    /// `maxUnavailable` batch onto it and reopening fleet-wide admission. The proof survives the
+    /// silence; it is still not a stored verdict (the halt is recomputed from these observations
+    /// every pass) and it still ends the moment the node moves: a fresh transaction in flight
+    /// clears it (the node is no longer at rest), settling on a different archive clears it (the
+    /// node committed), and settling on another identity drops the record entirely.
+    proved: bool,
 }
 
 impl ObservationLog {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -91,8 +108,17 @@ impl ObservationLog {
     /// the later genuine rollback produced no evidence. A report on the assignment the node is
     /// already settled on — an ordinary health blip — opens nothing.
     ///
+    /// A record is PROVED when the node settles healthy on the record's own target while running
+    /// the archive it left from — the rollback itself. It is un-proved by anything that means the
+    /// node is no longer sitting there: a transaction in flight again (the movement is being
+    /// re-attempted, so it is not at rest), or a settle on a different archive (it committed).
+    /// Ordering matters, which is why the flag is cleared on every `updating` tick rather than
+    /// merely set on every settle: a node that FETCHED the target, reported settled on it running
+    /// the old archive, and only then began the transaction would otherwise carry a proof minted
+    /// before the attempt existed, and halt the deployment it is at that moment installing.
+    ///
     /// A record is CLOSED when the node settles somewhere else, because the movement it describes
-    /// is over. Records only ever being dropped by [`prune`](Self::prune) — which keeps every
+    /// is over. Records only ever being dropped by `prune_identities` — which keeps every
     /// identity some group still names — left a node that had moved toward an identity, committed,
     /// and later moved away carrying that first movement's state for ever: the next movement
     /// toward the same identity reused the stale record, so a single merely-fetched tick inherited
@@ -109,6 +135,7 @@ impl ObservationLog {
                     from: from.clone(),
                     archive: archive.clone(),
                     attempted: report.updating,
+                    proved: false,
                 };
                 match self
                     .attempts
@@ -121,6 +148,7 @@ impl ObservationLog {
                     // tick must not downgrade a transaction already seen in flight.
                     std::collections::hash_map::Entry::Occupied(mut open) => {
                         open.get_mut().attempted |= report.updating;
+                        open.get_mut().proved &= !report.updating;
                     }
                     std::collections::hash_map::Entry::Vacant(vacant) => {
                         vacant.insert(seed);
@@ -138,6 +166,7 @@ impl ObservationLog {
                     .and_then(|attempts| attempts.get_mut(&report.assignment_sha256))
                 {
                     open.attempted = true;
+                    open.proved = false;
                 }
             }
             // A node never seen settled proves nothing about where a movement started, so no
@@ -158,6 +187,12 @@ impl ObservationLog {
             // the rollback verdict is read from exactly it.
             if let Some(attempts) = self.attempts.get_mut(node) {
                 attempts.retain(|identity, _| identity == &report.assignment_sha256);
+                // Where the node came to rest decides the surviving record's verdict outright:
+                // back on the archive it left from is the rollback proved, any other archive is
+                // the target COMMITTED and the proof withdrawn.
+                if let Some(open) = attempts.get_mut(&report.assignment_sha256) {
+                    open.proved = open.archive == report.archive_sha256;
+                }
                 if attempts.is_empty() {
                     self.attempts.remove(node);
                 }
@@ -189,24 +224,22 @@ impl ObservationLog {
         self.reported.contains(node)
     }
 
-    /// The movement record proving `node`, now settled on `identity` running `archive`, ROLLED
-    /// BACK: its transaction toward exactly this assignment was seen in flight, and it is back on
-    /// the archive it was settled on before the movement. `None` when nothing is proven: the node
-    /// committed successfully (a different archive), was never seen moving, or only ever fetched
-    /// the assignment without a transaction running.
-    pub(crate) fn rolled_back(
-        &self,
-        node: &str,
-        identity: &str,
-        archive: &str,
-    ) -> Option<&AttemptSeed> {
-        if !updated_contracts::is_sha256_hex(archive) {
-            return None;
-        }
+    /// The movement record proving `node` ROLLED BACK from `identity`: its transaction toward
+    /// exactly this assignment was seen in flight, and it was then seen settled on that assignment
+    /// running [`AttemptSeed::archive`] — the archive it was on before the movement. `None` when
+    /// nothing is proven: the node committed successfully (it settled on another archive), was
+    /// never seen moving, only ever fetched the assignment without a transaction running, or has
+    /// a transaction in flight right now and is therefore not at rest anywhere.
+    ///
+    /// Answered from the OBSERVATIONS alone, never from the node's current report. Whether the
+    /// machine is reachable this second says nothing about whether these bytes were rejected, and
+    /// requiring a fresh report here made one silent node clear a fleet-wide halt (see
+    /// [`AttemptSeed::proved`]).
+    pub(crate) fn rolled_back(&self, node: &str, identity: &str) -> Option<&AttemptSeed> {
         self.attempts
             .get(node)
             .and_then(|attempts| attempts.get(identity))
-            .filter(|seed| seed.attempted && seed.archive == archive)
+            .filter(|seed| seed.attempted && seed.proved)
     }
 
     /// Forget nodes that left the FLEET — the apiserver's full agent list, not the planned
@@ -214,7 +247,7 @@ impl ObservationLog {
     /// entire content is the pre-movement state this call destroys, unrecoverable from any later
     /// report, so a node quarantined mid-containment lost its rollback proof over a status
     /// condition. The caller is `reconcile_once`, the one place the full fleet is known.
-    pub fn prune_nodes(&mut self, fleet: impl Fn(&str) -> bool) {
+    pub(crate) fn prune_nodes(&mut self, fleet: impl Fn(&str) -> bool) {
         self.settled.retain(|node, _| fleet(node));
         self.reported.retain(|node| fleet(node));
         self.attempts.retain(|node, _| fleet(node));
@@ -276,13 +309,15 @@ mod tests {
     /// whole report history rather than as an incremental state machine — so the log and the model
     /// can only agree by both being right.
     ///
-    /// `rolled_back(T, archive)` holds exactly when:
+    /// `rolled_back(T)` returns a seed whose archive is `archive` exactly when:
     /// 1. there is a "departure point" `i`: the LAST report that was settled-healthy with a usable
     ///    archive on an assignment other than `T` (the state the movement left from);
     /// 2. after `i`, some report names `T` with an update transaction in flight (`updating`) —
     ///    the movement genuinely ran, not merely fetched, not a readiness blip;
-    /// 3. the queried `archive` is exactly the departure point's archive — the node is back on
-    ///    what it ran before the movement, so it did not commit.
+    /// 3. after the LAST such transaction the node came to rest: it reported settled-healthy again
+    ///    (necessarily on `T`, since `i` is the last settle anywhere else), and on the departure
+    ///    point's own archive — so it did not commit, and it is not mid-attempt right now;
+    /// 4. the queried `archive` is exactly that archive.
     fn model_rolled_back(history: &[Shape], target: char, archive: char) -> bool {
         let departure = history.iter().enumerate().rfind(|(_, shape)| {
             shape.healthy && shape.archive.is_some() && shape.assignment != target
@@ -290,10 +325,18 @@ mod tests {
         let Some((index, departed_from)) = departure else {
             return false;
         };
-        let attempted = history[index + 1..]
+        let Some(attempt) = history[index + 1..]
             .iter()
-            .any(|shape| shape.assignment == target && shape.updating);
-        attempted && departed_from.archive == Some(archive)
+            .rposition(|shape| shape.assignment == target && shape.updating)
+        else {
+            return false;
+        };
+        let at_rest = history[index + 1 + attempt + 1..]
+            .iter()
+            .rev()
+            .find(|shape| shape.healthy && shape.archive.is_some());
+        at_rest.is_some_and(|shape| shape.archive == departed_from.archive)
+            && departed_from.archive == Some(archive)
     }
 
     struct Lcg(u64);
@@ -390,7 +433,9 @@ mod tests {
                 for &target in &identities {
                     for &archive in &archives {
                         let expected = model_rolled_back(&history, target, archive);
-                        let actual = log.rolled_back("n", &hex(target), &hex(archive)).is_some();
+                        let actual = log
+                            .rolled_back("n", &hex(target))
+                            .is_some_and(|seed| seed.archive == hex(archive));
                         assert_eq!(
                             actual, expected,
                             "seed {seed}: history {history:?} target {target} archive {archive}"
@@ -424,12 +469,46 @@ mod tests {
                     in_fleet,
                     "seed {seed}: 'has ever reported' is bounded by the fleet and nothing else"
                 );
+                if !in_fleet {
+                    // The THIRD thing a prune drops is the settled origin, and every assertion
+                    // above is blind to it: `rolled_back` and `has_reported` read the other two,
+                    // so deleting the `settled` retain left the whole suite green. Its effect is
+                    // only visible on what happens NEXT — a machine re-imaged or an UpdateAgent
+                    // re-created under the same name must start from nothing, not inherit the
+                    // departed machine's (assignment, archive) as the origin of its first
+                    // movement. So the pruned clone is made to live a whole movement and required
+                    // to prove nothing by it.
+                    for &archive in &archives {
+                        let mut replacement = pruned.clone();
+                        for healthy in [false, true] {
+                            replacement.observe(
+                                "n",
+                                &report_of(Shape {
+                                    assignment: 'a',
+                                    archive: Some(archive),
+                                    healthy,
+                                    updating: !healthy,
+                                }),
+                            );
+                        }
+                        for &target in &identities {
+                            assert!(
+                                replacement.rolled_back("n", &hex(target)).is_none(),
+                                "seed {seed}: a departed node's memory seeded its replacement's \
+                                 first movement (target {target}, archive {archive}); history \
+                                 {history:?}"
+                            );
+                        }
+                    }
+                }
                 for &target in &identities {
                     for &archive in &archives {
-                        let before = log.rolled_back("n", &hex(target), &hex(archive)).is_some();
-                        let after = pruned
-                            .rolled_back("n", &hex(target), &hex(archive))
-                            .is_some();
+                        let proof = |log: &ObservationLog| {
+                            log.rolled_back("n", &hex(target))
+                                .is_some_and(|seed| seed.archive == hex(archive))
+                        };
+                        let before = proof(&log);
+                        let after = proof(&pruned);
                         let survives = before && in_fleet && named.contains(&hex(target));
                         assert_eq!(
                             after, survives,
@@ -490,18 +569,26 @@ mod tests {
             updating: false,
         });
         log.observe("n", &back);
-        assert!(log.rolled_back("n", &hex('b'), &hex('1')).is_some());
+        assert!(log.rolled_back("n", &hex('b')).is_some());
 
         // The identity leaves every generation: the record goes with it.
         let only_a: HashSet<String> = [hex('a')].into();
         log.prune_identities(&only_a);
-        assert!(log.rolled_back("n", &hex('b'), &hex('1')).is_none());
+        assert!(log.rolled_back("n", &hex('b')).is_none());
 
-        // The node leaves the fleet: everything about it goes.
+        // The node leaves the fleet: everything about it goes — including the settled origin no
+        // accessor exposes, which is why the departed node's replacement is made to move below.
         log.observe("n", &settled);
         log.observe("n", &moving);
         log.prune_nodes(|_| false);
         assert!(!log.has_reported("n"));
-        assert!(log.rolled_back("n", &hex('b'), &hex('1')).is_none());
+        assert!(log.rolled_back("n", &hex('b')).is_none());
+        // A machine re-imaged, or an UpdateAgent re-created, under the same name: its first
+        // movement must open from nothing. A retained origin would make this exact sequence —
+        // a transaction on 'b' and a settle back on archive '1' — mint a rollback proof out of
+        // hardware that no longer exists, and halt the deployment fleet-wide.
+        log.observe("n", &moving);
+        log.observe("n", &back);
+        assert!(log.rolled_back("n", &hex('b')).is_none());
     }
 }

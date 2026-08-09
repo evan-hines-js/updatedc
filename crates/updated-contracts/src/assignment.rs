@@ -98,8 +98,14 @@ impl RepositoryAssignment {
     /// strands every not-yet-upgraded node unable to parse the assignment that would have
     /// delivered its upgrade: a fleet-wide deadlock with no in-band cure. The WRITER carries the
     /// obligation instead: the control plane must not publish a new schema until every supported
-    /// node in the fleet runs a supervisor that reads it. In practice that means preferring a new
-    /// OPTIONAL field under the unchanged schema number over a bump, and bumping only as a
+    /// node in the fleet runs a supervisor that reads it.
+    ///
+    /// There is no cheaper additive escape here, and reaching for one is the trap: this document
+    /// and every struct nested in it are `deny_unknown_fields` (asserted below, and mirrored by
+    /// the closed `schemas/desired-deployment.schema.json`), so the first generation that EMITS a
+    /// new optional field is refused by every not-yet-upgraded node at `serde_json::from_slice`,
+    /// before `validate` can even name a schema — the same deadlock as a bump, with a worse
+    /// diagnostic. Any change to the SHAPE of this document, numbered or not, is therefore a
     /// deliberate act behind a verified fleet floor.
     pub const SCHEMA: u32 = 3;
 

@@ -98,6 +98,10 @@ spec:
             - {name: UPDATED_REPOSITORY, value: default}
             - {name: UPDATED_PUBLIC_URL, value: "https://updates.example/routing"}
             - {name: RUST_LOG, value: info}
+            # Optional observability and alerting, each off by default:
+            # - {name: UPDATED_METRICS_ADDRESS, value: "0.0.0.0:9090"}   # serve GET /metrics
+            # - {name: UPDATED_ALERT_URL, value: "https://alerts.example/hook"}  # POST condition transitions
+            # - {name: UPDATED_ALERT_TOKEN_FILE, value: /etc/alert-token/token}  # bearer token from a mounted Secret
           volumeMounts:
             - {name: state, mountPath: /var/lib/updatec}
             - {name: tmp, mountPath: /tmp}
