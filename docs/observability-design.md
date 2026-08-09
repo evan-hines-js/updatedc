@@ -49,6 +49,14 @@ already aggregates every fact a node is allowed to assert.
   progress as the admission logic counts it, not a re-derivation.
 - `updatec_reports_fresh` / `updatec_reports_stale` — node reports inside/outside
   `REPORT_FRESHNESS`, the same staleness the admission gate applies.
+- `updatec_report_schema{schema=...}` — nodes with a fresh authentic report, by the report schema
+  they wrote. The compatibility window (docs/wire-compatibility-design.md) admits older reports
+  with newer fields at their fail-safe default, which degrades what the fleet can prove without
+  changing anything else an operator can see: a pre-6 supervisor cannot assert `updating`, so its
+  rollbacks mint no regression evidence and "no node rolled back" reads identically to "every
+  rollback was invisible". This is also the only in-system answer to the question raising
+  `MIN_SUPPORTED_SCHEMA` depends on — whether any supported fleet still runs the older supervisor.
+  Bounded by the number of live schemas, not by nodes.
 - `updatec_quarantined_groups` — size of the quarantine set.
 
 `updated-healthproxy`:

@@ -13,7 +13,8 @@ impl AgentDocument {
     /// Read by nodes, like [`crate::assignment::RepositoryAssignment`]: the writer-restraint rule
     /// in `docs/wire-compatibility-design.md` applies — the control plane must never emit a new
     /// schema ahead of the fleet floor, because the node that cannot read this document cannot
-    /// receive the upgrade that would teach it to.
+    /// receive the upgrade that would teach it to. `deny_unknown_fields` here means a new optional
+    /// field is no cheaper than a bump: emitting it is refused by every older node too.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != 1 {
             return Err(format!("unsupported agent document schema {}", self.schema));
@@ -58,6 +59,13 @@ impl ProviderSet {
     /// The only provider-set document schema this build accepts. Every bound below is mirrored
     /// by `schemas/provider-set.schema.json`, and this module's tests check that file against
     /// these constants so the published contract and the deployed type cannot drift.
+    ///
+    /// Published by the control plane and read by NODES, exactly like [`AgentDocument`] and
+    /// [`crate::assignment::RepositoryAssignment`]: the writer-restraint rule in
+    /// `docs/wire-compatibility-design.md` governs it, `deny_unknown_fields` makes an added field
+    /// no cheaper than a bump, and a shape published ahead of the fleet floor is refused by every
+    /// older node — on a cold install that refusal descends the release list and can reject every
+    /// release the node has.
     pub const SCHEMA: u32 = 1;
     pub const MAX_ID_BYTES: usize = 128;
     pub const MAX_ARGS: usize = 256;

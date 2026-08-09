@@ -86,6 +86,9 @@ pub struct ReconcilePlan {
     /// Groups bound by the regression verdict, with the halted deployment each is bound by, for
     /// the per-group `DeploymentHalted` condition.
     pub halted_groups: BTreeMap<String, crate::HaltedDeployment>,
+    /// Nodes reporting under each report schema, for the metrics exposition
+    /// ([`crate::rollout::RolloutPlan::report_schemas`]).
+    pub report_schemas: BTreeMap<u32, usize>,
 }
 
 pub fn plan_reconcile(
@@ -373,6 +376,7 @@ pub fn plan_reconcile(
         groups: rollout.groups,
         node_counts: rollout.node_counts,
         halted_groups: rollout.halted_groups,
+        report_schemas: rollout.report_schemas,
     })
 }
 
@@ -502,7 +506,16 @@ fn resolve_one(
             return false;
         };
         let identity = crate::deployment_identity(&producer.deployment);
-        if !report.healthy || Some(&report.assignment_sha256) != identity.as_ref() {
+        // And it must be RUNNING what that configuration installs. The supervisor stamps the
+        // assignment it RESOLVED, so a producer that fetched the new assignment and installed
+        // nothing — or attempted it and rolled itself back — reports healthy on the new identity
+        // while executing the predecessor's bytes, and its outputs are read off the predecessor's
+        // manifest. Wiring those into the consumer publishes the old release's endpoints under
+        // the new deployment, with the control plane believing the producer moved.
+        if !report.healthy
+            || Some(&report.assignment_sha256) != identity.as_ref()
+            || report.archive_sha256 != producer.deployment.application.sha256
+        {
             return false;
         }
         let Some(value) = report
@@ -622,6 +635,37 @@ mod tests {
                 value: "https://vault-0:8200".into()
             }
         );
+
+        // The same producer, on the same assignment, healthy — but EXECUTING the predecessor's
+        // archive: it fetched the assignment and installed nothing, or attempted it and rolled
+        // itself back. Its outputs are read off the predecessor's manifest, so wiring them in
+        // would publish the old release's values under the new deployment while the control plane
+        // believed the producer had moved.
+        let predecessor = "b".repeat(64);
+        let mut stale = report.clone();
+        stale.archive_sha256 = predecessor;
+        stale.outputs = report.outputs.clone();
+        let stale_reports = HashMap::from([(
+            "producer".into(),
+            updated_contracts::telemetry::sign_report(&stale, &private).unwrap(),
+        )]);
+        let mut groups = BTreeMap::from([
+            ("initialize".into(), groups["initialize"].clone()),
+            (
+                "join".into(),
+                ResolvedGroup {
+                    inputs_ready: false,
+                    deployment: deployment("join-v1"),
+                    ..groups["join"].clone()
+                },
+            ),
+        ]);
+        resolve_group_inputs(&mut groups, &nodes, &stale_reports, &keys, now_ms);
+        assert!(
+            !groups["join"].inputs_ready,
+            "a producer that has not installed what its configuration names resolves nothing"
+        );
+        assert!(groups["join"].deployment.runtime.inputs.is_empty());
     }
 
     fn repository() -> UpdateRepositorySpec {

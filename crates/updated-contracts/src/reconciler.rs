@@ -1,6 +1,8 @@
 //! The node reconciler protocol vocabulary.
 //!
-//! Every release carries one signed node reconciler, invoked as ordinary argv.
+//! Every release carries one signed node reconciler, invoked as ordinary argv
+//! (the published contract a third-party author writes against is
+//! `docs/node-reconciler-protocol.md`).
 //! The protocol has exactly four operations and three reserved
 //! attempt identities, and this module is their single definition: the supervisor that
 //! *invokes* a reconciler, and every reconciler implementation in this workspace that

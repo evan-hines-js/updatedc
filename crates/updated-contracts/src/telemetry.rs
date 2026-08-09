@@ -232,6 +232,20 @@ impl OutputManifest {
     /// Manifests ride inside node reports, so they answer to the same reader window as
     /// [`NodeReport::MIN_SUPPORTED_SCHEMA`] and the same field-default rule — an exact-schema
     /// gate here would fail a whole report over the manifest it carries.
+    ///
+    /// This contract is DUAL-DIRECTION, and only the report half is covered by that window. The
+    /// values a producer publishes here are resolved by the control plane into
+    /// `ManagedRuntime.inputs` — a field of the signed [`crate::assignment::RepositoryAssignment`]
+    /// that NODES read — so [`OutputValue`]'s own shape answers to the writer-restraint rule
+    /// instead (`docs/wire-compatibility-design.md`). A new variant, or a new field on an existing
+    /// one, is refused by every not-yet-upgraded consumer node: the enum is internally tagged and
+    /// `deny_unknown_fields`, and the failure is the WHOLE assignment, not just the input. That is
+    /// the deadlock with no in-band cure, and the rollout order makes it the enforced one —
+    /// dependents are admitted only after their prerequisite settles, so the producer group has
+    /// upgraded by construction while the consumers that would be stranded have not. It needs no
+    /// schema bump to happen: `RepositoryAssignment` hardcodes `schema: OutputManifest::SCHEMA`
+    /// when it embeds a value, so the window above is never exercised on that path. No new variant
+    /// may be published in an assignment until the fleet floor reads it.
     pub const MIN_SUPPORTED_SCHEMA: u32 = 1;
     pub const MAX_VALUES: usize = 64;
     pub const MAX_STRING_BYTES: usize = 4 * 1024;
@@ -560,7 +574,7 @@ pub fn sign_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Envelope, St
 ///
 /// Returns the decoded report only when the body is an envelope of the report payload type, carries
 /// no more than [`Envelope::MAX_SIGNATURES`] signatures, decodes to a report that is well formed
-/// (which includes carrying this build's [`NodeReport::SCHEMA`] — the same predicate every reader
+/// (which includes a schema inside the compatibility window — the same predicate every reader
 /// applies, so a record no reader can use is never stored), and names `node` — the node the caller
 /// is filing it under. The signature is deliberately NOT
 /// verified here, and this is the only function that decodes a payload without checking it: a writer

@@ -56,6 +56,17 @@ pub struct RolloutPlan {
     /// its DESIRED body from being admitted at all, both of which freeze the group. Projected onto
     /// each group's own status, so a halted set-less group is never an invisible freeze.
     pub halted_groups: BTreeMap<String, crate::HaltedDeployment>,
+    /// How many nodes reported under each report schema this pass, counted once per node from the
+    /// verifications this pass already performed.
+    ///
+    /// The compatibility window ([`updated_contracts::telemetry::NodeReport::MIN_SUPPORTED_SCHEMA`])
+    /// accepts older reports with newer fields defaulting to their fail-safe reading, which is a
+    /// DEGRADATION the fleet cannot otherwise see: a pre-6 supervisor cannot assert `updating`, so
+    /// its rollbacks mint no regression evidence at all (see [`crate::evidence::AttemptSeed`]) and
+    /// "no node rolled back" is indistinguishable from "every rollback was invisible". This census
+    /// is also the only in-system answer to the question raising the floor depends on — whether any
+    /// supported fleet still runs the older supervisor.
+    pub report_schemas: BTreeMap<u32, usize>,
 }
 
 /// One planned group's node accounting for this pass, from the same observations admission reads.
@@ -391,6 +402,14 @@ impl<'a> Observations<'a> {
                 .is_some_and(|report| report.assignment_sha256 == identity)
     }
 
+    /// Whether this node's own report says it is EXECUTING what `deployment` installs — the
+    /// ARCHIVE digest, not the assignment digest. Only the node can make that claim, and no claim
+    /// is not a claim that it is running these bytes.
+    fn running(&self, node: &str, deployment: &DesiredDeployment) -> bool {
+        self.report(node)
+            .is_some_and(|report| report.archive_sha256 == deployment.application.sha256)
+    }
+
     /// How far this group has progressed toward the deployment it is admitted to. The single
     /// classifier every gate reads, so "settled", "still rolling", and "no evidence is possible"
     /// cannot be decided differently in three places.
@@ -430,8 +449,17 @@ impl<'a> Observations<'a> {
                 continue;
             }
             match self.evidence(node, &identity) {
-                NodeEvidence::Healthy => observable = true,
-                NodeEvidence::Broken | NodeEvidence::Silent => {
+                // Healthy on the right assignment is not the same as RUNNING what it installs.
+                // The supervisor stamps the assignment it RESOLVED, so a node that fetched the
+                // assignment and installed nothing — and, exactly, a node that attempted it and
+                // rolled itself back — reports settled and healthy on the target while executing
+                // its old archive. Counting that as settled made a canary that REJECTED a release
+                // release its set's concurrency slot and satisfy `dependsOn`, green-lighting the
+                // same bytes across every dependent group. It is the positive of the clause
+                // `regressed_nodes` already applies, asked here of the deployment's own
+                // application digest, so "settled" cannot mean two things.
+                NodeEvidence::Healthy if self.running(node, &state.current) => observable = true,
+                NodeEvidence::Healthy | NodeEvidence::Broken | NodeEvidence::Silent => {
                     observable = true;
                     settled = false;
                 }
@@ -468,11 +496,20 @@ impl<'a> Observations<'a> {
     /// The nodes of `member` whose signed reports prove they ATTEMPTED `target` and rolled
     /// themselves back. No new channel — this is the report sequence the supervisor already
     /// publishes: `updating=true` while the transaction is in flight, then the committed archive
-    /// after commit or rollback. `attempts` remembers the first half of that sequence across passes, so
-    /// a node now settled healthy on exactly `target`'s assignment while running its pre-movement
+    /// after commit or rollback. [`ObservationLog`] remembers that whole sequence across passes, so
+    /// a node seen settled healthy on exactly `target`'s assignment while running its pre-movement
     /// archive is a proven rollback — and a node that never showed the movement is not, which is
     /// what tells a fleet rolling back FROM a bad target apart from an operator retargeting TO the
     /// predecessor: the two are indistinguishable in any single snapshot.
+    ///
+    /// Read from the OBSERVATIONS, never from the node's report of this second. Requiring a fresh
+    /// report here too made the halt collapse on ordinary silence: a rollback restarts the app and
+    /// often reboots the host, so one contained node missing `REPORT_FRESHNESS` dropped the
+    /// evidence below `maxRegressions`, cleared the halt for that pass, and let another
+    /// `maxUnavailable` batch — and every pending admission in the fleet — onto the proven-bad
+    /// body, one blip at a time. The proof is about BYTES; reachability of the machine that
+    /// produced it is a different question, and the log closes the proof the moment the node
+    /// moves anywhere.
     ///
     /// Each node's evidence is guarded by ITS OWN movement's origin: the body the node moved from
     /// (resolved through `bodies`, the fleet-wide index) must name a different `application`
@@ -506,17 +543,11 @@ impl<'a> Observations<'a> {
         self.nodes(member)
             .into_iter()
             .filter(|node| {
-                self.report(node).is_some_and(|report| {
-                    report.assignment_sha256 == target_id
-                        && report.healthy
-                        && report.archive_sha256 != target.application.sha256
-                        && attempts
-                            .rolled_back(node, &target_id, &report.archive_sha256)
-                            .is_some_and(|seed| {
-                                bodies.get(&seed.from).is_some_and(|origin| {
-                                    origin.application.sha256 != target.application.sha256
-                                })
-                            })
+                attempts.rolled_back(node, &target_id).is_some_and(|seed| {
+                    seed.archive != target.application.sha256
+                        && bodies.get(&seed.from).is_some_and(|origin| {
+                            origin.application.sha256 != target.application.sha256
+                        })
                 })
             })
             .cloned()
@@ -633,10 +664,10 @@ pub(crate) fn plan_rollouts(
     // here instead would publish a cold cluster's consumer group with empty `runtime.inputs`.
     retire_deleted_groups(admitted, &desired, &observations);
     finish_staged_rollouts(admitted, &desired, &observations);
-    let (mut plans, group_plans) =
-        build_set_plans(sets, &desired, group_labels, admitted, &observations, now);
-    // The regression verdict, from evidence the reports already carry, BEFORE admission: a halted
-    // deployment must be refused admission, and evidence concerns deployments that were staged in
+    // The regression verdict, from evidence the reports already carry, BEFORE the set plans and
+    // BEFORE admission: a halted deployment must be refused admission, and a group the halt has
+    // frozen must not be counted as occupying one of its set's concurrency slots (see
+    // [`is_rolling`]), which is what the plans record. Evidence concerns deployments staged in
     // earlier generations, so pre-admission state is the honest baseline. The attempt log is
     // folded first — this pass's unsettled reports are the first half of the sequence a rollback
     // proves itself with — then pruned to the fleet and the identities any generation still names.
@@ -661,12 +692,21 @@ pub(crate) fn plan_rollouts(
     attempts.prune_identities(&live_identities);
     let halts = regression_halts(
         sets,
-        &plans,
         &desired,
+        group_labels,
         admitted,
         held,
         attempts,
         &observations,
+    );
+    let (mut plans, group_plans) = build_set_plans(
+        sets,
+        &desired,
+        group_labels,
+        admitted,
+        &observations,
+        &halts,
+        now,
     );
     admit_pending(
         groups,
@@ -773,7 +813,7 @@ pub(crate) fn plan_rollouts(
     // published `rollingCount: 0` while refusing every sibling, with nothing naming the holder.
     let slot_holders: BTreeSet<String> = desired
         .keys()
-        .filter(|name| is_rolling(admitted, &observations, name))
+        .filter(|name| is_rolling(admitted, &observations, &halts, name))
         .cloned()
         .collect();
     let statuses = build_statuses(
@@ -843,12 +883,22 @@ pub(crate) fn plan_rollouts(
             )
         })
         .collect();
+    // The report-schema census: one entry per node with an authentic, fresh report, keyed by the
+    // schema it wrote. Every verification is already memoized by this pass, so this costs nothing
+    // beyond the tally, and it is a projection of what was verified rather than a second reading.
+    let mut report_schemas: BTreeMap<u32, usize> = BTreeMap::new();
+    for node in node_groups.keys() {
+        if let Some(report) = observations.report(node) {
+            *report_schemas.entry(report.schema).or_default() += 1;
+        }
+    }
     RolloutPlan {
         sets: statuses,
         node_deployments,
         groups: group_progress,
         node_counts,
         halted_groups,
+        report_schemas,
     }
 }
 
@@ -975,27 +1025,40 @@ fn finish_staged_rollouts(
     }
 }
 
+/// The planned groups a set governs, in a stable order. The ONE spelling of set membership, read
+/// by the plan builder and by the regression verdict's threshold resolution — which runs before
+/// the plans exist, because a halted member must not be counted as occupying a slot.
+fn set_members(
+    set: &UpdateGroupSet,
+    desired: &BTreeMap<String, DesiredDeployment>,
+    group_labels: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Vec<String> {
+    let mut members: Vec<String> = desired
+        .keys()
+        .filter(|name| {
+            group_labels.get(*name).is_some_and(|labels| {
+                crate::selector_matches(&set.spec.selector.match_labels, labels)
+            })
+        })
+        .cloned()
+        .collect();
+    members.sort();
+    members
+}
+
 fn build_set_plans(
     sets: &[UpdateGroupSet],
     desired: &BTreeMap<String, DesiredDeployment>,
     group_labels: &BTreeMap<String, BTreeMap<String, String>>,
     admitted: &BTreeMap<String, AdmittedDeployment>,
     observations: &Observations<'_>,
+    halts: &BTreeMap<String, (String, usize)>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (Vec<SetPlan>, BTreeMap<String, Vec<usize>>) {
     let mut plans: Vec<SetPlan> = Vec::with_capacity(sets.len());
     let mut group_plans: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for set in sets {
-        let mut members: Vec<String> = desired
-            .keys()
-            .filter(|name| {
-                group_labels.get(*name).is_some_and(|labels| {
-                    crate::selector_matches(&set.spec.selector.match_labels, labels)
-                })
-            })
-            .cloned()
-            .collect();
-        members.sort();
+        let members = set_members(set, desired, group_labels);
         let max_concurrent = if members.is_empty() {
             0
         } else {
@@ -1009,7 +1072,7 @@ fn build_set_plans(
         // can be observed, so one offline-provisioned machine never wedges its healthy siblings.
         let rolling_now = members
             .iter()
-            .filter(|name| is_rolling(admitted, observations, name))
+            .filter(|name| is_rolling(admitted, observations, halts, name))
             .count();
         // A set is open only inside its schedule: both its recurring rollout windows and its
         // one-off dated calendar must admit `now` (each is "always open" when unset, so a set
@@ -1081,8 +1144,8 @@ fn named_identities(
 /// digest, which is the same rule each node's own rejection record enforces.
 fn regression_halts(
     sets: &[UpdateGroupSet],
-    plans: &[SetPlan],
     desired: &BTreeMap<String, DesiredDeployment>,
+    group_labels: &BTreeMap<String, BTreeMap<String, String>>,
     admitted: &BTreeMap<String, AdmittedDeployment>,
     held: &BTreeMap<String, AdmittedDeployment>,
     attempts: &ObservationLog,
@@ -1129,15 +1192,15 @@ fn regression_halts(
     }
     // The tightest threshold any governing set imposes on each identity with evidence.
     let mut thresholds: BTreeMap<&str, usize> = BTreeMap::new();
-    for (set, plan) in sets.iter().zip(plans) {
+    for set in sets {
         let threshold = set
             .spec
             .max_regressions
             .map(|n| n as usize)
             .unwrap_or(1)
             .max(1);
-        for member in &plan.members {
-            for identity in named_identities(member, desired, admitted) {
+        for member in set_members(set, desired, group_labels) {
+            for identity in named_identities(&member, desired, admitted) {
                 if let Some((key, _)) = evidence.get_key_value(identity.as_str()) {
                     let entry = thresholds.entry(key.as_str()).or_insert(threshold);
                     *entry = (*entry).min(threshold);
@@ -1161,14 +1224,26 @@ fn regression_halts(
 /// Deliberately asked about `admitted.current` rather than about the operator's desire: a group
 /// whose desire changed mid-rollout is [`GroupProgress::Held`] — the new deployment is not live —
 /// while the rollout it is actually performing still occupies the slot it claimed.
+///
+/// A group whose admitted current is HALTED is not in flight — the planner itself stopped it, and
+/// `assign_nodes` publishes a hold for every node it has not moved. Its `progress` is therefore
+/// pinned at `Rolling` for ever (no node can ever be handed `current`, so `fully_handed` can never
+/// become true), and reading that as a slot holder starved every sibling in the set indefinitely,
+/// the operator's `emergencyCorrection` waiver included — that flag waives the schedule and not
+/// the slot gate. It is the same rule `Progress::Unobservable` exists for: nothing in flight and
+/// nothing that can settle, so no slot may be held. The freeze stays visible on the group's own
+/// `halted_groups` entry and its `DeploymentHalted` condition.
 fn is_rolling(
     admitted: &BTreeMap<String, AdmittedDeployment>,
     observations: &Observations<'_>,
+    halts: &BTreeMap<String, (String, usize)>,
     name: &str,
 ) -> bool {
-    admitted
-        .get(name)
-        .is_some_and(|state| observations.progress(name, state) == Progress::Rolling)
+    admitted.get(name).is_some_and(|state| {
+        !crate::deployment_identity(&state.current)
+            .is_some_and(|identity| halts.contains_key(&identity))
+            && observations.progress(name, state) == Progress::Rolling
+    })
 }
 
 fn admit_pending(
@@ -1251,7 +1326,7 @@ fn admit_pending(
         // `finish_staged_rollouts` retires each entry as soon as no node is on it, and collapses
         // the list to one when no node is on any of them, so this grows only while cohorts
         // genuinely exist and a repeated retarget cannot accumulate entries.
-        let rolling = is_rolling(admitted, observations, &name);
+        let rolling = is_rolling(admitted, observations, halts, &name);
         // An EMERGENCY CORRECTION waives the SCHEDULE, and nothing else. A schedule governs when
         // new change is introduced into a fleet; it is not a promise to leave the fleet on a
         // release that is failing until Sunday. The set's concurrency limit still applies, so an
@@ -1390,24 +1465,25 @@ fn build_statuses(
                     emergency_members.push(name.clone());
                 }
                 match group_progress.get(name) {
-                    // Held back — neither rolling nor settled ON ITS DESIRE. It is still listed as
-                    // rolling when the rollout it was ADMITTED to is in flight, because that
-                    // rollout occupies one of the set's concurrency slots (`slot_holders` is the
-                    // very gate `build_set_plans` counts). Reporting the verdict alone left such a
-                    // member in no list at all: `status.rollingCount` read 0 while the set refused
-                    // every sibling for want of a slot, with no field naming the holder. A member
-                    // with no admitted entry has not been published at all, which is the same story
-                    // for a reader, and a member absent from the map is not planned this pass.
-                    Some(GroupProgress::Held) if slot_holders.contains(name) => {
-                        rolling.push(name.clone())
-                    }
-                    Some(GroupProgress::Held) | None => {}
                     Some(GroupProgress::Settled) => settled_members.push(name.clone()),
-                    Some(GroupProgress::Rolling) => rolling.push(name.clone()),
                     // Reported on its own, never as rolling: this member consumes no slot and can
                     // never settle, so an operator needs to see WHY its dependents are waiting —
                     // it selects no agent, or every agent it selects is blind.
                     Some(GroupProgress::Unobservable) => unobservable_members.push(name.clone()),
+                    // Everything else is listed as rolling exactly when it OCCUPIES A SLOT, read
+                    // from `slot_holders` — the very gate `build_set_plans` counts — rather than
+                    // from the verdict, because the two deliberately disagree in both directions.
+                    // A member retargeted mid-roll is `Held` on the operator's question while the
+                    // rollout it was ADMITTED to is still in flight: reporting the verdict alone
+                    // left it in no list at all, so `status.rollingCount` read 0 while the set
+                    // refused every sibling for want of a slot, with no field naming the holder.
+                    // A member the HALT froze is the mirror image — permanently `Rolling`, because
+                    // no node can ever be handed its current, yet holding no slot precisely because
+                    // the planner stopped it; listing it here would name a holder that is not one,
+                    // for a rollout that is not in flight. Its freeze is on `halted` and on its own
+                    // `DeploymentHalted` condition. A member absent from the map is not planned.
+                    _ if slot_holders.contains(name) => rolling.push(name.clone()),
+                    _ => {}
                 }
             }
             // Steady state, not an event: reported on the status and logged by `runtime` when it
@@ -1738,8 +1814,11 @@ fn assign_nodes(
 mod tests {
     use super::*;
 
-    /// A well-formed running digest for report fixtures. Nothing in this module reads it; a report
-    /// simply needs one to be well formed.
+    /// The running archive digest the plain report fixtures stamp, and — deliberately — the
+    /// application digest [`deployment_named`] installs. Settlement asks whether the node is
+    /// EXECUTING what the deployment installs, so a fixture meaning "this node is settled on this
+    /// deployment" has to report the deployment's own archive. Tests about rollbacks name the
+    /// archive explicitly instead ([`deployment_with_app`] / [`report_running`]).
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     // A fixed instant for tests whose sets carry no rollout windows (always open, so the
@@ -1761,7 +1840,7 @@ mod tests {
             report_url: Some("https://cdn".into()),
             application: crate::ExactTarget {
                 path: "app".into(),
-                sha256: "a".repeat(64),
+                sha256: DIGEST.into(),
             },
             ordered_install_fallback: false,
             provider_set: crate::ExactTarget {
@@ -6916,6 +6995,425 @@ mod tests {
             plan.node_counts["g"].observable, 2,
             "but the two nodes known to report stay observable, so the staleness the alert reads \
              is the whole fleet rather than nothing at all"
+        );
+    }
+
+    /// A node that ATTEMPTED the release and rolled ITSELF back reports settled and healthy on
+    /// exactly the target's assignment — the supervisor stamps the assignment it RESOLVED, not the
+    /// bytes it committed. Reading that as settlement made a canary that REJECTED a release release
+    /// its set's concurrency slot and satisfy `dependsOn`, green-lighting across every dependent
+    /// group the very bytes it had just refused. Settlement asks the archive question too, which is
+    /// the positive of the clause `regressed_nodes` already applies.
+    #[test]
+    fn a_canary_that_rolled_itself_back_never_settles_or_opens_its_dependents() {
+        let hex = |c: char| c.to_string().repeat(64);
+        let v0 = deployment_with_app("v0", &hex('1'));
+        let v1 = deployment_with_app("v1", &hex('2'));
+        // The canary's pre-movement archive is v0's own application — what it is still running.
+        let arch0 = hex('1');
+        let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
+
+        let mut groups = BTreeMap::from([
+            ("canary".to_string(), group("canary", v0.clone())),
+            ("web".to_string(), group("web", v0.clone())),
+        ]);
+        groups.get_mut("web").unwrap().depends_on = vec!["canary".to_string()];
+        let labels: BTreeMap<String, BTreeMap<String, String>> = ["canary", "web"]
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    BTreeMap::from([("set".to_string(), "pair-00".to_string())]),
+                )
+            })
+            .collect();
+        let node_groups = BTreeMap::from([
+            ("c0".to_string(), "canary".to_string()),
+            ("w0".to_string(), "web".to_string()),
+            ("w1".to_string(), "web".to_string()),
+        ]);
+        let keys = pubkeys(&node_groups);
+        // The threshold is out of reach, so this is the SETTLEMENT verdict on its own: the halt is
+        // the other, independent guard, and it must not be what saves the fleet here.
+        let mut set = pair_set();
+        set.spec.max_regressions = Some(9);
+        let sets = [set];
+        let mut attempts = ObservationLog::new();
+        let mut admitted = BTreeMap::new();
+        let pass = |groups: &BTreeMap<String, ResolvedGroup>,
+                    reports: &HashMap<String, Envelope>,
+                    published: &BTreeMap<String, String>,
+                    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+                    attempts: &mut ObservationLog| {
+            plan_rollouts(
+                &sets,
+                RolloutInputs {
+                    groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports,
+                    public_keys: &keys,
+                    published,
+                    held: &BTreeMap::new(),
+                    holds: &BTreeSet::new(),
+                    cordons: &BTreeSet::new(),
+                },
+                admitted,
+                attempts,
+                test_now(),
+            )
+        };
+
+        let settled_v0: HashMap<String, Envelope> = node_groups
+            .keys()
+            .map(|node| report_running(node, &v0, &arch0, true))
+            .collect();
+        pass(
+            &groups,
+            &settled_v0,
+            &BTreeMap::new(),
+            &mut admitted,
+            &mut attempts,
+        );
+        assert_eq!(admitted["canary"].current, v0);
+
+        // The operator stages v1 everywhere; the canary is admitted first and its node handed v1.
+        groups.get_mut("canary").unwrap().deployment = v1.clone();
+        groups.get_mut("web").unwrap().deployment = v1.clone();
+        let all_on_v0: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), id(&v0)))
+            .collect();
+        pass(
+            &groups,
+            &settled_v0,
+            &all_on_v0,
+            &mut admitted,
+            &mut attempts,
+        );
+        assert_eq!(admitted["canary"].current, v1);
+        let mut published = all_on_v0.clone();
+        published.insert("c0".to_string(), id(&v1));
+
+        // c0 runs the transaction, then rolls itself back: settled and healthy on v1's assignment
+        // while executing the archive it had before the attempt.
+        let mut reports = settled_v0.clone();
+        let (node, envelope) = report_running("c0", &v1, &arch0, false);
+        reports.insert(node, envelope);
+        pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+        let mut reports = settled_v0.clone();
+        let (node, envelope) = report_running("c0", &v1, &arch0, true);
+        reports.insert(node, envelope);
+        let plan = pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+
+        assert!(
+            plan.sets[0].halted.is_empty(),
+            "the threshold is out of reach: settlement alone has to hold the line here"
+        );
+        assert_eq!(
+            plan.groups["canary"],
+            GroupProgress::Rolling,
+            "a node executing the predecessor's archive has not settled on the target, however \
+             the assignment it names"
+        );
+        assert_eq!(
+            admitted["web"].current, v0,
+            "so the dependency stays shut and the rejected release reaches no dependent group"
+        );
+        assert_eq!(plan.node_deployments["w0"], v0);
+        assert_eq!(plan.node_deployments["w1"], v0);
+    }
+
+    /// The halt is a standing verdict about BYTES; a report is a perishable fact about one machine.
+    /// Re-deriving the proof from each contained node's CURRENT report meant one of them going
+    /// quiet for longer than `REPORT_FRESHNESS` — a rollback restarts the app and often reboots the
+    /// host — dropped the evidence below the threshold and UN-HALTED the proven-bad deployment for
+    /// that pass, leaking another `maxUnavailable` batch onto it. The proof lives in the
+    /// observation log and outlives the silence.
+    #[test]
+    fn a_contained_node_going_silent_does_not_clear_the_halt() {
+        let hex = |c: char| c.to_string().repeat(64);
+        let v0 = deployment_with_app("v0", &hex('1'));
+        let v1 = deployment_with_app("v1", &hex('2'));
+        let arch0 = hex('1');
+        let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
+
+        let nodes = ["n0", "n1", "n2", "n3", "n4", "n5"];
+        let mut groups = BTreeMap::from([("g".to_string(), group("g", v0.clone()))]);
+        groups.get_mut("g").unwrap().max_unavailable = 3;
+        let labels = BTreeMap::from([(
+            "g".to_string(),
+            BTreeMap::from([("set".to_string(), "pair-00".to_string())]),
+        )]);
+        let node_groups: BTreeMap<String, String> = nodes
+            .iter()
+            .map(|node| ((*node).to_string(), "g".to_string()))
+            .collect();
+        let keys = pubkeys(&node_groups);
+        let mut set = pair_set();
+        set.spec.max_regressions = Some(3);
+        let sets = [set];
+        let mut attempts = ObservationLog::new();
+        let mut admitted = BTreeMap::new();
+        let pass = |groups: &BTreeMap<String, ResolvedGroup>,
+                    reports: &HashMap<String, Envelope>,
+                    published: &BTreeMap<String, String>,
+                    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+                    attempts: &mut ObservationLog| {
+            plan_rollouts(
+                &sets,
+                RolloutInputs {
+                    groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports,
+                    public_keys: &keys,
+                    published,
+                    held: &BTreeMap::new(),
+                    holds: &BTreeSet::new(),
+                    cordons: &BTreeSet::new(),
+                },
+                admitted,
+                attempts,
+                test_now(),
+            )
+        };
+
+        let settled_v0: HashMap<String, Envelope> = nodes
+            .iter()
+            .map(|node| report_running(node, &v0, &arch0, true))
+            .collect();
+        pass(
+            &groups,
+            &settled_v0,
+            &BTreeMap::new(),
+            &mut admitted,
+            &mut attempts,
+        );
+        groups.get_mut("g").unwrap().deployment = v1.clone();
+        let all_on_v0: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), id(&v0)))
+            .collect();
+        pass(
+            &groups,
+            &settled_v0,
+            &all_on_v0,
+            &mut admitted,
+            &mut attempts,
+        );
+        let contained = ["n0", "n1", "n2"];
+        let mut published = all_on_v0.clone();
+        for node in contained {
+            published.insert(node.to_string(), id(&v1));
+        }
+
+        // The whole batch attempts v1 and rolls back: the threshold is met and v1 is halted.
+        let mut moving = settled_v0.clone();
+        for node in contained {
+            let (name, envelope) = report_running(node, &v1, &arch0, false);
+            moving.insert(name, envelope);
+        }
+        pass(&groups, &moving, &published, &mut admitted, &mut attempts);
+        let mut rolled_back = settled_v0.clone();
+        for node in contained {
+            let (name, envelope) = report_running(node, &v1, &arch0, true);
+            rolled_back.insert(name, envelope);
+        }
+        let plan = pass(
+            &groups,
+            &rolled_back,
+            &published,
+            &mut admitted,
+            &mut attempts,
+        );
+        assert_eq!(
+            plan.sets[0].halted,
+            vec![crate::HaltedDeployment {
+                deployment: "v1".into(),
+                evidence: 3
+            }]
+        );
+
+        // One contained node misses its upload window — a reboot, a lost write, a partition. It is
+        // the ONLY change; the bytes are exactly as proven-bad as they were a second ago.
+        let mut blip = rolled_back.clone();
+        blip.remove("n0");
+        let plan = pass(&groups, &blip, &published, &mut admitted, &mut attempts);
+        assert_eq!(
+            plan.sets[0].halted,
+            vec![crate::HaltedDeployment {
+                deployment: "v1".into(),
+                evidence: 3
+            }],
+            "the proof is in the observation log, not in whether the machine answered this second"
+        );
+        for node in ["n3", "n4", "n5"] {
+            assert_eq!(
+                plan.node_deployments[node], v0,
+                "no further node is leaked onto the halted body on a report blip"
+            );
+        }
+    }
+
+    /// A group the halt has FROZEN is not in flight: `assign_nodes` publishes a hold for every node
+    /// it has not moved, so its `progress` is pinned at `Rolling` for ever. Counting it as a slot
+    /// holder starved every sibling in its set indefinitely — the operator's `emergencyCorrection`
+    /// waiver included, since that flag waives the schedule and not the slot gate.
+    #[test]
+    fn a_halted_group_stops_holding_its_sets_concurrency_slot() {
+        let hex = |c: char| c.to_string().repeat(64);
+        let v0 = deployment_with_app("v0", &hex('1'));
+        let v1 = deployment_with_app("v1", &hex('2'));
+        let w1 = deployment_with_app("w1", &hex('4'));
+        let arch0 = hex('1');
+        let id = |d: &DesiredDeployment| crate::deployment_identity(d).unwrap();
+
+        let mut groups = BTreeMap::from([
+            ("canary".to_string(), group("canary", v0.clone())),
+            ("web".to_string(), group("web", v0.clone())),
+        ]);
+        let labels: BTreeMap<String, BTreeMap<String, String>> = ["canary", "web"]
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    BTreeMap::from([("set".to_string(), "pair-00".to_string())]),
+                )
+            })
+            .collect();
+        let node_groups = BTreeMap::from([
+            ("c0".to_string(), "canary".to_string()),
+            ("w0".to_string(), "web".to_string()),
+        ]);
+        let keys = pubkeys(&node_groups);
+        // One slot for the pair, and one rollback is a fleet verdict.
+        let mut set = pair_set();
+        set.spec.max_concurrent = Some(1);
+        set.spec.max_regressions = Some(1);
+        let sets = [set];
+        let mut attempts = ObservationLog::new();
+        let mut admitted = BTreeMap::new();
+        let pass = |groups: &BTreeMap<String, ResolvedGroup>,
+                    reports: &HashMap<String, Envelope>,
+                    published: &BTreeMap<String, String>,
+                    admitted: &mut BTreeMap<String, AdmittedDeployment>,
+                    attempts: &mut ObservationLog| {
+            plan_rollouts(
+                &sets,
+                RolloutInputs {
+                    groups,
+                    group_labels: &labels,
+                    node_groups: &node_groups,
+                    reports,
+                    public_keys: &keys,
+                    published,
+                    held: &BTreeMap::new(),
+                    holds: &BTreeSet::new(),
+                    cordons: &BTreeSet::new(),
+                },
+                admitted,
+                attempts,
+                test_now(),
+            )
+        };
+
+        let settled_v0: HashMap<String, Envelope> = node_groups
+            .keys()
+            .map(|node| report_running(node, &v0, &arch0, true))
+            .collect();
+        pass(
+            &groups,
+            &settled_v0,
+            &BTreeMap::new(),
+            &mut admitted,
+            &mut attempts,
+        );
+        groups.get_mut("canary").unwrap().deployment = v1.clone();
+        let all_on_v0: BTreeMap<String, String> = node_groups
+            .keys()
+            .map(|node| (node.clone(), id(&v0)))
+            .collect();
+        pass(
+            &groups,
+            &settled_v0,
+            &all_on_v0,
+            &mut admitted,
+            &mut attempts,
+        );
+        assert_eq!(admitted["canary"].current, v1);
+        let mut published = all_on_v0.clone();
+        published.insert("c0".to_string(), id(&v1));
+
+        // c0 attempts v1 and rolls back: v1 is halted, and `canary` is frozen on it for ever.
+        let mut reports = settled_v0.clone();
+        let (name, envelope) = report_running("c0", &v1, &arch0, false);
+        reports.insert(name, envelope);
+        pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+        let mut reports = settled_v0.clone();
+        let (name, envelope) = report_running("c0", &v1, &arch0, true);
+        reports.insert(name, envelope);
+        let plan = pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+        assert_eq!(
+            plan.sets[0].halted,
+            vec![crate::HaltedDeployment {
+                deployment: "v1".into(),
+                evidence: 1
+            }]
+        );
+        assert!(
+            !plan.sets[0].rolling.contains(&"canary".to_string()),
+            "the planner itself stopped this rollout, so it is not in flight and holds no slot"
+        );
+        assert!(
+            plan.halted_groups.contains_key("canary"),
+            "the freeze stays visible on the group's own status"
+        );
+
+        // A CVE lands and the operator retargets the SIBLING to patched bytes. Its set's only slot
+        // must not still be pinned by the group the planner froze.
+        groups.get_mut("web").unwrap().deployment = w1.clone();
+        groups.get_mut("web").unwrap().emergency_correction = true;
+        let plan = pass(&groups, &reports, &published, &mut admitted, &mut attempts);
+        assert_eq!(
+            admitted["web"].current, w1,
+            "the emergency correction is admitted rather than starved by a frozen sibling"
+        );
+        assert_eq!(plan.node_deployments["w0"], w1);
+        assert_eq!(
+            admitted["canary"].current, v1,
+            "and the halted group stays exactly where the halt left it"
+        );
+    }
+
+    /// The report-schema census the compatibility window depends on: nodes are counted by the
+    /// schema they actually wrote, so the population whose reports are read through a default —
+    /// and whose rollbacks therefore mint no regression evidence — is visible rather than inferred.
+    #[test]
+    fn the_plan_counts_reporting_nodes_by_their_report_schema() {
+        let (groups, node_groups, labels) = three_node_group();
+        // n2 never reports at all: a census of what was VERIFIED, not of what was expected.
+        let reports = HashMap::from([report("n0", "v0", true), report("n1", "v0", true)]);
+        let plan = plan_rollouts(
+            &[],
+            RolloutInputs {
+                groups: &groups,
+                group_labels: &labels,
+                node_groups: &node_groups,
+                reports: &reports,
+                public_keys: &pubkeys(&node_groups),
+                published: &BTreeMap::new(),
+                held: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+            },
+            &mut BTreeMap::new(),
+            &mut ObservationLog::new(),
+            test_now(),
+        );
+        assert_eq!(
+            plan.report_schemas,
+            BTreeMap::from([(NodeReport::SCHEMA, 2)])
         );
     }
 }

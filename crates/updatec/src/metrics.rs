@@ -34,6 +34,12 @@ pub struct FleetSnapshot {
     pub reports_stale: usize,
     /// Size of the quarantine set this pass.
     pub quarantined_groups: usize,
+    /// Nodes reporting under each report schema, from the verifications the pass already performed.
+    /// The compatibility window admits older reports with newer fields at their fail-safe default,
+    /// so the population below the current schema is exactly the population whose evidence is
+    /// degraded — and the only in-system answer to "does any supported fleet still run the older
+    /// supervisor", which is the precondition for raising the floor.
+    pub report_schemas: BTreeMap<u32, usize>,
 }
 
 /// The state the metrics listener reads: the latest snapshot, plus the failure counter that must
@@ -157,6 +163,11 @@ pub fn render(state: &MetricsState) -> String {
     let _ = writeln!(out, "# HELP updatec_reports_stale Nodes that have reported before but have no fresh authentic report.");
     let _ = writeln!(out, "# TYPE updatec_reports_stale gauge");
     let _ = writeln!(out, "updatec_reports_stale {}", snapshot.reports_stale);
+    let _ = writeln!(out, "# HELP updatec_report_schema Nodes with a fresh authentic report, by the report schema they wrote.");
+    let _ = writeln!(out, "# TYPE updatec_report_schema gauge");
+    for (schema, nodes) in &snapshot.report_schemas {
+        let _ = writeln!(out, "updatec_report_schema{{schema=\"{schema}\"}} {nodes}");
+    }
     let _ = writeln!(
         out,
         "# HELP updatec_quarantined_groups Size of the quarantine set."
@@ -246,6 +257,7 @@ mod tests {
                 reports_fresh: 7,
                 reports_stale: 1,
                 quarantined_groups: 1,
+                report_schemas: BTreeMap::from([(5, 2), (6, 5)]),
             }),
         };
         let text = render(&state);
@@ -263,6 +275,10 @@ mod tests {
             "updatec_group_nodes_on_target{group=\"core\"} 2",
             "updatec_reports_fresh 7",
             "updatec_reports_stale 1",
+            // The population still writing an older report schema, which is the population whose
+            // rollbacks mint no regression evidence — invisible in every other series.
+            "updatec_report_schema{schema=\"5\"} 2",
+            "updatec_report_schema{schema=\"6\"} 5",
             "updatec_quarantined_groups 1",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
