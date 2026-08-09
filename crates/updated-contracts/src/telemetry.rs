@@ -326,10 +326,24 @@ pub struct NodeReport {
     pub archive_sha256: String,
     /// Whether the node has *settled* on that deployment: it has finished acting on the
     /// assignment (installed and confirmed it, or attempted and rolled back from it) and
-    /// its running app is healthy. A node that has merely fetched the assignment, or has
-    /// an unconfirmed update still in flight, reports `false` — so the control plane never
-    /// mistakes "received" for "done".
+    /// its running app is healthy. A node with an unconfirmed update still in flight reports
+    /// `false` — so the control plane never mistakes "received" for "done".
+    ///
+    /// It is not a claim that the node installed what the assignment names: a node that resolved a
+    /// new assignment but could not fetch its archive has nothing in flight and a healthy app, so
+    /// it reports settled on that assignment while still running the old bytes.
+    /// [`NodeReport::archive_sha256`] is what says which bytes are executing.
     pub healthy: bool,
+    /// Whether an update TRANSACTION is in flight: the node committed an update whose
+    /// confirmation window has not closed yet.
+    ///
+    /// This is the half of `healthy == false` that says the transaction genuinely RAN. The two
+    /// meanings are not interchangeable — a report is also unsettled when the running app simply
+    /// fails a readiness probe, with no update anywhere near it — and a reader that infers "an
+    /// update was attempted" from `!healthy` alone mints rollback evidence out of an ordinary
+    /// readiness blip. Never true together with [`NodeReport::healthy`]: settled means the
+    /// confirmation window is closed.
+    pub updating: bool,
     /// Milliseconds since the Unix epoch when the node wrote this report (see [`now_ms`]). A
     /// reader ages the report against this so a node that dies without writing a not-ready
     /// report cannot stay trusted forever — a stale report fails closed.
@@ -346,8 +360,11 @@ pub struct NodeReport {
 }
 
 impl NodeReport {
-    pub const SCHEMA: u32 = 5;
+    pub const SCHEMA: u32 = 6;
 
+    /// A report of a node that is NOT mid-transaction. [`NodeReport::updating`] is set by the one
+    /// writer that knows (the supervisor's heartbeat, from its own unconfirmed-update journal);
+    /// every other constructor is describing a settled or merely not-ready node.
     pub fn new(
         node: impl Into<String>,
         deployment: impl Into<String>,
@@ -364,6 +381,7 @@ impl NodeReport {
             version: version.into(),
             archive_sha256: archive_sha256.into(),
             healthy,
+            updating: false,
             reported_at_ms: now_ms(),
             fingerprint: None,
             outputs: None,
@@ -383,6 +401,11 @@ impl NodeReport {
     /// node that has not completed its first install. Anything else is a malformed record — a
     /// truncated, re-encoded, or hand-written digest — and a reader that joined on it would
     /// attribute a running node to bytes it cannot name.
+    ///
+    /// `updating` and `healthy` are mutually exclusive by construction (settled means no
+    /// transaction is outstanding), so a record claiming both is malformed: it would otherwise be
+    /// one signed report asserting simultaneously that a rollout has completed and that the
+    /// transaction behind it is still in flight.
     pub fn is_wellformed(&self) -> bool {
         self.schema == Self::SCHEMA
             && !self.node.is_empty()
@@ -390,6 +413,7 @@ impl NodeReport {
             && self.reported_at_ms > 0
             && (self.version.is_empty() == self.archive_sha256.is_empty())
             && (!self.healthy || !self.archive_sha256.is_empty())
+            && !(self.healthy && self.updating)
             && (self.archive_sha256.is_empty() || crate::is_sha256_hex(&self.archive_sha256))
             && (self.assignment_sha256.is_empty() || crate::is_sha256_hex(&self.assignment_sha256))
             && self
@@ -891,6 +915,36 @@ mod tests {
         assert!(
             report_is_authentic_and_fresh(&future, "agent-9", &future_point, now_ms()).is_none(),
             "an unknown schema must fail closed even when authentic"
+        );
+    }
+
+    /// The two reasons a report is unsettled are carried separately, because a reader cannot
+    /// recover them from `healthy` alone: an update transaction in flight is evidence a rollout
+    /// ran, an ordinary readiness failure is not, and the control plane's rollback verdict is
+    /// built on the first meaning. Claiming BOTH settled and mid-transaction is a contradiction
+    /// no supervisor can produce, so it fails the gate closed rather than being interpreted.
+    #[test]
+    fn a_transaction_in_flight_is_reported_apart_from_readiness_and_never_beside_settled() {
+        let (unsettled, point) = signed(|r| {
+            r.healthy = false;
+            r.updating = true;
+        });
+        let report = report_is_authentic_and_fresh(&unsettled, "agent-9", &point, now_ms())
+            .expect("an unsettled report with a transaction in flight is well-formed");
+        assert!(!report.healthy && report.updating);
+
+        let (blip, point) = signed(|r| {
+            r.healthy = false;
+            r.updating = false;
+        });
+        let report = report_is_authentic_and_fresh(&blip, "agent-9", &point, now_ms())
+            .expect("so is an unsettled report with no update anywhere near it");
+        assert!(!report.healthy && !report.updating);
+
+        let (contradictory, point) = signed(|r| r.updating = true);
+        assert!(
+            report_is_authentic_and_fresh(&contradictory, "agent-9", &point, now_ms()).is_none(),
+            "settled means the confirmation window is closed; a record claiming both is malformed"
         );
     }
 

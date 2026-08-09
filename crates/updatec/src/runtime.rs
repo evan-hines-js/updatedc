@@ -796,10 +796,11 @@ async fn metadata_expiry(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
 pub struct ReconcileHooks {
     pub alerts: Option<Arc<crate::alerts::AlertSink>>,
     pub progress: crate::alerts::ProgressTracker,
-    /// The regression verdict's observation memory (`rollout::AttemptLog`): which assignments each
-    /// node has been seen attempting. Losing it (a restart, a leader change) only delays a halt
-    /// until the still-contained nodes' report sequences re-prove it.
-    pub regressions: crate::rollout::AttemptLog,
+    /// Cross-pass memory about the fleet's nodes (`rollout::ObservationLog`): which assignments
+    /// each node has been seen attempting, and which nodes have ever reported at all. Losing it (a
+    /// restart, a leader change) only delays a halt until the still-contained nodes' report
+    /// sequences re-prove it, and re-derives "has reported" from the next readable store listing.
+    pub observation_log: crate::rollout::ObservationLog,
     /// Failed passes in a row WITHIN one leadership epoch. Reset by a successful publish, and by
     /// the loop whenever this replica stops being the leader — a streak that spanned the gap let
     /// one ordinary transient after a handover reach the `ReconcileFailing` threshold on its own.
@@ -811,7 +812,7 @@ impl ReconcileHooks {
         Self {
             alerts,
             progress: crate::alerts::ProgressTracker::new(),
-            regressions: crate::rollout::AttemptLog::new(),
+            observation_log: crate::rollout::ObservationLog::new(),
             consecutive_failures: 0,
         }
     }
@@ -1000,6 +1001,19 @@ pub async fn reconcile_once(
     agent_resources
         .items
         .retain(|agent| agent.spec.repository_ref.name == repository_name);
+    // The cordoned set is collected BEFORE the quarantine filter below, from every agent of this
+    // repository. A cordon is an operational safety control that must fail SAFE: quarantining an
+    // agent (a malformed `registrationSha256` is one hand edit away, and repeats every pass) drops
+    // it from the plan, and collecting cordons afterwards dropped it from the endpoint projection
+    // too — the one channel a cordon travels — so a machine deliberately benched for maintenance
+    // was published back into load-balancer rotation while its own `status.cordoned` still read
+    // true. A quarantined agent is absent from `plan.node_groups`, so naming it here cannot reach
+    // any rollout accounting; it only keeps the drain published.
+    let cordons: BTreeSet<String> = agent_resources
+        .iter()
+        .filter(|agent| agent.spec.cordon)
+        .map(|agent| agent.name_any())
+        .collect();
     // Quarantine a malformed-identity agent — never the whole reconcile — and drop it from this
     // generation: a bad identity never resolved to an assignment, so there is nothing to preserve.
     // Overlapping selectors are deliberately NOT handled here. An ambiguous node must hold the last
@@ -1062,20 +1076,30 @@ pub async fn reconcile_once(
             labels: node.spec.labels.clone(),
         })
         .collect();
-    // The per-node operational controls, straight from each agent's spec. Both are pure planner
-    // inputs: a hold changes only what is published FOR the node (its recorded body, verbatim) and
-    // a cordon changes only what the endpoint projection publishes ABOUT it — the pull model
-    // holds, nothing reaches into a machine.
+    // The other per-node operational control, straight from each agent's spec (the cordoned set is
+    // collected above, before quarantine). Both are pure planner inputs: a hold changes only what
+    // is published FOR the node (its recorded body, verbatim) and a cordon changes only what the
+    // endpoint projection publishes ABOUT it — the pull model holds, nothing reaches into a
+    // machine. A hold on a quarantined agent needs no such care: that agent is out of the plan
+    // entirely, so there is nothing to hold it on.
     let holds: BTreeSet<String> = agent_resources
         .iter()
         .filter(|agent| agent.spec.hold)
         .map(|agent| agent.name_any())
         .collect();
-    let cordons: BTreeSet<String> = agent_resources
-        .iter()
-        .filter(|agent| agent.spec.cordon)
-        .map(|agent| agent.name_any())
-        .collect();
+
+    // The endpoint projection: which nodes the healthproxy must program as drained regardless of
+    // their reports — the one channel a cordon travels. Published HERE, as soon as the cordoned set
+    // is known, and deliberately not at the end of the pass: everything below can fail (a node
+    // matching two selectors faults the generation closed every pass by design, a missing signing
+    // Secret, a lost lease), and behind those failures a cordon reached no reader at all while the
+    // healthproxy kept reading the last projection successfully — so the freshness gauge said
+    // "current" and nothing was alertable. It is outside the signed generation because it is not
+    // desired state (see `updated_contracts::endpoints`), and written read-compare-put so a steady
+    // fleet costs one GET per pass, not a PUT. Best-effort like every other side-channel delivery
+    // (`deliver_subscriptions`): a failure here must not stall publication for the whole
+    // repository, and the write retries on the next pass of its own accord.
+    publish_endpoint_projection(store.as_ref(), &repository.spec.s3.prefix, &cordons).await;
 
     // An ABSENT admitted-state ConfigMap reads as "no group has ever been admitted", so every group
     // takes the first-admission branch and every group's staging baseline is lost: `previous` is
@@ -1157,7 +1181,7 @@ pub async fn reconcile_once(
             assignments: &durable.assignments,
             now: reconcile_now,
         },
-        &mut hooks.regressions,
+        &mut hooks.observation_log,
     )?;
     let crate::domain::ReconcilePlan {
         publication: plan,
@@ -1284,14 +1308,6 @@ pub async fn reconcile_once(
         .await
         .ok();
 
-    // The endpoint projection: which nodes the healthproxy must program as drained regardless of
-    // their reports — the one channel a cordon travels. Outside the signed generation because it
-    // is not desired state (see `updated_contracts::endpoints`), and written read-compare-put so a
-    // steady fleet costs one GET per pass, not a PUT. Best-effort like every other post-publication
-    // delivery (`deliver_subscriptions`): one unreadable object here must not stall publication for
-    // the whole repository, and the write retries on the next pass of its own accord.
-    publish_endpoint_projection(store.as_ref(), &repository.spec.s3.prefix, &cordons).await;
-
     // ONE projection path for both outcomes — a reconcile that reused an unchanged generation and
     // one that just signed a new one expose identical enrollment, status, and subscription state.
     //
@@ -1390,9 +1406,11 @@ pub async fn reconcile_once(
 /// prefix, beside the telemetry namespace the healthproxy already reads. Read-compare-put keeps a
 /// steady state at one bounded GET per reconcile.
 ///
-/// Best-effort: a failure is logged and retried next pass, never propagated — the projection is
-/// operator convenience, and publication for the whole repository must not stall over it. The
-/// unguarded write also means a lame-duck leader can briefly overwrite a new leader's projection;
+/// Best-effort and INDEPENDENT of the update pipeline in both directions: a failure here is logged
+/// and retried next pass rather than stalling publication for the whole repository, and it is
+/// called before anything that can fault the generation closed, so a faulted generation never
+/// holds an operational safety control hostage. The unguarded write also means a lame-duck leader
+/// can briefly overwrite a new leader's projection;
 /// that self-heals on the new leader's next one-second pass, which is the same bound a cordon's
 /// ordinary propagation already has.
 async fn publish_endpoint_projection(
@@ -1420,9 +1438,32 @@ async fn publish_endpoint_projection(
         );
         return;
     }
-    match crate::read_object_bounded(store, &key).await {
-        Ok(existing) if existing == desired => return,
-        Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+    // The read-compare probe. Only a TRANSPORT failure defers the write: an object that exists but
+    // cannot be read back within the shared bound is not a reason to stop publishing. This key has
+    // exactly one legitimate author, and the bucket is not exclusively ours, so a foreign or
+    // interrupted upload that left an oversized document there would otherwise wedge the cordon
+    // channel for ever — the probe failing identically on every pass while the healthproxy, which
+    // refuses the same document, releases every cordon. Overwriting it is the repair.
+    match store.get(&key).await {
+        Ok(result) => {
+            if result.meta.size <= updated_contracts::endpoints::MAX_PROJECTION_BYTES as u64 {
+                match result.bytes().await {
+                    Ok(existing) if existing.as_ref() == desired => return,
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "reading the endpoint projection back; cordon changes wait for the next pass");
+                        return;
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    bytes = result.meta.size,
+                    "the published endpoint projection is over the shared bound and unreadable by \
+                     the health proxy; replacing it"
+                );
+            }
+        }
+        Err(object_store::Error::NotFound { .. }) => {}
         Err(error) => {
             tracing::warn!(%error, "probing the endpoint projection; cordon changes wait for the next pass");
             return;
@@ -3464,6 +3505,49 @@ mod lease_tests {
 
         // Re-pruning an already-clean prefix is a no-op — the resumability the finalizer relies on.
         assert_eq!(prune_prefix(&store, "tenant/routing").await.unwrap(), 0);
+    }
+
+    /// The cordon channel must be self-healing. The bucket is not exclusively ours, so a foreign or
+    /// interrupted upload can leave an object at the projection's key that is over the shared bound
+    /// — which the healthproxy refuses by failing OPEN, releasing every cordon. Deferring the write
+    /// on any probe failure made that permanent: the probe failed identically every pass, so the
+    /// control plane never published again and cordoning was dead until a human deleted the object.
+    /// This key has exactly one legitimate author, so an unusable document is overwritten.
+    #[tokio::test]
+    async fn an_oversized_endpoint_projection_is_replaced_rather_than_wedging_cordons() {
+        use object_store::memory::InMemory;
+
+        let store = InMemory::new();
+        let key = crate::object_key(
+            "routing",
+            updated_contracts::endpoints::ENDPOINTS_OBJECT_KEY,
+        );
+        let junk = vec![b'x'; updated_contracts::endpoints::MAX_PROJECTION_BYTES + 1];
+        store
+            .put(&key, PutPayload::from_bytes(junk.into()))
+            .await
+            .unwrap();
+
+        let cordons = BTreeSet::from(["web-7".to_string()]);
+        publish_endpoint_projection(&store, "routing", &cordons).await;
+
+        let published = crate::read_object_bounded(&store, &key)
+            .await
+            .expect("the oversized object must have been replaced by a readable one");
+        assert_eq!(
+            updated_contracts::endpoints::EndpointProjection::parse(&published),
+            Some(cordons.clone()),
+            "the cordon reaches the health proxy again"
+        );
+
+        // And the ordinary read-compare probe still holds: an identical projection is not rewritten.
+        let before = store.head(&key).await.unwrap();
+        publish_endpoint_projection(&store, "routing", &cordons).await;
+        let after = store.head(&key).await.unwrap();
+        assert_eq!(
+            before.last_modified, after.last_modified,
+            "an unchanged cordon set costs a GET, not a PUT"
+        );
     }
 
     #[test]

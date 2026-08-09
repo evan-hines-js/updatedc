@@ -40,6 +40,11 @@ pub struct RunningState<'a> {
     pub archive_sha256: &'a str,
     /// Settled: acted on the assignment and healthy. Never true mid-rollout.
     pub healthy: bool,
+    /// An update transaction is in flight: this node committed an update whose confirmation window
+    /// has not closed. It is the OTHER half of an unsettled report — the half that says the
+    /// transaction genuinely ran, told apart from an ordinary readiness failure — and only this
+    /// writer can tell them apart, so it is reported rather than guessed at by a reader.
+    pub updating: bool,
     /// Latest successful opaque node-state fingerprint, when one is currently publishable.
     pub fingerprint: Option<&'a updated_contracts::telemetry::Fingerprint>,
     /// Where installed archives live, and the manifest digest identifying the running one — the
@@ -118,6 +123,7 @@ pub async fn report_running_state(
         state.archive_sha256,
         state.healthy,
     );
+    report.updating = state.updating;
     report.fingerprint = state.fingerprint.cloned();
     // Outputs describe what the running archive settled on, so an unsettled node has none to
     // publish — and no reason to pay the read. One gate, at the one place that attaches them.

@@ -148,19 +148,22 @@ pub async fn fetch_report(
 /// of the checker's own dependency must not flap a deliberate cordon.
 ///
 /// Fails OPEN in every terminal direction (see `updated_contracts::endpoints`): a store that has
-/// no projection (404), an unreadable document, or a cache that aged out all mean "nobody is
-/// cordoned" — health alone then governs, which is the safe steady state.
+/// no projection (404), a document that cannot be read or decoded, and a cache that aged out all
+/// end at "nobody is cordoned" — health alone then governs, which is the safe steady state.
+/// Terminal is the operative word: a document that cannot be USED is a failed observation like any
+/// other, so the cordons are bridged from the last usable projection first and released only when
+/// that ages out.
 ///
-/// Returns the cordoned set and whether the projection was actually OBSERVED this cycle. Failing
-/// open is deliberate; failing open SILENTLY is not — the caller stamps the observation into the
-/// metrics exposition and logs the edges, so "every cordon was released because the projection
-/// stopped being readable" is an alertable fact rather than something an operator infers from a
-/// node quietly taking production traffic again.
+/// Returns the cordoned set and whether a USABLE projection was actually OBSERVED this cycle.
+/// Failing open is deliberate; failing open SILENTLY is not — the caller stamps the observation
+/// into the metrics exposition and logs the edges, so "every cordon was released because the
+/// projection stopped being readable" is an alertable fact rather than something an operator infers
+/// from a node quietly taking production traffic again.
 pub async fn fetch_drained(
     client: &reqwest::Client,
     health_base: &str,
     health_timeout: Duration,
-    cache: &mut LastKnownGood<Vec<u8>>,
+    cache: &mut LastKnownGood<std::collections::BTreeSet<String>>,
 ) -> (std::collections::BTreeSet<String>, bool) {
     let url = updated_contracts::endpoints::endpoints_url(health_base);
     let fetch = async {
@@ -179,15 +182,23 @@ pub async fn fetch_drained(
         .await
         .ok()
     };
-    let fresh = tokio::time::timeout(health_timeout, fetch)
+    // A body that arrived is not an observation: it must also DECODE into a projection this build
+    // knows. Deciding "observed" on readability alone made a corrupt or newer-schema document —
+    // a truncated object, a 200 error page from a CDN, or a control plane one release ahead of
+    // this replica — release every cordon, cache the garbage over the last known good so the
+    // release outlived the bad cycle, and stamp the freshness gauge as current, with no edge
+    // logged. Decoding first turns exactly that case back into a failed observation: the cordons
+    // are bridged from the last usable projection, age out on the normal clock, and say so.
+    let usable = tokio::time::timeout(health_timeout, fetch)
         .await
         .ok()
-        .flatten();
-    let observed = fresh.is_some();
-    let cordoned = match cache.resolve("endpoints", fresh, Instant::now()) {
-        Some(body) => updated_contracts::endpoints::EndpointProjection::parse(&body),
-        None => std::collections::BTreeSet::new(),
-    };
+        .flatten()
+        .as_deref()
+        .and_then(updated_contracts::endpoints::EndpointProjection::parse);
+    let observed = usable.is_some();
+    let cordoned = cache
+        .resolve("endpoints", usable, Instant::now())
+        .unwrap_or_default();
     (cordoned, observed)
 }
 
@@ -502,12 +513,13 @@ pub async fn run(
     // (still freshness-bounded) instead of draining every healthy node at once.
     let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
     // The control plane's endpoint projection (cordoned nodes), through the same last-known-good
-    // discipline as the reports it travels beside.
-    let mut drained_cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
-    // Whether the projection was readable last cycle, and who it cordoned — the two things the
-    // edge logs below need, so a lost cordon says so instead of reading as a health event.
-    // Readable starts true so the FIRST failed observation is an edge and gets logged.
-    let mut projection_readable = true;
+    // discipline as the reports it travels beside. It caches the DECODED set, so only a document
+    // this build could actually act on can ever become the value a cordon is bridged with.
+    let mut drained_cache: LastKnownGood<std::collections::BTreeSet<String>> = LastKnownGood::new();
+    // Whether a usable projection was observed last cycle, and who it cordoned — the two things
+    // the edge logs below need, so a lost cordon says so instead of reading as a health event.
+    // It starts true so the FIRST failed observation is an edge and gets logged.
+    let mut projection_usable = true;
     let mut prior_drained: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // The scrape state, updated at the bottom of every cycle; the listener only reads it.
     let shared_metrics: metrics::Shared = Arc::default();
@@ -570,18 +582,18 @@ pub async fn run(
         // take production traffic again while `UpdateAgent.status.cordoned` still reads true. Both
         // edges are logged, and the metrics exposition carries when it was last observed so the
         // release is alertable rather than inferred.
-        if projection_observed != projection_readable {
-            projection_readable = projection_observed;
+        if projection_observed != projection_usable {
+            projection_usable = projection_observed;
             if projection_observed {
                 eprintln!(
-                    "healthproxy: endpoint projection at {} is readable again",
+                    "healthproxy: endpoint projection at {} is usable again",
                     updated_contracts::endpoints::endpoints_url(&config.health_base)
                 );
             } else {
                 eprintln!(
-                    "healthproxy: endpoint projection at {} is unreadable; cordons hold from the last observed projection for up to {}s and are then released",
+                    "healthproxy: endpoint projection at {} is unreadable or does not decode; cordons hold from the last observed projection for up to {}s and are then released",
                     updated_contracts::endpoints::endpoints_url(&config.health_base),
-                    LastKnownGood::<Vec<u8>>::STALENESS.as_secs()
+                    LastKnownGood::<std::collections::BTreeSet<String>>::STALENESS.as_secs()
                 );
             }
         }
@@ -1721,18 +1733,13 @@ mod tests {
     #[test]
     fn the_drained_projection_is_sticky_across_blips_and_fails_open() {
         use std::collections::BTreeSet;
-        let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
-        let projection =
-            serde_json::to_vec(&updated_contracts::endpoints::EndpointProjection::new(
-                BTreeSet::from(["agent-0".to_string()]),
-            ))
-            .unwrap();
+        let mut cache: LastKnownGood<BTreeSet<String>> = LastKnownGood::new();
+        let projection = BTreeSet::from(["agent-0".to_string()]);
         let now = Instant::now();
 
         // A fresh fetch programs the cordon.
         let drained = cache
             .resolve("endpoints", Some(projection.clone()), now)
-            .map(|body| updated_contracts::endpoints::EndpointProjection::parse(&body))
             .unwrap_or_default();
         assert!(drained.contains("agent-0"));
 
@@ -1740,7 +1747,6 @@ mod tests {
         // because the CDN blinked.
         let drained = cache
             .resolve("endpoints", None, now + Duration::from_secs(1))
-            .map(|body| updated_contracts::endpoints::EndpointProjection::parse(&body))
             .unwrap_or_default();
         assert!(drained.contains("agent-0"));
 
@@ -1752,9 +1758,8 @@ mod tests {
             .resolve(
                 "endpoints",
                 None,
-                now + LastKnownGood::<Vec<u8>>::STALENESS + Duration::from_secs(1),
+                now + LastKnownGood::<BTreeSet<String>>::STALENESS + Duration::from_secs(1),
             )
-            .map(|body| updated_contracts::endpoints::EndpointProjection::parse(&body))
             .unwrap_or_default();
         assert!(drained.is_empty());
     }

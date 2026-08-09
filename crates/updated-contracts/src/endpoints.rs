@@ -65,21 +65,27 @@ impl EndpointProjection {
         }
     }
 
-    /// The drained set this document asserts, or an empty set when the document cannot be used —
-    /// the fail-open reading described at the module level. Entries that are not valid node
-    /// identities are dropped individually.
-    pub fn parse(bytes: &[u8]) -> BTreeSet<String> {
-        let Ok(projection) = serde_json::from_slice::<Self>(bytes) else {
-            return BTreeSet::new();
-        };
+    /// The drained set this document asserts, or `None` when the document cannot be USED at all —
+    /// it does not decode, or it carries a schema this build does not know. Entries that are not
+    /// valid node identities are dropped individually.
+    ///
+    /// The fail-open reading described at the module level is the CALLER's (an unusable document
+    /// means "nobody is cordoned"), deliberately not folded in here: a reader that cannot tell an
+    /// unusable document from an empty one caches the garbage as its last known good, stamps its
+    /// freshness metric as current, and logs no edge — releasing every cordon silently, which is
+    /// the one thing the fail-open design is not allowed to do.
+    pub fn parse(bytes: &[u8]) -> Option<BTreeSet<String>> {
+        let projection = serde_json::from_slice::<Self>(bytes).ok()?;
         if projection.schema != Self::SCHEMA {
-            return BTreeSet::new();
+            return None;
         }
-        projection
-            .drained
-            .into_iter()
-            .filter(|node| crate::telemetry::is_valid_node(node))
-            .collect()
+        Some(
+            projection
+                .drained
+                .into_iter()
+                .filter(|node| crate::telemetry::is_valid_node(node))
+                .collect(),
+        )
     }
 }
 
@@ -93,7 +99,7 @@ mod tests {
         let bytes = serde_json::to_vec(&projection).unwrap();
         assert_eq!(
             EndpointProjection::parse(&bytes),
-            BTreeSet::from(["agent-0".to_string()])
+            Some(BTreeSet::from(["agent-0".to_string()]))
         );
         assert_eq!(ENDPOINTS_OBJECT_KEY, "endpoints/state.json");
         assert_eq!(
@@ -102,15 +108,26 @@ mod tests {
         );
     }
 
-    /// The reader fails OPEN: an unusable document means "nobody is cordoned", because a forged or
-    /// corrupt drain-everything document must not be able to evict a healthy fleet, while the
-    /// report path already covers genuinely unhealthy nodes.
+    /// An unusable document is told apart from an empty one. The caller still fails OPEN on it —
+    /// a forged or corrupt drain-everything document must not be able to evict a healthy fleet,
+    /// while the report path already covers genuinely unhealthy nodes — but it must be able to see
+    /// that it is failing open, and never cache the garbage as a good projection.
     #[test]
-    fn an_unusable_projection_reads_as_empty() {
-        assert!(EndpointProjection::parse(b"not json").is_empty());
-        assert!(EndpointProjection::parse(b"{}").is_empty());
+    fn an_unusable_projection_is_distinguishable_from_an_empty_one() {
+        assert_eq!(EndpointProjection::parse(b"not json"), None);
+        assert_eq!(EndpointProjection::parse(b"{}"), None);
         let wrong_schema = serde_json::json!({"schema": 99, "drained": ["agent-0"]});
-        assert!(EndpointProjection::parse(&serde_json::to_vec(&wrong_schema).unwrap()).is_empty());
+        assert_eq!(
+            EndpointProjection::parse(&serde_json::to_vec(&wrong_schema).unwrap()),
+            None,
+            "a schema this build does not know is not a document it may act on"
+        );
+        let empty = serde_json::to_vec(&EndpointProjection::new(BTreeSet::new())).unwrap();
+        assert_eq!(
+            EndpointProjection::parse(&empty),
+            Some(BTreeSet::new()),
+            "…while a document that genuinely cordons nobody is a usable observation"
+        );
     }
 
     /// One malformed entry is dropped alone; the rest of the document still applies. A name the
@@ -122,7 +139,7 @@ mod tests {
             serde_json::json!({"schema": 1, "drained": ["agent-0", "../escape", "web.prod"]});
         assert_eq!(
             EndpointProjection::parse(&serde_json::to_vec(&mixed).unwrap()),
-            BTreeSet::from(["agent-0".to_string()])
+            Some(BTreeSet::from(["agent-0".to_string()]))
         );
     }
 }

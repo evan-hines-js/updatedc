@@ -21,8 +21,9 @@ pub struct ProxyMetrics {
     pub reports_stale_total: u64,
     /// When the last reconcile finished, seconds since the Unix epoch. Zero until the first.
     pub reconcile_timestamp_seconds: u64,
-    /// When the control plane's endpoint projection was last OBSERVED, seconds since the Unix
-    /// epoch. Zero until the first. The projection fails open — once it falls further behind than
+    /// When a USABLE endpoint projection from the control plane was last observed, seconds since
+    /// the Unix epoch — a document that arrived but does not decode is not an observation, or this
+    /// series would read "current" while every cordon was being released. Zero until the first. The projection fails open — once it falls further behind than
     /// `LastKnownGood::STALENESS`, every cordon has been released and health alone governs — so
     /// this is what makes a silently lost cordon alertable, the mirror of what
     /// `reports_stale_total` does for a silently aged-out report.

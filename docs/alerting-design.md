@@ -63,5 +63,5 @@ duration fields named above.
 
 Condition derivation is planner-pure: unit tests per condition, both directions. The webhook
 client is tested against a local listener for transition-only firing, deadline, and drop
-semantics. The e2e chaos scenario asserts `RolloutStuck` rises on an induced wedge and clears
-after the fix generation.
+semantics. (Not yet implemented: an e2e chaos scenario asserting `RolloutStuck` rises on an
+induced wedge and clears after the fix generation.)

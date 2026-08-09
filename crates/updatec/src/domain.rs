@@ -91,7 +91,7 @@ pub struct ReconcilePlan {
 pub fn plan_reconcile(
     desired: DesiredState<'_>,
     observed: ObservedState<'_>,
-    attempts: &mut crate::rollout::AttemptLog,
+    attempts: &mut crate::rollout::ObservationLog,
 ) -> Result<ReconcilePlan, PlanError> {
     let quarantined_names: BTreeSet<String> = desired.quarantined.keys().cloned().collect();
     crate::validate_dependency_graph(desired.groups, &quarantined_names)?;
@@ -713,7 +713,7 @@ mod tests {
                 assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
     }
 
@@ -843,7 +843,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -940,7 +940,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .expect("removing the label is plannable");
         assert_eq!(planned.publication.node_groups["n1"], crate::DEFAULT_GROUP);
@@ -1098,7 +1098,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -1200,7 +1200,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -1275,7 +1275,7 @@ mod tests {
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .expect("a held node is plannable");
         assert_eq!(
@@ -1310,7 +1310,7 @@ mod tests {
                 assignments: &gone,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .expect_err("a hold whose body is gone must never become a move");
         assert!(
@@ -1351,7 +1351,7 @@ mod tests {
                 assignments: &BTreeMap::new(),
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .unwrap();
         let old_identity = crate::deployment_identity(&old_default).unwrap();
@@ -1386,7 +1386,7 @@ mod tests {
                 assignments: &first.assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .expect("a held default node with a recorded lineage is plannable");
         assert_eq!(
@@ -1415,7 +1415,7 @@ mod tests {
                 assignments: &second.assignments,
                 now: chrono::Utc::now(),
             },
-            &mut crate::rollout::AttemptLog::default(),
+            &mut crate::rollout::ObservationLog::default(),
         )
         .unwrap();
         let new_default =
@@ -1466,7 +1466,7 @@ mod tests {
                     assignments: previous.map_or(&empty_map, |plan| &plan.assignments),
                     now: chrono::Utc::now(),
                 },
-                &mut crate::rollout::AttemptLog::default(),
+                &mut crate::rollout::ObservationLog::default(),
             )
             .unwrap()
         };
