@@ -800,7 +800,7 @@ pub struct ReconcileHooks {
     /// each node has been seen attempting, and which nodes have ever reported at all. Losing it (a
     /// restart, a leader change) only delays a halt until the still-contained nodes' report
     /// sequences re-prove it, and re-derives "has reported" from the next readable store listing.
-    pub observation_log: crate::rollout::ObservationLog,
+    pub observation_log: crate::evidence::ObservationLog,
     /// Failed passes in a row WITHIN one leadership epoch. Reset by a successful publish, and by
     /// the loop whenever this replica stops being the leader — a streak that spanned the gap let
     /// one ordinary transient after a handover reach the `ReconcileFailing` threshold on its own.
@@ -812,7 +812,7 @@ impl ReconcileHooks {
         Self {
             alerts,
             progress: crate::alerts::ProgressTracker::new(),
-            observation_log: crate::rollout::ObservationLog::new(),
+            observation_log: crate::evidence::ObservationLog::new(),
             consecutive_failures: 0,
         }
     }
@@ -820,6 +820,7 @@ impl ReconcileHooks {
 
 /// What a successful reconcile pass hands back: the published digest, and the fleet snapshot the
 /// metrics listener projects at scrape time.
+#[derive(Debug)]
 pub struct ReconcileOutcome {
     pub digest: String,
     /// `None` when the pass had no fleet to project (repository finalization) — the caller keeps
@@ -4062,6 +4063,537 @@ mod lease_tests {
             inverted * 2 < flat,
             "storing one digest per deployment must be far smaller than one per node \
              ({inverted} vs {flat} bytes)"
+        );
+    }
+}
+
+/// The wiring harness `reconcile_once` never had: the full pass run for real against an
+/// in-process S3 endpoint (the `spec.s3.endpoint` seam that already exists for MinIO — no
+/// test-only code path in production) and the same mock apiserver the gateway tests use. Every
+/// ordering defect of the adversarial review rounds — a projection held hostage by the signing
+/// pipeline, cordons collected after the quarantine retain, conditions clobbered by a wholesale
+/// patch — was a WIRING bug invisible to the pure planner tests; this module is where that class
+/// gets locked instead of re-reviewed.
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::http::{Method, StatusCode, Uri};
+    use std::collections::BTreeSet;
+    use std::sync::Mutex as StdMutex;
+
+    /// One in-process S3-compatible store: path-style `/{bucket}/{key}`, GET/PUT/DELETE, the
+    /// headers `object_store`'s client needs, nothing else.
+    async fn s3_endpoint(
+        objects: Arc<StdMutex<BTreeMap<String, Vec<u8>>>>,
+    ) -> std::net::SocketAddr {
+        async fn handle(
+            axum::extract::State(objects): axum::extract::State<
+                Arc<StdMutex<BTreeMap<String, Vec<u8>>>>,
+            >,
+            method: Method,
+            uri: Uri,
+            body: Bytes,
+        ) -> axum::response::Response {
+            let key = uri.path().trim_start_matches('/');
+            let key = key.strip_prefix("updates/").unwrap_or(key).to_string();
+            let respond = |status: StatusCode, body: Vec<u8>| {
+                axum::response::Response::builder()
+                    .status(status)
+                    .header("etag", "\"wiring\"")
+                    .header("last-modified", "Sat, 08 Aug 2026 00:00:00 GMT")
+                    .body(axum::body::Body::from(body))
+                    .expect("response")
+            };
+            match method {
+                Method::GET => match objects.lock().expect("s3").get(&key) {
+                    Some(bytes) => respond(StatusCode::OK, bytes.clone()),
+                    None => respond(StatusCode::NOT_FOUND, Vec::new()),
+                },
+                Method::PUT => {
+                    objects.lock().expect("s3").insert(key, body.to_vec());
+                    respond(StatusCode::OK, Vec::new())
+                }
+                Method::DELETE => {
+                    objects.lock().expect("s3").remove(&key);
+                    respond(StatusCode::NO_CONTENT, Vec::new())
+                }
+                _ => respond(StatusCode::METHOD_NOT_ALLOWED, Vec::new()),
+            }
+        }
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(handle))
+            .with_state(objects);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// The cluster the mock apiserver serves: fixtures in, status patches out.
+    #[derive(Default)]
+    struct Cluster {
+        repository: Option<UpdateRepository>,
+        groups: Vec<UpdateGroup>,
+        agents: Vec<UpdateAgent>,
+        secrets: BTreeMap<String, Secret>,
+        configmaps: BTreeMap<String, ConfigMap>,
+        /// Every `PATCH .../status`, as (request path, body) in arrival order.
+        status_patches: Vec<(String, serde_json::Value)>,
+    }
+
+    fn kube_list(items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "metadata": { "resourceVersion": "1" }, "items": items })
+    }
+
+    fn apiserver_for(cluster: Arc<StdMutex<Cluster>>, identity: &str) -> Client {
+        let identity = identity.to_string();
+        crate::tests::apiserver(move |method, path, body| {
+            let mut cluster = cluster.lock().expect("cluster");
+            let not_found = || {
+                (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "metadata": {},
+                        "status": "Failure", "reason": "NotFound", "code": 404
+                    }),
+                )
+            };
+            if method == Method::PATCH && path.ends_with("/status") {
+                cluster.status_patches.push((
+                    path.to_string(),
+                    serde_json::from_slice(&body).expect("status patch body"),
+                ));
+                // kube deserializes the response as the patched resource, so answer with the
+                // fixture the path names.
+                let mut parts = path.trim_end_matches("/status").rsplit('/');
+                let name = parts.next().unwrap_or_default().to_string();
+                let plural = parts.next().unwrap_or_default();
+                let patched = match plural {
+                    "updaterepositories" => {
+                        serde_json::to_value(cluster.repository.as_ref().expect("repo")).unwrap()
+                    }
+                    "updategroups" => serde_json::to_value(
+                        cluster
+                            .groups
+                            .iter()
+                            .find(|group| group.metadata.name.as_deref() == Some(&name))
+                            .expect("patched group exists"),
+                    )
+                    .unwrap(),
+                    "updateagents" => serde_json::to_value(
+                        cluster
+                            .agents
+                            .iter()
+                            .find(|agent| agent.metadata.name.as_deref() == Some(&name))
+                            .expect("patched agent exists"),
+                    )
+                    .unwrap(),
+                    other => panic!("status patch for unmodeled plural {other}"),
+                };
+                return (StatusCode::OK, patched);
+            }
+            let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+            match (method.clone(), segments.as_slice()) {
+                (Method::GET, [.., "updaterepositories", _name]) => (
+                    StatusCode::OK,
+                    serde_json::to_value(cluster.repository.as_ref().expect("repo fixture"))
+                        .unwrap(),
+                ),
+                // The finalizer merge patch: acknowledged, not modeled.
+                (Method::PATCH, [.., "updaterepositories", _name]) => (
+                    StatusCode::OK,
+                    serde_json::to_value(cluster.repository.as_ref().expect("repo fixture"))
+                        .unwrap(),
+                ),
+                (Method::GET, [.., "updategroups"]) => (
+                    StatusCode::OK,
+                    kube_list(
+                        cluster
+                            .groups
+                            .iter()
+                            .map(|group| serde_json::to_value(group).unwrap())
+                            .collect(),
+                    ),
+                ),
+                (Method::GET, [.., "updateagents"]) => (
+                    StatusCode::OK,
+                    kube_list(
+                        cluster
+                            .agents
+                            .iter()
+                            .map(|agent| serde_json::to_value(agent).unwrap())
+                            .collect(),
+                    ),
+                ),
+                (Method::GET, [.., "updategroupsets"])
+                | (Method::GET, [.., "updatesubscriptions"]) => {
+                    (StatusCode::OK, kube_list(Vec::new()))
+                }
+                (Method::GET, [.., "leases", "updatec-publisher"]) => {
+                    let lease = Lease {
+                        metadata: kube::api::ObjectMeta {
+                            name: Some("updatec-publisher".into()),
+                            namespace: Some("default".into()),
+                            ..Default::default()
+                        },
+                        spec: Some(new_lease_spec(&identity, chrono::Utc::now(), 0)),
+                    };
+                    (StatusCode::OK, serde_json::to_value(&lease).unwrap())
+                }
+                (Method::GET, [.., "secrets", name]) => match cluster.secrets.get(*name) {
+                    Some(secret) => (StatusCode::OK, serde_json::to_value(secret).unwrap()),
+                    None => not_found(),
+                },
+                (Method::GET, [.., "configmaps", name]) => match cluster.configmaps.get(*name) {
+                    Some(map) => (StatusCode::OK, serde_json::to_value(map).unwrap()),
+                    None => not_found(),
+                },
+                (Method::POST, [.., "configmaps"]) => {
+                    let mut map: ConfigMap = serde_json::from_slice(&body).expect("configmap");
+                    map.metadata.resource_version = Some("1".into());
+                    let name = map.metadata.name.clone().expect("configmap name");
+                    let value = serde_json::to_value(&map).unwrap();
+                    cluster.configmaps.insert(name, map);
+                    (StatusCode::CREATED, value)
+                }
+                (Method::PUT, [.., "configmaps", name]) => {
+                    let mut map: ConfigMap = serde_json::from_slice(&body).expect("configmap");
+                    map.metadata.resource_version = Some("2".into());
+                    let value = serde_json::to_value(&map).unwrap();
+                    cluster.configmaps.insert((*name).to_string(), map);
+                    (StatusCode::OK, value)
+                }
+                _ => {
+                    eprintln!("apiserver mock: unhandled {method} {path}");
+                    not_found()
+                }
+            }
+        })
+    }
+
+    /// A signing Secret holding REAL freshly generated TUF keys, so the pass signs and publishes
+    /// exactly as production does.
+    async fn signing_secret(dir: &Path) -> Secret {
+        updated_tuf::repo::generate_keys(dir).await.expect("keys");
+        let mut data = BTreeMap::new();
+        for name in ["root.pk8", "targets.pk8", "snapshot.pk8", "timestamp.pk8"] {
+            data.insert(
+                name.to_string(),
+                ByteString(std::fs::read(dir.join(name)).expect(name)),
+            );
+        }
+        Secret {
+            metadata: kube::api::ObjectMeta {
+                name: Some("tuf-signing-keys".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    fn s3_credentials() -> Secret {
+        Secret {
+            metadata: kube::api::ObjectMeta {
+                name: Some("s3-creds".into()),
+                namespace: Some("default".into()),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([
+                (
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    ByteString(b"wiring".to_vec()),
+                ),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ByteString(b"wiring-secret".to_vec()),
+                ),
+            ])),
+            ..Default::default()
+        }
+    }
+
+    fn agent(name: &str, kind: crate::AgentIdentityKind, cordon: bool) -> UpdateAgent {
+        UpdateAgent::new(
+            name,
+            crate::UpdateAgentSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: "default".into(),
+                },
+                identity: crate::AgentIdentity {
+                    kind,
+                    // Enrolled with no registration digest is a MALFORMED identity: the shape
+                    // `reconcile_once` quarantines. Reserved with none is the ordinary fixture.
+                    registration_sha256: None,
+                    public_key: None,
+                },
+                labels: BTreeMap::from([("role".to_string(), "edge".to_string())]),
+                hold: false,
+                cordon,
+            },
+        )
+    }
+
+    /// The full fixture: repository pointed at the in-process S3, one healthy group over one
+    /// agent, plus whatever `mutate` adds. Returns everything a test asserts against.
+    async fn fleet(
+        tmp: &Path,
+        endpoint: std::net::SocketAddr,
+        mutate: impl FnOnce(&mut Cluster),
+    ) -> Arc<StdMutex<Cluster>> {
+        let mut spec = crate::tests::repository();
+        spec.s3.prefix = "routing".into();
+        spec.s3.credentials_secret_ref = Some(crate::LocalSecretReference {
+            name: "s3-creds".into(),
+        });
+        spec.s3.endpoint = Some(format!("http://{endpoint}"));
+        let mut repository = UpdateRepository::new("default", spec);
+        repository.metadata.namespace = Some("default".into());
+        let mut group = UpdateGroup::new(
+            "edge",
+            crate::UpdateGroupSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: "default".into(),
+                },
+                selector: crate::LabelSelector {
+                    match_labels: BTreeMap::from([("role".to_string(), "edge".to_string())]),
+                },
+                depends_on: Vec::new(),
+                inputs: BTreeMap::new(),
+                deployment: crate::tests::deployment_spec("edge-v1"),
+                max_unavailable: None,
+                emergency_correction: false,
+            },
+        );
+        group.metadata.namespace = Some("default".into());
+        let mut cluster = Cluster {
+            repository: Some(repository),
+            groups: vec![group],
+            agents: vec![agent("n1", crate::AgentIdentityKind::Reserved, false)],
+            ..Default::default()
+        };
+        cluster
+            .secrets
+            .insert("tuf-signing-keys".into(), signing_secret(tmp).await);
+        cluster.secrets.insert("s3-creds".into(), s3_credentials());
+        mutate(&mut cluster);
+        Arc::new(StdMutex::new(cluster))
+    }
+
+    fn drained_in(objects: &StdMutex<BTreeMap<String, Vec<u8>>>) -> BTreeSet<String> {
+        objects
+            .lock()
+            .expect("s3")
+            .get("routing/endpoints/state.json")
+            .map(|bytes| {
+                updated_contracts::endpoints::EndpointProjection::parse(bytes)
+                    .expect("published projection is usable")
+            })
+            .unwrap_or_default()
+    }
+
+    /// The happy pass, end to end: a generation is signed and uploaded (the store serves
+    /// `timestamp.json`), the durable rollout state is created, and the statuses carry the alert
+    /// conditions beside Ready — the whole wiring the planner tests cannot see.
+    #[tokio::test]
+    async fn a_full_pass_signs_publishes_and_projects_statuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |_| {}).await;
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+
+        let outcome = reconcile_once(
+            client,
+            "default",
+            "default",
+            &tmp.path().join("state"),
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("the pass succeeds");
+        assert!(outcome.snapshot.is_some());
+
+        let objects_now = objects.lock().expect("s3");
+        assert!(
+            objects_now.contains_key("routing/metadata/timestamp.json"),
+            "the generation was uploaded: {:?}",
+            objects_now.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            objects_now.keys().any(|key| key.contains("agents/n1.json")),
+            "the agent's assignment target was published (TUF names targets by hash): {:?}",
+            objects_now.keys().collect::<Vec<_>>()
+        );
+        drop(objects_now);
+
+        let cluster = cluster.lock().expect("cluster");
+        assert!(
+            cluster.configmaps.contains_key("updatec-admitted-default"),
+            "the durable rollout state was recorded"
+        );
+        let group_patch = cluster
+            .status_patches
+            .iter()
+            .find(|(path, _)| path.ends_with("/updategroups/edge/status"))
+            .expect("the group's status was written");
+        let conditions: Vec<&str> = group_patch.1["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .map(|condition| condition["type"].as_str().unwrap())
+            .collect();
+        for expected in ["Ready", "RolloutStuck", "ReportsStale", "DeploymentHalted"] {
+            assert!(
+                conditions.contains(&expected),
+                "group conditions missing {expected}: {conditions:?}"
+            );
+        }
+        assert!(cluster
+            .status_patches
+            .iter()
+            .any(|(path, _)| path.ends_with("/updateagents/n1/status")));
+    }
+
+    /// Round 4's ordering bug, locked: a QUARANTINED agent keeps its published drain. The cordon
+    /// set must be collected before the quarantine retain, or benching a machine and then breaking
+    /// its identity returns it to load-balancer rotation while its status still says cordoned.
+    #[tokio::test]
+    async fn a_quarantined_agents_cordon_still_reaches_the_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            // Enrolled with no registration digest: a malformed identity, quarantined on sight —
+            // and deliberately cordoned, the exact combination that used to lose the drain.
+            cluster
+                .agents
+                .push(agent("n2", crate::AgentIdentityKind::Enrolled, true));
+        })
+        .await;
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+        reconcile_once(
+            client,
+            "default",
+            "default",
+            &tmp.path().join("state"),
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("the pass succeeds around the quarantined agent");
+        assert!(
+            drained_in(&objects).contains("n2"),
+            "the quarantined agent's drain must stay published"
+        );
+    }
+
+    /// Rounds 2 and 4's decoupling, locked from the wiring side: the cordon channel publishes even
+    /// when the signing pipeline cannot — a generation faulted by a broken signing Secret must not
+    /// hold a maintenance drain hostage.
+    #[tokio::test]
+    async fn a_faulted_generation_still_publishes_the_cordon_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            cluster.agents[0].spec.cordon = true;
+            // The signing Secret loses a key: materialization, and with it the whole signing
+            // pipeline, fails after the projection is published.
+            let signing = cluster.secrets.get_mut("tuf-signing-keys").expect("keys");
+            signing.data.as_mut().expect("data").remove("timestamp.pk8");
+        })
+        .await;
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+        let error = reconcile_once(
+            client,
+            "default",
+            "default",
+            &tmp.path().join("state"),
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect_err("the broken signing Secret faults the pass");
+        assert!(error.to_string().contains("timestamp.pk8"), "{error}");
+        assert!(
+            drained_in(&objects).contains("n1"),
+            "the cordon published before the pipeline faulted"
+        );
+        assert!(
+            !objects
+                .lock()
+                .expect("s3")
+                .contains_key("routing/metadata/timestamp.json"),
+            "and nothing of the faulted generation reached the store"
+        );
+    }
+
+    /// Round 2's wholesale-replacement bug, locked at the wiring: quarantining a group must carry
+    /// every condition it does not speak for — deleting the alert conditions lost their transition
+    /// times and re-fired their webhooks when the group healed.
+    #[tokio::test]
+    async fn quarantining_a_group_carries_its_foreign_conditions_forward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            let mut broken = cluster.groups[0].clone();
+            broken.metadata.name = Some("broken".into());
+            broken.spec.selector.match_labels.clear(); // EmptySelector: quarantined on sight.
+            broken.status = Some(crate::UpdateGroupStatus {
+                observed_generation: Some(1),
+                matched_agents: None,
+                published_digest: None,
+                held_agents: None,
+                conditions: vec![ResourceCondition {
+                    condition_type: "RolloutStuck".into(),
+                    status: "True".into(),
+                    reason: "NoNewSettledNode".into(),
+                    message: "carried".into(),
+                    observed_generation: Some(1),
+                    last_transition_time: "2026-08-08T00:00:00Z".into(),
+                }],
+            });
+            cluster.groups.push(broken);
+        })
+        .await;
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+        reconcile_once(
+            client,
+            "default",
+            "default",
+            &tmp.path().join("state"),
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("one broken group never faults the repository");
+        let cluster = cluster.lock().expect("cluster");
+        let quarantine_patch = cluster
+            .status_patches
+            .iter()
+            .find(|(path, _)| path.ends_with("/updategroups/broken/status"))
+            .expect("the quarantined group's status was written");
+        let conditions = quarantine_patch.1["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|condition| {
+                condition["type"] == "RolloutStuck" && condition["message"] == "carried"
+            }),
+            "the foreign condition must survive the quarantine write: {conditions:?}"
         );
     }
 }

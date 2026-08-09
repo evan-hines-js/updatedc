@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::evidence::ObservationLog;
 use crate::{DesiredDeployment, ResolvedGroup, UpdateGroupSet};
 use serde::{Deserialize, Serialize};
 use updated_contracts::telemetry::{Envelope, NodeReport};
@@ -37,206 +38,6 @@ pub struct AdmittedDeployment {
     pub current: DesiredDeployment,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previous: Vec<DesiredDeployment>,
-}
-
-/// Cross-pass observation memory about the FLEET's nodes: which assignments each node has been
-/// SEEN attempting (what it was running before the attempt began), and which nodes have ever
-/// uploaded a report at all.
-///
-/// The evidence a rollback leaves behind is a report SEQUENCE — an update transaction in flight on
-/// the new assignment, then settled again on the pre-attempt archive — and no single snapshot can
-/// carry it: a fleet that rolled back FROM a bad deployment and a fleet the operator retargeted TO
-/// the predecessor look identical in one pass, and deriving the verdict from one snapshot halted
-/// the documented recovery path itself. This log is observational memory only, never a stored
-/// verdict: the halt remains recomputed from the reports each pass, and losing the log (a leader
-/// change, a restart) merely re-derives the evidence from the fresh attempt sequences the
-/// still-contained nodes keep producing.
-///
-/// "Has ever reported" lives here for the same reason and not one of its own: it is a fact about
-/// the past that a single pass's store read cannot establish. Re-deriving it from the reports
-/// readable RIGHT NOW made an object store that stopped answering drive every group's `observable`
-/// count to zero, which clears `ReportsStale` — the alert resolves itself exactly when the whole
-/// fleet goes dark. Remembered, a store outage leaves the count where it was while `fresh` falls,
-/// so the condition fires.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ObservationLog {
-    /// node → target assignment identity → the movement record ([`AttemptSeed`]) opened when the
-    /// node was first seen naming that assignment after being settled on a different one.
-    attempts: HashMap<String, HashMap<String, AttemptSeed>>,
-    /// node → the (assignment, archive) of its most recent settled healthy report.
-    settled: HashMap<String, (String, String)>,
-    /// Nodes whose report envelope has been seen in the store at least once, at any age and
-    /// whether or not it verified ([`ObservationLog::has_reported`]).
-    reported: std::collections::HashSet<String>,
-}
-
-/// One observed movement of a node toward a new assignment: where it came from, and whether the
-/// transaction itself was ever seen in flight.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AttemptSeed {
-    /// The assignment identity the node was settled on before the movement.
-    from: String,
-    /// The archive it was settled on before the movement — what a rollback returns it to.
-    archive: String,
-    /// Whether a report with an update TRANSACTION in flight on the target was observed
-    /// ([`NodeReport::updating`]): the transaction genuinely ran.
-    ///
-    /// Two shapes are rejected by this flag, and both mint a fleet-wide halt without it. A node
-    /// that merely FETCHED the assignment reports settled on it while running the old archive —
-    /// the supervisor stamps the assignment it resolved even on a tick that installed nothing.
-    /// And a node whose install never started still fails an ordinary readiness probe now and
-    /// then; `healthy == false` alone cannot tell that blip from a transaction, which is why the
-    /// node reports the two separately.
-    attempted: bool,
-}
-
-impl ObservationLog {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Fold one node's fresh, verified report into the log.
-    ///
-    /// A movement record opens at the TRANSITION of the reported assignment — in either report
-    /// shape. The transaction's own tick is the definitive one (it marks the record `attempted`),
-    /// but a settled report naming a NEW assignment must open the record too: the supervisor
-    /// reports the assignment it RESOLVED, so a tick that fetched the new assignment but could not
-    /// yet install (a transient archive-download failure) reports settled on it while still running
-    /// the old archive — and keying the seed off that report alone erased the movement's origin, so
-    /// the later genuine rollback produced no evidence. A report on the assignment the node is
-    /// already settled on — an ordinary health blip — opens nothing.
-    ///
-    /// A record is CLOSED when the node settles somewhere else, because the movement it describes
-    /// is over. Records only ever being dropped by [`prune`](Self::prune) — which keeps every
-    /// identity some group still names — left a node that had moved toward an identity, committed,
-    /// and later moved away carrying that first movement's state for ever: the next movement
-    /// toward the same identity reused the stale record, so a single merely-fetched tick inherited
-    /// an `attempted` flag and a pre-movement archive from a transaction that had SUCCEEDED, and
-    /// halted a healthy deployment fleet-wide. The same staleness silences genuine evidence in the
-    /// other direction, by remembering an archive the node has long left.
-    fn observe(&mut self, node: &str, report: &NodeReport) {
-        if !updated_contracts::is_sha256_hex(&report.assignment_sha256) {
-            return;
-        }
-        match self.settled.get(node) {
-            Some((from, archive)) if from != &report.assignment_sha256 => {
-                let seed = AttemptSeed {
-                    from: from.clone(),
-                    archive: archive.clone(),
-                    attempted: report.updating,
-                };
-                match self
-                    .attempts
-                    .entry(node.to_string())
-                    .or_default()
-                    .entry(report.assignment_sha256.clone())
-                {
-                    // A record already open for this target keeps its origin (the earliest settled
-                    // state of this movement) and only upgrades to `attempted` — the merely-fetched
-                    // tick must not downgrade a transaction already seen in flight.
-                    std::collections::hash_map::Entry::Occupied(mut open) => {
-                        open.get_mut().attempted |= report.updating;
-                    }
-                    std::collections::hash_map::Entry::Vacant(vacant) => {
-                        vacant.insert(seed);
-                    }
-                }
-            }
-            // NOT a transition — the merely-fetched tick already moved `settled` onto the target —
-            // but the transaction arriving now still proves the movement ran: upgrade the record
-            // opened at the transition. A readiness blip with NO transaction in flight upgrades
-            // nothing and opens nothing.
-            Some(_) if report.updating => {
-                if let Some(open) = self
-                    .attempts
-                    .get_mut(node)
-                    .and_then(|attempts| attempts.get_mut(&report.assignment_sha256))
-                {
-                    open.attempted = true;
-                }
-            }
-            // A node never seen settled proves nothing about where a movement started, so no
-            // record is opened for it — the conservative direction.
-            _ => {}
-        }
-        if report.healthy && updated_contracts::is_sha256_hex(&report.archive_sha256) {
-            self.settled.insert(
-                node.to_string(),
-                (
-                    report.assignment_sha256.clone(),
-                    report.archive_sha256.clone(),
-                ),
-            );
-            // Settling is what closes every movement this node is no longer performing — including
-            // the one it just completed toward some earlier identity. The record for the identity
-            // it settled ON is kept: that is the movement still in progress or just finished, and
-            // the rollback verdict is read from exactly it.
-            if let Some(attempts) = self.attempts.get_mut(node) {
-                attempts.retain(|identity, _| identity == &report.assignment_sha256);
-                if attempts.is_empty() {
-                    self.attempts.remove(node);
-                }
-            }
-        }
-    }
-
-    /// Remember every node whose report envelope was readable in the store this pass, at any age.
-    ///
-    /// Called with the raw store read rather than the verified reports: the question this answers
-    /// is "would this node's silence be news", which a node settles the first time it uploads
-    /// anything at all.
-    fn note_reported<'a>(&mut self, nodes: impl Iterator<Item = &'a String>) {
-        for node in nodes {
-            if !self.reported.contains(node) {
-                self.reported.insert(node.clone());
-            }
-        }
-    }
-
-    /// Whether this node has EVER been seen with a report envelope in the store — at any age, and
-    /// whether or not it verified. Observability accounting only, never a trust decision (that
-    /// stays [`Observations::report`]): it exists so "has not reported yet" can be told apart from
-    /// "stopped reporting". A node's key is pinned at enrollment, generations before it can fetch
-    /// an assignment and upload anything, so counting a keyed-but-silent node as observable made
-    /// every mass enrollment and every scale-out past `maxUnavailable` raise `ReportsStale` and
-    /// then clear it — the alert-on-a-healthy-rollout the condition is tuned to avoid.
-    fn has_reported(&self, node: &str) -> bool {
-        self.reported.contains(node)
-    }
-
-    /// The movement record proving `node`, now settled on `identity` running `archive`, ROLLED
-    /// BACK: its transaction toward exactly this assignment was seen in flight, and it is back on
-    /// the archive it was settled on before the movement. `None` when nothing is proven: the node
-    /// committed successfully (a different archive), was never seen moving, or only ever fetched
-    /// the assignment without a transaction running.
-    fn rolled_back(&self, node: &str, identity: &str, archive: &str) -> Option<&AttemptSeed> {
-        if !updated_contracts::is_sha256_hex(archive) {
-            return None;
-        }
-        self.attempts
-            .get(node)
-            .and_then(|attempts| attempts.get(identity))
-            .filter(|seed| seed.attempted && seed.archive == archive)
-    }
-
-    /// Drop memory about nodes that left the fleet, and attempt records for assignment identities
-    /// no generation still names — so the log stays bounded by the fleet and its live deployments
-    /// rather than growing with history.
-    fn prune(
-        &mut self,
-        nodes: impl Fn(&str) -> bool,
-        live_identities: &std::collections::HashSet<String>,
-    ) {
-        self.settled.retain(|node, _| nodes(node));
-        self.reported.retain(|node| nodes(node));
-        self.attempts.retain(|node, attempts| {
-            if !nodes(node) {
-                return false;
-            }
-            attempts.retain(|identity, _| live_identities.contains(identity));
-            !attempts.is_empty()
-        });
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -871,51 +672,56 @@ pub(crate) fn plan_rollouts(
     // "the body this group is staging is proven bad", so it must never widen past the current —
     // a group whose current is healthy would otherwise stop moving nodes onto it. Computed after
     // admission so it reflects what will be published.
-    let halted_currents: BTreeMap<String, crate::HaltedDeployment> = desired
-        .keys()
-        .filter_map(|name| {
-            let state = admitted.get(name)?;
-            let identity = crate::deployment_identity(&state.current)?;
-            let (deployment, evidence) = halts.get(&identity)?;
-            Some((
-                name.clone(),
-                crate::HaltedDeployment {
-                    deployment: deployment.clone(),
-                    evidence: *evidence as u32,
-                },
-            ))
-        })
-        .collect();
-    // Groups a halted identity BINDS, for the status projection: the routing gate above plus the
-    // groups whose DESIRED body is halted, which `admit_pending` refuses to admit. That refusal
-    // freezes the group as surely as the routing gate does, and a set-less group has no set status
-    // to say so — projecting the current alone left exactly that group frozen forever under a
-    // `Held` reason naming causes ("rollout capacity, a rollout window, its inputs, or a
-    // prerequisite group") that are all false. Same identities `set_halts` projects from, so a set
-    // member and a set-less group learn of a halt on the same terms.
-    let halted_groups: BTreeMap<String, crate::HaltedDeployment> = desired
-        .keys()
-        .filter_map(|name| {
-            let (deployment, evidence) = named_identities(name, &desired, admitted)
-                .iter()
-                .find_map(|identity| halts.get(identity))?;
-            Some((
-                name.clone(),
-                crate::HaltedDeployment {
-                    deployment: deployment.clone(),
-                    evidence: *evidence as u32,
-                },
-            ))
-        })
-        .collect();
-    // Each set's projection of the fleet-wide verdict: the halted identities its members name.
-    // The verdict itself is global; the projection is what the set's own status reports. Skipped
-    // wholesale in the steady state — `halts` is empty then, so every projection is empty, and
-    // `named_identities` hashes a deployment body per member to prove it.
-    let set_halts: Vec<Vec<crate::HaltedDeployment>> = if halts.is_empty() {
-        vec![Vec::new(); plans.len()]
+    // In the steady state — no evidence anywhere — every projection below is empty by
+    // construction, so none of the per-group body hashing runs at all: one emptiness check
+    // instead of a `named_identities` walk per group per second.
+    let (halted_currents, halted_groups, set_halts) = if halts.is_empty() {
+        (
+            BTreeMap::new(),
+            BTreeMap::new(),
+            vec![Vec::new(); plans.len()],
+        )
     } else {
-        plans
+        let halted_currents: BTreeMap<String, crate::HaltedDeployment> = desired
+            .keys()
+            .filter_map(|name| {
+                let state = admitted.get(name)?;
+                let identity = crate::deployment_identity(&state.current)?;
+                let (deployment, evidence) = halts.get(&identity)?;
+                Some((
+                    name.clone(),
+                    crate::HaltedDeployment {
+                        deployment: deployment.clone(),
+                        evidence: *evidence as u32,
+                    },
+                ))
+            })
+            .collect();
+        // Groups a halted identity BINDS, for the status projection: the routing gate above plus the
+        // groups whose DESIRED body is halted, which `admit_pending` refuses to admit. That refusal
+        // freezes the group as surely as the routing gate does, and a set-less group has no set status
+        // to say so — projecting the current alone left exactly that group frozen forever under a
+        // `Held` reason naming causes ("rollout capacity, a rollout window, its inputs, or a
+        // prerequisite group") that are all false. Same identities `set_halts` projects from, so a set
+        // member and a set-less group learn of a halt on the same terms.
+        let halted_groups: BTreeMap<String, crate::HaltedDeployment> = desired
+            .keys()
+            .filter_map(|name| {
+                let (deployment, evidence) = named_identities(name, &desired, admitted)
+                    .iter()
+                    .find_map(|identity| halts.get(identity))?;
+                Some((
+                    name.clone(),
+                    crate::HaltedDeployment {
+                        deployment: deployment.clone(),
+                        evidence: *evidence as u32,
+                    },
+                ))
+            })
+            .collect();
+        // Each set's projection of the fleet-wide verdict: the halted identities its members name.
+        // The verdict itself is global; the projection is what the set's own status reports.
+        let set_halts: Vec<Vec<crate::HaltedDeployment>> = plans
             .iter()
             .map(|plan| {
                 let named: BTreeSet<String> = plan
@@ -932,7 +738,8 @@ pub(crate) fn plan_rollouts(
                     })
                     .collect()
             })
-            .collect()
+            .collect();
+        (halted_currents, halted_groups, set_halts)
     };
     // Computed once, after admission, and then only projected: the set status lists below and the
     // per-group Kubernetes status the runtime writes are the same verdicts, not two derivations.

@@ -81,80 +81,88 @@ pub fn render(state: &MetricsState) -> String {
     let Some(snapshot) = &state.last else {
         return out;
     };
-    let mut line = |text: String| {
-        let _ = writeln!(out, "{text}");
-    };
-    line("# HELP updatec_reconcile_timestamp_seconds When the last successful reconcile finished (unix seconds).".into());
-    line("# TYPE updatec_reconcile_timestamp_seconds gauge".into());
-    line(format!(
+    let _ = writeln!(out, "# HELP updatec_reconcile_timestamp_seconds When the last successful reconcile finished (unix seconds).");
+    let _ = writeln!(out, "# TYPE updatec_reconcile_timestamp_seconds gauge");
+    let _ = writeln!(
+        out,
         "updatec_reconcile_timestamp_seconds {}",
         snapshot.reconcile_timestamp_seconds
-    ));
-    line(
-        "# HELP updatec_reconcile_duration_seconds How long the last successful reconcile took."
-            .into(),
     );
-    line("# TYPE updatec_reconcile_duration_seconds gauge".into());
-    line(format!(
+    let _ = writeln!(
+        out,
+        "# HELP updatec_reconcile_duration_seconds How long the last successful reconcile took."
+    );
+    let _ = writeln!(out, "# TYPE updatec_reconcile_duration_seconds gauge");
+    let _ = writeln!(
+        out,
         "updatec_reconcile_duration_seconds {:.6}",
         snapshot.reconcile_duration_seconds
-    ));
+    );
     if let Some(generation) = snapshot.generation {
-        line("# HELP updatec_generation The published generation, per deployment identity.".into());
-        line("# TYPE updatec_generation gauge".into());
+        let _ = writeln!(
+            out,
+            "# HELP updatec_generation The published generation, per deployment identity."
+        );
+        let _ = writeln!(out, "# TYPE updatec_generation gauge");
         for deployment in &snapshot.deployments {
-            line(format!(
+            let _ = writeln!(
+                out,
                 "updatec_generation{{deployment=\"{}\"}} {generation}",
                 escape(deployment)
-            ));
+            );
         }
     }
-    line(
-        "# HELP updatec_group_progress One-hot projection of the planner verdict per group.".into(),
+    let _ = writeln!(
+        out,
+        "# HELP updatec_group_progress One-hot projection of the planner verdict per group."
     );
-    line("# TYPE updatec_group_progress gauge".into());
+    let _ = writeln!(out, "# TYPE updatec_group_progress gauge");
     for (group, (progress, _)) in &snapshot.groups {
         for state in ["staging", "held", "settled", "unobservable"] {
             let value = u8::from(progress_label(*progress) == state);
-            line(format!(
+            let _ = writeln!(
+                out,
                 "updatec_group_progress{{group=\"{}\",state=\"{state}\"}} {value}",
                 escape(group)
-            ));
+            );
         }
     }
-    line("# HELP updatec_group_nodes Nodes each group selects.".into());
-    line("# TYPE updatec_group_nodes gauge".into());
+    let _ = writeln!(out, "# HELP updatec_group_nodes Nodes each group selects.");
+    let _ = writeln!(out, "# TYPE updatec_group_nodes gauge");
     for (group, (_, nodes)) in &snapshot.groups {
-        line(format!(
+        let _ = writeln!(
+            out,
             "updatec_group_nodes{{group=\"{}\"}} {}",
             escape(group),
             nodes.total
-        ));
+        );
     }
-    line("# HELP updatec_group_nodes_on_target Nodes already handed the group's admitted deployment, as admission counts it.".into());
-    line("# TYPE updatec_group_nodes_on_target gauge".into());
+    let _ = writeln!(out, "# HELP updatec_group_nodes_on_target Nodes already handed the group's admitted deployment, as admission counts it.");
+    let _ = writeln!(out, "# TYPE updatec_group_nodes_on_target gauge");
     for (group, (_, nodes)) in &snapshot.groups {
-        line(format!(
+        let _ = writeln!(
+            out,
             "updatec_group_nodes_on_target{{group=\"{}\"}} {}",
             escape(group),
             nodes.on_target
-        ));
+        );
     }
-    line("# HELP updatec_reports_fresh Node reports inside REPORT_FRESHNESS, as the admission gate counts them.".into());
-    line("# TYPE updatec_reports_fresh gauge".into());
-    line(format!("updatec_reports_fresh {}", snapshot.reports_fresh));
-    line(
-        "# HELP updatec_reports_stale Nodes that have reported before but have no fresh authentic report."
-            .into(),
+    let _ = writeln!(out, "# HELP updatec_reports_fresh Node reports inside REPORT_FRESHNESS, as the admission gate counts them.");
+    let _ = writeln!(out, "# TYPE updatec_reports_fresh gauge");
+    let _ = writeln!(out, "updatec_reports_fresh {}", snapshot.reports_fresh);
+    let _ = writeln!(out, "# HELP updatec_reports_stale Nodes that have reported before but have no fresh authentic report.");
+    let _ = writeln!(out, "# TYPE updatec_reports_stale gauge");
+    let _ = writeln!(out, "updatec_reports_stale {}", snapshot.reports_stale);
+    let _ = writeln!(
+        out,
+        "# HELP updatec_quarantined_groups Size of the quarantine set."
     );
-    line("# TYPE updatec_reports_stale gauge".into());
-    line(format!("updatec_reports_stale {}", snapshot.reports_stale));
-    line("# HELP updatec_quarantined_groups Size of the quarantine set.".into());
-    line("# TYPE updatec_quarantined_groups gauge".into());
-    line(format!(
+    let _ = writeln!(out, "# TYPE updatec_quarantined_groups gauge");
+    let _ = writeln!(
+        out,
         "updatec_quarantined_groups {}",
         snapshot.quarantined_groups
-    ));
+    );
     out
 }
 
