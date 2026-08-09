@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 /// What the reconcile loop last programmed, plus the one counter that survives cycles.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct ProxyMetrics {
     /// Backends programmed ready in the last reconcile.
     pub backends_up: usize,

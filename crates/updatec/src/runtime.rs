@@ -860,6 +860,57 @@ pub async fn reconcile_once(
     }
     ensure_repository_finalizer(&repositories, &repository).await?;
 
+    // The object store is needed every reconcile — to recover an interrupted publication, to read
+    // the node telemetry that drives rollout planning, and to publish — so build it up front.
+    let store = build_store(&secrets, &repository.spec.s3).await?;
+
+    // The agents of this repository, read BEFORE the durable rollout state, solely so the cordoned
+    // set below can be published before anything that can fault this pass. Nothing else here needs
+    // the agents this early; the quarantine pass over them runs after group validation, as it must.
+    let mut agent_resources = nodes_api.list(&ListParams::default()).await?;
+    agent_resources
+        .items
+        .retain(|agent| agent.spec.repository_ref.name == repository_name);
+    // The FULL fleet — quarantined agents included — is what the observation log's node memory is
+    // bounded by: pruning on the planned subset destroyed a quarantined agent's rollback proof
+    // over a status condition, and the pre-movement state a record carries is unrecoverable from
+    // any later report. This is the one place the full list is known, so the node half of the
+    // prune lives here; the planner prunes the identity half, whose set it owns.
+    let fleet: HashSet<String> = agent_resources
+        .iter()
+        .map(|agent| agent.name_any())
+        .collect();
+    hooks
+        .observation_log
+        .prune_nodes(|node| fleet.contains(node));
+    // The cordoned set is collected BEFORE the quarantine filter below, from every agent of this
+    // repository. A cordon is an operational safety control that must fail SAFE: quarantining an
+    // agent (a malformed `registrationSha256` is one hand edit away, and repeats every pass) drops
+    // it from the plan, and collecting cordons afterwards dropped it from the endpoint projection
+    // too — the one channel a cordon travels — so a machine deliberately benched for maintenance
+    // was published back into load-balancer rotation while its own `status.cordoned` still read
+    // true. A quarantined agent is absent from `plan.node_groups`, so naming it here cannot reach
+    // any rollout accounting; it only keeps the drain published.
+    let cordons: BTreeSet<String> = agent_resources
+        .iter()
+        .filter(|agent| agent.spec.cordon)
+        .map(|agent| agent.name_any())
+        .collect();
+
+    // The endpoint projection: which nodes the healthproxy must program as drained regardless of
+    // their reports — the one channel a cordon travels. Published HERE, as soon as the cordoned set
+    // is known, and deliberately not at the end of the pass: EVERYTHING below can fail (an
+    // unreadable admitted-state ConfigMap fails every pass forever until an operator repairs it, a
+    // node matching two selectors faults the generation closed every pass by design, a missing
+    // signing Secret, a lost lease), and behind those failures a cordon reached no reader at all
+    // while the healthproxy kept reading the last projection successfully — so the freshness gauge
+    // said "current" and nothing was alertable. It is outside the signed generation because it is
+    // not desired state (see `updated_contracts::endpoints`), and written read-compare-put so a
+    // steady fleet costs one GET per pass, not a PUT. Best-effort like every other side-channel
+    // delivery (`deliver_subscriptions`): a failure here must not stall publication for the whole
+    // repository, and the write retries on the next pass of its own accord.
+    publish_endpoint_projection(store.as_ref(), &repository.spec.s3.prefix, &cordons).await;
+
     // The rollout state (each group's currently-pinned deployment, and the routing the last
     // generation published) lives durably in-cluster — a ConfigMap — NOT on the node-local PVC.
     // That is what survives an HA leader change or a cold/rescheduled PVC: a fresh leader loads the
@@ -870,9 +921,6 @@ pub async fn reconcile_once(
     // quarantining a group needs the deployment that group is still pinned to.
     let admitted_name = admitted_configmap_name(repository_name);
     let (durable, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
-    // The object store is needed every reconcile — to recover an interrupted publication, to read
-    // the node telemetry that drives rollout planning, and to publish — so build it up front.
-    let store = build_store(&secrets, &repository.spec.s3).await?;
     // A generation this replica published but never recorded is adopted before anything is planned
     // from the loaded state — planning on a baseline that predates the live generation is what
     // republishes an already-advanced node on its predecessor.
@@ -998,23 +1046,6 @@ pub async fn reconcile_once(
         .items
         .retain(|group| !quarantined_groups.contains_key(&group.name_any()));
 
-    let mut agent_resources = nodes_api.list(&ListParams::default()).await?;
-    agent_resources
-        .items
-        .retain(|agent| agent.spec.repository_ref.name == repository_name);
-    // The cordoned set is collected BEFORE the quarantine filter below, from every agent of this
-    // repository. A cordon is an operational safety control that must fail SAFE: quarantining an
-    // agent (a malformed `registrationSha256` is one hand edit away, and repeats every pass) drops
-    // it from the plan, and collecting cordons afterwards dropped it from the endpoint projection
-    // too — the one channel a cordon travels — so a machine deliberately benched for maintenance
-    // was published back into load-balancer rotation while its own `status.cordoned` still read
-    // true. A quarantined agent is absent from `plan.node_groups`, so naming it here cannot reach
-    // any rollout accounting; it only keeps the drain published.
-    let cordons: BTreeSet<String> = agent_resources
-        .iter()
-        .filter(|agent| agent.spec.cordon)
-        .map(|agent| agent.name_any())
-        .collect();
     // Quarantine a malformed-identity agent — never the whole reconcile — and drop it from this
     // generation: a bad identity never resolved to an assignment, so there is nothing to preserve.
     // Overlapping selectors are deliberately NOT handled here. An ambiguous node must hold the last
@@ -1088,19 +1119,6 @@ pub async fn reconcile_once(
         .filter(|agent| agent.spec.hold)
         .map(|agent| agent.name_any())
         .collect();
-
-    // The endpoint projection: which nodes the healthproxy must program as drained regardless of
-    // their reports — the one channel a cordon travels. Published HERE, as soon as the cordoned set
-    // is known, and deliberately not at the end of the pass: everything below can fail (a node
-    // matching two selectors faults the generation closed every pass by design, a missing signing
-    // Secret, a lost lease), and behind those failures a cordon reached no reader at all while the
-    // healthproxy kept reading the last projection successfully — so the freshness gauge said
-    // "current" and nothing was alertable. It is outside the signed generation because it is not
-    // desired state (see `updated_contracts::endpoints`), and written read-compare-put so a steady
-    // fleet costs one GET per pass, not a PUT. Best-effort like every other side-channel delivery
-    // (`deliver_subscriptions`): a failure here must not stall publication for the whole
-    // repository, and the write retries on the next pass of its own accord.
-    publish_endpoint_projection(store.as_ref(), &repository.spec.s3.prefix, &cordons).await;
 
     // An ABSENT admitted-state ConfigMap reads as "no group has ever been admitted", so every group
     // takes the first-admission branch and every group's staging baseline is lost: `previous` is
@@ -1340,7 +1358,6 @@ pub async fn reconcile_once(
             reports: &reports,
             group_progress: &group_progress,
             public_keys: &public_keys,
-            holds: &holds,
             node_counts: &node_counts,
             halted_groups: &halted_groups,
             now: reconcile_now,
@@ -1960,7 +1977,7 @@ async fn publish_group_set_statuses(
             // This writer only runs on a pass that has succeeded this far, so the streak it
             // reports is zero by construction; the failing loop's own writer
             // (`record_reconcile_failing`) is the only place a non-zero streak can come from.
-            crate::alerts::reconcile_failing(set.metadata.generation, 0),
+            crate::alerts::reconcile_failing(set.metadata.generation, 0, chrono::Utc::now()),
         ] {
             let condition_type = next.condition_type.clone();
             let (published, fired) = crate::alerts::carry_transition(
@@ -2389,9 +2406,8 @@ struct StatusSnapshot<'a> {
     /// source for whether a group is held, rolling, settled, or unobservable.
     group_progress: &'a BTreeMap<String, crate::rollout::GroupProgress>,
     public_keys: &'a HashMap<String, Vec<u8>>,
-    /// Agents the operator is holding (`spec.hold`), for the per-group `heldAgents` projection.
-    holds: &'a BTreeSet<String>,
-    /// Per-group node accounting from the planner, for the alert conditions.
+    /// Per-group node accounting from the planner, for the alert conditions and the `heldAgents`
+    /// projection.
     node_counts: &'a BTreeMap<String, crate::rollout::GroupNodes>,
     /// Groups bound by the regression verdict, for the per-group `DeploymentHalted` condition —
     /// the one place a halted SET-LESS group is operator-visible.
@@ -2450,7 +2466,6 @@ impl ReconcileProjection<'_> {
                 reports: self.snapshot.reports,
                 group_progress: self.snapshot.group_progress,
                 public_keys: self.snapshot.public_keys,
-                holds: self.snapshot.holds,
                 node_counts: self.snapshot.node_counts,
                 halted_groups: self.snapshot.halted_groups,
                 now: self.snapshot.now,
@@ -2522,7 +2537,6 @@ async fn publish_resource_statuses(
         reports,
         group_progress,
         public_keys,
-        holds,
         node_counts,
         halted_groups,
         now,
@@ -2611,15 +2625,14 @@ async fn publish_resource_statuses(
             Some(plan.digest.clone()),
             condition,
         );
+        let counts = node_counts.get(&name).cloned().unwrap_or_default();
         // A forgotten hold must be a visible condition, not a mystery: the count of this group's
-        // held agents rides its status every pass, keyed on the published routing so it counts
-        // exactly the agents this group is accountable for.
-        status.held_agents = Some(
-            plan.node_groups
-                .iter()
-                .filter(|(node, selected)| *selected == &name && holds.contains(*node))
-                .count() as u32,
-        );
+        // held agents rides its status every pass, taken from the planner's own membership (the
+        // group this pass's labels select) and never re-derived here. Keying it on the PUBLISHED
+        // routing instead attributed the hold to whichever group the node was last published under:
+        // a held node is skipped by `assign_nodes` and carried forward on its previous routing, so
+        // relabelling one left the group whose rollout the hold actually wedges reporting zero.
+        status.held_agents = Some(counts.held as u32);
         // The alertable conditions, appended beside Ready every pass and cleared the same way —
         // standard condition semantics, never deleted. Each is a projection of a verdict computed
         // above (the planner's progress, the freshness counts admission already read); no new
@@ -2630,7 +2643,6 @@ async fn publish_resource_statuses(
             .as_ref()
             .map(|status| status.conditions.as_slice())
             .unwrap_or_default();
-        let counts = node_counts.get(&name).cloned().unwrap_or_default();
         let progressed_at =
             progress_marks.observe(&name, counts.target.clone(), counts.on_target, now);
         // A halted group's own status carries the verdict — the fleet-wide halt binds set-less
@@ -2652,6 +2664,7 @@ async fn publish_resource_statuses(
                 counts.fresh,
                 counts.observable,
                 group.spec.max_unavailable.unwrap_or(1),
+                now,
             ),
             crate::alerts::deployment_halted(group.metadata.generation, bound, now),
         ];
@@ -2829,8 +2842,11 @@ pub async fn record_reconcile_failing(
             .as_ref()
             .map(|status| status.conditions.as_slice())
             .unwrap_or_default();
-        let next =
-            crate::alerts::reconcile_failing(set.metadata.generation, hooks.consecutive_failures);
+        let next = crate::alerts::reconcile_failing(
+            set.metadata.generation,
+            hooks.consecutive_failures,
+            chrono::Utc::now(),
+        );
         let (published, fired) = crate::alerts::carry_transition(
             crate::alerts::existing(observed, crate::alerts::RECONCILE_FAILING),
             next,
@@ -4082,15 +4098,14 @@ mod wiring_tests {
     use std::collections::BTreeSet;
     use std::sync::Mutex as StdMutex;
 
+    /// The in-process store's contents: object key → bytes.
+    type Objects = Arc<StdMutex<BTreeMap<String, Vec<u8>>>>;
+
     /// One in-process S3-compatible store: path-style `/{bucket}/{key}`, GET/PUT/DELETE, the
     /// headers `object_store`'s client needs, nothing else.
-    async fn s3_endpoint(
-        objects: Arc<StdMutex<BTreeMap<String, Vec<u8>>>>,
-    ) -> std::net::SocketAddr {
+    async fn s3_endpoint(objects: Objects) -> std::net::SocketAddr {
         async fn handle(
-            axum::extract::State(objects): axum::extract::State<
-                Arc<StdMutex<BTreeMap<String, Vec<u8>>>>,
-            >,
+            axum::extract::State(objects): axum::extract::State<Objects>,
             method: Method,
             uri: Uri,
             body: Bytes,
@@ -4114,10 +4129,6 @@ mod wiring_tests {
                     objects.lock().expect("s3").insert(key, body.to_vec());
                     respond(StatusCode::OK, Vec::new())
                 }
-                Method::DELETE => {
-                    objects.lock().expect("s3").remove(&key);
-                    respond(StatusCode::NO_CONTENT, Vec::new())
-                }
                 _ => respond(StatusCode::METHOD_NOT_ALLOWED, Vec::new()),
             }
         }
@@ -4135,6 +4146,7 @@ mod wiring_tests {
     struct Cluster {
         repository: Option<UpdateRepository>,
         groups: Vec<UpdateGroup>,
+        sets: Vec<UpdateGroupSet>,
         agents: Vec<UpdateAgent>,
         secrets: BTreeMap<String, Secret>,
         configmaps: BTreeMap<String, ConfigMap>,
@@ -4189,6 +4201,14 @@ mod wiring_tests {
                             .expect("patched agent exists"),
                     )
                     .unwrap(),
+                    "updategroupsets" => serde_json::to_value(
+                        cluster
+                            .sets
+                            .iter()
+                            .find(|set| set.metadata.name.as_deref() == Some(&name))
+                            .expect("patched set exists"),
+                    )
+                    .unwrap(),
                     other => panic!("status patch for unmodeled plural {other}"),
                 };
                 return (StatusCode::OK, patched);
@@ -4226,8 +4246,19 @@ mod wiring_tests {
                             .collect(),
                     ),
                 ),
-                (Method::GET, [.., "updategroupsets"])
-                | (Method::GET, [.., "updatesubscriptions"]) => {
+                (Method::GET, [.., "updategroupsets"]) => (
+                    StatusCode::OK,
+                    kube_list(
+                        cluster
+                            .sets
+                            .iter()
+                            .map(|set| serde_json::to_value(set).unwrap())
+                            .collect(),
+                    ),
+                ),
+                // No subscription fixture: delivery is a side channel with its own tests, and an
+                // empty list is what every case here needs.
+                (Method::GET, [.., "updatesubscriptions"]) => {
                     (StatusCode::OK, kube_list(Vec::new()))
                 }
                 (Method::GET, [.., "leases", "updatec-publisher"]) => {
@@ -4478,6 +4509,31 @@ mod wiring_tests {
         .await;
         let client = apiserver_for(cluster.clone(), "wiring-test");
         let mut hooks = ReconcileHooks::new(None);
+        // The quarantined agent carries rollback-evidence memory into the pass: quarantine is a
+        // status condition, not a departure, and forgetting a contained node's proof over it
+        // weakened the fleet-wide verdict for as long as the quarantine lasted. The identity must
+        // be one a generation still names, so it is the group's own desired deployment.
+        let target = crate::deployment_identity(
+            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
+        )
+        .unwrap();
+        let origin = "a".repeat(64);
+        let archive = "b".repeat(64);
+        let mut settled = updated_contracts::telemetry::NodeReport::new(
+            "n2", "origin", &origin, "1.0.0", &archive, true,
+        );
+        hooks.observation_log.observe("n2", &settled);
+        settled.assignment_sha256 = target.clone();
+        settled.healthy = false;
+        settled.updating = true;
+        hooks.observation_log.observe("n2", &settled);
+        settled.healthy = true;
+        settled.updating = false;
+        hooks.observation_log.observe("n2", &settled);
+        assert!(hooks
+            .observation_log
+            .rolled_back("n2", &target, &archive)
+            .is_some());
         reconcile_once(
             client,
             "default",
@@ -4492,6 +4548,14 @@ mod wiring_tests {
         assert!(
             drained_in(&objects).contains("n2"),
             "the quarantined agent's drain must stay published"
+        );
+        assert!(
+            hooks
+                .observation_log
+                .rolled_back("n2", &target, &archive)
+                .is_some(),
+            "quarantine is a status condition, not a departure: the contained node's rollback \
+             proof survives the pass"
         );
     }
 
@@ -4535,6 +4599,210 @@ mod wiring_tests {
                 .expect("s3")
                 .contains_key("routing/metadata/timestamp.json"),
             "and nothing of the faulted generation reached the store"
+        );
+    }
+
+    /// The cordon channel outlives the one failure the loop cannot repair by itself: an
+    /// admitted-state ConfigMap this controller cannot read fails EVERY pass, forever, until an
+    /// operator intervenes — so a projection published after that load would never be written
+    /// again, while the healthproxy kept reading the last one successfully and the freshness gauge
+    /// kept saying "current". The cordon must reach the store before the durable state is loaded.
+    #[tokio::test]
+    async fn an_unreadable_admitted_state_still_publishes_the_cordon_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            cluster.agents[0].spec.cordon = true;
+            // Restored from a bad backup: `state.json` is truncated. Every pass fails on it.
+            cluster.configmaps.insert(
+                "updatec-admitted-default".into(),
+                ConfigMap {
+                    metadata: kube::api::ObjectMeta {
+                        name: Some("updatec-admitted-default".into()),
+                        namespace: Some("default".into()),
+                        resource_version: Some("7".into()),
+                        ..Default::default()
+                    },
+                    data: Some(BTreeMap::from([(
+                        "state.json".to_string(),
+                        "{".to_string(),
+                    )])),
+                    ..Default::default()
+                },
+            );
+        })
+        .await;
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+        let error = reconcile_once(
+            client,
+            "default",
+            "default",
+            &tmp.path().join("state"),
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect_err("an unreadable admitted state fails the pass");
+        assert!(
+            error.to_string().contains("invalid admitted state"),
+            "{error}"
+        );
+        assert!(
+            drained_in(&objects).contains("n1"),
+            "the cordon published before the durable state was ever read"
+        );
+    }
+
+    /// The `UpdateGroupSet` layer, end to end: the set's own status — member accounting, schedule
+    /// flags, and the alertable conditions — is written by a real pass. The planner tests decide
+    /// the numbers; this locks the wiring that carries them to the resource.
+    #[tokio::test]
+    async fn a_set_status_is_published_with_its_members_and_conditions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            cluster.groups[0].metadata.labels =
+                Some(BTreeMap::from([("tier".to_string(), "edge".to_string())]));
+            let mut set = UpdateGroupSet::new(
+                "edge-set",
+                crate::UpdateGroupSetSpec {
+                    selector: crate::LabelSelector {
+                        match_labels: BTreeMap::from([("tier".to_string(), "edge".to_string())]),
+                    },
+                    max_concurrent: None,
+                    rollout_windows: Vec::new(),
+                    calendar: Vec::new(),
+                    max_regressions: Some(3),
+                    stuck_after_seconds: Some(90),
+                },
+            );
+            set.metadata.namespace = Some("default".into());
+            cluster.sets.push(set);
+        })
+        .await;
+        let client = apiserver_for(cluster.clone(), "wiring-test");
+        let mut hooks = ReconcileHooks::new(None);
+        reconcile_once(
+            client,
+            "default",
+            "default",
+            &tmp.path().join("state"),
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("the pass succeeds with a set governing the group");
+
+        let cluster = cluster.lock().expect("cluster");
+        let set_patch = cluster
+            .status_patches
+            .iter()
+            .find(|(path, _)| path.ends_with("/updategroupsets/edge-set/status"))
+            .expect("the set's status was written");
+        let status = &set_patch.1["status"];
+        assert_eq!(status["memberCount"], 1, "{status}");
+        assert_eq!(
+            status["frozen"], false,
+            "a set with neither windows nor a calendar is never frozen: {status}"
+        );
+        let conditions: Vec<&str> = status["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .map(|condition| condition["type"].as_str().unwrap())
+            .collect();
+        for expected in ["Ready", "DeploymentHalted", "ReconcileFailing"] {
+            assert!(
+                conditions.contains(&expected),
+                "set conditions missing {expected}: {conditions:?}"
+            );
+        }
+    }
+
+    /// A hold is accounted to the group the node's LABELS select, not to the group its last
+    /// published routing names. A held node is skipped by `assign_nodes` and carried forward on its
+    /// previous routing, so keying `heldAgents` on the publication reported the hold against a group
+    /// that no longer selects the machine while the group whose rollout the hold actually wedges
+    /// reported zero — a freeze with nothing naming its cause.
+    #[tokio::test]
+    async fn a_hold_is_counted_by_the_group_the_labels_select_not_the_published_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let objects = Arc::new(StdMutex::new(BTreeMap::new()));
+        let endpoint = s3_endpoint(objects.clone()).await;
+        let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            let mut core = cluster.groups[0].clone();
+            core.metadata.name = Some("core".into());
+            core.spec.selector.match_labels =
+                BTreeMap::from([("role".to_string(), "core".to_string())]);
+            core.spec.deployment = crate::tests::deployment_spec("core-v1");
+            cluster.groups.push(core);
+        })
+        .await;
+        let state = tmp.path().join("state");
+        let mut hooks = ReconcileHooks::new(None);
+        // Pass one: an ordinary `edge` node, published under `edge`.
+        reconcile_once(
+            apiserver_for(cluster.clone(), "wiring-test"),
+            "default",
+            "default",
+            &state,
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("pass one publishes the fleet");
+        // The operator moves the machine to `core` and freezes it there.
+        {
+            let mut cluster = cluster.lock().expect("cluster");
+            cluster.status_patches.clear();
+            let agent = &mut cluster.agents[0];
+            agent.spec.labels = BTreeMap::from([("role".to_string(), "core".to_string())]);
+            agent.spec.hold = true;
+        }
+        reconcile_once(
+            apiserver_for(cluster.clone(), "wiring-test"),
+            "default",
+            "default",
+            &state,
+            "https://public",
+            "wiring-test",
+            &mut hooks,
+        )
+        .await
+        .expect("pass two plans around the hold");
+
+        let cluster = cluster.lock().expect("cluster");
+        let field = |group: &str, field: &str| -> u64 {
+            cluster
+                .status_patches
+                .iter()
+                .find(|(path, _)| path.ends_with(&format!("/updategroups/{group}/status")))
+                .unwrap_or_else(|| panic!("{group} status was written"))
+                .1["status"][field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{group} status has no {field}"))
+        };
+        let held_in = |group: &str| field(group, "heldAgents");
+        // The premise, from the publication itself: the held node is still ROUTED to `edge` —
+        // `matchedAgents` is the published routing's count — while the planner selects it into
+        // `core`. Keying the hold count on the routing is what reported it against `edge`.
+        assert_eq!(field("edge", "matchedAgents"), 1);
+        assert_eq!(field("core", "matchedAgents"), 0);
+        assert_eq!(
+            held_in("core"),
+            1,
+            "the group the labels select carries the hold"
+        );
+        assert_eq!(
+            held_in("edge"),
+            0,
+            "the group the stale routing names must not"
         );
     }
 

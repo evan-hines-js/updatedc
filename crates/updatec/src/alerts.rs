@@ -151,6 +151,7 @@ pub fn reports_stale(
     fresh: usize,
     observable: usize,
     max_unavailable: usize,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> ResourceCondition {
     // Strictly MORE stale than the budget: `maxUnavailable` nodes being briefly unaccounted for is
     // the ordinary shape of a staged rollout (the node rebooting into the update it was just
@@ -172,14 +173,7 @@ pub fn reports_stale(
             format!("{fresh} of {observable} observable nodes have fresh reports."),
         )
     };
-    condition(
-        REPORTS_STALE,
-        active,
-        generation,
-        reason,
-        message,
-        &chrono::Utc::now(),
-    )
+    condition(REPORTS_STALE, active, generation, reason, message, &now)
 }
 
 /// `DeploymentHalted` on an `UpdateGroupSet`: the regression verdict, with its evidence count.
@@ -215,7 +209,11 @@ pub fn deployment_halted(
 /// `ReconcileFailing` on an `UpdateGroupSet`: the loop itself erred on consecutive passes. One
 /// failed pass is an ordinary transient (the next pass retries within a second); two in a row is a
 /// loop that is not converging.
-pub fn reconcile_failing(generation: Option<i64>, consecutive_failures: u32) -> ResourceCondition {
+pub fn reconcile_failing(
+    generation: Option<i64>,
+    consecutive_failures: u32,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ResourceCondition {
     let active = consecutive_failures >= 2;
     // The active message carries no live count: the streak grows every failed pass, and a message
     // that grows with it forced an apiserver write per set per second for as long as the loop was
@@ -228,14 +226,7 @@ pub fn reconcile_failing(generation: Option<i64>, consecutive_failures: u32) -> 
     } else {
         ("Reconciling", "The reconcile loop is passing.".into())
     };
-    condition(
-        RECONCILE_FAILING,
-        active,
-        generation,
-        reason,
-        message,
-        &chrono::Utc::now(),
-    )
+    condition(RECONCILE_FAILING, active, generation, reason, message, &now)
 }
 
 /// Merge a freshly computed condition over the one the resource already carries: standard k8s
@@ -560,17 +551,17 @@ mod tests {
     /// only staleness EXCEEDING what admission tolerates raises the condition.
     #[test]
     fn reports_stale_tracks_the_admission_quorum() {
-        assert_eq!(reports_stale(Some(1), 3, 3, 1).status, "False");
+        assert_eq!(reports_stale(Some(1), 3, 3, 1, now()).status, "False");
         // One stale node inside a budget of one is a rollout in progress, not an alert.
-        assert_eq!(reports_stale(Some(1), 2, 3, 1).status, "False");
-        assert_eq!(reports_stale(Some(1), 1, 3, 1).status, "True");
+        assert_eq!(reports_stale(Some(1), 2, 3, 1, now()).status, "False");
+        assert_eq!(reports_stale(Some(1), 1, 3, 1, now()).status, "True");
         // A budget of two tolerates two stale nodes.
-        assert_eq!(reports_stale(Some(1), 1, 3, 2).status, "False");
-        assert_eq!(reports_stale(Some(1), 0, 3, 2).status, "True");
+        assert_eq!(reports_stale(Some(1), 1, 3, 2, now()).status, "False");
+        assert_eq!(reports_stale(Some(1), 0, 3, 2, now()).status, "True");
         // A single-node group can never exceed its own budget; its wedges raise RolloutStuck.
-        assert_eq!(reports_stale(Some(1), 0, 1, 1).status, "False");
+        assert_eq!(reports_stale(Some(1), 0, 1, 1, now()).status, "False");
         // Nothing observable: nothing to say.
-        assert_eq!(reports_stale(Some(1), 0, 0, 1).status, "False");
+        assert_eq!(reports_stale(Some(1), 0, 0, 1, now()).status, "False");
     }
 
     #[test]
@@ -591,9 +582,9 @@ mod tests {
 
     #[test]
     fn reconcile_failing_needs_consecutive_failures() {
-        assert_eq!(reconcile_failing(Some(1), 0).status, "False");
-        assert_eq!(reconcile_failing(Some(1), 1).status, "False");
-        assert_eq!(reconcile_failing(Some(1), 2).status, "True");
+        assert_eq!(reconcile_failing(Some(1), 0, now()).status, "False");
+        assert_eq!(reconcile_failing(Some(1), 1, now()).status, "False");
+        assert_eq!(reconcile_failing(Some(1), 2, now()).status, "True");
     }
 
     /// Transitions only: an unchanged status keeps its original `lastTransitionTime` and fires no

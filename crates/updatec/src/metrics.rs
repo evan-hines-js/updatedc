@@ -13,7 +13,7 @@ use crate::rollout::{GroupNodes, GroupProgress};
 
 /// What one reconcile pass leaves behind for the scrape to project. Built by `reconcile_once` from
 /// the same plan it publishes, so the scrape can never disagree with the CRD statuses.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug)]
 pub struct FleetSnapshot {
     /// When the pass finished, seconds since the Unix epoch.
     pub reconcile_timestamp_seconds: u64,
@@ -46,6 +46,10 @@ pub struct MetricsState {
 }
 
 pub type SharedMetrics = Arc<std::sync::RwLock<MetricsState>>;
+
+/// The one-hot label set, spelled once: the renderer emits exactly these states and
+/// `progress_label` maps into them, so the two cannot drift into a label the other never uses.
+const PROGRESS_STATES: [&str; 4] = ["staging", "held", "settled", "unobservable"];
 
 fn progress_label(progress: GroupProgress) -> &'static str {
     match progress {
@@ -101,7 +105,7 @@ pub fn render(state: &MetricsState) -> String {
     if let Some(generation) = snapshot.generation {
         let _ = writeln!(
             out,
-            "# HELP updatec_generation The published generation, per deployment identity."
+            "# HELP updatec_generation The published generation, labeled per deployment name."
         );
         let _ = writeln!(out, "# TYPE updatec_generation gauge");
         for deployment in &snapshot.deployments {
@@ -118,7 +122,7 @@ pub fn render(state: &MetricsState) -> String {
     );
     let _ = writeln!(out, "# TYPE updatec_group_progress gauge");
     for (group, (progress, _)) in &snapshot.groups {
-        for state in ["staging", "held", "settled", "unobservable"] {
+        for state in PROGRESS_STATES {
             let value = u8::from(progress_label(*progress) == state);
             let _ = writeln!(
                 out,
@@ -219,6 +223,7 @@ mod tests {
                                 on_target: 3,
                                 fresh: 3,
                                 observable: 3,
+                                held: 0,
                                 target: Some("id".into()),
                             },
                         ),
@@ -232,6 +237,7 @@ mod tests {
                                 on_target: 2,
                                 fresh: 4,
                                 observable: 5,
+                                held: 1,
                                 target: Some("id2".into()),
                             },
                         ),

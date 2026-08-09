@@ -34,7 +34,11 @@ an existing arm, not a parallel path. Specifically:
   case.
 
 A hold is visible in `UpdateAgent` status and counts in the group's `held` projection so a
-forgotten hold is a visible condition, not a mystery.
+forgotten hold is a visible condition, not a mystery. That count comes from the planner's own
+membership — the group this pass's labels select — and never from the published routing: a held
+node is never reassigned, so its routing keeps naming whichever group it was last published under,
+and counting there attributed the hold to a group that no longer selects the machine while the
+group the hold actually wedges reported zero.
 
 ## Cordon
 
@@ -53,7 +57,10 @@ in-flight rollout waiting for a machine the operator deliberately benched.
 
 A cordon must fail SAFE — stay drained — against everything else the reconcile does, so the
 cordoned set is collected from every agent of the repository before quarantine filtering, and the
-projection is published before anything that can fault the generation closed. Otherwise
+projection is published before anything else in the pass can fail: the object store is built, the
+agents are listed, the projection is written, and only then is the durable admitted state loaded.
+Ordering it after that load left the one failure the loop cannot repair on its own (an unreadable
+admitted-state ConfigMap fails every pass forever) wedging the cordon channel too. Otherwise
 quarantining an agent, or any faulted generation, silently released the drain while the agent's
 own `status.cordoned` still read true.
 

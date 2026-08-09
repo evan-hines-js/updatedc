@@ -137,6 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // condition on every set.
             Ok(false) => {
                 hooks.consecutive_failures = 0;
+                // A follower has no fleet view: serving the last leader-epoch snapshot as if it
+                // were current let a scrape read week-old gauges as fresh. The failure counter
+                // stays — it is this process's own history.
+                metrics.write().expect("metrics lock").last = None;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
