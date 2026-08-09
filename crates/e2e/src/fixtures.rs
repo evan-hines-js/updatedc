@@ -478,7 +478,7 @@ impl Sup {
         // file through these paths must exercise the same locations the agent under test uses.
         let paths = updated::config::Paths::resolve(&self.install_root, &self.state_dir());
         if matches!(
-            updated::state::read_installed(&paths.state),
+            updated::state::read_installed(&paths.installed),
             updated::state::Installed::Present(_)
         ) {
             return Ok(());
@@ -518,7 +518,7 @@ impl Sup {
             "{}metadata/",
             self.repository_base_url
         ));
-        updated::state::enroll(&paths.state).map_err(str_err)?;
+        updated::state::enroll(&paths.installed).map_err(str_err)?;
         // Carry the same signed provider set the published assignment references, so the seeded
         // predecessor is faithful to a cold-installed node (install stages its providers). Without
         // this the first update's rollback restores a predecessor with no providers to replay.
@@ -529,7 +529,7 @@ impl Sup {
             crate::harness::sha256_hex(&paths.download)?,
             Box::new(self.stage_seed_provider(&paths, "lifecycle", &command)?),
         );
-        updated::state::write_installed(&paths.state, &installed).map_err(str_err)
+        updated::state::write_installed(&paths.installed, &installed).map_err(str_err)
     }
 
     /// A guardian command: `bootstrap --state-dir <dir> --supervisor-config <cfg>

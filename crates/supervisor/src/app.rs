@@ -49,7 +49,7 @@ impl App {
         self.guardian.launch(&spec)?;
         // The child's environment is fixed from here; record which secret values went into it so a
         // later supervisor that adopts this process can tell whether they are still current.
-        opts.secrets.record_launched(&opts.paths.state);
+        opts.secrets.record_launched(&opts.paths.state_dir);
         Ok(())
     }
 }
@@ -66,7 +66,7 @@ pub(crate) fn adopt(guardian: Guardian, opts: &Options, pid: u32) -> io::Result<
     // bundle is this supervisor's only baseline — `reconcile` would compare it against itself and
     // never report a rotation that landed while this supervisor was down. Relaunch instead of
     // adopting a process that would otherwise run on revoked credentials forever.
-    if !opts.secrets.launched_with_current(&opts.paths.state) {
+    if !opts.secrets.launched_with_current(&opts.paths.state_dir) {
         log(
             "the running application was launched with different secret values; relaunching it \
              rather than adopting it",
