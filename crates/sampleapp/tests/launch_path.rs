@@ -2,7 +2,7 @@
 //!
 //! A whole class of defect lives between "the provider resolved a release" and "the
 //! application is running", and no unit test in `crates/updated` can see it: the
-//! provider's own tests assert what is on disk, and the supervisor's assert what it
+//! provider's own tests assert what is on disk, and the agent's assert what it
 //! would exec. Neither runs a real program. That gap is exactly how the round-5
 //! regression shipped — the launch `cwd` moved off the release tree to the writable
 //! workspace, the workspace was empty, and `sampleapp` (which reads
@@ -12,8 +12,8 @@
 //! e2e fixtures ship (`bin/app` + `config/release.toml`, see
 //! `crates/e2e/src/fixtures.rs`), install and resolve it through the real
 //! [`updated::provider::BundleStore`], and launch this crate's real binary with the
-//! resolved `program`/`cwd` and a cleared environment — exactly what
-//! `crates/supervisor/src/app.rs` builds into its `CommandSpec`. The full e2e suite
+//! resolved `program`/`cwd` and a cleared environment — the same shape the release's own
+//! reconciler launches a workload with. The full e2e suite
 //! proves the same thing more thoroughly, but it is a separate binary nobody runs by
 //! reflex; this runs under `cargo test --workspace`.
 
@@ -82,8 +82,8 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Launch as `supervisor::app::app_spec` does: the resolved program, the resolved cwd,
-/// and an explicitly constructed environment (nothing ambient crosses the boundary).
+/// Launch as a reconciler does: the resolved program, the resolved cwd, and an explicitly
+/// constructed environment (nothing ambient crosses the boundary).
 fn launch(resolved: &updated::provider::Resolved, port: u16) -> Child {
     Command::new(&resolved.program)
         .args(["--addr", &format!("127.0.0.1:{port}")])
@@ -133,8 +133,8 @@ fn await_ready_line(child: &mut Child) -> String {
     panic!("application produced no readiness line; status {status:?}");
 }
 
-/// The regression itself: a program launched the way the supervisor launches it finds
-/// its own bundled configuration by relative path and comes up.
+/// The regression itself: a program launched from a resolved release finds its own bundled
+/// configuration by relative path and comes up.
 #[test]
 fn the_real_application_starts_from_the_launch_cwd_the_provider_resolves() {
     let (_tmp, root) = scratch();

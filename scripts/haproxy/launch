@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start entrypoint (bin/launch) for a provider-managed HAProxy node.
+# Start entrypoint (bin/launch) for an HAProxy node.
 #
-# The deployment is `provider-managed`, so the agent starts no application process: the signed
+# The agent starts no workload process, so the signed
 # lifecycle provider runs this launcher whenever no master of ours is running (the first deployment
 # on a node, or one whose master is gone). Every later upgrade is the provider making THIS master
 # re-exec in place (SIGUSR2), so this script runs once per master, not once per release.

@@ -31,6 +31,11 @@ fn contains_bytes(root: &Path, needle: &[u8]) -> bool {
     })
 }
 
+/// Assigned secrets are delivered to the RECONCILER, not to a process the agent owns: every hook
+/// invocation carries the resolved values in its otherwise-cleared environment, and the entrypoint
+/// puts them wherever its environment wants them (here, into the workload it starts). A rotation is
+/// therefore an `apply --reason restart` and nothing else — the agent has no process to
+/// reconfigure — and no value ever reaches disk.
 pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:23180", "127.0.0.1:23181");
     let dir = ctx.work.join("assigned-secret-lifecycle");
@@ -53,25 +58,38 @@ pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
         serde_json::json!({ENVIRONMENT: first_secret}),
     )?;
     let _server = ctx.serve(&dir, srv)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
-    let sup = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+    let node = Node::new(ctx, &dir, srv, "app")
         .secret(ENVIRONMENT, "production-database", "password")
+        .workload(svc)
         .check_interval("1s")
         .health_grace("1s");
-    let mut command = sup.clone().guardian()?;
-    command.env(ENVIRONMENT, "ambient-value-must-not-reach-the-application");
+    let mut command = node.clone().launcher()?;
+    command.env(ENVIRONMENT, "ambient-value-must-not-reach-the-hook");
     let process = Service::spawn("assigned-secrets", &command);
+    let fixture_root = fixture::root(&dir);
 
     if !wait_until(EVENT_TIMEOUT, || {
         http_text(&format!("http://{svc}/test-secret")).as_deref() == Some(first_secret.as_str())
     }) {
         return fail(format!(
-            "initial assigned secret was not injected:\n{}",
+            "the initial assigned secret never reached the hook's environment:\n{}",
             process.captured_log()
         ));
     }
-    let first_pid = http_text(&format!("http://{svc}/pid")).ok_or("missing initial app pid")?;
+    let first_pid = fixture::workload_pid(&dir).ok_or("the reconciler recorded no workload PID")?;
+    // The hook's own record of what it was handed: the NAME was present on every invocation. The
+    // value is never written down, by the fixture or by anything else.
+    let converges: Vec<_> = fixture::operations(&fixture_root)
+        .into_iter()
+        .filter(|invocation| invocation.operation == "apply")
+        .collect();
+    if converges.is_empty()
+        || !converges
+            .iter()
+            .all(|invocation| invocation.has_environment(ENVIRONMENT))
+    {
+        return fail("a converge ran without the assigned secret in its environment");
+    }
 
     write_bundle(&dir, "malformed-rotation", serde_json::json!({}))?;
     if !process.wait_for_log(
@@ -79,16 +97,17 @@ pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
         EVENT_TIMEOUT,
     ) || http_text(&format!("http://{svc}/test-secret")).as_deref()
         != Some(first_secret.as_str())
-        || http_text(&format!("http://{svc}/pid")).as_deref() != Some(first_pid.as_str())
+        || fixture::workload_pid(&dir) != Some(first_pid)
     {
         return fail(format!(
-            "a malformed rotation disturbed the running application:\n{}",
+            "a malformed rotation disturbed the running workload:\n{}",
             process.captured_log()
         ));
     }
 
-    // Deliberately reuse the old generation. The supervisor must compare actual values and still
-    // restart; generation is opaque metadata, not a security decision.
+    // Deliberately reuse the old generation. The agent must compare actual values and still
+    // re-converge; generation is opaque metadata, not a security decision.
+    let before_rotation = fixture::operations(&fixture_root).len();
     write_bundle(
         &dir,
         "generation-one",
@@ -96,12 +115,21 @@ pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
     )?;
     if !wait_until(EVENT_TIMEOUT, || {
         http_text(&format!("http://{svc}/test-secret")).as_deref() == Some(second_secret.as_str())
-            && http_text(&format!("http://{svc}/pid")).as_deref() != Some(first_pid.as_str())
+            && fixture::workload_pid(&dir) != Some(first_pid)
     }) {
         return fail(format!(
-            "secret rotation did not restart the app with the new value:\n{}",
+            "the rotation did not reach the hook, which restarts the workload on a changed environment:\n{}",
             process.captured_log()
         ));
+    }
+    // The one mechanism a rotation has: `apply --reason restart`.
+    let rotation = fixture::operations(&fixture_root);
+    if !rotation
+        .iter()
+        .skip(before_rotation)
+        .any(|invocation| invocation.operation == "apply" && invocation.reason == "restart")
+    {
+        return fail("the rotation did not converge through apply --reason restart");
     }
 
     let runtime_path = dir.join("assignment-runtime.json");
@@ -114,33 +142,54 @@ pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
         serde_json::to_vec(&runtime).map_err(|error| error.to_string())?,
     )
     .map_err(str_err)?;
-    republish_assignment(&sup, "secrets-removed")?;
+    republish_assignment(&node, "secrets-removed")?;
     if !wait_until(EVENT_TIMEOUT, || {
         http_text(&format!("http://{svc}/test-secret")).as_deref() == Some("<missing>")
     }) {
         return fail(format!(
-            "removed assignment retained the secret in the child environment:\n{}",
+            "the removed assignment retained the secret in the hook's environment:\n{}",
             process.captured_log()
         ));
+    }
+    // Everything the reconciler is invoked with FROM HERE carries no secret. The window is opened
+    // by the observation above — the workload the hook restarted no longer has the value — not by
+    // the republish, because an invocation already in flight when the assignment changed was
+    // correctly handed the environment that was assigned when it started.
+    let removed_at = fixture::operations(&fixture_root).len();
+    let clean = wait_until(EVENT_TIMEOUT, || {
+        let later = fixture::operations(&fixture_root);
+        later.len() > removed_at
+            && later
+                .iter()
+                .skip(removed_at)
+                .all(|invocation| !invocation.has_environment(ENVIRONMENT))
+    });
+    if !clean {
+        return fail("a hook still received the removed secret's environment entry");
     }
 
     let install = dir.join("install");
     if contains_bytes(&install, first_secret.as_bytes())
         || contains_bytes(&install, second_secret.as_bytes())
+        || contains_bytes(&fixture_root, first_secret.as_bytes())
+        || contains_bytes(&fixture_root, second_secret.as_bytes())
     {
-        return fail("secret bytes were persisted under the node install root");
+        return fail("secret bytes were persisted under the node install root or the hook's state");
     }
     let log = process.captured_log();
     if log.contains(&first_secret) || log.contains(&second_secret) {
-        return fail("secret bytes appeared in supervisor/application logs");
+        return fail("secret bytes appeared in the node's logs");
     }
     drop(process);
-    kill_stray(&install);
-    ok("secret injection, rotation restart, removal, and non-persistence all held");
+    fixture::stop_workload(&dir);
+    ok("assigned secrets reached every hook invocation, rotated by apply --reason restart, were removed, and never touched disk");
     Ok(())
 }
 
-pub(crate) fn missing_assigned_secret_blocks_launch(ctx: &Ctx) -> R {
+/// A bundle that does not carry every assigned secret must stop the converge before it starts. A
+/// hook invoked with a partial environment would be indistinguishable, to the release, from one
+/// whose secrets were deliberately removed — so no hook runs at all.
+pub(crate) fn missing_assigned_secret_blocks_the_converge(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:23182", "127.0.0.1:23183");
     let dir = ctx.work.join("missing-assigned-secret");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
@@ -148,25 +197,25 @@ pub(crate) fn missing_assigned_secret_blocks_launch(ctx: &Ctx) -> R {
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     write_bundle(&dir, "incomplete", serde_json::json!({}))?;
     let _server = ctx.serve(&dir, srv)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
-    let mut command = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+    let mut command = Node::new(ctx, &dir, srv, "app")
         .secret(ENVIRONMENT, "production-database", "password")
+        .workload(svc)
         .check_interval("1s")
-        .guardian()?;
+        .launcher()?;
     let process = Proc::spawn("missing-assigned-secret", &mut command)?;
     let failed_closed = process.wait_for_log(
         "secret bundle that does not match the assignment",
         EVENT_TIMEOUT,
-    ) && http_text(&format!("http://{svc}/pid")).is_none();
+    ) && fixture::operations(&fixture::root(&dir)).is_empty()
+        && http_text(&format!("http://{svc}/healthz")).is_none();
     let log = process.captured_log();
     drop(process);
-    kill_stray(&dir.join("install"));
+    fixture::stop_workload(&dir);
     if !failed_closed {
         return fail(format!(
-            "an incomplete bundle did not block application launch:\n{log}"
+            "an incomplete bundle did not block the converge before any hook ran:\n{log}"
         ));
     }
-    ok("an incomplete authorized bundle prevented application launch");
+    ok("an incomplete authorized bundle blocked the converge; no hook ever ran with partial secrets");
     Ok(())
 }

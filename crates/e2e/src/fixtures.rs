@@ -1,4 +1,4 @@
-//! Shared test fixtures: the `Sup` supervisor/guardian config builder and version-path helpers,
+//! Shared test fixtures: the `Node` launcher+agent config builder and version-path helpers,
 //! used by the e2e scenario runner and the standalone kill fuzzer alike.
 
 use crate::harness::*;
@@ -13,45 +13,37 @@ pub fn app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
 pub fn supervisor_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
     ctx.work.join(format!("build/supervisor-{v}{}", ctx.exe))
 }
-/// The managed-app command line (binary path + args) for a scenario config.
-pub fn appcmd(app: &Path, args: &[&str]) -> Vec<String> {
-    let mut v = vec![app.display().to_string()];
-    v.extend(args.iter().map(|s| s.to_string()));
-    v
-}
 /// A TOML literal string (single-quoted, no escaping) — safe for Windows paths.
 fn lit(s: &str) -> String {
     format!("'{s}'")
 }
-/// Writes a scenario's config file and yields a guardian command — the whole tower.
-/// The guardian (`bootstrap`) launches the disposable supervisor, which owns the update
-/// policy and drives the guardian to run the application. Production launches nothing
-/// else; there is no way to run the supervisor standalone.
+/// Writes a scenario's config file and yields a launcher command — the whole node stack. The
+/// launcher (`bootstrap`) decides which agent binary runs; the disposable agent owns the update
+/// policy and invokes the release's reconciler. Nothing here launches a workload: that is the
+/// reconciler's job, and [`Node::workload`] is how a scenario asks for one.
 #[derive(Clone)]
-pub struct Sup {
+pub struct Node {
     repository_base_url: String,
     supervisor_bin: PathBuf,
     server_bin: PathBuf,
     platform: String,
     exe: &'static str,
-    guardian_bin: PathBuf,
+    launcher_bin: PathBuf,
     dir: PathBuf,
     product: String,
     pub install_root: PathBuf,
     seed_binary: PathBuf,
     check_interval: Option<String>,
     health_grace: Option<String>,
-    drain_hold: Option<String>,
     health_successes: u32,
     confirmation_window: Option<String>,
-    /// The signed lifecycle reconciler every fixture runs. Not optional: `new` always installs
-    /// the default `accept-managed` fixture, and a scenario only ever swaps in its own.
-    lifecycle_command: Vec<String>,
+    /// The mode of the one signed reconciler every scenario runs. `inert` records and succeeds; a
+    /// scenario selects its own mode exactly once (see [`Node::mode`]).
+    lifecycle_mode: String,
     supervisor_check_interval: Option<String>,
     ready_timeout: Option<String>,
-    probe_address: Option<String>,
     seed_application: bool,
-    /// Override the supervisor binary the guardian runs (self-update tests supply a
+    /// Override the agent binary the launcher runs (self-update tests supply a
     /// specific version); defaults to the built one.
     supervisor_override: Option<PathBuf>,
     /// Sign `ordered_install_fallback` into the assignment: a cold node whose exact assigned
@@ -59,47 +51,36 @@ pub struct Sup {
     ordered_install_fallback: bool,
     secrets: Vec<updated_contracts::assignment::SecretReference>,
 }
-/// The reconciler every fixture starts with: the shared cross-platform fixture in `accept-managed`
-/// mode. There is one reconciler implementation in this harness, so a scenario can never assert
-/// against an operation vocabulary the supervisor does not speak.
-fn default_lifecycle_command(dir: &Path) -> Vec<String> {
-    vec![
-        std::env::current_exe()
-            .expect("the e2e lifecycle fixture must have a current executable")
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        dir.join("default-lifecycle-state").display().to_string(),
-        "accept-managed".into(),
-    ]
-}
 
-impl Sup {
-    /// The tower managing `command` (the app binary + args) against the repo under
-    /// `dir` served at `srv`, for `product`.
-    pub fn new(ctx: &Ctx, dir: &Path, srv: &str, product: &str, command: Vec<String>) -> Self {
-        let seed_binary = PathBuf::from(command.first().expect("app command requires binary"));
-        let lifecycle_command = default_lifecycle_command(dir);
-        Sup {
+/// The mode the reconciler starts in: record the invocation and succeed. There is one reconciler
+/// implementation in this harness, so a scenario can never assert against an operation vocabulary
+/// the agent does not speak.
+const INERT: &str = "inert";
+
+impl Node {
+    /// A node stack for `product`, fed by the repo under `dir` served at `srv`.
+    pub fn new(ctx: &Ctx, dir: &Path, srv: &str, product: &str) -> Self {
+        // Every seeded predecessor is the version-agnostic sample release at 1.0.0; its identity
+        // comes from the bundle config the publisher writes, never from the bytes.
+        let seed_binary = app_v(ctx, "1.0.0");
+        Node {
             repository_base_url: format!("https://{srv}/"),
             supervisor_bin: ctx.supervisor.clone(),
             server_bin: ctx.server.clone(),
             platform: ctx.platkey.clone(),
             exe: ctx.exe,
-            guardian_bin: ctx.bootstrap.clone(),
+            launcher_bin: ctx.bootstrap.clone(),
             dir: dir.to_path_buf(),
             product: product.into(),
             install_root: dir.join("install"),
             seed_binary,
             check_interval: None,
             health_grace: None,
-            drain_hold: None,
             health_successes: 1,
             confirmation_window: None,
-            lifecycle_command,
+            lifecycle_mode: INERT.into(),
             supervisor_check_interval: None,
             ready_timeout: None,
-            probe_address: None,
             seed_application: true,
             supervisor_override: None,
             ordered_install_fallback: false,
@@ -120,22 +101,20 @@ impl Sup {
         self.ordered_install_fallback = true;
         self
     }
-    /// Install the cross-platform Rust lifecycle fixture. It implements the whole lifecycle
-    /// protocol and, on the `healthcheck` operation, fails unless `http://{svc}/healthz` answers.
-    pub fn readiness_health(self, svc: &str) -> Self {
-        let executable = std::env::current_exe()
-            .expect("the e2e lifecycle fixture must have a current executable");
-        let state_dir = self.dir.join("http-lifecycle-state").display().to_string();
-        self.lifecycle(vec![
-            executable.display().to_string(),
-            "--lifecycle-fixture".into(),
-            state_dir,
-            format!("http-health=http://{svc}/healthz"),
-        ])
+    /// The reconciler manages the sample application at `address`: its `apply` converges the
+    /// workload onto the candidate, its `rollback` onto the predecessor, and its `healthcheck`
+    /// observes it. The agent never touches that process.
+    pub fn workload(self, address: &str) -> Self {
+        self.mode(&format!("workload={address}"))
     }
-    pub fn guardian_probes(mut self, address: &str) -> Self {
-        self.probe_address = Some(address.into());
-        self
+    /// [`workload`](Self::workload) with a deterministic fault injected into the application.
+    pub fn faulty_workload(self, address: &str, fault: &str) -> Self {
+        self.mode(&format!("workload={address},fault={fault}"))
+    }
+    /// [`workload`](Self::workload) whose hook withdraws it from traffic for `drain_millis` before
+    /// replacing it — the drain a readiness-aware load balancer needs, performed by the release.
+    pub fn draining_workload(self, address: &str, drain_millis: u64) -> Self {
+        self.mode(&format!("workload={address},drain={drain_millis}"))
     }
     pub fn local_repository(mut self) -> Self {
         self.repository_base_url = format!("{}/", self.dir.join("repo").display());
@@ -149,13 +128,6 @@ impl Sup {
         self.health_grace = Some(s.into());
         self
     }
-    /// How long the built-in drain holds after readiness is withdrawn and before the running
-    /// release is stopped. Unset means no hold at all (stop immediately), which is what every
-    /// scenario but the zero-downtime ones wants: it keeps their upgrades prompt.
-    pub fn drain_hold(mut self, s: &str) -> Self {
-        self.drain_hold = Some(s.into());
-        self
-    }
     pub fn health_successes(mut self, successes: u32) -> Self {
         self.health_successes = successes;
         self
@@ -164,43 +136,56 @@ impl Sup {
         self.confirmation_window = Some(s.into());
         self
     }
-    /// Install this fixture's reconciler. A fixture configures its reconciler exactly once: two
-    /// reconciler-selecting calls in one builder chain would leave the last one silently winning
-    /// and the earlier one's intent unmet.
-    pub fn lifecycle(mut self, command: Vec<String>) -> Self {
+    /// Select the reconciler's mode (see `crate::fixture`). A scenario selects it exactly once: two
+    /// mode-selecting calls in one builder chain would leave the last one silently winning and the
+    /// earlier one's intent unmet.
+    pub fn mode(mut self, mode: &str) -> Self {
         assert_eq!(
-            self.lifecycle_command,
-            default_lifecycle_command(&self.dir),
-            "a fixture selects its node reconciler exactly once"
+            self.lifecycle_mode, INERT,
+            "a scenario selects its node reconciler's mode exactly once"
         );
-        self.lifecycle_command = command;
+        self.lifecycle_mode = mode.into();
         self
     }
     pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
         self.supervisor_check_interval = Some(check_interval.into());
         self
     }
-    /// How long a replacement supervisor has to prove ready before the guardian rolls back.
+    /// How long a replacement agent has to prove ready before the launcher rolls back.
     pub fn ready_timeout(mut self, secs: &str) -> Self {
         self.ready_timeout = Some(secs.into());
         self
     }
-    /// Run this supervisor binary instead of the default (self-update tests).
+    /// Run this agent binary instead of the default (self-update tests).
     pub fn supervisor_bin(mut self, path: &Path) -> Self {
         self.supervisor_override = Some(path.to_path_buf());
         self
     }
 
-    /// Start with only bootstrap + supervisor; the supervisor must install the
-    /// first trusted application before the guardian launches anything.
+    /// Start with only the launcher + agent and no installed release: the agent must cold-install
+    /// the first trusted application and converge it through the reconciler's `apply`.
     pub fn cold_install(mut self) -> Self {
         self.seed_application = false;
         self
     }
 
-    /// The guardian's state directory for this scenario.
+    /// The launcher's state directory for this scenario.
     pub fn state_dir(&self) -> PathBuf {
-        self.dir.join("guardian-state")
+        self.dir.join("launcher-state")
+    }
+
+    /// The reconciler command this node publishes and runs: this driver's own executable in the
+    /// selected mode, recording into the scenario's fixture root.
+    fn lifecycle_command(&self) -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .expect("the reconciler fixture must have a current executable")
+                .display()
+                .to_string(),
+            crate::fixture::FLAG.into(),
+            crate::fixture::root(&self.dir).display().to_string(),
+            self.lifecycle_mode.clone(),
+        ]
     }
 
     /// Materialize a provider `command` into a real executable source tree with a stable
@@ -360,7 +345,7 @@ impl Sup {
                 .arg(self.dir.join("keys"))
                 .args(["--id", "default"]);
             let (path, sha, signed_args) =
-                self.publish_provider("lifecycle", &self.lifecycle_command.clone())?;
+                self.publish_provider("lifecycle", &self.lifecycle_command())?;
             provider_set
                 .args(["--provider-path", &path])
                 .args(["--provider-sha256", &sha])
@@ -517,7 +502,7 @@ impl Sup {
         // Carry the same signed provider set the published assignment references, so the seeded
         // predecessor is faithful to a cold-installed node (install stages its providers). Without
         // this the first update's rollback restores a predecessor with no providers to replay.
-        let command = self.lifecycle_command.clone();
+        let command = self.lifecycle_command();
         let installed = updated::state::InstalledState::confirmed(
             lineage,
             staged,
@@ -527,10 +512,10 @@ impl Sup {
         updated::state::write_installed(&paths.installed, &installed).map_err(str_err)
     }
 
-    /// A guardian command: `bootstrap --state-dir <dir> --supervisor-config <cfg>
-    /// --supervisor <supervisor>`. This is the whole tower — the guardian owns the app,
-    /// launches the supervisor, and reflects the app's exit code.
-    pub fn guardian(self) -> R<Command> {
+    /// A launcher command: `bootstrap --state-dir <dir> --supervisor-config <cfg>
+    /// --supervisor <agent>`. This is the whole node stack — the launcher decides which agent
+    /// binary runs, and the agent runs packages.
+    pub fn launcher(self) -> R<Command> {
         let state_dir = self.state_dir();
         std::fs::create_dir_all(&state_dir).map_err(str_err)?;
         let supervisor = self
@@ -539,7 +524,7 @@ impl Sup {
             .unwrap_or_else(|| self.supervisor_bin.clone());
         let ready_timeout = self.ready_timeout.clone().unwrap_or_else(|| "30".into());
         let cfg = self.write_config()?;
-        let mut c = Command::new(&self.guardian_bin);
+        let mut c = Command::new(&self.launcher_bin);
         c.arg("--state-dir")
             .arg(&state_dir)
             .arg("--supervisor-config")
@@ -550,9 +535,6 @@ impl Sup {
             .arg(&ready_timeout)
             .arg("--confirm-timeout")
             .arg("1");
-        if let Some(address) = &self.probe_address {
-            c.arg("--probe-address").arg(address);
-        }
         Ok(c)
     }
 }
@@ -590,10 +572,10 @@ fn resolve_executable(program: &str) -> R<PathBuf> {
 }
 
 /// The single builder of the `server publish-assignment` invocation — the signed-assignment format.
-/// Both the harness's initial publish and a `Sup` republish go through it, so a change to how an
+/// Both the harness's initial publish and a `Node` republish go through it, so a change to how an
 /// assignment is published (a new required flag, a changed marker) lands in exactly one place and
 /// the two entry points can never drift. The metadata/targets URLs are the only per-caller inputs
-/// (the harness derives them from a listen address; a `Sup` from its repository base).
+/// (the harness derives them from a listen address; a `Node` from its repository base).
 pub fn publish_assignment(
     server: &Path,
     dir: &Path,
@@ -629,7 +611,7 @@ pub fn publish_assignment(
         .args(["--provider-set-sha256", &set_sha])
         .arg("--runtime")
         .arg(runtime);
-    // The Sup builder drops this marker when ordered-install fallback is opted into; it must
+    // The Node builder drops this marker when ordered-install fallback is opted into; it must
     // ride the *initial* assignment (this is the doc a cold node resolves), not only later
     // republishes, or the first install pins the assigned head exactly and cannot descend.
     if dir.join("ordered-install-fallback").exists() {
@@ -638,12 +620,12 @@ pub fn publish_assignment(
     crate::harness::run(&mut command)
 }
 
-pub fn republish_assignment(sup: &Sup, deployment: &str) -> R {
+pub fn republish_assignment(node: &Node, deployment: &str) -> R {
     publish_assignment(
-        &sup.server_bin,
-        &sup.dir,
-        &format!("{}metadata/", sup.repository_base_url),
-        &format!("{}targets/", sup.repository_base_url),
+        &node.server_bin,
+        &node.dir,
+        &format!("{}metadata/", node.repository_base_url),
+        &format!("{}targets/", node.repository_base_url),
         deployment,
     )
 }

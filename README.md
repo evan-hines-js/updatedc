@@ -379,7 +379,7 @@ The E2E harness creates a real signed repository and disposable towers under
 `target/e2e-work/`. It covers application upgrade and rollback, a tampered trust root,
 offline launch, rejection persistence, transaction-boundary crashes, locking, supervisor
 adoption/self-update, one-shot launch, and the provider-managed lifecycle (including a
-Magnolia-shaped enterprise upgrade whose `apply` backs up state and migrates it, whose
+Jenkins-shaped enterprise upgrade whose `apply` backs up state and migrates it, whose
 `healthcheck` gates the result, and which rolls back on failure). Its signed chaotic-application
 fixture separately proves fail-closed behavior for an exit before bind, persistent 503, a
 health request held for five minutes, flapping readiness, a crash during probing, and

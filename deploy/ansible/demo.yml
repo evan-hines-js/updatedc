@@ -4,8 +4,8 @@
 #     cd updated && ansible-playbook deploy/ansible/demo.yml
 #
 # It installs the deps (docker/kind/kubectl/rust), brings up the kind demo (operator + CDN +
-# fleet + Magnolia), routes every endpoint through nginx, and provisions a co-located
-# out-of-cluster agent on this same host that doubles as the external Magnolia VM — it reaches
+# fleet + Jenkins), routes every endpoint through nginx, and provisions a co-located
+# out-of-cluster agent on this same host that doubles as the external Jenkins VM — it reaches
 # the in-cluster gateway locally (resolving updatec-gateway to nginx on 127.0.0.1; no socat, no
 # LAN-IP). When it finishes, browse to http://<this-server>/ .
 - name: updated operator demo (single server)
@@ -19,19 +19,19 @@
     demo_kube_context: kind-updatec-demo
     # Hostname handed to `updatec-demo agent-name` below to derive this host's enrollment name.
     # It MUST equal the compiled-in
-    # `DEMO_EXTERNAL_VM_HOSTNAME` ("magnolia-manual-vm", crates/updatec-demo/src/layout.rs):
-    # `updatec-demo setup` labels the manual Magnolia node by
+    # `DEMO_EXTERNAL_VM_HOSTNAME` ("jenkins-manual-vm", crates/updatec-demo/src/layout.rs):
+    # `updatec-demo setup` labels the manual Jenkins node by
     # `resource_name(DEMO_EXTERNAL_VM_HOSTNAME)` regardless of what is set here, and the demo UI
     # selects on the labels it patches there (`demo.updated.dev/node` / `/cohort` / `/kind`,
     # `label_external_vm_agent`), not on this variable. Changing it without changing the constant
     # enrolls the agent under a name the demo layer never patches: the labels land on a
-    # non-existent UpdateAgent, the `external-vm` cohort stays empty, and the Magnolia group
+    # non-existent UpdateAgent, the `external-vm` cohort stays empty, and the Jenkins group
     # manages no node — the agent runs on this host but never appears in the demo.
-    demo_colocated_hostname: magnolia-manual-vm
+    demo_colocated_hostname: jenkins-manual-vm
   roles:
     # Order matters: bring up the cluster + gateway ingress first, then (in tasks, below) enroll
     # the co-located agent, THEN apply the demo layer — which labels that now-enrolled agent into
-    # the manual Magnolia group.
+    # the manual Jenkins group.
     - demo_deps
     - demo_cluster
     - demo_ingress
@@ -65,7 +65,7 @@
       changed_when: false
 
     # A real agent on THIS host, outside kind — the co-located "external VM" that becomes the
-    # manual Magnolia node. Same role production fleets
+    # manual Jenkins node. Same role production fleets
     # use; only the variables differ: the workspace is already here (so it is built in place, no
     # rsync), the gateway names resolve to nginx on 127.0.0.1 (no socat shim), and the enrollment
     # name is the sha-derived resource name the demo layer addresses.

@@ -43,7 +43,7 @@ pub(crate) struct Demo {
     /// separates a genuine rollback from a cohort still sitting untouched below the bad version.
     pub(crate) left_lb: Arc<StdMutex<std::collections::HashSet<String>>>,
     /// Live load-balancer membership per fleet node (pod name → currently `Ready`), maintained
-    /// by the same readiness watch ([`spawn_readiness_watcher`]). A fleet/Magnolia pod's native
+    /// by the same readiness watch ([`spawn_readiness_watcher`]). A fleet/Jenkins pod's native
     /// readinessProbe drives the per-set Service EndpointSlices, so its `Ready` condition *is*
     /// whether it is in the pool — reading it from the watch stream means the UI's IN/OUT and the
     /// synthetic load balancer's endpoint set reflect the very signal Kubernetes routes on, with
@@ -115,7 +115,7 @@ impl Demo {
             let resource = agent.name_any();
             // Running version and health come straight from the control plane — the operator
             // publishes each node's last rollout report onto its UpdateAgent status. The demo
-            // never probes the managed app for a version, so a Magnolia node (which speaks no
+            // never probes the managed app for a version, so a Jenkins node (which speaks no
             // /version endpoint) is read exactly like a sample-app node.
             let (selected_group, version, healthy) = agent
                 .status
@@ -1069,7 +1069,7 @@ impl Demo {
     /// SIGKILLs pods — no graceful drain — so recovery is purely from persisted, PVC-backed
     /// state: a recreated agent must resume an interrupted cold-install from its install
     /// journal, recover a mid-flight upgrade from the update journal, relaunch the committed
-    /// app, or restore Magnolia's in-place JCR from its backup disk.
+    /// app, or restore Jenkins's in-place JCR from its backup disk.
     ///
     /// Two bounded targets, so it exercises recovery without ever breaching availability:
     ///   * Fleet pods — only pods already *draining* (out of the load balancer), and exactly one

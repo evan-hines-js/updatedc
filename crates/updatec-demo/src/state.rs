@@ -6,9 +6,9 @@ pub(crate) struct FleetNode {
     pub(crate) selected_group: Option<String>,
     /// The version the node is actually running, straight from the control plane
     /// (`UpdateAgent.status.reportedVersion`) — never probed off the managed app, so it works
-    /// for any app kind, a Rust service or a real Magnolia CMS alike.
+    /// for any app kind, a Rust service or a real Jenkins alike.
     pub(crate) version: Option<String>,
-    /// The app kind this node runs (`demo.updated.dev/kind`, e.g. `magnolia`); `None` is the
+    /// The app kind this node runs (`demo.updated.dev/kind`, e.g. `jenkins`); `None` is the
     /// default sample application. The UI marks non-default kinds distinctly.
     pub(crate) kind: Option<String>,
     pub(crate) healthy: bool,

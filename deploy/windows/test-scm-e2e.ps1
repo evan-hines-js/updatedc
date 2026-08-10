@@ -1,6 +1,17 @@
-# Requires an elevated PowerShell. Exercises the native SCM host with the current
-# bundle-only installation model: SCM -> wrapper -> bootstrap -> supervisor -> app,
-# followed by a clean service stop and a fresh launch of the committed bundle.
+# Requires an elevated PowerShell. Exercises the native SCM host with the current bundle-only
+# installation model: SCM -> wrapper -> launcher -> agent, a real signed PowerShell reconciler that
+# the agent invokes to converge the release, a clean service stop, and a fresh launch of the
+# committed bundle.
+#
+# SCOPE, deliberately: this drives the launcher + agent lifecycle and one full reconciler converge.
+# It does NOT have the reconciler start a workload process. The property that matters here is
+# ownership, and it is asserted directly: an SCM stop must cleanly end the tree the service owns —
+# the wrapper, the launcher and the agent — and a workload is provably not part of that tree,
+# because the agent never launches, holds, or stops one. What runs the workload is the operator's
+# own mechanism, driven from the reconciler (`sc.exe`, a container runtime, a config reload); on
+# Windows a reconciler that instead forks a workload as its own child would have that child killed
+# with the hook's job object when the hook returns, so driving the service manager is the shape this
+# platform supports and the shape this test's reconciler stands in for.
 [CmdletBinding()]
 param()
 
@@ -10,16 +21,15 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $work = Join-Path $root 'target\scm-e2e'
 $repo = Join-Path $work 'repo'
 $keys = Join-Path $work 'keys'
-$guardianState = Join-Path $work 'guardian-state'
+$launcherState = Join-Path $work 'launcher-state'
 $install = Join-Path $work 'install'
 $bundle = Join-Path $work 'bundle-1.0.0'
+$providerSource = Join-Path $work 'reconciler-source'
+$receipt = Join-Path $work 'reconciler-operations.log'
 $config = Join-Path $work 'bootstrap.toml'
 $runtime = Join-Path $work 'runtime.json'
 $repoPort = 21980
-$appPort = 21990
 $serverProcess = $null
-$appPid = $null
-$restartedPid = $null
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -37,29 +47,39 @@ function Wait-ServiceState([string]$wanted, [int]$seconds = 30) {
     throw "service did not reach $wanted within ${seconds}s"
 }
 
-function Wait-Http([string]$path, [int]$seconds = 30) {
+# The reconciler's recorded history: one line per invocation, `operation<TAB>attempt-id<TAB>reason`.
+function Wait-Operation([string]$operation, [int]$seconds = 60) {
     $deadline = (Get-Date).AddSeconds($seconds)
     do {
-        try {
-            return (Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:$appPort$path").Content.Trim()
-        } catch {
-            Start-Sleep -Milliseconds 200
+        if (Test-Path $receipt) {
+            $match = Get-Content $receipt | Where-Object { $_.StartsWith("$operation`t") }
+            if ($match) { return $match }
         }
-    } while ((Get-Date) -lt $deadline)
-    throw "application endpoint $path did not become ready"
-}
-
-function Wait-ProcessExit([int]$id, [int]$seconds = 30) {
-    $deadline = (Get-Date).AddSeconds($seconds)
-    do {
-        if (-not (Get-Process -Id $id -ErrorAction SilentlyContinue)) { return }
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $deadline)
-    throw "application process $id did not exit within ${seconds}s"
+    throw "the agent never invoked the reconciler's $operation operation"
 }
 
-function Read-DesiredSupervisor() {
-    $pointer = Join-Path $guardianState 'desired-supervisor'
+function Get-TreeProcessIds() {
+    $ids = @()
+    foreach ($name in @('bootstrap', 'supervisor', 'selfupdate-service')) {
+        $ids += (Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    }
+    return $ids
+}
+
+function Wait-ProcessExit([int[]]$ids, [int]$seconds = 30) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do {
+        $alive = $ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }
+        if (-not $alive) { return }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+    throw "the service tree left processes running after a clean stop: $($alive -join ', ')"
+}
+
+function Read-DesiredAgent() {
+    $pointer = Join-Path $launcherState 'desired-supervisor'
     $lines = [IO.File]::ReadAllLines($pointer)
     if ($lines.Count -ne 2 -or $lines[0] -ne 'supervisor-v1' -or -not $lines[1]) {
         throw "invalid desired-supervisor pointer: $($lines -join ' | ')"
@@ -72,9 +92,10 @@ try {
     & sc.exe delete $service 2>$null | Out-Null
     Start-Sleep -Milliseconds 500
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force $guardianState | Out-Null
+    New-Item -ItemType Directory -Force $launcherState | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'bin') | Out-Null
     New-Item -ItemType Directory -Force (Join-Path $bundle 'config') | Out-Null
+    New-Item -ItemType Directory -Force (Join-Path $providerSource 'bin') | Out-Null
 
     Push-Location $root
     try {
@@ -91,15 +112,46 @@ try {
         "version = `"1.0.0`"`n",
         [Text.UTF8Encoding]::new($false)
     )
-    $initialSupervisor = Join-Path $work 'supervisor.exe'
-    Copy-Item (Join-Path $bin 'supervisor.exe') $initialSupervisor
+    $initialAgent = Join-Path $work 'supervisor.exe'
+    Copy-Item (Join-Path $bin 'supervisor.exe') $initialAgent
+
+    # The release's own node reconciler: an ordinary PowerShell script, which is the whole point of
+    # the protocol. It records every invocation and converges nothing further, standing in for the
+    # `sc.exe`/config-reload work an operator's script does here.
+    $reconcilerText = @"
+[CmdletBinding()] param([Parameter(ValueFromRemainingArguments = `$true)] [string[]] `$rest)
+`$ErrorActionPreference = 'Stop'
+`$operation = `$rest[0]
+function Value([string] `$name) {
+    for (`$i = 0; `$i -lt `$rest.Count - 1; `$i++) { if (`$rest[`$i] -eq `$name) { return `$rest[`$i + 1] } }
+    return ''
+}
+if ((Value '--protocol') -ne '1') { exit 2 }
+`$line = "`$operation`t`$(Value '--attempt-id')`t`$(Value '--reason')`t`$(Value '--candidate-version')"
+Add-Content -LiteralPath '$receipt' -Value `$line
+if (`$operation -eq 'inspect') { Write-Output "candidate-version=`$(Value '--candidate-version')" }
+exit 0
+"@
+    [IO.File]::WriteAllText(
+        (Join-Path $providerSource 'bin\reconciler.ps1'),
+        $reconcilerText,
+        [Text.UTF8Encoding]::new($false)
+    )
 
     & (Join-Path $bin 'server.exe') init --repo $repo --keys $keys
     if ($LASTEXITCODE) { throw 'repository initialization failed' }
     & (Join-Path $bin 'server.exe') publish-app --repo $repo --keys $keys --product app `
         --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }
-    & (Join-Path $bin 'server.exe') publish-provider-set --repo $repo --keys $keys --id default
+    & (Join-Path $bin 'server.exe') publish-provider-artifact --repo $repo --keys $keys `
+        --product app-lifecycle --version 1.0.0 --bundle "windows-x86_64=$providerSource" `
+        --entrypoint bin/reconciler.ps1
+    if ($LASTEXITCODE) { throw 'publishing the node reconciler failed' }
+    $providerTarget = 'products/app-lifecycle/stable/1.0.0/windows-x86_64/app-lifecycle'
+    $providerSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $providerTarget).Trim()
+    if ($LASTEXITCODE) { throw 'resolving the reconciler hash failed' }
+    & (Join-Path $bin 'server.exe') publish-provider-set --repo $repo --keys $keys --id default `
+        --provider-path $providerTarget --provider-sha256 $providerSha --provider-timeout-ms 30000
     if ($LASTEXITCODE) { throw 'publishing provider set failed' }
     $appTarget = 'products/app/stable/1.0.0/windows-x86_64/app'
     $setTarget = 'provider-sets/default.json'
@@ -108,8 +160,7 @@ try {
     $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $setTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
     $runtimeJson = @{
-        mode = 'managed'; product = 'app'; channel = 'stable'; install_root = $install
-        args = @('--addr', "127.0.0.1:$appPort")
+        product = 'app'; channel = 'stable'; install_root = $install
         repository = @{metadata_limit=1048576; target_limit=536870912; transport_timeout_seconds=30}
         storage = @{inactive_releases=2; inactive_providers=2; inactive_supervisors=1; inactive_bytes=1073741824; inactive_repository_caches=2}
         timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; supervisor_check_interval_seconds=3600}
@@ -127,7 +178,7 @@ try {
     & (Join-Path $bin 'server.exe') export-enrollment --repo $repo `
         --assignment assignments/agents/agent.json --agent-id agent `
         --routing-base-url "http://127.0.0.1:$repoPort/" `
-        --output (Join-Path $guardianState 'enrollment.json')
+        --output (Join-Path $launcherState 'enrollment.json')
     if ($LASTEXITCODE) { throw 'exporting enrollment bundle failed' }
     # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never
     # calls /enroll — but the bootstrap must still be a complete, valid EnrollmentBootstrap. The name
@@ -143,19 +194,25 @@ ca = 'unused-preplaced-ca.crt'
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
 
     $wrapper = Join-Path $bin 'selfupdate-service.exe'
-    $bootstrap = Join-Path $bin 'bootstrap.exe'
-    $binPath = "`"$wrapper`" --bootstrap `"$bootstrap`" --state-dir `"$guardianState`" --supervisor-config `"$config`" --supervisor `"$initialSupervisor`""
+    $launcher = Join-Path $bin 'bootstrap.exe'
+    $binPath = "`"$wrapper`" --bootstrap `"$launcher`" --state-dir `"$launcherState`" --supervisor-config `"$config`" --supervisor `"$initialAgent`""
     & sc.exe create $service binPath= $binPath start= demand | Out-Null
     if ($LASTEXITCODE) { throw 'SCM service creation failed' }
 
     & sc.exe start $service | Out-Null
     Wait-ServiceState 'Running'
-    $appPid = [int](Wait-Http '/pid')
-    if ((Wait-Http '/version') -ne '1.0.0') { throw 'unexpected baseline version' }
 
-    $desired = Read-DesiredSupervisor
-    if (-not $desired.Equals([IO.Path]::GetFullPath($initialSupervisor), [StringComparison]::OrdinalIgnoreCase)) {
-        throw "guardian pointer does not name the initial supervisor: $desired"
+    # The agent converged the release the only way it can: through the release's own hooks. The
+    # first boot's apply carries `install`, and the boot readiness gate runs under the reserved
+    # `boot` identity.
+    $apply = Wait-Operation 'apply'
+    if (($apply -split "`t")[2] -ne 'install') { throw "the first converge was not an install: $apply" }
+    $gate = Wait-Operation 'healthcheck'
+    if (($gate -split "`t")[1] -ne 'boot') { throw "the boot readiness gate did not run under the boot identity: $gate" }
+
+    $desired = Read-DesiredAgent
+    if (-not $desired.Equals([IO.Path]::GetFullPath($initialAgent), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "the launcher pointer does not name the initial agent: $desired"
     }
     $installed = Get-Content (Join-Path $install 'state\installed.json') -Raw | ConvertFrom-Json
     $active = Get-Content (Join-Path $install 'active-release') -Raw | ConvertFrom-Json
@@ -166,25 +223,30 @@ ca = 'unused-preplaced-ca.crt'
         throw 'active-release does not name the committed bundle'
     }
 
+    # A clean stop must end the tree the service owns — wrapper, launcher and agent — with no
+    # external reaper. Nothing else is in that tree: the agent holds no workload process.
+    $tree = Get-TreeProcessIds
+    if (-not $tree) { throw 'the running service exposed no launcher/agent processes to stop' }
     & sc.exe stop $service | Out-Null
     Wait-ServiceState 'Stopped'
-    Wait-ProcessExit $appPid
-    $reachable = $true
-    try {
-        Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:$appPort/pid" | Out-Null
-    } catch {
-        $reachable = $false
-    }
-    if ($reachable) { throw 'application remained reachable after its guardian stopped' }
+    Wait-ProcessExit $tree
 
+    # A fresh launch re-converges the committed bundle through the same reconciler, this time as a
+    # restart, and never moves the agent pointer.
+    $before = (Get-Content $receipt).Count
     & sc.exe start $service | Out-Null
     Wait-ServiceState 'Running'
-    $restartedPid = [int](Wait-Http '/pid')
-    if ($restartedPid -eq $appPid) { throw "application PID unexpectedly survived guardian restart ($appPid)" }
-    if ((Wait-Http '/version') -ne '1.0.0') { throw 'restarted application has an unexpected version' }
-    if ((Read-DesiredSupervisor) -ne $desired) { throw 'SCM restart changed the supervisor pointer' }
+    $deadline = (Get-Date).AddSeconds(60)
+    do {
+        $restart = Get-Content $receipt | Select-Object -Skip $before |
+            Where-Object { $_.StartsWith("apply`t") -and ($_ -split "`t")[2] -eq 'restart' }
+        if ($restart) { break }
+        Start-Sleep -Milliseconds 200
+    } while ((Get-Date) -lt $deadline)
+    if (-not $restart) { throw 'the relaunched agent never re-converged the committed release' }
+    if ((Read-DesiredAgent) -ne $desired) { throw 'the SCM restart changed the agent pointer' }
 
-    Write-Host "SUCCESS: native SCM stop/start relaunched committed bundle 1.0.0 ($appPid -> $restartedPid)" -ForegroundColor Green
+    Write-Host "SUCCESS: SCM stop ended the launcher+agent tree cleanly and a fresh start re-converged committed bundle 1.0.0 through its own reconciler" -ForegroundColor Green
 }
 finally {
     if (Get-Service -Name $service -ErrorAction SilentlyContinue) {
@@ -192,7 +254,5 @@ finally {
         try { Wait-ServiceState 'Stopped' 10 } catch { }
     }
     & sc.exe delete $service 2>$null | Out-Null
-    if ($appPid) { Stop-Process -Id $appPid -Force -ErrorAction SilentlyContinue }
-    if ($restartedPid) { Stop-Process -Id $restartedPid -Force -ErrorAction SilentlyContinue }
     if ($serverProcess) { Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue }
 }

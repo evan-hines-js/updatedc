@@ -22,7 +22,13 @@ The public interface has exactly four operations:
 - `apply` — idempotently converge machine state to the candidate. `--reason` distinguishes
   `install`, `update`, and `restart`/repair.
 - `healthcheck` — make one bounded readiness observation. Exit zero means healthy.
-- `rollback` — idempotently restore or compensate toward the predecessor.
+- `rollback` — idempotently restore or compensate toward the release being restored.
+
+`--candidate` is always the release to converge ONTO, in both directions: on a rollback the
+agent passes the release being restored as `--candidate` and the release that failed as
+`--predecessor`. A reconciler that converges toward `--candidate` therefore needs no
+direction-specific branch at all; `--predecessor` exists for compensation that must know what
+it is undoing (which backup to restore, which schema to reverse).
 - `inspect` — make one bounded steady-state observation. Non-empty stdout is opaque fingerprint
   material; typed dependency outputs are written to `--output-file`.
 
@@ -158,7 +164,8 @@ case "$operation" in
     ./existing-status-command
     ;;
   rollback)
-    ./existing-restore-command --source "$predecessor"
+    # On a rollback, --candidate IS the release being restored.
+    ./existing-restore-command --source "$candidate"
     ;;
   inspect)
     ./existing-status-command

@@ -508,7 +508,7 @@ pub struct UpdateAgentStatus {
     /// The version the node last reported it is actually running, from its rollout telemetry.
     /// This is the control plane's authoritative view of a node's running version — no
     /// consumer probes the managed app, so it works for any app kind (a Rust service, a real
-    /// Magnolia CMS, anything). `None` until the node has reported at least once.
+    /// Jenkins, anything). `None` until the node has reported at least once.
     pub reported_version: Option<String>,
     /// Whether the node last reported itself settled and healthy on its assignment.
     pub reported_ready: Option<bool>,

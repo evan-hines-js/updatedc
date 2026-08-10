@@ -97,8 +97,8 @@ reaped() {
   done
 }
 
-# The deployment is provider-managed: the agent starts nothing, so the first apply on a node has to
-# start HAProxy itself rather than stage bytes and wait for a launch that never comes.
+# The agent starts nothing, so the first apply on a node has to start HAProxy itself rather than
+# stage bytes and wait for a launch that never comes.
 invoke apply "$WORK/v2" "$WORK/v1" apply
 test -f "$RUNTIME/haproxy.cfg"
 master="$(cat "$RUNTIME/haproxy.pid")"
