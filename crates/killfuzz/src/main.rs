@@ -5,7 +5,7 @@
 //! *named* state-machine boundary — that's the exhaustive proof *under the atomicity invariant*
 //! (every durable write is atomic, so a crash between boundaries is equivalent to a crash at one).
 //! This fuzzer is the adversarial check that the invariant actually holds *everywhere*: it kills the
-//! whole tower at truly arbitrary instants, which is the one thing that catches a durable write we
+//! whole stack at truly arbitrary instants, which is the one thing that catches a durable write we
 //! forgot to make atomic (or a boundary we forgot to place), and it models real pod-kill timing.
 //!
 //! It runs three sequential rounds, each a full burst of arbitrary kills, so the fuzz spans the
@@ -29,7 +29,7 @@
 //!   broken release, restore the predecessor, and roll forward to the healthy successor (versions
 //!   climb 3→5→7→9). Persistent disk — no wipes.
 //!
-//! We do NOT publish 3.0.0 until the node has provably BEGUN the 2.0.0 rollout (a clean tower is
+//! We do NOT publish 3.0.0 until the node has provably BEGUN the 2.0.0 rollout (a clean stack is
 //! run first and gated on the `applying update … -> 2.0.0` log). Otherwise 3.0.0 would pre-empt an
 //! un-attempted 2.0.0 and the node would jump straight to 3.0.0, never exercising the rollback. The
 //! `interleave` round is the stronger form of that same guarantee: it publishes the healthy
@@ -40,25 +40,25 @@
 //!
 //! It lives in its own binary — never inside the e2e concurrent scenario pool — so its aggressive
 //! whole-tree kills can never starve or collide with other scenarios. It reuses the e2e harness
-//! library for the (fragile, single-source-of-truth) TUF + guardian setup and adds only the kill
+//! library for the (fragile, single-source-of-truth) TUF + launcher setup and adds only the kill
 //! loop. Run: `cargo run -p killfuzz` (tune with `KILLFUZZ_ROUNDS` / `KILLFUZZ_SEED`).
 
+use e2e::fixture;
 use e2e::fixtures::*;
 use e2e::harness::*;
 use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // `Sup::new` signs the current test executable in as its default lifecycle provider.
-    // The e2e binary dispatches this marker to its fixture implementation, but killfuzz is a
-    // separate consumer of the shared harness. Without this dispatch, every lifecycle hook
-    // recursively starts another complete killfuzz run; the supervisor then kills or times out
-    // that nested run and can never complete pre-start on the final convergence boot.
-    //
-    // Killfuzz uses the harness's `accept-managed` mode, whose lifecycle contract is deliberately
-    // a no-op: the guardian already proves the managed process is alive. Returning success here is
-    // therefore the complete provider implementation needed by this binary.
-    if is_lifecycle_fixture(std::env::args_os()) {
+    // `Node::new` signs THIS executable in as the release's reconciler, so the agent invokes it as
+    // the hook that owns the workload. Dispatch to the shared fixture implementation before
+    // anything else: without it every hook invocation would recursively start another complete
+    // killfuzz run, which the agent then times out.
+    if fixture::is_invocation(std::env::args_os()) {
+        if let Err(error) = fixture::run() {
+            eprintln!("node reconciler fixture: {error}");
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -69,11 +69,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-fn is_lifecycle_fixture(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> bool {
-    args.into_iter()
-        .any(|arg| arg.as_ref() == "--lifecycle-fixture")
 }
 
 /// A tiny deterministic PRNG so a failing run is reproducible from its seed.
@@ -94,15 +89,13 @@ impl Lcg {
     }
 }
 
-/// Reap the tower's stragglers after a kill WITHOUT touching the mock-CDN server. `Service::drop`
-/// already killed the guardian's process group; this mops up the two things that can escape it: the
-/// app orphan on macOS (its argv carries the *install* path) and a supervisor that raced the
-/// guardian's relaunch out of the group (its argv carries the *supervisor-binary* path, e.g.
-/// `.../killfuzz-work/build/supervisor-chaos`). The server's argv carries the *repo* path, so
-/// neither pattern matches it — it must stay up to serve the repo across every kill.
-fn reap(install: &Path, supervisor: &Path) {
-    kill_stray(install);
-    kill_stray(supervisor);
+/// End the round's straggler processes WITHOUT touching the mock-CDN server. `Service::drop`
+/// already killed the launcher's process group, which takes the agent with it; what remains is the
+/// hook-managed workload, which lives in a session of its own precisely so no agent restart can
+/// disturb it. The reconciler recorded its PID, so it is stopped by identity rather than by
+/// pattern-matching argv.
+fn reap(dir: &Path) {
+    fixture::stop_workload(dir);
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -116,7 +109,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
 }
 
 /// One kill-fuzz round: `rounds` arbitrary SIGKILLs, then an untouched boot that must reconverge to
-/// a live, committed `expect`. The whole tower is respawned and killed each iteration. When
+/// a live, committed `expect`. The whole stack is respawned and killed each iteration. When
 /// `wipe_disk` is set (the cold-install round only), half the iterations wipe the install first
 /// (stateless emptyDir → fresh cold-install), half leave state to recover; an upgrade round never
 /// wipes — deleting the disk would turn it into a fresh install, not an upgrade.
@@ -129,8 +122,8 @@ fn fuzz_phase(
     seed: u64,
     rng: &mut Lcg,
     cmd: &Command,
+    dir: &Path,
     install: &Path,
-    supervisor: &Path,
     state_path: &Path,
     svc: &str,
     ver_url: &str,
@@ -144,17 +137,17 @@ fn fuzz_phase(
         if stateless {
             let _ = std::fs::remove_dir_all(install);
         }
-        let tower = Service::spawn("killfuzz", cmd);
+        let stack = Service::spawn("killfuzz", cmd);
         // Kill at a random instant spanning the install/upgrade/reject/confirm/steady window.
         let kill_ms = rng.range(150, 3500);
         std::thread::sleep(std::time::Duration::from_millis(kill_ms));
 
         // A brick is never acceptable at any kill timing: a healthy floor (1.0.0, later 2.0.0)
         // always exists at or below the assigned head, so recovery can never run out of targets.
-        if tower.log_contains("no installable application") {
-            let log = tower.captured_log();
-            drop(tower);
-            reap(install, supervisor);
+        if stack.log_contains("no installable application") {
+            let log = stack.captured_log();
+            drop(stack);
+            reap(dir);
             return fail(format!(
                 "phase {label} round {round} ({}, killed at {kill_ms}ms, seed {seed:#x}): stranded on \
                  'no installable application' — a kill must never brick a node with a healthy floor:\n{log}",
@@ -162,22 +155,22 @@ fn fuzz_phase(
             ));
         }
 
-        // SIGKILL the WHOLE tree, then reap synchronously: `Service::drop` kills the guardian's
-        // process group and joins its monitor; `reap` mops up any app/supervisor orphan (see its
-        // doc) while leaving the mock-CDN server up.
-        drop(tower);
-        reap(install, supervisor);
+        // SIGKILL the WHOLE tree, then reap synchronously: `Service::drop` kills the launcher's
+        // process group (taking the agent with it) and joins its monitor; `reap` ends the
+        // hook-managed workload while leaving the mock-CDN server up.
+        drop(stack);
+        reap(dir);
         // Do not start the next round until the tree is actually gone (service port released).
         if !wait_until(20, || http_text(ver_url).is_none()) {
             return fail(format!(
-                "phase {label} round {round}: the tower tree was not fully reaped (service port still held) after the kill"
+                "phase {label} round {round}: the node stack was not fully reaped (service port still held) after the kill"
             ));
         }
     }
 
     // An untouched boot must reconverge to this phase's expected live, committed version — proving
     // no round's kill left durable state that bricks recovery or strands the wrong release.
-    let tower = Service::spawn("killfuzz", cmd);
+    let stack = Service::spawn("killfuzz", cmd);
     let live = wait_for_version(svc, expect, 120);
     let want = expect.to_string();
     let settled = wait_until(120, || {
@@ -186,16 +179,16 @@ fn fuzz_phase(
             updated::state::Installed::Present(ref s) if s.release.version == want
         )
     });
-    let log = tower.captured_log();
-    drop(tower);
-    reap(install, supervisor);
+    let log = stack.captured_log();
+    drop(stack);
+    reap(dir);
     if !live || !settled {
         return fail(format!(
             "phase {label}: after {rounds} arbitrary SIGKILLs (seed {seed:#x}) the node never \
              reconverged to a live, committed {expect} (live={live}, settled={settled}):\n{log}"
         ));
     }
-    // Release the port before the next phase respawns the tower.
+    // Release the port before the next phase respawns the stack.
     if !wait_until(20, || http_text(ver_url).is_none()) {
         return fail(format!(
             "phase {label}: the settle boot's tree was not fully reaped (service port still held)"
@@ -212,7 +205,7 @@ fn run() -> R {
     // Silent for a couple of minutes on a cold target — say so, so it doesn't look hung.
     println!("killfuzz: building workspace binaries + sample app (first run is slow)…");
     ctx.build()?;
-    // `ctx.build()` builds server/supervisor/bootstrap; the versioned sample app is a separate
+    // `ctx.build()` builds the server, agent and launcher binaries; the versioned sample app is a separate
     // fixture the e2e runner builds explicitly, so build it here too or the publish has no source.
     // One version-agnostic binary serves every release — the version is baked into each signed
     // bundle's config, so the same bytes publish as 1.0.0, 2.0.0, and 3.0.0.
@@ -223,25 +216,24 @@ fn run() -> R {
     ctx.init_repo(&dir)?;
     // Round 1 starts with only a healthy 1.0.0 floor and ordered-install fallback signed in. The
     // corrupt 2.0.0 and healthy 3.0.0 heads are published live BETWEEN rounds (below), which re-signs
-    // the assignment in place, so the running tower rolls forward exactly as a fleet push would.
+    // the assignment in place, so the running stack rolls forward exactly as a fleet push would.
     ctx.publish(&dir, "app", "1.0.0", &app_v(&ctx, "1.0.0"))?;
 
-    let (srv, svc, probes) = ("127.0.0.1:21990", "127.0.0.1:21991", "127.0.0.1:21992");
+    let (srv, svc) = ("127.0.0.1:21990", "127.0.0.1:21991");
     let server = ctx.serve(&dir, srv)?;
-    let unplaced = dir.join(format!("not-preinstalled{}", ctx.exe));
-    let cmd = Sup::new(&ctx, &dir, srv, "app", appcmd(&unplaced, &["--addr", svc]))
+    let cmd = Node::new(&ctx, &dir, srv, "app")
         .cold_install()
+        .workload(svc)
         .ordered_install_fallback()
         .check_interval("1s")
         .health_grace("2s")
         // A short confirmation window (default is 120s) so a committed update confirms quickly
         // instead of blocking the next one. The `interleave` round in particular can only begin a
-        // fresh broken rollout once the current version is confirmed — the supervisor refuses to
+        // fresh broken rollout once the current version is confirmed — the agent refuses to
         // start a new update while one is still unconfirmed in its window. The killfuzz exercises
         // crash-safety of install/rollback/roll-forward/reconcile, not the window's duration.
         .confirmation_window("3s")
-        .guardian_probes(probes)
-        .guardian()?;
+        .launcher()?;
 
     let install = dir.join("install");
     let state_path = install.join("state/installed.json");
@@ -266,8 +258,8 @@ fn run() -> R {
         seed,
         &mut rng,
         &cmd,
+        &dir,
         &install,
-        &ctx.supervisor,
         &state_path,
         svc,
         &ver_url,
@@ -283,23 +275,23 @@ fn run() -> R {
     ctx.publish(&dir, "app", "2.0.0", &broken)?;
 
     // Gate: prove the node actually BEGINS rolling out 2.0.0 before 3.0.0 is ever published. A clean
-    // tower is run and waited on for the durable `applying update 1.0.0 -> 2.0.0` log (a broken
+    // stack is run and waited on for the durable `applying update 1.0.0 -> 2.0.0` log (a broken
     // executable makes the rollback that follows inevitable). Without this, publishing 3.0.0 could
     // pre-empt an un-attempted 2.0.0 and the node would jump straight to 3.0.0, never exercising the
     // rollback — the whole point of the round.
     {
-        let tower = Service::spawn("killfuzz", &cmd);
-        let started = wait_until(120, || tower.log_contains("applying update 1.0.0 -> 2.0.0"));
-        let log = tower.captured_log();
-        drop(tower);
-        reap(&install, &ctx.supervisor);
+        let stack = Service::spawn("killfuzz", &cmd);
+        let started = wait_until(120, || stack.log_contains("applying update 1.0.0 -> 2.0.0"));
+        let log = stack.captured_log();
+        drop(stack);
+        reap(&dir);
         // The next phase rebinds the same port, so the wait for the old listener to disappear is a
         // precondition, not a diagnostic: discarding its result meant the phase could start against
-        // a port the previous tower still held and fail for an unrelated reason.
+        // a port the previous stack still held and fail for an unrelated reason.
         if !wait_until(20, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(
-                "round 2: the previous tower never released its listener, so the next phase would \
+                "round 2: the previous stack never released its listener, so the next phase would \
                  race it for the port"
                     .to_string(),
             );
@@ -323,8 +315,8 @@ fn run() -> R {
         seed,
         &mut rng,
         &cmd,
+        &dir,
         &install,
-        &ctx.supervisor,
         &state_path,
         svc,
         &ver_url,
@@ -343,8 +335,8 @@ fn run() -> R {
         seed,
         &mut rng,
         &cmd,
+        &dir,
         &install,
-        &ctx.supervisor,
         &state_path,
         svc,
         &ver_url,
@@ -376,16 +368,16 @@ fn run() -> R {
 
         // Bring the broken update in-flight, then SIGKILL the tree with its transaction journal on
         // disk. Gate on THIS trial's fresh rollout log (`-> {broken_v}`) first, NOT on bare
-        // `journal_path.exists()`: the previous trial's settle tower can be torn down in the window
+        // `journal_path.exists()`: the previous trial's settle stack can be torn down in the window
         // after it commits an update but before it clears the spent journal, leaving a stale
         // committed journal on disk. Keying off bare journal existence would fire on that stale
         // journal — before the broken rollout even starts (the just-committed version is still
-        // unconfirmed, so the supervisor won't begin a new update yet) — and recovery would then
+        // unconfirmed, so the agent will not begin a new update yet) — and recovery would then
         // reconcile the stale version instead of {broken_v}. Waiting for `-> {broken_v}` means the
-        // gate tower has already cleared the stale journal and confirmed the predecessor, so the
+        // gate stack has already cleared the stale journal and confirmed the predecessor, so the
         // journal we then catch belongs to {broken_v}.
-        let tower = Service::spawn("killfuzz", &cmd);
-        let began = wait_until(120, || tower.log_contains(&format!("-> {broken_v}")));
+        let stack = Service::spawn("killfuzz", &cmd);
+        let began = wait_until(120, || stack.log_contains(&format!("-> {broken_v}")));
         // Tight-poll for the fresh journal (written at ActivateStarted, before the entrypoint even
         // execs) and SIGKILL the instant it lands — before the failed activation can roll up and a
         // Service restart's recovery can clear it, freezing a genuine in-flight transaction on disk.
@@ -401,9 +393,9 @@ fn run() -> R {
             seen
         };
         if !in_flight {
-            let log = tower.captured_log();
-            drop(tower);
-            reap(&install, &ctx.supervisor);
+            let log = stack.captured_log();
+            drop(stack);
+            reap(&dir);
             drop(server);
             return fail(format!(
                 "round 4 trial {trial}: the broken {broken_v} update never went in-flight \
@@ -412,12 +404,12 @@ fn run() -> R {
         }
 
         // SIGKILL the whole tree with the broken transaction still journaled.
-        drop(tower);
-        reap(&install, &ctx.supervisor);
+        drop(stack);
+        reap(&dir);
         if !wait_until(20, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(format!(
-                "round 4 trial {trial}: tower tree not reaped after the mid-flight kill"
+                "round 4 trial {trial}: stack tree not reaped after the mid-flight kill"
             ));
         }
         // The in-flight broken journal must have survived the kill — that durable record is what
@@ -434,7 +426,7 @@ fn run() -> R {
 
         // Boot into recovery. Journal-driven, it must finalize the broken transaction (reject/restore
         // the predecessor) and then roll forward to a live, committed healthy_v.
-        let tower = Service::spawn("killfuzz", &cmd);
+        let stack = Service::spawn("killfuzz", &cmd);
         let live = wait_for_version(svc, &healthy_v, 120);
         let want = healthy_v.clone();
         let settled = wait_until(120, || {
@@ -446,14 +438,14 @@ fn run() -> R {
         // Prove recovery actually reconciled the in-flight broken transaction (rather than the node
         // simply never having engaged the broken head): a recovery line must name broken_v. Which
         // classification fires depends on where the kill landed, so accept any of them.
-        let reconciled = tower.log_contains(&format!(
+        let reconciled = stack.log_contains(&format!(
             "recovery: rejected {broken_v} after failed activation"
-        )) || tower.log_contains(&format!("interrupted activation of {broken_v}"))
-            || tower.log_contains(&format!("activation of {broken_v} never landed"))
-            || tower.log_contains(&format!("completing rollback from {broken_v}"));
-        let log = tower.captured_log();
-        drop(tower);
-        reap(&install, &ctx.supervisor);
+        )) || stack.log_contains(&format!("interrupted activation of {broken_v}"))
+            || stack.log_contains(&format!("activation of {broken_v} never landed"))
+            || stack.log_contains(&format!("completing rollback from {broken_v}"));
+        let log = stack.captured_log();
+        drop(stack);
+        reap(&dir);
         if !live || !settled {
             drop(server);
             return fail(format!(
@@ -473,7 +465,7 @@ fn run() -> R {
         if !wait_until(20, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(format!(
-                "round 4 trial {trial}: settle tower not reaped (service port still held)"
+                "round 4 trial {trial}: settle stack not reaped (service port still held)"
             ));
         }
         println!(
@@ -497,12 +489,12 @@ mod tests {
 
     #[test]
     fn lifecycle_fixture_dispatch_cannot_reenter_the_fuzzer() {
-        assert!(is_lifecycle_fixture([
+        assert!(fixture::is_invocation([
             "killfuzz",
-            "pre-start",
+            "apply",
             "--",
             "--lifecycle-fixture",
         ]));
-        assert!(!is_lifecycle_fixture(["killfuzz"]));
+        assert!(!fixture::is_invocation(["killfuzz"]));
     }
 }

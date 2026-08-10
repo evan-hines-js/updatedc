@@ -4,9 +4,9 @@ set -euo pipefail
 # Signed HAProxy node reconciler. The agent supplies the operation and context as ordinary argv;
 # this script contains only HAProxy-specific machine-state policy.
 #
-# The deployment is `provider-managed`: the agent's stop and start are no-ops, so this reconciler
-# owns the HAProxy process outright. `apply` (and `rollback`) start the release when no master of
-# ours is running and re-exec the live master in place when one is — see `converge_release`.
+# The agent never touches a workload process, so this reconciler owns the HAProxy process outright.
+# `apply` (and `rollback`) start the release when no master of ours is running and re-exec the live
+# master in place when one is — see `converge_release`.
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/haproxy/lib.sh
@@ -36,7 +36,6 @@ while (($#)); do
     --input-file | --output-file) shift 2 ;;
     --predecessor) predecessor=$2; shift 2 ;;
     --predecessor-version) shift 2 ;;
-    --managed-pid) shift 2 ;;
     --) shift; break ;;
     *) die "unknown reconciler argument '$1'" ;;
   esac
@@ -59,9 +58,8 @@ case "$operation" in
     converge_release "$predecessor" "$root"
     ;;
   healthcheck)
-    # This deployment is `provider-managed`: the agent owns no application process, so a running,
-    # identified master under the runtime pid file is the whole of "healthy" — before the first
-    # upgrade as much as after one.
+    # The agent owns no workload process, so a running, identified master under the runtime pid
+    # file is the whole of "healthy" — before the first upgrade as much as after one.
     [[ -f "$runtime/haproxy.cfg" ]] || die "stable runtime configuration is missing"
     live_master "$runtime" || die "no HAProxy master is running"
     ;;

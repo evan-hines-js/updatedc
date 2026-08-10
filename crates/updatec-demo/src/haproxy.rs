@@ -11,7 +11,7 @@
 //! infrastructure (a load balancer) that fronts real services and that k8s cannot roll seamlessly.
 //!
 //! This tier sits entirely outside the sample-app cohort/set machinery and the pod-kill chaos
-//! (like the Magnolia tier), so it never perturbs the finely-tuned convergence/SLA math.
+//! (like the Jenkins tier), so it never perturbs the finely-tuned convergence/SLA math.
 
 use crate::*;
 use std::process::{Command, Stdio};

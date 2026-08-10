@@ -175,9 +175,9 @@ start_master() {
 # only in the release they name.
 #
 # A master of ours that is already running takes the new bytes in place — that re-exec is the point
-# of this provider. Where nothing of ours is running the release is started instead: this deployment
-# is `provider-managed`, so the agent launches no application process and the first deployment on a
-# node (and any later operation that finds the master gone) has no other way into service.
+# of this provider. Where nothing of ours is running the release is started instead: the agent
+# launches no workload process, so the first deployment on a node (and any later operation that
+# finds the master gone) has no other way into service.
 converge_release() {
   local release="$1" root="$2" runtime="$2/runtime"
   if live_master "$runtime"; then

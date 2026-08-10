@@ -14,7 +14,7 @@ publish_fuzz_artifact() {
     print sum
   }')
   if [ $((checksum % 2)) -eq 0 ]; then
-    printf '%s\n' magnolia
+    printf '%s\n' jenkins
   else
     printf '%s\n' sampleapp
   fi

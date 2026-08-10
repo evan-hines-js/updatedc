@@ -106,16 +106,16 @@ pub(crate) async fn start_demo(
         "statefulset/agent",
         &format!("--replicas={DEMO_TOTAL_AGENTS}"),
     ]))?;
-    let magnolia_enabled = prepare_demo_layer().await?;
-    // The out-of-cluster VM is the manual Magnolia node, so it only makes sense where Magnolia
+    let jenkins_enabled = prepare_demo_layer().await?;
+    // The out-of-cluster VM is the manual Jenkins node, so it only makes sense where Jenkins
     // is available.
-    if magnolia_enabled {
+    if jenkins_enabled {
         if let Some((ssh_target, _)) = external_vm_target() {
-            println!("[demo] provisioning the out-of-cluster Magnolia VM {ssh_target} (crude, best-effort)");
+            println!("[demo] provisioning the out-of-cluster Jenkins VM {ssh_target} (crude, best-effort)");
             match provision_external_vm(&ssh_target) {
                 Ok(()) => {
                     if let Err(error) = label_external_vm_agent() {
-                        println!("[demo] could not label the external VM's agent ({error}); it will not get Magnolia");
+                        println!("[demo] could not label the external VM's agent ({error}); it will not get Jenkins");
                     }
                 }
                 Err(error) => {
@@ -127,7 +127,7 @@ pub(crate) async fn start_demo(
         }
     }
     println!("[demo] deploying the healthproxy reconciler for the out-of-cluster slice");
-    deploy_external_reconciler(magnolia_enabled)?;
+    deploy_external_reconciler(jenkins_enabled)?;
     with_demo_port_forward(&port, |url| async move {
         if automated {
             exercise_demo(&url, exit_after).await?;
@@ -154,41 +154,41 @@ pub(crate) async fn start_demo(
 }
 
 /// Apply the demo layer onto an already-provisioned, already-scaled fleet: detect the platform
-/// and whether Magnolia is published for it, deploy the Magnolia fleet when it is, assign every
+/// and whether Jenkins is published for it, deploy the Jenkins fleet when it is, assign every
 /// enrolled node its labels, apply the UI/RBAC/per-set/per-agent resources, and wait for the
-/// managed StatefulSet to roll out. Returns whether Magnolia is enabled for this platform, which
+/// managed StatefulSet to roll out. Returns whether Jenkins is enabled for this platform, which
 /// the callers use to decide the external-VM labeling and reconciler. The one shared body behind
 /// the initial bring-up (`start_demo`) and the ansible-driven `setup_demo`; each caller keeps its
 /// own cluster preamble and external-VM handling around this call.
 async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
-    // Magnolia is only published for linux-x86_64 (its install provider fetches an x86_64 JRE),
+    // Jenkins is only published for linux-x86_64 (its install provider fetches an x86_64 JRE),
     // so on any other platform — e.g. an arm64 kind cluster on Apple Silicon — its bundle is
-    // absent. Detect that from the repo and skip the Magnolia nodes and the out-of-cluster VM
-    // entirely, running the rest of the demo. Run the full test (with Magnolia) on an x86_64 box.
+    // absent. Detect that from the repo and skip the Jenkins nodes and the out-of-cluster VM
+    // entirely, running the rest of the demo. Run the full test (with Jenkins) on an x86_64 box.
     let platform = repository_platform()?.trim().to_string();
-    let magnolia_path = format!("products/magnolia/stable/1.0.0/{platform}/app");
-    let magnolia_enabled = repository_target_sha(&magnolia_path).is_ok();
-    if magnolia_enabled {
-        println!("[demo] deploying {DEMO_MAGNOLIA_TOTAL} in-cluster Magnolia CMS nodes (author + publisher pairs); the manual node is the out-of-cluster VM (if provisioned), rolled by `updatectl deploy` against its own UpdateGroup");
-        apply_magnolia_fleet()?;
+    let jenkins_path = format!("products/jenkins/stable/1.0.0/{platform}/app");
+    let jenkins_enabled = repository_target_sha(&jenkins_path).is_ok();
+    if jenkins_enabled {
+        println!("[demo] deploying {DEMO_JENKINS_TOTAL} in-cluster Jenkins nodes (ci + release controller pairs); the manual node is the out-of-cluster VM (if provisioned), rolled by `updatectl deploy` against its own UpdateGroup");
+        apply_jenkins_fleet()?;
     } else {
-        println!("[demo] Magnolia is not published for {platform} (x86_64 only) — skipping the Magnolia nodes and the out-of-cluster VM");
+        println!("[demo] Jenkins is not published for {platform} (x86_64 only) — skipping the Jenkins nodes and the out-of-cluster VM");
     }
     println!("[demo] waiting for enrollment and assigning every new node");
     label_demo_agents()?;
-    if magnolia_enabled {
-        label_magnolia_agents()?;
+    if jenkins_enabled {
+        label_jenkins_agents()?;
     }
     label_external_agents()?;
     // The sample-app cohorts resolve their provider set from MinIO; its sha is published and
     // returned by `bootstrap_minio_release_repo`, not read from the release-server repo here.
     let provider_path = "provider-sets/rube-goldberg.json";
-    // Magnolia bundle refs, resolved only when it is published for this platform.
-    let (magnolia_sha, magnolia_provider_path, magnolia_provider_sha) = if magnolia_enabled {
+    // Jenkins bundle refs, resolved only when it is published for this platform.
+    let (jenkins_sha, jenkins_provider_path, jenkins_provider_sha) = if jenkins_enabled {
         (
-            repository_target_sha(&magnolia_path)?,
-            "provider-sets/magnolia.json".to_string(),
-            repository_target_sha("provider-sets/magnolia.json")?,
+            repository_target_sha(&jenkins_path)?,
+            "provider-sets/jenkins.json".to_string(),
+            repository_target_sha("provider-sets/jenkins.json")?,
         )
     } else {
         (String::new(), String::new(), String::new())
@@ -196,11 +196,11 @@ async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
     println!("[demo] applying the UI, RBAC, per-set services/ingress, and per-agent groups");
     apply_demo_resources(
         provider_path,
-        magnolia_enabled,
-        &magnolia_path,
-        magnolia_sha.trim(),
-        &magnolia_provider_path,
-        magnolia_provider_sha.trim(),
+        jenkins_enabled,
+        &jenkins_path,
+        jenkins_sha.trim(),
+        &jenkins_provider_path,
+        jenkins_provider_sha.trim(),
     )?;
     println!("[demo] waiting for all assigned agents to become ready");
     run(Command::new("kubectl").args([
@@ -216,7 +216,7 @@ async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
     // membership from signed CDN health. Runs after the release keys + external slice exist. Sits
     // outside the cohort/set/chaos machinery, so it never perturbs the convergence/SLA math.
     prepare_haproxy_tier(&platform).await?;
-    Ok(magnolia_enabled)
+    Ok(jenkins_enabled)
 }
 
 /// Apply the demo layer onto an already-provisioned cluster, then exit. This is the entry
@@ -224,7 +224,7 @@ async fn prepare_demo_layer() -> Result<bool, Box<dyn std::error::Error>> {
 /// base fleet, and ingress are already up (ansible provisioned them), and it does not
 /// port-forward or serve — the in-cluster UI pod serves the UI, reached through nginx. The
 /// co-located out-of-cluster agent (also provisioned by ansible) is labeled into the manual
-/// Magnolia group here, once it has enrolled.
+/// Jenkins group here, once it has enrolled.
 pub(crate) async fn setup_demo() -> Result<(), Box<dyn std::error::Error>> {
     let cluster = demo_cluster();
     use_demo_context(&cluster)?;
@@ -245,16 +245,16 @@ pub(crate) async fn setup_demo() -> Result<(), Box<dyn std::error::Error>> {
         "statefulset/agent",
         &format!("--replicas={DEMO_TOTAL_AGENTS}"),
     ]))?;
-    let magnolia_enabled = prepare_demo_layer().await?;
+    let jenkins_enabled = prepare_demo_layer().await?;
     // The co-located out-of-cluster agent (provisioned by ansible on this host) is the manual
-    // Magnolia node: label its enrolled UpdateAgent into the manual group so the control plane
-    // assigns it Magnolia. Best-effort — it retries until the agent has registered.
-    if magnolia_enabled {
+    // Jenkins node: label its enrolled UpdateAgent into the manual group so the control plane
+    // assigns it Jenkins. Best-effort — it retries until the agent has registered.
+    if jenkins_enabled {
         if let Err(error) = label_external_vm_agent() {
-            println!("[demo] could not label the co-located Magnolia agent ({error}); is it enrolled yet?");
+            println!("[demo] could not label the co-located Jenkins agent ({error}); is it enrolled yet?");
         }
     }
-    deploy_external_reconciler(magnolia_enabled)?;
+    deploy_external_reconciler(jenkins_enabled)?;
     println!(
         "[demo] setup complete: fleet, groups, per-set services/ingress, and reconciler applied"
     );
@@ -388,7 +388,7 @@ pub(crate) async fn assert_external_endpoints_reconciled() -> Result<(), Box<dyn
             }
         }
         // `>=`, not `==`: a provisioned out-of-cluster VM adds another ready endpoint on top of
-        // the pod stand-ins, and it may still be installing Magnolia when this runs.
+        // the pod stand-ins, and it may still be installing Jenkins when this runs.
         if managed_by_reconciler && ready >= DEMO_EXTERNAL_COUNT {
             println!(
                 "[demo] verified the healthproxy reconciler programmed {DEMO_EXTERNAL_COUNT} out-of-cluster endpoints from CDN health"
@@ -739,19 +739,19 @@ pub(crate) fn label_demo_agents() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The real-Magnolia nodes get a `kind=magnolia` marker (the UI badges them), their instance
-/// `role` (author/publisher — the role UpdateGroup selects on), and their node name. No
+/// The real-Jenkins nodes get a `kind=jenkins` marker (the UI badges them), their instance
+/// `role` (ci/release — the role UpdateGroup selects on), and their node name. No
 /// cohort/set/fleet labels, so they sit entirely outside the convergence state machine and
 /// pod-kill chaos — their slow ~4-minute installs never gate the fast sample-app cohorts.
-pub(crate) fn label_magnolia_agents() -> Result<(), Box<dyn std::error::Error>> {
-    for (role, _instance, _context, replicas) in MAGNOLIA_COHORTS {
+pub(crate) fn label_jenkins_agents() -> Result<(), Box<dyn std::error::Error>> {
+    for (role, replicas) in JENKINS_COHORTS {
         for ordinal in 0..replicas {
-            let node = format!("magnolia-{role}-{ordinal}");
+            let node = format!("jenkins-{role}-{ordinal}");
             patch_agent_labels(
                 &resource_name(&node),
                 serde_json::json!({
                     "demo.updated.dev/node": node,
-                    "demo.updated.dev/kind": "magnolia",
+                    "demo.updated.dev/kind": "jenkins",
                     "demo.updated.dev/role": role
                 }),
             )?;
@@ -760,57 +760,52 @@ pub(crate) fn label_magnolia_agents() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Deploy the real-Magnolia cohorts: one StatefulSet per instance role (author, publisher) on
-/// the Magnolia tower image, in the same headless `agents` Service (so `magnolia-<role>-N.agents`
+/// Deploy the real-Jenkins cohorts: one StatefulSet per instance role (ci, release) on
+/// the Jenkins tower image, in the same headless `agents` Service (so `jenkins-<role>-N.agents`
 /// resolves for the uniform readyz probe) and enrolling through the same gateway as every
-/// other node. Each pod keeps its installed state and JCR repository on a persistent volume,
-/// so a restart reuses the already-installed Magnolia (~30-60s) instead of the multi-minute
+/// other node. Each pod keeps its installed state and JENKINS_HOME data on a persistent volume,
+/// so a restart reuses the already-installed Jenkins (~30-60s) instead of the multi-minute
 /// first install.
-pub(crate) fn apply_magnolia_fleet() -> Result<(), Box<dyn std::error::Error>> {
-    let items: Vec<serde_json::Value> = MAGNOLIA_COHORTS
+pub(crate) fn apply_jenkins_fleet() -> Result<(), Box<dyn std::error::Error>> {
+    let items: Vec<serde_json::Value> = JENKINS_COHORTS
         .iter()
-        .map(|(role, instance, _context, replicas)| magnolia_statefulset(role, instance, *replicas))
+        .map(|(role, replicas)| jenkins_statefulset(role, *replicas))
         .collect();
     apply_json(&serde_json::json!({ "apiVersion": "v1", "kind": "List", "items": items }))
 }
 
-pub(crate) fn magnolia_statefulset(
-    role: &str,
-    instance: &str,
-    replicas: usize,
-) -> serde_json::Value {
+pub(crate) fn jenkins_statefulset(role: &str, replicas: usize) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
-        "metadata": { "name": format!("magnolia-{role}"), "namespace": "updated-system" },
+        "metadata": { "name": format!("jenkins-{role}"), "namespace": "updated-system" },
         "spec": {
             "serviceName": "agents",
             "replicas": replicas,
             "podManagementPolicy": "Parallel",
-            "selector": { "matchLabels": { "app": "updated-agent", "demo.updated.dev/kind": "magnolia", "demo.updated.dev/role": role } },
+            "selector": { "matchLabels": { "app": "updated-agent", "demo.updated.dev/kind": "jenkins", "demo.updated.dev/role": role } },
             "template": {
-                "metadata": { "labels": { "app": "updated-agent", "demo.updated.dev/kind": "magnolia", "demo.updated.dev/role": role } },
+                "metadata": { "labels": { "app": "updated-agent", "demo.updated.dev/kind": "jenkins", "demo.updated.dev/role": role } },
                 "spec": {
                     "securityContext": { "fsGroup": 65532, "seccompProfile": { "type": "RuntimeDefault" } },
                     "containers": [{
                         "name": "agent",
                         // The very same plain Ubuntu + agent image as every other node — no
-                        // Magnolia-specific image. The pre-start install provider installs
-                        // Magnolia into this vanilla container at runtime.
+                        // Jenkins-specific image. The pre-start install provider installs
+                        // Jenkins into this vanilla container at runtime.
                         "image": "updatec-e2e:kind",
                         "imagePullPolicy": "Never",
                         "command": ["/usr/local/bin/run-agent"],
                         "env": [
-                            { "name": "MAGNOLIA_INSTANCE", "value": instance },
-                            { "name": "MAGNOLIA_DATA", "value": "/var/lib/magnolia" },
+                            { "name": "JENKINS_DATA", "value": "/var/lib/jenkins" },
                             // A separate disk (its own PVC) the activate phase writes the
-                            // pre-upgrade JCR backup tar to, and rollback restores from.
-                            { "name": "MAGNOLIA_BACKUPS", "value": "/var/lib/magnolia-backups" }
+                            // pre-upgrade JENKINS_HOME backup tar to, and rollback restores from.
+                            { "name": "JENKINS_BACKUPS", "value": "/var/lib/jenkins-backups" }
                         ],
                         "ports": [{ "name": "http", "containerPort": 8080 }, { "name": "guardian", "containerPort": 9090 }],
-                        // Magnolia's first install is minutes; the startup probe gives it up to
+                        // Jenkins's first install is minutes; the startup probe gives it up to
                         // ~10 minutes before liveness applies, and readiness reflects the
-                        // supervisor's real Magnolia health check the whole time.
+                        // supervisor's real Jenkins health check the whole time.
                         "startupProbe": { "httpGet": { "path": "/startupz", "port": "guardian" }, "periodSeconds": 3, "failureThreshold": 200 },
                         // failureThreshold: 1 so a withdrawn-readiness pod leaves the Service
                         // endpoints on the very next probe (~1s), not after 3 — the drain hold
@@ -821,8 +816,8 @@ pub(crate) fn magnolia_statefulset(
                         "resources": { "requests": { "cpu": "250m", "memory": "1Gi" }, "limits": { "memory": "1500Mi" } },
                         "volumeMounts": [
                             { "name": "state", "mountPath": "/var/lib/updated" },
-                            { "name": "magnolia-data", "mountPath": "/var/lib/magnolia" },
-                            { "name": "magnolia-backups", "mountPath": "/var/lib/magnolia-backups" },
+                            { "name": "jenkins-data", "mountPath": "/var/lib/jenkins" },
+                            { "name": "jenkins-backups", "mountPath": "/var/lib/jenkins-backups" },
                             { "name": "agent-tls", "mountPath": "/etc/agent-tls", "readOnly": true },
                             { "name": "tmp", "mountPath": "/tmp" }
                         ]
@@ -835,9 +830,9 @@ pub(crate) fn magnolia_statefulset(
             },
             "volumeClaimTemplates": [
                 { "metadata": { "name": "state" }, "spec": { "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "1Gi" } } } },
-                { "metadata": { "name": "magnolia-data" }, "spec": { "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "2Gi" } } } },
-                // A distinct volume — "another disk" — for the pre-upgrade JCR backup tars.
-                { "metadata": { "name": "magnolia-backups" }, "spec": { "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "2Gi" } } } }
+                { "metadata": { "name": "jenkins-data" }, "spec": { "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "2Gi" } } } },
+                // A distinct volume — "another disk" — for the pre-upgrade JENKINS_HOME backup tars.
+                { "metadata": { "name": "jenkins-backups" }, "spec": { "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "2Gi" } } } }
             ]
         }
     })
@@ -845,7 +840,7 @@ pub(crate) fn magnolia_statefulset(
 
 /// The enrollment name a host asserts, and hence the `UpdateAgent` resource name that node's
 /// CR carries: the enrollment nonce is `sha256(hostname)` and the registration (hence the CR
-/// name) is `sha256(that)`. One derivation for every node kind — sample-app pods, Magnolia pods,
+/// name) is `sha256(that)`. One derivation for every node kind — sample-app pods, Jenkins pods,
 /// and the out-of-cluster demo VM alike — so the demo can address any node's CR without special
 /// cases.
 ///
@@ -1052,7 +1047,7 @@ pub(crate) fn label_external_agents() -> Result<(), Box<dyn std::error::Error>> 
 /// The reconciler then programs the selectorless `external` Service's EndpointSlice purely
 /// from those nodes' CDN health, with no knowledge that they happen to be pods.
 pub(crate) fn deploy_external_reconciler(
-    magnolia_enabled: bool,
+    jenkins_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut members = Vec::with_capacity(DEMO_EXTERNAL_COUNT);
     for index in 0..DEMO_EXTERNAL_COUNT {
@@ -1073,7 +1068,7 @@ pub(crate) fn deploy_external_reconciler(
     // A real out-of-cluster VM, if one was provisioned, joins the same inventory — a static
     // `node=address=pubkeyhex` entry indistinguishable from a genuine VM's, which is exactly the
     // point.
-    if magnolia_enabled {
+    if jenkins_enabled {
         if let Some((_, address)) = external_vm_target() {
             let node = resource_name(DEMO_EXTERNAL_VM_HOSTNAME);
             let key = agent_pinned_public_key(&node)?;
@@ -1145,7 +1140,7 @@ pub(crate) fn external_vm_target() -> Option<(String, String)> {
 /// run). Ansible builds the agent from source on the target and runs it as a systemd service,
 /// pointed — through a `socat`/`/etc/hosts` shim — at the in-cluster gateway, which we expose to
 /// the LAN with `kubectl port-forward --address 0.0.0.0`. The VM then enrolls, phones home, and
-/// gets Magnolia like any node. Driven entirely from the laptop over its passwordless SSH.
+/// gets Jenkins like any node. Driven entirely from the laptop over its passwordless SSH.
 pub(crate) fn provision_external_vm(ssh_target: &str) -> Result<(), Box<dyn std::error::Error>> {
     command_exists("ansible-playbook")?;
     let root = workspace_root()?;
@@ -1331,14 +1326,14 @@ fn write_owner_only(
     Ok(())
 }
 
-/// Label the enrolled VM's UpdateAgent into the `external-vm` cohort the Magnolia group selects.
+/// Label the enrolled VM's UpdateAgent into the `external-vm` cohort the Jenkins group selects.
 pub(crate) fn label_external_vm_agent() -> Result<(), Box<dyn std::error::Error>> {
     patch_agent_labels(
         &resource_name(DEMO_EXTERNAL_VM_HOSTNAME),
         serde_json::json!({
             "demo.updated.dev/node": DEMO_EXTERNAL_VM_HOSTNAME,
             "demo.updated.dev/cohort": DEMO_EXTERNAL_VM_COHORT,
-            "demo.updated.dev/kind": "magnolia"
+            "demo.updated.dev/kind": "jenkins"
         }),
     )
 }
@@ -1491,16 +1486,16 @@ pub(crate) fn bootstrap_minio_release_repo(
     ))
 }
 
-// The five `magnolia_*` parameters are what push this over the argument threshold; they collapse
-// into one struct once the Magnolia demo wiring is finalized (it is currently being pared back).
+// The five `jenkins_*` parameters are what push this over the argument threshold; they collapse
+// into one struct once the Jenkins demo wiring is finalized (it is currently being pared back).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_demo_resources(
     provider_path: &str,
-    magnolia_enabled: bool,
-    magnolia_path: &str,
-    magnolia_sha: &str,
-    magnolia_provider_path: &str,
-    magnolia_provider_sha: &str,
+    jenkins_enabled: bool,
+    jenkins_path: &str,
+    jenkins_sha: &str,
+    jenkins_provider_path: &str,
+    jenkins_provider_sha: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let edge: serde_json::Value = serde_json::from_str(&output(Command::new("kubectl").args([
         "-n",
@@ -1545,7 +1540,7 @@ pub(crate) fn apply_demo_resources(
         deployment["name"] = name.into();
         deployment["application"] = serde_json::json!({"path": path, "sha256": sha256});
         // Point the cohort at MinIO: this is the repository `updatectl deploy` publishes to and
-        // patches. The Magnolia groups below keep edge's release-server repo (the default path).
+        // patches. The Jenkins groups below keep edge's release-server repo (the default path).
         deployment["releaseRepository"] = minio_release_repository.clone();
         deployment["providerSet"] = provider.clone();
         // Nodes write rollout telemetry here so the control plane can throttle the fleet.
@@ -1619,39 +1614,37 @@ pub(crate) fn apply_demo_resources(
             success_sha,
         ));
     }
-    // The two real-Magnolia cohorts (author, publisher): same clean group path, just
-    // different data. Each selects its `role` nodes and assigns the magnolia product with that
+    // The two real-Jenkins cohorts (ci, release): same clean group path, just
+    // different data. Each selects its `role` nodes and assigns the jenkins product with that
     // instance's readiness URL and a boot-time-sized health grace. Neither carries a
     // fleet/set label — so they are upgraded one node at a time by the same supervisor
     // mechanism (zero downtime across each pair) yet sit entirely outside the convergence
     // throttling and pod-kill chaos that drive the sample-app cohorts.
-    // One Magnolia UpdateGroup builder: the author/publisher cohorts and the manual
+    // One Jenkins UpdateGroup builder: the ci/release cohorts and the manual
     // out-of-cluster VM group are identical apart from their name, readiness URL context, and
-    // selector. Every group clones edge's deployment, assigns the magnolia product with custom
-    // activation, and uses the boot-sized health grace and relaxed cadence Magnolia's
+    // selector. Every group clones edge's deployment, assigns the jenkins product with custom
+    // activation, and uses the boot-sized health grace and relaxed cadence Jenkins's
     // multi-minute install needs.
-    let magnolia_group = |name: &str,
-                          selector: serde_json::Value,
-                          magnolia_path: &str,
-                          magnolia_sha: &str,
-                          magnolia_provider_path: &str,
-                          magnolia_provider_sha: &str|
+    let jenkins_group = |name: &str,
+                         selector: serde_json::Value,
+                         jenkins_path: &str,
+                         jenkins_sha: &str,
+                         jenkins_provider_path: &str,
+                         jenkins_provider_sha: &str|
      -> serde_json::Value {
         let mut deployment = edge["spec"]["deployment"].clone();
         deployment["name"] = name.into();
         deployment["application"] =
-            serde_json::json!({"path": magnolia_path, "sha256": magnolia_sha});
+            serde_json::json!({"path": jenkins_path, "sha256": jenkins_sha});
         deployment["providerSet"] =
-            serde_json::json!({"path": magnolia_provider_path, "sha256": magnolia_provider_sha});
+            serde_json::json!({"path": jenkins_provider_path, "sha256": jenkins_provider_sha});
         deployment["reportUrl"] = DEMO_REPORT_URL.into();
         deployment["orderedInstallFallback"] = serde_json::json!(false);
-        deployment["runtime"]["product"] = "magnolia".into();
-        deployment["runtime"]["mode"] = "managed".into();
-        deployment["runtime"]["args"] = serde_json::json!([]);
-        // The Magnolia reconciler backs the JCR up before activation and reuses the repository.
-        // Managed mode supplies the process stop/start; rollback restores the backup.
-        // Magnolia's first install runs for minutes; give it a boot-sized health grace and a
-        // relaxed cadence rather than the fleet's sub-second timings.
+        deployment["runtime"]["product"] = "jenkins".into();
+        // The Jenkins reconciler backs JENKINS_HOME up before activation and reuses it; the
+        // hook owns the process, and rollback restores the backup. Jenkins's first install
+        // runs for minutes; give it a boot-sized health grace and a relaxed cadence rather
+        // than the fleet's sub-second timings.
         deployment["runtime"]["timeouts"] = serde_json::json!({
             "checkIntervalSeconds": 5,
             "healthGraceSeconds": 360,
@@ -1672,30 +1665,28 @@ pub(crate) fn apply_demo_resources(
             }
         })
     };
-    for (role, _instance, _context, _replicas) in
-        MAGNOLIA_COHORTS.into_iter().filter(|_| magnolia_enabled)
-    {
-        items.push(magnolia_group(
-            &format!("magnolia-{role}"),
-            serde_json::json!({"matchLabels":{"demo.updated.dev/kind":"magnolia", "demo.updated.dev/role": role}}),
-            magnolia_path,
-            magnolia_sha,
-            magnolia_provider_path,
-            magnolia_provider_sha,
+    for (role, _replicas) in JENKINS_COHORTS.into_iter().filter(|_| jenkins_enabled) {
+        items.push(jenkins_group(
+            &format!("jenkins-{role}"),
+            serde_json::json!({"matchLabels":{"demo.updated.dev/kind":"jenkins", "demo.updated.dev/role": role}}),
+            jenkins_path,
+            jenkins_sha,
+            jenkins_provider_path,
+            jenkins_provider_sha,
         ));
     }
-    // The out-of-cluster VM IS the manual Magnolia node (no in-cluster pod stands in): the
-    // `magnolia-manual` group selects the VM's `external-vm` cohort. It installs Magnolia through
+    // The out-of-cluster VM IS the manual Jenkins node (no in-cluster pod stands in): the
+    // `jenkins-manual` group selects the VM's `external-vm` cohort. It installs Jenkins through
     // the identical mechanism as the in-cluster pods; the only difference is it runs on a real VM
     // the reconciler fronts.
-    if magnolia_enabled {
-        items.push(magnolia_group(
-            MAGNOLIA_MANUAL_GROUP,
+    if jenkins_enabled {
+        items.push(jenkins_group(
+            JENKINS_MANUAL_GROUP,
             serde_json::json!({"matchLabels":{"demo.updated.dev/cohort": DEMO_EXTERNAL_VM_COHORT}}),
-            magnolia_path,
-            magnolia_sha,
-            magnolia_provider_path,
-            magnolia_provider_sha,
+            jenkins_path,
+            jenkins_sha,
+            jenkins_provider_path,
+            jenkins_provider_sha,
         ));
     }
     // Per-set UpdateGroupSet (default maxConcurrent = members-1): never both groups of a

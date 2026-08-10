@@ -5,7 +5,7 @@
 #   ./scripts/demo.sh root@10.0.0.206  # remotely — on that server over SSH, UI tunnelled to you
 #
 # Either way it runs the SAME single ansible playbook (deploy/ansible/demo.yml), which stands the
-# whole thing up: Docker/kind/kubectl/Rust, the kind demo (operator + CDN + fleet + Magnolia), the
+# whole thing up: Docker/kind/kubectl/Rust, the kind demo (operator + CDN + fleet + Jenkins), the
 # co-located out-of-cluster agent, and nginx serving the UI on port 80. Releases roll through the
 # real `updatectl deploy` (published to the in-cluster MinIO release repo the playbook bootstraps).
 set -euo pipefail

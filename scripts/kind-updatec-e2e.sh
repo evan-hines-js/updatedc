@@ -539,9 +539,9 @@ data:
     #!/bin/sh
     echo "FAIL: agent used the image-baked sampleapp instead of a verified bundle" >&2
     exit 97
-  magnolia-like: |
+  stateful-like: |
     #!/bin/sh
-    echo "FAIL: agent used the image-baked magnolia-like app instead of a verified bundle" >&2
+    echo "FAIL: agent used the image-baked stateful-like app instead of a verified bundle" >&2
     exit 98
 ---
 apiVersion: v1
@@ -588,7 +588,7 @@ spec:
             - {name: tmp, mountPath: /tmp}
             - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
             - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/sampleapp, subPath: sampleapp, readOnly: true}
-            - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/magnolia-like, subPath: magnolia-like, readOnly: true}
+            - {name: poison-preinstalled-apps, mountPath: /usr/local/bin/stateful-like, subPath: stateful-like, readOnly: true}
       volumes:
         - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 64Mi}}
         # cert-manager issues the agents' shared client identity here. In mount mode this fleet cert
@@ -840,8 +840,8 @@ spec:
                 echo "$agent: expected $expected, got ${actual:-unreachable}" >&2
                 return 1
               }
-              check agent-0 2.0.0 magnolia
-              check agent-1 2.0.0 magnolia
+              check agent-0 2.0.0 jenkins
+              check agent-1 2.0.0 jenkins
               check agent-2 3.0.0 sampleapp
               check agent-3 3.0.0 sampleapp
               check agent-4 1.0.0 sampleapp
@@ -1130,7 +1130,7 @@ for recovery_version in 19.0.0 20.0.0; do
   done
   verify_fleet "verify-fuzz-recovery-${recovery_version%%.*}" "$recovery_expected"
 done
-echo "fleet recovered through sampleapp 19.0.0 -> Magnolia-shaped 20.0.0"
+echo "fleet recovered through sampleapp 19.0.0 -> Jenkins-shaped 20.0.0"
 echo "fleet observer transitions during chaos:"
 kubectl -n updated-system logs -l job-name=observe-fleet-chaos --prefix --all-containers=true
 kubectl -n updated-system delete job observe-fleet-chaos --wait=true >/dev/null

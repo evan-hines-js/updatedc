@@ -4,46 +4,42 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     let dir = ctx.work.join("reject");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
     let v1 = app_v(ctx, "1.0.0");
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(&v1, &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
-    // Broken v2: the `server` binary exits immediately on the app's args.
+    // Broken v2: the `server` binary starts and immediately exits on the workload's args, so the
+    // release's healthcheck can never pass.
     ctx.publish(&dir, "app", "2.0.0", &ctx.server.clone())?;
     let _server = ctx.serve(&dir, srv)?;
 
     let make = || {
-        Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+        Node::new(ctx, &dir, srv, "app")
             .check_interval("1s")
             .health_grace("1s")
-            .readiness_health(svc)
-            .guardian()
+            .workload(svc)
+            .launcher()
     };
 
-    // Run 1: apply the crashing v2. The guardian rolls the crash up, the init system
-    // restarts the tower, and recovery rejects v2 and rolls back to v1 — persisting the
-    // rejection so the failed bytes are never re-applied.
+    // Run 1: apply the broken v2. Its health gate fails, the transaction leaves a durable rollback
+    // journal and ends the disposable agent; the init system relaunches the stack and boot recovery
+    // rejects v2 and restores v1 — persisting the rejection so the failed bytes are never
+    // re-applied.
     {
         let cmd = make()?;
-        let sup = Service::spawn("reject-1", &cmd);
-        // A candidate that fails its health gate during activation is rejected by the
-        // transaction, which leaves a durable rollback journal and terminates the
-        // disposable supervisor; the guardian relaunches it and boot recovery rejects the
-        // bad bytes and restores v1 — the single rollback path.
-        if !sup.wait_for_log(
+        let node = Service::spawn("reject-1", &cmd);
+        if !node.wait_for_log(
             "recovery: rejected 2.0.0 after failed activation",
             EVENT_TIMEOUT,
         ) {
-            return fail("boot recovery did not reject the crashing v2");
-        }
-        if !sup.wait_for_log(
-            "restoring predecessor 1.0.0 after interrupted activation of 2.0.0",
-            EVENT_TIMEOUT,
-        ) {
-            return fail("boot recovery did not roll back to v1.0.0");
+            return fail(format!(
+                "boot recovery did not reject the broken v2:\n{}",
+                node.captured_log()
+            ));
         }
         if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-            return fail("the tower did not recover to v1.0.0 after rejecting v2");
+            return fail(format!(
+                "the node did not recover to v1.0.0 after rejecting v2:\n{}",
+                node.captured_log()
+            ));
         }
         let persisted = wait_until(EVENT_TIMEOUT, || {
             std::fs::metadata(dir.join("install/state/rejected"))
@@ -51,30 +47,30 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
                 .unwrap_or(false)
         });
         if !persisted {
-            return fail("rejection was not persisted to disk");
+            return fail("the rejection was not persisted to disk");
         }
     }
-    // Reap any orphaned app before the second tower reuses the port (macOS only).
-    kill_stray(&dir.join("install"));
+    // End the first run's workload before the second stack reuses its address.
+    fixture::stop_workload(&dir);
     if !wait_until(EVENT_TIMEOUT, || {
         http_text(&format!("http://{svc}/version")).is_none()
     }) {
-        return fail("first rejection tower did not release its application port");
+        return fail("the first run's workload never released its address");
     }
 
-    // Run 2 (a fresh tower): must NOT reapply the known-bad v2.
+    // Run 2 (a fresh stack): must NOT reapply the known-bad v2.
     {
         let cmd = make()?;
-        let sup = Service::spawn("reject-2", &cmd);
+        let node = Service::spawn("reject-2", &cmd);
         if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
             return fail("v1.0.0 did not come back up on restart");
         }
         std::thread::sleep(Duration::from_secs(4));
-        if sup.log_contains("applying update 1.0.0 -> 2.0.0") {
-            return fail("restart re-applied the known-bad v2");
+        if node.log_contains("applying update 1.0.0 -> 2.0.0") {
+            return fail("the restart re-applied the known-bad v2");
         }
     }
-    kill_stray(&dir.join("install"));
-    ok("a crashing release was rejected on recovery and NOT reapplied after a restart");
+    fixture::stop_workload(&dir);
+    ok("a release that failed its health gate was rejected on recovery and NOT reapplied after a restart");
     Ok(())
 }

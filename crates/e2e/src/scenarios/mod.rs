@@ -1,4 +1,4 @@
-mod adoption;
+mod agent;
 mod application;
 mod chaos;
 mod locking;
@@ -9,7 +9,7 @@ mod self_update;
 #[cfg(unix)]
 mod unix;
 
-pub(super) use adoption::*;
+pub(super) use agent::*;
 pub(super) use application::*;
 pub(super) use chaos::*;
 pub(super) use locking::*;

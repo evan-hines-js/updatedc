@@ -65,39 +65,36 @@ pub(crate) fn external_ordinal(index: usize) -> usize {
 /// A genuinely out-of-cluster node — a real VM reached over passwordless SSH — provisioned for
 /// the live demo by the shipped ansible role (`deploy/ansible`), which builds the agent on the
 /// VM and runs it as a systemd service pointed, via a `socat`/`/etc/hosts` shim, at the
-/// in-cluster gateway exposed on the laptop's LAN. It enrolls, installs Magnolia, and becomes
-/// **the manual Magnolia node** — managed by its own UpdateGroup ([`MAGNOLIA_MANUAL_GROUP`]), with
+/// in-cluster gateway exposed on the laptop's LAN. It enrolls, installs Jenkins, and becomes
+/// **the manual Jenkins node** — managed by its own UpdateGroup ([`JENKINS_MANUAL_GROUP`]), with
 /// no in-cluster pod standing in for it. Also appears as a real endpoint the reconciler programs. Optional and
 /// guarded: skipped unless `DEMO_EXTERNAL_VM` (e.g. `root@10.0.0.206`) is set AND passwordless
-/// SSH works. Its Magnolia role reaches the UI as an explicit backend field (`FleetNode::kind`),
+/// SSH works. Its Jenkins role reaches the UI as an explicit backend field (`FleetNode::kind`),
 /// not by anything reading this name.
-pub(crate) const DEMO_EXTERNAL_VM_HOSTNAME: &str = "magnolia-manual-vm";
+pub(crate) const DEMO_EXTERNAL_VM_HOSTNAME: &str = "jenkins-manual-vm";
 pub(crate) const DEMO_EXTERNAL_VM_COHORT: &str = "external-vm";
 /// LAN port `kubectl port-forward` publishes the in-cluster gateway on for the VM to reach.
 pub(crate) const DEMO_EXTERNAL_VM_GATEWAY_PORT: u16 = 18080;
-/// Real Magnolia CMS runs as its two standard instance kinds — an `author` cohort (editing)
-/// and a `publisher` cohort (public traffic) — each a pair the supervisor upgrades one node at
+/// Real Jenkins runs as two independent controller cohorts — a `ci` cohort (build traffic)
+/// and a `release` cohort (release pipelines) — each a pair the agent upgrades one node at
 /// a time with zero downtime. A genuinely complex Java deployment, installed and upgraded by
 /// the exact same mechanism as the sample app, but kept outside the convergence/chaos
 /// machinery so its slow (~4-min) installs never gate the fast cohorts.
-/// Fields: (display role, Magnolia instance, servlet context, replicas).
+/// Fields: (display role, replicas).
 ///
-/// The `manual` Magnolia node is the out-of-cluster VM ([`DEMO_EXTERNAL_VM_HOSTNAME`]), not an
+/// The `manual` Jenkins node is the out-of-cluster VM ([`DEMO_EXTERNAL_VM_HOSTNAME`]), not an
 /// in-cluster pod, so it is not listed here.
-pub(crate) const MAGNOLIA_COHORTS: [(&str, &str, &str, usize); 2] = [
-    ("author", "author", "magnoliaAuthor", 2),
-    ("publisher", "public", "magnoliaPublic", 2),
-];
-/// Total in-cluster Magnolia pods — derived from the cohort table above, like every other total
+pub(crate) const JENKINS_COHORTS: [(&str, usize); 2] = [("ci", 2), ("release", 2)];
+/// Total in-cluster Jenkins pods — derived from the cohort table above, like every other total
 /// in this file, so changing a cohort's replicas cannot silently under-reserve cluster capacity
 /// (this feeds [`DEMO_REQUIRED_POD_CAPACITY`]).
-pub(crate) const DEMO_MAGNOLIA_TOTAL: usize = magnolia_total();
+pub(crate) const DEMO_JENKINS_TOTAL: usize = jenkins_total();
 
-const fn magnolia_total() -> usize {
+const fn jenkins_total() -> usize {
     let mut total = 0;
     let mut index = 0;
-    while index < MAGNOLIA_COHORTS.len() {
-        total += MAGNOLIA_COHORTS[index].3;
+    while index < JENKINS_COHORTS.len() {
+        total += JENKINS_COHORTS[index].1;
         index += 1;
     }
     total
@@ -111,7 +108,7 @@ const fn magnolia_total() -> usize {
 /// (a load balancer) that fronts real services, which plain Kubernetes rollouts cannot express.
 pub(crate) const DEMO_HAPROXY_REPLICAS: usize = 2;
 /// The cohort label the HAProxy pods carry and the `haproxy` UpdateGroup selects on. Outside the
-/// per-set/fleet throttle and the pod-kill chaos, exactly like the Magnolia tier.
+/// per-set/fleet throttle and the pod-kill chaos, exactly like the Jenkins tier.
 pub(crate) const DEMO_HAPROXY_COHORT: &str = "haproxy";
 /// The single HAProxy UpdateGroup that rolls the tier from 1.0.0 → 2.0.0. It owns both HAProxy
 /// nodes with `maxUnavailable: 1`, so the group itself caps the tier to ONE node rolling at a time
@@ -137,12 +134,12 @@ pub(crate) const DEMO_HAPROXY_NEXT_SHA_ANNOTATION: &str = "demo.updated.dev/next
 /// The group that manages the out-of-cluster VM ([`DEMO_EXTERNAL_VM_HOSTNAME`]) — a node with no
 /// Kubernetes pod behind it, held at its baseline by the same mechanism as every in-cluster
 /// cohort. Nothing rolls it: it is the demo's proof that management is not pod-shaped.
-pub(crate) const MAGNOLIA_MANUAL_GROUP: &str = "magnolia-manual";
+pub(crate) const JENKINS_MANUAL_GROUP: &str = "jenkins-manual";
 /// Extra pods the HAProxy tier consumes: the HAProxy replicas plus the one HAProxy-mode
 /// healthproxy Deployment that programs their backend membership.
 pub(crate) const DEMO_HAPROXY_TOTAL: usize = DEMO_HAPROXY_REPLICAS + 1;
 pub(crate) const DEMO_REQUIRED_POD_CAPACITY: usize =
-    DEMO_TOTAL_AGENTS + DEMO_MAGNOLIA_TOTAL + DEMO_HAPROXY_TOTAL + 40;
+    DEMO_TOTAL_AGENTS + DEMO_JENKINS_TOTAL + DEMO_HAPROXY_TOTAL + 40;
 
 /// Serving pods a set is guaranteed to keep while it rolls: total pods minus the pods of the
 /// at-most-one group the per-set cap lets roll (`gps - 1` groups). Chaos never enters this

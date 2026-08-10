@@ -111,13 +111,13 @@ pub struct Ctx {
     /// Cargo's build-output dir for this driver. `e2e` uses the shared `target/`; a differently
     /// named driver (the kill fuzzer) gets its own `target/<name>-cargo` so its `cargo build`
     /// never unlinks a shared `target/release/*` artifact out from under a concurrent e2e run
-    /// (which surfaced as the guardian's transient `inspecting supervisor: No such file`).
+    /// (which surfaced as the launcher's transient `inspecting supervisor: No such file`).
     pub target: PathBuf,
     pub server: PathBuf,
     pub supervisor: PathBuf,
     pub bootstrap: PathBuf,
     /// Rust's own OS-arch key, e.g. `macos-aarch64` / `windows-x86_64`; matches
-    /// what the supervisor sends and the server keys manifests by.
+    /// what the agent sends and the server keys manifests by.
     pub platkey: String,
     /// `.exe` on Windows, empty elsewhere.
     pub exe: &'static str,
@@ -125,11 +125,11 @@ pub struct Ctx {
     pub fips: bool,
 }
 
-/// The cargo features every supervisor build in the run uses: `chaos` for the crash-injection
-/// points the recovery scenarios need, plus `fips` under `E2E_FIPS` so the supervisors the
+/// The cargo features every agent build in the run uses: `chaos` for the crash-injection
+/// points the recovery scenarios need, plus `fips` under `E2E_FIPS` so the agents the
 /// self-update scenarios publish and run link the validated provider too — the same binary
-/// shape as `Ctx::supervisor`. One source of truth, so no supervisor fixture can silently
-/// drop out of FIPS mode (and so feature unification never rebuilds the supervisor between
+/// shape as `Ctx::supervisor`. One source of truth, so no agent fixture can silently
+/// drop out of FIPS mode (and so feature unification never rebuilds the agent between
 /// fixtures).
 pub fn supervisor_features(fips: bool) -> &'static [&'static str] {
     if fips {
@@ -159,7 +159,7 @@ impl Ctx {
         let lock_path = root.join(format!("target/{name}.lock"));
         // Every driver builds into its own `target/<name>-cargo`, so concurrent `cargo build`s
         // (and the dev tree's own `target/`) never unlink a shared `target/release/*` artifact out
-        // from under each other — the collision that surfaced as the guardian's transient
+        // from under each other — the collision that surfaced as the launcher's transient
         // `inspecting supervisor: No such file`. Point cargo (via `CARGO_TARGET_DIR`) and every
         // built-artifact path below at the same dir so builds and copies agree.
         let target = root.join(format!("target/{name}-cargo"));
@@ -192,9 +192,8 @@ impl Ctx {
                 }
             }
         }
-        // An interrupted prior run can leave durable app processes behind (on Unix
-        // they outlive their supervisor by design); reap them so they don't hold a
-        // port this run needs.
+        // An interrupted prior run can leave hook-managed workloads behind (they outlive the
+        // node stack by design); reap them so they don't hold a port this run needs.
         reap_workdir(&work);
         match std::fs::remove_dir_all(&work) {
             Ok(()) => {}
@@ -221,13 +220,13 @@ impl Ctx {
         })
     }
 
-    /// Build the release binaries the harness drives. The supervisor is built with its
+    /// Build the release binaries the harness drives. The agent is built with its
     /// `chaos` feature — the crash-injection points the chaos-recovery scenarios need,
     /// which are compiled out of every ordinary build.
     pub fn build(&self) -> R {
         // `E2E_FIPS=1` runs the suite on FIPS-validated crypto: the binaries that do crypto (the
-        // mock CDN and supervisor — mTLS, the TUF transport, hashing,
-        // signing) are built `--features fips`, which links the validated aws-lc-rs. The guardian
+        // mock CDN and agent — mTLS, the TUF transport, hashing,
+        // signing) are built `--features fips`, which links the validated aws-lc-rs. The launcher
         // and sample apps do no crypto, so they build unchanged. A FIPS build that cannot validate
         // its provider fails closed at startup.
         let fips_feature: &[&str] = if self.fips {
@@ -242,7 +241,7 @@ impl Ctx {
         .concat();
         cargo(&self.root, &crypto_cdn)?;
         cargo(&self.root, &["build", "--release", "-p", "bootstrap"])?;
-        // Same package, env and features as every versioned supervisor fixture; only the
+        // Same package, env and features as every versioned agent fixture; only the
         // staged name differs.
         self.build_and_stage(
             "supervisor",
@@ -296,7 +295,7 @@ impl Ctx {
     }
 
     /// Build a candidate that completes boot and signals ready, then exits
-    /// before the guardian's confirmation window can commit it.
+    /// before the launcher's confirmation window can commit it.
     pub fn build_post_ready_crashing_supervisor(&self, version: &str) -> R<PathBuf> {
         self.build_and_stage(
             "supervisor",
@@ -309,9 +308,9 @@ impl Ctx {
         )
     }
 
-    /// The update-transaction boundaries the supervisor can crash at, enumerated from the
+    /// The update-transaction boundaries the agent can crash at, enumerated from the
     /// binary itself (`--list-chaos-boundaries`, a chaos-feature build). One source of
-    /// truth: the chaos scenario drives exactly the supervisor's crossings, so a boundary
+    /// truth: the chaos scenario drives exactly the agent's crossings, so a boundary
     /// added or renamed on one side can never silently go untested on the other.
     pub fn chaos_boundaries(&self) -> R<Vec<String>> {
         self.list_chaos_boundaries("--list-chaos-boundaries")
@@ -357,7 +356,7 @@ impl Ctx {
             .arg("--keys")
             .arg(dir.join("keys")))?;
         // Mint the fleet mTLS material alongside the TUF keys, so the mock CDN can require client
-        // certs and each supervisor can present one. Loopback SANs cover `https://127.0.0.1:port`.
+        // certs and each agent can present one. Loopback SANs cover `https://127.0.0.1:port`.
         run(Command::new(&self.server)
             .arg("gen-certs")
             .arg("--dir")
@@ -508,7 +507,7 @@ pub fn release_target(
 // ------------------------------- HTTP polling -------------------------------
 
 /// Hex SHA-256 of a file — used to seed committed installed-target state. Delegates
-/// to the same streaming hasher the tower uses, so the harness and the production
+/// to the same streaming hasher the node stack uses, so the harness and the production
 /// path can never disagree on a digest. Fixture I/O failures are fatal rather than
 /// becoming an empty digest that could make two missing files appear equal.
 pub fn sha256_hex(path: &Path) -> R<String> {
@@ -529,19 +528,6 @@ pub fn http_text(url: &str) -> Option<String> {
 pub fn wait_for_version(addr: &str, want: &str, secs: u64) -> bool {
     wait_until(secs, || {
         http_text(&format!("http://{addr}/version")).as_deref() == Some(want)
-    })
-}
-
-/// Trigger the sampleapp's committed test crash, tolerating the brief window where a freshly
-/// relaunched process is not yet serving: poll `GET /crash` until it answers `crashing` (the app
-/// then exits). A single-shot GET fired the instant `upgraded to <v>` is logged races the
-/// post-upgrade relaunch — the new process may not be listening yet, so the GET hits
-/// connection-refused and the crash never triggers — which is exactly the contended-runner flake
-/// this replaces. Returns on the first successful trigger, so it never over-polls into the
-/// rolled-back predecessor.
-pub fn wait_for_crash(addr: &str, secs: u64) -> bool {
-    wait_until(secs, || {
-        http_text(&format!("http://{addr}/crash")).as_deref() == Some("crashing")
     })
 }
 
@@ -612,15 +598,7 @@ impl Proc {
     /// in-memory buffer.
     pub fn spawn(label: &str, cmd: &mut Command) -> R<Proc> {
         // The tree teardown (process group on Unix, Job Object on Windows) is `spawn_grouped`'s
-        // job. On Windows one extra flag beyond it: make the child its own process-group leader so
-        // `term_pid` can deliver a `CTRL_BREAK_EVENT` to just this tree — the graceful-stop signal
-        // a directly-spawned process (unlike an init-model `Service`) must be able to receive.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        }
+        // job.
         let mut grouped = spawn_grouped(cmd).map_err(|e| format!("spawn {label}: {e}"))?;
         let log = log_buf();
         let readers = [
@@ -645,7 +623,7 @@ impl Proc {
         matches!(self.grouped.child.try_wait(), Ok(Some(_)))
     }
 
-    /// This process's own PID (e.g. the guardian's), so a test can signal it directly.
+    /// This process's own PID (the launcher's), so a test can signal it directly.
     pub fn pid(&self) -> u32 {
         self.grouped.child.id()
     }
@@ -697,11 +675,9 @@ fn assign_job(child: &Child) -> R<windows_sys::Win32::Foundation::HANDLE> {
 /// A process run under a *simulated init system*. Like systemd `Restart=on-failure`, it
 /// relaunches the process whenever it exits, up to a start-limit burst, then gives up.
 ///
-/// The transparent guardian rolls a crash up and exits, delegating the restart to the
-/// init system; production runs it under systemd / a Windows service. The harness has no
-/// such supervisor, so recovery paths (rollback before commit or reverting an
-/// unconfirmed update) would never get a second boot to run in. `Service` is that init
-/// system. Output across every restart accumulates in one buffer, and `Drop` both stops
+/// The launcher runs under the operator's init system, which owns its restarts; the harness has
+/// no such service manager, so recovery paths (a rollback deferred to boot recovery, or reverting
+/// an unconfirmed update) would never get a second boot to run in. `Service` is that init system. Output across every restart accumulates in one buffer, and `Drop` both stops
 /// the restarts and tears down the running instance's whole process tree.
 pub struct Service {
     stop: Arc<AtomicBool>,
@@ -717,7 +693,7 @@ impl CapturedLog for Service {
 
 impl Service {
     /// systemd's default `StartLimitBurst`. Enough restarts for recovery to converge
-    /// (each revert costs a couple of boots); after it the tower settles and no
+    /// (each revert costs a couple of boots); after it the node settles and no
     /// more fire, so this is only a runaway backstop.
     const MAX_STARTS: u32 = 12;
 
@@ -1004,30 +980,8 @@ pub fn dump_install_state(work: &Path) -> String {
     out
 }
 
-/// Best-effort teardown of any process still running the binary at `path`. The
-/// application dies with its guardian on Linux (`PR_SET_PDEATHSIG`) and Windows (the
-/// kill-on-close Job Object), so this only matters on macOS, where a guardian teardown
-/// can orphan the app's own process group; `pkill -f` reaps it. Harmless elsewhere.
-pub fn kill_stray(path: &Path) {
-    #[cfg(unix)]
-    {
-        let install = path.parent().map(|parent| parent.join("install"));
-        for pattern in std::iter::once(path).chain(install.as_deref()) {
-            let _ = Command::new("pkill")
-                .arg("-9")
-                .arg("-f")
-                .arg(pattern)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-    #[cfg(windows)]
-    let _ = path; // the guardian's Job Object already tore the app down.
-}
-
-/// Extract the PID printed as `(pid N)` in the first log line containing `needle` — used
-/// to target a specific child (e.g. the supervisor) inside the guardian's process tree.
+/// Extract the PID printed as `(pid N)` in the first log line containing `needle` — used to target
+/// the agent process the launcher reports launching.
 pub fn pid_after(log: &str, needle: &str) -> Option<u32> {
     let at = log.find(needle)?;
     let rest = &log[at..];
@@ -1036,20 +990,8 @@ pub fn pid_after(log: &str, needle: &str) -> Option<u32> {
     rest[open..open + close].trim().parse().ok()
 }
 
-/// Extract the decimal PID immediately following `needle`, as printed by the
-/// supervisor after the guardian returns the OS-derived child PID.
-pub fn pid_number_after(log: &str, needle: &str) -> Option<u32> {
-    let at = log.find(needle)? + needle.len();
-    let digits: String = log[at..]
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
-}
-
-/// Kill one process by PID (not its group/tree) — to simulate a supervisor crash while
-/// the guardian and the application keep running.
+/// Kill one process by PID (not its group/tree) — to simulate an agent crash while the launcher
+/// and the hook-managed workload keep running.
 pub fn kill_pid(pid: u32) {
     #[cfg(unix)]
     unsafe {
@@ -1063,23 +1005,6 @@ pub fn kill_pid(pid: u32) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-}
-
-/// Ask a process to stop *gracefully* (Unix `SIGTERM`; Windows `CTRL_BREAK_EVENT`) —
-/// what an init system sends on a clean stop, so a test can prove the guardian forwards it.
-pub fn term_pid(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
-        // `Proc::spawn` makes the child a process-group leader, whose group id is its PID.
-        // Targeting that group exercises the guardian's console shutdown handler without
-        // terminating it externally or signalling unrelated E2E processes.
-        let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
-    }
 }
 
 /// Whether a process with `pid` still exists — `kill(pid, 0)` on Unix (a running or unreaped
@@ -1100,9 +1025,10 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Kill any process still running from a previous run's work directory. On Unix an
-/// interrupted run leaves the durable app processes behind (they outlive their
-/// supervisor by design); on Windows the per-run job objects already tear them down.
+/// Kill any process still running from a previous run's work directory. A hook-managed workload
+/// lives outside every tree the node stack owns — that is the whole model — so an interrupted run
+/// leaves it behind; a scenario ends its own workload (`fixture::stop_workload`), and this reaps
+/// what an interrupted run never got to.
 pub fn reap_workdir(work: &Path) {
     #[cfg(unix)]
     let _ = Command::new("pkill")

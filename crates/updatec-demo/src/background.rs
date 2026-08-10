@@ -111,7 +111,7 @@ pub(crate) fn spawn_load_generator(demo: Demo) {
 ///     the generation-settle's durable proof a broken cohort actually attempted the bad release
 ///     and drained (a brief, already-past drain still counts).
 ///
-/// The pod name is the node key (`agent-<ordinal>`, `magnolia-<role>-<ordinal>`), the same value
+/// The pod name is the node key (`agent-<ordinal>`, `jenkins-<role>-<ordinal>`), the same value
 /// the fleet and settle logic read from each agent's `demo.updated.dev/node` label, so the maps
 /// join cleanly by node name.
 pub(crate) fn spawn_readiness_watcher(demo: Demo) {

@@ -101,7 +101,7 @@ Names must match the new shape, and nothing keeps its old name as an alias:
 ## e2e disposition
 
 - Hook-driven workload scenarios (application lifecycle, rollback, chaos-at-every-boundary,
-  Magnolia-shaped transactions, HAProxy) are rewritten where needed so the release's own
+  migration-shaped transactions, HAProxy) are rewritten where needed so the release's own
   entrypoint starts/stops the workload (a script + pidfile), proving the generic model with
   the same crash-injection coverage.
 - Adoption and launched-secrets scenarios are deleted with the mechanism.

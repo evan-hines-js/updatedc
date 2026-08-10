@@ -15,10 +15,9 @@ static ARTIFACT: OnceLock<&'static str> = OnceLock::new();
 static FAULT: OnceLock<Fault> = OnceLock::new();
 static HEALTH_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Deterministic bad-application behaviors used by the updater E2E suite. Keeping
-/// these in the managed process (rather than mocking the supervisor's HTTP client)
-/// exercises the real signed bundle, guardian, network timeout, health,
-/// rollback, confirmation, and outer-restart paths.
+/// Deterministic bad-application behaviors used by the updater E2E suite. Keeping these in the
+/// workload itself (rather than mocking a health probe) exercises the real signed bundle, the
+/// release's own reconciler, network timeouts, health, rollback, confirmation, and restart paths.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Fault {
     #[default]
@@ -172,18 +171,18 @@ fn handle(mut stream: TcpStream) {
     let req = String::from_utf8_lossy(&buf[..n]);
     let path = req.split_whitespace().nth(1).unwrap_or("/");
 
-    // Optional diagnostics for deployment smoke tests (not an application contract):
-    // guardian ownership and adoption use the OS-derived child PID over `control` and
-    // never depend on this endpoint.
+    // Optional diagnostics for deployment smoke tests (not an application contract): the
+    // reconciler that owns this process records the PID it spawned and never depends on this
+    // endpoint.
     let pid = std::process::id().to_string();
     let secret = std::env::var("DATABASE_PASSWORD").unwrap_or_else(|_| "<missing>".into());
     let fault = *FAULT.get().expect("fault initialized");
     let health_request = path == "/healthz";
     let health_attempt = health_request.then(|| HEALTH_REQUESTS.fetch_add(1, Ordering::SeqCst));
     if health_request && fault == Fault::HangHealth {
-        // Deliberately much longer than every supervisor-side probe deadline. This
-        // models a wedged handler that accepts the connection and never completes;
-        // recovery must not depend on the managed application releasing it.
+        // Deliberately much longer than every probe deadline. This models a wedged handler that
+        // accepts the connection and never completes; recovery must not depend on the workload
+        // releasing it.
         thread::sleep(Duration::from_secs(300));
     }
     let injected_unhealthy = health_request && matches!(fault, Fault::Unhealthy)

@@ -1061,7 +1061,7 @@ mod tests {
             csr: String::new(),
         };
         assert!(name("agent-7").name_is_wellformed());
-        assert!(name("magnolia-author-0").name_is_wellformed());
+        assert!(name("jenkins-author-0").name_is_wellformed());
         for bad in ["", "-agent", "agent-", "Agent", "a_b", "a/b", "a.b"] {
             assert!(
                 !name(bad).name_is_wellformed(),

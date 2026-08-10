@@ -12,12 +12,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /src/target/release/demo-lifecycle /out-demo-lifecycle && \
     cp /src/target/release/updated-healthproxy /out-updated-healthproxy && \
     cp /src/target/release/updatectl /out-updatectl && \
-    cp /src/target/release/magnolia-like /out-magnolia-like
+    cp /src/target/release/stateful-like /out-stateful-like
 
 # Raw Ubuntu + our agent, nothing else. Any managed application — the sample app, or a real
-# Magnolia CMS — is installed INTO this vanilla container at runtime by the update/lifecycle
+# Jenkins — is installed INTO this vanilla container at runtime by the update/lifecycle
 # mechanism, never baked into a bespoke image. `curl`/`unzip` are ordinary base tooling a
-# runtime installer uses; the JRE, Tomcat, and Magnolia are not here.
+# runtime installer uses; the JRE and Jenkins are not here.
 FROM ubuntu:22.04
 # `haproxy` is an ordinary distro package here so the release-server can copy the binary into a
 # signed bundle and every agent (same base image, so the shared libs are present) can run it after
@@ -33,15 +33,15 @@ COPY --from=build /out-updatec-demo /usr/local/bin/updatec-demo
 COPY --from=build /out-demo-lifecycle /usr/local/bin/demo-lifecycle
 COPY --from=build /out-updated-healthproxy /usr/local/bin/updated-healthproxy
 COPY --from=build /out-updatectl /usr/local/bin/updatectl
-COPY --from=build /out-magnolia-like /usr/local/bin/magnolia-like
+COPY --from=build /out-stateful-like /usr/local/bin/stateful-like
 COPY crates/updatec/e2e/release-server.sh /usr/local/bin/release-server
 COPY crates/updatec/e2e/agent.sh /usr/local/bin/run-agent
 COPY scripts/lib/publish-fuzz-plan.sh /usr/local/lib/publish-fuzz-plan.sh
-# The magnolia product's launcher and its pre-start install provider — published into the
+# The jenkins product's launcher and its install reconciler — published into the
 # release repo by release-server and downloaded by the agent at runtime, never baked into a
-# node image (the node is plain Ubuntu + agent; Magnolia itself is installed at runtime).
-COPY crates/updatec/e2e/magnolia/app.sh /usr/local/share/magnolia/app.sh
-COPY crates/updatec/e2e/magnolia/install.sh /usr/local/share/magnolia/install.sh
+# node image (the node is plain Ubuntu + agent; Jenkins itself is installed at runtime).
+COPY crates/updatec/e2e/jenkins/app.sh /usr/local/share/jenkins/app.sh
+COPY crates/updatec/e2e/jenkins/install.sh /usr/local/share/jenkins/install.sh
 # The HAProxy lifecycle provider (a clean bash state machine) and its launcher — published into the
 # release repo by release-server and downloaded at runtime, never a bespoke image. This is the same
 # reexec provider proven by scripts/linux-haproxy-e2e.sh.

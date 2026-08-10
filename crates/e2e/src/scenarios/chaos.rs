@@ -1,20 +1,20 @@
 use super::super::*;
 
 // Failure deadlines, not reaction delays. Every helper polls and returns as soon as its
-// condition is true. Keep these generous for contended Linux CI while the supervisor
+// condition is true. Keep these generous for contended Linux CI while the agent
 // itself uses one-second checks and bounded transport retries.
 const TRANSACTION_START_TIMEOUT: u64 = 120;
 const RECOVERY_TIMEOUT: u64 = 120;
 const HEALTH_GRACE: &str = "10s";
 
-/// Crash the supervisor at every application-update transaction boundary; the guardian
+/// Crash the agent at every application-update transaction boundary; the launcher
 /// relaunches it and recovery (driven by the on-disk journal) drives the update to a
-/// committed version. The chaos is one-shot, so the relaunched supervisor recovers
+/// committed version. The chaos is one-shot, so the relaunched agent recovers
 /// rather than crashing again. Each boundary runs in a fully isolated dir + repo so
 /// there is no shared state to reset.
 pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
-    // Enumerated from the supervisor binary, not hand-copied — so the scenario tests
-    // exactly the crossings the supervisor defines (see `Ctx::chaos_boundaries`).
+    // Enumerated from the agent binary, not hand-copied — so the scenario tests
+    // exactly the crossings the agent defines (see `Ctx::chaos_boundaries`).
     let boundaries = ctx.chaos_boundaries()?;
     for (index, point) in boundaries.iter().enumerate() {
         let srv = format!("127.0.0.1:{}", 21200 + index);
@@ -22,17 +22,15 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         let dir = ctx.work.join(format!("chaos-{point}"));
         std::fs::create_dir_all(&dir).map_err(str_err)?;
         let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
-        let app = dir.join(format!("app{}", ctx.exe));
-        std::fs::copy(&v1, &app).map_err(str_err)?;
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &v1)?;
         ctx.publish(&dir, "app", "2.0.0", &v2)?;
         let server = ctx.serve(&dir, &srv)?;
-        let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
-            .readiness_health(&svc)
+        let mut cmd = Node::new(ctx, &dir, &srv, "app")
+            .workload(&svc)
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
-            .guardian()?;
+            .launcher()?;
         cmd.env(updated::env::CHAOS_POINT, point);
         let boot = Proc::spawn("chaos", &mut cmd)?;
 
@@ -43,23 +41,21 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
             let log = boot.captured_log();
             drop(boot);
             drop(server);
-            kill_stray(&dir.join("install"));
+            fixture::stop_workload(&dir);
             return fail(format!(
                 "update at {point} never reached the transaction boundary preparation gate; log:\n{log}"
             ));
         }
 
-        // The supervisor applies the update, crashes once at `point`; the guardian
-        // must observe that crash and launch a fresh supervisor. Merely seeing v2 at
-        // the health endpoint is insufficient for the later boundaries: the new app
-        // can become healthy just before the old supervisor dies.
+        // The agent applies the update, crashes once at `point`; the launcher
+        // must observe that crash and launch a fresh agent. Merely seeing v2 at
+        // the service endpoint is insufficient for the later boundaries: the new workload
+        // can become healthy just before the old agent dies.
         let crash_seen = boot.wait_for_log(
             &format!("CHAOS: exiting at boundary \"{point}\""),
             RECOVERY_TIMEOUT,
         );
-        let relaunched = wait_until(RECOVERY_TIMEOUT, || {
-            boot.log_count("launched supervisor") >= 2
-        });
+        let relaunched = wait_until(RECOVERY_TIMEOUT, || boot.log_count("launched agent") >= 2);
 
         // Prove durable convergence as well as liveness: installed state names the
         // exact v2 bytes and the transaction journal is gone. This catches recovery
@@ -77,7 +73,7 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         let log = boot.captured_log();
         drop(boot);
         drop(server);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         let stopped = wait_until(RECOVERY_TIMEOUT, || {
             http_text(&format!("http://{svc}/version")).is_none()
         });
@@ -92,13 +88,13 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
     Ok(())
 }
 
-/// Crash the supervisor at every *first-install* journal boundary. There is no predecessor to
-/// fall back to, so recovery is not a rollback: the guardian relaunches, the on-disk install
+/// Crash the agent at every *first-install* journal boundary. There is no predecessor to
+/// fall back to, so recovery is not a rollback: the launcher relaunches, the on-disk install
 /// journal drives the interrupted install to a committed, live release, and no journal is left
 /// behind. This proves cold install has the same crash-safe journaled parity as an update.
 /// Each boundary runs in its own isolated dir + repo, cold-installed from only the runtime.
 pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
-    // Enumerated from the supervisor binary so the scenario crashes at exactly the crossings the
+    // Enumerated from the agent binary so the scenario crashes at exactly the crossings the
     // install machine defines (see `Ctx::install_chaos_boundaries`).
     let boundaries = ctx.install_chaos_boundaries()?;
     for (index, point) in boundaries.iter().enumerate() {
@@ -108,29 +104,26 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
         std::fs::create_dir_all(&dir).map_err(str_err)?;
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
-        let app = dir.join(format!("not-preinstalled{}", ctx.exe));
         let server = ctx.serve(&dir, &srv)?;
-        let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+        let mut cmd = Node::new(ctx, &dir, &srv, "app")
             .cold_install()
-            .readiness_health(&svc)
+            .workload(&svc)
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
-            .guardian()?;
+            .launcher()?;
         cmd.env(updated::env::CHAOS_POINT, point);
         let boot = Proc::spawn("install-chaos", &mut cmd)?;
 
-        // The first supervisor cold-installs and crashes once at `point`; the guardian must
-        // observe that crash and launch a fresh supervisor that resumes the install.
+        // The first agent cold-installs and crashes once at `point`; the launcher must
+        // observe that crash and launch a fresh agent that resumes the install.
         let crash_seen = boot.wait_for_log(
             &format!("CHAOS: exiting at boundary \"{point}\""),
             RECOVERY_TIMEOUT,
         );
-        let relaunched = wait_until(RECOVERY_TIMEOUT, || {
-            boot.log_count("launched supervisor") >= 2
-        });
+        let relaunched = wait_until(RECOVERY_TIMEOUT, || boot.log_count("launched agent") >= 2);
 
         // Durable convergence: the installed record names the exact v1 bytes and the install
-        // journal is gone. Since the first supervisor died mid-install, only recovery could
+        // journal is gone. Since the first agent died mid-install, only recovery could
         // have reached this state.
         let state_path = dir.join("install/state/installed.json");
         let journal_path = dir.join("install/state/install.json");
@@ -145,7 +138,7 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
         let log = boot.captured_log();
         drop(boot);
         drop(server);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         let stopped = wait_until(RECOVERY_TIMEOUT, || {
             http_text(&format!("http://{svc}/version")).is_none()
         });
@@ -160,68 +153,77 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
     Ok(())
 }
 
-/// Commit a candidate that deliberately crashes inside its confirmation window, then
-/// kill the recovering supervisor at every rollback action/journal boundary. Each case
-/// must converge to the predecessor with the candidate rejected and no journal left.
+/// Commit a candidate whose workload dies inside its confirmation window, then kill the recovering
+/// agent at every rollback action/journal boundary. Each case must converge to the predecessor with
+/// the candidate rejected and no journal left.
 pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
     let boundaries = ctx.rollback_chaos_boundaries()?;
+    // Whether any boundary's recovery reached the `rollback` operation. Which boundaries do is not
+    // this scenario's to dictate — a crash after the predecessor is restored and committed leaves
+    // nothing left to compensate — but a sweep in which the operation never ran at all would mean
+    // the compensating hook is unreachable, and that is worth failing over.
+    let mut compensated = false;
     for (index, point) in boundaries.iter().enumerate() {
         let srv = format!("127.0.0.1:{}", 21400 + index);
         let svc = format!("127.0.0.1:{}", 21500 + index);
         let dir = ctx.work.join(format!("rollback-chaos-{point}"));
         std::fs::create_dir_all(&dir).map_err(str_err)?;
         let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
-        let app = dir.join(format!("app{}", ctx.exe));
-        std::fs::copy(&v1, &app).map_err(str_err)?;
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &v1)?;
         ctx.publish(&dir, "app", "2.0.0", &v2)?;
         let server = ctx.serve(&dir, &srv)?;
-        let fixture = dir.join("lifecycle-fixture");
-        let fixture_command = vec![
-            std::env::current_exe()
-                .map_err(str_err)?
-                .display()
-                .to_string(),
-            "--lifecycle-fixture".into(),
-            fixture.display().to_string(),
-        ];
+        let fixture_root = fixture::root(&dir);
 
-        let mut cmd = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+        let mut cmd = Node::new(ctx, &dir, &srv, "app")
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
             .confirmation_window("120s")
-            .lifecycle(fixture_command)
-            .guardian()?;
+            // The candidate passes its transaction health gate on its first observation and fails
+            // every one after it. A workload that merely died would be restarted by the next boot's
+            // own converge — the reconciler owns it — so a running, unhealthy release is what makes
+            // a boot gate fail and a rollback happen at all.
+            .faulty_workload(&svc, "degrade-after-ready")
+            .launcher()?;
         cmd.env(updated::env::CHAOS_POINT, point);
-        let tower = Service::spawn("rollback-chaos", &cmd);
-
-        if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
-            let log = tower.captured_log();
-            drop(tower);
+        let node = Service::spawn("rollback-chaos", &cmd);
+        let abandon = |node: Service, server: Proc, message: String| -> R {
+            let log = node.captured_log();
+            drop(node);
             drop(server);
-            kill_stray(&dir.join("install"));
-            return fail(format!(
-                "rollback case {point} never began its update transaction; log:\n{log}"
-            ));
+            fixture::stop_workload(&dir);
+            fail(format!("{message}; log:\n{log}"))
+        };
+
+        if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+            return abandon(
+                node,
+                server,
+                format!("rollback case {point} never began its update transaction"),
+            );
         }
 
-        // This scenario is specifically about rollback of a committed, unconfirmed
-        // release. Trigger its crash from that durable state instead of racing a timer
-        // against provider finalization on a contended Linux runner.
-        if !tower.wait_for_log("upgraded to 2.0.0", RECOVERY_TIMEOUT)
-            || !wait_for_crash(&svc, RECOVERY_TIMEOUT)
-        {
-            let log = tower.captured_log();
-            drop(tower);
-            drop(server);
-            kill_stray(&dir.join("install"));
-            return fail(format!(
-                "rollback case {point} could not trigger its post-commit crash; log:\n{log}"
-            ));
+        // This scenario is specifically about the rollback of a committed, unconfirmed release.
+        // Trigger it from that durable state — wait for the commit, then crash the agent so the
+        // next boot's health gate is the one that renders the verdict on the degraded release —
+        // rather than racing a timer against the transaction's finalization on a contended runner.
+        if !node.wait_for_log("upgraded to 2.0.0", RECOVERY_TIMEOUT) {
+            return abandon(
+                node,
+                server,
+                format!("rollback case {point} never committed its degrading candidate"),
+            );
         }
+        let Some(agent) = pid_after(&node.captured_log(), "launched agent") else {
+            return abandon(
+                node,
+                server,
+                format!("rollback case {point}: the launcher never reported an agent PID"),
+            );
+        };
+        kill_pid(agent);
 
-        let crash_seen = tower.wait_for_log(
+        let crash_seen = node.wait_for_log(
             &format!("CHAOS: exiting at boundary \"{point}\""),
             RECOVERY_TIMEOUT,
         );
@@ -237,39 +239,30 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
         let rejected = std::fs::read_to_string(dir.join("install/state/rejected"))
             .is_ok_and(|contents| !contents.trim().is_empty());
-        let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
-        let parsed: Vec<(&str, &str)> = attempts
-            .lines()
-            .filter_map(|line| line.split_once('\t'))
-            .collect();
-        let ids: std::collections::HashSet<&str> = parsed.iter().map(|(_, id)| *id).collect();
-        let operation_contract_held = !parsed.is_empty()
-            && parsed
-                .iter()
-                .all(|(operation, _)| matches!(*operation, "apply" | "healthcheck" | "rollback"))
-            && parsed.iter().any(|(operation, _)| *operation == "apply")
-            && parsed.iter().any(|(operation, _)| *operation == "rollback")
+        let attempts = fixture::attempts(&fixture_root);
+        let ids: std::collections::HashSet<&str> =
+            attempts.iter().map(|(_, id)| id.as_str()).collect();
+        let operation_contract_held = !attempts.is_empty()
+            && attempts.iter().all(|(operation, _)| {
+                matches!(operation.as_str(), "apply" | "healthcheck" | "rollback")
+            })
+            && attempts.iter().any(|(operation, _)| operation == "apply")
             && ids.len() == 1;
-        let effect_names: Vec<String> = std::fs::read_dir(fixture.join("effects"))
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        let effects_are_idempotent = ["apply", "healthcheck", "rollback"].iter().all(|phase| {
-            effect_names
-                .iter()
-                // Markers are `{id}-{phase}`; the id is dashless hex, so the phase is
-                // everything after the first `-`. Exactly one marker per phase is the
-                // idempotency claim: a replayed phase must not leave a second effect.
-                .filter(|name| name.split_once('-').map(|(_, tail)| tail) == Some(*phase))
-                .count()
-                == 1
-        });
-        let log = tower.captured_log();
-        drop(tower);
+        compensated |= attempts
+            .iter()
+            .any(|(operation, _)| operation == "rollback");
+        // One marker per operation that ran is the idempotency claim: however many times recovery
+        // replayed an operation, its attempt-keyed effect landed once.
+        let effects_are_idempotent = ["apply", "healthcheck", "rollback"]
+            .iter()
+            .all(|operation| {
+                let invoked = attempts.iter().any(|(recorded, _)| recorded == operation);
+                fixture::effect_markers(&fixture_root, operation) == usize::from(invoked)
+            });
+        let log = node.captured_log();
+        drop(node);
         drop(server);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         if !crash_seen
             || !durable
             || !live
@@ -281,9 +274,15 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
                 "rollback recovery at {point} was incomplete (crash_seen={crash_seen}, \
                  durable={durable}, live={live}, rejected={rejected}, \
                  operation_contract_held={operation_contract_held}, effects_are_idempotent={effects_are_idempotent}); \
-                 attempts:\n{attempts}\nlog:\n{log}"
+                 attempts:\n{attempts:?}\nlog:\n{log}"
             ));
         }
+    }
+    if !compensated {
+        return fail(
+            "no rollback boundary's recovery ever invoked the reconciler's rollback operation, so \
+             the compensating hook is unreachable",
+        );
     }
     ok("every rollback action/journal boundary recovered to the predecessor");
     Ok(())
@@ -294,80 +293,72 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let svc = format!("127.0.0.1:{}", 21900 + index);
     let dir = ctx.work.join(format!("provider-failure-{phase}"));
     std::fs::create_dir_all(&dir).map_err(str_err)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let server = ctx.serve(&dir, &srv)?;
-    let fixture = dir.join("lifecycle-fixture");
-    // Every case here injects a PERSISTENT provider failure: the phase fails on every attempt, so
-    // containment must hold indefinitely rather than being papered over by a lucky retry.
+    let fixture_root = fixture::root(&dir);
+    // Every case here injects a PERSISTENT reconciler failure: the operation fails on every
+    // attempt, so containment must hold indefinitely rather than being papered over by a lucky
+    // retry. The rollback case additionally fails the recovery itself.
     let mode = if phase == "rollback" {
-        "fail-apply-and-rollback".to_string()
+        format!("workload={svc},fail=apply,fail=rollback")
     } else {
-        format!("fail-{phase}")
+        format!("workload={svc},fail={phase}")
     };
-    let fixture_command = vec![
-        std::env::current_exe()
-            .map_err(str_err)?
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        fixture.display().to_string(),
-        mode,
-    ];
-    let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+    let command = Node::new(ctx, &dir, &srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
-        .lifecycle(fixture_command)
-        .guardian()?;
-    let tower = Proc::spawn("provider-failure", &mut command)?;
-    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
-        let log = tower.captured_log();
-        drop(tower);
+        .mode(&mode)
+        .launcher()?;
+    // The single rollback path is boot recovery, so the node runs under the init model: the
+    // failed candidate ends the disposable agent and the launcher's relaunch is what recovers.
+    let node = Service::spawn("provider-failure", &command);
+    if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = node.captured_log();
+        drop(node);
         drop(server);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         return fail(format!(
-            "provider {phase} case never began its update transaction; log:\n{log}"
+            "reconciler {phase} case never began its update transaction; log:\n{log}"
         ));
     }
     let observed = wait_until(RECOVERY_TIMEOUT, || {
-        std::fs::read_to_string(fixture.join("attempts.log")).is_ok_and(|attempts| {
-            let saw_phase = attempts
-                .lines()
-                .any(|line| line.starts_with(&format!("{phase}\t")));
-            let saw_rollback = attempts.lines().any(|line| line.starts_with("rollback\t"));
-            saw_phase && saw_rollback
-        })
+        let attempts = fixture::attempts(&fixture_root);
+        attempts.iter().any(|(operation, _)| operation == phase)
+            && attempts
+                .iter()
+                .any(|(operation, _)| operation == "rollback")
     });
-    // The predecessor must be the version actually answering: a contained provider failure never
-    // leaves the candidate serving.
+    // The predecessor must be the version actually answering: a contained failure never leaves the
+    // candidate serving.
     let predecessor_live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
-    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
-    let held_without_replay = if phase == "rollback" {
-        std::thread::sleep(Duration::from_secs(2));
-        std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default() == attempts
-    } else {
-        true
-    };
+    let attempts = fixture::attempts(&fixture_root);
+    // A failed rollback is retried from the SAME durable evidence, never restarted as a fresh
+    // transaction: the held recovery keeps one attempt identity however many times it replays.
+    let one_recovery_identity = attempts
+        .iter()
+        .map(|(_, id)| id.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == 1;
     let completed_journal_cleared = phase == "rollback"
         || wait_until(RECOVERY_TIMEOUT, || {
             !dir.join("install/state/transaction.json").is_file()
         });
     let journal_present = dir.join("install/state/transaction.json").is_file();
-    drop(tower);
+    drop(node);
     drop(server);
-    kill_stray(&dir.join("install"));
+    fixture::stop_workload(&dir);
 
     if !observed || !predecessor_live {
         return fail(format!(
-            "provider {phase} failure escaped containment (live={predecessor_live}); attempts:\n{attempts}"
+            "reconciler {phase} failure escaped containment (live={predecessor_live}); attempts:\n{attempts:?}"
         ));
     }
-    if !held_without_replay {
+    if !one_recovery_identity {
         return fail(format!(
-            "provider {phase} failure caused a recovery replay loop:\n{attempts}"
+            "reconciler {phase} failure was retried under a new transaction identity:\n{attempts:?}"
         ));
     }
     if phase == "rollback" {
@@ -376,22 +367,25 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         }
     } else if !completed_journal_cleared {
         return fail(format!(
-            "provider {phase} failure left a completed recovery journal behind"
+            "reconciler {phase} failure left a completed recovery journal behind"
         ));
     }
-    if !attempts.contains("rollback\t") {
+    if !attempts
+        .iter()
+        .any(|(operation, _)| operation == "rollback")
+    {
         return fail(format!(
-            "provider {phase} failure did not invoke rollback:\n{attempts}"
+            "reconciler {phase} failure did not invoke rollback:\n{attempts:?}"
         ));
     }
     Ok(())
 }
 
 /// Fuzz the timeout-bounded-*hang* failure mode across every forward lifecycle hook. The clean
-/// exit-nonzero failure at each phase is covered by [`provider_failure_case`]; this covers the
+/// exit-nonzero failure at each operation is covered by [`provider_failure_case`]; this covers the
 /// other way a hook goes wrong — it wedges and never returns. Each hook must be killed by the
-/// supervisor's provider timeout and recovered from, leaving a *live* predecessor. A stall (no
-/// timeout) would freeze the update or strand the app stopped mid-switchover — either way 1.0.0
+/// agent's hook timeout and recovered from, leaving a *live* predecessor. A stall (no
+/// timeout) would freeze the update or strand the workload mid-switchover — either way 1.0.0
 /// never comes back within the bound, so "predecessor live" is the invariant that catches it.
 /// (Rollback is excluded: its hooks run with the candidate/predecessor reversed, so the forward
 /// hang guard cannot target them.)
@@ -400,67 +394,56 @@ pub(crate) fn provider_hook_hangs_are_bounded(ctx: &Ctx) -> R {
     for (index, phase) in PHASES.iter().enumerate() {
         provider_hang_case(ctx, phase, index as u16)?;
     }
-    ok("every forward lifecycle hook hang was bounded by the provider timeout and recovered with the predecessor live");
+    ok("every forward lifecycle hook hang was bounded by the hook timeout and recovered with the predecessor live");
     Ok(())
 }
 
 fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
-    // Keep this range disjoint from `chaotic_application_health_failures`, whose guardian
-    // probes occupy 22300..22307 while the scenarios run concurrently.
+    // Keep this range disjoint from `chaotic_application_health_failures` (22100..22107).
     let srv = format!("127.0.0.1:{}", 23300 + index);
     let svc = format!("127.0.0.1:{}", 23350 + index);
     let dir = ctx.work.join(format!("provider-hang-{phase}"));
     std::fs::create_dir_all(&dir).map_err(str_err)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let server = ctx.serve(&dir, &srv)?;
-    let fixture = dir.join("lifecycle-fixture");
-    let fixture_command = vec![
-        std::env::current_exe()
-            .map_err(str_err)?
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        fixture.display().to_string(),
-        format!("hang-{phase}"),
-    ];
-    let mut command = Sup::new(ctx, &dir, &srv, "app", appcmd(&app, &["--addr", &svc]))
+    let fixture_root = fixture::root(&dir);
+    let command = Node::new(ctx, &dir, &srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
-        .lifecycle(fixture_command)
-        .guardian()?;
-    let tower = Proc::spawn("provider-hang", &mut command)?;
-    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
-        let log = tower.captured_log();
-        drop(tower);
+        .mode(&format!("workload={svc},hang={phase}"))
+        .launcher()?;
+    let node = Service::spawn("provider-hang", &command);
+    if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = node.captured_log();
+        drop(node);
         drop(server);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         return fail(format!(
-            "provider hang {phase} case never began its update transaction; log:\n{log}"
+            "reconciler hang {phase} case never began its update transaction; log:\n{log}"
         ));
     }
-    // The hook wedges at `phase`; the bounded provider timeout must fire and recovery must restore
-    // a live predecessor within the window.
+    // The hook wedges at `phase`; the bounded hook timeout must fire and recovery must restore a
+    // live predecessor within the window.
     let attempted = wait_until(RECOVERY_TIMEOUT, || {
-        std::fs::read_to_string(fixture.join("attempts.log"))
-            .is_ok_and(|a| a.lines().any(|l| l.starts_with(&format!("{phase}\t"))))
+        fixture::attempts(&fixture_root)
+            .iter()
+            .any(|(operation, _)| operation == phase)
     });
     let predecessor_live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
-    let log = tower.captured_log();
-    drop(tower);
+    let log = node.captured_log();
+    drop(node);
     drop(server);
-    kill_stray(&dir.join("install"));
+    fixture::stop_workload(&dir);
     if !attempted {
         return fail(format!(
-            "provider hang {phase}: the hook was never invoked at that phase:\n{log}"
+            "reconciler hang {phase}: the hook was never invoked at that operation:\n{log}"
         ));
     }
     if !predecessor_live {
         return fail(format!(
-            "provider hang {phase}: the wedged hook was not bounded by the provider timeout — the \
+            "reconciler hang {phase}: the wedged hook was not bounded by the hook timeout — the \
              node never recovered a live predecessor within {RECOVERY_TIMEOUT}s:\n{log}"
         ));
     }
@@ -468,50 +451,44 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
 }
 
 /// The double-execution window, as a first-class scenario: crash the agent after a successful
-/// forward `apply` but before its checkpoint lands, so recovery MUST invoke `apply` again. This is
-/// the exact case the protocol's execution contract makes the hook author's obligation, so it gets
-/// its own named proof rather than riding inside the boundary sweep: the replay carries the SAME
-/// attempt id, the fixture's attempt-keyed marker makes the effect exactly-once, and the machine
-/// still converges to the committed candidate.
+/// forward `apply` but before its checkpoint lands, so recovery MUST invoke `apply` again under the
+/// same transaction. This is the exact case the protocol's execution contract makes the hook
+/// author's obligation, so it gets its own named proof rather than riding inside the boundary
+/// sweep: the interrupted attempt is invoked again under the SAME attempt id, the fixture's
+/// attempt-keyed marker makes that attempt's effect land exactly once however many invocations it
+/// takes, and the machine still converges to a committed candidate.
+///
+/// A later roll-forward is a DIFFERENT attempt with its own identity and its own effect, which is
+/// why every claim here is made per-attempt rather than over the whole recorded history.
 pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
-    // Disjoint from the provider-hang range (23300..) and the health-failure range (22300..).
+    // Disjoint from the hang range (23300..) and the health-failure range (22100..).
     let srv = "127.0.0.1:23400";
     let svc = "127.0.0.1:23450";
     let dir = ctx.work.join("apply-replay");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let server = ctx.serve(&dir, srv)?;
-    let fixture = dir.join("lifecycle-fixture");
-    let fixture_command = vec![
-        std::env::current_exe()
-            .map_err(str_err)?
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        fixture.display().to_string(),
-    ];
-    let mut command = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+    let fixture_root = fixture::root(&dir);
+    let mut command = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
-        .lifecycle(fixture_command)
-        .guardian()?;
+        .workload(svc)
+        .launcher()?;
     // One-shot crash exactly between the successful apply hook and its durable checkpoint.
     command.env(updated::env::CHAOS_POINT, "candidate-lifecycle-applied");
-    let tower = Proc::spawn("apply-replay", &mut command)?;
-    if !tower.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
-        let log = tower.captured_log();
-        drop(tower);
+    let node = Proc::spawn("apply-replay", &mut command)?;
+    if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = node.captured_log();
+        drop(node);
         drop(server);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         return fail(format!(
             "the replay case never began its update transaction; log:\n{log}"
         ));
     }
-    let crash_seen = tower.wait_for_log(
+    let crash_seen = node.wait_for_log(
         "CHAOS: exiting at boundary \"candidate-lifecycle-applied\"",
         RECOVERY_TIMEOUT,
     );
@@ -524,44 +501,32 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
                 if state.release.version == "2.0.0"
         ) && !journal_path.exists()
     });
-    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).unwrap_or_default();
+    let attempts = fixture::attempts(&fixture_root);
     let applies: Vec<&str> = attempts
-        .lines()
-        .filter_map(|line| line.strip_prefix("apply\t"))
+        .iter()
+        .filter(|(operation, _)| operation == "apply")
+        .map(|(_, id)| id.as_str())
         .collect();
-    let ids: std::collections::HashSet<&str> = applies.iter().copied().collect();
-    // At least two invocations — the one the crash interrupted and its recovery replay — and
-    // every one under the same attempt id, or replay identity is broken.
-    let replayed_under_one_id = applies.len() >= 2 && ids.len() == 1;
-    let apply_markers = std::fs::read_dir(fixture.join("effects"))
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .split_once('-')
-                .map(|(_, tail)| tail == "apply")
-                .unwrap_or(false)
-        })
-        .count();
+    // The attempt the crash interrupted is the first one recorded; its apply must have been invoked
+    // again during recovery, or the replay carried a fresh identity and the contract is broken.
+    let interrupted = applies.first().copied().unwrap_or_default().to_string();
+    let invocations = applies.iter().filter(|id| **id == interrupted).count();
+    let replayed_under_one_id = invocations >= 2;
+    let apply_markers = fixture::effect_markers_for(&fixture_root, &interrupted, "apply");
     let effect_exactly_once = apply_markers == 1;
-    let log = tower.captured_log();
-    drop(tower);
+    let log = node.captured_log();
+    drop(node);
     drop(server);
-    kill_stray(&dir.join("install"));
+    fixture::stop_workload(&dir);
     if !crash_seen || !durable || !replayed_under_one_id || !effect_exactly_once {
         return fail(format!(
             "the apply replay was not exactly-once (crash_seen={crash_seen}, durable={durable}, \
-             replayed_under_one_id={replayed_under_one_id} ({} applies, {} ids), \
-             effect_exactly_once={effect_exactly_once} ({apply_markers} markers)); \
-             attempts:\n{attempts}\nlog:\n{log}",
-            applies.len(),
-            ids.len(),
+             replayed_under_one_id={replayed_under_one_id} ({invocations} invocations of attempt \
+             {interrupted}), effect_exactly_once={effect_exactly_once} ({apply_markers} markers)); \
+             attempts:\n{attempts:?}\nlog:\n{log}"
         ));
     }
-    ok("a crashed apply was replayed under the same attempt id and its effect landed exactly once");
+    ok("a crashed apply was invoked again under the same attempt id and that attempt's effect landed exactly once");
     Ok(())
 }
 
@@ -575,80 +540,71 @@ pub(crate) fn provider_rollback_failure(ctx: &Ctx) -> R {
     provider_failure_case(ctx, "rollback", 2)
 }
 
-pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
+/// Seed the baseline a migration-shaped release upgrades from: the live content and application
+/// archive its `apply` must back up before migrating.
+fn seed_migration_baseline(dir: &Path) -> R<PathBuf> {
+    let live = fixture::root(dir).join("migration-state/live");
+    std::fs::create_dir_all(&live).map_err(str_err)?;
+    std::fs::write(live.join("content.db"), b"baseline-content\n").map_err(str_err)?;
+    std::fs::write(live.join("app.war"), b"1.0.0\n").map_err(str_err)?;
+    Ok(live)
+}
+
+pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
     use std::time::Instant;
 
     let srv = "127.0.0.1:21809";
     let svc = "127.0.0.1:21909";
-    let dir = ctx.work.join("magnolia-shaped-upgrade");
+    let dir = ctx.work.join("migration-shaped-upgrade");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let _server = ctx.serve(&dir, srv)?;
-    let fixture = dir.join("lifecycle-fixture");
-    let live = fixture.join("magnolia-state/live");
-    std::fs::create_dir_all(&live).map_err(str_err)?;
-    std::fs::write(live.join("content.db"), b"baseline-content\n").map_err(str_err)?;
-    std::fs::write(live.join("app.war"), b"1.0.0\n").map_err(str_err)?;
-    let command = vec![
-        std::env::current_exe()
-            .map_err(str_err)?
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        fixture.display().to_string(),
-        "magnolia-shaped".into(),
-    ];
-    let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+    let fixture_root = fixture::root(&dir);
+    let live = seed_migration_baseline(&dir)?;
+    let mut node = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
-        .lifecycle(command)
-        .guardian()?;
-    let process = Proc::spawn("magnolia-shaped", &mut tower)?;
+        .mode(&format!("workload={svc},migration-shaped"))
+        .launcher()?;
+    let process = Proc::spawn("migration-shaped", &mut node)?;
     if !wait_for_version(svc, "1.0.0", TRANSACTION_START_TIMEOUT) {
-        return fail("Magnolia-shaped baseline did not become healthy");
+        return fail("the migration-shaped baseline did not become healthy");
     }
     if !process.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
         let log = process.captured_log();
         drop(process);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         return fail(format!(
-            "Magnolia-shaped upgrade never began its transaction; log:\n{log}"
+            "the migration-shaped upgrade never began its transaction; log:\n{log}"
         ));
     }
-    // The provider owns all domain-specific sequencing inside one apply operation.
+    // The reconciler owns all domain-specific sequencing inside one apply operation.
     let upgrade_started = Instant::now();
+    // The workload answers as 2.0.0 from inside `apply`, so waiting on the service alone would read
+    // the recorded history before the transaction's healthcheck had run. The committed upgrade is
+    // the barrier that means every operation of this transaction is behind us.
     let upgraded = wait_until(RECOVERY_TIMEOUT, || {
         wait_for_version(svc, "2.0.0", 1)
-            && std::path::Path::new(&fixture)
-                .join("magnolia-state/migration-finalized")
+            && fixture_root
+                .join("migration-state/migration-finalized")
                 .is_file()
-    });
-    // `upgraded` already required `migration-finalized`; re-checking the same single marker under
-    // a second name added no coverage. What the state assertions below check — the migrated
-    // content, the exact backup, and no leftover drain marker — is the real contract.
-    let state = fixture.join("magnolia-state");
-    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).map_err(str_err)?;
-    let parsed = attempts
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .collect::<Vec<_>>();
-    let ordered = parsed
+    }) && process.wait_for_log("upgraded to 2.0.0", RECOVERY_TIMEOUT);
+    let state = fixture_root.join("migration-state");
+    let attempts = fixture::attempts(&fixture_root);
+    let ordered = attempts
         .iter()
-        .map(|(operation, _)| *operation)
+        .map(|(operation, _)| operation.as_str())
         .eq(["apply", "healthcheck"]);
-    let one_attempt = parsed
+    let one_attempt = attempts
         .first()
-        .is_some_and(|(_, id)| parsed.iter().all(|(_, candidate)| candidate == id));
+        .is_some_and(|(_, id)| attempts.iter().all(|(_, candidate)| candidate == id));
     let state_is_migrated = std::fs::read_to_string(live.join("content.db")).map_err(str_err)?
         == "migrated-2.0.0\n"
-        && std::fs::read_to_string(live.join("app.war")).map_err(str_err)? == "2.0.0\n"
-        && !live.join("draining").exists();
-    let backup_is_exact = parsed.first().is_some_and(|(_, id)| {
+        && std::fs::read_to_string(live.join("app.war")).map_err(str_err)? == "2.0.0\n";
+    let backup_is_exact = attempts.first().is_some_and(|(_, id)| {
         let backup = state.join("backups").join(id);
         std::fs::read_to_string(backup.join("content.db"))
             .is_ok_and(|content| content == "baseline-content\n")
@@ -656,170 +612,142 @@ pub(crate) fn magnolia_shaped_upgrade(ctx: &Ctx) -> R {
     });
     let elapsed = upgrade_started.elapsed();
     drop(process);
-    kill_stray(&dir.join("install"));
+    fixture::stop_workload(&dir);
     if !upgraded || !ordered || !one_attempt || !state_is_migrated || !backup_is_exact {
         return fail(format!(
-            "Magnolia-shaped wrapper violated its lifecycle/state contract in {state:?}:\n{attempts}"
+            "the migration-shaped wrapper violated its lifecycle/state contract in {state:?}:\n{attempts:?}"
         ));
     }
     if elapsed < Duration::from_millis(250) {
         return fail(format!(
-            "Magnolia-shaped lifecycle completed unrealistically quickly ({elapsed:?})"
+            "the migration-shaped lifecycle completed unrealistically quickly ({elapsed:?})"
         ));
     }
-    ok("Magnolia-shaped provider applied its migration, passed healthcheck, and retained an exact rollback backup");
+    ok("the migration-shaped reconciler applied its migration, passed healthcheck, and retained an exact rollback backup");
     Ok(())
 }
 
-pub(crate) fn sample_magnolia_sample_transition(ctx: &Ctx) -> R {
+pub(crate) fn sample_to_migration_shaped_and_back(ctx: &Ctx) -> R {
     let srv = "127.0.0.1:21811";
     let svc = "127.0.0.1:21911";
-    let dir = ctx.work.join("sample-magnolia-sample");
+    let dir = ctx.work.join("sample-migration-sample");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let _server = ctx.serve(&dir, srv)?;
-
-    let fixture = dir.join("lifecycle-fixture");
-    let live = fixture.join("magnolia-state/live");
-    std::fs::create_dir_all(&live).map_err(str_err)?;
-    std::fs::write(live.join("content.db"), b"baseline-content\n").map_err(str_err)?;
-    std::fs::write(live.join("app.war"), b"1.0.0\n").map_err(str_err)?;
-    let command = vec![
-        std::env::current_exe()
-            .map_err(str_err)?
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        fixture.display().to_string(),
-        "magnolia-shaped-transition".into(),
-    ];
-    let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+    let fixture_root = fixture::root(&dir);
+    seed_migration_baseline(&dir)?;
+    let mut node = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
         .confirmation_window("2s")
-        .lifecycle(command)
-        .guardian()?;
-    let process = Proc::spawn("artifact-transition", &mut tower)?;
-    let magnolia_committed = wait_until(RECOVERY_TIMEOUT, || {
+        .mode(&format!("workload={svc},migration-shaped-transition"))
+        .launcher()?;
+    let process = Proc::spawn("artifact-transition", &mut node)?;
+    let migrated = wait_until(RECOVERY_TIMEOUT, || {
         wait_for_version(svc, "2.0.0", 1)
-            && fixture.join("magnolia-state/migration-finalized").is_file()
+            && fixture_root
+                .join("migration-state/migration-finalized")
+                .is_file()
     }) && process.wait_for_log("upgraded to 2.0.0", RECOVERY_TIMEOUT);
-    if !magnolia_committed {
+    if !migrated {
         let log = process.captured_log();
         drop(process);
-        kill_stray(&dir.join("install"));
+        fixture::stop_workload(&dir);
         return fail(format!(
-            "sample -> Magnolia-shaped transition failed:\n{log}"
+            "the sample -> migration-shaped transition failed:\n{log}"
         ));
     }
 
     // Reuse the ordinary sample-app executable fixture. `publish-app` writes
     // the requested 3.0.0 release configuration into the immutable bundle.
     ctx.publish(&dir, "app", "3.0.0", &app_v(ctx, "1.0.0"))?;
-    let attempts_path = fixture.join("attempts.log");
     let returned = wait_until(RECOVERY_TIMEOUT, || {
-        if !wait_for_version(svc, "3.0.0", 1) {
-            return false;
-        }
-        let Ok(attempts) = std::fs::read_to_string(&attempts_path) else {
-            return false;
-        };
-        attempts
-            .lines()
-            .filter_map(|line| {
-                let (phase, id) = line.split_once('\t')?;
-                (phase == "apply").then_some(id)
-            })
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            == 2
+        wait_for_version(svc, "3.0.0", 1)
+            && fixture::attempts(&fixture_root)
+                .iter()
+                .filter(|(operation, _)| operation == "apply")
+                .map(|(_, id)| id.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == 2
     }) && process.wait_for_log("upgraded to 3.0.0", RECOVERY_TIMEOUT);
-    let attempts = std::fs::read_to_string(&attempts_path).map_err(str_err)?;
+    let attempts = fixture::attempts(&fixture_root);
     let transaction_ids = attempts
-        .lines()
-        .filter_map(|line| line.split_once('\t').map(|(_, id)| id))
+        .iter()
+        .map(|(_, id)| id.as_str())
         .collect::<std::collections::HashSet<_>>();
     let log = process.captured_log();
+    let identities = transaction_ids.len();
     drop(process);
-    kill_stray(&dir.join("install"));
-    if !returned || transaction_ids.len() != 2 {
+    fixture::stop_workload(&dir);
+    if !returned || identities != 2 {
         return fail(format!(
-            "Magnolia-shaped -> sample transition was not a distinct complete transaction:\n{attempts}\ntower log:\n{log}"
+            "the migration-shaped -> sample transition was not a distinct complete transaction:\n{attempts:?}\nnode log:\n{log}"
         ));
     }
-    ok("one install switched sample app -> Magnolia-shaped lifecycle -> sample app");
+    ok("one install switched sample app -> migration-shaped lifecycle -> sample app");
     Ok(())
 }
 
-pub(crate) fn magnolia_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
+pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
     let srv = "127.0.0.1:21810";
     let svc = "127.0.0.1:21910";
-    let dir = ctx.work.join("magnolia-shaped-rollback");
+    let dir = ctx.work.join("migration-shaped-rollback");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
-    let app = dir.join(format!("app{}", ctx.exe));
-    std::fs::copy(app_v(ctx, "1.0.0"), &app).map_err(str_err)?;
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let _server = ctx.serve(&dir, srv)?;
-    let fixture = dir.join("lifecycle-fixture");
-    let live = fixture.join("magnolia-state/live");
-    std::fs::create_dir_all(&live).map_err(str_err)?;
-    std::fs::write(live.join("content.db"), b"baseline-content\n").map_err(str_err)?;
-    std::fs::write(live.join("app.war"), b"1.0.0\n").map_err(str_err)?;
-    let command = vec![
-        std::env::current_exe()
-            .map_err(str_err)?
-            .display()
-            .to_string(),
-        "--lifecycle-fixture".into(),
-        fixture.display().to_string(),
-        "magnolia-shaped-fail-apply".into(),
-    ];
-    let mut tower = Sup::new(ctx, &dir, srv, "app", appcmd(&app, &["--addr", svc]))
+    let fixture_root = fixture::root(&dir);
+    let live = seed_migration_baseline(&dir)?;
+    let cmd = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
-        .lifecycle(command)
-        .guardian()?;
-    let process = Proc::spawn("magnolia-rollback", &mut tower)?;
+        .mode(&format!("workload={svc},migration-shaped-fail-apply"))
+        .launcher()?;
+    // A failed apply is recovered by the launcher's relaunch into boot recovery — the single
+    // rollback path — so this node runs under the init model.
+    let node = Service::spawn("migration-rollback", &cmd);
     if !wait_for_version(svc, "1.0.0", TRANSACTION_START_TIMEOUT) {
-        return fail("Magnolia rollback baseline did not become healthy");
+        return fail("the migration-shaped rollback baseline did not become healthy");
     }
-    if !process.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
-        let log = process.captured_log();
-        drop(process);
-        kill_stray(&dir.join("install"));
+    if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
+        let log = node.captured_log();
+        drop(node);
+        fixture::stop_workload(&dir);
         return fail(format!(
-            "Magnolia rollback update never began its transaction; log:\n{log}"
+            "the migration-shaped rollback update never began its transaction; log:\n{log}"
         ));
     }
     let restored = wait_until(RECOVERY_TIMEOUT, || {
-        fixture.join("magnolia-state/rollback-completed").is_file()
+        fixture_root
+            .join("migration-state/rollback-completed")
+            .is_file()
             && std::fs::read_to_string(live.join("content.db"))
                 .is_ok_and(|content| content == "baseline-content\n")
             && std::fs::read_to_string(live.join("app.war")).is_ok_and(|war| war == "1.0.0\n")
             && wait_for_version(svc, "1.0.0", 1)
     });
-    let attempts = std::fs::read_to_string(fixture.join("attempts.log")).map_err(str_err)?;
+    let attempts = fixture::attempts(&fixture_root);
     let ids = attempts
-        .lines()
-        .filter_map(|line| line.split_once('\t').map(|(_, id)| id))
+        .iter()
+        .map(|(_, id)| id.as_str())
         .collect::<std::collections::HashSet<_>>();
     let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
     let journal_cleared = wait_until(RECOVERY_TIMEOUT, || {
         !dir.join("install/state/transaction.json").is_file()
     });
-    drop(process);
-    kill_stray(&dir.join("install"));
-    if !restored || ids.len() != 1 || rejected.trim().is_empty() || !journal_cleared {
+    let identities = ids.len();
+    let log = node.captured_log();
+    drop(node);
+    fixture::stop_workload(&dir);
+    if !restored || identities != 1 || rejected.trim().is_empty() || !journal_cleared {
         return fail(format!(
-            "failed Magnolia migration did not restore one transaction cleanly:\n{attempts}"
+            "the failed migration did not restore one transaction cleanly:\n{attempts:?}\nlog:\n{log}"
         ));
     }
-    ok("failed Magnolia migration restored the WAR and content backup, rejected the candidate, and cleared recovery state");
+    ok("a failed migration restored its archive and content backup, rejected the candidate, and cleared recovery state");
     Ok(())
 }
