@@ -77,7 +77,8 @@ impl std::ops::Deref for BoundedTimeouts {
     }
 }
 
-/// The release the boot health gate must observe, and the providers it must observe it with.
+/// The whole identity of the boot health gate's invocation: which attempt it belongs to, which
+/// release it observes, which release that one displaced, and the providers it must observe with.
 ///
 /// These are one signed unit and must always be resolved together. During a crash-recovered
 /// rollback the predecessor's commit is deferred until *after* the gate, so the installed record
@@ -86,13 +87,39 @@ impl std::ops::Deref for BoundedTimeouts {
 /// `--candidate 2.0.0`, and a reconciler that honours the documented argv contract reports
 /// unhealthy — eventually rejecting a perfectly good release and writing its outputs under the
 /// candidate's hash, where telemetry never looks.
+pub(crate) struct GateTarget {
+    /// The attempt this observation belongs to: the rollback transaction's own compensating token
+    /// when the gate is that transaction's health step, and the reserved boot identity otherwise.
+    pub attempt: String,
+    pub candidate: ReleaseId,
+    pub predecessor: ReleaseId,
+    pub lifecycle: Box<updated::state::ProviderRelease>,
+}
+
+/// Resolve the boot gate's whole invocation identity from one source.
+///
+/// A crash-recovered rollback's boot gate IS that transaction's health step — its verdict advances
+/// `RollbackHealthStarted` -> `PredecessorHealthy` and bounds the rollback — so it carries the same
+/// compensating attempt identity as the transaction's predecessor `apply` and its `rollback`, and
+/// names the failed candidate as the predecessor. Every other boot gate belongs to no transaction
+/// and is a reserved-identity observation of the installed release.
 pub(crate) fn boot_gate_target(
     recovery: Option<&Transaction>,
     installed: &InstalledState,
-) -> (ReleaseId, Box<updated::state::ProviderRelease>) {
+) -> GateTarget {
     match recovery {
-        Some(tx) if tx.is_rollback() => (tx.previous_release.clone(), tx.lifecycle.clone()),
-        _ => (installed.release.clone(), installed.lifecycle.clone()),
+        Some(tx) if tx.is_rollback() => GateTarget {
+            attempt: tx.rollback_attempt_id(),
+            candidate: tx.previous_release.clone(),
+            predecessor: tx.candidate_release.clone(),
+            lifecycle: tx.lifecycle.clone(),
+        },
+        _ => GateTarget {
+            attempt: updated_contracts::reconciler::attempt::BOOT.to_string(),
+            candidate: installed.release.clone(),
+            predecessor: installed.release.clone(),
+            lifecycle: installed.lifecycle.clone(),
+        },
     }
 }
 
@@ -281,20 +308,35 @@ mod tests {
         let tx = rollback_of(predecessor.clone());
         let record = deferred_candidate_record();
 
-        let (target, lifecycle) = boot_gate_target(Some(&tx), &record);
-        assert_eq!(target, predecessor);
-        assert_eq!(lifecycle, tx.lifecycle);
+        let target = boot_gate_target(Some(&tx), &record);
+        assert_eq!(target.candidate, predecessor);
+        assert_eq!(target.lifecycle, tx.lifecycle);
+        // The gate is this rollback's health step, so it carries the transaction's own compensating
+        // identity and names the failed candidate as the predecessor — the same three arguments its
+        // predecessor `apply` and its `rollback` carry.
+        assert_eq!(target.attempt, tx.rollback_attempt_id());
+        assert_eq!(target.predecessor, tx.candidate_release);
+        assert!(
+            !updated_contracts::reconciler::attempt::is_reserved(&target.attempt),
+            "a transaction's gate never borrows a reserved observation identity"
+        );
 
-        // An ordinary boot has no rollback, so the committed record is the running release.
-        let (target, lifecycle) = boot_gate_target(None, &record);
-        assert_eq!(target, record.release);
-        assert_eq!(lifecycle, record.lifecycle);
+        // An ordinary boot has no rollback, so the committed record is the running release and the
+        // gate belongs to no transaction.
+        let target = boot_gate_target(None, &record);
+        assert_eq!(target.candidate, record.release);
+        assert_eq!(target.predecessor, record.release);
+        assert_eq!(target.lifecycle, record.lifecycle);
+        assert_eq!(target.attempt, updated_contracts::reconciler::attempt::BOOT);
 
-        // A forward transaction is not a rollback: nothing was restored, the record still governs.
+        // A forward transaction is not a rollback: nothing was restored, the record still governs
+        // and the gate is still a reserved-identity observation.
         let mut forward = rollback_of(release("1.0.0"));
         forward.phase = TransactionPhase::CandidateActivated;
-        let (target, _) = boot_gate_target(Some(&forward), &record);
-        assert_eq!(target, record.release);
+        let target = boot_gate_target(Some(&forward), &record);
+        assert_eq!(target.candidate, record.release);
+        assert_eq!(target.predecessor, record.release);
+        assert_eq!(target.attempt, updated_contracts::reconciler::attempt::BOOT);
     }
 
     #[test]

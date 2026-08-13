@@ -71,9 +71,31 @@ impl fmt::Display for Operation {
     }
 }
 
+/// Every protocol flag the agent passes to a reconciler invocation, in argv order. This is the
+/// published invocation grammar: the agent's argv builder emits exactly these, and a reconciler may
+/// read only these. Publisher-configured arguments are separated by `--` and are not part of it.
+///
+/// One list, so a flag the agent stops emitting cannot go on being parsed by a hook that then reads
+/// a value nobody sends.
+pub const FLAGS: &[&str] = &[
+    "--protocol",
+    "--attempt-id",
+    "--reason",
+    "--install-root",
+    "--state-dir",
+    "--candidate",
+    "--candidate-version",
+    "--output-file",
+    "--input-file",
+    "--predecessor",
+    "--predecessor-version",
+];
+
 /// The reserved `--attempt-id` values. A deployment carries the transaction's own token, so
-/// a reconciler can tell a transaction step from an observation made outside one; these three
-/// name the observations that belong to no transaction.
+/// a reconciler can tell a transaction step from an operation performed outside one; these three
+/// name the operations that belong to no transaction. They are stable, deliberately recurring
+/// names — reused on every boot and every probe — so they are never idempotency keys: an operation
+/// invoked under a reserved identity does its full work on every invocation.
 pub mod attempt {
     /// A boot or restart: the per-boot converge and the boot readiness gate.
     pub const BOOT: &str = "boot";
@@ -121,5 +143,18 @@ mod tests {
         assert!(attempt::is_reserved(attempt::PERIODIC));
         assert!(attempt::is_reserved(attempt::FINGERPRINT));
         assert!(!attempt::is_reserved("a1b2c3"));
+    }
+
+    /// The reserved identities are a published cross-organization contract; a reconciler author
+    /// reading the doc must see every spelling the agent actually sends.
+    #[test]
+    fn the_published_protocol_names_every_reserved_identity() {
+        const PROTOCOL: &str = include_str!("../../../docs/node-reconciler-protocol.md");
+        for id in [attempt::BOOT, attempt::PERIODIC, attempt::FINGERPRINT] {
+            assert!(
+                PROTOCOL.contains(&format!("`{id}`")),
+                "docs/node-reconciler-protocol.md does not name the reserved attempt id `{id}`"
+            );
+        }
     }
 }

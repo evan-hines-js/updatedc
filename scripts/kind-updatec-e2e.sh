@@ -386,11 +386,8 @@ spec:
       image: updatec-e2e:kind
       imagePullPolicy: IfNotPresent
       command: [/usr/local/bin/bootstrap]
-      args: [--state-dir, /var/lib/updated/guardian, --supervisor-config, /bootstrap/bootstrap.toml, --supervisor, /usr/local/bin/supervisor, --ready-timeout, "30", --confirm-timeout, "2", --probe-address, 0.0.0.0:9090]
-      ports: [{name: http, containerPort: 8080}, {name: guardian, containerPort: 9090}]
-      startupProbe: {httpGet: {path: /startupz, port: guardian}, periodSeconds: 1, failureThreshold: 60}
-      readinessProbe: {httpGet: {path: /readyz, port: guardian}, periodSeconds: 1}
-      livenessProbe: {httpGet: {path: /livez, port: guardian}, periodSeconds: 2}
+      args: [--state-dir, /var/lib/updated/guardian, --supervisor-config, /bootstrap/bootstrap.toml, --supervisor, /usr/local/bin/supervisor, --ready-timeout, "30", --confirm-timeout, "2"]
+      ports: [{name: http, containerPort: 8080}]
       securityContext:
         allowPrivilegeEscalation: false
         capabilities: {drop: [ALL]}
@@ -551,7 +548,7 @@ spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector: {app: updated-agent}
-  ports: [{name: http, port: 8080, targetPort: http}, {name: guardian, port: 9090, targetPort: guardian}]
+  ports: [{name: http, port: 8080, targetPort: http}]
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -570,10 +567,7 @@ spec:
           image: updatec-e2e:kind
           imagePullPolicy: IfNotPresent
           command: [/usr/local/bin/run-agent]
-          ports: [{name: http, containerPort: 8080}, {name: guardian, containerPort: 9090}]
-          startupProbe: {httpGet: {path: /startupz, port: guardian}, periodSeconds: 1, failureThreshold: 120}
-          readinessProbe: {httpGet: {path: /readyz, port: guardian}, periodSeconds: 1}
-          livenessProbe: {httpGet: {path: /livez, port: guardian}, periodSeconds: 2}
+          ports: [{name: http, containerPort: 8080}]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}

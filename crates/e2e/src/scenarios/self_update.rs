@@ -33,11 +33,12 @@ fn desired_agent(dir: &Path) -> R<PathBuf> {
 }
 
 /// What a hook-managed workload looks like right now, for the before/after comparison every
-/// self-update scenario makes: its PID, and how many deployment operations the reconciler has run.
+/// self-update scenario makes: its PID, and how many invocations the reconciler has recorded.
 ///
-/// A handoff must move neither. The agent's own boots legitimately invoke the reserved
-/// `boot`/`periodic` observations (that is how it reports health at all), but a deployment
-/// operation during a self-update would mean the agent had reached for the workload.
+/// The PID must not move. The invocation count is a cursor, not an assertion: the successor
+/// agent's own boot converge is an expected `apply` under the reserved `boot` identity, so what the
+/// scenarios check over the added slice is [`fixture::disturbances`] — a deployment operation or a
+/// `rollback` during a handoff would mean the agent had reached for the workload.
 fn workload_state(dir: &Path) -> R<(u32, usize)> {
     let pid = fixture::workload_pid(dir).ok_or("the reconciler recorded no workload PID")?;
     if !pid_alive(pid) {
@@ -45,7 +46,7 @@ fn workload_state(dir: &Path) -> R<(u32, usize)> {
             "the hook-managed workload (pid {pid}) is no longer running"
         ));
     }
-    Ok((pid, fixture::attempts(&fixture::root(dir)).len()))
+    Ok((pid, fixture::operations(&fixture::root(dir)).len()))
 }
 
 /// The launcher commits a self-updated agent (v1 → v2) by pointer flip, and the hook-managed
@@ -54,6 +55,7 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21086", "127.0.0.1:21096");
     let dir = ctx.work.join("selfupd");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let agent_v1 = supervisor_v(ctx, "1.0.0");
 
     ctx.init_repo(&dir)?;
@@ -64,7 +66,6 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
 
     let boot = Proc::spawn("launcher", &mut node(ctx, &dir, srv, svc, &agent_v1)?)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        fixture::stop_workload(&dir);
         return fail("the workload never came up under the node stack");
     }
     let (pid, operations) = workload_state(&dir)?;
@@ -75,12 +76,12 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     // ready, and the launcher commits the desired-supervisor pointer.
     ctx.publish(&dir, "supervisor", "2.0.0", &supervisor_v(ctx, "2.0.0"))?;
     let committed = boot.wait_for_log("committed as the agent", EVENT_TIMEOUT);
-    let (pid_after_update, operations_after) = workload_state(&dir)?;
-    let undisturbed = committed && pid_after_update == pid && operations_after == operations;
+    let (pid_after_update, _) = workload_state(&dir)?;
+    let disturbances = fixture::disturbances(&fixture::root(&dir), operations);
+    let undisturbed = committed && pid_after_update == pid && disturbances.is_empty();
     let desired = desired_agent(&dir)?;
     let log = boot.captured_log();
     drop(boot);
-    fixture::stop_workload(&dir);
 
     if !committed {
         return fail(format!(
@@ -90,8 +91,8 @@ pub(crate) fn supervisor_self_update(ctx: &Ctx) -> R {
     if !undisturbed {
         return fail(format!(
             "the self-update reached the workload (pid {pid} -> {pid_after_update}, \
-             {} deployment operation(s) during the handoff)",
-            operations_after - operations
+             disturbances during the handoff: {})",
+            disturbances.join(", ")
         ));
     }
     // The committed pointer must name the exact published v2 bytes. Comparing content
@@ -115,6 +116,7 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21087", "127.0.0.1:21097");
     let dir = ctx.work.join("selfupd-rollback");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let agent_v1 = supervisor_v(ctx, "1.0.0");
 
     ctx.init_repo(&dir)?;
@@ -124,7 +126,6 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
 
     let boot = Proc::spawn("launcher", &mut node(ctx, &dir, srv, svc, &agent_v1)?)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        fixture::stop_workload(&dir);
         return fail("the workload never came up under the node stack");
     }
     let (pid, operations) = workload_state(&dir)?;
@@ -150,22 +151,22 @@ pub(crate) fn supervisor_self_update_rollback(ctx: &Ctx) -> R {
     let retries = boot.log_count("rejecting") - rejections;
     let re_records = boot.log_count("recorded rejected supervisor candidate") - records;
     let served = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);
-    let (pid_after_rollback, operations_after) = workload_state(&dir)?;
+    let (pid_after_rollback, _) = workload_state(&dir)?;
     let desired = desired_agent(&dir)?;
     let log = boot.captured_log();
     drop(boot);
-    fixture::stop_workload(&dir);
 
     if !rejected {
         return fail(format!(
             "the launcher did not roll back the unlaunchable agent candidate:\n{log}"
         ));
     }
-    if !served || pid_after_rollback != pid || operations_after != operations {
+    let disturbances = fixture::disturbances(&fixture::root(&dir), operations);
+    if !served || pid_after_rollback != pid || !disturbances.is_empty() {
         return fail(format!(
             "the failed self-update reached the workload (pid {pid} -> {pid_after_rollback}, \
-             {} deployment operation(s) during the handoff)",
-            operations_after - operations
+             disturbances during the handoff: {})",
+            disturbances.join(", ")
         ));
     }
     if !recorded {
@@ -194,6 +195,7 @@ pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21122", "127.0.0.1:21123");
     let dir = ctx.work.join("selfupd-post-ready-crash");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let agent_v1 = supervisor_v(ctx, "1.0.0");
     let unstable = ctx.work.join(format!(
         "build/supervisor-post-ready-crash-2.0.0{}",
@@ -206,7 +208,6 @@ pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
     let _server = ctx.serve(&dir, srv)?;
     let boot = Proc::spawn("launcher", &mut node(ctx, &dir, srv, svc, &agent_v1)?)?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        fixture::stop_workload(&dir);
         return fail("the node stack did not establish its baseline");
     }
     let (pid, operations) = workload_state(&dir)?;
@@ -217,22 +218,22 @@ pub(crate) fn supervisor_post_ready_crash_rolls_back(ctx: &Ctx) -> R {
     let predecessor_returned =
         boot.wait_for_log("recorded rejected supervisor candidate", EVENT_TIMEOUT);
     let still_serving = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);
-    let (pid_after_crash, operations_after) = workload_state(&dir)?;
+    let (pid_after_crash, _) = workload_state(&dir)?;
     let desired = desired_agent(&dir)?;
     let log = boot.captured_log();
     drop(boot);
-    fixture::stop_workload(&dir);
 
     if !began_confirmation || !rejected || !predecessor_returned {
         return fail(format!(
             "the post-ready agent failure did not complete its guarded rollback:\n{log}"
         ));
     }
-    if !still_serving || pid_after_crash != pid || operations_after != operations {
+    let disturbances = fixture::disturbances(&fixture::root(&dir), operations);
+    if !still_serving || pid_after_crash != pid || !disturbances.is_empty() {
         return fail(format!(
             "the post-ready agent failure reached the workload (pid {pid} -> {pid_after_crash}, \
-             {} deployment operation(s) during the handoff)",
-            operations_after - operations
+             disturbances during the handoff: {})",
+            disturbances.join(", ")
         ));
     }
     if !desired.is_file() || sha256_hex(&desired)? != sha256_hex(&agent_v1)? {

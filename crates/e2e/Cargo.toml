@@ -15,6 +15,7 @@ name = "e2e"
 path = "src/lib.rs"
 
 [dependencies]
+foundation = { path = "../foundation" }
 updated = { path = "../updated" }
 updated-contracts = { path = "../updated-contracts" }
 serde.workspace = true

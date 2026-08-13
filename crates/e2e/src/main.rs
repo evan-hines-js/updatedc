@@ -107,7 +107,7 @@ fn scenarios() -> Vec<Scenario> {
         ),
         ("a reconciler apply failure rolls back", provider_apply_failure),
         (
-            "a crashed apply replays under the same attempt id and lands exactly once",
+            "an interrupted apply is compensated under its own attempt id and lands exactly once",
             apply_replay_converges_exactly_once,
         ),
         ("a reconciler healthcheck failure rolls back", provider_healthcheck_failure),
@@ -168,6 +168,10 @@ fn scenarios() -> Vec<Scenario> {
     s.push((
         "crash before and after every rollback boundary; recovery remains resumable",
         rollback_chaos_recovery,
+    ));
+    s.push((
+        "a reboot mid-rollback still converges the restored predecessor",
+        a_reboot_mid_rollback_still_converges_the_predecessor,
     ));
     s
 }

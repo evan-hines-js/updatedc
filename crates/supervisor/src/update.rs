@@ -210,14 +210,23 @@ pub(crate) trait Reconciler {
 pub(crate) struct ReleaseReconciler<'a> {
     opts: &'a Options,
     lifecycle: &'a updated::state::ProviderRelease,
+    /// The `--reason` every probe this port makes carries. It is a property of the boot or the
+    /// transaction the port serves, not of an individual probe, so it is fixed at construction:
+    /// a boot gate observes the same kind of event the boot converge just performed.
+    reason: LifecycleReason,
 }
 
 impl<'a> ReleaseReconciler<'a> {
     pub(crate) fn new(
         opts: &'a Options,
         lifecycle: &'a updated::state::ProviderRelease,
+        reason: LifecycleReason,
     ) -> ReleaseReconciler<'a> {
-        ReleaseReconciler { opts, lifecycle }
+        ReleaseReconciler {
+            opts,
+            lifecycle,
+            reason,
+        }
     }
 }
 
@@ -234,7 +243,7 @@ impl Reconciler for ReleaseReconciler<'_> {
             self.opts,
             LifecycleInvocation {
                 phase: operation,
-                reason: LifecycleReason::Update,
+                reason: self.reason,
                 id: lifecycle_attempt_id,
                 candidate,
                 predecessor,
@@ -373,10 +382,11 @@ impl Readiness {
 /// consecutive-success evidence or the agent-owned deadline expires. The reconciler performs one
 /// application-specific observation; the agent owns cadence, bounds, cancellation, and policy.
 ///
-/// `lifecycle_attempt_id` is the transaction's own token when a transaction is gating its
-/// candidate — the reconciler may then rely on effects written by earlier operations of that exact
-/// attempt — and [`attempt::BOOT`] for a boot or restart, which observes only durable steady state
-/// and never impersonates a transaction whose attempt markers no longer exist.
+/// `lifecycle_attempt_id` is the transaction's own token whenever the gate is a step of a
+/// transaction — the forward candidate's gate and a crash-recovered rollback's predecessor gate
+/// alike — so the reconciler may rely on effects written by earlier operations of that exact
+/// attempt. It is [`attempt::BOOT`] only for a gate that belongs to no transaction, which observes
+/// durable steady state and never impersonates an attempt whose effects no longer exist.
 pub(crate) async fn became_healthy<T: Reconciler>(
     reconciler: &mut T,
     lifecycle_attempt_id: &str,
@@ -833,30 +843,27 @@ fn prepare_lifecycle_command(
         &serde_json::to_vec(&opts.application.inputs)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     )?;
+    // The flag names come from the published grammar itself, positionally paired with their values,
+    // so the agent cannot emit a flag the contract does not name — or stop emitting one a hook still
+    // reads — without this failing to compile.
+    let values: [&std::ffi::OsStr; updated_contracts::reconciler::FLAGS.len()] = [
+        std::ffi::OsStr::new("1"),
+        std::ffi::OsStr::new(lifecycle_attempt_id),
+        std::ffi::OsStr::new(reason.name()),
+        opts.paths.install_root.as_os_str(),
+        state_dir.as_os_str(),
+        candidate_dir.as_os_str(),
+        std::ffi::OsStr::new(&candidate.version),
+        output_file.as_os_str(),
+        input_file.as_os_str(),
+        predecessor_dir.as_os_str(),
+        std::ffi::OsStr::new(&predecessor.version),
+    ];
     let mut cmd = reconciler_command(&resolved.program)?;
-    cmd.arg(phase_name)
-        .arg("--protocol")
-        .arg("1")
-        .arg("--attempt-id")
-        .arg(lifecycle_attempt_id)
-        .arg("--reason")
-        .arg(reason.name())
-        .arg("--install-root")
-        .arg(&opts.paths.install_root)
-        .arg("--state-dir")
-        .arg(&state_dir)
-        .arg("--candidate")
-        .arg(&candidate_dir)
-        .arg("--candidate-version")
-        .arg(&candidate.version)
-        .arg("--output-file")
-        .arg(&output_file)
-        .arg("--input-file")
-        .arg(&input_file)
-        .arg("--predecessor")
-        .arg(&predecessor_dir)
-        .arg("--predecessor-version")
-        .arg(&predecessor.version);
+    cmd.arg(phase_name);
+    for (flag, value) in updated_contracts::reconciler::FLAGS.iter().zip(values) {
+        cmd.arg(flag).arg(value);
+    }
     if !lifecycle.args.is_empty() {
         // Publisher-configured arguments are explicitly separated from the stable protocol.
         cmd.arg("--").args(&lifecycle.args);
@@ -895,11 +902,23 @@ pub(crate) fn reconciler_output_path(
 
 const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// The agent-owned ceiling on a single `healthcheck`. The steady-state probe runs inline on the
+/// control loop that emits the node's only report, so a wedged hook would spend the node's
+/// freshness budget in silence and the healthproxy would drain a node whose workload is fine: the
+/// ceiling must stay well inside `updated_contracts::telemetry::REPORT_FRESHNESS`. It is also what
+/// makes [`became_healthy`]'s `health_grace` a real bound rather than an advisory one, since a
+/// single probe could otherwise outlast the whole grace.
+pub(crate) const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The agent's own runtime ceilings over the publisher-configured provider timeout. Exhaustive on
+/// purpose: a new operation must state its bound rather than silently inherit "unbounded".
 fn lifecycle_timeout(phase: Operation, configured: Duration) -> Duration {
-    if phase == Operation::Inspect {
-        configured.min(FINGERPRINT_TIMEOUT)
-    } else {
-        configured
+    match phase {
+        Operation::Inspect => configured.min(FINGERPRINT_TIMEOUT),
+        Operation::Healthcheck => configured.min(HEALTHCHECK_TIMEOUT),
+        // Deployment operations run under a transaction, not on the steady-state loop, and are
+        // legitimately as slow as the publisher says they are.
+        Operation::Apply | Operation::Rollback => configured,
     }
 }
 
@@ -1201,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_has_one_agent_owned_runtime_ceiling() {
+    fn steady_state_operations_have_agent_owned_runtime_ceilings() {
         assert_eq!(
             lifecycle_timeout(Operation::Inspect, Duration::from_secs(86_400)),
             FINGERPRINT_TIMEOUT
@@ -1212,7 +1231,30 @@ mod tests {
         );
         assert_eq!(
             lifecycle_timeout(Operation::Healthcheck, Duration::from_secs(86_400)),
+            HEALTHCHECK_TIMEOUT
+        );
+        assert_eq!(
+            lifecycle_timeout(Operation::Healthcheck, Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        // Deployment operations run under a transaction, never on the report loop, so they keep the
+        // publisher's own bound.
+        assert_eq!(
+            lifecycle_timeout(Operation::Apply, Duration::from_secs(86_400)),
             Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn a_healthcheck_cannot_stall_the_loop_into_a_health_drain() {
+        // The periodic `healthcheck` runs inline on the loop that emits the node's only report, so
+        // its ceiling is a health property: a probe near REPORT_FRESHNESS drains a healthy node out
+        // of rotation for a reason no reader can see.
+        assert!(
+            HEALTHCHECK_TIMEOUT * 2 < updated_contracts::telemetry::REPORT_FRESHNESS,
+            "a healthcheck ceiling of {HEALTHCHECK_TIMEOUT:?} is not well inside the {:?} freshness \
+             window the healthproxy drains on",
+            updated_contracts::telemetry::REPORT_FRESHNESS
         );
     }
 
@@ -1245,6 +1287,95 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_hook_kills_its_undetached_tree_but_not_a_detached_workload() {
+        // The published contract, executable: an invocation's tree is torn down when the hook
+        // returns — on SUCCESS as much as on timeout — so a workload started inside it is killed by
+        // its own successful `apply`, and a hook that wants the workload to belong to the release
+        // must move it out of the tree first. Both halves are asserted, because a "fix" that spares
+        // the tree on success would let a wrapper's inherited pipes outlive the deadline.
+        fn run(script: &str) -> (io::Result<ReconcilerOutput>, PathBuf) {
+            let dir = std::env::temp_dir().join(format!(
+                "hook-detach-{}-{}",
+                std::process::id(),
+                updated::rand::token().unwrap()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let pidfile = dir.join("workload.pid");
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", script])
+                .env("PIDFILE", &pidfile)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            foundation::process::arrange_parent_death_signal(&mut command);
+            let outcome = run_prepared_lifecycle_command(
+                PreparedLifecycleCommand {
+                    command,
+                    phase: Operation::Apply,
+                    timeout: Duration::from_secs(30),
+                },
+                None,
+            );
+            (outcome, pidfile)
+        }
+        fn recorded_pid(pidfile: &std::path::Path) -> u32 {
+            std::fs::read_to_string(pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+        fn alive(pid: u32) -> bool {
+            unsafe { libc::kill(pid as i32, 0) == 0 }
+        }
+        fn settle(pid: u32, want: bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if alive(pid) == want {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            alive(pid) == want
+        }
+
+        let (outcome, pidfile) = run("sleep 60 & echo $! > \"$PIDFILE\"; exit 0");
+        outcome.expect("the hook succeeded");
+        let undetached = recorded_pid(&pidfile);
+        assert!(
+            settle(undetached, false),
+            "a workload left inside the invocation's tree must not survive the hook's return"
+        );
+
+        // The other half needs a shell-reachable way to leave the session. Where there is none
+        // (macOS ships no `setsid`), the undetached half above is the whole assertion this platform
+        // can make; the reference hook's own `detach()` covers it in the e2e.
+        if !Command::new("sh")
+            .args(["-c", "command -v setsid"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let (outcome, pidfile) = run(
+            "setsid sh -c 'echo $$ > \"$PIDFILE\"; exec sleep 60' </dev/null >/dev/null 2>&1 &\n\
+             while [ ! -s \"$PIDFILE\" ]; do sleep 0.05; done; exit 0",
+        );
+        outcome.expect("the hook succeeded");
+        let detached = recorded_pid(&pidfile);
+        std::thread::sleep(Duration::from_millis(300));
+        let survived = alive(detached);
+        unsafe { libc::kill(detached as i32, libc::SIGKILL) };
+        assert!(
+            survived,
+            "a workload the hook detached belongs to the release and must outlive the invocation"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1751,6 +1882,37 @@ mod tests {
             "apply_reconciler_environment(&mut cmd, opts.secrets.",
             "values());"
         )));
+    }
+
+    #[test]
+    fn the_chokepoint_sets_exactly_the_names_a_secret_may_never_claim() {
+        // Secret values are applied last so a deployment's own value wins over an ambient one,
+        // which means every ambient name this chokepoint sets is shadowable — unless the contract
+        // refuses to let an assignment claim it. Coupling the two here is what stops a future
+        // ambient variable from being added on one side only.
+        let mut command = Command::new("hook");
+        apply_reconciler_environment(&mut command, &std::collections::BTreeMap::new());
+        let mut set: Vec<String> = command
+            .get_envs()
+            .filter_map(|(name, _)| Some(name.to_str()?.to_uppercase()))
+            .collect();
+        set.sort();
+        set.dedup();
+        let mut expected: Vec<String> =
+            updated_contracts::assignment::RECONCILER_AMBIENT_ENVIRONMENT
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect();
+        // TEMP/TMP are forwarded only when this machine has them; the contract blocks them either
+        // way, so the chokepoint's set is a subset of the reserved one and never exceeds it.
+        expected.sort();
+        for name in &set {
+            assert!(
+                expected.contains(name),
+                "{name} is set on every hook but no assignment is stopped from shadowing it"
+            );
+        }
+        assert!(set.contains(&"PATH".to_owned()));
     }
 
     /// The published `--reason` spellings. A reconciler branches on this argv value, so a rename

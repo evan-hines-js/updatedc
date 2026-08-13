@@ -377,7 +377,7 @@ mod windows {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
     /// Send `CTRL_BREAK` to the still-unreaped child's process group — the Windows analogue of
@@ -420,8 +420,17 @@ mod windows {
         Ok(())
     }
 
-    /// Create a kill-on-close job object; the returned handle is owned by the caller. On
-    /// any failure the partially-created handle is closed before returning the error.
+    /// Create the job object every contained tree on this platform is held by; the returned handle
+    /// is owned by the caller. On any failure the partially-created handle is closed before
+    /// returning the error.
+    ///
+    /// The tree is killed as a unit when the job closes, and a child that explicitly asks to break
+    /// away (`CREATE_BREAKAWAY_FROM_JOB`) is permitted to leave it. That permission is the only
+    /// supported way for a reconciler hook to hand a workload to the release rather than to the
+    /// agent's disposable hook attempt: this one helper builds every job in the nested chain
+    /// (service -> launcher -> agent -> hook), so the workload can leave all of them. Containment is
+    /// unweakened for everything that does not ask, since neither the agent nor the launcher ever
+    /// sets the flag.
     pub fn create_kill_on_close_job() -> io::Result<HANDLE> {
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -429,7 +438,8 @@ mod windows {
                 return Err(io::Error::last_os_error());
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             if SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
@@ -603,6 +613,46 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "an inherited pipe remained open after descendant cleanup"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// The two limits are one design, not two settings: kill-on-close is what makes a hook's tree
+    /// disposable, and breakaway is what lets the workload the hook starts survive it. Without
+    /// breakaway, `CreateProcess` with `CREATE_BREAKAWAY_FROM_JOB` fails with ACCESS_DENIED and a
+    /// reconciler cannot start a workload on Windows at all.
+    #[test]
+    fn the_contained_tree_is_killable_as_a_unit_and_escapable_on_request() {
+        let job = super::create_kill_on_close_job().unwrap();
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut returned = 0u32;
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                &mut returned,
+            )
+        };
+        let flags = info.BasicLimitInformation.LimitFlags;
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(job);
+        }
+        assert_ne!(ok, 0, "the job's limits must be readable back");
+        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+        assert_ne!(
+            flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+            0,
+            "a hook-started workload could not leave the agent's disposable tree"
         );
     }
 }

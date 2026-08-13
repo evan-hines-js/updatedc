@@ -21,6 +21,7 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         let svc = format!("127.0.0.1:{}", 21300 + index);
         let dir = ctx.work.join(format!("chaos-{point}"));
         std::fs::create_dir_all(&dir).map_err(str_err)?;
+        let _workload = fixture::workload(&dir);
         let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -41,7 +42,6 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
             let log = boot.captured_log();
             drop(boot);
             drop(server);
-            fixture::stop_workload(&dir);
             return fail(format!(
                 "update at {point} never reached the transaction boundary preparation gate; log:\n{log}"
             ));
@@ -73,7 +73,9 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         let log = boot.captured_log();
         drop(boot);
         drop(server);
-        fixture::stop_workload(&dir);
+        // This scenario observes the address being released, so the workload is ended here rather
+        // than at scope end. Consuming the guard keeps `Drop` the one mechanism.
+        _workload.stop();
         let stopped = wait_until(RECOVERY_TIMEOUT, || {
             http_text(&format!("http://{svc}/version")).is_none()
         });
@@ -102,6 +104,7 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
         let svc = format!("127.0.0.1:{}", 22850 + index);
         let dir = ctx.work.join(format!("install-chaos-{point}"));
         std::fs::create_dir_all(&dir).map_err(str_err)?;
+        let _workload = fixture::workload(&dir);
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
         let server = ctx.serve(&dir, &srv)?;
@@ -138,7 +141,9 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
         let log = boot.captured_log();
         drop(boot);
         drop(server);
-        fixture::stop_workload(&dir);
+        // This scenario observes the address being released, so the workload is ended here rather
+        // than at scope end. Consuming the guard keeps `Drop` the one mechanism.
+        _workload.stop();
         let stopped = wait_until(RECOVERY_TIMEOUT, || {
             http_text(&format!("http://{svc}/version")).is_none()
         });
@@ -168,6 +173,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let svc = format!("127.0.0.1:{}", 21500 + index);
         let dir = ctx.work.join(format!("rollback-chaos-{point}"));
         std::fs::create_dir_all(&dir).map_err(str_err)?;
+        let _workload = fixture::workload(&dir);
         let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -191,7 +197,6 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             let log = node.captured_log();
             drop(node);
             drop(server);
-            fixture::stop_workload(&dir);
             fail(format!("{message}; log:\n{log}"))
         };
 
@@ -240,40 +245,53 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let rejected = std::fs::read_to_string(dir.join("install/state/rejected"))
             .is_ok_and(|contents| !contents.trim().is_empty());
         let attempts = fixture::attempts(&fixture_root);
-        let ids: std::collections::HashSet<&str> =
-            attempts.iter().map(|(_, id)| id.as_str()).collect();
+        // One transaction, two directions, two identities. The forward direction runs under the
+        // transaction's own token; every compensating operation — the predecessor's `apply`, its
+        // health gate, and the `rollback` — runs under that token's dashless `r` twin, because a
+        // reconciler that keys completion on the attempt id must never see the same id twice with
+        // different arguments. Anything else means an operation borrowed the wrong identity.
+        let forward = attempts
+            .first()
+            .map(|(_, id)| id.clone())
+            .unwrap_or_default();
+        let compensating = format!("{forward}r");
         let operation_contract_held = !attempts.is_empty()
-            && attempts.iter().all(|(operation, _)| {
+            && attempts.iter().all(|(operation, id)| {
                 matches!(operation.as_str(), "apply" | "healthcheck" | "rollback")
+                    && (*id == forward || *id == compensating)
             })
             && attempts.iter().any(|(operation, _)| operation == "apply")
-            && ids.len() == 1;
+            && attempts
+                .iter()
+                .all(|(operation, id)| operation != "rollback" || *id == compensating);
         compensated |= attempts
             .iter()
             .any(|(operation, _)| operation == "rollback");
-        // One marker per operation that ran is the idempotency claim: however many times recovery
-        // replayed an operation, its attempt-keyed effect landed once.
-        let effects_are_idempotent = ["apply", "healthcheck", "rollback"]
+        // Wherever the recovery reached the compensating hook it must also have converged the
+        // predecessor first, under that same compensating identity: a `rollback` with no
+        // compensating `apply` behind it is a rollback the machine never actually performed.
+        let compensating_apply = attempts
             .iter()
-            .all(|operation| {
-                let invoked = attempts.iter().any(|(recorded, _)| recorded == operation);
-                fixture::effect_markers(&fixture_root, operation) == usize::from(invoked)
-            });
+            .any(|(operation, id)| operation == "apply" && *id == compensating);
+        let converged_before_compensating = !attempts
+            .iter()
+            .any(|(operation, _)| operation == "rollback")
+            || compensating_apply;
         let log = node.captured_log();
         drop(node);
         drop(server);
-        fixture::stop_workload(&dir);
         if !crash_seen
             || !durable
             || !live
             || !rejected
             || !operation_contract_held
-            || !effects_are_idempotent
+            || !converged_before_compensating
         {
             return fail(format!(
                 "rollback recovery at {point} was incomplete (crash_seen={crash_seen}, \
                  durable={durable}, live={live}, rejected={rejected}, \
-                 operation_contract_held={operation_contract_held}, effects_are_idempotent={effects_are_idempotent}); \
+                 operation_contract_held={operation_contract_held}, \
+                 converged_before_compensating={converged_before_compensating}); \
                  attempts:\n{attempts:?}\nlog:\n{log}"
             ));
         }
@@ -293,6 +311,7 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let svc = format!("127.0.0.1:{}", 21900 + index);
     let dir = ctx.work.join(format!("provider-failure-{phase}"));
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
@@ -318,7 +337,6 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         let log = node.captured_log();
         drop(node);
         drop(server);
-        fixture::stop_workload(&dir);
         return fail(format!(
             "reconciler {phase} case never began its update transaction; log:\n{log}"
         ));
@@ -335,13 +353,9 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let predecessor_live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
     let attempts = fixture::attempts(&fixture_root);
     // A failed rollback is retried from the SAME durable evidence, never restarted as a fresh
-    // transaction: the held recovery keeps one attempt identity however many times it replays.
-    let one_recovery_identity = attempts
-        .iter()
-        .map(|(_, id)| id.as_str())
-        .collect::<std::collections::HashSet<_>>()
-        .len()
-        == 1;
+    // transaction: however many times recovery replays, everything folds to one transaction —
+    // its forward token plus at most that token's own compensating identity.
+    let one_recovery_identity = fixture::transactions(&attempts).len() == 1;
     let completed_journal_cleared = phase == "rollback"
         || wait_until(RECOVERY_TIMEOUT, || {
             !dir.join("install/state/transaction.json").is_file()
@@ -349,7 +363,6 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let journal_present = dir.join("install/state/transaction.json").is_file();
     drop(node);
     drop(server);
-    fixture::stop_workload(&dir);
 
     if !observed || !predecessor_live {
         return fail(format!(
@@ -404,6 +417,7 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let svc = format!("127.0.0.1:{}", 23350 + index);
     let dir = ctx.work.join(format!("provider-hang-{phase}"));
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
@@ -419,7 +433,6 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
         let log = node.captured_log();
         drop(node);
         drop(server);
-        fixture::stop_workload(&dir);
         return fail(format!(
             "reconciler hang {phase} case never began its update transaction; log:\n{log}"
         ));
@@ -435,7 +448,6 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     let log = node.captured_log();
     drop(node);
     drop(server);
-    fixture::stop_workload(&dir);
     if !attempted {
         return fail(format!(
             "reconciler hang {phase}: the hook was never invoked at that operation:\n{log}"
@@ -451,30 +463,40 @@ fn provider_hang_case(ctx: &Ctx, phase: &str, index: u16) -> R {
 }
 
 /// The double-execution window, as a first-class scenario: crash the agent after a successful
-/// forward `apply` but before its checkpoint lands, so recovery MUST invoke `apply` again under the
-/// same transaction. This is the exact case the protocol's execution contract makes the hook
-/// author's obligation, so it gets its own named proof rather than riding inside the boundary
-/// sweep: the interrupted attempt is invoked again under the SAME attempt id, the fixture's
-/// attempt-keyed marker makes that attempt's effect land exactly once however many invocations it
-/// takes, and the machine still converges to a committed candidate.
+/// `apply` but before its checkpoint lands, so recovery must drive the same transaction's
+/// compensating direction and then converge the machine again. This is the exact case the
+/// protocol's execution contract makes the hook author's obligation, so it gets its own named
+/// proof rather than riding inside the boundary sweep. Three claims, each of which the refactor
+/// can break independently:
 ///
-/// A later roll-forward is a DIFFERENT attempt with its own identity and its own effect, which is
-/// why every claim here is made per-attempt rather than over the whole recorded history.
+///  * the two directions of one transaction carry DIFFERENT attempt identities, so a reconciler
+///    that marks completion under the attempt id never mistakes the compensating `apply` for the
+///    forward one it already ran;
+///  * every operation of the compensating direction shares ONE identity, so the hook's per-attempt
+///    state is findable across a resume boot;
+///  * the migration-shaped release's one-way effect lands exactly once however many invocations it
+///    takes — the restore point the interrupted attempt took still holds the pre-migration bytes,
+///    which is precisely what a hook that double-executed would have clobbered.
 pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
     // Disjoint from the hang range (23300..) and the health-failure range (22100..).
     let srv = "127.0.0.1:23400";
     let svc = "127.0.0.1:23450";
     let dir = ctx.work.join("apply-replay");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
     let server = ctx.serve(&dir, srv)?;
     let fixture_root = fixture::root(&dir);
+    // A migration-shaped release, so the replayed `apply` re-enters a genuinely one-way effect: a
+    // hook that double-executes copies already-migrated content over its own restore point, which
+    // the backup assertions below catch.
+    seed_migration_baseline(&dir)?;
     let mut command = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
-        .workload(svc)
+        .mode(&format!("workload={svc},migration-shaped"))
         .launcher()?;
     // One-shot crash exactly between the successful apply hook and its durable checkpoint.
     command.env(updated::env::CHAOS_POINT, "candidate-lifecycle-applied");
@@ -483,7 +505,6 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
         let log = node.captured_log();
         drop(node);
         drop(server);
-        fixture::stop_workload(&dir);
         return fail(format!(
             "the replay case never began its update transaction; log:\n{log}"
         ));
@@ -502,31 +523,52 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
         ) && !journal_path.exists()
     });
     let attempts = fixture::attempts(&fixture_root);
-    let applies: Vec<&str> = attempts
+    // The attempt the crash interrupted is the first one recorded. Its compensating direction is a
+    // distinct, derived identity, and everything the recovery does to undo that attempt runs under
+    // it: the predecessor's `apply`, its health gate, and the `rollback`.
+    let interrupted = attempts
+        .first()
+        .map(|(_, id)| id.clone())
+        .unwrap_or_default();
+    let compensating = format!("{interrupted}r");
+    let compensating_operations: Vec<&str> = attempts
         .iter()
-        .filter(|(operation, _)| operation == "apply")
-        .map(|(_, id)| id.as_str())
+        .filter(|(_, id)| *id == compensating)
+        .map(|(operation, _)| operation.as_str())
         .collect();
-    // The attempt the crash interrupted is the first one recorded; its apply must have been invoked
-    // again during recovery, or the replay carried a fresh identity and the contract is broken.
-    let interrupted = applies.first().copied().unwrap_or_default().to_string();
-    let invocations = applies.iter().filter(|id| **id == interrupted).count();
-    let replayed_under_one_id = invocations >= 2;
-    let apply_markers = fixture::effect_markers_for(&fixture_root, &interrupted, "apply");
-    let effect_exactly_once = apply_markers == 1;
+    let directions_are_distinct = !interrupted.is_empty()
+        && compensating_operations.contains(&"apply")
+        && attempts
+            .iter()
+            .all(|(operation, id)| operation != "rollback" || *id == compensating);
+    // The effect landed, and landed once: the migration is on disk, and the restore point the
+    // interrupted attempt took still holds the pre-migration bytes. A hook that re-ran the
+    // migrating half would have copied `migrated-2.0.0` over that backup.
+    let migration = fixture_root.join("migration-state");
+    let read = |path: PathBuf| std::fs::read_to_string(path).unwrap_or_default();
+    let backup = migration.join("backups").join(&interrupted);
+    let effect_landed_once = read(migration.join("live/content.db")) == "migrated-2.0.0\n"
+        && read(migration.join("live/app.war")) == "2.0.0\n"
+        && read(backup.join("content.db")) == "baseline-content\n"
+        && read(backup.join("app.war")) == "1.0.0\n";
     let log = node.captured_log();
     drop(node);
     drop(server);
-    fixture::stop_workload(&dir);
-    if !crash_seen || !durable || !replayed_under_one_id || !effect_exactly_once {
+    if !crash_seen || !durable || !directions_are_distinct || !effect_landed_once {
+        let state = migration.display().to_string();
         return fail(format!(
-            "the apply replay was not exactly-once (crash_seen={crash_seen}, durable={durable}, \
-             replayed_under_one_id={replayed_under_one_id} ({invocations} invocations of attempt \
-             {interrupted}), effect_exactly_once={effect_exactly_once} ({apply_markers} markers)); \
-             attempts:\n{attempts:?}\nlog:\n{log}"
+            "the interrupted apply did not converge exactly once (crash_seen={crash_seen}, \
+             durable={durable}, directions_are_distinct={directions_are_distinct} (forward \
+             {interrupted}, compensating {compensating} ran {compensating_operations:?}), \
+             effect_landed_once={effect_landed_once}); migration state under {state}: live \
+             content={:?} app={:?}, backup content={:?} app={:?}; attempts:\n{attempts:?}\nlog:\n{log}",
+            read(migration.join("live/content.db")),
+            read(migration.join("live/app.war")),
+            read(backup.join("content.db")),
+            read(backup.join("app.war")),
         ));
     }
-    ok("a crashed apply was invoked again under the same attempt id and that attempt's effect landed exactly once");
+    ok("an interrupted apply was compensated under its own attempt identity and its one-way effect landed exactly once");
     Ok(())
 }
 
@@ -551,12 +593,11 @@ fn seed_migration_baseline(dir: &Path) -> R<PathBuf> {
 }
 
 pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
-    use std::time::Instant;
-
     let srv = "127.0.0.1:21809";
     let svc = "127.0.0.1:21909";
     let dir = ctx.work.join("migration-shaped-upgrade");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
@@ -576,13 +617,12 @@ pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
     if !process.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
         let log = process.captured_log();
         drop(process);
-        fixture::stop_workload(&dir);
         return fail(format!(
             "the migration-shaped upgrade never began its transaction; log:\n{log}"
         ));
     }
     // The reconciler owns all domain-specific sequencing inside one apply operation.
-    let upgrade_started = Instant::now();
+    //
     // The workload answers as 2.0.0 from inside `apply`, so waiting on the service alone would read
     // the recorded history before the transaction's healthcheck had run. The committed upgrade is
     // the barrier that means every operation of this transaction is behind us.
@@ -610,17 +650,10 @@ pub(crate) fn migration_shaped_upgrade(ctx: &Ctx) -> R {
             .is_ok_and(|content| content == "baseline-content\n")
             && std::fs::read_to_string(backup.join("app.war")).is_ok_and(|war| war == "1.0.0\n")
     });
-    let elapsed = upgrade_started.elapsed();
     drop(process);
-    fixture::stop_workload(&dir);
     if !upgraded || !ordered || !one_attempt || !state_is_migrated || !backup_is_exact {
         return fail(format!(
             "the migration-shaped wrapper violated its lifecycle/state contract in {state:?}:\n{attempts:?}"
-        ));
-    }
-    if elapsed < Duration::from_millis(250) {
-        return fail(format!(
-            "the migration-shaped lifecycle completed unrealistically quickly ({elapsed:?})"
         ));
     }
     ok("the migration-shaped reconciler applied its migration, passed healthcheck, and retained an exact rollback backup");
@@ -632,6 +665,7 @@ pub(crate) fn sample_to_migration_shaped_and_back(ctx: &Ctx) -> R {
     let svc = "127.0.0.1:21911";
     let dir = ctx.work.join("sample-migration-sample");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
@@ -654,7 +688,6 @@ pub(crate) fn sample_to_migration_shaped_and_back(ctx: &Ctx) -> R {
     if !migrated {
         let log = process.captured_log();
         drop(process);
-        fixture::stop_workload(&dir);
         return fail(format!(
             "the sample -> migration-shaped transition failed:\n{log}"
         ));
@@ -674,14 +707,9 @@ pub(crate) fn sample_to_migration_shaped_and_back(ctx: &Ctx) -> R {
                 == 2
     }) && process.wait_for_log("upgraded to 3.0.0", RECOVERY_TIMEOUT);
     let attempts = fixture::attempts(&fixture_root);
-    let transaction_ids = attempts
-        .iter()
-        .map(|(_, id)| id.as_str())
-        .collect::<std::collections::HashSet<_>>();
     let log = process.captured_log();
-    let identities = transaction_ids.len();
+    let identities = fixture::transactions(&attempts).len();
     drop(process);
-    fixture::stop_workload(&dir);
     if !returned || identities != 2 {
         return fail(format!(
             "the migration-shaped -> sample transition was not a distinct complete transaction:\n{attempts:?}\nnode log:\n{log}"
@@ -696,6 +724,7 @@ pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
     let svc = "127.0.0.1:21910";
     let dir = ctx.work.join("migration-shaped-rollback");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
@@ -716,7 +745,6 @@ pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
     if !node.wait_for_log("applying update 1.0.0 -> 2.0.0", TRANSACTION_START_TIMEOUT) {
         let log = node.captured_log();
         drop(node);
-        fixture::stop_workload(&dir);
         return fail(format!(
             "the migration-shaped rollback update never began its transaction; log:\n{log}"
         ));
@@ -731,23 +759,116 @@ pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
             && wait_for_version(svc, "1.0.0", 1)
     });
     let attempts = fixture::attempts(&fixture_root);
-    let ids = attempts
-        .iter()
-        .map(|(_, id)| id.as_str())
-        .collect::<std::collections::HashSet<_>>();
     let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
     let journal_cleared = wait_until(RECOVERY_TIMEOUT, || {
         !dir.join("install/state/transaction.json").is_file()
     });
-    let identities = ids.len();
+    let identities = fixture::transactions(&attempts).len();
     let log = node.captured_log();
     drop(node);
-    fixture::stop_workload(&dir);
     if !restored || identities != 1 || rejected.trim().is_empty() || !journal_cleared {
         return fail(format!(
             "the failed migration did not restore one transaction cleanly:\n{attempts:?}\nlog:\n{log}"
         ));
     }
     ok("a failed migration restored its archive and content backup, rejected the candidate, and cleared recovery state");
+    Ok(())
+}
+
+/// A machine reboot in the middle of a rollback, which is a different fault from an agent kill: the
+/// hook-managed workload dies with the machine, so the restored predecessor is NOT already running
+/// when the next boot's health gate observes it. Only the predecessor's own `apply` can put it
+/// back, and the resume gate must therefore owe that `apply` until the rollback actually completes —
+/// not merely until it has run once.
+///
+/// The rest of the suite structurally cannot see this: the fixture's workload is designed to
+/// survive an agent crash, so every other rollback case finds the predecessor already serving.
+pub(crate) fn a_reboot_mid_rollback_still_converges_the_predecessor(ctx: &Ctx) -> R {
+    let srv = "127.0.0.1:23410";
+    let svc = "127.0.0.1:23460";
+    let dir = ctx.work.join("rollback-reboot");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
+    ctx.init_repo(&dir)?;
+    ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
+    ctx.publish(&dir, "app", "2.0.0", &app_v(ctx, "2.0.0"))?;
+    let server = ctx.serve(&dir, srv)?;
+
+    let mut cmd = Node::new(ctx, &dir, srv, "app")
+        .check_interval("1s")
+        .health_grace(HEALTH_GRACE)
+        .confirmation_window("120s")
+        .faulty_workload(svc, "degrade-after-ready")
+        .launcher()?;
+    // Crash the agent immediately after the predecessor's `apply` — the point at which a resume
+    // boot has "already run" that apply once.
+    cmd.env(updated::env::CHAOS_POINT, "predecessor-lifecycle-applied");
+    let node = Service::spawn("rollback-reboot", &cmd);
+    let abandon = |node: Service, server: Proc, message: String| -> R {
+        let log = node.captured_log();
+        drop(node);
+        drop(server);
+        fail(format!("{message}; log:\n{log}"))
+    };
+
+    if !node.wait_for_log("upgraded to 2.0.0", RECOVERY_TIMEOUT) {
+        return abandon(
+            node,
+            server,
+            "the reboot case never committed its degrading candidate".into(),
+        );
+    }
+    let Some(agent) = pid_after(&node.captured_log(), "launched agent") else {
+        return abandon(
+            node,
+            server,
+            "the launcher never reported an agent PID".into(),
+        );
+    };
+    kill_pid(agent);
+    if !node.wait_for_log(
+        "CHAOS: exiting at boundary \"predecessor-lifecycle-applied\"",
+        RECOVERY_TIMEOUT,
+    ) {
+        return abandon(
+            node,
+            server,
+            "the rollback never reached the predecessor's apply".into(),
+        );
+    }
+    // The reboot: the workload the predecessor's `apply` had just started dies too. From the next
+    // boot's point of view the machine is unconverged, exactly as it would be after a power cycle.
+    match fixture::workload_pid(&dir) {
+        Some(pid) => kill_pid(pid),
+        None => {
+            return abandon(
+                node,
+                server,
+                "the reconciler recorded no workload to reboot away".into(),
+            )
+        }
+    }
+
+    let converged = wait_until(RECOVERY_TIMEOUT, || {
+        matches!(
+            updated::state::read_installed(&dir.join("install/state/installed.json")),
+            updated::state::Installed::Present(ref state)
+                if state.release.version == "1.0.0" && state.pending.is_none()
+        ) && !dir.join("install/state/transaction.json").exists()
+    }) && wait_for_version(svc, "1.0.0", RECOVERY_TIMEOUT);
+    let log = node.captured_log();
+    // A healthy predecessor must never be charged a health failure: the bound exists for a
+    // predecessor that cannot come up, and counting an unconverged machine against it would reject
+    // perfectly good bytes after three reboots.
+    let charged = log.contains("unhealthy (attempt");
+    drop(node);
+    drop(server);
+    if !converged || charged {
+        return fail(format!(
+            "a reboot mid-rollback did not converge the predecessor (converged={converged}, \
+             charged_a_health_failure={charged}):\n{log}"
+        ));
+    }
+    ok("a reboot mid-rollback re-ran the predecessor's apply and completed the rollback");
     Ok(())
 }

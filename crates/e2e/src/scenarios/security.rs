@@ -3,6 +3,7 @@ pub(crate) fn tampered_root_fails_closed(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21088", "127.0.0.1:21098");
     let dir = ctx.work.join("badroot");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let v1 = app_v(ctx, "1.0.0");
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -39,7 +40,6 @@ pub(crate) fn tampered_root_fails_closed(ctx: &Ctx) -> R {
     // Nothing authorized: no hook was ever invoked, so nothing the release could do was done.
     let ran_a_hook = !fixture::operations(&fixture::root(&dir)).is_empty();
     drop(node);
-    fixture::stop_workload(&dir);
     if ran_a_hook || log.contains("upgraded to") {
         return fail(format!(
             "tampered enrollment trust authorized a reconciler invocation:\n{log}"
@@ -53,6 +53,7 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
     let svc = "127.0.0.1:21140";
     let dir = ctx.work.join("signed-local-repair");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let v1 = app_v(ctx, "1.0.0");
     let v2 = app_v(ctx, "2.0.0");
     ctx.init_repo(&dir)?;
@@ -90,7 +91,6 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
         .ok_or("active release directory was not found")?;
     let entrypoint = active_dir.join(format!("bin/app{}", ctx.exe));
     drop(stack);
-    fixture::stop_workload(&dir);
     make_owner_writable(&entrypoint)?;
     std::fs::write(&entrypoint, b"locally modified and no longer trusted").map_err(str_err)?;
 
@@ -103,7 +103,6 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
     }
     let log = repaired.captured_log();
     drop(repaired);
-    fixture::stop_workload(&dir);
     if !log.contains("repaired the committed application from signed local deployment 2.0.0") {
         return fail(format!("the local repair path was not observed:\n{log}"));
     }

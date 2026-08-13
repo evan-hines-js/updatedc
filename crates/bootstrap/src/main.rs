@@ -127,6 +127,150 @@ fn usage() {
     );
 }
 
+/// Every flag the launcher accepts, as one list. `parse_args` matches exactly these and `usage`
+/// documents exactly these, and the checked-in launch sites below are scanned against them — so a
+/// flag deleted from the parser fails `cargo test` rather than crash-looping a pod.
+#[cfg_attr(not(test), allow(dead_code))]
+const ACCEPTED_FLAGS: &[&str] = &[
+    "--state-dir",
+    "--supervisor-config",
+    "--supervisor",
+    "--ready-timeout",
+    "--confirm-timeout",
+    "--stop-grace",
+    "--help",
+];
+
+#[cfg(test)]
+mod launch_sites {
+    //! A launcher command line is duplicated as untyped text across shipped assets — a shell
+    //! wrapper, Kubernetes manifests, an init unit, the README. Nothing else type-checks them, so a
+    //! flag the parser no longer accepts survives right up until a node refuses to start. This
+    //! scans them against the parser's own accepted set.
+
+    use super::ACCEPTED_FLAGS;
+
+    const SITES: &[(&str, &str)] = &[
+        (
+            "crates/updatec/e2e/agent.sh",
+            include_str!("../../../crates/updatec/e2e/agent.sh"),
+        ),
+        (
+            "scripts/kind-updatec-e2e.sh",
+            include_str!("../../../scripts/kind-updatec-e2e.sh"),
+        ),
+        ("README.md", include_str!("../../../README.md")),
+        (
+            "deploy/systemd/updated-supervisor.service",
+            include_str!("../../../deploy/systemd/updated-supervisor.service"),
+        ),
+        (
+            "deploy/ansible/roles/updated_agent/templates/updated-agent.service.j2",
+            include_str!(
+                "../../../deploy/ansible/roles/updated_agent/templates/updated-agent.service.j2"
+            ),
+        ),
+        (
+            "deploy/launchd/com.example.updated-supervisor.plist",
+            include_str!("../../../deploy/launchd/com.example.updated-supervisor.plist"),
+        ),
+    ];
+
+    /// Every `--flag` token on a line, with the punctuation shell, YAML and XML wrap them in
+    /// stripped.
+    fn flags(line: &str) -> Vec<&str> {
+        line.split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '[' | ']' | '"' | '\'' | '<' | '>')
+        })
+        .filter(|token| token.starts_with("--") && token.len() > 2)
+        .collect()
+    }
+
+    /// The launcher invocations in one asset: maximal runs of consecutive flag-bearing lines, kept
+    /// only when the run names `--state-dir` — the one flag the launcher requires, so it marks a
+    /// launcher command line and nothing else. A plist spells one argument per element, so its
+    /// whole `ProgramArguments` array counts as a single invocation.
+    fn invocations(path: &str, text: &str) -> Vec<Vec<String>> {
+        if path.ends_with(".plist") {
+            let all: Vec<String> = text.lines().flat_map(flags).map(str::to_owned).collect();
+            return if all.iter().any(|f| f == "--state-dir") {
+                vec![all]
+            } else {
+                Vec::new()
+            };
+        }
+        let mut found = Vec::new();
+        let mut run: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let line_flags = flags(line);
+            if line_flags.is_empty() {
+                if run.iter().any(|f| f == "--state-dir") {
+                    found.push(std::mem::take(&mut run));
+                }
+                run.clear();
+                continue;
+            }
+            run.extend(line_flags.into_iter().map(str::to_owned));
+        }
+        if run.iter().any(|f| f == "--state-dir") {
+            found.push(run);
+        }
+        found
+    }
+
+    #[test]
+    fn every_shipped_launcher_invocation_uses_flags_the_parser_accepts() {
+        let mut checked = 0;
+        for (path, text) in SITES {
+            for invocation in invocations(path, text) {
+                checked += 1;
+                for flag in invocation {
+                    assert!(
+                        ACCEPTED_FLAGS.contains(&flag.as_str()),
+                        "{path} passes {flag}, which the launcher does not accept"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= SITES.len(),
+            "the scan found only {checked} launcher invocations; the extraction has stopped seeing them"
+        );
+    }
+
+    #[test]
+    fn the_accepted_set_is_exactly_what_the_parser_matches_and_usage_documents() {
+        const SOURCE: &str = include_str!("main.rs");
+        let parser = SOURCE
+            .split_once("fn parse_args()")
+            .expect("the parser")
+            .1
+            .split_once("fn next_path")
+            .expect("the parser body")
+            .0;
+        let usage = SOURCE.split_once("fn usage()").expect("the usage text").1;
+        for flag in ACCEPTED_FLAGS {
+            assert!(
+                parser.contains(&format!("\"{flag}\"")),
+                "{flag} is advertised as accepted but the parser has no arm for it"
+            );
+            assert!(
+                usage.contains(flag),
+                "{flag} is accepted but undocumented in usage"
+            );
+        }
+        for token in parser
+            .split(|c: char| c.is_whitespace() || matches!(c, '"' | '|' | '=' | '>'))
+            .filter(|t| t.starts_with("--") && t.len() > 2)
+        {
+            assert!(
+                ACCEPTED_FLAGS.contains(&token),
+                "the parser accepts {token}, which the checked set does not know about"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod dependency_isolation {
     //! The launcher's isolation is load-bearing: it must depend only on the frozen

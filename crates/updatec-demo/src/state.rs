@@ -14,8 +14,8 @@ pub(crate) struct FleetNode {
     pub(crate) healthy: bool,
     pub(crate) in_load_balancer: bool,
     /// Telemetry: why the node reads out of the load balancer, if it does — a readiness the
-    /// watch saw withdrawn, a watch that stalled (failing closed), or a `readyz` failure still
-    /// inside its debounce, so the UI can tell a genuine flap from a stale view.
+    /// watch saw withdrawn, a watch that stalled (failing closed), or a withdrawal still inside
+    /// its debounce, so the UI can tell a genuine flap from a stale view.
     pub(crate) probe_note: Option<String>,
 }
 

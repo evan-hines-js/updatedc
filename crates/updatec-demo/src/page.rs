@@ -260,8 +260,7 @@ pub(crate) const PAGE: &str = r#"<!doctype html>
 │   ├── start.done
 │   ├── verify.done
 │   ├── apply.done
-│   ├── generated-install.properties
-│   └── stopped-process.pid
+│   └── generated-install.properties
 ├── backups/&lt;signed-attempt-id&gt;/
 │   ├── application.war
 │   ├── content.repository

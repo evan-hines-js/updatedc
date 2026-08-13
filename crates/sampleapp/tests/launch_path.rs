@@ -84,16 +84,21 @@ fn free_port() -> u16 {
 
 /// Launch as a reconciler does: the resolved program, the resolved cwd, and an explicitly
 /// constructed environment (nothing ambient crosses the boundary).
-fn launch(resolved: &updated::provider::Resolved, port: u16) -> Child {
-    Command::new(&resolved.program)
+fn launch(resolved: &updated::provider::Resolved, port: u16, record: &Path) -> Child {
+    let child = Command::new(&resolved.program)
         .args(["--addr", &format!("127.0.0.1:{port}")])
+        .args(["--await-record", &record.display().to_string()])
         .current_dir(&resolved.cwd)
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap()
+        .unwrap();
+    // A hook records its reap handle immediately after the spawn; the workload will not serve
+    // until it does.
+    std::fs::write(record, format!("{{\"pid\":{}}}", child.id())).unwrap();
+    child
 }
 
 /// Read the application's readiness line (it reports on stderr, as the e2e harness
@@ -145,7 +150,7 @@ fn the_real_application_starts_from_the_launch_cwd_the_provider_resolves() {
     assert_ne!(resolved.cwd, store.location(&id));
 
     let port = free_port();
-    let mut child = launch(&resolved, port);
+    let mut child = launch(&resolved, port, &root.join("workload.json"));
     let line = await_ready_line(&mut child);
     let _ = child.kill();
     let _ = child.wait();
@@ -166,7 +171,7 @@ fn what_the_application_writes_into_its_cwd_never_condemns_its_release() {
     let (_store, id, resolved) = install_release(&root, "2.0.0");
 
     let port = free_port();
-    let mut child = launch(&resolved, port);
+    let mut child = launch(&resolved, port, &root.join("workload.json"));
     let line = await_ready_line(&mut child);
     assert!(
         line.contains("2.0.0"),
@@ -186,4 +191,41 @@ fn what_the_application_writes_into_its_cwd_never_condemns_its_release() {
 
     bundle::verify_release(&root.join("versions"), &id)
         .expect("the application's writes to its workspace must not fail release verification");
+}
+
+/// The unreapable-orphan window, closed at its cause: a workload that has not been recorded cannot
+/// take traffic, so a hook killed between the spawn and the write leaves either nothing at all or a
+/// process that exits on its own bound without ever binding the service address.
+#[test]
+fn an_unrecorded_workload_never_binds_the_service_address() {
+    let (_tmp, root) = scratch();
+    let (_store, _id, resolved) = install_release(&root, "3.0.0");
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+
+    for record in ["never-written.json", "someone-elses.json"] {
+        let record = root.join(record);
+        if record.file_name().unwrap() == "someone-elses.json" {
+            // A record from a previous workload does not license a new process to serve.
+            std::fs::write(&record, "{\"pid\":1}").unwrap();
+        }
+        let status = Command::new(&resolved.program)
+            .args(["--addr", &addr])
+            .args(["--await-record", &record.display().to_string()])
+            .current_dir(&resolved.cwd)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "an unrecorded workload must refuse to serve ({record:?})"
+        );
+        TcpListener::bind(&addr)
+            .expect("the address was never bound, so it is free the moment the process is gone");
+    }
 }

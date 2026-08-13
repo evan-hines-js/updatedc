@@ -12,6 +12,7 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21081", "127.0.0.1:21091");
     let dir = ctx.work.join("agent-crash");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let v1 = app_v(ctx, "1.0.0");
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -25,13 +26,12 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
             .launcher()?,
     )?;
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        fixture::stop_workload(&dir);
         return fail("the release's apply hook never brought the workload into service");
     }
     let workload = fixture::workload_pid(&dir).ok_or("the reconciler recorded no workload PID")?;
     let agent = pid_after(&boot.captured_log(), "launched agent")
         .ok_or("the launcher never reported the agent PID it launched")?;
-    let before = fixture::attempts(&fixture::root(&dir)).len();
+    let before = fixture::operations(&fixture::root(&dir)).len();
 
     // Crash ONLY the agent. Nothing in the workload's ancestry is touched: the reconciler put it in
     // a session of its own, exactly as an operator's init system would.
@@ -45,15 +45,31 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
         && fixture::workload_pid(&dir) == Some(workload)
         && http_text(&format!("http://{svc}/healthz")).is_some();
 
-    // And the recovered agent ran no deployment operation at all. Its boot converge is an
-    // ordinary reserved-identity invocation (never recorded as an attempt), and it converged onto
-    // a workload that was already correct.
-    let no_deployment_operations = fixture::attempts(&fixture::root(&dir)).len() == before;
+    // And the recovered agent disturbed nothing: no deployment operation and no `rollback` — only
+    // the reserved-identity invocations a boot legitimately makes. The other half of the claim is
+    // that it really did re-converge: the boot `apply` is present, under `--reason restart`, and it
+    // changed nothing, which is the whole package-runner point.
+    let added = fixture::operations(&fixture::root(&dir));
+    let disturbances = fixture::disturbances(&fixture::root(&dir), before);
+    let boot_converges = |slice: &[fixture::Invocation]| {
+        slice
+            .iter()
+            .filter(|invocation| {
+                invocation.operation == "apply"
+                    && invocation.id == updated_contracts::reconciler::attempt::BOOT
+            })
+            .count()
+    };
+    // The reserved identity is a deliberately recurring name, never an idempotency key: EVERY boot
+    // runs the converge under it. So the count grows with each boot — one before the crash, at
+    // least one more after — which fails immediately if the converge is ever made conditional or
+    // the reserved id is "fixed" into a one-shot key.
+    let converges_before = boot_converges(&added[..before]);
+    let re_converged = converges_before >= 1 && boot_converges(&added[before..]) >= 1;
     // Read the record before teardown removes it, so a failure reports what actually happened.
     let workload_after = fixture::workload_pid(&dir);
     let log = boot.captured_log();
     drop(boot);
-    fixture::stop_workload(&dir);
 
     if !resumed {
         return fail(format!(
@@ -65,8 +81,37 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
             "the agent crash disturbed the hook-managed workload (pid {workload} was {workload_after:?} afterwards)"
         ));
     }
-    if !no_deployment_operations {
-        return fail("the recovered agent ran a deployment operation it had no reason to run");
+    if !disturbances.is_empty() {
+        return fail(format!(
+            "the recovered agent reached for the workload: {}",
+            disturbances.join(", ")
+        ));
+    }
+    if !re_converged {
+        return fail(
+            "each boot must run its own converge under the reserved boot identity, and this run \
+             did not: nothing proves the converge is what left the workload alone",
+        );
+    }
+    // The boot converge and the boot gate belong to the same boot, so they carry the same
+    // `--reason` — `install` on the first boot, `restart` afterwards — and never `update`. A gate
+    // that invents its own reason contradicts the converge that just ran.
+    let mut converge_reason = String::new();
+    for invocation in &added {
+        if invocation.id != updated_contracts::reconciler::attempt::BOOT {
+            continue;
+        }
+        match invocation.operation.as_str() {
+            "apply" => converge_reason = invocation.reason.clone(),
+            "healthcheck" if invocation.reason != converge_reason => {
+                return fail(format!(
+                    "the boot gate was invoked with --reason {} while its boot converge ran with \
+                     --reason {converge_reason:?}",
+                    invocation.reason
+                ));
+            }
+            _ => {}
+        }
     }
     ok(&format!(
         "an agent crash left the hook-managed workload untouched (pid {workload}); the launcher relaunched the agent"

@@ -29,11 +29,11 @@ pub(crate) struct Demo {
     /// [`LOAD_STEADY_GRACE`], then true forever. Workers neither send nor record until it
     /// flips, so availability reflects steady-state service, not baseline warm-up.
     pub(crate) counting: Arc<Vec<AtomicBool>>,
-    /// Per-node instant readyz first started failing, for the UI's readiness debounce:
-    /// at 1s polling a single missed probe shouldn't flip a node OUT, so the UI only
-    /// believes OUT after readyz has failed continuously for a grace period. The
-    /// generation-settle logic uses the raw signal, not this.
-    pub(crate) readyz_failing_since: Arc<Mutex<std::collections::HashMap<String, Instant>>>,
+    /// Per-node instant the node was first observed out of the pool, for the UI's readiness
+    /// debounce: a single missed observation shouldn't flip a node OUT, so the UI only believes
+    /// OUT after the node has read out continuously for a grace period. The generation-settle
+    /// logic uses the raw signal, not this.
+    pub(crate) readiness_lost_at: Arc<Mutex<std::collections::HashMap<String, Instant>>>,
     /// Fleet nodes (pod names) seen OUT of the load balancer — readiness withdrawn — at least
     /// once since the current generation began. Filled by a continuous Kubernetes *watch* on
     /// pod readiness ([`spawn_readiness_watcher`]), not a periodic poll, so a broken cohort's
@@ -47,7 +47,7 @@ pub(crate) struct Demo {
     /// readinessProbe drives the per-set Service EndpointSlices, so its `Ready` condition *is*
     /// whether it is in the pool — reading it from the watch stream means the UI's IN/OUT and the
     /// synthetic load balancer's endpoint set reflect the very signal Kubernetes routes on, with
-    /// no per-node `readyz` curl storm and no poll that can miss a transition. A node absent from
+    /// no per-node HTTP probe storm and no poll that can miss a transition. A node absent from
     /// the map (not yet observed, or not pod-backed like the unimplemented manual VM) reads OUT.
     pub(crate) readiness: Arc<StdMutex<std::collections::HashMap<String, bool>>>,
     /// Instant of the last successful readiness-watch event or relist — the watch's liveness
@@ -89,7 +89,7 @@ impl Demo {
                     .map(|_| AtomicBool::new(false))
                     .collect(),
             ),
-            readyz_failing_since: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            readiness_lost_at: Arc::new(Mutex::new(std::collections::HashMap::new())),
             left_lb: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             readiness: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             readiness_fresh_at: Arc::new(StdMutex::new(Instant::now())),
@@ -206,15 +206,15 @@ impl Demo {
     }
 
     /// The fleet snapshot the UI renders: the raw probe from [`Self::fleet`] with a
-    /// readiness *debounce* applied. A node is only reported OUT once its readyz has
-    /// failed continuously for [`READYZ_DEBOUNCE`]; a single missed probe at 1s polling
-    /// keeps it IN (annotated as debounced). Generation-settle uses raw `fleet()`, so
-    /// this smoothing never affects correctness — only what the human sees.
+    /// readiness *debounce* applied. A node is only reported OUT once it has read out of the pool
+    /// continuously for [`READINESS_DEBOUNCE`]; a single missed observation keeps it IN (annotated
+    /// as debounced). Generation-settle uses raw `fleet()`, so this smoothing never affects
+    /// correctness — only what the human sees.
     pub(crate) async fn fleet_for_ui(&self) -> Result<Vec<FleetNode>, Box<dyn std::error::Error>> {
-        const READYZ_DEBOUNCE: Duration = Duration::from_secs(2);
+        const READINESS_DEBOUNCE: Duration = Duration::from_secs(2);
         let mut nodes = self.fleet().await?;
         let now = Instant::now();
-        let mut failing = self.readyz_failing_since.lock().await;
+        let mut failing = self.readiness_lost_at.lock().await;
         for node in &mut nodes {
             if node.in_load_balancer {
                 failing.remove(&node.node);
@@ -222,10 +222,10 @@ impl Demo {
             }
             let since = *failing.entry(node.node.clone()).or_insert(now);
             let elapsed = now.saturating_duration_since(since);
-            if elapsed < READYZ_DEBOUNCE {
+            if elapsed < READINESS_DEBOUNCE {
                 node.in_load_balancer = true;
                 let debounced = format!(
-                    "readyz failing {}ms (debounced, still IN)",
+                    "out of the pool for {}ms (debounced, still IN)",
                     elapsed.as_millis()
                 );
                 node.probe_note = Some(match node.probe_note.take() {

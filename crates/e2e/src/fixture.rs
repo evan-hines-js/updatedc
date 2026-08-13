@@ -13,9 +13,10 @@
 //!   same environment, still running). That is what makes a workload's PID provably stable across
 //!   agent boots, restarts, crashes and self-updates — the agent has no means to disturb it, and
 //!   its own reconciler does not either unless something actually changed.
-//! * **Idempotence keyed to the attempt.** Every operation is recorded, and the create-new markers
-//!   under `effects/` land at most once per `(attempt, operation)` however often a crash replays the
-//!   invocation.
+//! * **Idempotence keyed to the attempt.** Every operation is recorded, and the migration adapter —
+//!   the fixture's one genuinely one-way effect — inspects what is already on disk before doing its
+//!   destructive half, so a crash-replayed invocation converges instead of clobbering its own
+//!   restore point.
 //!
 //! One recording chokepoint sits ahead of every mode, so no mode can answer an operation that the
 //! recorded history does not show.
@@ -53,7 +54,6 @@ pub struct Invocation {
     pub operation: String,
     pub id: String,
     pub reason: String,
-    pub candidate_version: String,
     /// The NAMES present in the invocation's environment. Values are never recorded — a secret
     /// that reached a hook must be provable without ever being written down.
     pub environment: Vec<String>,
@@ -72,18 +72,25 @@ pub fn operations(root: &Path) -> Vec<Invocation> {
         .lines()
         .filter_map(|line| {
             let mut fields = line.split('\t');
+            let operation = fields.next()?.to_string();
+            let id = fields.next()?.to_string();
+            let reason = fields.next()?.to_string();
+            // The recorded candidate version: written for a human reading a failed run's log,
+            // asserted on by nothing. Consumed positionally so the environment column stays put,
+            // and with `?` so a line of fewer than four columns is still not an invocation.
+            fields.next()?;
+            let environment = fields
+                .next()
+                .unwrap_or_default()
+                .split(' ')
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect();
             Some(Invocation {
-                operation: fields.next()?.to_string(),
-                id: fields.next()?.to_string(),
-                reason: fields.next()?.to_string(),
-                candidate_version: fields.next()?.to_string(),
-                environment: fields
-                    .next()
-                    .unwrap_or_default()
-                    .split(' ')
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-                    .collect(),
+                operation,
+                id,
+                reason,
+                environment,
             })
         })
         .collect()
@@ -102,35 +109,38 @@ pub fn attempts(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// How many at-most-once effect markers the fixture landed for `operation` — one per attempt that
-/// reached it, however many times a crash replayed the invocation.
-pub fn effect_markers(root: &Path, operation: &str) -> usize {
-    markers(root, |_, marked| marked == operation)
+/// The distinct TRANSACTIONS behind a recorded attempt history. A transaction's forward direction
+/// carries its own token and its compensating direction carries that token plus a trailing `r`
+/// (never a hex digit, so the mapping is exact); both fold to the one transaction they belong to.
+/// This is what a scenario asserts on when it means "no retry under a new identity" — a
+/// compensation is the same transaction, not a second one.
+pub fn transactions(attempts: &[(String, String)]) -> std::collections::BTreeSet<String> {
+    attempts
+        .iter()
+        .map(|(_, id)| id.strip_suffix('r').unwrap_or(id).to_string())
+        .collect()
 }
 
-/// The markers for one `(attempt, operation)` pair. Exactly one is the exactly-once claim: an
-/// attempt may be invoked any number of times, but its effect lands once.
-pub fn effect_markers_for(root: &Path, id: &str, operation: &str) -> usize {
-    markers(root, |marked_id, marked| {
-        marked_id == id && marked == operation
-    })
-}
-
-fn markers(root: &Path, keep: impl Fn(&str, &str) -> bool) -> usize {
-    std::fs::read_dir(root.join("effects"))
+/// The invocations recorded after `since` that no agent-only event may ever produce: any deployment
+/// operation (a non-reserved attempt id) and any `rollback`. A re-converging agent legitimately runs
+/// `apply`/`healthcheck` under the reserved `boot` identity and the steady-state
+/// `periodic`/`fingerprint` observations; a deployment or a rollback means it reached for the
+/// workload.
+pub fn disturbances(root: &Path, since: usize) -> Vec<String> {
+    operations(root)
         .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            // Markers are `{attempt-id}-{operation}`; the id is dashless hex, so the operation is
-            // everything after the first `-`.
-            entry
-                .file_name()
-                .to_string_lossy()
-                .split_once('-')
-                .is_some_and(|(id, operation)| keep(id, operation))
+        .skip(since)
+        .filter(|invocation| {
+            !updated_contracts::reconciler::attempt::is_reserved(&invocation.id)
+                || invocation.operation == "rollback"
         })
-        .count()
+        .map(|invocation| {
+            format!(
+                "{} under {} ({})",
+                invocation.operation, invocation.id, invocation.reason
+            )
+        })
+        .collect()
 }
 
 // ------------------------------------ modes ---------------------------------------
@@ -336,11 +346,10 @@ pub fn run() -> R {
 
 /// Record one invocation. This is the fixture's only writer of observation history.
 ///
-/// `operations.log` holds *every* invocation, including the reserved observation identities, with
-/// the full argument shape a scenario may need to assert on — including which environment variable
-/// NAMES were present, never their values. `attempts.log` and the create-new markers under
-/// `effects/` hold only deployment operations: they model the transaction history and an effect
-/// that must land at most once per `(attempt, operation)` even when recovery replays the command.
+/// `operations.log` holds *every* invocation, including the reserved identities, with the full
+/// argument shape a scenario may need to assert on — including which environment variable NAMES were
+/// present, never their values. `attempts.log` holds only deployment operations, so it is the
+/// transaction history alone.
 fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &str) -> R {
     let append = |path: PathBuf, line: &str| -> R {
         std::fs::create_dir_all(root).map_err(str_err)?;
@@ -371,19 +380,7 @@ fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &s
         root.join("attempts.log"),
         &format!("{}\t{id}", operation.as_str()),
     )?;
-    std::fs::create_dir_all(root.join("effects")).map_err(str_err)?;
-    let marker = root
-        .join("effects")
-        .join(format!("{id}-{}", operation.as_str()));
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(marker)
-    {
-        Ok(mut file) => writeln!(file, "{id}").map_err(str_err),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(str_err(error)),
-    }
+    Ok(())
 }
 
 // ---------------------------------- the workload ----------------------------------
@@ -395,7 +392,7 @@ fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &s
 /// The environment is a digest, never the values: a rotated secret must be provably acted on
 /// without any part of it reaching disk.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct Workload {
+struct WorkloadRecord {
     pid: u32,
     release: String,
     environment: String,
@@ -405,7 +402,7 @@ fn record_path(root: &Path) -> PathBuf {
     root.join("workload.json")
 }
 
-fn read_workload(root: &Path) -> Option<Workload> {
+fn read_workload(root: &Path) -> Option<WorkloadRecord> {
     serde_json::from_slice(&std::fs::read(record_path(root)).ok()?).ok()
 }
 
@@ -424,26 +421,31 @@ fn environment_digest() -> String {
 fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
     let release_id = release.display().to_string();
     let environment = environment_digest();
-    if let Some(current) = read_workload(root) {
-        if current.release == release_id
-            && current.environment == environment
-            && pid_alive(current.pid)
+    let replacing = match read_workload(root) {
+        Some(current)
+            if current.release == release_id
+                && current.environment == environment
+                && pid_alive(current.pid) =>
         {
             // Already converged. Rotation is still derived rather than assumed: a workload that
             // came up after a previous `apply` gave up waiting is put back in rotation here.
             return restore_rotation(root, address, mode);
         }
-        if let Some(hold) = mode.drain {
-            // Withdraw before stopping, never after: a load balancer that is still routing to this
-            // node when its process goes away drops the requests already in flight. The marker is
-            // the hook's rotation signal, and it stays up until the replacement answers.
-            drain_marker(root, true)?;
+        Some(current) => Some(current.pid),
+        None => None,
+    };
+    // Withdraw before stopping, never after: a load balancer that is still routing to this node
+    // when its process goes away drops the requests already in flight. The marker is the hook's
+    // rotation signal, and it stays up until the replacement answers. One site sets it, mirroring
+    // the one site that clears it.
+    if let Some(hold) = mode.drain {
+        drain_marker(root, true)?;
+        if replacing.is_some() {
             std::thread::sleep(hold);
         }
-        stop_pid(current.pid);
     }
-    if mode.drain.is_some() {
-        drain_marker(root, true)?;
+    if let Some(pid) = replacing {
+        stop_pid(pid);
     }
     let program = release.join(format!("bin/app{}", std::env::consts::EXE_SUFFIX));
     let mut command = Command::new(&program);
@@ -462,18 +464,27 @@ fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(str_err)?))
         .stderr(Stdio::from(log));
+    // The workload refuses to serve until the record names its own pid, and the stale record is
+    // removed first, so no process capable of binding the service address can exist without a
+    // durable reap handle naming it — this hook can be killed at any instant between the spawn and
+    // the write, and the workload it started outlives every tree the node stack owns.
+    command.args(["--await-record", &record_path(root).display().to_string()]);
+    let _ = std::fs::remove_file(record_path(root));
     detach(&mut command);
     let child = command
         .spawn()
         .map_err(|error| format!("starting {}: {error}", program.display()))?;
-    let workload = Workload {
+    let workload = WorkloadRecord {
         pid: child.id(),
         release: release_id,
         environment,
     };
-    std::fs::write(
-        record_path(root),
-        serde_json::to_vec(&workload).map_err(str_err)?,
+    // Renamed into place, never truncate-then-write: a kill mid-write would otherwise leave an
+    // unparseable record and the same unreapable orphan.
+    foundation::durable::atomic_write(
+        &record_path(root),
+        ".workload-",
+        &serde_json::to_vec(&workload).map_err(str_err)?,
     )
     .map_err(str_err)?;
     if mode.drain.is_none() {
@@ -488,7 +499,8 @@ fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
     // marker can never outlive the condition it describes.
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if restore_rotation(root, address, mode).is_ok() && !root.join("draining").is_file() {
+        restore_rotation(root, address, mode)?;
+        if !root.join("draining").is_file() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -525,10 +537,9 @@ pub fn draining(dir: &Path) -> bool {
     root(dir).join("draining").is_file()
 }
 
-/// Detach the workload from this hook invocation. The agent contains each invocation in a process
-/// group (Unix) / job object (Windows) and tears that tree down as soon as the hook returns, so a
-/// workload left inside it would be killed by its own `apply`. A workload belongs to the release,
-/// not to the agent attempt that converged it.
+/// Detach the workload from this hook invocation, as the Invocation section of
+/// `docs/node-reconciler-protocol.md` requires: a workload left inside the invocation's contained
+/// tree is killed by its own successful `apply`.
 fn detach(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -565,42 +576,99 @@ fn probe(address: &str) -> R {
     }
 }
 
-/// Stop a workload and wait for the address it held to be released, so the next start can bind.
+/// Ask a pid to stop, escalating if it does not, and wait for the address it held to be released so
+/// the next start can bind.
+///
+/// A pid the fixture recorded is routinely already gone — the workload runs outside every tree this
+/// process owns, so nothing pins its slot and the number is reusable. Every signal is therefore
+/// gated on a fresh liveness observation taken immediately before it: the residual window (the
+/// process exits between the check and the signal) is inherent to pid-addressed signalling and is
+/// microseconds wide, where an unguarded signal was seconds wide and aimed at a number a sibling
+/// scenario may already own.
 fn stop_pid(pid: u32) {
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    if !pid_alive(pid) {
+        return;
     }
-    #[cfg(windows)]
-    let _ = Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while pid_alive(pid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-    }
-    // The replacement binds the same address, so the wait for the old process to be gone is a
-    // precondition of starting the new one, not politeness.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while pid_alive(pid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+    signal(pid, false);
+    if !wait_for_exit(pid) && pid_alive(pid) {
+        signal(pid, true);
+        wait_for_exit(pid);
     }
 }
 
-/// Stop the workload a scenario's fixture is managing, for teardown. The agent cannot do this — the
-/// workload is deliberately outside every tree it owns — so the scenario that started one ends it.
-pub fn stop_workload(dir: &Path) {
+/// Ask `pid` to stop, forcefully when `hard`. The two platforms are structurally parallel: a
+/// graceful request first, an unconditional kill on escalation.
+fn signal(pid: u32, hard: bool) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(
+            pid as libc::pid_t,
+            if hard { libc::SIGKILL } else { libc::SIGTERM },
+        );
+    }
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        if hard {
+            command.arg("/F");
+        }
+        let _ = command
+            .args(["/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Wait up to two seconds for `pid` to be gone; `true` once it is. The replacement binds the same
+/// address, so this is a precondition of starting the new workload, not politeness.
+fn wait_for_exit(pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Stop the workload a scenario's fixture is managing. The agent cannot do this — the workload is
+/// deliberately outside every tree it owns — so the scenario that started one ends it. The recorded
+/// pid may name a workload that already exited on its own (the normal case for the fault modes), so
+/// [`stop_pid`] observes liveness before it signals; a real reconciler hook must do the same, where
+/// the victim of a stale pid would be a production process.
+fn stop_workload(dir: &Path) {
     let root = root(dir);
     if let Some(workload) = read_workload(&root) {
         stop_pid(workload.pid);
     }
     let _ = std::fs::remove_file(record_path(&root));
+}
+
+/// Ends the fixture's workload when the scenario's scope ends. The workload is deliberately outside
+/// every tree the node stack owns, so the scenario that started one is the only thing that can end
+/// it — and a failing scenario returns early, so ending it must not be a statement the author has to
+/// remember to write.
+///
+/// Bind it before the `Proc`/`Service` handles: Rust drops in reverse declaration order, so the
+/// guard declared first is dropped last, which is the ordering a correct manual teardown writes.
+pub struct Workload(PathBuf);
+
+pub fn workload(dir: &Path) -> Workload {
+    Workload(dir.to_path_buf())
+}
+
+impl Workload {
+    /// End the workload before the scope does, for a scenario that observes the address being
+    /// released. Consumes the guard, so `Drop` remains the one mechanism.
+    pub fn stop(self) {}
+}
+
+impl Drop for Workload {
+    fn drop(&mut self) {
+        stop_workload(&self.0);
+    }
 }
 
 /// The PID of the workload the fixture under `dir` currently manages.
@@ -616,11 +684,18 @@ pub fn workload_pid(dir: &Path) -> Option<u32> {
 fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version: &str) -> R {
     let state = root.join("migration-state");
     let live = state.join("live");
-    let backup = state.join("backups").join(id);
+    // The restore point is keyed by the attempt that TOOK it, and which attempt that was is durable
+    // sub-progress this hook keeps for itself — exactly what the protocol reserves `--state-dir`
+    // for. The compensating direction carries its own attempt id (a transaction never reuses one id
+    // with different arguments), so `rollback` looks the restore point up rather than assuming its
+    // own id named it.
+    let restore_point = state.join("restore-point");
+    let backup = |taken_by: &str| state.join("backups").join(taken_by);
     std::fs::create_dir_all(&state).map_err(str_err)?;
     // A real stateful upgrade spends meaningful time in backup, quiescence, startup, and migration.
-    // Keep CI deterministic while making timeout and ordering behaviour observable instead of
-    // accidentally testing a zero-latency wrapper.
+    // The fixed cost keeps CI deterministic while giving the operations observable, non-instant
+    // duration, so the agent's ordering and hook-timeout behaviour is exercised rather than raced
+    // past.
     std::thread::sleep(Duration::from_millis(250));
     match operation {
         Operation::Healthcheck => Ok(()),
@@ -650,10 +725,14 @@ fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version
                 {
                     return fail("the migration-shaped apply found an invalid baseline");
                 }
+                let backup = backup(id);
                 std::fs::create_dir_all(&backup).map_err(str_err)?;
                 std::fs::copy(live.join("content.db"), backup.join("content.db"))
                     .map_err(str_err)?;
                 std::fs::copy(live.join("app.war"), backup.join("app.war")).map_err(str_err)?;
+                // Recorded before the one-way write, so a crash between them still leaves the
+                // compensating direction able to find what it must restore.
+                std::fs::write(&restore_point, id.as_bytes()).map_err(str_err)?;
                 std::fs::write(live.join("app.war"), format!("{version}\n")).map_err(str_err)?;
                 std::fs::write(live.join("content.db"), format!("migrated-{version}\n"))
                     .map_err(str_err)?;
@@ -664,6 +743,8 @@ fn migrate(root: &Path, mode: Migration, operation: Operation, id: &str, version
             std::fs::write(state.join("migration-finalized"), id.as_bytes()).map_err(str_err)
         }
         Operation::Rollback => {
+            let taken_by = std::fs::read_to_string(&restore_point).map_err(str_err)?;
+            let backup = backup(taken_by.trim());
             std::fs::copy(backup.join("content.db"), live.join("content.db")).map_err(str_err)?;
             std::fs::copy(backup.join("app.war"), live.join("app.war")).map_err(str_err)?;
             std::fs::write(state.join("rollback-completed"), id.as_bytes()).map_err(str_err)

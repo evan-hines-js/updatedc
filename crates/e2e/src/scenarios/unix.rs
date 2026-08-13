@@ -1,4 +1,5 @@
 use super::super::*;
+use updated_contracts::reconciler::attempt;
 
 /// The never-healthy twin of `cold_install_descends_past_broken_head`. There the assigned heads
 /// fail their `apply`; here `apply` succeeds — the workload starts and stays alive — but the
@@ -10,6 +11,7 @@ pub(crate) fn cold_install_descends_past_unhealthy_head(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21330", "127.0.0.1:21331");
     let dir = ctx.work.join("cold-install-wedge");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     // The healthy release below the wedged heads.
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
@@ -56,7 +58,6 @@ pub(crate) fn cold_install_descends_past_unhealthy_head(ctx: &Ctx) -> R {
     });
     let wedge_stopped = !pid_alive(wedged_pid);
     drop(node);
-    fixture::stop_workload(&dir);
     if !settled {
         return fail(
             "the descended-to 1.0.0 served but the committed install record never settled on it",
@@ -80,6 +81,7 @@ pub(crate) fn lifecycle_healthcheck_gates_readiness(ctx: &Ctx) -> R {
     let svc = "127.0.0.1:21182";
     let dir = ctx.work.join("lifecycle-verify");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -104,9 +106,8 @@ pub(crate) fn lifecycle_healthcheck_gates_readiness(ctx: &Ctx) -> R {
         .filter(|invocation| invocation.operation == "healthcheck")
         .map(|invocation| invocation.id.as_str())
         .collect();
-    let gated_install = gates.contains(&"boot");
-    let gated_upgrade = gates.iter().any(|id| *id != "boot" && *id != "periodic");
-    fixture::stop_workload(&dir);
+    let gated_install = gates.contains(&attempt::BOOT);
+    let gated_upgrade = gates.iter().any(|id| !attempt::is_reserved(id));
     if !gated_install {
         return fail(format!(
             "the reconciler's healthcheck operation never gated the first install: {gates:?}"
@@ -125,6 +126,7 @@ pub(crate) fn key_perms(ctx: &Ctx) -> R {
     use std::os::unix::fs::PermissionsExt;
     let dir = ctx.work.join("keyperms");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     // Every key `server init` mints, including the standby root that becomes the fleet-wide
     // root on the next rotate-root.

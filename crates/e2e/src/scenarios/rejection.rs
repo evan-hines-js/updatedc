@@ -3,6 +3,7 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21084", "127.0.0.1:21094");
     let dir = ctx.work.join("reject");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let first_workload = fixture::workload(&dir);
     let v1 = app_v(ctx, "1.0.0");
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -50,8 +51,9 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
             return fail("the rejection was not persisted to disk");
         }
     }
-    // End the first run's workload before the second stack reuses its address.
-    fixture::stop_workload(&dir);
+    // The workload is deliberately outside every tree the first stack owned, so it survives that
+    // stack's teardown; end it explicitly before the second stack reuses its address.
+    first_workload.stop();
     if !wait_until(EVENT_TIMEOUT, || {
         http_text(&format!("http://{svc}/version")).is_none()
     }) {
@@ -59,6 +61,7 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
     }
 
     // Run 2 (a fresh stack): must NOT reapply the known-bad v2.
+    let _workload = fixture::workload(&dir);
     {
         let cmd = make()?;
         let node = Service::spawn("reject-2", &cmd);
@@ -70,7 +73,6 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
             return fail("the restart re-applied the known-bad v2");
         }
     }
-    fixture::stop_workload(&dir);
     ok("a release that failed its health gate was rejected on recovery and NOT reapplied after a restart");
     Ok(())
 }

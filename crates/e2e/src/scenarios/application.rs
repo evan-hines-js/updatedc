@@ -7,6 +7,7 @@ pub(crate) fn cold_install_applies_the_first_release(ctx: &Ctx) -> R {
     let svc = "127.0.0.1:21074";
     let dir = ctx.work.join("cold-install");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     let _server = ctx.serve(&dir, srv)?;
@@ -29,7 +30,6 @@ pub(crate) fn cold_install_applies_the_first_release(ctx: &Ctx) -> R {
         && dir.join("install/active-release").is_file();
     let log = process.captured_log();
     drop(process);
-    fixture::stop_workload(&dir);
     if !installed {
         return fail(format!(
             "the agent did not cold-install the first release and converge it through apply:\n{log}"
@@ -46,6 +46,7 @@ pub(crate) fn cold_install_hands_off_to_update(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:22900", "127.0.0.1:22901");
     let dir = ctx.work.join("install-update-handoff");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -90,7 +91,6 @@ pub(crate) fn cold_install_hands_off_to_update(ctx: &Ctx) -> R {
     });
     let log = node.captured_log();
     drop(node);
-    fixture::stop_workload(&dir);
     if !converged {
         return fail(format!(
             "install/update handoff left durable state inconsistent (installed != 2.0.0, or a journal remained):\n{log}"
@@ -104,6 +104,7 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21080", "127.0.0.1:21090");
     let dir = ctx.work.join("app");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
 
     ctx.init_repo(&dir)?;
@@ -172,7 +173,6 @@ pub(crate) fn app_update_and_rollback(ctx: &Ctx) -> R {
     }
     let log = node.captured_log();
     drop(node);
-    fixture::stop_workload(&dir);
     if !log.contains("restoring predecessor 2.0.0 after interrupted activation of 3.0.0")
         && !log.contains("recovery: completing rollback from 3.0.0 to 2.0.0")
     {
@@ -196,6 +196,7 @@ pub(crate) fn zero_downtime_upgrade(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21150", "127.0.0.1:21151");
     let dir = ctx.work.join("zero-downtime");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -238,8 +239,13 @@ pub(crate) fn zero_downtime_upgrade(ctx: &Ctx) -> R {
                     .build();
                 while !stop.load(Ordering::Relaxed) {
                     // A load balancer only routes to a node in rotation; a draining node being
-                    // skipped is correct removal, not a dropped request.
+                    // skipped is correct removal, not a dropped request. A drained node is polled
+                    // at the fixture's own rotation cadence rather than busy-waited: fifteen
+                    // threads spinning on a stat would starve the very upgrade this scenario times.
+                    // The served path takes no delay — request density is what makes a dropped
+                    // request detectable.
                     if fixture::draining(&dir) {
+                        std::thread::sleep(Duration::from_millis(5));
                         continue;
                     }
                     served.fetch_add(1, Ordering::Relaxed);
@@ -273,7 +279,6 @@ pub(crate) fn zero_downtime_upgrade(ctx: &Ctx) -> R {
     for worker in workers {
         let _ = worker.join();
     }
-    fixture::stop_workload(&dir);
 
     if !reached {
         return fail("service did not upgrade to v2.0.0 under load");
@@ -322,6 +327,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
         let svc = format!("127.0.0.1:{port}");
         let dir = ctx.work.join(format!("chaotic-health-{fault}"));
         std::fs::create_dir_all(&dir).map_err(str_err)?;
+        let _workload = fixture::workload(&dir);
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
         let _server = ctx.serve(&dir, &srv)?;
@@ -375,7 +381,6 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
         };
         let log = node.captured_log();
         drop(node);
-        fixture::stop_workload(&dir);
         if !held {
             return fail(format!(
                 "fault {fault}: the healthcheck hook's verdict was not acted on as expected:\n{log}"
@@ -399,6 +404,7 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21230", "127.0.0.1:21231");
     let dir = ctx.work.join("cold-install-fallback");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     // The good release below the broken heads.
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
@@ -440,7 +446,6 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
         )
     });
     drop(node);
-    fixture::stop_workload(&dir);
     if !settled {
         return fail(
             "descended app served 1.0.0 but the committed install record never settled on it",
@@ -461,6 +466,7 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21530", "127.0.0.1:21531");
     let dir = ctx.work.join("cold-install-corrupt");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     // Malformed-but-signed heads: 2.0.0 truncated, 3.0.0 pure garbage. Each verifies its signed
@@ -499,7 +505,6 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
     let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
     let rejected_count = rejected.lines().filter(|l| !l.trim().is_empty()).count();
     drop(node);
-    fixture::stop_workload(&dir);
     if !settled {
         return fail(
             "descended app served 1.0.0 but the committed install record never settled on it",
@@ -535,6 +540,7 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21089", "127.0.0.1:21099");
     let dir = ctx.work.join("crash-evidence-unconfirmed");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     let (v1, v2) = (app_v(ctx, "1.0.0"), app_v(ctx, "2.0.0"));
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
@@ -548,14 +554,12 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
         .launcher()?;
     let node = Service::spawn("unconfirmed", &cmd);
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        fixture::stop_workload(&dir);
         return fail("v1.0.0 never came into service");
     }
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
     // Let the candidate commit first: it passes its transaction health gate on its first
     // observation and degrades immediately afterwards.
     if !node.wait_for_log("upgraded to 2.0.0", EVENT_TIMEOUT) {
-        fixture::stop_workload(&dir);
         return fail(format!(
             "the degrading v2.0.0 never committed:\n{}",
             node.captured_log()
@@ -573,7 +577,6 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
     let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
     let log = node.captured_log();
     drop(node);
-    fixture::stop_workload(&dir);
     if !reverted {
         return fail(format!(
             "an unconfirmed release whose workload died was not reverted to 1.0.0:\n{log}"
@@ -588,6 +591,7 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21189", "127.0.0.1:21199");
     let dir = ctx.work.join("crash-evidence-confirmed");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &v1)?;
     let _server = ctx.serve(&dir, srv)?;
@@ -599,7 +603,6 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
         .launcher()?;
     let node = Service::spawn("confirmed", &cmd);
     if !wait_for_version(svc, "1.0.0", EVENT_TIMEOUT) {
-        fixture::stop_workload(&dir);
         return fail("v1.0.0 never came into service");
     }
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
@@ -607,7 +610,6 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
         "update 2.0.0 confirmed; confirmation window passed",
         EVENT_TIMEOUT,
     ) {
-        fixture::stop_workload(&dir);
         return fail(format!(
             "v2.0.0 was never confirmed:\n{}",
             node.captured_log()
@@ -632,7 +634,6 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
         });
     let log = node.captured_log();
     drop(node);
-    fixture::stop_workload(&dir);
     if !held {
         return fail(format!(
             "a confirmed release that became unhealthy was not merely reported (reported={reported}):\n{log}"
@@ -650,12 +651,16 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
         ("healthy", "127.0.0.1:21120", "127.0.0.1:21130", false),
         ("failing", "127.0.0.1:21121", "127.0.0.1:21131", true),
     ];
+    // Declared ahead of the handles below so it drops last: each node's workload is ended after
+    // its agent and its repository server are gone.
+    let mut workloads = Vec::new();
     let mut services = Vec::new();
     let mut servers = Vec::new();
 
     for (name, repository_addr, service_addr, fails) in nodes {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).map_err(str_err)?;
+        workloads.push(fixture::workload(&dir));
         ctx.init_repo(&dir)?;
         ctx.publish(&dir, "app", "1.0.0", &v1)?;
         servers.push(ctx.serve(&dir, repository_addr)?);
@@ -716,10 +721,8 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
     {
         return fail("healthy peer was incorrectly rolled back with its failing peer");
     }
-    for (dir, _, _) in &services {
-        fixture::stop_workload(dir);
-    }
     drop(servers);
+    drop(workloads);
     ok("one node reverted locally while its group peer remained committed at 2.0.0");
     Ok(())
 }
