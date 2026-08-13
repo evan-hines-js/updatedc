@@ -8,10 +8,11 @@
 # ownership, and it is asserted directly: an SCM stop must cleanly end the tree the service owns —
 # the wrapper, the launcher and the agent — and a workload is provably not part of that tree,
 # because the agent never launches, holds, or stops one. What runs the workload is the operator's
-# own mechanism, driven from the reconciler (`sc.exe`, a container runtime, a config reload); on
-# Windows a reconciler that instead forks a workload as its own child would have that child killed
-# with the hook's job object when the hook returns, so driving the service manager is the shape this
-# platform supports and the shape this test's reconciler stands in for.
+# own mechanism, driven from the reconciler (`sc.exe`, a container runtime, a config reload); a
+# reconciler that instead forks a workload directly must create it with CREATE_BREAKAWAY_FROM_JOB,
+# which the agent's job object permits, so that the workload leaves the hook's disposable tree.
+# Driving the service manager is the shape this test's reconciler stands in for — that is scope,
+# not a platform limitation.
 [CmdletBinding()]
 param()
 

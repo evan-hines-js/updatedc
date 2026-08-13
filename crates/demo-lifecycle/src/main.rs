@@ -46,7 +46,6 @@ struct Deployment {
     candidate: String,
     predecessor: String,
     candidate_dir: PathBuf,
-    managed_pid: Option<String>,
     reason: String,
     state: PathBuf,
     effects: PathBuf,
@@ -75,7 +74,6 @@ impl Deployment {
             candidate,
             predecessor: required_argument(&values, "--predecessor-version")?.to_string(),
             candidate_dir: PathBuf::from(required_argument(&values, "--candidate")?),
-            managed_pid: values.get("--managed-pid").cloned(),
             reason: required_argument(&values, "--reason")?.to_string(),
         })
     }
@@ -243,11 +241,7 @@ impl Deployment {
 
     fn stop(&self) -> Result<(), Error> {
         self.require("drain")?;
-        expect(&self.live.join("removed-from-load-balancer"), &self.attempt)?;
-        self.write(
-            self.effects.join("stopped-process.pid"),
-            self.managed_pid.as_deref().unwrap_or("unknown").as_bytes(),
-        )
+        expect(&self.live.join("removed-from-load-balancer"), &self.attempt)
     }
 
     fn activate(&self) -> Result<(), Error> {
@@ -292,10 +286,10 @@ impl Deployment {
 
     /// Prove the activation from durable live state.
     ///
-    /// The supervisor stops the managed process before it invokes this hook and only relaunches it
-    /// after the hook returns, so an in-transaction probe of the application would always find
-    /// nothing listening. The running application is evidence `periodic` collects, once there is a
-    /// process to collect it from.
+    /// This hook, not the agent, owns the workload lifecycle, so the activation is proved from the
+    /// durable live files it wrote rather than from a process it may not have started yet. The
+    /// running application is evidence `periodic` collects, once there is a process to collect it
+    /// from.
     fn verify(&self) -> Result<(), Error> {
         self.require("start")?;
         expect(&self.live.join("application.war"), &self.candidate)?;
@@ -514,6 +508,28 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// The hook may only read flags the agent actually emits. A flag deleted from the published
+    /// grammar must fail here rather than silently become an always-absent value at runtime.
+    #[test]
+    fn every_flag_this_hook_reads_is_one_the_agent_emits() {
+        const SOURCE: &str = include_str!("main.rs");
+        let mut read = Vec::new();
+        let mut rest = SOURCE;
+        while let Some(at) = rest.find("required_argument(&values, \"") {
+            rest = &rest[at + "required_argument(&values, \"".len()..];
+            let end = rest.find('"').expect("a terminated flag literal");
+            read.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+        assert!(!read.is_empty(), "the flag reads must be discoverable");
+        for flag in read {
+            assert!(
+                updated_contracts::reconciler::FLAGS.contains(&flag),
+                "{flag} is read by this hook but is not part of the published invocation grammar"
+            );
+        }
+    }
+
     fn deployment(root: PathBuf, phase: Operation, attempt: &str) -> Deployment {
         Deployment {
             phase,
@@ -521,7 +537,6 @@ mod tests {
             candidate: "22.0.0".into(),
             predecessor: "1.0.0".into(),
             candidate_dir: root.join("candidate"),
-            managed_pid: None,
             reason: "update".into(),
             state: root.clone(),
             effects: root.join("attempts").join(attempt),

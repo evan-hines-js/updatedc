@@ -295,7 +295,7 @@ pub(crate) async fn check_application(
     // Stop background observers before any lifecycle transaction hook can run.
     before_deployment();
     log(&format!("applying update {from} -> {}", prepared.version));
-    let mut port = ReleaseReconciler::new(opts, &reconciler);
+    let mut port = ReleaseReconciler::new(opts, &reconciler, LifecycleReason::Update);
     let outcome = apply_update(
         &mut port,
         store,

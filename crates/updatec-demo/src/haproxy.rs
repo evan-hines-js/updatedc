@@ -98,8 +98,8 @@ fn haproxy_cfg(version: &str, servers: &[BackendServer]) -> String {
 /// The HAProxy StatefulSet: `DEMO_HAPROXY_REPLICAS` pods, each the same plain Ubuntu + agent image
 /// as every other node, enrolling through the same gateway and installing HAProxy from the signed
 /// bundle at runtime. In the headless `agents` Service so `haproxy-<n>.agents` resolves for the
-/// healthproxy's admin-socket reach and the uniform guardian readyz probe.
-fn haproxy_statefulset() -> serde_json::Value {
+/// healthproxy's admin-socket reach.
+pub(crate) fn haproxy_statefulset() -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
@@ -120,14 +120,12 @@ fn haproxy_statefulset() -> serde_json::Value {
                         "command": ["/usr/local/bin/run-agent"],
                         "ports": [
                             { "name": "http", "containerPort": 8080 },
-                            { "name": "admin", "containerPort": DEMO_HAPROXY_ADMIN_PORT },
-                            { "name": "guardian", "containerPort": 9090 }
+                            { "name": "admin", "containerPort": DEMO_HAPROXY_ADMIN_PORT }
                         ],
-                        // HAProxy installs in a few seconds, so a short startup budget suffices;
-                        // readiness tracks the supervisor's real HAProxy health check thereafter.
-                        "startupProbe": { "httpGet": { "path": "/startupz", "port": "guardian" }, "periodSeconds": 1, "failureThreshold": 180 },
-                        "readinessProbe": { "httpGet": { "path": "/readyz", "port": "guardian" }, "periodSeconds": 1, "failureThreshold": 1 },
-                        "livenessProbe": { "httpGet": { "path": "/livez", "port": "guardian" }, "periodSeconds": 5, "failureThreshold": 6 },
+                        // The workload's own frontend, which is what "this pod can serve" means
+                        // here. Node health has one path — reconciler hook verdict -> signed
+                        // NodeReport -> healthproxy — and the kubelet never judges the agent.
+                        "readinessProbe": { "tcpSocket": { "port": "http" }, "periodSeconds": 1, "failureThreshold": 180 },
                         "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] }, "runAsNonRoot": true, "runAsUser": 65532 },
                         "resources": { "requests": { "cpu": "50m", "memory": "64Mi" }, "limits": { "memory": "256Mi" } },
                         "volumeMounts": [
@@ -169,8 +167,8 @@ pub(crate) struct HaproxyRelease {
 /// The provider bundle is `scripts/haproxy/{lifecycle,lib.sh}` (the exact reexec provider proven by
 /// `scripts/linux-haproxy-e2e.sh`). Each app release carries the real distro `haproxy` binary, a
 /// version-stamped `haproxy.cfg`, and `scripts/haproxy/launch` as `bin/launch` — the start line the
-/// provider's `apply` runs when no master is up yet, since this deployment is `provider-managed`
-/// and the agent starts no process of its own. The two releases differ only in the version their
+/// provider's `apply` runs when no master is up yet, since the reconciler hooks own every workload
+/// process and the agent starts none of its own. The two releases differ only in the version their
 /// config reports, so applying 2.0.0 is a pure SIGUSR2 config re-exec of the same master.
 pub(crate) fn publish_haproxy_bundles(
     seed_deployment: &serde_json::Value,
@@ -322,16 +320,14 @@ fn pipe_into_release_server(command: &str, stdin: &str) -> Result<(), Box<dyn st
 
 /// The real `haproxy` UpdateGroup's deployment: clone `edge` (for CRD-field completeness), then
 /// override everything that makes it a HAProxy node — the app bundle, the HAProxy lifecycle
-/// provider set, the MinIO repo, the HAProxy product, `provider-managed` mode, an empty arg list
-/// (the launch entrypoint takes none), and a fast cadence with a short boot grace for HAProxy's
-/// few-second install.
+/// provider set, the MinIO repo, the HAProxy product, and a fast cadence with a short boot grace
+/// for HAProxy's few-second install.
 ///
-/// `provider-managed` is the mode this tier's whole claim rests on. The agent's stop and start
-/// become no-ops, so the HAProxy master is never stopped around an upgrade: the signed reconciler
-/// starts it once and thereafter re-execs that same master in place (SIGUSR2), which is what keeps
-/// the bound listeners — and therefore the traffic — alive across the switchover. In `managed` mode
-/// the agent would stop the master before `apply` ever ran, and there would be nothing left to
-/// re-exec.
+/// The invariant this tier's whole claim rests on: the release's signed reconciler hooks own the
+/// HAProxy master. `apply` starts it on first install and thereafter re-execs that same master in
+/// place (SIGUSR2), which is what keeps the bound listeners — and therefore the traffic — alive
+/// across the switchover. The agent never starts or stops a workload process, so there is no stop
+/// to sequence around.
 fn haproxy_group_deployment(
     edge: &serde_json::Value,
     release_root: &str,
@@ -347,9 +343,7 @@ fn haproxy_group_deployment(
     deployment["reportUrl"] = DEMO_REPORT_URL.into();
     deployment["orderedInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
-    deployment["runtime"]["mode"] = "provider-managed".into();
     deployment["runtime"]["installRoot"] = "/var/lib/updated/haproxy".into();
-    deployment["runtime"]["args"] = serde_json::json!([]);
     deployment["runtime"]["timeouts"] = serde_json::json!({
         "checkIntervalSeconds": 1,
         "healthGraceSeconds": 12,
@@ -734,4 +728,87 @@ async fn wait_for_front_version(
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     Err(format!("HAProxy front never reported the re-execed version {version}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge_group() -> serde_json::Value {
+        let deployment = updatec::DeploymentSpec {
+            name: "edge@1.0.0".into(),
+            release_repository: updatec::ReleaseRepositorySpec {
+                metadata_url: "https://release/metadata/".into(),
+                targets_url: "https://release/targets/".into(),
+                root_json: "{}".into(),
+            },
+            application: updatec::TargetSpec {
+                path: "app-1.0.0.tar.zst".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: true,
+            provider_set: updatec::TargetSpec {
+                path: "providers-1.0.0.tar.zst".into(),
+                sha256: "b".repeat(64),
+            },
+            runtime: updatec::RuntimeSpec {
+                product: "sampleapp".into(),
+                channel: "stable".into(),
+                install_root: "/var/lib/updated/app".into(),
+                secrets: Vec::new(),
+                repository: updatec::RepositoryLimitsSpec {
+                    metadata_limit: 1 << 20,
+                    target_limit: 512 << 20,
+                    transport_timeout_seconds: 30,
+                },
+                storage: updatec::StorageSpec {
+                    inactive_releases: 2,
+                    inactive_providers: 2,
+                    inactive_supervisors: 2,
+                    inactive_bytes: 1 << 30,
+                    inactive_repository_caches: 2,
+                },
+                timeouts: updatec::TimeoutsSpec {
+                    check_interval_seconds: 15,
+                    health_grace_seconds: 30,
+                    health_successes: 1,
+                    health_interval_seconds: 1,
+                    refresh_retry_seconds: 5,
+                    confirmation_window_seconds: 120,
+                    supervisor_check_interval_seconds: 3600,
+                },
+            },
+            report_url: "https://gateway/v1/node/report".into(),
+        };
+        serde_json::json!({
+            "spec": { "deployment": serde_json::to_value(deployment).unwrap() }
+        })
+    }
+
+    /// The demo writes its CRs as untyped JSON, so a field the contract has dropped is silently
+    /// pruned by the API server instead of failing anywhere the author can see. Round-tripping
+    /// through the typed spec is what makes any key the spec cannot express fail loudly: a bare
+    /// deserialize would not, since equality is what proves nothing was dropped.
+    #[test]
+    fn the_haproxy_deployment_says_only_what_the_contract_can_express() {
+        let built = haproxy_group_deployment(
+            &edge_group(),
+            "{\"signed\":{}}",
+            &HaproxyRelease {
+                provider_path: "haproxy-providers.tar.zst".into(),
+                provider_sha: "c".repeat(64),
+                v1_path: "haproxy-1.0.0.tar.zst".into(),
+                v1_sha: "d".repeat(64),
+                v2_path: "haproxy-2.0.0.tar.zst".into(),
+                v2_sha: "e".repeat(64),
+            },
+        );
+        let typed: updatec::DeploymentSpec = serde_json::from_value(built.clone())
+            .expect("the demo's deployment must deserialize into the published spec");
+        assert_eq!(
+            serde_json::to_value(typed).unwrap(),
+            built,
+            "the demo wrote a key the typed deployment spec cannot express"
+        );
+    }
 }

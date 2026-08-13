@@ -30,7 +30,6 @@ fn runtime() -> RuntimeSpec {
             refresh_retry_seconds: 2,
             confirmation_window_seconds: 2,
             supervisor_check_interval_seconds: 3600,
-            // No drain hold for the base fleet (not a zero-downtime rollout scenario).
         },
     }
 }

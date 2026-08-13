@@ -40,6 +40,7 @@ pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:23180", "127.0.0.1:23181");
     let dir = ctx.work.join("assigned-secret-lifecycle");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     let nonce = format!(
@@ -181,7 +182,6 @@ pub(crate) fn assigned_secret_lifecycle(ctx: &Ctx) -> R {
         return fail("secret bytes appeared in the node's logs");
     }
     drop(process);
-    fixture::stop_workload(&dir);
     ok("assigned secrets reached every hook invocation, rotated by apply --reason restart, were removed, and never touched disk");
     Ok(())
 }
@@ -193,6 +193,7 @@ pub(crate) fn missing_assigned_secret_blocks_the_converge(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:23182", "127.0.0.1:23183");
     let dir = ctx.work.join("missing-assigned-secret");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     write_bundle(&dir, "incomplete", serde_json::json!({}))?;
@@ -210,7 +211,6 @@ pub(crate) fn missing_assigned_secret_blocks_the_converge(ctx: &Ctx) -> R {
         && http_text(&format!("http://{svc}/healthz")).is_none();
     let log = process.captured_log();
     drop(process);
-    fixture::stop_workload(&dir);
     if !failed_closed {
         return fail(format!(
             "an incomplete bundle did not block the converge before any hook ran:\n{log}"

@@ -280,7 +280,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         {
             // The repaired-from repository is of no use on the boot path — there is no loop tick to
             // report for yet, and the ordinary heartbeat starts one refresh later.
-            let _repo = repair_committed_bundle(&opts, &mut store)
+            let repair = repair_committed_bundle(&opts, &mut store)
                 .await
                 .map_err(|repair| {
                     format!(
@@ -293,7 +293,13 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // drives the revert (reversible) but never the permanent, hash-keyed rejection. One
             // boot deep: the next boot finds an intact tree, and a release that fails its gate
             // again is charged for it, so the descent still terminates.
-            bytes_repaired = true;
+            //
+            // The predecessor fallback repaired no bytes: it journaled a revert, which carries its
+            // own (non-)rejection decision, and `gather_situation` below re-reads the store, so
+            // that journal drives the rollback in this same boot with no further code here.
+            if matches!(repair, Repair::FromAssignment(_)) {
+                bytes_repaired = true;
+            }
         }
     }
 
@@ -440,21 +446,21 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // The boot converge: the committed release's own `apply`, so the reconciler brings the machine
-    // onto what this boot just reconciled. A boot that is resuming an interrupted update or
-    // rollback (recovery_transaction is Some) must replay only that transaction's minimal,
-    // idempotent steps — injecting a fresh per-boot `apply` there would run the reconciler outside
-    // the transaction — so it fires only on an ordinary boot.
+    // One reason for this whole boot, so the converge below and the gate after it can never
+    // disagree about what kind of boot the reconciler is being asked to serve.
+    let boot_reason = if first_install {
+        LifecycleReason::Install
+    } else {
+        LifecycleReason::Restart
+    };
+    // The boot converge is the COMMITTED release's `apply` and never runs during recovery: a boot
+    // resuming an interrupted update or rollback replays only that transaction's own minimal,
+    // idempotent steps, and applying the committed candidate here while a rollback commit is still
+    // deferred would converge the machine onto the very release the rollback is undoing. A rollback
+    // recovery instead re-runs the predecessor's own `apply` on every boot until the rollback
+    // completes — see [`complete_recovery_activation`].
     if recovery_transaction.is_none() {
-        converge_environment(
-            &opts,
-            &store,
-            if first_install {
-                LifecycleReason::Install
-            } else {
-                LifecycleReason::Restart
-            },
-        )?;
+        converge_environment(&opts, &store, boot_reason)?;
     }
     if let Some(tx) = recovery_transaction.as_mut() {
         if tx.recovery_pending(TransactionPhase::RollbackHealthStarted) {
@@ -476,12 +482,17 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         Installed::Present(installed) => installed,
         _ => return Err("cannot verify a boot without an installed release".into()),
     };
-    // Identity and providers are resolved together, from one source, so the gate can never observe
-    // one release with another's hooks.
-    let (installed, installed_lifecycle) =
-        boot_gate_target(recovery_transaction.as_ref(), &installed_state);
-    let mut reconciler = ReleaseReconciler::new(&opts, installed_lifecycle.as_ref());
-    let gate = update::became_healthy(&mut reconciler, attempt::BOOT, &installed, &installed).await;
+    // Attempt identity, release identity and providers are resolved together, from one source, so
+    // the gate can never observe one release with another's hooks or under another's attempt.
+    let target = boot_gate_target(recovery_transaction.as_ref(), &installed_state);
+    let mut reconciler = ReleaseReconciler::new(&opts, target.lifecycle.as_ref(), boot_reason);
+    let gate = update::became_healthy(
+        &mut reconciler,
+        &target.attempt,
+        &target.candidate,
+        &target.predecessor,
+    )
+    .await;
     if let update::Health::Inconclusive(cause) = &gate {
         // No verdict about these bytes: the probes stopped reaching the node reconciler (a corrupt
         // or pruned provider tree, ENOSPC/EACCES/EIO preparing the invocation), so this says more
@@ -505,19 +516,35 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // install uses.
         if let Some(tx) = recovery_transaction.as_mut().filter(|tx| tx.is_rollback()) {
             let predecessor = tx.previous_release.version.clone();
-            match bound_unhealthy_rollback(&mut store, tx) {
+            let opts = &opts;
+            match bound_unhealthy_rollback(&mut store, tx, &mut |tx: &Transaction| {
+                run_lifecycle_command(
+                    tx.lifecycle.as_ref(),
+                    opts,
+                    LifecycleInvocation {
+                        phase: Operation::Rollback,
+                        reason: LifecycleReason::Update,
+                        id: &tx.rollback_attempt_id(),
+                        candidate: &tx.previous_release,
+                        predecessor: &tx.candidate_release,
+                    },
+                )
+            }) {
                 Ok(RollbackHealthOutcome::Descend) => error(&format!(
                     "rollback target {predecessor} is unhealthy after {MAX_ROLLBACK_HEALTH_ATTEMPTS} \
-                     attempts; rejected its bytes and cleared the rollback so the next boot descends \
-                     via ordered fallback past it"
+                     attempts; compensated the failed candidate, rejected the predecessor's bytes \
+                     and cleared the rollback so the next boot descends via ordered fallback past it"
                 )),
                 Ok(RollbackHealthOutcome::Retry(attempt)) => warn(&format!(
                     "rollback target {predecessor} unhealthy (attempt {attempt} of \
                      {MAX_ROLLBACK_HEALTH_ATTEMPTS}); retrying the same predecessor on the next boot"
                 )),
-                Err(error) => warn(&format!(
-                    "recording the unhealthy rollback target failed: {error}"
-                )),
+                Err(error) => {
+                    return Err(exit_for_relaunch(
+                        "rollback compensation before descending",
+                        &error,
+                    ));
+                }
             }
             return Err("the rollback target failed its health gate".into());
         }
@@ -603,7 +630,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 LifecycleInvocation {
                     phase: Operation::Rollback,
                     reason: LifecycleReason::Update,
-                    id: &tx.id,
+                    id: &tx.rollback_attempt_id(),
                     candidate: &tx.previous_release,
                     predecessor: &tx.candidate_release,
                 },
@@ -714,7 +741,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         let wait = wait.max(Duration::from_millis(100));
 
         if sleep_interruptible(wait, &shutdown).await {
-            log("shutdown requested; exiting (the guardian stops the application)");
+            log("shutdown requested; exiting (workloads keep running under the release's hooks)");
             return Ok(());
         }
 
@@ -852,18 +879,31 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                                 "committed application bundle changed on disk ({error}); no signed repair was applicable: {repair}"
                             )
                         })?;
+                    let repaired_from = match repaired_from {
+                        Repair::FromAssignment(repo) => *repo,
+                        // The revert is journaled but nothing has moved: the record still names the
+                        // candidate, so `current`, the heartbeat and the converge below would all
+                        // speak for a release this node is no longer going to run. Exit and let the
+                        // launcher relaunch into boot recovery, which is the one rollback path.
+                        Repair::RollbackJournaled => {
+                            return Err(exit_for_relaunch(
+                                "repair fallback to the local predecessor",
+                                &"the revert is journaled for boot recovery",
+                            ));
+                        }
+                    };
                     current = match store.installed() {
                         updated::state::Installed::Present(state) => Some(state.release.version),
                         _ => None,
                     };
                     // Re-derive the in-memory confirmation intent from the record the repair just
-                    // wrote, exactly like every other divergence site. The repair CARRIES an in-flight
-                    // update's `pending` forward, so blanking it here would leave a durable `pending`
-                    // this process can never confirm (only `confirm_due` -> `confirm_update`, off this
-                    // local, clears it) — and the first failed health gate days later would be read
-                    // by the boot gate as an unconfirmed release inside its window: a revert to the
-                    // predecessor plus a permanent rejection of a release that had long since proven
-                    // itself.
+                    // wrote, exactly like every other divergence site. The assignment repair CARRIES
+                    // an in-flight update's `pending` forward, so blanking it here would leave a
+                    // durable `pending` this process can never confirm (only `confirm_due` ->
+                    // `confirm_update`, off this local, clears it) — and the first failed health gate
+                    // days later would be read by the boot gate as an unconfirmed release inside its
+                    // window: a revert to the predecessor plus a permanent rejection of a release
+                    // that had long since proven itself.
                     pending = installed_pending(&store);
                     // The SAME converge the runtime arm below runs, for the same reason: the
                     // reconciler owns every workload process, so `apply` is the only step that puts
@@ -896,12 +936,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // silent cycle would drain the node one `REPORT_FRESHNESS` later for a reason no
                     // reader can see. It reports not-settled, which is simply what `reconverged`
                     // just made true.
-                    //
-                    // The predecessor fallback resolves no repository — it runs when the control plane
-                    // is unreachable — so the heartbeat then reports off the last one this node saw.
-                    if let Some(repo) = repaired_from {
-                        last_repo = Some(repo);
-                    }
+                    last_repo = Some(repaired_from);
                     return Ok(TickFlow::Next);
                 }
             }
@@ -1174,27 +1209,39 @@ impl Heartbeat {
 ///  2. Failing that — an unreachable control plane, an assignment with nothing installable — fall
 ///     back to the predecessor the committed record already holds for exactly this purpose
 ///     (`pending.previous_release`, which [`garbage_collect`] keeps on disk). This needs no
-///     network at all. Its bytes are verified before the pointer moves, so a second corrupt tree is
-///     not launched either, and the update loop converges the node forward again from there.
+///     network at all. Its bytes are verified first, so a second corrupt tree is not converged onto
+///     either, and then the revert is *journaled* rather than performed: boot recovery is the one
+///     rollback implementation, and it is what moves the pointer, runs the predecessor's `apply`,
+///     gates it, and replays the candidate's compensating `rollback`. The update loop converges the
+///     node forward again from there.
 ///
 /// The corrupt archive is never *rejected*: a rejection is durable and never expires, and damage to
 /// this disk is evidence about this node, not about the release — rejecting it would permanently
 /// exclude a perfectly good version from this node and walk its ordered fallback downward.
 /// Returns the trusted repository the repair ran off, when it came from the assignment — the caller
-/// reports against it without a second refresh. The predecessor fallback below runs precisely when
-/// no repository could be loaded, so it has none to give.
+/// reports against it without a second refresh. The predecessor fallback runs precisely when no
+/// repository could be loaded, so it has none to give.
+enum Repair {
+    /// The assigned release was re-acquired and re-committed off this repository.
+    FromAssignment(Box<TrustedRepository>),
+    /// No signed repair was applicable, so the revert to the local predecessor is journaled and
+    /// boot recovery drives it. Nothing has moved yet: the committed record still names the
+    /// candidate.
+    RollbackJournaled,
+}
+
 async fn repair_committed_bundle(
     opts: &Options,
     store: &mut FileStore,
-) -> Result<Option<TrustedRepository>, Box<dyn std::error::Error>> {
+) -> Result<Repair, Box<dyn std::error::Error>> {
     let assignment_error = match repair_from_assignment(opts, store).await {
-        Ok(repo) => return Ok(Some(repo)),
+        Ok(repo) => return Ok(Repair::FromAssignment(Box::new(repo))),
         Err(error) => error,
     };
     let Installed::Present(installed) = store.installed() else {
         return Err(assignment_error);
     };
-    let Some(pending) = installed.pending else {
+    let Some(pending) = &installed.pending else {
         return Err(assignment_error);
     };
     warn(&format!(
@@ -1202,26 +1249,35 @@ async fn repair_committed_bundle(
          local predecessor {}",
         pending.previous_release.version
     ));
-    // Verify-then-point, and only then commit: a crash between them leaves active on the
-    // predecessor with the record still naming the candidate and a `pending` to match, which is the
-    // interrupted-rollback shape `plan_boot` already completes on the next boot.
-    store.activate(&pending.previous_release).map_err(|error| {
-        format!(
-            "the local predecessor {} is not intact either: {error}",
-            pending.previous_release.version
-        )
-    })?;
-    store.commit_installed(&updated::state::InstalledState::confirmed(
-        pending.previous_repository_lineage.clone(),
-        pending.previous_release.clone(),
-        pending.previous_archive_sha256.clone(),
-        pending.lifecycle.clone(),
-    ))?;
+    // Commit to the direction only once the predecessor's own bytes verify, so an unusable
+    // predecessor surfaces the original assignment error instead of journaling a revert onto a
+    // second corrupt tree.
+    updated::bundle::verify_release(&opts.paths.versions, &pending.previous_release).map_err(
+        |error| {
+            format!(
+                "the local predecessor {} is not intact either: {error}",
+                pending.previous_release.version
+            )
+        },
+    )?;
+    journal_predecessor_fallback(store, &installed, pending)?;
     log(&format!(
-        "repaired the committed application by falling back to the intact predecessor {}",
+        "journaled a revert to the intact local predecessor {}; boot recovery drives it",
         pending.previous_release.version
     ));
-    Ok(None)
+    Ok(Repair::RollbackJournaled)
+}
+
+/// Record the revert the committed record already owes, in the one shape every other revert
+/// produces, so a revert decided here and driven by boot recovery cannot describe two different
+/// things. The candidate is not rejected: the same reasoning that forbids rejecting the corrupt
+/// archive applies to the release whose tree this disk damaged.
+fn journal_predecessor_fallback(
+    store: &mut dyn Store,
+    installed: &updated::state::InstalledState,
+    pending: &Pending,
+) -> io::Result<()> {
+    persist_transaction(store, &rollback_of_unconfirmed(installed, pending, false))
 }
 
 /// Re-acquire and re-commit the assigned application from the signed deployment contract. This is
@@ -1533,24 +1589,50 @@ enum RollbackHealthOutcome {
     /// Still under the bound: the incremented counter is persisted and the same predecessor is
     /// retried on the next boot. Carries the attempt number for the log.
     Retry(u32),
-    /// The bound was reached: the predecessor's bytes are rejected, it is recorded as a provisional
-    /// (now-rejected) head, and the rollback journal is cleared, so the next boot's
-    /// [`ensure_installed`] descends via ordered fallback past it exactly as a cold install does.
+    /// The bound was reached: the failed candidate's `rollback` compensation is run first, then the
+    /// predecessor's bytes are rejected, it is recorded as a provisional (now-rejected) head, and
+    /// the rollback journal is cleared, so the next boot's [`ensure_installed`] descends via ordered
+    /// fallback past it exactly as a cold install does.
     Descend,
 }
 
 /// Bound rollback-target health failures so a predecessor whose bytes can no longer pass the gate
 /// cannot crash-loop the node forever. The failure count rides the journal (the very thing that
 /// re-derives the rollback on each boot, so it survives the guardian relaunch). Once it reaches
-/// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], this rejects the predecessor, records it provisional, and drops
-/// the journal — the next boot then descends via the cold-install ordered-fallback path instead of
-/// relaunching the same broken predecessor.
+/// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], this compensates the failed candidate through the release's
+/// own `rollback` — the agent promises reconciler authors that every `apply` it drives is
+/// compensated, and abandoning the transaction here would break that promise with the journal
+/// destroyed — and then rejects the predecessor, records it provisional, and drops the journal, so
+/// the next boot descends via the cold-install ordered-fallback path instead of relaunching the
+/// same broken predecessor.
+///
+/// The compensation is journaled before it is attempted, and the failure tally is the durable
+/// marker that makes it one shot rather than a relaunch loop: the boot that reaches the bound
+/// persists the count at exactly [`MAX_ROLLBACK_HEALTH_ATTEMPTS`] before invoking the hook, so a
+/// boot that finds the count already past the bound knows the previous attempt did not complete and
+/// descends uncompensated instead of relaunching into it forever. Worst case, two boots.
+///
+/// The phase is deliberately not advanced across this: the predecessor never became healthy, and
+/// [`Transaction::advance`] admits only the true rollback edges.
 fn bound_unhealthy_rollback(
     store: &mut dyn Store,
     tx: &mut Transaction,
+    compensate: &mut dyn FnMut(&Transaction) -> io::Result<()>,
 ) -> io::Result<RollbackHealthOutcome> {
     tx.rollback_health_failures = tx.rollback_health_failures.saturating_add(1);
     if tx.rollback_health_failures >= MAX_ROLLBACK_HEALTH_ATTEMPTS {
+        if tx.rollback_health_failures == MAX_ROLLBACK_HEALTH_ATTEMPTS {
+            // Journal the intent first, so a compensation that dies mid-flight is not re-attempted
+            // forever by the boots that follow.
+            persist_transaction(store, tx)?;
+            compensate(tx)?;
+            Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
+        } else {
+            warn(
+                "the failed candidate's rollback compensation was already attempted and did not \
+                 complete; descending uncompensated rather than relaunching into it forever",
+            );
+        }
         store.reject(&tx.previous_repository_lineage, &tx.previous_archive_sha256)?;
         store.commit_installed(&updated::state::InstalledState::provisional(
             tx.previous_repository_lineage.clone(),
@@ -1672,6 +1754,18 @@ fn revert_unconfirmed_head(
     Ok(())
 }
 
+/// Converge the machine onto the restored predecessor during a rollback recovery.
+///
+/// The boot converge is the committed release's `apply` and never runs during recovery, so this is
+/// the only thing that starts the predecessor's workload. An incomplete rollback owes a converged
+/// predecessor until it reaches `RolledBack` — not merely one historical `apply` — because a machine
+/// reboot (rather than an agent kill) at any later rollback phase leaves the predecessor's workload
+/// stopped and the boot gate would then fail a perfectly healthy release. The `apply` is idempotent
+/// by the Execution contract, so replaying it on every resume boot is exactly the right semantics.
+///
+/// It runs under the transaction's compensating attempt identity, never the forward one: the
+/// forward switchover already invoked `apply` under `tx.id` with the *candidate* as `--candidate`,
+/// and a reconciler that keys completion on the attempt id would otherwise skip this one.
 fn complete_recovery_activation(
     opts: &Options,
     store: &mut dyn Store,
@@ -1680,7 +1774,7 @@ fn complete_recovery_activation(
     let Some(tx) = recovery else {
         return Ok(());
     };
-    if !tx.recovery_pending(TransactionPhase::PredecessorActivated) {
+    if !tx.recovery_pending(TransactionPhase::RolledBack) {
         return Ok(());
     }
     // Restore the predecessor's machine state through the same reconciler operation used for the
@@ -1691,13 +1785,18 @@ fn complete_recovery_activation(
         LifecycleInvocation {
             phase: Operation::Apply,
             reason: LifecycleReason::Update,
-            id: &tx.id,
+            id: &tx.rollback_attempt_id(),
             candidate: &tx.previous_release,
             predecessor: &tx.candidate_release,
         },
     )?;
     Chaos::from_env().crossing(update::boundary::PREDECESSOR_LIFECYCLE_APPLIED);
-    advance_transaction(store, tx, TransactionPhase::PredecessorActivated)
+    // Only the first resume boot records the phase; the later ones replay the apply under a phase
+    // the machine no longer admits an edge into.
+    if tx.recovery_pending(TransactionPhase::PredecessorActivated) {
+        advance_transaction(store, tx, TransactionPhase::PredecessorActivated)?;
+    }
+    Ok(())
 }
 
 // ============================== boot: gather + execute ==============================
@@ -2292,13 +2391,23 @@ mod tests {
 
         // Each iteration models one boot that re-derives the rollback from the durable journal and
         // fails the predecessor's health gate. The loop must terminate (descend), never spin.
+        let mut compensations = Vec::new();
         let mut outcomes = Vec::new();
         for _ in 0..MAX_ROLLBACK_HEALTH_ATTEMPTS + 5 {
             let Some(mut derived) = store.journal().unwrap() else {
                 break; // journal cleared: we descended, so the next boot no longer rolls back.
             };
             assert!(derived.is_rollback());
-            let outcome = bound_unhealthy_rollback(&mut store, &mut derived).unwrap();
+            let outcome =
+                bound_unhealthy_rollback(&mut store, &mut derived, &mut |tx: &Transaction| {
+                    compensations.push((
+                        tx.rollback_attempt_id(),
+                        tx.previous_release.clone(),
+                        tx.candidate_release.clone(),
+                    ));
+                    Ok(())
+                })
+                .unwrap();
             let done = outcome == RollbackHealthOutcome::Descend;
             outcomes.push(outcome);
             if done {
@@ -2315,6 +2424,15 @@ mod tests {
             ],
             "the rollback must be bounded at {MAX_ROLLBACK_HEALTH_ATTEMPTS} attempts, then descend"
         );
+        // The descend is not an abandonment: the failed candidate's `apply` is compensated by the
+        // release's own `rollback` — once, under the transaction's compensating identity, with the
+        // restored predecessor as the candidate — before the journal that carries the evidence is
+        // destroyed.
+        assert_eq!(
+            compensations,
+            vec![("attemptr".to_string(), predecessor.clone(), candidate)],
+            "the descend compensates exactly once, with the rollback direction's arguments"
+        );
         // On descent the predecessor's bytes are rejected and it is recorded provisional with the
         // journal cleared — exactly the state `ensure_installed` treats as "descend via ordered
         // fallback past this head" on the next boot.
@@ -2330,6 +2448,171 @@ mod tests {
             }
             _ => panic!("expected a provisional predecessor record"),
         }
+    }
+
+    #[test]
+    fn a_failing_compensation_holds_the_descend_for_exactly_one_more_boot() {
+        // The compensation must be durable-intent-first and one-shot: the boot that reaches the
+        // bound journals the tally, invokes the hook, and — if the hook fails — exits with the
+        // journal intact so the launcher relaunches. The next boot must NOT re-invoke it forever;
+        // it descends uncompensated, which is what bounds the whole thing at two boots.
+        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        let predecessor = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = MemStore {
+            installed: Some(InstalledState::confirmed(
+                lineage.clone(),
+                candidate.clone(),
+                "archive-two".into(),
+                provider(),
+            )),
+            journal: Some(Transaction {
+                id: "attempt".into(),
+                previous_release: predecessor.clone(),
+                previous_archive_sha256: "archive-one".into(),
+                previous_repository_lineage: lineage.clone(),
+                candidate_release: candidate,
+                candidate_archive_sha256: "archive-two".into(),
+                candidate_repository_lineage: lineage.clone(),
+                candidate_rejection_required: true,
+                lifecycle: provider(),
+                // Two boots have already failed the gate; this is the boot that reaches the bound.
+                rollback_health_failures: MAX_ROLLBACK_HEALTH_ATTEMPTS - 1,
+                phase: Phase::RollbackHealthStarted,
+            }),
+            ..MemStore::default()
+        };
+
+        let mut invocations = 0u32;
+        let mut derived = store.journal().unwrap().expect("the rollback journal");
+        let failed = bound_unhealthy_rollback(&mut store, &mut derived, &mut |_| {
+            invocations += 1;
+            Err(io::Error::other("the rollback hook exited non-zero"))
+        });
+        assert!(failed.is_err(), "a failed compensation is not a descend");
+        assert_eq!(invocations, 1);
+        let held = store
+            .journal()
+            .unwrap()
+            .expect("the journal survives so the next boot still owes the descend");
+        assert_eq!(held.rollback_health_failures, MAX_ROLLBACK_HEALTH_ATTEMPTS);
+        assert!(
+            !store.is_rejected(&lineage, "archive-one"),
+            "nothing is decided until the descend actually runs"
+        );
+
+        // The next boot descends without a second invocation.
+        let mut derived = store.journal().unwrap().expect("the rollback journal");
+        let outcome = bound_unhealthy_rollback(&mut store, &mut derived, &mut |_| {
+            invocations += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(outcome, RollbackHealthOutcome::Descend);
+        assert_eq!(
+            invocations, 1,
+            "the durable tally makes the compensation one-shot, never a relaunch loop"
+        );
+        assert!(store.is_rejected(&lineage, "archive-one"));
+        assert!(store.journal().unwrap().is_none());
+        match store.installed() {
+            Installed::Present(state) => {
+                assert_eq!(state.release, predecessor);
+                assert!(!state.confirmed);
+            }
+            _ => panic!("expected a provisional predecessor record"),
+        }
+    }
+
+    #[test]
+    fn every_pre_terminal_rollback_phase_still_owes_the_predecessor_apply() {
+        // The resume gate on the predecessor's `apply` is "is this rollback still incomplete", not
+        // "has the apply ever run": a machine reboot (rather than an agent kill) at any later
+        // rollback phase leaves the predecessor's workload stopped, and the boot gate would then
+        // fail a perfectly healthy release three times and reject it. The apply is idempotent, so
+        // replaying it on every resume boot is the correct semantics.
+        let mut tx = rollback_of_unconfirmed(
+            &unconfirmed_head(),
+            unconfirmed_head().pending.as_ref().unwrap(),
+            false,
+        );
+        for phase in [
+            Phase::RollbackStarted,
+            Phase::RollbackActivateStarted,
+            Phase::PredecessorActivated,
+            Phase::RollbackHealthStarted,
+            Phase::PredecessorHealthy,
+            Phase::RollbackFinalizeStarted,
+        ] {
+            tx.phase = phase;
+            assert!(
+                tx.recovery_pending(Phase::RolledBack),
+                "{phase:?} still owes a converged predecessor"
+            );
+        }
+        tx.phase = Phase::RolledBack;
+        assert!(!tx.recovery_pending(Phase::RolledBack));
+
+        // Which is why recording the phase stays guarded: the machine admits only the true forward
+        // edges, so a second resume boot must replay the apply without re-advancing.
+        tx.phase = Phase::PredecessorActivated;
+        assert!(
+            tx.advance(Phase::PredecessorActivated).is_err(),
+            "re-advancing into a phase already reached is rejected, so the advance stays guarded"
+        );
+    }
+
+    #[test]
+    fn the_compensating_direction_carries_its_own_stable_attempt_id() {
+        // A reconciler that marks completion under the attempt id would skip the predecessor's
+        // `apply` if it reused the forward token — the forward switchover already ran `apply` under
+        // it with a different `--candidate`. The compensating identity is derived, so it is
+        // identical on every replay and on every boot, and dashless so the reference hook's
+        // `{attempt-id}-{operation}` effect names still split on the first `-`.
+        let head = unconfirmed_head();
+        let tx = rollback_of_unconfirmed(&head, head.pending.as_ref().unwrap(), false);
+        assert_ne!(tx.rollback_attempt_id(), tx.id);
+        assert_eq!(tx.rollback_attempt_id(), tx.clone().rollback_attempt_id());
+        assert!(!tx.rollback_attempt_id().contains('-'));
+        assert!(!attempt::is_reserved(&tx.rollback_attempt_id()));
+    }
+
+    #[test]
+    fn the_repair_fallback_journals_a_revert_the_next_boot_can_drive() {
+        // The predecessor fallback is not a second, hook-free rollback implementation: it records
+        // the rollback the committed record already owes and hands it to boot recovery, so the
+        // candidate's machine-state changes are compensated by a real `rollback` invocation.
+        let head = unconfirmed_head();
+        let pending = head
+            .pending
+            .clone()
+            .expect("an unconfirmed head has pending");
+        let mut store = store_holding(&head);
+
+        journal_predecessor_fallback(&mut store, &head, &pending).unwrap();
+
+        assert_eq!(
+            store.journal().unwrap(),
+            Some(rollback_of_unconfirmed(&head, &pending, false)),
+            "the fallback's revert is the one shape every other revert produces"
+        );
+        assert!(
+            !store.is_rejected(&head.repository_lineage, "archive-two"),
+            "damage to this disk is never charged to the release"
+        );
+        // And the boot that follows can still drive it: the record still names the candidate, so
+        // the journal classifies as a resumable rollback.
+        let situation = Situation {
+            installed: store.installed(),
+            active: Some(head.release.clone()),
+            journal: store.journal().unwrap(),
+            bad_supervisor: None,
+            confirm_window: Duration::from_secs(60),
+            now: 120,
+        };
+        let derived = recovery_transaction(&situation).expect("a drivable revert");
+        assert!(derived.is_rollback());
+        assert!(derived.recovery_pending(Phase::RolledBack));
     }
 
     /// The shipped example values from the finding this test pins: a 30s start grace with a 1s

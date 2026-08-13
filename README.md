@@ -14,7 +14,8 @@ across a whole fleet:
 - **`updated`** — the per-node agent. It securely installs and activates signed
   application bundles on Linux, macOS, and Windows, works with update-unaware
   applications, survives interruption at every durable boundary, rolls back unhealthy
-  releases, and can replace its own supervisor without stopping the managed application.
+  releases, and can replace its own agent binary without disturbing the reconciler-owned
+  workload.
 - **`updatec`** — the Kubernetes control plane. It groups nodes into fleets, publishes
   each group's desired release as signed TUF metadata to object storage/CDN, throttles
   how fast a change ripples through a group, gates completion on the nodes' own signed
@@ -62,17 +63,17 @@ optional argument is an SSH host:
                                    # playbook there, tunnel its port 80 to 127.0.0.1:8088
 ```
 
-This opens a local page with a red managed application and a small typed `release.json`.
+This opens a local page with a red application and a small typed `release.json`.
 Publishing it creates the update through the real Kubernetes operator. The demo service
 holds no signing keys or bucket credentials: `updatec` signs and uploads the new routing
 generation to MinIO, then the real agent downloads, verifies, and activates it.
 
 The green release also selects a signed Rust lifecycle-provider executable that models an
 intentionally elaborate enterprise deployment: compatibility preflight, mutable-state
-backup, generated configuration, load-balancer drain, process stop, artifact activation,
-cache warmup, health verification, schema migration, traffic restoration, rollback, and an
-audit receipt. The page turns green only after that transaction finishes and the managed
-application reports the new version.
+backup, generated configuration, load-balancer drain, artifact activation, cache warmup,
+health verification, schema migration, traffic restoration, rollback, and an audit receipt.
+The page turns green only after that transaction finishes and the application reports the new
+version.
 
 Below the release transaction, the page renders the operator's groups and an 80-service
 fleet. "Run seeded fleet chaos" keeps agents in sixteen permanent five-service cohorts and
@@ -136,7 +137,7 @@ authenticate the archive through TUF
     verifies the manifested bundle into an immutable release)
   → write the transaction journal
   → atomically switch active-release
-  → start the candidate (or let the provider-managed reconciler bring it into service)
+  → the release's reconciler `apply` brings the candidate into service
   → require health
   → commit, or reactivate and reject the predecessor
 ```
@@ -200,7 +201,7 @@ Secrets they presuppose are in the [Kubernetes install guide](docs/kubernetes-in
 - Failed activation or health reactivates the predecessor and rejects the candidate
   archive for a bounded retry period.
 - A post-commit crash inside the confirmation window also reverts the release.
-- Supervisor crashes and self-updates do not stop the guardian-owned application.
+- Agent crashes and agent self-update do not disturb the reconciler-owned workload.
 - An unavailable repository does not prevent a verified installed bundle from starting.
 - A throttled rollout completes only on the nodes' own signed health reports; a forged,
   missing, or stale report fails closed rather than releasing a slot or a load-balancer
@@ -212,18 +213,13 @@ Trust is anchored by [TUF](https://theupdateframework.io/) through the `tough` c
 pinned-root rotation, threshold roles, expiry/freeze resistance, metadata rollback
 protection, and target hash/length verification are not reimplemented here.
 
-## Runtime modes
+## Workload ownership
 
-The signed runtime has two ownership modes:
-
-- `managed` (the default): the guardian launches one contained application child, observes
-  exit, adopts it across supervisor replacement, and owns stop and process-tree cleanup.
-- `provider-managed`: the agent launches and manages no application process. The signed node
-  reconciler performs every external effect, including calls to systemd, launchd, Windows SCM,
-  a container runtime, firmware tooling, or a remote control plane.
-
-There is no partially managed mode and no PID-discovery contract. Either the guardian owns
-the process, or the reconciler owns the external runtime.
+The agent owns no workload process. The release's signed reconciler hooks — `apply`,
+`healthcheck`, `rollback`, and `inspect` — perform every external effect, including calls to
+systemd, launchd, Windows SCM, a container runtime, firmware tooling, or a remote control plane.
+A workload the reconciler starts is detached from the invocation that started it, so it belongs
+to the release rather than to the agent attempt.
 
 Every deployment carries an immutable, signed node-reconciler bundle. The agent supplies
 delivery, verification of bytes, durable ordering, retries, deadlines, containment,
@@ -237,9 +233,8 @@ document, and a copyable Bash template are in the
 observed release is acceptable; the agent retries it to the signed success threshold within the
 signed grace window, and runs the same operation on the signed cadence for steady state. Each
 invocation carries `--attempt-id`: a transaction's own token when it gates that transaction's
-candidate, or the reserved `boot`/`periodic` identity for an observation that belongs to no
-transaction. Managed child exit remains an immediate reliability event independent of any
-reconciler observation.
+candidate, or one of the reserved `boot`/`periodic`/`fingerprint` identities for an operation
+that belongs to no transaction.
 
 `inspect` is the bounded steady-state measurement operation. It runs after each deploy or
 rollback once the periodic `healthcheck` reports healthy, then hourly with stable per-node ±10% jitter. This
@@ -286,39 +281,13 @@ target/release/bootstrap \
   --supervisor /usr/lib/example-app/supervisor \
   --ready-timeout 60 \
   --confirm-timeout 30 \
-  --probe-address 127.0.0.1:9090
+  --stop-grace 10
 ```
 
-The config is not named on the command line: the bootstrap reads the canonical path above.
+The bootstrap is the launcher: it manages only which agent binary runs, and touches no
+workload. The config is not named on the command line: it reads the canonical path above.
 `--supervisor-config` overrides it for a deployment that deliberately keeps the file
 elsewhere.
-
-### Guardian health state machine
-
-The optional probe listener belongs to the permanent guardian, not to a particular
-supervisor or application release. It gives Kubernetes, service managers, load balancers,
-and local diagnostics one stable lifecycle surface:
-
-| State | `/startupz` | `/readyz` | `/livez` | Meaning |
-| --- | --- | --- | --- | --- |
-| Starting | 503 | 503 | 200 | Tower is alive; no application has been accepted yet |
-| Serving | 200 | 200 | 200 | The committed application is healthy and may receive traffic |
-| Draining | 200 | 503 | 200 | Planned update or rollback; remove traffic without restarting |
-| Failed | latched value | 503 | 503 | Provider verification or managed-process liveness failed |
-
-```text
-Starting --first healthy application--> Serving
-Serving  --planned drain-------------> Draining
-Draining --commit or restored rollback-> Serving
-any live state --application failure--> Failed
-```
-
-Readiness is withdrawn before stop begins and restored only after the candidate commits or
-the predecessor is restored. Liveness remains successful throughout an intentional drain.
-Startup is a one-way latch, matching Kubernetes startup-probe semantics. In managed mode a
-child crash is observed directly by the guardian and rolls up the tower immediately. All
-application-specific acceptance and steady-state evidence comes from the signed reconciler's
-`healthcheck` operation; the node configuration contains no HTTP health language.
 
 Platform templates (systemd, launchd, Windows service) live under [deploy/](deploy).
 
@@ -344,7 +313,7 @@ install_root/
     tuf/
 ```
 
-`work/<version-manifest-id>` is the managed application's launch working directory, and
+`work/<version-manifest-id>` is the release's writable working directory, and
 `providers/work/<version-manifest-id>` is the equivalent for a lifecycle provider. Each is a
 *sibling* of the matching `versions/` tree and deliberately not the tree itself: `versions/<id>`
 is content-addressed and re-hashed by release verification on every check tick, so a single log,
@@ -377,13 +346,14 @@ cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
 The E2E harness creates a real signed repository and disposable towers under
 `target/e2e-work/`. It covers application upgrade and rollback, a tampered trust root,
-offline launch, rejection persistence, transaction-boundary crashes, locking, supervisor
-adoption/self-update, one-shot launch, and the provider-managed lifecycle (including a
+offline launch, rejection persistence, transaction-boundary crashes, locking, agent restart,
+agent self-update, assigned secrets, and the reconciler-hook lifecycle (including a
 Jenkins-shaped enterprise upgrade whose `apply` backs up state and migrates it, whose
 `healthcheck` gates the result, and which rolls back on failure). Its signed chaotic-application
-fixture separately proves fail-closed behavior for an exit before bind, persistent 503, a
-health request held for five minutes, flapping readiness, a crash during probing, and
-health that degrades only after initially becoming ready.
+fixture separately proves fail-closed behavior for a workload that exits before it binds, a
+`healthcheck` that never returns a healthy verdict, a `healthcheck` held past its deadline,
+a verdict that flaps between healthy and unhealthy, and one that degrades only after first
+reporting healthy.
 
 ### Rejected releases and break glass
 
@@ -455,7 +425,7 @@ is for development and for control planes built on other orchestrators.
 - Local state is not hardware-backed monotonic storage; a local administrator is inside the
   host trust boundary and can reseed an installation.
 - The reference deployment runs the updater and application under one restricted OS
-  identity. Containing a hostile managed program requires a separate account or sandbox.
+  identity. Containing a hostile workload requires a separate account or sandbox.
 - Custom-provider activation requires a cooperative lifecycle (a master/worker reload, a
   systemd unit, an external launcher). Windows uses stop/activate/start for application
   updates.

@@ -23,5 +23,4 @@ ca = "/etc/agent-tls/ca.crt"
 EOF
 
 exec bootstrap --state-dir "$guardian" --supervisor-config /tmp/bootstrap.toml \
-  --supervisor /usr/local/bin/supervisor --ready-timeout 30 --confirm-timeout 2 \
-  --probe-address 0.0.0.0:9090
+  --supervisor /usr/local/bin/supervisor --ready-timeout 30 --confirm-timeout 2

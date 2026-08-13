@@ -173,11 +173,11 @@ pub struct Application {
 pub struct Timeouts {
     /// How often to check for an application update.
     pub check_interval: Duration,
-    /// Window for the child to become healthy after a (re)start. With a startup or
-    /// readiness health check
-    /// this is how long a slow-starting app has to answer — set it to minutes if
-    /// needed; a *crash* is still detected instantly (the process exits), so a long
-    /// grace never slows crash detection.
+    /// Window for the `healthcheck` hook to report the deployed release ready after an apply. The
+    /// hook is the only health source (see the Execution contract in
+    /// `docs/node-reconciler-protocol.md`), so this is also the full detection latency for a release
+    /// that never comes up — a longer grace buys a slow starter more room, and costs exactly that
+    /// much delay on a release that will never answer. Set it to minutes if the release needs it.
     pub health_grace: Duration,
     /// Consecutive good health responses required to declare the app ready (a
     /// readiness `successThreshold`). Default 1 — the first good answer commits;
@@ -189,8 +189,9 @@ pub struct Timeouts {
     pub health_interval: Duration,
     /// Backoff base for retrying a transient metadata transport failure.
     pub refresh_retry: Duration,
-    /// How long a just-committed update stays unconfirmed. A crash within it reverts the
-    /// update (one strike); surviving it confirms the update and drops the rollback image.
+    /// How long a just-committed update stays unconfirmed. A failed boot gate inside it — a
+    /// `healthcheck` verdict on the next agent boot — reverts to the predecessor (one strike);
+    /// surviving it confirms the update and drops the rollback image.
     pub confirmation_window: Duration,
     /// How often to check for a supervisor release.
     pub supervisor_check_interval: Duration,
@@ -200,17 +201,16 @@ impl Default for Timeouts {
     fn default() -> Self {
         Timeouts {
             check_interval: Duration::from_secs(15),
-            // Forgiving enough for an app that takes a few seconds to bind; a *crash*
-            // is still caught instantly (process exit), and the first good answer
-            // returns immediately, so a longer window never slows a fast app. Raise it
-            // for an app that legitimately takes tens of seconds or minutes to start.
+            // Forgiving enough for a reconciler that takes a few seconds to bring the workload
+            // up; the first good `healthcheck` answer returns immediately, so a longer window
+            // never slows a healthy release. Raise it for a workload that legitimately takes tens
+            // of seconds or minutes to start.
             health_grace: Duration::from_secs(10),
             health_successes: 1,
             health_interval: Duration::from_secs(1),
             refresh_retry: Duration::from_secs(5),
             confirmation_window: Duration::from_secs(120),
             supervisor_check_interval: Duration::from_secs(3600),
-            // No hold by default: a deployment opts into the drain hold explicitly.
         }
     }
 }

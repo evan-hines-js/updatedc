@@ -131,7 +131,7 @@ impl RepositoryAssignment {
 /// Every `*_seconds` field becomes a `Duration` that a consumer adds to an `Instant` or hands to a
 /// sleep, and both of those PANIC on overflow, so an unbounded value is a remote crash of every
 /// node the assignment reaches — not a merely eccentric policy. Thirty days is far past any
-/// legitimate check interval, health grace, drain hold, or retry backoff.
+/// legitimate check interval, health grace, confirmation window, or retry backoff.
 ///
 /// This is the single definition of that ceiling, on the contract every publisher signs and every
 /// consumer ingests: validation here refuses anything above it, and a consumer that additionally
@@ -290,8 +290,22 @@ fn validate_report_url(raw: &str) -> Result<(), String> {
     }
 }
 
+/// The environment names the agent itself sets on every reconciler invocation. Naming a secret
+/// after one of these would shadow it, because secret values are deliberately applied last so a
+/// deployment's own value always wins over an ambient one — so they are unshadowable by
+/// construction: [`is_code_injection_variable`] rejects the whole set. The agent-side chokepoint
+/// asserts it sets exactly these and nothing else.
+pub const RECONCILER_AMBIENT_ENVIRONMENT: &[&str] =
+    &["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"];
+
+/// Whether a control-plane principal naming this environment variable would be redirecting code
+/// resolution rather than passing a value. Platform-independent on purpose: an assignment is
+/// validated once, centrally, and may be scheduled onto a node of any platform. Windows environment
+/// lookup is case-insensitive, so the Windows names are matched by their uppercase spelling exactly
+/// as the (already uppercase-only) environment-name rule requires.
 fn is_code_injection_variable(name: &str) -> bool {
     const EXACT: &[&str] = &[
+        // Unix loader, interpreter, and shell resolution.
         "GLIBC_TUNABLES",
         "NODE_OPTIONS",
         "PYTHONPATH",
@@ -308,8 +322,23 @@ fn is_code_injection_variable(name: &str) -> bool {
         "BASH_ENV",
         "ENV",
         "IFS",
+        // Windows loader, interpreter, and module resolution.
+        "SYSTEMROOT",
+        "WINDIR",
+        "SYSTEMDRIVE",
+        "COMSPEC",
+        "PATHEXT",
+        "PSMODULEPATH",
+        "PSEXECUTIONPOLICYPREFERENCE",
+        "TEMP",
+        "TMP",
+        "DOTNET_STARTUP_HOOKS",
+        "DOTNET_ROOT",
     ];
-    name.starts_with("LD_") || name.starts_with("DYLD_") || EXACT.contains(&name)
+    name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || EXACT.contains(&name)
+        || RECONCILER_AMBIENT_ENVIRONMENT.contains(&name)
 }
 
 #[cfg(test)]
@@ -527,6 +556,17 @@ mod tests {
             "PATH",
             "BASH_ENV",
             "IFS",
+            "SYSTEMROOT",
+            "WINDIR",
+            "SYSTEMDRIVE",
+            "COMSPEC",
+            "PATHEXT",
+            "PSMODULEPATH",
+            "PSEXECUTIONPOLICYPREFERENCE",
+            "TEMP",
+            "TMP",
+            "DOTNET_STARTUP_HOOKS",
+            "DOTNET_ROOT",
         ] {
             let mut value = runtime();
             value.secrets.push(SecretReference {
@@ -541,6 +581,11 @@ mod tests {
             environment: "PATH_TO_LICENSE".into(),
             secret: "licensing".into(),
             key: "path".into(),
+        });
+        value.secrets.push(SecretReference {
+            environment: "TEMP_BUCKET_TOKEN".into(),
+            secret: "storage".into(),
+            key: "token".into(),
         });
         value.validate().unwrap();
     }
@@ -584,10 +629,19 @@ mod tests {
             "DYLD_INSERT_LIBRARIES",
             "PATH",
             "NODE_OPTIONS",
+            "PSMODULEPATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "COMSPEC",
         ] {
             assert!(is_code_injection_variable(name), "{name}");
         }
         assert!(!is_code_injection_variable("DATABASE_PASSWORD"));
+        assert!(!is_code_injection_variable("TEMP_BUCKET_TOKEN"));
+        // Every name the agent's own chokepoint sets is unshadowable by construction.
+        for ambient in RECONCILER_AMBIENT_ENVIRONMENT {
+            assert!(is_code_injection_variable(ambient), "{ambient}");
+        }
     }
 
     #[test]

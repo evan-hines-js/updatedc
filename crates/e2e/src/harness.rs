@@ -622,11 +622,6 @@ impl Proc {
     pub fn has_exited(&mut self) -> bool {
         matches!(self.grouped.child.try_wait(), Ok(Some(_)))
     }
-
-    /// This process's own PID (the launcher's), so a test can signal it directly.
-    pub fn pid(&self) -> u32 {
-        self.grouped.child.id()
-    }
 }
 
 impl Drop for Proc {
@@ -1027,8 +1022,8 @@ pub fn pid_alive(pid: u32) -> bool {
 
 /// Kill any process still running from a previous run's work directory. A hook-managed workload
 /// lives outside every tree the node stack owns — that is the whole model — so an interrupted run
-/// leaves it behind; a scenario ends its own workload (`fixture::stop_workload`), and this reaps
-/// what an interrupted run never got to.
+/// leaves it behind; a scenario ends its own workload through the `fixture::Workload` guard it
+/// binds, and this reaps what an interrupted run never got to.
 pub fn reap_workdir(work: &Path) {
     #[cfg(unix)]
     let _ = Command::new("pkill")
@@ -1080,5 +1075,49 @@ mod tests {
     fn every_supervisor_build_is_chaos_and_gains_fips_with_the_run() {
         assert_eq!(supervisor_features(false), &["chaos"]);
         assert_eq!(supervisor_features(true), &["chaos", "fips"]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod workload_guard_tests {
+    use crate::fixture;
+
+    /// The property, not the call sites: a scenario that returns early still ends its workload.
+    /// The workload is deliberately outside every tree the node stack owns, so a missed teardown
+    /// leaks a listener that holds the scenario's service address for the rest of the run — and
+    /// nearly every teardown site sat after an early `return fail(...)`.
+    #[test]
+    fn an_early_return_still_reaps_the_workload() {
+        let dir = std::env::temp_dir().join(format!("e2e-workload-guard-{}", std::process::id()));
+        let root = fixture::root(&dir);
+        std::fs::create_dir_all(&root).unwrap();
+        // A grandchild, so it is reparented away from this process: a zombie of our own would read
+        // as alive however it was signalled, and the workload the guard reaps is never this
+        // process's child either.
+        let spawned = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
+            .output()
+            .unwrap();
+        let pid: u32 = String::from_utf8_lossy(&spawned.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::write(
+            root.join("workload.json"),
+            format!("{{\"pid\":{pid},\"release\":\"r\",\"environment\":\"e\"}}"),
+        )
+        .unwrap();
+
+        fn scenario_that_fails_early(dir: &std::path::Path) -> Result<(), String> {
+            let _workload = fixture::workload(dir);
+            Err("the scenario failed before any teardown statement could run".into())
+        }
+        assert!(scenario_that_fails_early(&dir).is_err());
+        assert!(
+            !crate::harness::pid_alive(pid),
+            "the guard must end the workload even on an early return"
+        );
+        assert!(fixture::workload_pid(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

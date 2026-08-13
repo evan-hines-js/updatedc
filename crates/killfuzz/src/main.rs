@@ -89,13 +89,13 @@ impl Lcg {
     }
 }
 
-/// End the round's straggler processes WITHOUT touching the mock-CDN server. `Service::drop`
-/// already killed the launcher's process group, which takes the agent with it; what remains is the
+/// End the round's straggler workload WITHOUT touching the mock-CDN server. `Service::drop` already
+/// killed the launcher's process group, which takes the agent with it; what remains is the
 /// hook-managed workload, which lives in a session of its own precisely so no agent restart can
 /// disturb it. The reconciler recorded its PID, so it is stopped by identity rather than by
-/// pattern-matching argv.
+/// pattern-matching argv — through the same guard every scenario's teardown uses.
 fn reap(dir: &Path) {
-    fixture::stop_workload(dir);
+    fixture::workload(dir).stop();
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -213,6 +213,7 @@ fn run() -> R {
 
     let dir = ctx.work.join("killfuzz");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
     ctx.init_repo(&dir)?;
     // Round 1 starts with only a healthy 1.0.0 floor and ordered-install fallback signed in. The
     // corrupt 2.0.0 and healthy 3.0.0 heads are published live BETWEEN rounds (below), which re-signs
@@ -284,7 +285,6 @@ fn run() -> R {
         let started = wait_until(120, || stack.log_contains("applying update 1.0.0 -> 2.0.0"));
         let log = stack.captured_log();
         drop(stack);
-        reap(&dir);
         // The next phase rebinds the same port, so the wait for the old listener to disappear is a
         // precondition, not a diagnostic: discarding its result meant the phase could start against
         // a port the previous stack still held and fail for an unrelated reason.
@@ -395,7 +395,6 @@ fn run() -> R {
         if !in_flight {
             let log = stack.captured_log();
             drop(stack);
-            reap(&dir);
             drop(server);
             return fail(format!(
                 "round 4 trial {trial}: the broken {broken_v} update never went in-flight \
@@ -405,7 +404,6 @@ fn run() -> R {
 
         // SIGKILL the whole tree with the broken transaction still journaled.
         drop(stack);
-        reap(&dir);
         if !wait_until(20, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(format!(
@@ -445,7 +443,6 @@ fn run() -> R {
             || stack.log_contains(&format!("completing rollback from {broken_v}"));
         let log = stack.captured_log();
         drop(stack);
-        reap(&dir);
         if !live || !settled {
             drop(server);
             return fail(format!(

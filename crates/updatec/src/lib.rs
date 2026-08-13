@@ -95,7 +95,7 @@ pub struct GroupOutputReference {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeploymentSpec {
     pub name: String,
     pub release_repository: ReleaseRepositorySpec,
@@ -113,7 +113,7 @@ pub struct DeploymentSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReleaseRepositorySpec {
     pub metadata_url: String,
     pub targets_url: String,
@@ -123,7 +123,7 @@ pub struct ReleaseRepositorySpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeSpec {
     pub product: String,
     pub channel: String,
@@ -136,7 +136,7 @@ pub struct RuntimeSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecretReferenceSpec {
     pub environment: String,
     /// Secret in the control-plane namespace, which the gateway serves to the assigned node at
@@ -151,14 +151,14 @@ pub struct SecretReferenceSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RepositoryLimitsSpec {
     pub metadata_limit: u64,
     pub target_limit: u64,
     pub transport_timeout_seconds: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StorageSpec {
     pub inactive_releases: usize,
     pub inactive_providers: usize,
@@ -167,7 +167,7 @@ pub struct StorageSpec {
     pub inactive_repository_caches: usize,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TimeoutsSpec {
     pub check_interval_seconds: u64,
     pub health_grace_seconds: u64,
@@ -179,6 +179,7 @@ pub struct TimeoutsSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TargetSpec {
     pub path: String,
     pub sha256: String,

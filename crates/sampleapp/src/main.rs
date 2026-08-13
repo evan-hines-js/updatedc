@@ -45,6 +45,25 @@ impl Fault {
     }
 }
 
+/// Wait for the hook's durable reap handle to name this process. The record is the only thing that
+/// can ever stop this workload — it lives outside every process tree the node stack owns — so
+/// serving before it exists would create an unreapable listener.
+fn await_record(path: &str) -> bool {
+    let me = std::process::id();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(path).is_ok_and(|recorded| {
+            recorded
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|field| field.parse::<u32>() == Ok(me))
+        }) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 fn version() -> &'static str {
     VERSION.get().expect("version initialized")
 }
@@ -96,6 +115,22 @@ pub fn run_artifact(artifact: &'static str) {
         })
         .unwrap_or_default();
     FAULT.set(fault).expect("fault set once");
+    // Ahead of every path that could bind, including the injected faults: a workload nothing has
+    // recorded is a workload nothing can reap, and the hook that starts one can be killed at any
+    // instant between the spawn and the write. Refusing to serve until the record names THIS pid
+    // makes that window harmless — the orphan exits on its own bound without ever taking traffic.
+    let record = flag("--await-record").unwrap_or_else(|| {
+        eprintln!("sampleapp: --await-record <path> is required");
+        std::process::exit(2);
+    });
+    if !await_record(&record) {
+        eprintln!(
+            "sampleapp {}: no record named pid {} within the bound; exiting without binding",
+            version(),
+            std::process::id()
+        );
+        std::process::exit(3);
+    }
     if fault == Fault::ExitBeforeBind {
         eprintln!("sampleapp {}: injected exit before bind", version());
         std::process::exit(17);

@@ -90,6 +90,18 @@ impl Transaction {
         Ok(())
     }
 
+    /// The attempt identity every compensating operation of this transaction carries — the
+    /// predecessor's `apply` and the `rollback` alike. It is a different attempt from the forward
+    /// direction (whose identity is [`id`](Self::id)) because the two invoke the same operation
+    /// with different arguments, and a reconciler that keys idempotence on the attempt id must be
+    /// able to tell them apart. Derived rather than stored, so every boot and every replay of the
+    /// same transaction produces the identical string. The suffix is dashless: an attempt id is
+    /// dashless hex, and the reference reconciler splits its per-attempt effect names on the first
+    /// `-`.
+    pub fn rollback_attempt_id(&self) -> String {
+        format!("{}r", self.id)
+    }
+
     pub fn is_rollback(&self) -> bool {
         matches!(
             self.phase,

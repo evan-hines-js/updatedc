@@ -762,7 +762,7 @@ pub(crate) fn label_jenkins_agents() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Deploy the real-Jenkins cohorts: one StatefulSet per instance role (ci, release) on
 /// the Jenkins tower image, in the same headless `agents` Service (so `jenkins-<role>-N.agents`
-/// resolves for the uniform readyz probe) and enrolling through the same gateway as every
+/// resolves for the demo's fleet view) and enrolling through the same gateway as every
 /// other node. Each pod keeps its installed state and JENKINS_HOME data on a persistent volume,
 /// so a restart reuses the already-installed Jenkins (~30-60s) instead of the multi-minute
 /// first install.
@@ -802,16 +802,12 @@ pub(crate) fn jenkins_statefulset(role: &str, replicas: usize) -> serde_json::Va
                             // pre-upgrade JENKINS_HOME backup tar to, and rollback restores from.
                             { "name": "JENKINS_BACKUPS", "value": "/var/lib/jenkins-backups" }
                         ],
-                        "ports": [{ "name": "http", "containerPort": 8080 }, { "name": "guardian", "containerPort": 9090 }],
-                        // Jenkins's first install is minutes; the startup probe gives it up to
-                        // ~10 minutes before liveness applies, and readiness reflects the
-                        // supervisor's real Jenkins health check the whole time.
-                        "startupProbe": { "httpGet": { "path": "/startupz", "port": "guardian" }, "periodSeconds": 3, "failureThreshold": 200 },
-                        // failureThreshold: 1 so a withdrawn-readiness pod leaves the Service
-                        // endpoints on the very next probe (~1s), not after 3 — the drain hold
-                        // above only has to cover that plus kube-proxy propagation.
-                        "readinessProbe": { "httpGet": { "path": "/readyz", "port": "guardian" }, "periodSeconds": 1, "failureThreshold": 1 },
-                        "livenessProbe": { "httpGet": { "path": "/livez", "port": "guardian" }, "periodSeconds": 5, "failureThreshold": 6 },
+                        "ports": [{ "name": "http", "containerPort": 8080 }],
+                        // The workload's own endpoint, which the release's `healthcheck` hook also
+                        // uses. Node health has one path — reconciler hook verdict -> signed
+                        // NodeReport -> healthproxy — and the kubelet is never asked to judge the
+                        // agent: it only learns whether Jenkins itself answers.
+                        "readinessProbe": { "httpGet": { "path": "/login", "port": "http" }, "periodSeconds": 3, "failureThreshold": 200 },
                         "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] }, "runAsNonRoot": true, "runAsUser": 65532 },
                         "resources": { "requests": { "cpu": "250m", "memory": "1Gi" }, "limits": { "memory": "1500Mi" } },
                         "volumeMounts": [
@@ -1562,15 +1558,7 @@ pub(crate) fn apply_demo_resources(
             "healthIntervalSeconds": 1,
             "refreshRetrySeconds": 1,
             "confirmationWindowSeconds": 3,
-            "supervisorCheckIntervalSeconds": 3600,
-            // Hold the drain up to 4s after withdrawing readiness so kube-proxy drops this pod
-            // from the per-set Service endpoints before the app is stopped — otherwise a rollout
-            // restart drops the ~2s of in-flight requests that land while the endpoint lingers
-            // (a bare readiness flip is not enough; the removal must propagate first). Paired with
-            // the readiness probe's failureThreshold: 1 below, the endpoint clears in ~1-2s, well
-            // inside this ceiling. (Externally-managed cohorts could set this to null/indefinite
-            // once the intermediary signs the drain acknowledgement into the status.)
-            "drainHoldSeconds": 4
+            "supervisorCheckIntervalSeconds": 3600
         });
         // Every group carries the fleet label (its single throttle set) and its display
         // pair label (UI grouping / per-pair load balancer only, not a throttle).
@@ -1885,6 +1873,27 @@ pub(crate) fn open_browser(url: &str) {
 mod tests {
     use super::*;
 
+    /// Node health has exactly one path — the release's `healthcheck` hook -> signed NodeReport ->
+    /// healthproxy — and nothing in the node stack serves an HTTP probe endpoint of its own. A
+    /// manifest that asks the kubelet for one produces a pod that can never become Ready, and the
+    /// only place that fails is a live cluster. Assert the whole class, not today's three sites.
+    #[test]
+    fn no_rendered_manifest_probes_an_endpoint_the_node_stack_does_not_serve() {
+        for manifest in [
+            crate::haproxy::haproxy_statefulset(),
+            jenkins_statefulset("ci", 2),
+            jenkins_statefulset("release", 1),
+        ] {
+            let rendered = serde_json::to_string(&manifest).unwrap();
+            for dead in ["startupz", "readyz", "livez", "\"guardian\""] {
+                assert!(
+                    !rendered.contains(dead),
+                    "a rendered manifest still references {dead}, which nothing serves"
+                );
+            }
+        }
+    }
+
     /// The audit log mixes transactions with the reserved observation identities. Only a
     /// completed `apply` under a deployment attempt is a transaction; a green `healthcheck`
     /// under `periodic` or `boot` must never be mistaken for one.
@@ -1934,7 +1943,6 @@ inspect\tfingerprint\tcompleted
             .map(|phase| format!("{phase}.done"))
             .collect::<Vec<_>>();
         markers.push("generated-install.properties".to_owned());
-        markers.push("stopped-process.pid".to_owned());
         assert!(missing_sub_phase_markers(&markers).is_empty());
 
         markers.retain(|marker| marker != "verify.done" && marker != "drain.done");
