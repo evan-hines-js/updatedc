@@ -3,6 +3,24 @@
 version = 4
 
 [[package]]
+name = "agent"
+version = "0.1.0"
+dependencies = [
+ "control",
+ "foundation",
+ "libc",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "updated",
+ "updated-contracts",
+ "updated-tuf",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -340,17 +358,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "bootstrap"
-version = "0.1.0"
-dependencies = [
- "control",
- "foundation",
- "libc",
- "tempfile",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1737,6 +1744,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "launcher"
+version = "0.1.0"
+dependencies = [
+ "control",
+ "foundation",
+ "libc",
+ "tempfile",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2937,24 +2955,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "supervisor"
-version = "0.1.0"
-dependencies = [
- "control",
- "foundation",
- "libc",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "updated",
- "updated-contracts",
- "updated-tuf",
- "windows-sys 0.59.0",
-]
 
 [[package]]
 name = "syn"

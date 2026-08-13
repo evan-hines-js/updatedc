@@ -162,7 +162,7 @@ pub struct RepositoryLimitsSpec {
 pub struct StorageSpec {
     pub inactive_releases: usize,
     pub inactive_providers: usize,
-    pub inactive_supervisors: usize,
+    pub inactive_agents: usize,
     pub inactive_bytes: u64,
     pub inactive_repository_caches: usize,
 }
@@ -175,7 +175,7 @@ pub struct TimeoutsSpec {
     pub health_interval_seconds: u64,
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
-    pub supervisor_check_interval_seconds: u64,
+    pub agent_check_interval_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -230,7 +230,7 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                 storage: updated_contracts::assignment::ManagedStorage {
                     inactive_releases: value.runtime.storage.inactive_releases,
                     inactive_providers: value.runtime.storage.inactive_providers,
-                    inactive_supervisors: value.runtime.storage.inactive_supervisors,
+                    inactive_agents: value.runtime.storage.inactive_agents,
                     inactive_bytes: value.runtime.storage.inactive_bytes,
                     inactive_repository_caches: value.runtime.storage.inactive_repository_caches,
                 },
@@ -241,10 +241,10 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
                     health_interval_seconds: value.runtime.timeouts.health_interval_seconds,
                     refresh_retry_seconds: value.runtime.timeouts.refresh_retry_seconds,
                     confirmation_window_seconds: value.runtime.timeouts.confirmation_window_seconds,
-                    supervisor_check_interval_seconds: value
+                    agent_check_interval_seconds: value
                         .runtime
                         .timeouts
-                        .supervisor_check_interval_seconds,
+                        .agent_check_interval_seconds,
                 },
             },
         };
@@ -453,7 +453,7 @@ pub struct UpdateAgentSpec {
     /// Take this node out of load-balancer rotation gracefully, without stopping the application.
     /// A cordoned node is published to the healthproxy's endpoint projection as drained regardless
     /// of its report — the same drained state a stale report produces — while the application
-    /// keeps running, the node keeps reporting, and the supervisor stays entirely unaware. Rollout
+    /// keeps running, the node keeps reporting, and the agent stays entirely unaware. Rollout
     /// accounting treats it as absent (like a departed node) rather than unhealthy, so a cordon
     /// neither eats the group's availability budget nor wedges an in-flight rollout. Orthogonal to
     /// [`hold`](Self::hold): a node can be held but serving, or cordoned but updatable.
@@ -1210,7 +1210,7 @@ mod tests {
             storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 2,
                 inactive_providers: 2,
-                inactive_supervisors: 2,
+                inactive_agents: 2,
                 inactive_bytes: 1_073_741_824,
                 inactive_repository_caches: 2,
             },
@@ -1221,7 +1221,7 @@ mod tests {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
-                supervisor_check_interval_seconds: 3600,
+                agent_check_interval_seconds: 3600,
             },
         }
     }
@@ -1240,7 +1240,7 @@ mod tests {
             storage: StorageSpec {
                 inactive_releases: 2,
                 inactive_providers: 2,
-                inactive_supervisors: 2,
+                inactive_agents: 2,
                 inactive_bytes: 1_073_741_824,
                 inactive_repository_caches: 2,
             },
@@ -1251,7 +1251,7 @@ mod tests {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
-                supervisor_check_interval_seconds: 3600,
+                agent_check_interval_seconds: 3600,
             },
         }
     }

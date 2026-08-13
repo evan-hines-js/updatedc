@@ -134,7 +134,7 @@ pub fn prune_releases(
 }
 
 /// Prune direct content-addressed child directories while preserving exact names.
-/// This is also used for supervisor and repository caches, whose identities are hashes
+/// This is also used for agent and repository caches, whose identities are hashes
 /// rather than [`ReleaseId`] values.
 pub fn prune_directories(
     root: &Path,

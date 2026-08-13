@@ -3,9 +3,9 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p bootstrap -p supervisor -p server -p sampleapp -p updatec-demo -p demo-lifecycle -p updated-healthproxy -p updatectl && \
-    cp /src/target/release/bootstrap /out-bootstrap && \
-    cp /src/target/release/supervisor /out-supervisor && \
+    cargo build --release -p launcher -p agent -p server -p sampleapp -p updatec-demo -p demo-lifecycle -p updated-healthproxy -p updatectl && \
+    cp /src/target/release/updated-launcher /out-launcher && \
+    cp /src/target/release/updated-agent /out-agent && \
     cp /src/target/release/server /out-server && \
     cp /src/target/release/sampleapp /out-sampleapp && \
     cp /src/target/release/updatec-demo /out-updatec-demo && \
@@ -25,8 +25,8 @@ FROM ubuntu:22.04
 # into a bespoke image. curl/unzip are the same generic runtime-installer tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip haproxy && \
     rm -rf /var/lib/apt/lists/* && useradd --uid 65532 --create-home updated
-COPY --from=build /out-bootstrap /usr/local/bin/bootstrap
-COPY --from=build /out-supervisor /usr/local/bin/supervisor
+COPY --from=build /out-launcher /usr/local/bin/updated-launcher
+COPY --from=build /out-agent /usr/local/bin/updated-agent
 COPY --from=build /out-server /usr/local/bin/server
 COPY --from=build /out-sampleapp /usr/local/bin/sampleapp
 COPY --from=build /out-updatec-demo /usr/local/bin/updatec-demo

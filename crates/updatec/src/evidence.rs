@@ -62,7 +62,7 @@ pub(crate) struct AttemptSeed {
     /// Whether a report with an update TRANSACTION in flight on the target was observed
     /// ([`NodeReport::updating`]): the transaction genuinely ran.
     ///
-    /// A supervisor older than schema 6 cannot assert `updating`, and the compatibility window
+    /// An agent older than schema 6 cannot assert `updating`, and the compatibility window
     /// admits its reports with the field defaulting FALSE — so a pre-6 node's rollbacks produce
     /// no evidence until it upgrades. Strictly weaker evidence during a fleet upgrade, never a
     /// false verdict. The per-schema node counts in the metrics exposition
@@ -70,7 +70,7 @@ pub(crate) struct AttemptSeed {
     ///
     /// Two shapes are rejected by this flag, and both mint a fleet-wide halt without it. A node
     /// that merely FETCHED the assignment reports settled on it while running the old archive —
-    /// the supervisor stamps the assignment it resolved even on a tick that installed nothing.
+    /// the agent stamps the assignment it resolved even on a tick that installed nothing.
     /// And a node whose install never started still fails an ordinary readiness probe now and
     /// then; `healthy == false` alone cannot tell that blip from a transaction, which is why the
     /// node reports the two separately.
@@ -101,7 +101,7 @@ impl ObservationLog {
     ///
     /// A movement record opens at the TRANSITION of the reported assignment — in either report
     /// shape. The transaction's own tick is the definitive one (it marks the record `attempted`),
-    /// but a settled report naming a NEW assignment must open the record too: the supervisor
+    /// but a settled report naming a NEW assignment must open the record too: the agent
     /// reports the assignment it RESOLVED, so a tick that fetched the new assignment but could not
     /// yet install (a transient archive-download failure) reports settled on it while still running
     /// the old archive — and keying the seed off that report alone erased the movement's origin, so

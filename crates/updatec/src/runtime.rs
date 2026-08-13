@@ -1420,7 +1420,7 @@ pub async fn reconcile_once(
 
 /// Publish the endpoint projection — the cordoned set — to the object store the healthproxy polls.
 ///
-/// A cordon is invisible on the node (the application keeps running, the supervisor is unaware),
+/// A cordon is invisible on the node (the application keeps running, the agent is unaware),
 /// so the ONLY thing it may change is what the control plane publishes about the node: this
 /// document, at [`updated_contracts::endpoints::ENDPOINTS_OBJECT_KEY`] under the repository
 /// prefix, beside the telemetry namespace the healthproxy already reads. Read-compare-put keeps a
@@ -3407,7 +3407,7 @@ mod lease_tests {
                     storage: crate::StorageSpec {
                         inactive_releases: 2,
                         inactive_providers: 2,
-                        inactive_supervisors: 2,
+                        inactive_agents: 2,
                         inactive_bytes: 1_073_741_824,
                         inactive_repository_caches: 2,
                     },
@@ -3418,7 +3418,7 @@ mod lease_tests {
                         health_interval_seconds: 1,
                         refresh_retry_seconds: 5,
                         confirmation_window_seconds: 120,
-                        supervisor_check_interval_seconds: 3600,
+                        agent_check_interval_seconds: 3600,
                     },
                 },
             },

@@ -1,0 +1,67 @@
+# systemd unit for the self-updating agent (Linux). Template — adjust paths,
+# URLs, user, and intervals for your deployment, then install as:
+#
+#   install -m0644 updated-agent.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now updated-agent
+#
+# systemd manages the lifecycle of the tiny, installer-owned LAUNCHER (launcher).
+# The launcher runs the committed agent pointer and advances it only after a
+# content-addressed candidate proves it can run; the agent deploys releases by
+# invoking each release's own reconciler hooks. Workload processes belong to the
+# hooks (typically their own systemd units), never to the launcher or the agent,
+# so this unit's restarts can never disturb a workload:
+#
+#   systemd --manages--> launcher --activates--> agent --invokes--> release hooks
+#                            |
+#                      pointer-swaps the agent (readiness-gated); never itself
+#
+#     package manager --replaces--> launcher/agent   (out-of-band alternative)
+#
+# The launcher runs continuously: when the agent stages a self-update and exits,
+# the launcher (not systemd) activates the candidate under a readiness gate,
+# committing its path or retaining the previous pointer. systemd only relaunches
+# the launcher itself, on the rare event that it crashes.
+
+[Unit]
+Description=Self-updating release agent (via launcher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# The launcher is installer-owned and read-only; it never updates itself, so it
+# lives outside the writable state directory. The initial agent is installer-owned;
+# later verified candidates live content-addressed under the state directory.
+#
+# No --agent-config: the launcher reads the canonical /etc/updated/config.toml.
+# Pass it only if this deployment puts the config somewhere else.
+ExecStart=/usr/lib/updated/updated-launcher --state-dir /var/lib/updated --agent /usr/lib/updated/updated-agent --ready-timeout 60 --confirm-timeout 30
+
+# Relaunch the launcher if it ever crashes. The start-limit defaults stop a
+# crash-looping build after a few tries.
+Restart=always
+RestartSec=2
+
+# Signal only the launcher; it coordinates a clean agent shutdown. Workloads are
+# separate units and are not signalled here.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# --- Sandboxing (tighten to taste). Agent candidates and installed releases
+#     live under the writable state directory (which also holds the commit
+#     journal and the TUF metadata cache). The launcher and the pinned TUF root —
+#     the two anchors of trust — stay read-only. ---
+User=updated
+Group=updated
+StateDirectory=updated
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/updated
+
+[Install]
+WantedBy=multi-user.target

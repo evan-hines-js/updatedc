@@ -48,7 +48,7 @@ Cordon changes only what the healthproxy programs, through the channel that alre
 control plane's endpoint projection. A cordoned node is published to the healthproxy inventory
 as `drained` regardless of its report — the same drained state a stale report produces today,
 so haproxy handling is unchanged. The application keeps running, the node keeps reporting, and
-the supervisor is entirely unaware — cordon is invisible on the node because it changes nothing
+the agent is entirely unaware — cordon is invisible on the node because it changes nothing
 the node owns.
 
 Rollout accounting treats a cordoned node as absent (as departed nodes already are) rather than

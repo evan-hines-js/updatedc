@@ -65,7 +65,7 @@ pub struct RepositorySource {
 impl Application {
     /// The launch spec and probes the signed runtime carries. The single construction path for
     /// [`Application`] — used both when the config is first materialized and when a running
-    /// supervisor reconciles a control-plane reassignment (which may change the declared secrets
+    /// agent reconciles a control-plane reassignment (which may change the declared secrets
     /// or health checks independently of the release version).
     pub fn from_runtime(runtime: &ManagedRuntime) -> Application {
         Application {
@@ -85,7 +85,7 @@ impl Storage {
         Storage {
             inactive_releases: runtime.storage.inactive_releases,
             inactive_providers: runtime.storage.inactive_providers,
-            inactive_supervisors: runtime.storage.inactive_supervisors,
+            inactive_agents: runtime.storage.inactive_agents,
             inactive_bytes: runtime.storage.inactive_bytes,
             inactive_repository_caches: runtime.storage.inactive_repository_caches,
         }
@@ -103,8 +103,8 @@ impl Timeouts {
             health_interval: Duration::from_secs(runtime.timeouts.health_interval_seconds),
             refresh_retry: Duration::from_secs(runtime.timeouts.refresh_retry_seconds),
             confirmation_window: Duration::from_secs(runtime.timeouts.confirmation_window_seconds),
-            supervisor_check_interval: Duration::from_secs(
-                runtime.timeouts.supervisor_check_interval_seconds,
+            agent_check_interval: Duration::from_secs(
+                runtime.timeouts.agent_check_interval_seconds,
             ),
         }
     }
@@ -139,7 +139,7 @@ impl Config {
 pub struct Storage {
     pub inactive_releases: usize,
     pub inactive_providers: usize,
-    pub inactive_supervisors: usize,
+    pub inactive_agents: usize,
     pub inactive_bytes: u64,
     pub inactive_repository_caches: usize,
 }
@@ -149,7 +149,7 @@ impl Default for Storage {
         Self {
             inactive_releases: 2,
             inactive_providers: 2,
-            inactive_supervisors: 1,
+            inactive_agents: 1,
             inactive_bytes: 1024 * 1024 * 1024,
             inactive_repository_caches: 2,
         }
@@ -193,8 +193,8 @@ pub struct Timeouts {
     /// `healthcheck` verdict on the next agent boot — reverts to the predecessor (one strike);
     /// surviving it confirms the update and drops the rollback image.
     pub confirmation_window: Duration,
-    /// How often to check for a supervisor release.
-    pub supervisor_check_interval: Duration,
+    /// How often to check for an agent release.
+    pub agent_check_interval: Duration,
 }
 
 impl Default for Timeouts {
@@ -210,12 +210,12 @@ impl Default for Timeouts {
             health_interval: Duration::from_secs(1),
             refresh_retry: Duration::from_secs(5),
             confirmation_window: Duration::from_secs(120),
-            supervisor_check_interval: Duration::from_secs(3600),
+            agent_check_interval: Duration::from_secs(3600),
         }
     }
 }
 
-/// The one canonical immutable-release layout shared by supervisor and one-shot mode.
+/// The one canonical immutable-release layout shared by agent and one-shot mode.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub install_root: PathBuf,
@@ -224,7 +224,7 @@ pub struct Paths {
     /// Per-release writable working directories for the managed application — the launch `cwd`.
     /// Deliberately a sibling of `versions/`, never a child of it: `versions/<release>` is the
     /// content-addressed tree `bundle::verify_release` re-hashes on every check, so a single file
-    /// an ordinary application writes to its own working directory would make the supervisor
+    /// an ordinary application writes to its own working directory would make the agent
     /// condemn, re-download and republish the release forever. See [`crate::provider::BundleStore`].
     pub work: PathBuf,
     pub active_release: PathBuf,
@@ -250,13 +250,13 @@ pub struct Paths {
 }
 
 /// Where the last live routing assignment is kept: beside the enrollment material in the
-/// guardian's state directory, never under `install_root`.
+/// launcher's state directory, never under `install_root`.
 ///
 /// This file is read *before any network fetch* to decide what the managed application is
 /// launched with — its args, which secret populates which environment variable, which product and
 /// channel are acceptable. Nothing local can re-verify it at that moment, so it may only live
 /// where every other boot input already lives: the enrollment directory that also holds the
-/// bootstrap config, the enrollment bundle, and the node's private key. Kept under `install_root`
+/// node config, the enrollment bundle, and the node's private key. Kept under `install_root`
 /// it would let write access to a directory full of otherwise-recoverable state choose the
 /// managed process's arguments and secrets.
 pub fn persisted_assignment_path(enrollment_state: &Path) -> PathBuf {
@@ -307,7 +307,7 @@ impl Config {
 }
 
 /// Append `suffix` to a path's final component. Used for independent lock/download
-/// siblings in the supervisor self-update path.
+/// siblings in the agent self-update path.
 pub fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
     let mut value = base.as_os_str().to_os_string();
     value.push(suffix);

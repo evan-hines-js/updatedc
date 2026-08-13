@@ -13,13 +13,13 @@ fips = ["aws-lc-rs/fips", "rustls/fips"]
 [dependencies]
 foundation = { path = "../foundation" }
 updated-contracts = { path = "../updated-contracts" }
-# The shared operator-config loader for the supervisor and one-shot updater.
+# The shared operator-config loader for the agent and one-shot updater.
 serde = { workspace = true }
 # The committed installed-state record (updated::state) is JSON.
 serde_json = { workspace = true }
 toml = { workspace = true }
 semver = { workspace = true }
-# SHA-256 of a file for supervisor/one-shot drift and transaction verification.
+# SHA-256 of a file for agent/one-shot drift and transaction verification.
 aws-lc-rs = { workspace = true }
 hex = { workspace = true }
 tar = { workspace = true }
@@ -31,7 +31,7 @@ futures = { workspace = true }
 # the trait needs an async method in object-safe form.
 async-trait = { workspace = true }
 # The agent's mTLS enrollment/repository identity — an aws-lc-rs rustls client config built
-# from cert/key/CA file paths (the bootstrap config holds paths, never secrets).
+# from cert/key/CA file paths (the node config holds paths, never secrets).
 rustls = { workspace = true }
 # Join-mode enrollment: the agent generates its keypair and a CSR locally (aws-lc-rs backend,
 # one crypto library) so no per-node certificate is ever provisioned out of band.

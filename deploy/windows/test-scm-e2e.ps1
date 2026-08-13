@@ -17,7 +17,7 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-$service = 'SelfUpdateSupervisor'
+$service = 'SelfUpdateAgent'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $work = Join-Path $root 'target\scm-e2e'
 $repo = Join-Path $work 'repo'
@@ -27,7 +27,7 @@ $install = Join-Path $work 'install'
 $bundle = Join-Path $work 'bundle-1.0.0'
 $providerSource = Join-Path $work 'reconciler-source'
 $receipt = Join-Path $work 'reconciler-operations.log'
-$config = Join-Path $work 'bootstrap.toml'
+$config = Join-Path $work 'config.toml'
 $runtime = Join-Path $work 'runtime.json'
 $repoPort = 21980
 $serverProcess = $null
@@ -63,7 +63,7 @@ function Wait-Operation([string]$operation, [int]$seconds = 60) {
 
 function Get-TreeProcessIds() {
     $ids = @()
-    foreach ($name in @('bootstrap', 'supervisor', 'selfupdate-service')) {
+    foreach ($name in @('updated-launcher', 'updated-agent', 'selfupdate-service')) {
         $ids += (Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
     }
     return $ids
@@ -80,10 +80,10 @@ function Wait-ProcessExit([int[]]$ids, [int]$seconds = 30) {
 }
 
 function Read-DesiredAgent() {
-    $pointer = Join-Path $launcherState 'desired-supervisor'
+    $pointer = Join-Path $launcherState 'desired-agent'
     $lines = [IO.File]::ReadAllLines($pointer)
-    if ($lines.Count -ne 2 -or $lines[0] -ne 'supervisor-v1' -or -not $lines[1]) {
-        throw "invalid desired-supervisor pointer: $($lines -join ' | ')"
+    if ($lines.Count -ne 2 -or $lines[0] -ne 'agent-v1' -or -not $lines[1]) {
+        throw "invalid desired-agent pointer: $($lines -join ' | ')"
     }
     return [IO.Path]::GetFullPath($lines[1])
 }
@@ -100,7 +100,7 @@ try {
 
     Push-Location $root
     try {
-        & cargo build --release -p server -p bootstrap -p supervisor -p windows-service -p sampleapp
+        & cargo build --release -p server -p launcher -p agent -p windows-service -p sampleapp
         if ($LASTEXITCODE) { throw 'building SCM test binaries failed' }
     } finally {
         Pop-Location
@@ -113,8 +113,8 @@ try {
         "version = `"1.0.0`"`n",
         [Text.UTF8Encoding]::new($false)
     )
-    $initialAgent = Join-Path $work 'supervisor.exe'
-    Copy-Item (Join-Path $bin 'supervisor.exe') $initialAgent
+    $initialAgent = Join-Path $work 'updated-agent.exe'
+    Copy-Item (Join-Path $bin 'updated-agent.exe') $initialAgent
 
     # The release's own node reconciler: an ordinary PowerShell script, which is the whole point of
     # the protocol. It records every invocation and converges nothing further, standing in for the
@@ -163,8 +163,8 @@ exit 0
     $runtimeJson = @{
         product = 'app'; channel = 'stable'; install_root = $install
         repository = @{metadata_limit=1048576; target_limit=536870912; transport_timeout_seconds=30}
-        storage = @{inactive_releases=2; inactive_providers=2; inactive_supervisors=1; inactive_bytes=1073741824; inactive_repository_caches=2}
-        timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; supervisor_check_interval_seconds=3600}
+        storage = @{inactive_releases=2; inactive_providers=2; inactive_agents=1; inactive_bytes=1073741824; inactive_repository_caches=2}
+        timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; agent_check_interval_seconds=3600}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
@@ -182,7 +182,7 @@ exit 0
         --output (Join-Path $launcherState 'enrollment.json')
     if ($LASTEXITCODE) { throw 'exporting enrollment bundle failed' }
     # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never
-    # calls /enroll — but the bootstrap must still be a complete, valid EnrollmentBootstrap. The name
+    # calls /enroll — but the config must still be a complete, valid EnrollmentBootstrap. The name
     # and cert paths are never read in this offline path; they only satisfy config validation.
     $configText = @"
 [enrollment]
@@ -195,8 +195,8 @@ ca = 'unused-preplaced-ca.crt'
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
 
     $wrapper = Join-Path $bin 'selfupdate-service.exe'
-    $launcher = Join-Path $bin 'bootstrap.exe'
-    $binPath = "`"$wrapper`" --bootstrap `"$launcher`" --state-dir `"$launcherState`" --supervisor-config `"$config`" --supervisor `"$initialAgent`""
+    $launcher = Join-Path $bin 'updated-launcher.exe'
+    $binPath = "`"$wrapper`" --launcher `"$launcher`" --state-dir `"$launcherState`" --config `"$config`" --agent `"$initialAgent`""
     & sc.exe create $service binPath= $binPath start= demand | Out-Null
     if ($LASTEXITCODE) { throw 'SCM service creation failed' }
 

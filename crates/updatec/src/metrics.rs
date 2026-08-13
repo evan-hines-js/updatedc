@@ -38,7 +38,7 @@ pub struct FleetSnapshot {
     /// The compatibility window admits older reports with newer fields at their fail-safe default,
     /// so the population below the current schema is exactly the population whose evidence is
     /// degraded — and the only in-system answer to "does any supported fleet still run the older
-    /// supervisor", which is the precondition for raising the floor.
+    /// agent", which is the precondition for raising the floor.
     pub report_schemas: BTreeMap<u32, usize>,
 }
 

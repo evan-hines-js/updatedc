@@ -214,8 +214,8 @@ pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
 
 /// [`atomic_write`] for a non-secret file under the node's state directory: identical durability,
 /// but the committed file keeps whatever access its directory confers (on Windows the deployment's
-/// inheritable grant to the service account; on unix still `0o600`). A supervisor pointer, a
-/// guardian marker, a journal — anything a differently-privileged principal may legitimately have
+/// inheritable grant to the service account; on unix still `0o600`). An agent pointer, a
+/// launcher marker, a journal — anything a differently-privileged principal may legitimately have
 /// to read or replace later.
 pub fn atomic_write_managed(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
     durable_write(path, prefix, data, Visibility::Managed)
@@ -284,9 +284,9 @@ fn unsynced(error: io::Error) -> io::Error {
 /// directory fsync behind it is what failed (`EMFILE`, an fsync `EIO`).
 ///
 /// The distinction exists for callers that undo their own state when a durable write fails.
-/// The guardian rolls its committed-supervisor pointer back to the predecessor and records the
+/// The launcher rolls its committed-agent pointer back to the predecessor and records the
 /// candidate rejected — which, for a pointer that actually moved, would leave a rejection
-/// marker about the very binary the next boot launches as the committed supervisor. Every other
+/// marker about the very binary the next boot launches as the committed agent. Every other
 /// caller is right to treat this as the plain failure it also is.
 pub fn committed_unsynced(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<Unsynced>())
@@ -508,9 +508,9 @@ mod tests {
     fn a_failure_after_the_rename_reports_the_write_as_committed() {
         // The rename is already visible when the directory fsync runs, so reporting that failure
         // as a plain Err claims the old content is still there while the new content is what
-        // every reader sees. The guardian rolls its supervisor pointer back to the predecessor
+        // every reader sees. The launcher rolls its agent pointer back to the predecessor
         // on a failed commit; rolling back a pointer that moved rejects the binary the next boot
-        // launches as the committed supervisor.
+        // launches as the committed agent.
         use std::os::unix::fs::PermissionsExt;
         let (_guard, d) = dir("unsynced");
         let p = d.join("pointer");
@@ -550,7 +550,7 @@ mod tests {
         // recognise it is its raw code, and an `io::Error` that carries the `Unsynced` payload
         // cannot also carry that code. Whoever classifies must read it one `source()` hop down.
         // Lose that hop and a transient disk fault reads as a bad release: the candidate
-        // supervisor is rejected by content hash and the node is stranded a release behind.
+        // agent is rejected by content hash and the node is stranded a release behind.
         use std::error::Error;
         let wrapped = unsynced(io::Error::from_raw_os_error(libc::EIO));
 
@@ -575,7 +575,7 @@ mod tests {
     fn executable_install_uses_the_canonical_durable_path() {
         let (_guard, root) = dir("executable");
         let source = root.join("download");
-        let target = root.join("supervisor");
+        let target = root.join("agent");
         fs::write(&source, b"verified bytes").unwrap();
 
         install_executable(&target, &source).unwrap();
@@ -678,23 +678,23 @@ mod tests {
         fs::write(d.join("state"), b"committed").unwrap();
         fs::write(d.join("other-9-9-9.tmp"), b"not ours").unwrap();
         // A fresh temp under our prefix is an in-flight write — spare it.
-        fs::write(d.join(".guardian-1-2-3.tmp"), b"in flight").unwrap();
-        let in_flight_stage = d.join(".guardian-generation-live.tmp");
+        fs::write(d.join(".launcher-1-2-3.tmp"), b"in flight").unwrap();
+        let in_flight_stage = d.join(".launcher-generation-live.tmp");
         fs::create_dir(&in_flight_stage).unwrap();
         // An aged temp under our prefix is a crash leftover — reap it, file or directory.
         let aged = SystemTime::now() - (STALE_TEMP_AGE + Duration::from_secs(1));
-        let stale = d.join(".guardian-4-5-6.tmp");
+        let stale = d.join(".launcher-4-5-6.tmp");
         fs::write(&stale, b"orphan").unwrap();
         filetime_set(&stale, aged);
-        let stale_stage = d.join(".guardian-generation-dead.tmp");
+        let stale_stage = d.join(".launcher-generation-dead.tmp");
         fs::create_dir(&stale_stage).unwrap();
         fs::write(stale_stage.join("timestamp.json"), b"{}").unwrap();
         filetime_set(&stale_stage, aged);
 
-        assert_eq!(sweep_stale_temps(&d, ".guardian-"), 2);
+        assert_eq!(sweep_stale_temps(&d, ".launcher-"), 2);
         assert!(d.join("state").exists());
         assert!(d.join("other-9-9-9.tmp").exists());
-        assert!(d.join(".guardian-1-2-3.tmp").exists());
+        assert!(d.join(".launcher-1-2-3.tmp").exists());
         assert!(in_flight_stage.exists(), "an in-flight stage was yanked");
         assert!(!stale.exists());
         assert!(
@@ -710,11 +710,11 @@ mod tests {
     #[test]
     fn sweep_spares_temps_whose_age_is_unknown() {
         let (_guard, d) = dir("sweep-future-mtime");
-        let in_flight = d.join(".guardian-7-8-9.tmp");
+        let in_flight = d.join(".launcher-7-8-9.tmp");
         fs::write(&in_flight, b"in flight").unwrap();
         filetime_set(&in_flight, SystemTime::now() + Duration::from_secs(600));
 
-        assert_eq!(sweep_stale_temps(&d, ".guardian-"), 0);
+        assert_eq!(sweep_stale_temps(&d, ".launcher-"), 0);
         assert!(in_flight.exists());
     }
 
@@ -784,7 +784,7 @@ mod tests {
         atomic_write(&secret, ".key-", b"k").unwrap();
         assert_eq!(mode(&secret), 0o600);
         let state = d.join("state");
-        atomic_write_managed(&state, ".guardian-", b"s").unwrap();
+        atomic_write_managed(&state, ".launcher-", b"s").unwrap();
         assert_eq!(mode(&state), 0o600, "state stays owner-only on unix");
     }
 
@@ -804,7 +804,7 @@ mod tests {
         let (_file, published) = create_temp_published(&d, ".publish-").unwrap();
         assert!(!dacl_sddl(&published).starts_with("D:P"));
         let state = d.join("state");
-        atomic_write_managed(&state, ".guardian-", b"s").unwrap();
+        atomic_write_managed(&state, ".launcher-", b"s").unwrap();
         assert!(!dacl_sddl(&state).starts_with("D:P"));
         let secret = d.join("secret");
         atomic_write(&secret, ".key-", b"k").unwrap();

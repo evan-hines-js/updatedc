@@ -317,7 +317,7 @@ echo "initial routing generation published"
 
 # Exercise the operator-driven enrollment route end to end. The controller turns a manual
 # UpdateAgent into an immutable signed enrollment Secret. The init container places only that
-# trust artifact; the supervisor then performs the same repository-backed cold install used by
+# trust artifact; the agent then performs the same repository-backed cold install used by
 # every other fresh node.
 cat <<'YAML' | kubectl apply -f -
 apiVersion: updated.dev/v1alpha1
@@ -346,9 +346,9 @@ fi
 cat >"$WORK/manual-offline.yaml" <<YAML
 apiVersion: v1
 kind: ConfigMap
-metadata: {name: manual-offline-bootstrap, namespace: updated-system}
+metadata: {name: manual-offline-config, namespace: updated-system}
 data:
-  bootstrap.toml: |
+  config.toml: |
     [enrollment]
     # The preplaced signed bundle gives this node its routing/assignment/initial config for a
     # network-free first start, so it never fetches the bundle over the network. Identity is
@@ -376,8 +376,8 @@ spec:
       command: [/bin/sh, -ec]
       args:
         - |
-          mkdir -p /var/lib/updated/guardian
-          cp /signed/enrollment.json /var/lib/updated/guardian/enrollment.json
+          mkdir -p /var/lib/updated/launcher
+          cp /signed/enrollment.json /var/lib/updated/launcher/enrollment.json
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
         - {name: enrollment, mountPath: /signed, readOnly: true}
@@ -385,8 +385,8 @@ spec:
     - name: agent
       image: updatec-e2e:kind
       imagePullPolicy: IfNotPresent
-      command: [/usr/local/bin/bootstrap]
-      args: [--state-dir, /var/lib/updated/guardian, --supervisor-config, /bootstrap/bootstrap.toml, --supervisor, /usr/local/bin/supervisor, --ready-timeout, "30", --confirm-timeout, "2"]
+      command: [/usr/local/bin/updated-launcher]
+      args: [--state-dir, /var/lib/updated/launcher, --config, /launcher-config/config.toml, --agent, /usr/local/bin/updated-agent, --ready-timeout, "30", --confirm-timeout, "2"]
       ports: [{name: http, containerPort: 8080}]
       securityContext:
         allowPrivilegeEscalation: false
@@ -396,17 +396,17 @@ spec:
         runAsUser: 65532
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
-        - {name: bootstrap, mountPath: /bootstrap, readOnly: true}
+        - {name: launcher-config, mountPath: /launcher-config, readOnly: true}
         # The offline agent still fronts the real gateway for routing/secrets after its
         # network-free cold install, so it carries the same shared fleet mTLS identity every
-        # other agent does (its bootstrap.toml points its client cert/key/CA here).
+        # other agent does (its config.toml points its client cert/key/CA here).
         - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
   volumes:
     - {name: state, emptyDir: {}}
     - name: enrollment
       secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
-    - name: bootstrap
-      configMap: {name: manual-offline-bootstrap}
+    - name: launcher-config
+      configMap: {name: manual-offline-config}
     - {name: agent-tls, secret: {secretName: agent-tls}}
 YAML
 kubectl apply -f "$WORK/manual-offline.yaml"
@@ -421,7 +421,7 @@ kubectl_log_contains manual-offline 'started managed application pid' -c agent
 echo "manual CRD export enrolled, cold-installed, and launched 1.0.0"
 
 # A malformed enrollment artifact is terminal: it must never fall back to the URL/key or launch
-# an application. `timeout` bounds bootstrap's intentional supervision retries so Kubernetes
+# an application. `timeout` bounds the launcher's intentional supervision retries so Kubernetes
 # records an observable failed container for this negative test.
 cat >"$WORK/manual-bad-enrollment.yaml" <<YAML
 apiVersion: v1
@@ -438,9 +438,9 @@ spec:
       command: [/bin/sh, -ec]
       args:
         - |
-          mkdir -p /var/lib/updated/guardian
-          cp /signed/enrollment.json /var/lib/updated/guardian/enrollment.json
-          printf tampered >>/var/lib/updated/guardian/enrollment.json
+          mkdir -p /var/lib/updated/launcher
+          cp /signed/enrollment.json /var/lib/updated/launcher/enrollment.json
+          printf tampered >>/var/lib/updated/launcher/enrollment.json
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
         - {name: enrollment, mountPath: /signed, readOnly: true}
@@ -448,16 +448,16 @@ spec:
     - name: agent
       image: updatec-e2e:kind
       command: [/bin/sh, -ec]
-      args: ["timeout 15 bootstrap --state-dir /var/lib/updated/guardian --supervisor-config /bootstrap/bootstrap.toml --supervisor /usr/local/bin/supervisor --ready-timeout 5 --confirm-timeout 2"]
+      args: ["timeout 15 updated-launcher --state-dir /var/lib/updated/launcher --config /launcher-config/config.toml --agent /usr/local/bin/updated-agent --ready-timeout 5 --confirm-timeout 2"]
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
-        - {name: bootstrap, mountPath: /bootstrap, readOnly: true}
+        - {name: launcher-config, mountPath: /launcher-config, readOnly: true}
   volumes:
     - {name: state, emptyDir: {}}
     - name: enrollment
       secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
-    - name: bootstrap
-      configMap: {name: manual-offline-bootstrap}
+    - name: launcher-config
+      configMap: {name: manual-offline-config}
 YAML
 kubectl apply -f "$WORK/manual-bad-enrollment.yaml"
 for attempt in {1..30}; do
@@ -476,7 +476,7 @@ BAD_LOG="$(kubectl -n updated-system logs manual-bad-enrollment -c agent)"
 echo "corrupted installer enrollment failed closed before application launch"
 
 # Invalid online credentials are also fail-closed and may not leave registration state. The gateway
-# creates the UpdateAgent under the name the node self-asserts in its bootstrap file, so that is the
+# creates the UpdateAgent under the name the node self-asserts in its config file, so that is the
 # object this must prove was never created.
 BAD_AGENT_NAME=intruder
 cat <<'YAML' | kubectl apply -f -
@@ -491,11 +491,11 @@ spec:
       command: [/bin/sh, -ec]
       args:
         - |
-          mkdir -p /var/lib/updated/guardian
+          mkdir -p /var/lib/updated/launcher
           # Present an intruder client cert NOT signed by the fleet CA: the gateway must reject
           # it at the mTLS handshake so enrollment fails closed. It still trusts the real fleet
           # CA for the gateway's server cert.
-          cat >/tmp/bootstrap.toml <<EOF
+          cat >/tmp/config.toml <<EOF
           [enrollment]
           url = "https://updatec-gateway"
           name = "intruder"
@@ -503,8 +503,8 @@ spec:
           client_key = "/etc/intruder-tls/tls.key"
           ca = "/etc/agent-tls/ca.crt"
           EOF
-          timeout 15 bootstrap --state-dir /var/lib/updated/guardian \
-            --supervisor-config /tmp/bootstrap.toml --supervisor /usr/local/bin/supervisor \
+          timeout 15 updated-launcher --state-dir /var/lib/updated/launcher \
+            --config /tmp/config.toml --agent /usr/local/bin/updated-agent \
             --ready-timeout 5 --confirm-timeout 2
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
@@ -622,7 +622,7 @@ for ordinal in 0 1 2 3 4; do
   }
   kubectl -n updated-system exec "agent-$ordinal" -c agent -- \
     grep -q '"routingBaseUrl":"https://updatec-gateway/"' \
-      /var/lib/updated/guardian/enrollment.json || {
+      /var/lib/updated/launcher/enrollment.json || {
     echo "FAIL: agent-$ordinal did not persist the reachable in-cluster routing URL" >&2
     exit 1
   }
@@ -641,12 +641,12 @@ echo "all five empty agents enrolled online and cold-installed the network assig
 
 # Exercise certificate renewal through the live gateway without restarting the pod, container, or
 # application. Replace agent-4's leaf with a fleet-CA-signed one-day leaf for the SAME durable key,
-# terminate only the supervisor, and let the guardian adopt the still-running application. The new
-# supervisor sees the short lifetime immediately, calls /renew with that current identity, installs
-# the replacement atomically, and exits once so the guardian rebuilds every authenticated client.
+# terminate only the agent, and let the launcher adopt the still-running application. The new
+# agent sees the short lifetime immediately, calls /renew with that current identity, installs
+# the replacement atomically, and exits once so the launcher rebuilds every authenticated client.
 ROTATION_AGENT=agent-4
 ROTATION_RESOURCE="${AGENT_RESOURCES[4]}"
-ROTATION_STATE=/var/lib/updated/guardian
+ROTATION_STATE=/var/lib/updated/launcher
 ROTATION_DIR="$WORK/certificate-rotation"
 mkdir -p "$ROTATION_DIR"
 kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
@@ -687,7 +687,7 @@ process_pid() {
     exit 1
   ' sh "$process"
 }
-supervisor_before="$(process_pid supervisor)"
+agent_before="$(process_pid agent)"
 application_before="$(process_pid app)"
 
 cat <<'YAML' | kubectl apply -f -
@@ -721,28 +721,28 @@ YAML
 kubectl -n updated-system wait --for=condition=ready \
   pod -l job-name=observe-certificate-rotation --timeout=30s
 
-# Install the near-expiry leaf completely before signalling the supervisor. Existing clients keep
-# using their in-memory identity until the guardian relaunches the supervisor.
+# Install the near-expiry leaf completely before signalling the agent. Existing clients keep
+# using their in-memory identity until the launcher relaunches the agent.
 kubectl -n updated-system exec -i "$ROTATION_AGENT" -c agent -- \
   sh -c "cat >'$ROTATION_STATE/agent.crt'" <"$ROTATION_DIR/short.crt"
 kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
-  kill -TERM "$supervisor_before"
+  kill -TERM "$agent_before"
 
 renewed=false
 for attempt in $(seq 1 90); do
   kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
     cat "$ROTATION_STATE/agent.crt" >"$ROTATION_DIR/renewed.crt"
   renewed_cert="$(sha256sum "$ROTATION_DIR/renewed.crt" | awk '{print $1}')"
-  supervisor_after="$(process_pid supervisor 2>/dev/null || true)"
-  if [[ "$renewed_cert" != "$short_cert" && -n "$supervisor_after" \
-      && "$supervisor_after" != "$supervisor_before" ]]; then
+  agent_after="$(process_pid agent 2>/dev/null || true)"
+  if [[ "$renewed_cert" != "$short_cert" && -n "$agent_after" \
+      && "$agent_after" != "$agent_before" ]]; then
     renewed=true
     break
   fi
   sleep 1
 done
 [[ "$renewed" == true ]] || {
-  echo "FAIL: agent-4 did not renew its short-lived certificate and relaunch its supervisor" >&2
+  echo "FAIL: agent-4 did not renew its short-lived certificate and relaunch its agent" >&2
   kubectl -n updated-system logs "$ROTATION_AGENT" -c agent --tail=200 >&2 || true
   exit 1
 }
@@ -844,9 +844,9 @@ YAML
 kubectl -n updated-system wait --for=condition=complete job/verify-agent-versions --timeout=150s
 kubectl -n updated-system logs job/verify-agent-versions
 
-# A real application crash is not a planned drain. The guardian marks the tower
+# A real application crash is not a planned drain. The launcher marks the tower
 # failed, exits with the application, and lets Kubernetes restart the container.
-# The pod and its emptyDir survive that container restart, so the new guardian must
+# The pod and its emptyDir survive that container restart, so the new launcher must
 # verify and relaunch the same committed bundle before readiness returns.
 restart_before="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
 kubectl -n updated-system exec agent-4 -c agent -- \
@@ -871,7 +871,7 @@ recovered_version="$(kubectl -n updated-system exec agent-4 -c agent -- curl -fs
   echo "FAIL: agent-4 recovered as '$recovered_version', expected committed 1.0.0" >&2
   exit 1
 }
-echo "managed application crash failed the guardian tower; Kubernetes restarted it and readiness recovered"
+echo "managed application crash failed the launcher tower; Kubernetes restarted it and readiness recovered"
 
 if (( FUZZ_ROUNDS > 0 )); then
 cat <<'YAML' | kubectl apply -f -

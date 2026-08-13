@@ -12,7 +12,7 @@ REPO="$WORK/repo"
 KEYS="$WORK/keys"
 INSTALL="$WORK/install"
 BIN="$WORK/bin"
-BOOTSTRAP="$WORK/bootstrap.toml"
+CONFIG="$WORK/config.toml"
 RUNTIME="$WORK/runtime.json"
 STACK_LOG="$WORK/tower.log"
 REPO_LOG="$WORK/repository.log"
@@ -130,8 +130,8 @@ assign() {
 
 rm -rf "$WORK"
 mkdir -p "$BIN" "$WORK/launcher-state"
-(cd "$ROOT" && cargo build --release -p server -p bootstrap -p supervisor)
-cp "$ROOT/target/release/"{server,bootstrap,supervisor} "$BIN/"
+(cd "$ROOT" && cargo build --release -p server -p launcher -p agent)
+cp "$ROOT/target/release/"{server,updated-launcher,updated-agent} "$BIN/"
 # The lifecycle provider and its helpers are the real, tested bundle scripts under scripts/haproxy/ —
 # the same bytes the demo publishes — so this e2e proves the shipped provider, not an inline copy.
 cp "$ROOT/scripts/haproxy/lifecycle" "$BIN/lifecycle"
@@ -163,16 +163,16 @@ for tree in "$WORK"/bundle-*; do
 done
 
 cat >"$RUNTIME" <<EOF
-{"product":"app","channel":"stable","install_root":"$INSTALL","repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_supervisors":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"supervisor_check_interval_seconds":3600}}
+{"product":"app","channel":"stable","install_root":"$INSTALL","repository":{"metadata_limit":1048576,"target_limit":536870912,"transport_timeout_seconds":5},"storage":{"inactive_releases":2,"inactive_providers":2,"inactive_agents":1,"inactive_bytes":1073741824,"inactive_repository_caches":2},"timeouts":{"check_interval_seconds":1,"health_grace_seconds":4,"health_successes":1,"health_interval_seconds":1,"refresh_retry_seconds":1,"confirmation_window_seconds":2,"agent_check_interval_seconds":3600}}
 EOF
 publish 1.0.0 "$WORK/bundle-1.0.0"
 "$BIN/server" export-enrollment --repo "$REPO" --assignment assignments/agents/agent.json \
   --agent-id agent --routing-base-url "http://127.0.0.1:$REPO_PORT/" \
   --output "$WORK/launcher-state/enrollment.json"
 # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never calls
-# /enroll — but the bootstrap config must still be a complete, valid EnrollmentBootstrap. The name
+# /enroll — but the node config must still be a complete, valid EnrollmentBootstrap. The name
 # and cert paths are never read in this offline path; they only satisfy config validation.
-cat >"$BOOTSTRAP" <<EOF
+cat >"$CONFIG" <<EOF
 [enrollment]
 url = "http://127.0.0.1:$REPO_PORT/"
 name = "agent"
@@ -184,8 +184,8 @@ EOF
 : >"$STACK_LOG"; : >"$REPO_LOG"; : >"$TRAFFIC_LOG"
 "$BIN/server" serve --repo "$REPO" --addr "127.0.0.1:$REPO_PORT" >>"$REPO_LOG" 2>&1 &
 REPO_PID="$!"
-"$BIN/bootstrap" --state-dir "$WORK/launcher-state" --supervisor-config "$BOOTSTRAP" \
-  --supervisor "$BIN/supervisor" --stop-grace 2 >>"$STACK_LOG" 2>&1 &
+"$BIN/updated-launcher" --state-dir "$WORK/launcher-state" --config "$CONFIG" \
+  --agent "$BIN/updated-agent" --stop-grace 2 >>"$STACK_LOG" 2>&1 &
 STACK_PID="$!"
 wait_version 1.0.0
 

@@ -1,6 +1,6 @@
 //! The committed application release and authenticated archive identity.
 //!
-//! Shared by the supervisor and the one-shot updater so the two never disagree about
+//! Shared by the agent and the one-shot updater so the two never disagree about
 //! the on-disk format, location, or the crucial distinction between *absent* (a
 //! first install) and *corrupt* (which must fail closed, never silently reinstall).
 
@@ -37,7 +37,7 @@ impl RepositoryLineage {
 }
 
 /// Exact independently signed lifecycle provider pinned to a release.
-/// The supervisor stages it content-addressed on disk and invokes its manifest entrypoint
+/// The agent stages it content-addressed on disk and invokes its manifest entrypoint
 /// as an external CLI; this record holds only the signed reference plus its invocation args.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

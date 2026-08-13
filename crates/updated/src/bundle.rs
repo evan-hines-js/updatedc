@@ -18,7 +18,7 @@ pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 /// cannot accept surfaces as [`InstallError::Archive`] — a verdict on the BYTES — which is recorded
 /// as a durable, never-expiring rejection keyed by digest. Publishing a shape ahead of the fleet
 /// floor therefore makes every not-yet-upgraded node permanently refuse every new bundle, the one
-/// carrying its own supervisor included, and reverting the publisher does not heal them: the
+/// carrying its own agent included, and reverting the publisher does not heal them: the
 /// rejections outlive it, and only fresh bytes can be offered again.
 pub(crate) const MANIFEST_SCHEMA: u32 = 1;
 const MANIFEST_BYTES_LIMIT: u64 = 4 << 20;
@@ -281,7 +281,7 @@ pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleMan
     Ok((manifest, entrypoint))
 }
 
-/// Re-hash a committed release without exposing its manifest internals. Supervisors use
+/// Re-hash a committed release without exposing its manifest internals. Agents use
 /// this before every network refresh so local tampering is detected while fully offline.
 pub fn verify_release(root: &Path, id: &ReleaseId) -> io::Result<()> {
     read_release(root, id).map(|_| ())
@@ -306,7 +306,7 @@ pub fn write_active(path: &Path, release: &ReleaseId) -> io::Result<()> {
 /// Why materializing a downloaded archive failed — split by what the failure is *evidence about*.
 ///
 /// This distinction is load-bearing and deliberately typed so it survives every crate boundary
-/// between here and the supervisor's rejection set:
+/// between here and the agent's rejection set:
 ///
 /// * [`Archive`](Self::Archive) is a verdict on the bytes. Only this may become a durable,
 ///   never-expiring rejection of a release, because only this is reproducible on every node and
@@ -464,7 +464,7 @@ const CLAIM_ATTEMPTS: usize = 4;
 /// One staging attempt's private extraction directory.
 ///
 /// Isolation is by construction, not by exclusion: the directory is named with a fresh random
-/// token, so no two attempts — in this process, in another supervisor generation across a
+/// token, so no two attempts — in this process, in another agent generation across a
 /// self-update, or in a tool run by hand — can ever name the same path. There is no lock to
 /// contend on, no heartbeat to miss and no staleness threshold to tune, so concurrent staging
 /// cannot fail, cannot delete another attempt's tree, and cannot be refused.
@@ -1081,7 +1081,7 @@ mod tests {
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
     }
 
-    /// Two attempts staging into one staging root at the same time — two supervisor generations
+    /// Two attempts staging into one staging root at the same time — two agent generations
     /// across a self-update, or a hand-run tool — must not interact at all: neither is refused,
     /// and neither's live tree is touched by the other's sweep.
     #[test]
@@ -1384,7 +1384,7 @@ mod tests {
     }
 
     /// An archive whose entries collide on a destination path is malformed *bytes* — reproducible
-    /// on every node and every retry — so it must be an `Archive` verdict the supervisor can
+    /// on every node and every retry — so it must be an `Archive` verdict the agent can
     /// reject and descend past. Classified as `Storage` (which is what a bare `?` on
     /// `create_new`/`create_dir_all` yields) the same bad version is retried on every boot forever
     /// and the ordered fallback never runs.

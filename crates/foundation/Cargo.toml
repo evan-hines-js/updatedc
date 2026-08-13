@@ -4,12 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# Shared mechanisms only. Keep this crate usable by the permanent guardian: no
+# Shared mechanisms only. Keep this crate usable by the permanent launcher: no
 # serialization, async runtime, crypto policy, configuration, or application crates.
 # Platform binding crates are the sole permitted dependencies (they are ABI-correct
 # type/constant/function declarations, not behaviour) — the `process` module's
 # process-group/job-object containment needs them. Routine tower changes must remain
-# deployable against an older statically linked guardian. A rare guardian/OS release may
+# deployable against an older statically linked launcher. A rare launcher/OS release may
 # coordinate a new tower baseline.
 
 [target.'cfg(unix)'.dependencies]

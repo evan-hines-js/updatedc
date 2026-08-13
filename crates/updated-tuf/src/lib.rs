@@ -118,7 +118,7 @@ mod error_tests {
             storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
-                inactive_supervisors: 1,
+                inactive_agents: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
@@ -129,7 +129,7 @@ mod error_tests {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
-                supervisor_check_interval_seconds: 1,
+                agent_check_interval_seconds: 1,
             },
         }
     }
@@ -224,7 +224,7 @@ mod error_tests {
     /// The enrollment bundle is written once and never rewritten, so every long-lived node
     /// eventually holds an expired embedded chain. A node that has since resolved and persisted a
     /// live routing assignment must still boot on it: the alternative — the state this replaces —
-    /// was a hard trust failure out of option parsing, a crash-looping supervisor, a stopped
+    /// was a hard trust failure out of option parsing, a crash-looping agent, a stopped
     /// application, and no update loop to ever fix it.
     #[test]
     fn an_expired_enrollment_bundle_still_boots_a_node_that_has_live_state() {
@@ -315,7 +315,7 @@ mod error_tests {
             storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
-                inactive_supervisors: 1,
+                inactive_agents: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
@@ -326,7 +326,7 @@ mod error_tests {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
-                supervisor_check_interval_seconds: 1,
+                agent_check_interval_seconds: 1,
             },
         };
         let assignment = |metadata: &str, targets: &str| RepositoryAssignment {
@@ -386,7 +386,7 @@ mod error_tests {
                 storage: updated_contracts::assignment::ManagedStorage {
                     inactive_releases: 1,
                     inactive_providers: 1,
-                    inactive_supervisors: 1,
+                    inactive_agents: 1,
                     inactive_bytes: 1,
                     inactive_repository_caches: 1,
                 },
@@ -397,7 +397,7 @@ mod error_tests {
                     health_interval_seconds: 1,
                     refresh_retry_seconds: 1,
                     confirmation_window_seconds: 1,
-                    supervisor_check_interval_seconds: 1,
+                    agent_check_interval_seconds: 1,
                 },
             },
         };
@@ -624,21 +624,21 @@ pub struct TrustedRepository {
 /// The caller supplies a durable enrollment state directory; no managed install path
 /// is consulted until after the assignment has passed TUF verification.
 pub async fn resolve_managed_config(
-    bootstrap_path: &Path,
+    config_path: &Path,
     enrollment_state: &Path,
 ) -> Result<updated::config::Config, Error> {
-    let bootstrap = updated::enrollment::BootstrapConfig::load(bootstrap_path)
-        .map_err(|error| Error::Local(format!("loading bootstrap config: {error}")))?;
+    let config = updated::enrollment::NodeConfig::load(config_path)
+        .map_err(|error| Error::Local(format!("loading the node config: {error}")))?;
     // The gateway that serves routing and release metadata is the same externally-exposed listener
     // the agent enrolled through, so ongoing fetches present the same mTLS identity: the per-node
     // certificate the node minted at `/enroll`. The refresh policy is given it too, since catching a
     // lagging pin up means reading the repository's published versioned roots.
-    let mtls = bootstrap
+    let mtls = config
         .enrollment
         .steady_identity(enrollment_state)
         .map_err(|error| Error::Local(format!("resolving steady-state mTLS identity: {error}")))?;
     let bundle = updated::enrollment::load_or_enroll_http(
-        &bootstrap,
+        &config,
         enrollment_state,
         &EmbeddedChainPolicy::new(mtls.clone()),
     )
@@ -661,7 +661,7 @@ pub async fn resolve_managed_config(
     // The enrollment bundle carries the assignment as of enrollment. Once the node has resolved a
     // live routing assignment (persisted by the update loop), THAT is the current managed config:
     // a control-plane reassignment changes the launch spec, health checks, cadence, and retention,
-    // and the running supervisor must boot on those, not the enrollment-frozen values. The embedded
+    // and the running agent must boot on those, not the enrollment-frozen values. The embedded
     // assignment seeds only the very first boot, before any live resolution — and the loop still
     // re-verifies and reconciles the live assignment every cycle, so a stale or tampered persisted
     // file is corrected within one tick. Any read/parse/validate failure falls back to embedded,
@@ -784,7 +784,7 @@ impl LiveAssignment {
 /// actually fetch from, and leaves the node where the enrollment bundle put it. The persisted file
 /// is local state this boot cannot re-verify, so it may refine the assignment the enrollment
 /// bundle authenticated but never relocate the node: an `install_root` read out of it would move
-/// the binary, state, journal, and rejection set the guardian and supervisor operate on.
+/// the binary, state, journal, and rejection set the launcher and agent operate on.
 fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAssignment {
     let path = updated::config::persisted_assignment_path(enrollment_state);
     let bytes = match std::fs::read(&path) {
@@ -818,7 +818,7 @@ fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAss
 /// a node can boot on it are node-local and no publisher can check them: whether this build can
 /// fetch from the endpoints it names, and whether it leaves the node where the enrollment bundle
 /// put it. An `install_root` taken out of such a document would move the binary, state, journal and
-/// rejection set the guardian and supervisor operate on.
+/// rejection set the launcher and agent operate on.
 ///
 /// The writer that commits a freshly resolved document and the reader that boots on the committed
 /// one both come through here, so no document can become the live config by a route that skips a
@@ -869,7 +869,7 @@ pub fn verify_embedded_assignment(
 /// control-plane request replacing it.
 ///
 /// Generous on purpose. The material is checked on the boot path and then every 12 hours by the
-/// supervisor's identity tick, so a window of days means an ordinary node replaces its chain long
+/// agent's identity tick, so a window of days means an ordinary node replaces its chain long
 /// before it matters and a node that is offline, or whose gateway is down, gets many attempts before
 /// its bundle stops counting as current. Nothing breaks the moment it lapses — an expired bundle
 /// still pins the root of trust and the install root, and a node with live state boots on it — so
@@ -903,7 +903,7 @@ const ROOT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`ROOT_FETCH_TIMEOUT`] resets on every byte, so a gateway that trickles one byte just under it
 /// holds a single fetch open until the 64 MiB metadata floor is reached — and the walk is up to
 /// [`MAX_ROOT_CATCH_UP`] such fetches, run in sequence, awaited inline on the boot path and in the
-/// supervisor's single control loop. Without one deadline over the whole walk a node stops probing
+/// agent's single control loop. Without one deadline over the whole walk a node stops probing
 /// and reporting health while still looking alive, which is the failure the control-plane deadline
 /// on the other two gateway calls exists to prevent.
 ///
@@ -1082,7 +1082,7 @@ impl updated::enrollment::BundlePolicy for EmbeddedChainPolicy {
     /// deployment: it stops asking for bundles at all, so no later refresh — not even from a
     /// restored gateway — can undo it, and routing resolution fails as a retryable transport error
     /// forever. Pinning it means a genuine gateway relocation is not adoptable by refresh, which is
-    /// correct: the refresh endpoint itself is reached through the node's bootstrap configuration,
+    /// correct: the refresh endpoint itself is reached through the node's local configuration,
     /// not this field, so moving the fleet's routing origin is a re-enrollment, not a metadata
     /// rotation.
     ///
@@ -1570,7 +1570,7 @@ const ROUTING_TARGET_LIMIT: u64 = {
 /// release repository's limit, no signed assignment or operator setting can raise it once it is
 /// too low. Exceeding it does not degrade one node: it aborts the `targets.json` fetch on every
 /// node at once, so the whole fleet stops resolving assignments simultaneously and the fix — a new
-/// supervisor binary — can no longer be delivered through the update path it broke. This floor
+/// agent binary — can no longer be delivered through the update path it broke. This floor
 /// puts that cliff past a hundred thousand nodes; a caller that wants more may still ask for more.
 const ROUTING_METADATA_FLOOR: u64 = 64 * 1024 * 1024;
 

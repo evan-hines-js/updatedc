@@ -1,0 +1,40 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "updated-agent"
+path = "src/main.rs"
+
+[features]
+# Deterministic crash injection at update-transaction boundaries, for the e2e's
+# crash-recovery scenarios. OFF by default so production binaries contain no injection
+# points at all — a stray `UPDATED_CHAOS_POINT` can never crash a real agent.
+chaos = []
+# Build the whole agent against FIPS-validated crypto. Propagates to the shared aws-lc-rs/rustls.
+fips = ["updated/fips", "updated-tuf/fips"]
+
+[dependencies]
+foundation = { path = "../foundation" }
+updated = { path = "../updated" }
+updated-contracts = { path = "../updated-contracts" }
+updated-tuf = { path = "../updated-tuf" }
+# The disposable agent drives the launcher over the frozen control protocol.
+control = { path = "../control" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+
+# Re-arming FD_CLOEXEC on the inherited control-channel endpoint, so it stops at this
+# process instead of leaking into the operator's lifecycle provider.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -3,7 +3,7 @@
 //! - `init`    mint the five ed25519 role keys and an empty signed repository.
 //! - `publish-app` build and publish application bundles.
 //! - `publish-provider-artifact` alias of `publish-app` for provider binaries.
-//! - `publish-supervisor` publish supervisor bootstrap binaries.
+//! - `publish-agent` publish agent binaries.
 //! - `publish-provider-set` publish an immutable exact provider collection.
 //! - `publish-assignment` publish an exact desired deployment last.
 //! - `export-enrollment` write the enrollment bundle a node boots from.
@@ -37,7 +37,7 @@ async fn main() {
     let result = match cmd {
         "init" => init(rest).await,
         "publish-app" | "publish-provider-artifact" => publish(rest, true).await,
-        "publish-supervisor" => publish(rest, false).await,
+        "publish-agent" => publish(rest, false).await,
         "publish-provider-set" => publish_provider_set(rest).await,
         "publish-assignment" => publish_assignment(rest).await,
         "export-enrollment" => export_enrollment(rest),
@@ -47,7 +47,7 @@ async fn main() {
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|publish-app|publish-provider-artifact|publish-supervisor|publish-provider-set|publish-assignment|export-enrollment|target-sha256|gen-certs|serve> [flags]"
+                "usage: server <init|publish-app|publish-provider-artifact|publish-agent|publish-provider-set|publish-assignment|export-enrollment|target-sha256|gen-certs|serve> [flags]"
             );
             exit(2);
         }
@@ -322,7 +322,7 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
     let component = if application_bundle {
         product.clone()
     } else {
-        "supervisor".into()
+        "agent".into()
     };
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
 
@@ -1230,7 +1230,7 @@ mod tests {
             storage: ManagedStorage {
                 inactive_releases: 2,
                 inactive_providers: 2,
-                inactive_supervisors: 2,
+                inactive_agents: 2,
                 inactive_bytes: 1 << 30,
                 inactive_repository_caches: 2,
             },
@@ -1241,7 +1241,7 @@ mod tests {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
-                supervisor_check_interval_seconds: 3600,
+                agent_check_interval_seconds: 3600,
             },
         }
     }

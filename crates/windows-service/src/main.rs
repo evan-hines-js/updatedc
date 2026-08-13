@@ -1,14 +1,14 @@
-//! Native Windows SCM host for the installer-owned bootstrap.
+//! Native Windows SCM host for the installer-owned launcher.
 //!
-//! The service owns only the bootstrap, and owns it as a contained tree: it is spawned into a
-//! kill-on-close job object, so a bootstrap can never outlive the service process that reports
+//! The service owns only the launcher, and owns it as a contained tree: it is spawned into a
+//! kill-on-close job object, so a launcher can never outlive the service process that reports
 //! its state to the SCM. That is what keeps the single-launcher invariant true across the SCM's
 //! recovery restarts — a second service process would otherwise launch a second launcher over
 //! the same state directory.
 //!
-//! It reports a bootstrap that exits on its own to the SCM as a service failure — restarts are
+//! It reports a launcher that exits on its own to the SCM as a service failure — restarts are
 //! the SCM's recovery actions, not a second loop in here — and translates SERVICE_CONTROL_STOP
-//! into CTRL_BREAK for the bootstrap's process group.
+//! into CTRL_BREAK for the launcher's process group.
 
 #[cfg(not(windows))]
 fn main() {
@@ -30,9 +30,9 @@ mod windows {
 
     use foundation::process::ContainedChild;
 
-    const SERVICE_NAME: &str = "SelfUpdateSupervisor";
+    const SERVICE_NAME: &str = "SelfUpdateAgent";
     const STOP_GRACE: Duration = Duration::from_secs(20);
-    /// How often the bootstrap is re-checked while watching it and while stopping it.
+    /// How often the launcher is re-checked while watching it and while stopping it.
     const POLL: Duration = Duration::from_millis(100);
     static STOP: AtomicBool = AtomicBool::new(false);
     static STATUS: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
@@ -40,12 +40,12 @@ mod windows {
 
     #[derive(Clone, Debug)]
     struct Args {
-        bootstrap: OsString,
+        launcher: OsString,
         state_dir: OsString,
-        /// Forwarded only when given: the bootstrap owns the canonical default, so this
+        /// Forwarded only when given: the launcher owns the canonical default, so this
         /// wrapper never needs to know where a node's config lives.
-        supervisor_config: Option<OsString>,
-        supervisor: OsString,
+        config: Option<OsString>,
+        agent: OsString,
     }
 
     pub fn main() {
@@ -83,34 +83,32 @@ mod windows {
     }
 
     /// Every flag here takes a value, and a flag without one is an error — including the
-    /// optional `--supervisor-config`. Treating a valueless flag as "not given" would silently
-    /// fall back to the bootstrap's canonical config path while the SCM reports SERVICE_RUNNING,
-    /// making this wrapper weaker than the bootstrap it fronts, which rejects the same input.
+    /// optional `--config`. Treating a valueless flag as "not given" would silently
+    /// fall back to the launcher's canonical config path while the SCM reports SERVICE_RUNNING,
+    /// making this wrapper weaker than the launcher it fronts, which rejects the same input.
     fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
-        let mut bootstrap = None;
+        let mut launcher = None;
         let mut state_dir = None;
-        let mut supervisor_config = None;
-        let mut supervisor = None;
+        let mut config = None;
+        let mut agent = None;
         fn value(it: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<OsString, String> {
             it.next().ok_or_else(|| format!("{flag} needs a value"))
         }
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.to_string_lossy().as_ref() {
-                "--bootstrap" => bootstrap = Some(value(&mut it, "--bootstrap")?),
+                "--launcher" => launcher = Some(value(&mut it, "--launcher")?),
                 "--state-dir" => state_dir = Some(value(&mut it, "--state-dir")?),
-                "--supervisor-config" => {
-                    supervisor_config = Some(value(&mut it, "--supervisor-config")?)
-                }
-                "--supervisor" => supervisor = Some(value(&mut it, "--supervisor")?),
+                "--config" => config = Some(value(&mut it, "--config")?),
+                "--agent" => agent = Some(value(&mut it, "--agent")?),
                 other => return Err(format!("unknown argument {other:?}")),
             }
         }
         Ok(Args {
-            bootstrap: bootstrap.ok_or("--bootstrap <path> is required")?,
+            launcher: launcher.ok_or("--launcher <path> is required")?,
             state_dir: state_dir.ok_or("--state-dir <path> is required")?,
-            supervisor_config,
-            supervisor: supervisor.ok_or("--supervisor <path> is required")?,
+            config,
+            agent: agent.ok_or("--agent <path> is required")?,
         })
     }
 
@@ -134,7 +132,7 @@ mod windows {
             NO_ERROR,
         );
         // Report the outcome to the SCM, not just to stderr: `sc failure`/`sc failureflag`
-        // recovery actions (see deploy/windows/install-selfupdate-supervisor.bat) fire only
+        // recovery actions (see deploy/windows/install-updated-agent.bat) fire only
         // on a STOPPED report carrying a non-zero exit code. Reporting a clean stop after a
         // failure leaves the whole stack down with the SCM believing all is well.
         let exit = run_service();
@@ -175,94 +173,94 @@ mod windows {
         NO_ERROR
     }
 
-    /// Restarting a bootstrap that will not spawn is the SCM's job, not ours: reporting the
+    /// Restarting a launcher that will not spawn is the SCM's job, not ours: reporting the
     /// failure (see `report`) triggers the `sc failure` recovery actions the installer
     /// configures, which retry with escalating backoff and give up cleanly. Retrying in
     /// here as well would be a second restart path that reports success while looping.
     fn run_service() -> Result<(), String> {
-        let mut child = spawn_bootstrap()?;
+        let mut child = spawn_launcher()?;
         if monitor(&mut child) {
             return Ok(());
         }
-        // The bootstrap exited on its own. Report it as a service failure instead of restarting
+        // The launcher exited on its own. Report it as a service failure instead of restarting
         // here: the SCM's recovery actions retry with escalating backoff and eventually give up
-        // visibly, whereas an in-process retry loop restarts a bootstrap that fails immediately —
+        // visibly, whereas an in-process retry loop restarts a launcher that fails immediately —
         // forever, on a fixed delay — while the SCM is told the service is running fine.
         let status = child.try_wait().ok().flatten().and_then(|s| s.code());
         Err(match status {
-            Some(code) => format!("the bootstrap exited with code {code}"),
-            None => "the bootstrap exited".to_string(),
+            Some(code) => format!("the launcher exited with code {code}"),
+            None => "the launcher exited".to_string(),
         })
     }
 
-    /// Watch the bootstrap until a stop is requested or it exits on its own. Returns true for the
+    /// Watch the launcher until a stop is requested or it exits on its own. Returns true for the
     /// requested stop (the caller reports a clean STOPPED) and false when it exited by itself
     /// (reported to the SCM as a failure).
     ///
-    /// It never returns while the bootstrap is still running, and no failure inside it is
+    /// It never returns while the launcher is still running, and no failure inside it is
     /// propagated: a STOPPED report — clean or failed — is the moment the SCM may start another
     /// service process, and the configured recovery action does exactly that on a failure. A
-    /// bootstrap that outlived this wrapper would then meet a second guardian over the same
-    /// `--state-dir`, both owning `desired-supervisor` and `rejected-supervisor`.
+    /// launcher that outlived this wrapper would then meet a second launcher over the same
+    /// `--state-dir`, both owning `desired-agent` and `rejected-agent`.
     fn monitor(child: &mut ContainedChild) -> bool {
         loop {
             if STOP.load(Ordering::SeqCst) {
-                stop_bootstrap(child);
+                stop_launcher(child);
                 return true;
             }
             match child.try_wait() {
                 Ok(Some(_)) => return false,
                 Ok(None) => std::thread::sleep(POLL),
                 Err(error) => {
-                    // The handle is unusable, so the bootstrap can no longer be observed — it may
+                    // The handle is unusable, so the launcher can no longer be observed — it may
                     // well still be running. Take the tree down before reporting anything.
-                    eprintln!("selfupdate-service: watching the bootstrap failed ({error})");
-                    stop_bootstrap(child);
+                    eprintln!("selfupdate-service: watching the launcher failed ({error})");
+                    stop_launcher(child);
                     return false;
                 }
             }
         }
     }
 
-    /// Stop the bootstrap tree: a graceful console break first, then a hard kill of the whole
+    /// Stop the launcher tree: a graceful console break first, then a hard kill of the whole
     /// job. Returns only once it is gone, or once the kill has been issued and the wait for it
     /// has been given [`foundation::process::KILL_HEADROOM`] — the same budget the SCM was told
     /// to expect.
     ///
     /// Failures are logged, never propagated, and the last resort is structural rather than
     /// reported: the tree lives in a kill-on-close job object, so dropping `child` when this
-    /// wrapper exits takes down anything that survived. There is no path on which a bootstrap
+    /// wrapper exits takes down anything that survived. There is no path on which a launcher
     /// outlives the service process that owns it.
-    fn stop_bootstrap(child: &mut ContainedChild) {
+    fn stop_launcher(child: &mut ContainedChild) {
         // The whole sequence — graceful console break, grace, hard kill of the job, reap — is
         // `ContainedChild::stop`'s, including the decision to skip the grace when the break event
         // could not be delivered. This wrapper only reports what it took.
         match child.stop(STOP_GRACE) {
             foundation::process::Stopped::Gracefully | foundation::process::Stopped::Killed => {}
             foundation::process::Stopped::Surviving => eprintln!(
-                "selfupdate-service: the bootstrap did not exit after being killed; its \
+                "selfupdate-service: the launcher did not exit after being killed; its \
                  kill-on-close job takes it down as this process exits"
             ),
         }
     }
 
-    fn spawn_bootstrap() -> Result<ContainedChild, String> {
+    fn spawn_launcher() -> Result<ContainedChild, String> {
         let args = ARGS.get().ok_or("service arguments unavailable")?;
-        let mut command = Command::new(&args.bootstrap);
+        let mut command = Command::new(&args.launcher);
         command
             .arg("--state-dir")
             .arg(&args.state_dir)
-            .arg("--supervisor")
-            .arg(&args.supervisor);
-        if let Some(config) = &args.supervisor_config {
-            command.arg("--supervisor-config").arg(config);
+            .arg("--agent")
+            .arg(&args.agent);
+        if let Some(config) = &args.config {
+            command.arg("--config").arg(config);
         }
-        // Contained: the bootstrap and everything below it belong to a kill-on-close job object
+        // Contained: the launcher and everything below it belong to a kill-on-close job object
         // this process owns, so it can never survive the service process that reports its
-        // state to the SCM. A service has no console, so the bootstrap is given one — that is what
+        // state to the SCM. A service has no console, so the launcher is given one — that is what
         // makes `request_stop`'s graceful break addressable at all.
         ContainedChild::spawn_in_new_console(command)
-            .map_err(|e| format!("launching bootstrap {:?}: {e}", args.bootstrap))
+            .map_err(|e| format!("launching launcher {:?}: {e}", args.launcher))
     }
 
     fn report(
@@ -311,36 +309,36 @@ mod windows {
         }
 
         const REQUIRED: [&str; 6] = [
-            "--bootstrap",
+            "--launcher",
             "b.exe",
             "--state-dir",
             "state",
-            "--supervisor",
+            "--agent",
             "s.exe",
         ];
 
         #[test]
         fn trailing_optional_flag_is_rejected() {
             let mut args = REQUIRED.to_vec();
-            args.push("--supervisor-config");
+            args.push("--config");
             let err = parse_from(argv(&args)).unwrap_err();
-            assert_eq!(err, "--supervisor-config needs a value");
+            assert_eq!(err, "--config needs a value");
         }
 
         #[test]
         fn trailing_required_flag_is_rejected() {
-            let err = parse_from(argv(&["--bootstrap"])).unwrap_err();
-            assert_eq!(err, "--bootstrap needs a value");
+            let err = parse_from(argv(&["--launcher"])).unwrap_err();
+            assert_eq!(err, "--launcher needs a value");
         }
 
         #[test]
         fn full_command_line_parses() {
             let mut args = REQUIRED.to_vec();
-            args.extend(["--supervisor-config", "c.toml"]);
+            args.extend(["--config", "c.toml"]);
             let parsed = parse_from(argv(&args)).expect("parses");
-            assert_eq!(parsed.bootstrap, OsString::from("b.exe"));
-            assert_eq!(parsed.supervisor_config, Some(OsString::from("c.toml")));
-            assert_eq!(parsed.supervisor, OsString::from("s.exe"));
+            assert_eq!(parsed.launcher, OsString::from("b.exe"));
+            assert_eq!(parsed.config, Some(OsString::from("c.toml")));
+            assert_eq!(parsed.agent, OsString::from("s.exe"));
         }
     }
 }

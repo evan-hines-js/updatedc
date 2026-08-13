@@ -506,7 +506,7 @@ fn resolve_one(
             return false;
         };
         let identity = crate::deployment_identity(&producer.deployment);
-        // And it must be RUNNING what that configuration installs. The supervisor stamps the
+        // And it must be RUNNING what that configuration installs. The agent stamps the
         // assignment it RESOLVED, so a producer that fetched the new assignment and installed
         // nothing — or attempted it and rolled itself back — reports healthy on the new identity
         // while executing the predecessor's bytes, and its outputs are read off the predecessor's

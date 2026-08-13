@@ -19,7 +19,7 @@ No new channel. The evidence is what nodes already assert through the signed `No
 
 - A node assigned deployment X that reports the predecessor's `archive_sha256` with
   `settled=true` after its report previously showed X with an update transaction in flight has
-  attempted X and rolled back. This is the report sequence the supervisor already publishes: the
+  attempted X and rolled back. This is the report sequence the agent already publishes: the
   heartbeat emits every tick, `settled=false` with `updating=true` during the confirmation
   window, and the committed digest after commit or rollback. `updating` is reported separately
   from `settled` because an unsettled report also covers an ordinary readiness failure with no

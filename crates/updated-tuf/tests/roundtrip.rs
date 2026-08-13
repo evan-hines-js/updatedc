@@ -79,7 +79,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         storage: updated_contracts::assignment::ManagedStorage {
             inactive_releases: 2,
             inactive_providers: 2,
-            inactive_supervisors: 2,
+            inactive_agents: 2,
             inactive_bytes: 1024 * 1024,
             inactive_repository_caches: 2,
         },
@@ -90,7 +90,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             health_interval_seconds: 1,
             refresh_retry_seconds: 5,
             confirmation_window_seconds: 5,
-            supervisor_check_interval_seconds: 5,
+            agent_check_interval_seconds: 5,
         },
     };
     let assignment = updated_contracts::assignment::RepositoryAssignment {
@@ -195,9 +195,9 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
             managed_configuration: String::from_utf8(config_bytes).unwrap(),
         },
     };
-    let bootstrap = tmp.join("bootstrap.toml");
+    let config_path = tmp.join("config.toml");
     std::fs::write(
-        &bootstrap,
+        &config_path,
         "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
     )
     .unwrap();
@@ -213,7 +213,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         serde_json::to_vec(&bundle).unwrap(),
     )
     .unwrap();
-    let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
+    let config = updated_tuf::resolve_managed_config(&config_path, &enrollment_state)
         .await
         .unwrap();
     assert_eq!(config.application.product, "offline-app");
@@ -238,16 +238,16 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
     )
     .unwrap();
     // A node boots only on a bundle issued for the agent it is configured to enroll as, so this
-    // second agent needs its own bootstrap — reusing `offline`'s would be the split identity the
+    // second agent needs its own config — reusing `offline`'s would be the split identity the
     // enrollment path fails closed on, and would never reach the digest-casing behavior under test.
-    let uppercase_bootstrap = tmp.join("bootstrap-uppercase.toml");
+    let uppercase_config_path = tmp.join("config-uppercase.toml");
     std::fs::write(
-        &uppercase_bootstrap,
+        &uppercase_config_path,
         "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline-uppercase'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
     )
     .unwrap();
     let uppercase_config =
-        updated_tuf::resolve_managed_config(&uppercase_bootstrap, &uppercase_state)
+        updated_tuf::resolve_managed_config(&uppercase_config_path, &uppercase_state)
             .await
             .unwrap();
     assert_eq!(uppercase_config.application.product, "offline-app");
@@ -269,7 +269,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         serde_json::to_vec(&hostile).unwrap(),
     )
     .unwrap();
-    let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
+    let config = updated_tuf::resolve_managed_config(&config_path, &enrollment_state)
         .await
         .unwrap();
     assert!(
@@ -284,7 +284,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         serde_json::to_vec(&hostile).unwrap(),
     )
     .unwrap();
-    let config = updated_tuf::resolve_managed_config(&bootstrap, &enrollment_state)
+    let config = updated_tuf::resolve_managed_config(&config_path, &enrollment_state)
         .await
         .unwrap();
     assert_eq!(config.application.secrets.len(), 1);
@@ -308,7 +308,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         serde_json::to_vec(&tampered).unwrap(),
     )
     .unwrap();
-    let error = updated_tuf::resolve_managed_config(&bootstrap, &tampered_state)
+    let error = updated_tuf::resolve_managed_config(&config_path, &tampered_state)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("digest mismatch"), "{error}");
@@ -369,7 +369,7 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
                 storage: updated_contracts::assignment::ManagedStorage {
                     inactive_releases: 2,
                     inactive_providers: 2,
-                    inactive_supervisors: 2,
+                    inactive_agents: 2,
                     inactive_bytes: 1024 * 1024,
                     inactive_repository_caches: 2,
                 },
@@ -380,7 +380,7 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
                     health_interval_seconds: 1,
                     refresh_retry_seconds: 5,
                     confirmation_window_seconds: 5,
-                    supervisor_check_interval_seconds: 5,
+                    agent_check_interval_seconds: 5,
                 },
             },
         }
@@ -626,7 +626,7 @@ async fn publish_then_verify_and_download() {
         .unwrap();
 
     // Re-acquiring the repository against the same datastore — exactly what the
-    // supervisor and one-shot updater do each cycle — refreshes the metadata chain and
+    // agent and one-shot updater do each cycle — refreshes the metadata chain and
     // surfaces the newly published release. There is one path to fresh metadata.
     let repo = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds"))
         .await
@@ -729,7 +729,7 @@ async fn publish_then_verify_and_download() {
     assert_eq!(current[0].path, "assignments/agents/current.json");
 }
 
-/// A download killed mid-stream — SIGKILL from the guardian, a reboot, power loss — leaves its
+/// A download killed mid-stream — SIGKILL from the launcher, a reboot, power loss — leaves its
 /// full-size staging temp behind, and nothing outside this crate reclaims it: the staging roots
 /// hold fixed destination files rather than per-attempt directories, so the bundle sweep and the
 /// directory pruner never see them. Without the sweep here a crash-looping node accumulates one

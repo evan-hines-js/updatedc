@@ -18,7 +18,7 @@ fn runtime() -> RuntimeSpec {
         storage: StorageSpec {
             inactive_releases: 2,
             inactive_providers: 2,
-            inactive_supervisors: 2,
+            inactive_agents: 2,
             inactive_bytes: 1_073_741_824,
             inactive_repository_caches: 2,
         },
@@ -29,7 +29,7 @@ fn runtime() -> RuntimeSpec {
             health_interval_seconds: 1,
             refresh_retry_seconds: 2,
             confirmation_window_seconds: 2,
-            supervisor_check_interval_seconds: 3600,
+            agent_check_interval_seconds: 3600,
         },
     }
 }

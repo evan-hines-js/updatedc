@@ -4,10 +4,10 @@
 //! (the published contract a third-party author writes against is
 //! `docs/node-reconciler-protocol.md`).
 //! The protocol has exactly four operations and three reserved
-//! attempt identities, and this module is their single definition: the supervisor that
+//! attempt identities, and this module is their single definition: the agent that
 //! *invokes* a reconciler, and every reconciler implementation in this workspace that
 //! *answers* one, name them from here. A second spelling of `healthcheck` — a reconciler
-//! that answers `verify` while the supervisor asks for `healthcheck` — is exactly the
+//! that answers `verify` while the agent asks for `healthcheck` — is exactly the
 //! silent drift this module exists to make impossible.
 
 use std::fmt;
@@ -99,7 +99,7 @@ pub const FLAGS: &[&str] = &[
 pub mod attempt {
     /// A boot or restart: the per-boot converge and the boot readiness gate.
     pub const BOOT: &str = "boot";
-    /// The supervisor's steady-state readiness/liveness observation.
+    /// The agent's steady-state readiness/liveness observation.
     pub const PERIODIC: &str = "periodic";
     /// The steady-state fingerprint observation.
     pub const FINGERPRINT: &str = "fingerprint";

@@ -2,13 +2,13 @@
 //! killed as a unit — a Unix process group, a Windows job object.
 //!
 //! This is the one home for that primitive. A caller that runs an untrusted or
-//! long-running helper (the supervisor's lifecycle-hook runner is the motivating case)
+//! long-running helper (the agent's lifecycle-hook runner is the motivating case)
 //! must be able to time it out and take down *the whole tree* it spawned, not just the
 //! immediate child — otherwise a wrapper shell dies while the `curl`/vendor-CLI it
 //! launched keeps running. Re-implementing that per-OS at each call site is exactly the
 //! kind of platform leak this crate exists to prevent.
 //!
-//! The permanent guardian owns application processes through its own lower-level `sys`
+//! The permanent launcher owns application processes through its own lower-level `sys`
 //! seam (it drives a raw suspended-spawn/assign/resume on Windows for a stronger no-orphan
 //! guarantee); this module is the portable, `std::process::Command`-based containment used
 //! by the churning tower.
@@ -258,9 +258,9 @@ impl ContainedChild {
 
 /// Additively arrange for a child spawned from `command` to be killed if THIS process
 /// dies — parent-death containment for a child that is *not* wrapped in [`ContainedChild`],
-/// such as the guardian's disposable supervisor. On Linux this installs a `pre_exec` hook
+/// such as the launcher's disposable agent. On Linux this installs a `pre_exec` hook
 /// setting `PR_SET_PDEATHSIG(SIGKILL)` and re-checks the parent immediately after, closing
-/// the fork/exec race where the guardian already died before the signal was armed. Off
+/// the fork/exec race where the launcher already died before the signal was armed. Off
 /// Linux it is a no-op — macOS is a dev/test target, and Windows death-containment is a
 /// kill-on-close job object ([`ContainedChild`]) rather than a signal.
 ///
@@ -283,7 +283,7 @@ pub fn arrange_parent_death_signal(command: &mut Command) {
                     0,
                     0,
                 );
-                // If the guardian already died between fork and here, the signal will never
+                // If the launcher already died between fork and here, the signal will never
                 // arrive; check the parent is still who we expect and self-exit if not.
                 if libc::getppid() != expected_ppid {
                     libc::_exit(0);
@@ -361,8 +361,8 @@ mod unix {
     }
 }
 
-/// Shared kill-on-close job-object setup: the guardian's suspended-spawn adapter
-/// (`bootstrap::sys::windows`) assigns to the job differently than this crate's
+/// Shared kill-on-close job-object setup: the launcher's suspended-spawn adapter
+/// (`launcher::sys::windows`) assigns to the job differently than this crate's
 /// `Command`-based containment but needs the identical creation, so it lives here once.
 #[cfg(windows)]
 pub use windows::create_kill_on_close_job;

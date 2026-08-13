@@ -20,7 +20,7 @@ use rcgen::{
 const TRUST_DOMAIN: &str = "updated.fleet";
 
 /// Default validity of a minted leaf certificate. Bounded so a leaked leaf is time-limited;
-/// supervisors renew through the authenticated `/renew` endpoint during the final 30 days.
+/// agents renew through the authenticated `/renew` endpoint during the final 30 days.
 const LEAF_CERT_TTL_DAYS: i64 = 90;
 
 /// The full identity a minted node leaf carries in its URI SAN: which repository the node enrolled

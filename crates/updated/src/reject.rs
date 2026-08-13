@@ -35,7 +35,7 @@ impl Rejections {
     /// Record `hash` as rejected (persisted immediately). Validated on the way in with the
     /// same rule [`Rejections::load`] enforces on the way out: a key that `save` accepts
     /// but `load` refuses would fail every subsequent start, and the rejection record is
-    /// read before anything else the supervisor does.
+    /// read before anything else the agent does.
     pub fn reject(&mut self, hash: &str) -> std::io::Result<()> {
         let hash = digest_key(hash)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -94,7 +94,7 @@ fn override_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Whether `hash` is a well-formed rejection key: a plain SHA-256 digest (supervisor
+/// Whether `hash` is a well-formed rejection key: a plain SHA-256 digest (agent
 /// candidates) or `repository-lineage:digest` (application candidates). The single
 /// definition of that grammar — callers that must know in advance whether
 /// [`Rejections::reject`] would accept a key ask here rather than restating it.
@@ -105,7 +105,7 @@ pub fn is_rejection_key(hash: &str) -> bool {
         })
 }
 
-/// Canonical rejection key. Supervisor candidates use their plain digest; application
+/// Canonical rejection key. Agent candidates use their plain digest; application
 /// candidates use `repository-lineage:digest`, preventing a rejection in one metadata
 /// lineage from poisoning a different lineage that happens to reuse the same bytes.
 fn digest_key(hash: &str) -> Result<String, String> {
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn reject_refuses_what_load_would_fail_closed_on() {
         // save() must never be able to write a record load() rejects: the record is read
-        // before anything else the supervisor does, so one bad key would be a permanent,
+        // before anything else the agent does, so one bad key would be a permanent,
         // un-restartable crash loop rather than one failed rejection.
         let (_dir, path) = tmp();
         let mut r = Rejections::load(&path).unwrap();

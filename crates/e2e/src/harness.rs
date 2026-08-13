@@ -111,11 +111,11 @@ pub struct Ctx {
     /// Cargo's build-output dir for this driver. `e2e` uses the shared `target/`; a differently
     /// named driver (the kill fuzzer) gets its own `target/<name>-cargo` so its `cargo build`
     /// never unlinks a shared `target/release/*` artifact out from under a concurrent e2e run
-    /// (which surfaced as the launcher's transient `inspecting supervisor: No such file`).
+    /// (which surfaced as the launcher's transient `inspecting agent: No such file`).
     pub target: PathBuf,
     pub server: PathBuf,
-    pub supervisor: PathBuf,
-    pub bootstrap: PathBuf,
+    pub agent: PathBuf,
+    pub launcher: PathBuf,
     /// Rust's own OS-arch key, e.g. `macos-aarch64` / `windows-x86_64`; matches
     /// what the agent sends and the server keys manifests by.
     pub platkey: String,
@@ -128,10 +128,10 @@ pub struct Ctx {
 /// The cargo features every agent build in the run uses: `chaos` for the crash-injection
 /// points the recovery scenarios need, plus `fips` under `E2E_FIPS` so the agents the
 /// self-update scenarios publish and run link the validated provider too — the same binary
-/// shape as `Ctx::supervisor`. One source of truth, so no agent fixture can silently
+/// shape as `Ctx::agent`. One source of truth, so no agent fixture can silently
 /// drop out of FIPS mode (and so feature unification never rebuilds the agent between
 /// fixtures).
-pub fn supervisor_features(fips: bool) -> &'static [&'static str] {
+pub fn agent_features(fips: bool) -> &'static [&'static str] {
     if fips {
         &["chaos", "fips"]
     } else {
@@ -160,7 +160,7 @@ impl Ctx {
         // Every driver builds into its own `target/<name>-cargo`, so concurrent `cargo build`s
         // (and the dev tree's own `target/`) never unlink a shared `target/release/*` artifact out
         // from under each other — the collision that surfaced as the launcher's transient
-        // `inspecting supervisor: No such file`. Point cargo (via `CARGO_TARGET_DIR`) and every
+        // `inspecting agent: No such file`. Point cargo (via `CARGO_TARGET_DIR`) and every
         // built-artifact path below at the same dir so builds and copies agree.
         let target = root.join(format!("target/{name}-cargo"));
         std::env::set_var("CARGO_TARGET_DIR", &target);
@@ -206,11 +206,11 @@ impl Ctx {
         Ok(Ctx {
             _run_lock: run_lock,
             server: bin("server"),
-            // The canonical chaos-enabled supervisor is copied here by `build()`.
+            // The canonical chaos-enabled agent is copied here by `build()`.
             // Versioned self-update fixture builds reuse Cargo's target path, so no
             // scenario may execute that mutable build output directly.
-            supervisor: work.join(format!("build/supervisor-chaos{exe}")),
-            bootstrap: bin("bootstrap"),
+            agent: work.join(format!("build/agent-chaos{exe}")),
+            launcher: bin("updated-launcher"),
             platkey: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             exe,
             work,
@@ -240,24 +240,26 @@ impl Ctx {
         ]
         .concat();
         cargo(&self.root, &crypto_cdn)?;
-        cargo(&self.root, &["build", "--release", "-p", "bootstrap"])?;
+        cargo(&self.root, &["build", "--release", "-p", "launcher"])?;
         // Same package, env and features as every versioned agent fixture; only the
         // staged name differs.
         self.build_and_stage(
-            "supervisor",
+            "agent",
+            "updated-agent",
             &[],
-            supervisor_features(self.fips),
-            "supervisor-chaos",
+            agent_features(self.fips),
+            "agent-chaos",
         )?;
         Ok(())
     }
 
     /// Build one release package (with optional extra env and cargo `--features`) and stage the
     /// resulting binary at `build/<dst_stem><exe>`. The single build-then-copy path behind
-    /// `build_app`, `build_supervisor`, and the post-ready-crash variant.
+    /// `build_app`, `build_agent`, and the post-ready-crash variant.
     fn build_and_stage(
         &self,
         pkg: &str,
+        bin_stem: &str,
         env: &[(&str, &str)],
         features: &[&str],
         dst_stem: &str,
@@ -272,7 +274,7 @@ impl Ctx {
             cmd.arg("--features").arg(features.join(","));
         }
         run(&mut cmd)?;
-        let src = self.target.join(format!("release/{pkg}{}", self.exe));
+        let src = self.target.join(format!("release/{bin_stem}{}", self.exe));
         let dst = self.work.join(format!("build/{dst_stem}{}", self.exe));
         std::fs::copy(&src, &dst).map_err(str_err)?;
         Ok(dst)
@@ -280,31 +282,39 @@ impl Ctx {
 
     /// Build one version-agnostic sample binary. Release identity lives in its bundle config.
     pub fn build_app(&self, version: &str) -> R<PathBuf> {
-        self.build_and_stage("sampleapp", &[], &[], &format!("app-{version}"))
+        self.build_and_stage(
+            "sampleapp",
+            "sampleapp",
+            &[],
+            &[],
+            &format!("app-{version}"),
+        )
     }
 
-    /// Build `supervisor` with a baked version (so the bytes differ per version) and
-    /// copy it to `build/supervisor-<v><exe>`, for the self-update scenarios.
-    pub fn build_supervisor(&self, version: &str) -> R<PathBuf> {
+    /// Build `agent` with a baked version (so the bytes differ per version) and
+    /// copy it to `build/agent-<v><exe>`, for the self-update scenarios.
+    pub fn build_agent(&self, version: &str) -> R<PathBuf> {
         self.build_and_stage(
-            "supervisor",
-            &[("SUPERVISOR_VERSION", version)],
-            supervisor_features(self.fips),
-            &format!("supervisor-{version}"),
+            "agent",
+            "updated-agent",
+            &[("AGENT_VERSION", version)],
+            agent_features(self.fips),
+            &format!("agent-{version}"),
         )
     }
 
     /// Build a candidate that completes boot and signals ready, then exits
     /// before the launcher's confirmation window can commit it.
-    pub fn build_post_ready_crashing_supervisor(&self, version: &str) -> R<PathBuf> {
+    pub fn build_post_ready_crashing_agent(&self, version: &str) -> R<PathBuf> {
         self.build_and_stage(
-            "supervisor",
+            "agent",
+            "updated-agent",
             &[
-                ("SUPERVISOR_VERSION", version),
-                ("SUPERVISOR_CHAOS_EXIT_AFTER_READY", "1"),
+                ("AGENT_VERSION", version),
+                ("AGENT_CHAOS_EXIT_AFTER_READY", "1"),
             ],
-            supervisor_features(self.fips),
-            &format!("supervisor-post-ready-crash-{version}"),
+            agent_features(self.fips),
+            &format!("agent-post-ready-crash-{version}"),
         )
     }
 
@@ -325,14 +335,12 @@ impl Ctx {
     }
 
     fn list_chaos_boundaries(&self, flag: &str) -> R<Vec<String>> {
-        let out = Command::new(&self.supervisor)
+        let out = Command::new(&self.agent)
             .arg(flag)
             .output()
             .map_err(str_err)?;
         if !out.status.success() {
-            return fail(format!(
-                "`supervisor {flag}` failed (chaos feature not built?)"
-            ));
+            return fail(format!("`agent {flag}` failed (chaos feature not built?)"));
         }
         let list: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -341,7 +349,7 @@ impl Ctx {
             .map(str::to_string)
             .collect();
         if list.is_empty() {
-            return fail("supervisor reported no chaos boundaries");
+            return fail("agent reported no chaos boundaries");
         }
         Ok(list)
     }
@@ -390,13 +398,13 @@ impl Ctx {
         source: &Path,
         corrupt: Option<&str>,
     ) -> R {
-        let application = product != "supervisor";
+        let application = product != "agent";
         let mut command = Command::new(&self.server);
         command
             .arg(if application {
                 "publish-app"
             } else {
-                "publish-supervisor"
+                "publish-agent"
             })
             .arg("--repo")
             .arg(dir.join("repo"))
@@ -1065,16 +1073,16 @@ pub fn make_owner_writable(path: &Path) -> R {
 
 #[cfg(test)]
 mod tests {
-    use super::supervisor_features;
+    use super::agent_features;
 
-    /// The self-update scenarios publish and run the fixtures `build_supervisor` /
-    /// `build_post_ready_crashing_supervisor` produce, so those builds must carry `fips`
-    /// under `E2E_FIPS` exactly as `Ctx::build`'s canonical supervisor does — otherwise a
+    /// The self-update scenarios publish and run the fixtures `build_agent` /
+    /// `build_post_ready_crashing_agent` produce, so those builds must carry `fips`
+    /// under `E2E_FIPS` exactly as `Ctx::build`'s canonical agent does — otherwise a
     /// FIPS run exercises the TUF-fetch, digest-verify and staging path on default crypto.
     #[test]
-    fn every_supervisor_build_is_chaos_and_gains_fips_with_the_run() {
-        assert_eq!(supervisor_features(false), &["chaos"]);
-        assert_eq!(supervisor_features(true), &["chaos", "fips"]);
+    fn every_agent_build_is_chaos_and_gains_fips_with_the_run() {
+        assert_eq!(agent_features(false), &["chaos"]);
+        assert_eq!(agent_features(true), &["chaos", "fips"]);
     }
 }
 

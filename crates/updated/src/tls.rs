@@ -2,7 +2,7 @@
 //!
 //! The gateway is the only externally-reachable listener and it requires client auth, so every
 //! agent→gateway request — enrollment and TUF metadata/target fetches alike — presents this
-//! identity. It is built from cert/key/CA *file paths* (the bootstrap config holds paths, never
+//! identity. It is built from cert/key/CA *file paths* (the node config holds paths, never
 //! secrets) into an `aws-lc-rs` rustls client config, so there is one crypto library everywhere.
 
 use std::io;

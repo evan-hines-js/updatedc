@@ -24,21 +24,21 @@ pub const MAGIC: [u8; 4] = *b"UGRD";
 /// Version of the framing layer itself (length-prefix + preamble rules).
 pub const FRAMING_VERSION: u8 = 1;
 
-/// Where a node's `bootstrap.toml` lives — the one canonical location, defined here rather than
+/// Where a node's `config.toml` lives — the one canonical location, defined here rather than
 /// restated by each deployment adapter.
 ///
 /// A node's entire local configuration is this single file, so its location is part of the node
 /// contract rather than a per-deployment choice: an installer places it here, a lifecycle owner
 /// needs no argument to find it, and a co-resident process that must learn which fleet node it is
-/// running on has exactly one place to look. `--supervisor-config` still exists for a non-standard
+/// running on has exactly one place to look. `--config` still exists for a non-standard
 /// layout, but nothing standard should need it.
 ///
 /// Deliberately outside the writable state directory: the config is installer-owned and read-only,
 /// one of the two things that must never be forged.
 #[cfg(not(windows))]
-pub const DEFAULT_BOOTSTRAP_CONFIG: &str = "/etc/updated/bootstrap.toml";
+pub const DEFAULT_CONFIG: &str = "/etc/updated/config.toml";
 #[cfg(windows)]
-pub const DEFAULT_BOOTSTRAP_CONFIG: &str = r"C:\Program Files\updated\bootstrap.toml";
+pub const DEFAULT_CONFIG: &str = r"C:\Program Files\updated\config.toml";
 
 /// The inherited control-channel endpoint: a file-descriptor number on Unix, a handle
 /// value on Windows.
@@ -47,56 +47,56 @@ pub const CONTROL_ENV: &str = "UPDATED_CONTROL";
 /// launch reached readiness.
 pub const READY_NONCE_ENV: &str = "UPDATED_READY_NONCE";
 /// The launcher's state directory, so the agent knows where to stage a
-/// replacement agent binary (`<state>/supervisors/<id>/`).
+/// replacement agent binary (`<state>/agents/<id>/`).
 pub const STATE_DIR_ENV: &str = "UPDATED_STATE_DIR";
 
 /// Filename, under the state directory, into which the launcher writes the path of a
 /// replacement agent that failed its readiness gate (so the launcher rolled the
-/// `desired-supervisor` pointer back). The agent reads it on recovery and records
+/// `desired-agent` pointer back). The agent reads it on recovery and records
 /// the *rejection* — the launcher keeps no rejection set of its own, only this one dumb
 /// marker; deciding what it means is the agent's job.
-pub const REJECTED_SUPERVISOR_FILE: &str = "rejected-supervisor";
+pub const REJECTED_AGENT_FILE: &str = "rejected-agent";
 
 /// Filename, under the state directory, holding the path of the COMMITTED agent binary — the
 /// one the launcher launches, and the one it rolls back to when a candidate fails its readiness
 /// gate. Shared durable layout, not a wire message: the launcher moves this pointer, and the
 /// agent must read it (its staging-cache GC has to know which content-addressed directory is
 /// the launcher's rollback target, or it can delete the binary the launcher is about to need).
-pub const DESIRED_SUPERVISOR_FILE: &str = "desired-supervisor";
+pub const DESIRED_AGENT_FILE: &str = "desired-agent";
 
 /// First line of an agent pointer file, naming the frozen format of the rest.
-const SUPERVISOR_POINTER_HEADER: &str = "supervisor-v1";
+const AGENT_POINTER_HEADER: &str = "agent-v1";
 
 /// Encode an agent pointer file's contents. The path must be valid UTF-8 (state-dir paths are
 /// checked for that at startup), so the record stays plain text.
-pub fn encode_supervisor_pointer(target: &Path) -> io::Result<String> {
+pub fn encode_agent_pointer(target: &Path) -> io::Result<String> {
     let target = target
         .to_str()
-        .ok_or_else(|| io::Error::other("supervisor path is not valid UTF-8"))?;
-    Ok(format!("{SUPERVISOR_POINTER_HEADER}\n{target}\n"))
+        .ok_or_else(|| io::Error::other("agent path is not valid UTF-8"))?;
+    Ok(format!("{AGENT_POINTER_HEADER}\n{target}\n"))
 }
 
 /// Decode an agent pointer file's contents, refusing anything that is not exactly the header
 /// line followed by one non-empty path.
-fn decode_supervisor_pointer(text: &str) -> io::Result<PathBuf> {
+fn decode_agent_pointer(text: &str) -> io::Result<PathBuf> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message.to_string());
     let mut lines = text.lines();
-    if lines.next() != Some(SUPERVISOR_POINTER_HEADER) {
-        return Err(invalid("invalid supervisor pointer header"));
+    if lines.next() != Some(AGENT_POINTER_HEADER) {
+        return Err(invalid("invalid agent pointer header"));
     }
     let path = lines
         .next()
-        .ok_or_else(|| invalid("supervisor pointer path is missing"))?;
+        .ok_or_else(|| invalid("agent pointer path is missing"))?;
     if path.is_empty() || lines.next().is_some() {
-        return Err(invalid("supervisor pointer record is malformed"));
+        return Err(invalid("agent pointer record is malformed"));
     }
     Ok(PathBuf::from(path))
 }
 
 /// Read an agent pointer file, or `None` when it does not exist yet.
-pub fn read_supervisor_pointer(path: &Path) -> io::Result<Option<PathBuf>> {
+pub fn read_agent_pointer(path: &Path) -> io::Result<Option<PathBuf>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => decode_supervisor_pointer(&text).map(Some),
+        Ok(text) => decode_agent_pointer(&text).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -180,7 +180,7 @@ impl Hello {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Hand off to the staged replacement agent at this opaque path.
-    ReplaceSupervisor(OsString),
+    ReplaceAgent(OsString),
     /// This agent has initialized; the nonce proves it is *this* launch.
     Ready(Nonce),
 }
@@ -398,7 +398,7 @@ impl Request {
     fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         match self {
-            Request::ReplaceSupervisor(path) => {
+            Request::ReplaceAgent(path) => {
                 out.push(TAG_REPLACE);
                 put_os(&mut out, path)?;
             }
@@ -414,7 +414,7 @@ impl Request {
         let (&tag, body) = buf.split_first().ok_or(Error::Malformed("empty frame"))?;
         let mut at = 0usize;
         let req = match tag {
-            TAG_REPLACE => Request::ReplaceSupervisor(get_os(body, &mut at)?),
+            TAG_REPLACE => Request::ReplaceAgent(get_os(body, &mut at)?),
             TAG_READY => Request::Ready(get_nonce(body, &mut at)?),
             other => return Err(Error::UnknownTag(other)),
         };
@@ -550,8 +550,8 @@ mod tests {
 
     #[test]
     fn requests_round_trip() {
-        round_trip_request(Request::ReplaceSupervisor(OsString::from(
-            "/var/lib/app/supervisors/deadbeef/supervisor",
+        round_trip_request(Request::ReplaceAgent(OsString::from(
+            "/var/lib/app/agents/deadbeef/agent",
         )));
         round_trip_request(Request::Ready([0xABu8; 16]));
     }
@@ -698,7 +698,7 @@ mod tests {
         // identical message again. The write must fail locally instead.
         let over = OsString::from("a".repeat(MAX_STR_UNITS as usize + 1));
         assert!(matches!(
-            Request::ReplaceSupervisor(over).write(&mut Vec::new()),
+            Request::ReplaceAgent(over).write(&mut Vec::new()),
             Err(Error::Malformed(_))
         ));
 

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Execution ceiling signed into the `haproxy-lifecycle` provider set. The supervisor bounds the
+/// Execution ceiling signed into the `haproxy-lifecycle` provider set. The agent bounds the
 /// WHOLE hook invocation by it, and this reconciler is the shell program in `scripts/haproxy`:
 /// a config validation (`haproxy -c`) plus a SIGUSR2 master-worker re-exec, both sub-second, with
 /// room for a cold install unpacking the bundle on a loaded demo cluster. It is deliberately not
@@ -351,7 +351,7 @@ fn haproxy_group_deployment(
         "healthIntervalSeconds": 1,
         "refreshRetrySeconds": 1,
         "confirmationWindowSeconds": 3,
-        "supervisorCheckIntervalSeconds": 3600
+        "agentCheckIntervalSeconds": 3600
     });
     deployment
 }
@@ -764,7 +764,7 @@ mod tests {
                 storage: updatec::StorageSpec {
                     inactive_releases: 2,
                     inactive_providers: 2,
-                    inactive_supervisors: 2,
+                    inactive_agents: 2,
                     inactive_bytes: 1 << 30,
                     inactive_repository_caches: 2,
                 },
@@ -775,7 +775,7 @@ mod tests {
                     health_interval_seconds: 1,
                     refresh_retry_seconds: 5,
                     confirmation_window_seconds: 120,
-                    supervisor_check_interval_seconds: 3600,
+                    agent_check_interval_seconds: 3600,
                 },
             },
             report_url: "https://gateway/v1/node/report".into(),

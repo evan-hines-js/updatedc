@@ -61,11 +61,11 @@ pub struct RolloutPlan {
     ///
     /// The compatibility window ([`updated_contracts::telemetry::NodeReport::MIN_SUPPORTED_SCHEMA`])
     /// accepts older reports with newer fields defaulting to their fail-safe reading, which is a
-    /// DEGRADATION the fleet cannot otherwise see: a pre-6 supervisor cannot assert `updating`, so
+    /// DEGRADATION the fleet cannot otherwise see: a pre-6 agent cannot assert `updating`, so
     /// its rollbacks mint no regression evidence at all (see [`crate::evidence::AttemptSeed`]) and
     /// "no node rolled back" is indistinguishable from "every rollback was invisible". This census
     /// is also the only in-system answer to the question raising the floor depends on — whether any
-    /// supported fleet still runs the older supervisor.
+    /// supported fleet still runs the older agent.
     pub report_schemas: BTreeMap<u32, usize>,
 }
 
@@ -450,7 +450,7 @@ impl<'a> Observations<'a> {
             }
             match self.evidence(node, &identity) {
                 // Healthy on the right assignment is not the same as RUNNING what it installs.
-                // The supervisor stamps the assignment it RESOLVED, so a node that fetched the
+                // The agent stamps the assignment it RESOLVED, so a node that fetched the
                 // assignment and installed nothing — and, exactly, a node that attempted it and
                 // rolled itself back — reports settled and healthy on the target while executing
                 // its old archive. Counting that as settled made a canary that REJECTED a release
@@ -494,7 +494,7 @@ impl<'a> Observations<'a> {
     }
 
     /// The nodes of `member` whose signed reports prove they ATTEMPTED `target` and rolled
-    /// themselves back. No new channel — this is the report sequence the supervisor already
+    /// themselves back. No new channel — this is the report sequence the agent already
     /// publishes: `updating=true` while the transaction is in flight, then the committed archive
     /// after commit or rollback. [`ObservationLog`] remembers that whole sequence across passes, so
     /// a node seen settled healthy on exactly `target`'s assignment while running its pre-movement
@@ -1867,7 +1867,7 @@ mod tests {
             storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
-                inactive_supervisors: 1,
+                inactive_agents: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
@@ -1878,7 +1878,7 @@ mod tests {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
-                supervisor_check_interval_seconds: 1,
+                agent_check_interval_seconds: 1,
             },
         }
     }
@@ -5979,7 +5979,7 @@ mod tests {
         );
     }
 
-    /// docs/regression-response-design.md, end to end through the report sequence the supervisor
+    /// docs/regression-response-design.md, end to end through the report sequence the agent
     /// already publishes: below the threshold admission proceeds normally; at the threshold the
     /// deployment is halted for the set (no further node moved to it, nodes already on it left
     /// where they are); the identical body cannot be re-admitted while the evidence stands; and a
@@ -6488,7 +6488,7 @@ mod tests {
     }
 
     /// The merely-fetched tick must neither erase the movement's origin nor be evidence itself:
-    /// the supervisor reports settled on the assignment it RESOLVED even when a transient failure
+    /// the agent reports settled on the assignment it RESOLVED even when a transient failure
     /// kept it from installing, so the sequence settled(A) → fetched(B, old archive, healthy) →
     /// unsettled(B) → rolled back(B, old archive, healthy) must still halt — and the fetched tick
     /// alone must not.
@@ -6996,7 +6996,7 @@ mod tests {
     }
 
     /// A node that ATTEMPTED the release and rolled ITSELF back reports settled and healthy on
-    /// exactly the target's assignment — the supervisor stamps the assignment it RESOLVED, not the
+    /// exactly the target's assignment — the agent stamps the assignment it RESOLVED, not the
     /// bytes it committed. Reading that as settlement made a canary that REJECTED a release release
     /// its set's concurrency slot and satisfy `dependsOn`, green-lighting across every dependent
     /// group the very bytes it had just refused. Settlement asks the archive question too, which is

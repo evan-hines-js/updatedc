@@ -56,10 +56,10 @@ mod dependency_isolation {
     const PRODUCTION_MANIFESTS: &[(&str, &str)] = &[
         ("foundation", include_str!("../../foundation/Cargo.toml")),
         ("control", include_str!("../../control/Cargo.toml")),
-        ("bootstrap", include_str!("../../bootstrap/Cargo.toml")),
+        ("launcher", include_str!("../../launcher/Cargo.toml")),
         ("updated", include_str!("../../updated/Cargo.toml")),
         ("updated-tuf", include_str!("../../updated-tuf/Cargo.toml")),
-        ("supervisor", include_str!("../../supervisor/Cargo.toml")),
+        ("agent", include_str!("../../agent/Cargo.toml")),
         ("updatec", include_str!("../../updatec/Cargo.toml")),
         (
             "updated-healthproxy",
