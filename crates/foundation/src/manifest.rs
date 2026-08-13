@@ -1,7 +1,7 @@
 //! Reading a Cargo manifest well enough to audit what a crate *ships*.
 //!
 //! Several crates enforce a dependency rule against their own (or another crate's) `Cargo.toml`:
-//! the guardian may link only platform bindings, this crate may link only system bindings, no
+//! the launcher may link only platform bindings, this crate may link only system bindings, no
 //! production crate may link a demo or test package. Each of those rules is an assertion about the
 //! same fact — "what does this manifest make the crate depend on" — so the fact is derived here
 //! once. Hand-rolled per test, it had already drifted into two answers.

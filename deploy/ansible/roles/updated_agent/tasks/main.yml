@@ -39,7 +39,7 @@
   become: false
   ansible.builtin.shell: >
     . "{{ ansible_env.HOME }}/.cargo/env" &&
-    cargo build --release -p bootstrap -p supervisor
+    cargo build --release -p launcher -p agent
   args:
     chdir: "{{ updated_build_dir }}"
 
@@ -50,8 +50,8 @@
     dest: "/usr/local/bin/{{ item }}"
     mode: "0755"
   loop:
-    - bootstrap
-    - supervisor
+    - updated-launcher
+    - updated-agent
 
 # ── Reachability (demo only) ──────────────────────────────────────────────────
 # In production the agent points straight at the real gateway URL. For a kind demo the gateway
@@ -100,10 +100,10 @@
     label: "{{ item.name }}"
   no_log: true
 
-- name: Write the bootstrap enrollment config
+- name: Write the launcher enrollment config
   ansible.builtin.template:
-    src: bootstrap.toml.j2
-    dest: /etc/updated/bootstrap.toml
+    src: config.toml.j2
+    dest: /etc/updated/config.toml
     mode: "0600"
 
 - name: Install the agent service

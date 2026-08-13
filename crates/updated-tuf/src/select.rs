@@ -1,5 +1,5 @@
 //! Choosing the newest installable target from verified TUF metadata — the single
-//! selection path shared by the supervisor (both the application and its own
+//! selection path shared by the agent (both the application and its own
 //! self-update) and the one-shot updater.
 //!
 //! It operates only on already-[`VerifiedTarget`]s and the signed custom metadata a
@@ -132,7 +132,7 @@ fn signed_provider_set(
     serde_json::from_value(target.custom.get("provider_set")?.clone()).ok()
 }
 
-/// Shared select-and-download path used by supervised and one-shot modes.
+/// Shared select-and-download path used by the long-running and one-shot modes.
 impl TrustedRepository {
     /// Resolve and authorize the application selected by the signed deployment
     /// assignment.
@@ -467,7 +467,7 @@ mod provider_binding {
             storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 1,
                 inactive_providers: 1,
-                inactive_supervisors: 1,
+                inactive_agents: 1,
                 inactive_bytes: 1,
                 inactive_repository_caches: 1,
             },
@@ -478,7 +478,7 @@ mod provider_binding {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: 1,
-                supervisor_check_interval_seconds: 1,
+                agent_check_interval_seconds: 1,
             },
         }
     }
@@ -631,7 +631,7 @@ mod provider_binding {
 
     // An established node (exact-pin, no floor-less descent) leaves provider selection to the
     // assignment's own `provider_set`, so a provider-only revision reconciles at the head
-    // WITHOUT an app change: `provider_set` is `None`, and the supervisor uses the assignment's.
+    // WITHOUT an app change: `provider_set` is `None`, and the agent uses the assignment's.
     #[tokio::test]
     async fn established_node_defers_providers_to_the_assignment_for_provider_only_updates() {
         let (_tmp, repo) = repo_with_assignment(false).await;

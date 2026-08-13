@@ -23,7 +23,7 @@ upgraded first?**
 
 **Reports (node → control plane, node → healthproxy; `NodeReport`, `OutputManifest`, and the
 plane's own `EndpointProjection` to the healthproxy).** Readers upgrade first BY CONSTRUCTION —
-nodes receive their supervisor through this very system, so the readers of a new report schema
+nodes receive their agent through this very system, so the readers of a new report schema
 are always running before any node can write it. Readers therefore accept a window
 `[MIN_SUPPORTED_SCHEMA, SCHEMA]`; writers always write `SCHEMA`.
 
@@ -33,7 +33,7 @@ are always running before any node can write it. Readers therefore accept a wind
 - The exact bytes a floor-schema writer signs are locked by a literal-payload test, so a
   defaultless field cannot land while the window claims to cover the old shape.
 - Above the window is a writer newer than the reader — a violation of the supported order, and a
-  refusal, not a transition. Below the window is a supervisor no release supports.
+  refusal, not a transition. Below the window is an agent no release supports.
 - Raising the floor is a deliberate act in its own commit, made when no supported fleet still
   runs the older writer. `updatec_report_schema{schema=...}` counts the nodes writing each schema,
   so that precondition is a fact an operator can check rather than a claim — and so the degraded
@@ -56,7 +56,7 @@ The readers are the nodes themselves, and no reader window can save them: an old
 taught to read a schema it predates, and the document it would fail to read is the one that
 delivers its upgrade — a bump ahead of the fleet is a deadlock with no in-band cure. The WRITER
 carries the obligation: the control plane must not publish a new schema until every supported
-node runs a supervisor that reads it.
+node runs an agent that reads it.
 
 An optional field under an unchanged number is NOT a cheaper alternative here, and treating it as
 one is the trap: every one of these documents is `deny_unknown_fields` (the published JSON schemas

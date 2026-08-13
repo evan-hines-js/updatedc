@@ -1558,7 +1558,7 @@ pub(crate) fn apply_demo_resources(
             "healthIntervalSeconds": 1,
             "refreshRetrySeconds": 1,
             "confirmationWindowSeconds": 3,
-            "supervisorCheckIntervalSeconds": 3600
+            "agentCheckIntervalSeconds": 3600
         });
         // Every group carries the fleet label (its single throttle set) and its display
         // pair label (UI grouping / per-pair load balancer only, not a throttle).
@@ -1605,7 +1605,7 @@ pub(crate) fn apply_demo_resources(
     // The two real-Jenkins cohorts (ci, release): same clean group path, just
     // different data. Each selects its `role` nodes and assigns the jenkins product with that
     // instance's readiness URL and a boot-time-sized health grace. Neither carries a
-    // fleet/set label — so they are upgraded one node at a time by the same supervisor
+    // fleet/set label — so they are upgraded one node at a time by the same agent
     // mechanism (zero downtime across each pair) yet sit entirely outside the convergence
     // throttling and pod-kill chaos that drive the sample-app cohorts.
     // One Jenkins UpdateGroup builder: the ci/release cohorts and the manual
@@ -1640,7 +1640,7 @@ pub(crate) fn apply_demo_resources(
             "healthIntervalSeconds": 3,
             "refreshRetrySeconds": 5,
             "confirmationWindowSeconds": 10,
-            "supervisorCheckIntervalSeconds": 3600
+            "agentCheckIntervalSeconds": 3600
         });
         serde_json::json!({
             "apiVersion":"updated.dev/v1alpha1",
@@ -1885,7 +1885,7 @@ mod tests {
             jenkins_statefulset("release", 1),
         ] {
             let rendered = serde_json::to_string(&manifest).unwrap();
-            for dead in ["startupz", "readyz", "livez", "\"guardian\""] {
+            for dead in ["startupz", "readyz", "livez", "\"launcher\""] {
                 assert!(
                     !rendered.contains(dead),
                     "a rendered manifest still references {dead}, which nothing serves"

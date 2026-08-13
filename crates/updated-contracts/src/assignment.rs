@@ -60,7 +60,7 @@ pub struct ManagedRepositoryLimits {
 pub struct ManagedStorage {
     pub inactive_releases: usize,
     pub inactive_providers: usize,
-    pub inactive_supervisors: usize,
+    pub inactive_agents: usize,
     pub inactive_bytes: u64,
     pub inactive_repository_caches: usize,
 }
@@ -74,18 +74,18 @@ pub struct ManagedTimeouts {
     pub health_interval_seconds: u64,
     pub refresh_retry_seconds: u64,
     pub confirmation_window_seconds: u64,
-    pub supervisor_check_interval_seconds: u64,
+    pub agent_check_interval_seconds: u64,
 }
 
 impl RepositoryAssignment {
     /// Desired-state contracts evolve under the OPPOSITE rule from report contracts (see
     /// `docs/wire-compatibility-design.md`). The readers here are the nodes themselves, and a
-    /// node receives its new supervisor THROUGH this very document — so a reader window cannot
+    /// node receives its new agent THROUGH this very document — so a reader window cannot
     /// exist (an old node cannot be taught to read a schema it predates), and bumping this number
     /// strands every not-yet-upgraded node unable to parse the assignment that would have
     /// delivered its upgrade: a fleet-wide deadlock with no in-band cure. The WRITER carries the
     /// obligation instead: the control plane must not publish a new schema until every supported
-    /// node in the fleet runs a supervisor that reads it.
+    /// node in the fleet runs an agent that reads it.
     ///
     /// There is no cheaper additive escape here, and reaching for one is the trap: this document
     /// and every struct nested in it are `deny_unknown_fields` (asserted below, and mirrored by
@@ -160,7 +160,7 @@ impl ManagedRuntime {
             || self.timeouts.health_interval_seconds == 0
             || self.timeouts.refresh_retry_seconds == 0
             || self.timeouts.confirmation_window_seconds == 0
-            || self.timeouts.supervisor_check_interval_seconds == 0
+            || self.timeouts.agent_check_interval_seconds == 0
         {
             return Err("managed runtime limits and timeouts must be non-zero".into());
         }
@@ -182,8 +182,8 @@ impl ManagedRuntime {
                 self.timeouts.confirmation_window_seconds,
             ),
             (
-                "timeouts.supervisor_check_interval_seconds",
-                self.timeouts.supervisor_check_interval_seconds,
+                "timeouts.agent_check_interval_seconds",
+                self.timeouts.agent_check_interval_seconds,
             ),
         ] {
             if seconds > MAX_INTERVAL_SECONDS {
@@ -193,7 +193,7 @@ impl ManagedRuntime {
             }
         }
         // The node's report cadence rides on the check loop — it heartbeats at the bottom of it —
-        // so every field the supervisor uses as the BASE of its next-check deadline answers to the
+        // so every field the agent uses as the BASE of its next-check deadline answers to the
         // freshness window every reader ages a report against, not to the generic ceiling above.
         // `check_interval` is that base in steady state and `refresh_retry` is that base after a
         // retryable repository failure; bounding only the first leaves the identical
@@ -201,7 +201,7 @@ impl ManagedRuntime {
         // are stale on arrival: drained from the load balancer for part of every cycle, and never
         // counted as settled by the rollout throttle, while being perfectly healthy.
         //
-        // What this does NOT cover is the exponential backoff the supervisor multiplies that base
+        // What this does NOT cover is the exponential backoff the agent multiplies that base
         // by after repeated failures. A node that cannot refresh its assignment at all cannot show
         // it is running what the control plane assigned, so aging out of "settled" there is the
         // fail-closed direction; a publisher choosing a slow cadence for a perfectly healthy fleet
@@ -361,7 +361,7 @@ mod tests {
             storage: ManagedStorage {
                 inactive_releases: 2,
                 inactive_providers: 2,
-                inactive_supervisors: 2,
+                inactive_agents: 2,
                 inactive_bytes: 1 << 30,
                 inactive_repository_caches: 2,
             },
@@ -372,7 +372,7 @@ mod tests {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 120,
-                supervisor_check_interval_seconds: 3600,
+                agent_check_interval_seconds: 3600,
             },
         }
     }
@@ -421,8 +421,8 @@ mod tests {
             ("confirmation_window", |r, v| {
                 r.timeouts.confirmation_window_seconds = v
             }),
-            ("supervisor_check_interval", |r, v| {
-                r.timeouts.supervisor_check_interval_seconds = v
+            ("agent_check_interval", |r, v| {
+                r.timeouts.agent_check_interval_seconds = v
             }),
         ];
         for (name, set) in fields {
@@ -451,7 +451,7 @@ mod tests {
         }
     }
 
-    /// The node heartbeats at the bottom of its check loop, so whatever the supervisor schedules
+    /// The node heartbeats at the bottom of its check loop, so whatever the agent schedules
     /// that loop on IS the report cadence and the freshness window every reader enforces is what
     /// bounds it — not the generic 30-day ceiling, under which the perfectly ordinary 60 was
     /// accepted and produced a healthy node that drops out of the load balancer for part of every
@@ -816,7 +816,7 @@ mod tests {
                 "health_grace_seconds",
                 "health_interval_seconds",
                 "confirmation_window_seconds",
-                "supervisor_check_interval_seconds",
+                "agent_check_interval_seconds",
             ] {
                 assert_eq!(
                     timeouts["properties"][bounded]["maximum"],

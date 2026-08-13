@@ -131,15 +131,15 @@ fn scenarios() -> Vec<Scenario> {
         ),
         (
             "the agent self-updates by pointer flip; the hook-managed workload is untouched",
-            supervisor_self_update,
+            agent_self_update,
         ),
         (
             "an unlaunchable agent candidate is rolled back, rejected, and never retried",
-            supervisor_self_update_rollback,
+            agent_self_update_rollback,
         ),
         (
             "a ready agent that crashes during confirmation is rolled back without disturbing the workload",
-            supervisor_post_ready_crash_rolls_back,
+            agent_post_ready_crash_rolls_back,
         ),
     ];
     // Unix-only mechanisms (file modes; a shell entrypoint for the never-healthy head).
@@ -188,10 +188,10 @@ fn run_suite() -> R {
             "sample app binaries differ; release identity must come only from bundle config",
         );
     }
-    // Two distinguishable supervisor builds for the self-update scenarios.
-    ctx.build_supervisor("1.0.0")?;
-    ctx.build_supervisor("2.0.0")?;
-    ctx.build_post_ready_crashing_supervisor("2.0.0")?;
+    // Two distinguishable agent builds for the self-update scenarios.
+    ctx.build_agent("1.0.0")?;
+    ctx.build_agent("2.0.0")?;
+    ctx.build_post_ready_crashing_agent("2.0.0")?;
 
     // Every scenario owns a unique working dir and unique ports, so they are safe to
     // run concurrently on a bounded worker pool. They are blocking process work

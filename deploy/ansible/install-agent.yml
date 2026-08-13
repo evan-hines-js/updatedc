@@ -1,7 +1,7 @@
 ---
 # Install the `updated` agent on a fleet of hosts and register each with the control plane.
-# This is the VM-fleet counterpart to the Kubernetes operator: the *same* agent (bootstrap +
-# supervisor), installed by ansible instead of a pod spec, phoning the same control plane home.
+# This is the VM-fleet counterpart to the Kubernetes operator: the *same* agent (launcher +
+# agent), installed by ansible instead of a pod spec, phoning the same control plane home.
 #
 # Required vars (see roles/updated_agent/defaults):
 #   updatedc_source         path to the updatedc workspace to build from (on the control node)

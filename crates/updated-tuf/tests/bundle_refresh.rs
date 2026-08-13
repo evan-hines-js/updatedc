@@ -70,7 +70,7 @@ fn assignment(install_root: &Path) -> updated_contracts::assignment::RepositoryA
             storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 2,
                 inactive_providers: 2,
-                inactive_supervisors: 2,
+                inactive_agents: 2,
                 inactive_bytes: 1024 * 1024,
                 inactive_repository_caches: 2,
             },
@@ -81,7 +81,7 @@ fn assignment(install_root: &Path) -> updated_contracts::assignment::RepositoryA
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 5,
                 confirmation_window_seconds: 5,
-                supervisor_check_interval_seconds: 5,
+                agent_check_interval_seconds: 5,
             },
         },
     }

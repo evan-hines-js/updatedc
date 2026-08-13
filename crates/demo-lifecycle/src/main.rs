@@ -2,7 +2,7 @@
 //!
 //! It intentionally models an over-engineered Java-era deployment, but implements
 //! that process as one typed, idempotent state machine rather than a pile of shell
-//! entrypoints. The supervisor downloads this executable as a provider artifact.
+//! entrypoints. The agent downloads this executable as a provider artifact.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -15,7 +15,7 @@ use std::time::Duration;
 use demo_lifecycle::PROVIDER_TIMEOUT_MS;
 use foundation::durable;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate; this fixture
-/// answers exactly the operations the supervisor invokes.
+/// answers exactly the operations the agent invokes.
 use updated_contracts::reconciler::{attempt, Operation};
 
 type Error = Box<dyn std::error::Error>;
@@ -83,7 +83,7 @@ impl Deployment {
         fs::create_dir_all(&self.live)?;
         fs::create_dir_all(self.state.join("audit"))?;
         // Completion markers make ONE update attempt idempotent, so a crash mid-apply resumes
-        // without repeating finished work. A per-boot hook is not an attempt: the supervisor
+        // without repeating finished work. A per-boot hook is not an attempt: the agent
         // invokes it under a constant id on every launch, so honouring a marker there would turn
         // "run this before every start" into "run this once, ever".
         if !matches!(self.phase, Operation::Healthcheck | Operation::Inspect)
@@ -164,7 +164,7 @@ impl Deployment {
     /// Copy the predecessor's live state aside, exactly once per attempt.
     ///
     /// `apply` is replayed under the same attempt id — after a crash mid-apply, and by the
-    /// supervisor's recovery activation, which re-invokes the hook with candidate and predecessor
+    /// agent's recovery activation, which re-invokes the hook with candidate and predecessor
     /// swapped. By then `activate` may already have written the candidate into `live`, so a second
     /// copy would overwrite the predecessor bytes that this attempt's `rollback` restores. The
     /// marker is written last, so a copy interrupted halfway is retaken rather than trusted.
@@ -182,7 +182,7 @@ impl Deployment {
 
     fn pre_drain(&self) -> Result<(), Error> {
         self.require("prepare")?;
-        // Runs BEFORE the guardian withdraws readiness, while the app is still serving.
+        // Runs BEFORE the launcher withdraws readiness, while the app is still serving.
         // A real integration signals workers to stop accepting new sessions and lets
         // in-flight work wind down — meaningful wall-clock time in an enterprise app.
         self.write(
@@ -301,7 +301,7 @@ impl Deployment {
     }
 
     /// Observe the running application, which only exists outside the activation transaction:
-    /// `periodic` runs after the supervisor has relaunched the process (and after supervisor or
+    /// `periodic` runs after the agent has relaunched the process (and after agent or
     /// pod restarts), so its evidence comes from durable live state and the live socket.
     fn verify_running_version(&self) -> Result<(), Error> {
         let observed = ureq::get("http://127.0.0.1:8080/version")
@@ -334,7 +334,7 @@ impl Deployment {
     }
 
     fn fingerprint(&self) -> Result<(), Error> {
-        // The provider chooses the measured state; the supervisor hashes these exact bytes and
+        // The provider chooses the measured state; the agent hashes these exact bytes and
         // never logs them. Keep the representation explicit and stable across filesystem order.
         self.periodic()?;
         let application = fs::read_to_string(self.live.join("application.war"))?;
@@ -384,7 +384,7 @@ impl Deployment {
         }
     }
 
-    /// Whether this invocation is the supervisor's per-boot environment hook (`install`/`restart`
+    /// Whether this invocation is the agent's per-boot environment hook (`install`/`restart`
     /// reasons, run on every launch under a constant attempt id) rather than one update attempt.
     fn is_per_boot(&self) -> bool {
         matches!(self.reason.as_str(), "install" | "restart")
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn an_update_apply_fits_the_signed_provider_timeout_for_every_attempt_id() {
-        // The supervisor bounds the whole hook invocation by the provider timeout the demo signs
+        // The agent bounds the whole hook invocation by the provider timeout the demo signs
         // in, so the WORST case over attempt ids — fixed work plus both dwells — has to fit it
         // with margin. Otherwise a healthy candidate is killed mid-apply and the cohort rolls
         // back, deterministically for that attempt id (the retry re-runs the same steps).
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn in_transaction_verification_does_not_probe_the_stopped_application() {
-        // The supervisor stops the managed process before it invokes the activation hook and only
+        // The agent stops the managed process before it invokes the activation hook and only
         // relaunches it afterwards, so nothing is listening while `verify` runs. Verification must
         // come from durable live state, or every update fails and rolls back.
         let scratch = tempfile::tempdir().unwrap();
@@ -648,7 +648,7 @@ mod tests {
 
     #[test]
     fn a_replayed_apply_keeps_the_attempts_original_rollback_backup() {
-        // A crash after `activate` but before `apply.done` — or the supervisor's recovery
+        // A crash after `activate` but before `apply.done` — or the agent's recovery
         // activation, which re-invokes `apply` under the same attempt id — replays `prepare` with
         // the candidate already in `live`. Re-copying then would leave `rollback` restoring the
         // candidate's bytes as if they were the predecessor's.

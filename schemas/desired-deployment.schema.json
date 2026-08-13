@@ -161,14 +161,14 @@
       "required": [
         "inactive_releases",
         "inactive_providers",
-        "inactive_supervisors",
+        "inactive_agents",
         "inactive_bytes",
         "inactive_repository_caches"
       ],
       "properties": {
         "inactive_releases": { "type": "integer", "minimum": 0 },
         "inactive_providers": { "type": "integer", "minimum": 0 },
-        "inactive_supervisors": { "type": "integer", "minimum": 0 },
+        "inactive_agents": { "type": "integer", "minimum": 0 },
         "inactive_bytes": { "type": "integer", "minimum": 1 },
         "inactive_repository_caches": { "type": "integer", "minimum": 0 }
       }
@@ -184,7 +184,7 @@
         "health_interval_seconds",
         "refresh_retry_seconds",
         "confirmation_window_seconds",
-        "supervisor_check_interval_seconds"
+        "agent_check_interval_seconds"
       ],
       "properties": {
         "check_interval_seconds": {
@@ -216,7 +216,7 @@
           "minimum": 1,
           "maximum": 2592000
         },
-        "supervisor_check_interval_seconds": {
+        "agent_check_interval_seconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000

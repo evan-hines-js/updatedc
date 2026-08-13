@@ -2,7 +2,7 @@
 //!
 //! This is deliberately not a deployment provider. It authenticates, materializes,
 //! resolves, and locates bundles for both the application and executable providers.
-//! Deployment policy lives behind the supervisor's single provider phase protocol.
+//! Deployment policy lives behind the agent's single provider phase protocol.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -121,7 +121,7 @@ impl BundleStore {
     /// this store owns: every check tick re-hashes it against its manifest and refuses any file
     /// the manifest does not declare, so an ordinary application writing a log, a pid file, a
     /// sqlite journal or a listening socket into its own working directory would condemn its own
-    /// release — the supervisor would stop it, discard the drifted tree, re-download the archive
+    /// release — the agent would stop it, discard the drifted tree, re-download the archive
     /// and relaunch, every tick, forever. The working directory therefore has to be somewhere the
     /// integrity check does not own, and per-release rather than shared so two releases never
     /// inherit each other's scratch.
@@ -221,7 +221,7 @@ fn grant_workspace_ownership(path: &Path, _executable: bool) -> io::Result<()> {
 }
 
 /// A private sibling name to copy into before the rename that publishes it. Unique per process and
-/// per call, so two supervisor generations materializing the same workspace never share one.
+/// per call, so two agent generations materializing the same workspace never share one.
 fn staging_name(destination: &Path) -> io::Result<PathBuf> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = destination
@@ -291,7 +291,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // The supervisor only ever hands the provider a filepath to a verified archive.
+        // The agent only ever hands the provider a filepath to a verified archive.
         let archive = root.join("bundle.tar.zst");
         bundle::create_bundle(
             &source,
@@ -379,7 +379,7 @@ mod tests {
 
     /// The defect: the launch `cwd` used to be the content-addressed tree, so the first file the
     /// application wrote to its own working directory made the release fail verification — and the
-    /// supervisor then condemned, re-downloaded and relaunched it on every check tick.
+    /// agent then condemned, re-downloaded and relaunched it on every check tick.
     #[test]
     fn an_application_writing_to_its_working_directory_leaves_the_release_verifiable() {
         let (_dir, root) = scratch("workspace-drift");

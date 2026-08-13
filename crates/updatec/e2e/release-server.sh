@@ -18,7 +18,7 @@ if [ ! -f /data/ready ]; then
     source="$fixtures/$version"
     mkdir -p "$source/bin" "$source/config"
     if [ "$major" -eq 18 ] || [ "$major" -eq 21 ]; then
-      # An unlaunchable entrypoint (not a valid executable): the supervisor must reject this
+      # An unlaunchable entrypoint (not a valid executable): the agent must reject this
       # release at activation and roll back, rather than crash-loop it.
       printf 'intentionally corrupt bundle entrypoint\n' >"$source/bin/app"
       chmod 0755 "$source/bin/app"
@@ -36,8 +36,8 @@ if [ ! -f /data/ready ]; then
       --bundle "$platform=$source"
   done
   # Every release now carries exactly one signed node reconciler — there is no reconciler-less
-  # provider set. The ordinary fleet runs plain, guardian-owned HTTP apps, so its `default` set uses
-  # a MINIMAL, stateless reconciler: the guardian owns process lifecycle, so every phase is a no-op
+  # provider set. The ordinary fleet runs plain, launcher-owned HTTP apps, so its `default` set uses
+  # a MINIMAL, stateless reconciler: the launcher owns process lifecycle, so every phase is a no-op
   # except health verification. `verify` (the update gate) and `periodic` (the steady-state liveness
   # signal) confirm the managed app answers `/healthz`; a non-zero exit fails the update and rolls
   # back. It must be stateless — a stateful provider that gates `verify` on a prior `start` marker

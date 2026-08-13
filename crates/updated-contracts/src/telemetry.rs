@@ -24,9 +24,9 @@ use std::collections::BTreeMap;
 /// that — so the two cannot drift apart and a merely-slow re-report never flaps.
 pub const REPORT_FRESHNESS: Duration = Duration::from_secs(60);
 
-/// How much later than its assigned check interval a node's heartbeat can land: the supervisor
+/// How much later than its assigned check interval a node's heartbeat can land: the agent
 /// spreads each next check by this much, so consecutive reports are up to 1.2x the interval apart.
-/// Public because the supervisor schedules against it — the spread a node actually applies and the
+/// Public because the agent schedules against it — the spread a node actually applies and the
 /// spread [`MAX_CHECK_INTERVAL_SECONDS`] budgets for are then the same number, not two literals
 /// that agree today.
 pub const REPORT_CADENCE_JITTER_PERCENT: u32 = 20;
@@ -203,7 +203,7 @@ const REPORT_ENVELOPE_OVERHEAD_BYTES: usize = 8 * 1024;
 /// The largest output manifest a node may attach to a report — the writer-side bound, derived so
 /// the WORST-CASE signed envelope for a manifest of exactly this size still fits
 /// [`MAX_REPORT_ENVELOPE_BYTES`] after base64 expansion and envelope overhead. Enforced by
-/// `supervisor::telemetry::load_outputs` before a manifest is ever attached, and asserted against
+/// `agent::telemetry::load_outputs` before a manifest is ever attached, and asserted against
 /// a real signed envelope by this module's tests, so the two bounds cannot drift into agreeing on
 /// a number while disagreeing on its units.
 pub const MAX_OUTPUT_MANIFEST_BYTES: usize =
@@ -365,7 +365,7 @@ pub struct NodeReport {
     /// confirmation window is closed.
     ///
     /// Added in schema 6, so it defaults for reports the compatibility window still admits from
-    /// older supervisors — and the default is the FAIL-SAFE reading: absent means "no transaction
+    /// older agents — and the default is the FAIL-SAFE reading: absent means "no transaction
     /// was ever observed", which proves nothing to the regression verdict. A pre-6 node's
     /// rollbacks therefore produce no halt evidence until it upgrades — strictly weaker evidence,
     /// never a false verdict and never a drained fleet.
@@ -393,7 +393,7 @@ impl NodeReport {
     /// compatibility policy (see `docs/wire-compatibility-design.md`).
     ///
     /// A fleet never upgrades atomically, and its readers upgrade FIRST by construction: nodes
-    /// receive their new supervisor through this very system, so the control plane and healthproxy
+    /// receive their new agent through this very system, so the control plane and healthproxy
     /// that will read schema-N reports are running before any node can write one. What a bare
     /// `schema == SCHEMA` gate did to that ordering was catastrophic: the moment a reader
     /// upgraded, every not-yet-upgraded node's reports failed verification — the healthproxy
@@ -403,14 +403,14 @@ impl NodeReport {
     /// So readers accept the window `[MIN_SUPPORTED_SCHEMA, SCHEMA]`, writers always write
     /// `SCHEMA`, and every field added since `MIN_SUPPORTED_SCHEMA` MUST carry a serde default
     /// chosen in the fail-safe direction, documented at the field (`updating`: absent means
-    /// "proves nothing"). The exact bytes a `MIN_SUPPORTED_SCHEMA` supervisor signs are locked by
+    /// "proves nothing"). The exact bytes a `MIN_SUPPORTED_SCHEMA` agent signs are locked by
     /// `a_previous_schema_report_still_verifies`, so a defaultless field cannot land while the
     /// window still claims to cover the old shape. Raising this floor is a deliberate act in its
-    /// own commit, made only when no supported fleet still runs the older supervisor.
+    /// own commit, made only when no supported fleet still runs the older agent.
     pub const MIN_SUPPORTED_SCHEMA: u32 = 5;
 
     /// A report of a node that is NOT mid-transaction. [`NodeReport::updating`] is set by the one
-    /// writer that knows (the supervisor's heartbeat, from its own unconfirmed-update journal);
+    /// writer that knows (the agent's heartbeat, from its own unconfirmed-update journal);
     /// every other constructor is describing a settled or merely not-ready node.
     pub fn new(
         node: impl Into<String>,
@@ -721,9 +721,9 @@ mod tests {
         (sign_report(&report, &pkcs8).unwrap(), point)
     }
 
-    /// The EXACT BYTES a schema-5 supervisor signs — a literal payload, not a re-serialization of
+    /// The EXACT BYTES a schema-5 agent signs — a literal payload, not a re-serialization of
     /// the current struct — must verify for as long as [`NodeReport::MIN_SUPPORTED_SCHEMA`] claims
-    /// to cover it. A fleet's readers upgrade before its nodes (nodes receive their supervisor
+    /// to cover it. A fleet's readers upgrade before its nodes (nodes receive their agent
     /// THROUGH this system), so the pass where this bound broke drained every not-yet-upgraded
     /// node out of rotation and stalled the very rollout that would have delivered the upgrade.
     /// This test is what makes the window real: adding a defaultless field fails it immediately.
@@ -757,7 +757,7 @@ mod tests {
             }],
         };
         let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
-            .expect("a report from a supervisor inside the compatibility window must verify");
+            .expect("a report from an agent inside the compatibility window must verify");
         assert_eq!(report.schema, 5);
         assert!(
             !report.updating,
@@ -765,7 +765,7 @@ mod tests {
         );
     }
 
-    /// The window has two hard edges: below the floor is a supervisor no release supports, above
+    /// The window has two hard edges: below the floor is an agent no release supports, above
     /// the ceiling is a writer NEWER than this reader — a report it cannot interpret and must not
     /// guess at (the supported upgrade order is readers first, which makes that shape a fault,
     /// not a transition).
@@ -1035,7 +1035,7 @@ mod tests {
     /// recover them from `healthy` alone: an update transaction in flight is evidence a rollout
     /// ran, an ordinary readiness failure is not, and the control plane's rollback verdict is
     /// built on the first meaning. Claiming BOTH settled and mid-transaction is a contradiction
-    /// no supervisor can produce, so it fails the gate closed rather than being interpreted.
+    /// no agent can produce, so it fails the gate closed rather than being interpreted.
     #[test]
     fn a_transaction_in_flight_is_reported_apart_from_readiness_and_never_beside_settled() {
         let (unsettled, point) = signed(|r| {

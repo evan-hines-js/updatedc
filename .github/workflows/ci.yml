@@ -98,7 +98,7 @@ jobs:
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         run: |
-          cargo build --release -p bootstrap -p supervisor
+          cargo build --release -p launcher -p agent
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cargo build --release -p windows-service
           fi
@@ -107,14 +107,14 @@ jobs:
         run: |
           mkdir -p dist
           tar -C target/release -czf "dist/updated-${{ matrix.release }}.tar.gz" \
-            bootstrap supervisor
+            updated-launcher updated-agent
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os == 'Windows'
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           $files = @(
-            "target/release/bootstrap.exe"
-            "target/release/supervisor.exe"
+            "target/release/updated-launcher.exe"
+            "target/release/updated-agent.exe"
             "target/release/selfupdate-service.exe"
           )
           Compress-Archive -Path $files -DestinationPath "dist/updated-${{ matrix.release }}.zip"
@@ -135,7 +135,7 @@ jobs:
       # aws-lc-rs requires NASM when building for Windows MSVC.
       - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # Exercise native service registration, durable bootstrap state, clean
+      # Exercise native service registration, durable launcher state, clean
       # application shutdown, and relaunch after an SCM service restart.
       - name: Exercise the native SCM lifecycle
         shell: powershell

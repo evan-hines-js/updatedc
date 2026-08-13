@@ -1,6 +1,6 @@
 # Node reconciler protocol
 
-Status: implemented. The invocation site is `supervisor::update::prepare_lifecycle_command`; the
+Status: implemented. The invocation site is `agent::update::prepare_lifecycle_command`; the
 four operations and the reserved attempt identities are typed in
 `crates/updated-contracts/src/reconciler.rs`; the output manifest is
 `updated_contracts::telemetry::OutputManifest`.

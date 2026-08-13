@@ -10,21 +10,21 @@ pub fn app_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
     ctx.work.join(format!("build/app-{v}{}", ctx.exe))
 }
 
-pub fn supervisor_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
-    ctx.work.join(format!("build/supervisor-{v}{}", ctx.exe))
+pub fn agent_v(ctx: &Ctx, v: &str) -> std::path::PathBuf {
+    ctx.work.join(format!("build/agent-{v}{}", ctx.exe))
 }
 /// A TOML literal string (single-quoted, no escaping) — safe for Windows paths.
 fn lit(s: &str) -> String {
     format!("'{s}'")
 }
 /// Writes a scenario's config file and yields a launcher command — the whole node stack. The
-/// launcher (`bootstrap`) decides which agent binary runs; the disposable agent owns the update
+/// launcher (`launcher`) decides which agent binary runs; the disposable agent owns the update
 /// policy and invokes the release's reconciler. Nothing here launches a workload: that is the
 /// reconciler's job, and [`Node::workload`] is how a scenario asks for one.
 #[derive(Clone)]
 pub struct Node {
     repository_base_url: String,
-    supervisor_bin: PathBuf,
+    agent_bin: PathBuf,
     server_bin: PathBuf,
     platform: String,
     exe: &'static str,
@@ -40,12 +40,12 @@ pub struct Node {
     /// The mode of the one signed reconciler every scenario runs. `inert` records and succeeds; a
     /// scenario selects its own mode exactly once (see [`Node::mode`]).
     lifecycle_mode: String,
-    supervisor_check_interval: Option<String>,
+    agent_check_interval: Option<String>,
     ready_timeout: Option<String>,
     seed_application: bool,
     /// Override the agent binary the launcher runs (self-update tests supply a
     /// specific version); defaults to the built one.
-    supervisor_override: Option<PathBuf>,
+    agent_override: Option<PathBuf>,
     /// Sign `ordered_install_fallback` into the assignment: a cold node whose exact assigned
     /// bytes prove unusable may descend to the newest healthy target at or below it.
     ordered_install_fallback: bool,
@@ -65,11 +65,11 @@ impl Node {
         let seed_binary = app_v(ctx, "1.0.0");
         Node {
             repository_base_url: format!("https://{srv}/"),
-            supervisor_bin: ctx.supervisor.clone(),
+            agent_bin: ctx.agent.clone(),
             server_bin: ctx.server.clone(),
             platform: ctx.platkey.clone(),
             exe: ctx.exe,
-            launcher_bin: ctx.bootstrap.clone(),
+            launcher_bin: ctx.launcher.clone(),
             dir: dir.to_path_buf(),
             product: product.into(),
             install_root: dir.join("install"),
@@ -79,10 +79,10 @@ impl Node {
             health_successes: 1,
             confirmation_window: None,
             lifecycle_mode: INERT.into(),
-            supervisor_check_interval: None,
+            agent_check_interval: None,
             ready_timeout: None,
             seed_application: true,
-            supervisor_override: None,
+            agent_override: None,
             ordered_install_fallback: false,
             secrets: vec![],
         }
@@ -147,8 +147,8 @@ impl Node {
         self.lifecycle_mode = mode.into();
         self
     }
-    pub fn supervisor_check_interval(mut self, check_interval: &str) -> Self {
-        self.supervisor_check_interval = Some(check_interval.into());
+    pub fn agent_check_interval(mut self, check_interval: &str) -> Self {
+        self.agent_check_interval = Some(check_interval.into());
         self
     }
     /// How long a replacement agent has to prove ready before the launcher rolls back.
@@ -157,8 +157,8 @@ impl Node {
         self
     }
     /// Run this agent binary instead of the default (self-update tests).
-    pub fn supervisor_bin(mut self, path: &Path) -> Self {
-        self.supervisor_override = Some(path.to_path_buf());
+    pub fn agent_bin(mut self, path: &Path) -> Self {
+        self.agent_override = Some(path.to_path_buf());
         self
     }
 
@@ -380,7 +380,7 @@ impl Node {
             storage: updated_contracts::assignment::ManagedStorage {
                 inactive_releases: 2,
                 inactive_providers: 2,
-                inactive_supervisors: 1,
+                inactive_agents: 1,
                 inactive_bytes: 1024 * 1024 * 1024,
                 inactive_repository_caches: 2,
             },
@@ -391,10 +391,7 @@ impl Node {
                 health_interval_seconds: 1,
                 refresh_retry_seconds: 1,
                 confirmation_window_seconds: seconds(self.confirmation_window.as_ref(), 120)?,
-                supervisor_check_interval_seconds: seconds(
-                    self.supervisor_check_interval.as_ref(),
-                    3600,
-                )?,
+                agent_check_interval_seconds: seconds(self.agent_check_interval.as_ref(), 3600)?,
             },
         };
         std::fs::write(
@@ -429,12 +426,12 @@ impl Node {
         // per-node leaf; the e2e needs no per-node attribution.
         std::fs::copy(certs.join("client.crt"), state_dir.join("agent.crt")).map_err(str_err)?;
         std::fs::copy(certs.join("client.key"), state_dir.join("agent.key")).map_err(str_err)?;
-        let bootstrap = self.dir.join(format!(
-            "bootstrap-{}.toml",
+        let config = self.dir.join(format!(
+            "config-{}.toml",
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(
-            &bootstrap,
+            &config,
             format!(
                 "[enrollment]\nurl = {}\nname = \"agent\"\nclient_cert = {}\nclient_key = {}\nca = {}\n",
                 lit(if self.repository_base_url.starts_with("https://") {
@@ -450,7 +447,7 @@ impl Node {
             ),
         )
         .map_err(str_err)?;
-        Ok(bootstrap)
+        Ok(config)
     }
 
     fn seed_install(&self) -> R {
@@ -512,25 +509,25 @@ impl Node {
         updated::state::write_installed(&paths.installed, &installed).map_err(str_err)
     }
 
-    /// A launcher command: `bootstrap --state-dir <dir> --supervisor-config <cfg>
-    /// --supervisor <agent>`. This is the whole node stack — the launcher decides which agent
+    /// A launcher command: `launcher --state-dir <dir> --config <cfg>
+    /// --agent <agent>`. This is the whole node stack — the launcher decides which agent
     /// binary runs, and the agent runs packages.
     pub fn launcher(self) -> R<Command> {
         let state_dir = self.state_dir();
         std::fs::create_dir_all(&state_dir).map_err(str_err)?;
-        let supervisor = self
-            .supervisor_override
+        let agent = self
+            .agent_override
             .clone()
-            .unwrap_or_else(|| self.supervisor_bin.clone());
+            .unwrap_or_else(|| self.agent_bin.clone());
         let ready_timeout = self.ready_timeout.clone().unwrap_or_else(|| "30".into());
         let cfg = self.write_config()?;
         let mut c = Command::new(&self.launcher_bin);
         c.arg("--state-dir")
             .arg(&state_dir)
-            .arg("--supervisor-config")
+            .arg("--config")
             .arg(&cfg)
-            .arg("--supervisor")
-            .arg(&supervisor)
+            .arg("--agent")
+            .arg(&agent)
             .arg("--ready-timeout")
             .arg(&ready_timeout)
             .arg("--confirm-timeout")

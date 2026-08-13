@@ -8,8 +8,11 @@
        alt="updatedc: the updatec control plane distributes signed releases to a fleet of updated node agents." />
 </p>
 
-**updatedc** is two cooperating halves that together roll signed application updates
-across a whole fleet:
+**updatedc** is a generic, signed configuration-and-deployment channel: publish any
+tarball or zip with an entrypoint script, and a fleet of machines pulls it, verifies it,
+activates it transactionally, and rolls it back on failed health — with zero learning
+curve on the node, because the entrypoint is a Bash or PowerShell script (or any
+executable) the operator already knows how to write. Two cooperating halves:
 
 - **`updated`** — the per-node agent. It securely installs and activates signed
   application bundles on Linux, macOS, and Windows, works with update-unaware
@@ -33,10 +36,10 @@ may carry its entrypoint, configuration, assets, helpers, and libraries under on
 verified, rollback-safe identity.
 
 > `updated` is update infrastructure, not the first installer. An installer places the
-> bootstrap and initial supervisor, provisions permissions, and registers the platform
+> launcher and initial agent, provisions permissions, and registers the platform
 > lifecycle owner. It may also preplace a signed enrollment artifact, the node's minted
 > identity, and a verified application bundle for a network-free first start. Otherwise
-> the first supervisor enrolls and cold-installs online. Loose preinstalled files are
+> the first agent enrolls and cold-installs online. Loose preinstalled files are
 > never trusted.
 
 ## One-command operator demo
@@ -105,7 +108,8 @@ the complete failure/rollback/recovery scenario both pass.
 
 ## Architecture
 
-Every node runs a small tower; the control plane lives outside the node entirely.
+Every node runs two small processes; workloads belong to the releases themselves, and
+the control plane lives outside the node entirely.
 
 ```text
                     updatec (Kubernetes operator + gateway + healthproxy)
@@ -114,20 +118,19 @@ Every node runs a small tower; the control plane lives outside the node entirely
         ┌─────────────┴───────── signed TUF metadata + bundles ──────────────┐
         ▼  (object storage / CDN)                                            ▲
   per node:                                                       signed health reports
-    outer lifecycle owner (systemd, launchd, Windows SCM, login item, launcher)
-      └── bootstrap (small permanent process guardian; no network or release policy)
-            ├── supervisor (TUF, selection, transactions, health, rollback)
-            └── application (launched from the active immutable bundle)
+    outer lifecycle owner (systemd, launchd, Windows SCM)
+      └── updated-launcher (which agent binary runs; readiness-gated pointer flips)
+            └── updated-agent (TUF, selection, transactions, health, rollback)
+                  └── invokes the release's own reconciler hooks
+                        └── workload processes (owned by the hooks, never the agent)
 ```
 
-On the node, the supervisor authenticates releases through TUF and hands the verified
-bytes to a provider; the bootstrap owns process lifetime. That separation lets a new
-supervisor prove readiness before its pointer is committed, while the application keeps
-running under the bootstrap. The supervisor carries no knowledge of what it downloads: it
-proves the bytes are the exact selected target and hands the provider a filepath. The
-built-in default provider extracts and verifies the signed bundle into an immutable
-release and resolves its entrypoint — a linked shared library, not a runtime plugin, so it
-can evolve independently of the trust/transaction/health/rollback core.
+On the node, the agent authenticates releases through TUF, extracts and verifies the
+signed bundle into an immutable release, and invokes the release's own reconciler hooks —
+it never launches, holds, or stops a workload process, so an agent restart, crash, or
+self-update can never disturb one. The launcher owns only which agent binary runs: a new
+agent proves readiness before its pointer is committed, and a bad one is reverted and
+rejected by content hash.
 
 Application activation follows one durable path:
 
@@ -248,10 +251,10 @@ stability of those bytes; stdout is fingerprint data and diagnostics belong on s
 output, non-zero exit, cancellation, exceeding the five-minute agent ceiling, or output beyond 64
 KiB omits the fingerprint rather than attesting incomplete state.
 
-## Bootstrap and enrollment
+## Node configuration and enrollment
 
-A node's entire local configuration is one `bootstrap.toml`, at one canonical path —
-`/etc/updated/bootstrap.toml` (`C:\Program Files\updated\bootstrap.toml` on Windows). It
+A node's entire local configuration is one `config.toml`, at one canonical path —
+`/etc/updated/config.toml` (`C:\Program Files\updated\config.toml` on Windows). It
 carries the gateway URL, the fleet CA, the shared fleet enrollment credential, and the
 node's unique configured name:
 
@@ -271,23 +274,22 @@ installer must preplace both `enrollment.json` and the already-minted `agent.crt
 The same signed deployment accepts HTTP(S), `file:` URLs, or absolute local repository
 directories, so an operator can repair a deployment fully offline. Raw edits inside an
 immutable installed release remain untrusted and are rejected. See
-[deploy/bootstrap.toml](deploy/bootstrap.toml).
+[deploy/config.toml](deploy/config.toml).
 
-Run the bootstrap — not the supervisor — under the chosen lifecycle owner:
+Run the launcher — not the agent — under the chosen lifecycle owner:
 
 ```sh
-target/release/bootstrap \
-  --state-dir /var/lib/example-app/guardian-state \
-  --supervisor /usr/lib/example-app/supervisor \
+target/release/updated-launcher \
+  --state-dir /var/lib/example-app/launcher-state \
+  --agent /usr/lib/example-app/updated-agent \
   --ready-timeout 60 \
   --confirm-timeout 30 \
   --stop-grace 10
 ```
 
-The bootstrap is the launcher: it manages only which agent binary runs, and touches no
-workload. The config is not named on the command line: it reads the canonical path above.
-`--supervisor-config` overrides it for a deployment that deliberately keeps the file
-elsewhere.
+The launcher manages only which agent binary runs, and touches no workload. The config
+is not named on the command line: it reads the canonical path above. `--config` overrides
+it for a deployment that deliberately keeps the file elsewhere.
 
 Platform templates (systemd, launchd, Windows service) live under [deploy/](deploy).
 
@@ -317,7 +319,7 @@ install_root/
 `providers/work/<version-manifest-id>` is the equivalent for a lifecycle provider. Each is a
 *sibling* of the matching `versions/` tree and deliberately not the tree itself: `versions/<id>`
 is content-addressed and re-hashed by release verification on every check tick, so a single log,
-lockfile or cache an ordinary application writes into its own `cwd` would make the supervisor
+lockfile or cache an ordinary application writes into its own `cwd` would make the agent
 condemn a perfectly good release and re-download it forever. So that a program still finds its own
 bundled configuration, templates and assets where it expects them, the workspace is seeded on
 resolve with a private copy of every file the release manifest declares — a copy, not a link, so an
@@ -326,8 +328,8 @@ content-addressed tree. A workspace is created on resolve and reaped once its re
 stayed gone across collection passes, so it never outlives what it belongs to and scratch survives
 restarts and rollbacks onto a release the node has run before.
 
-The bootstrap has a separate state root containing `desired-supervisor`, lifecycle markers,
-and content-addressed supervisor candidates.
+The launcher has a separate state root containing `desired-agent`, lifecycle markers,
+and content-addressed agent candidates.
 
 ## Try it
 
@@ -367,7 +369,7 @@ To deliberately retry the exact rejected bytes, copy its complete key from
 line, and restart the runtime. This local file is an intentionally inconvenient break-glass
 mechanism: malformed or partial keys fail startup closed, overrides are read only at
 startup, and the file should be removed after the controlled retry. Application keys are
-`repository-lineage-sha256:artifact-sha256`; supervisor keys are a single artifact SHA-256.
+`repository-lineage-sha256:artifact-sha256`; agent keys are a single artifact SHA-256.
 
 CI additionally runs:
 
@@ -385,7 +387,7 @@ deployments should publish immutable targets and signed metadata to object stora
 and keep role keys offline or in controlled CI/KMS infrastructure.
 
 ```sh
-cargo build --release -p server -p bootstrap -p supervisor
+cargo build --release -p server -p launcher -p agent
 
 target/release/server init --repo ./repo --keys ./keys
 
@@ -420,7 +422,7 @@ is for development and for control planes built on other orchestrators.
 
 ## Scope and limitations
 
-- The bootstrap is installer-owned and updated out of band; trust roots arrive inside the
+- The launcher is installer-owned and updated out of band; trust roots arrive inside the
   signed enrollment artifact.
 - Local state is not hardware-backed monotonic storage; a local administrator is inside the
   host trust boundary and can reseed an installation.
@@ -441,7 +443,7 @@ is for development and for control planes built on other orchestrators.
 - [Node reconciler protocol](docs/node-reconciler-protocol.md) — the argv and output-manifest
   contract a release's own reconciler is written against
 - [Kubernetes install guide](docs/kubernetes-install.md) — CRDs, namespace, and Secrets
-- [Reference bootstrap](deploy/bootstrap.toml)
+- [Reference node config](deploy/config.toml)
 - Design notes for the shipped controls: [observability](docs/observability-design.md),
   [regression response](docs/regression-response-design.md),
   [alerting](docs/alerting-design.md),

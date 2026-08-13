@@ -50,7 +50,7 @@
     "storage": {
       "inactive_releases": 2,
       "inactive_providers": 2,
-      "inactive_supervisors": 2,
+      "inactive_agents": 2,
       "inactive_bytes": 1073741824,
       "inactive_repository_caches": 2
     },
@@ -61,7 +61,7 @@
       "health_interval_seconds": 1,
       "refresh_retry_seconds": 5,
       "confirmation_window_seconds": 120,
-      "supervisor_check_interval_seconds": 3600
+      "agent_check_interval_seconds": 3600
     }
   }
 }

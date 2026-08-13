@@ -4,7 +4,7 @@
 # (LAN VM).
 updated_enrollment_url: "https://updatec-gateway"
 # Stable identity the control plane addresses this node by; defaults to the inventory name. It is
-# written verbatim as `name` in /etc/updated/bootstrap.toml, which is the name the gateway mints
+# written verbatim as `name` in /etc/updated/config.toml, which is the name the gateway mints
 # into the node's certificate CN and gives its UpdateAgent object.
 updated_hostname: "{{ inventory_hostname }}"
 # Where the source is built ON the target. `updatedc_source` (on the control node) is rsync'd here

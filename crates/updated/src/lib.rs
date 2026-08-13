@@ -1,4 +1,4 @@
-//! Reusable node-side installation primitives shared by the supervisor:
+//! Reusable node-side installation primitives shared by the agent:
 //! crash-safe filesystem replacement, a single-instance lock,
 //! health-rejection tracking, the committed
 //! installed-state record, and the operator-config loader (which also resolves
@@ -11,8 +11,8 @@
 //! The trust and download path — authenticating releases and streaming verified
 //! target bytes — lives in [`updated-tuf`](../updated_tuf/index.html) on top of
 //! TUF. This crate is everything that happens *after* verified bytes are staged
-//! on disk, plus the small OS glue the supervisor needs. Application process
-//! ownership and boot-safe identity now live in the guardian (`bootstrap`), not here.
+//! on disk, plus the small OS glue the agent needs. Application process
+//! ownership and boot-safe identity now live in the launcher (`launcher`), not here.
 
 pub mod bundle;
 pub mod config;
