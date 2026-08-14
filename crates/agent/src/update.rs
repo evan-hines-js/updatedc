@@ -9,26 +9,6 @@ pub(crate) enum Outcome {
     RollbackPending,
 }
 
-/// Why the application is being launched — passed to the provider as
-/// `--reason` so one program can branch (first-boot seeding vs. per-restart
-/// cleanup vs. an update) instead of needing a hook per situation.
-#[derive(Clone, Copy)]
-pub(crate) enum LifecycleReason {
-    Install,
-    Restart,
-    Update,
-}
-
-impl LifecycleReason {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Install => "install",
-            Self::Restart => "restart",
-            Self::Update => "update",
-        }
-    }
-}
-
 /// Crashes at a configured transaction boundary, for the e2e's crash-recovery scenarios.
 /// Compiled in only under the `chaos` feature (which the e2e enables); a production build
 /// has no injection points, so a stray `UPDATED_CHAOS_POINT` can never crash it. One-shot:
@@ -213,14 +193,14 @@ pub(crate) struct ReleaseReconciler<'a> {
     /// The `--reason` every probe this port makes carries. It is a property of the boot or the
     /// transaction the port serves, not of an individual probe, so it is fixed at construction:
     /// a boot gate observes the same kind of event the boot converge just performed.
-    reason: LifecycleReason,
+    reason: Reason,
 }
 
 impl<'a> ReleaseReconciler<'a> {
     pub(crate) fn new(
         opts: &'a Options,
         lifecycle: &'a updated::state::ProviderRelease,
-        reason: LifecycleReason,
+        reason: Reason,
     ) -> ReleaseReconciler<'a> {
         ReleaseReconciler {
             opts,
@@ -324,7 +304,7 @@ fn fingerprint_from_output(
 pub(crate) fn converge_environment(
     opts: &Options,
     store: &dyn Store,
-    reason: LifecycleReason,
+    reason: Reason,
 ) -> io::Result<()> {
     let updated::state::Installed::Present(installed) = store.installed() else {
         return Ok(());
@@ -774,7 +754,7 @@ pub(crate) fn persist_transaction(store: &mut dyn Store, tx: &Transaction) -> io
 /// integration from wedging the updater forever.
 pub(crate) struct LifecycleInvocation<'a> {
     pub(crate) phase: Operation,
-    pub(crate) reason: LifecycleReason,
+    pub(crate) reason: Reason,
     pub(crate) id: &'a str,
     pub(crate) candidate: &'a updated::bundle::ReleaseId,
     pub(crate) predecessor: &'a updated::bundle::ReleaseId,
@@ -849,7 +829,7 @@ fn prepare_lifecycle_command(
     let values: [&std::ffi::OsStr; updated_contracts::reconciler::FLAGS.len()] = [
         std::ffi::OsStr::new("1"),
         std::ffi::OsStr::new(lifecycle_attempt_id),
-        std::ffi::OsStr::new(reason.name()),
+        std::ffi::OsStr::new(reason.as_str()),
         opts.paths.install_root.as_os_str(),
         state_dir.as_os_str(),
         candidate_dir.as_os_str(),
@@ -1913,15 +1893,6 @@ mod tests {
             );
         }
         assert!(set.contains(&"PATH".to_owned()));
-    }
-
-    /// The published `--reason` spellings. A reconciler branches on this argv value, so a rename
-    /// here silently falls through the operator's `case` and the release never re-converges.
-    #[test]
-    fn reason_names_are_the_published_argv_spellings() {
-        assert_eq!(LifecycleReason::Install.name(), "install");
-        assert_eq!(LifecycleReason::Restart.name(), "restart");
-        assert_eq!(LifecycleReason::Update.name(), "update");
     }
 
     #[test]

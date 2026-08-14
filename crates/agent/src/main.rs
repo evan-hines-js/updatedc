@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use updated::config::{with_suffix, Application, Paths, Routing, Storage, Timeouts};
 /// The reconciler protocol vocabulary is defined once, in the contracts crate, and shared with
 /// every reconciler implementation in this workspace.
-use updated_contracts::reconciler::{attempt, Operation};
+use updated_contracts::reconciler::{attempt, Operation, Reason};
 use updated_contracts::telemetry::REPORT_CADENCE_JITTER_PERCENT;
 mod acquire;
 mod boot;
@@ -451,9 +451,9 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // One reason for this whole boot, so the converge below and the gate after it can never
     // disagree about what kind of boot the reconciler is being asked to serve.
     let boot_reason = if first_install {
-        LifecycleReason::Install
+        Reason::Install
     } else {
-        LifecycleReason::Restart
+        Reason::Restart
     };
     // The boot converge is the COMMITTED release's `apply` and never runs during recovery: a boot
     // resuming an interrupted update or rollback replays only that transaction's own minimal,
@@ -525,7 +525,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     opts,
                     LifecycleInvocation {
                         phase: Operation::Rollback,
-                        reason: LifecycleReason::Update,
+                        reason: Reason::Update,
                         id: &tx.rollback_attempt_id(),
                         candidate: &tx.previous_release,
                         predecessor: &tx.candidate_release,
@@ -631,7 +631,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 &opts,
                 LifecycleInvocation {
                     phase: Operation::Rollback,
-                    reason: LifecycleReason::Update,
+                    reason: Reason::Update,
                     id: &tx.rollback_attempt_id(),
                     candidate: &tx.previous_release,
                     predecessor: &tx.candidate_release,
@@ -675,7 +675,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // the node's identity. If that identity can't build (an offline/non-mTLS deployment with no
     // CA on disk), fall back to a plain client: telemetry is best-effort, and a plain-HTTP report
     // target is served as usual.
-    let heartbeat = Heartbeat {
+    let mut heartbeat = Heartbeat {
         client: opts
             .routing
             .mtls
@@ -689,6 +689,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         signing_key: std::fs::read_to_string(&opts.routing.mtls.client_key)
             .ok()
             .and_then(|pem| updated::csr::key_pem_to_pkcs8_der(&pem).ok()),
+        refusal: telemetry::Refusal::default(),
     };
     let mut fingerprints = fingerprint::Tracker::new(Instant::now());
     // The last repository this node resolved. Kept across cycles so the heartbeat has something to
@@ -820,7 +821,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     &opts,
                     LifecycleInvocation {
                         phase: Operation::Healthcheck,
-                        reason: LifecycleReason::Restart,
+                        reason: Reason::Restart,
                         id: attempt::PERIODIC,
                         candidate: installed,
                         predecessor: installed,
@@ -837,7 +838,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                             &opts,
                             LifecycleInvocation {
                                 phase: Operation::Inspect,
-                                reason: LifecycleReason::Restart,
+                                reason: Reason::Restart,
                                 id: attempt::FINGERPRINT,
                                 candidate: installed,
                                 predecessor: installed,
@@ -913,7 +914,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // running and the next probe would report it ready. NOT best effort: a converge
                     // that fails would leave the old image serving, so it propagates and this agent
                     // exits, leaving boot recovery to converge the repaired release.
-                    converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
+                    converge_environment(&opts, &store, Reason::Restart).map_err(|error| {
                         format!("converging the environment onto the repaired bundle: {error}")
                     })?;
                     health.reconverged(&opts.timeouts);
@@ -1022,7 +1023,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // The SAME converge the boot path runs, through the same function. Readiness
                     // comes back only through the ordinary observed-healthy path once `reconverged`
                     // re-arms probing, so a converge that fails leaves this node reporting unready.
-                    converge_environment(&opts, &store, LifecycleReason::Restart).map_err(|error| {
+                    converge_environment(&opts, &store, Reason::Restart).map_err(|error| {
                         format!("converging the environment onto the new runtime: {error}")
                     })?;
                     // Re-gate readiness from scratch — under the configured start grace, since
@@ -1132,6 +1133,11 @@ struct Heartbeat {
     node: Option<String>,
     /// The per-node key each report is signed with (PKCS#8 DER).
     signing_key: Option<Vec<u8>>,
+    /// Whether the report endpoint is currently refusing this node, and when to try again. A
+    /// refusal is a standing verdict about identity (see [`telemetry::Refusal`]), so it paces the
+    /// writer down to the agent-check cadence instead of spending a request and a warning per cycle
+    /// on a report no reader could ever accept.
+    refusal: telemetry::Refusal,
 }
 
 /// What this node can say about its own settlement on the assignment it is acting on: the two
@@ -1161,7 +1167,7 @@ impl Heartbeat {
     /// `repo` is the last repository this node resolved — `None` only before the first successful
     /// resolution, when there is no assignment and so no report target yet.
     async fn emit(
-        &self,
+        &mut self,
         opts: &Options,
         repo: Option<&TrustedRepository>,
         store: &dyn Store,
@@ -1191,6 +1197,10 @@ impl Heartbeat {
                 manifest_sha256: &manifest_sha256,
             },
             self.signing_key.as_deref(),
+            &mut self.refusal,
+            // The slowest cadence the agent already has, read fresh each cycle so an assignment
+            // that changes it moves the backoff with it.
+            opts.timeouts.agent_check_interval,
         )
         .await;
     }
@@ -1797,7 +1807,7 @@ fn complete_recovery_activation(
         opts,
         LifecycleInvocation {
             phase: Operation::Apply,
-            reason: LifecycleReason::Update,
+            reason: Reason::Update,
             id: &tx.rollback_attempt_id(),
             candidate: &tx.previous_release,
             predecessor: &tx.candidate_release,
@@ -2174,6 +2184,42 @@ mod tests {
         }
         // No journal at all is trivially clearable — recovery retries a failed post-commit delete.
         assert!(MemStore::default().clear_journal().is_ok());
+    }
+
+    /// The one non-terminal phase whose journal can still be spent: a crash between the durable
+    /// commit and the journal's own terminal write leaves `CommitStarted` on disk while active
+    /// and installed state prove the commit landed. The store admits exactly that evidence — and
+    /// still refuses the same phase when the machine does NOT corroborate it.
+    #[test]
+    fn a_commit_that_landed_makes_its_journal_discardable() {
+        let situation = interrupted_revert(Some(Phase::CommitStarted));
+        let tx = situation.journal.unwrap();
+        let candidate = tx.candidate_release.clone();
+
+        let landed = updated::state::InstalledState::provisional(
+            tx.candidate_repository_lineage.clone(),
+            candidate.clone(),
+            tx.candidate_archive_sha256.clone(),
+            tx.lifecycle.clone(),
+        );
+        let mut store = MemStore {
+            journal: Some(tx.clone()),
+            installed: Some(landed),
+            active: Some(candidate),
+            ..MemStore::default()
+        };
+        store.clear_journal().unwrap();
+        assert!(store.journal().unwrap().is_none());
+
+        // Same phase, but the machine still shows the predecessor: the commit did NOT land, the
+        // transaction still owes it, and the journal survives.
+        let mut unlanded = MemStore {
+            active: Some(tx.previous_release.clone()),
+            journal: Some(tx),
+            ..MemStore::default()
+        };
+        assert!(unlanded.clear_journal().is_err());
+        assert!(unlanded.journal().unwrap().is_some());
     }
 
     /// The other door into evidence destruction: persisting transaction B over transaction A's
@@ -2915,10 +2961,7 @@ mod tests {
             .expect("the cycle body is one expression")..];
         // Spelled in halves so this assertion does not count itself.
         let call = concat!("converge_", "environment(&opts, &store,");
-        let restart = concat!(
-            "converge_",
-            "environment(&opts, &store, LifecycleReason::Restart)"
-        );
+        let restart = concat!("converge_", "environment(&opts, &store, Reason::Restart)");
         let converges = loop_body.matches(call).count();
         assert_eq!(converges, 2, "the repair arm and the runtime arm");
         assert_eq!(

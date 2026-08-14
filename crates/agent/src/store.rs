@@ -49,15 +49,30 @@ pub(crate) trait Store {
         self.point_active(release)
     }
     /// Destroy the journal — but only when its transaction no longer owes the machine anything.
-    /// [`Transaction::may_discard`] is the rule: before `ActivateStarted` nothing was displaced,
-    /// and `Committed`/`RolledBack` have settled their debt (reaching `RolledBack` is what runs,
-    /// or durably abandons, the compensating `rollback` hook). Every other phase is a machine
-    /// whose displaced state still has an obligation on record, and discarding the record would
-    /// silently skip the compensation — so the refusal lives here, on the destroy operation
-    /// itself, where no future call site can forget it.
+    /// Two ways a journal can be owed nothing, each with its single existing definition:
+    /// [`Transaction::may_discard`] answers from the phase alone (nothing displaced yet, or a
+    /// terminal phase — and reaching `RolledBack` is what runs, or durably abandons, the
+    /// compensating `rollback` hook); and [`classify_recovery`]'s `Committed` answers from the
+    /// machine — a crash between the durable commit and the journal's own terminal write leaves
+    /// the phase at `CommitStarted` while active and installed state prove the commit landed.
+    /// Every other case is displaced state with an obligation on record, and discarding the
+    /// record would silently skip the compensation — so the refusal lives here, on the destroy
+    /// operation itself, where no future call site can forget it.
     fn clear_journal(&mut self) -> io::Result<()> {
         if let Some(tx) = self.journal()? {
-            if !tx.may_discard() {
+            let committed = match self.installed() {
+                Installed::Present(state) => Some(state.release.clone()),
+                Installed::Missing | Installed::Invalid => None,
+            };
+            let landed = matches!(
+                updated::transaction::classify_recovery(
+                    &tx,
+                    self.active_release()?.as_ref(),
+                    committed.as_ref(),
+                ),
+                updated::transaction::Recovery::Committed
+            );
+            if !tx.may_discard() && !landed {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(

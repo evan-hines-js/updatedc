@@ -484,7 +484,11 @@ pub struct AgentIdentity {
 pub enum AgentIdentityKind {
     /// Offline provisioning: the operator declares the agent and exports its immutable enrollment
     /// Secret out of band. The machine never talks to `/enroll`, so this identity is NEVER
-    /// completable over the shared fleet bootstrap certificate.
+    /// completable over the shared fleet bootstrap certificate — and therefore never carries a
+    /// pinned key, which is why such a node is planned BLIND (see [`AgentIdentity::public_key`]).
+    /// Its report writes are refused for the life of the machine; the node's own agent backs off to
+    /// its agent-check cadence after the first refusal rather than reporting into a `403` every
+    /// cycle (`agent::telemetry::Refusal`).
     Manual,
     /// The operator reserved this exact name for a machine that will enroll dynamically, and
     /// deferred the identity to the node's own CSR. This is the ONLY shape `/enroll` may complete

@@ -18,6 +18,12 @@
 //!   target into the S3 repository, then patches the named `UpdateGroup` to reference the
 //!   new target. It touches Kubernetes only to patch that one resource.
 //!
+//! * `reconciler-check` is the pre-publication conformance harness for the one cross-organization
+//!   surface in the system: it runs a release's own node reconciler against a scratch install root
+//!   through the published argv grammar and checks the properties the agent cannot enforce —
+//!   replay tolerance, observation purity, fingerprint stability, and the two refusals. It touches
+//!   no repository, no keys, and no Kubernetes.
+//!
 //! Keys are always just a directory of `root.pk8`, `targets.pk8`, `snapshot.pk8`, and
 //! `timestamp.pk8`. Delivery (Vault → Secret → mount) is the platform's job; `updatectl`
 //! stays out of the secret business. It only ever *mints and signs* — it never verifies;
@@ -34,6 +40,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod reconciler_check;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
@@ -80,6 +88,10 @@ enum Command {
     /// a signed target. Like `deploy` but publishes only the target — no group is rolled. A
     /// provider set then references the resulting `path`+`sha256`.
     PublishProviderArtifact(ProviderArtifactArgs),
+    /// Check a release's node reconciler against the published protocol: replay tolerance,
+    /// observation purity, fingerprint stability, and the two refusals. Runs the hook against a
+    /// scratch install root; needs no repository, keys, or Kubernetes access.
+    ReconcilerCheck(reconciler_check::ReconcilerCheckArgs),
     /// Sign and publish an immutable provider set (`provider-sets/<id>.json`) as a target,
     /// binding the required lifecycle provider artifact by path+sha256. This is the
     /// S3-native counterpart of `server publish-provider-set`.
@@ -324,6 +336,9 @@ async fn main() -> std::process::ExitCode {
         Command::Deploy(args) => deploy(args).await,
         Command::PublishProviderArtifact(args) => publish_provider_artifact(args).await,
         Command::PublishProviderSet(args) => publish_provider_set(args).await,
+        // Local and synchronous: it drives child processes against a scratch directory and touches
+        // no repository at all.
+        Command::ReconcilerCheck(args) => reconciler_check::reconciler_check(args),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

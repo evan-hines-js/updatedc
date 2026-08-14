@@ -1,6 +1,6 @@
 # updatedc — reliable upgrades across fleets of applications
 
-[![CI](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml/badge.svg)](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml)
+[![CI](https://github.com/evan-hines-js/updated/actions/workflows/ci.yml/badge.svg)](https://github.com/evan-hines-js/updated/actions/workflows/ci.yml)
 [![License: PolyForm Small Business 1.0.0](https://img.shields.io/badge/License-PolyForm%20Small%20Business%201.0.0-blue.svg)](LICENSE)
 
 <p align="center">
@@ -271,6 +271,18 @@ Enrollment returns the pinned routing root plus the complete TUF-signed runtime 
 repository configuration. For a network-free first boot against a remote gateway, an
 installer must preplace both `enrollment.json` and the already-minted `agent.crt` /
 `agent.key`; a bundle alone still requires `/enroll` to establish the per-node identity.
+An offline-provisioned agent (`identity.kind: manual`) is the exception, and deliberately so:
+it never talks to `/enroll`, so no public key is ever pinned to its name, and the control plane
+can never verify anything it reports. It is staged **blind** — on what was published to it
+rather than on evidence — so its group stays throttled and stays updatable without any
+unverifiable report being believed. The gateway consequently refuses that node's report writes
+(`403`), and the node's agent treats the refusal as the standing verdict it is: it warns once
+and drops reporting to the agent-check cadence rather than re-PUTting a report no reader could
+accept on every update cycle. Reporting resumes at full cadence by itself if the identity is
+ever completed. An operator who wants a node observed enrolls it (`kind: reserved` reserves the
+name for a specific machine to claim); manual provisioning trades visibility for needing no
+inbound enrollment at all.
+
 The same signed deployment accepts HTTP(S), `file:` URLs, or absolute local repository
 directories, so an operator can repair a deployment fully offline. Raw edits inside an
 immutable installed release remain untrusted and are rejected. See
