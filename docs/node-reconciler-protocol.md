@@ -156,7 +156,34 @@ Validate against the bounds above rather than against a rollout that appears to 
 
 Exit status zero means success; any other status means failure. The agent can enforce ordering,
 bounds, identity, and result handling, but cannot prove that a reconciler is idempotent, read-only,
-safe, or semantically correct.
+safe, or semantically correct. `updatectl reconciler-check` (below) exercises those properties
+directly, before a release is published.
+
+## Conformance harness
+
+```text
+updatectl reconciler-check ./reconciler [--scratch DIR] [-- PUBLISHER_ARGUMENTS...]
+```
+
+It builds a scratch install root and state directory, then invokes the hook through the same argv
+grammar the agent emits — the flag list above, in that order, with a cleared environment, a null
+stdin, and the publisher arguments after `--` — and replays every operation the way crash recovery
+does. Each check is reported `PASS`/`FAIL` with the evidence that decided it, and the command exits
+non-zero if any failed:
+
+- `apply --reason install` twice under one attempt id: both succeed (at-least-once tolerance).
+- `healthcheck` and `inspect` twice each: consistent exit status across the pair, and a state-dir
+  tree digest unchanged by all four — an observation that writes fails here.
+- `inspect` writes non-empty stdout that is identical across the pair, since that is the
+  fingerprint material.
+- `rollback` twice under the compensating attempt id (the forward token with `r` appended), with
+  `--candidate` and `--predecessor` swapped per the rule above: both end the same way.
+- An output manifest, if one is written, parses under the bounds in this document and is
+  byte-identical across the replay.
+- An unknown operation exits non-zero, and so does an unimplemented `--protocol`.
+
+It needs no repository, keys, or Kubernetes access. What it cannot check is what nothing can: that
+the operations mean what the release needs them to mean.
 
 ## Minimal Bash reconciler
 

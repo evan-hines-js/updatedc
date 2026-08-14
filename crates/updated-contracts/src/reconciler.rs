@@ -71,6 +71,31 @@ impl fmt::Display for Operation {
     }
 }
 
+/// The `--reason` vocabulary: why the agent is asking for this convergence. Part of the published
+/// grammar exactly like [`FLAGS`] and [`Operation`] — the agent emits these spellings and a
+/// reconciler may branch on only these — so it lives here rather than privately in the invoker,
+/// where a second speller (a conformance harness, a test fixture) could drift from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+    /// First convergence onto a release this node has not run before.
+    Install,
+    /// Re-converge onto the release already installed: a boot, a repair, a secret rotation.
+    Restart,
+    /// A transaction moving between releases, in either direction.
+    Update,
+}
+
+impl Reason {
+    /// The wire spelling passed after `--reason`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Restart => "restart",
+            Self::Update => "update",
+        }
+    }
+}
+
 /// Every protocol flag the agent passes to a reconciler invocation, in argv order. This is the
 /// published invocation grammar: the agent's argv builder emits exactly these, and a reconciler may
 /// read only these. Publisher-configured arguments are separated by `--` and are not part of it.
@@ -145,6 +170,17 @@ mod tests {
         assert!(!attempt::is_reserved("a1b2c3"));
     }
 
+    #[test]
+    fn the_three_reasons_spell_the_published_grammar() {
+        for (reason, spelling) in [
+            (Reason::Install, "install"),
+            (Reason::Restart, "restart"),
+            (Reason::Update, "update"),
+        ] {
+            assert_eq!(reason.as_str(), spelling);
+        }
+    }
+
     /// The reserved identities are a published cross-organization contract; a reconciler author
     /// reading the doc must see every spelling the agent actually sends.
     #[test]
@@ -154,6 +190,13 @@ mod tests {
             assert!(
                 PROTOCOL.contains(&format!("`{id}`")),
                 "docs/node-reconciler-protocol.md does not name the reserved attempt id `{id}`"
+            );
+        }
+        for reason in [Reason::Install, Reason::Restart, Reason::Update] {
+            assert!(
+                PROTOCOL.contains(reason.as_str()),
+                "docs/node-reconciler-protocol.md does not name the reason `{}`",
+                reason.as_str()
             );
         }
     }

@@ -8,7 +8,7 @@
 //! logged no-op — a node that cannot report keeps updating and serving exactly as if
 //! telemetry were never configured.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use updated::config::Routing;
 use updated_contracts::telemetry::{
@@ -93,19 +93,74 @@ pub fn load_outputs(
     Some(manifest)
 }
 
+/// The report endpoint's standing refusal of this node, and when reporting may next be attempted.
+///
+/// A `403` there is a verdict about identity, not a transient failure: the gateway admits a report
+/// only from a node whose `UpdateAgent` is an enrolled member of the repository presenting the
+/// public key that name is pinned to. It fails OPEN on every indefinite condition (an apiserver
+/// blip, a 5xx, throttling), so a refusal means the node genuinely may not write its own report and
+/// will keep not being able to until its identity itself changes.
+///
+/// An offline-provisioned `kind: manual` node is the deliberate case: it never enrolls, so it never
+/// has a pinned key, and the control plane classifies it as blind by design (see
+/// `updatec::rollout::NodeEvidence::Blind`) — it is staged on what was published to it rather than
+/// on evidence. Its reports are refused for the life of the machine. Reporting rides the update
+/// cadence, so re-PUTting a refused report every cycle is one futile request and one warning per
+/// cycle — once a second on a demo cadence — forever.
+///
+/// So a refusal drops reporting to the slowest cadence the agent already has, the agent-check
+/// interval, and warns once. Nothing is given up: a report that would be refused carries no
+/// information to any reader, and a node whose identity is later completed recovers on its own at
+/// that cadence without a restart.
+#[derive(Default)]
+pub struct Refusal {
+    /// When a report may next be attempted. `None` while the endpoint is accepting — which is also
+    /// what re-arms the single warning, so a later refusal is reported again rather than silently.
+    retry_after: Option<Instant>,
+}
+
+impl Refusal {
+    /// Whether a report may be attempted now.
+    fn admits(&self, now: Instant) -> bool {
+        self.retry_after.is_none_or(|at| now >= at)
+    }
+
+    /// Record a refusal, returning whether this is the first of an episode (and so the one that
+    /// warns).
+    fn refused(&mut self, now: Instant, backoff: Duration) -> bool {
+        let first = self.retry_after.is_none();
+        self.retry_after = Some(now + backoff);
+        first
+    }
+
+    /// The endpoint accepted a report: full cadence resumes and the next refusal warns.
+    fn accepted(&mut self) {
+        self.retry_after = None;
+    }
+}
+
 /// Write the node's running state to its report location. Strictly best-effort: any
 /// error (no report URL, no derivable identity, network failure, non-success status)
 /// is logged and swallowed so reporting can never disrupt the update loop.
+///
+/// `backoff` is how long a refused node stays quiet before trying again (see [`Refusal`]).
 pub async fn report_running_state(
     client: &reqwest::Client,
     report_url: Option<&str>,
     node: Option<&str>,
     state: &RunningState<'_>,
     signing_key: Option<&[u8]>,
+    refusal: &mut Refusal,
+    backoff: Duration,
 ) {
     let (Some(report_url), Some(node)) = (report_url, node) else {
         return;
     };
+    // Checked before the report is even built: a refused node pays no signing, no output read, and
+    // no request until its backoff elapses.
+    if !refusal.admits(Instant::now()) {
+        return;
+    }
     // No key means nothing publishable. A report is a signed DSSE envelope — there is no unsigned
     // form — and writing one no reader could verify would be worse than writing nothing: it would
     // OVERWRITE this node's last good report, so a consumer that had a fresh healthy record would be
@@ -153,7 +208,18 @@ pub async fn report_running_state(
         .send()
         .await;
     match result {
-        Ok(response) if response.status().is_success() => {}
+        Ok(response) if response.status().is_success() => refusal.accepted(),
+        Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
+            if refusal.refused(Instant::now(), backoff) {
+                crate::warn(&format!(
+                    "rollout telemetry to {target} was refused (403): this node is not an enrolled \
+                     member of its repository presenting its pinned key, so the control plane \
+                     cannot verify anything it reports and stages it blind. Reporting backs off to \
+                     one attempt every {}s and recovers on its own if the identity is completed.",
+                    backoff.as_secs()
+                ));
+            }
+        }
         Ok(response) => crate::warn(&format!(
             "rollout telemetry to {target} returned {}; continuing",
             response.status()
@@ -168,6 +234,9 @@ pub async fn report_running_state(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn routing(assignment: &str) -> Routing {
         Routing {
@@ -214,5 +283,145 @@ mod tests {
     fn node_identity_is_none_without_a_usable_stem() {
         assert_eq!(node_identity(&routing("assignments/agents/.json")), None);
         assert_eq!(node_identity(&routing("agents/agent")), None);
+    }
+
+    /// A report endpoint that answers every request with one fixed status, counting the requests it
+    /// actually receives. `connection: close` keeps the client from pooling, so one connection is
+    /// one request and the count is exactly what the writer put on the wire.
+    fn report_endpoint(status: &'static str) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream);
+                // Drain the whole request before replying: answering mid-body would reset the
+                // connection and the client would see a transport error instead of the status.
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let _ = reader.get_mut().write_all(
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        (base, requests)
+    }
+
+    /// One report attempt against `base`, with a fresh signing key so the envelope is real.
+    async fn report(base: &str, refusal: &mut Refusal, backoff: Duration) {
+        let key =
+            updated::csr::key_pem_to_pkcs8_der(&updated::csr::generate_key().unwrap()).unwrap();
+        report_running_state(
+            &reqwest::Client::new(),
+            Some(base),
+            Some("node-1"),
+            &RunningState {
+                deployment: "deployment",
+                assignment_sha256: "assignment",
+                version: "1.0.0",
+                archive_sha256: "archive",
+                healthy: false,
+                updating: false,
+                fingerprint: None,
+                install_root: std::path::Path::new("/nonexistent"),
+                manifest_sha256: "",
+            },
+            Some(&key),
+            refusal,
+            backoff,
+        )
+        .await;
+    }
+
+    /// A 403 is a standing verdict on this node's identity: the writer must stop hammering it every
+    /// cycle. A `kind: manual` node — deliberately blind, never enrolled, never pinned — is refused
+    /// for the life of the machine, which on the demo cadence was one futile request and one warning
+    /// per second, forever.
+    #[tokio::test]
+    async fn a_refused_report_backs_off_instead_of_reporting_every_cycle() {
+        let (base, requests) = report_endpoint("403 Forbidden");
+        let mut refusal = Refusal::default();
+        for _ in 0..5 {
+            report(&base, &mut refusal, Duration::from_secs(3600)).await;
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "only the first cycle of a refusal episode reaches the endpoint"
+        );
+    }
+
+    /// The backoff is a pace, not a surrender: the node keeps trying at the slow cadence, so an
+    /// identity completed later recovers without a restart.
+    #[tokio::test]
+    async fn a_refused_node_keeps_retrying_at_the_backoff_cadence() {
+        let (base, requests) = report_endpoint("403 Forbidden");
+        let mut refusal = Refusal::default();
+        for _ in 0..3 {
+            report(&base, &mut refusal, Duration::ZERO).await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    /// An accepting endpoint is never paced, and acceptance re-arms the single warning so a later
+    /// refusal is still reported.
+    #[tokio::test]
+    async fn an_accepted_report_leaves_the_cadence_alone() {
+        let (base, requests) = report_endpoint("200 OK");
+        let mut refusal = Refusal {
+            retry_after: Some(std::time::Instant::now()),
+        };
+        for _ in 0..3 {
+            report(&base, &mut refusal, Duration::from_secs(3600)).await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(refusal.retry_after.is_none());
+    }
+
+    /// Anything other than a refusal keeps the ordinary cadence: a 5xx or an unreachable gateway is
+    /// transient, and the node's freshness budget depends on retrying it next cycle.
+    #[tokio::test]
+    async fn a_transient_failure_is_not_a_refusal() {
+        let (base, requests) = report_endpoint("503 Service Unavailable");
+        let mut refusal = Refusal::default();
+        for _ in 0..3 {
+            report(&base, &mut refusal, Duration::from_secs(3600)).await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(refusal.retry_after.is_none());
+    }
+
+    #[test]
+    fn a_refusal_episode_warns_exactly_once_and_re_arms_on_acceptance() {
+        let now = Instant::now();
+        let mut refusal = Refusal::default();
+        assert!(refusal.admits(now));
+        assert!(refusal.refused(now, Duration::from_secs(60)));
+        assert!(!refusal.admits(now));
+        assert!(refusal.admits(now + Duration::from_secs(60)));
+        assert!(
+            !refusal.refused(now, Duration::from_secs(60)),
+            "a continuing refusal does not warn again"
+        );
+        refusal.accepted();
+        assert!(refusal.admits(now));
+        assert!(
+            refusal.refused(now, Duration::from_secs(60)),
+            "a new episode after an accepted report warns again"
+        );
     }
 }

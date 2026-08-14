@@ -49,8 +49,6 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
     // the reserved-identity invocations a boot legitimately makes. The other half of the claim is
     // that it really did re-converge: the boot `apply` is present, under `--reason restart`, and it
     // changed nothing, which is the whole package-runner point.
-    let added = fixture::operations(&fixture::root(&dir));
-    let disturbances = fixture::disturbances(&fixture::root(&dir), before);
     let boot_converges = |slice: &[fixture::Invocation]| {
         slice
             .iter()
@@ -62,10 +60,14 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
     };
     // The reserved identity is a deliberately recurring name, never an idempotency key: EVERY boot
     // runs the converge under it. So the count grows with each boot — one before the crash, at
-    // least one more after — which fails immediately if the converge is ever made conditional or
-    // the reserved id is "fixed" into a one-shot key.
-    let converges_before = boot_converges(&added[..before]);
-    let re_converged = converges_before >= 1 && boot_converges(&added[before..]) >= 1;
+    // least one more after. "Resumed reconciling" (above) is the agent's banner, which lands
+    // BEFORE its boot converge runs, so the recorded history is given the same bounded wait as
+    // every other eventually-true observation rather than one sample under a loaded runner.
+    let re_converged = wait_until(EVENT_TIMEOUT, || {
+        let added = fixture::operations(&fixture::root(&dir));
+        boot_converges(&added[..before]) >= 1 && boot_converges(&added[before..]) >= 1
+    });
+    let disturbances = fixture::disturbances(&fixture::root(&dir), before);
     // Read the record before teardown removes it, so a failure reports what actually happened.
     let workload_after = fixture::workload_pid(&dir);
     let log = boot.captured_log();
@@ -97,7 +99,7 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
     // `--reason` — `install` on the first boot, `restart` afterwards — and never `update`. A gate
     // that invents its own reason contradicts the converge that just ran.
     let mut converge_reason = String::new();
-    for invocation in &added {
+    for invocation in &fixture::operations(&fixture::root(&dir)) {
         if invocation.id != updated_contracts::reconciler::attempt::BOOT {
             continue;
         }
