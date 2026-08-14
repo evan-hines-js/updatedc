@@ -1,7 +1,6 @@
 [Unit]
 Description=updated agent (launcher)
-# Only the socat-shim demo has a unit to wait for; a production install has none.
-After=network-online.target{{ ' updated-gateway-shim.service' if updated_demo_shim_host is defined else '' }}
+After=network-online.target
 Wants=network-online.target
 
 [Service]

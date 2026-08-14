@@ -16,6 +16,6 @@ if [ ! -x "$JAVA" ] || [ ! -f "$WAR" ]; then
 fi
 
 echo "jenkins-app: starting Jenkins" >&2
-# The demo fleet is headless: skip the interactive setup wizard so /login answers as soon
+# The e2e fleet is headless: skip the interactive setup wizard so /login answers as soon
 # as the controller is up, which is what the reconciler's healthcheck probes.
 exec "$JAVA" -Djenkins.install.runSetupWizard=false -jar "$WAR" --httpPort=8080

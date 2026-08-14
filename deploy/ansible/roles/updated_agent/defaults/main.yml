@@ -1,18 +1,12 @@
 ---
-# The control plane's enrollment endpoint. In production this is your real gateway URL; the
-# demo overrides it to the in-cluster name reached through nginx (co-located) or the socat shim
-# (LAN VM).
+# The control plane's enrollment endpoint — your gateway's URL.
 updated_enrollment_url: "https://updatec-gateway"
 # Stable identity the control plane addresses this node by; defaults to the inventory name. It is
 # written verbatim as `name` in /etc/updated/config.toml, which is the name the gateway mints
 # into the node's certificate CN and gives its UpdateAgent object.
 updated_hostname: "{{ inventory_hostname }}"
 # Where the source is built ON the target. `updatedc_source` (on the control node) is rsync'd here
-# first; when the two are the same path — the co-located demo, where the workspace already lives on
-# the target — the copy is skipped and the checkout is built in place.
+# first; when the two are the same path the copy is skipped and the checkout is built in place.
 updated_build_dir: "{{ ansible_env.HOME }}/updatedc-src"
-# Point the in-cluster gateway names at 127.0.0.1 via /etc/hosts. True whenever the socat shim is
-# in play; the co-located demo sets it directly because there nginx already listens on port 80.
-updated_gateway_local_names: "{{ updated_demo_shim_host is defined }}"
 # Required (no default): updatedc_source and the mTLS identity —
 # updated_enrollment_client_cert / _client_key / _ca (base64 PEM).

@@ -1,8 +1,7 @@
 ---
 # Build the agent from source on the target (native binaries, no cross-compile) and run it as
 # a systemd service that enrolls with the control plane. This is the ONE way an agent is
-# installed on a host — production fleet (install-agent.yml) and demo (demo.yml) alike; the
-# demo only supplies different variables.
+# installed on a host by install-agent.yml.
 
 - name: Install build and runtime dependencies
   ansible.builtin.apt:
@@ -52,33 +51,6 @@
   loop:
     - updated-launcher
     - updated-agent
-
-# ── Reachability (demo only) ──────────────────────────────────────────────────
-# In production the agent points straight at the real gateway URL. For a kind demo the gateway
-# lives in-cluster: the co-located demo publishes it on this host's port 80 through nginx, and the
-# LAN-VM demo forwards to the laptop with socat. Either way the agent keeps the identical config
-# the in-cluster pods use — only /etc/hosts changes.
-- name: Resolve in-cluster gateway names locally (demo)
-  when: updated_gateway_local_names | bool
-  ansible.builtin.blockinfile:
-    path: /etc/hosts
-    marker: "# {mark} updated demo gateway names"
-    block: "127.0.0.1 updatec-gateway release-default"
-
-- name: Forward the gateway to the laptop (demo)
-  when: updated_demo_shim_host is defined
-  ansible.builtin.template:
-    src: updated-gateway-shim.service.j2
-    dest: /etc/systemd/system/updated-gateway-shim.service
-    mode: "0644"
-
-- name: Start the gateway shim (demo)
-  when: updated_demo_shim_host is defined
-  ansible.builtin.systemd:
-    name: updated-gateway-shim
-    state: restarted
-    enabled: true
-    daemon_reload: true
 
 # ── Agent service ─────────────────────────────────────────────────────────────
 - name: Ensure the agent mTLS directory exists

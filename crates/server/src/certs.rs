@@ -7,7 +7,7 @@
 //!   server.crt/.key — the gateway's server identity
 //!   client.crt/.key — the agent's client identity
 //!
-//! This is the local/e2e issuer. In the kind demo cert-manager issues the same three roles.
+//! This is the local/e2e issuer. In the kind e2e cert-manager issues the same three roles.
 
 use std::path::Path;
 

@@ -5,9 +5,9 @@
 //! HAProxy processes — it only needs each instance's admin stats socket reachable and the fronted
 //! servers pre-declared in that instance's `backend` (so `set server` can flip their state). The
 //! HAProxy could be a plain Deployment, an appliance, or anything else; this only speaks the Runtime
-//! API to it. (Our *demo* separately installs and holds HAProxy under `updated` from a signed
+//! API to it. (The fleet e2e separately installs and holds HAProxy under `updated` from a signed
 //! bundle — which additionally shows `updated` managing infra outside a cluster — but that is a
-//! property of the demo topology, not a requirement of this backend.)
+//! property of that topology, not a requirement of this backend.)
 //!
 //! Membership is driven from the fleet's own signed health: a ready node routes (`state ready`), a
 //! not-ready node **drains** (`state drain`) — existing connections finish while no new ones arrive,

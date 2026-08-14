@@ -14,7 +14,7 @@ die() {
 }
 
 # Append one tab-separated audit line (phase, attempt, event) under the install root, so a
-# reexec deployment is as observable as the demo's stop/start one (both read a lifecycle receipt).
+# reexec deployment is as observable as a stop/start one (both read a lifecycle receipt).
 # Strictly best-effort: a phase is never failed because its audit line could not be written.
 audit() {
   local root="$1" phase="$2" attempt="$3" event="$4" log="$1/haproxy-lifecycle/audit.tsv"

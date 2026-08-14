@@ -1,9 +1,9 @@
-//! The updated-managed HAProxy tier of the demo.
+//! The updated-managed HAProxy tier of the fleet e2e.
 //!
 //! Two HAProxy pods stand up as ordinary `updated` agents — plain Ubuntu + agent, no bespoke
 //! image — that install HAProxy from a signed tarball bundle and upgrade it **in place** via the
 //! provider's SIGUSR2 master-worker re-exec (`scripts/haproxy/{lifecycle,launch,lib.sh}`). They
-//! front the demo's external slice (the pods that stand in for out-of-cluster VMs); a HAProxy-mode
+//! front the e2e's external slice (the pods that stand in for out-of-cluster VMs); a HAProxy-mode
 //! `updated-healthproxy` programs their `fleet` backend membership from the same signed CDN health
 //! the EndpointSlice reconciler reads. A ClusterIP front Service fans traffic across the two
 //! HAProxies, and the e2e drives it across a 1.0.0 → 2.0.0 HAProxy upgrade proving zero dropped
@@ -11,10 +11,10 @@
 //! infrastructure (a load balancer) that fronts real services and that k8s cannot roll seamlessly.
 //!
 //! This tier sits entirely outside the sample-app cohort/set machinery and the pod-kill chaos
-//! (like the Jenkins tier), so it never perturbs the finely-tuned convergence/SLA math.
+//! (like the Jenkins tier), so it never perturbs the finely-tuned convergence math.
 
 use crate::*;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// Execution ceiling signed into the `haproxy-lifecycle` provider set. The agent bounds the
 /// WHOLE hook invocation by it, and this reconciler is the shell program in `scripts/haproxy`:
 /// a config validation (`haproxy -c`) plus a SIGUSR2 master-worker re-exec, both sub-second, with
-/// room for a cold install unpacking the bundle on a loaded demo cluster. It is deliberately not
+/// room for a cold install unpacking the bundle on a loaded kind cluster. It is deliberately not
 /// the Rust lifecycle fixture's `PROVIDER_TIMEOUT_MS`, which is sized by that fixture's own dwell
 /// arithmetic — two unrelated programs whose budgets only ever coincided by accident.
 const HAPROXY_PROVIDER_TIMEOUT_MS: u64 = 30_000;
@@ -35,11 +35,11 @@ struct BackendServer {
     address: String,
 }
 
-/// The demo's external slice, reused as HAProxy's backend: the two pods that stand in for
+/// The e2e's external slice, reused as HAProxy's backend: the two pods that stand in for
 /// out-of-cluster VMs. HAProxy fronting them is the thesis in miniature — a load balancer
 /// `updated` manages, in front of infrastructure that lives (conceptually) outside the cluster.
 fn backend_servers() -> Vec<BackendServer> {
-    (0..DEMO_EXTERNAL_COUNT)
+    (0..EXTERNAL_COUNT)
         .map(|index| {
             let ordinal = external_ordinal(index);
             BackendServer {
@@ -53,7 +53,7 @@ fn backend_servers() -> Vec<BackendServer> {
 /// The HAProxy configuration for one release version. The `fleet` backend pre-declares every
 /// backend server (the healthproxy only ever flips their `ready`/`drain` state at runtime — it
 /// never adds or removes servers), the frontend proxies real traffic to them, and `/haproxy-version`
-/// returns this release's version so the demo can observe the in-place re-exec actually swapping
+/// returns this release's version so the e2e can observe the in-place re-exec actually swapping
 /// the running configuration. `master-worker` + the admin stats socket are what the provider's
 /// `apply` operation drives (SIGUSR2 re-exec) and what the healthproxy programs.
 fn haproxy_cfg(version: &str, servers: &[BackendServer]) -> String {
@@ -78,8 +78,8 @@ fn haproxy_cfg(version: &str, servers: &[BackendServer]) -> String {
          \x20   default_backend {backend}\n\
          \n\
          backend {backend}\n",
-        admin = DEMO_HAPROXY_ADMIN_PORT,
-        backend = DEMO_HAPROXY_BACKEND,
+        admin = HAPROXY_ADMIN_PORT,
+        backend = HAPROXY_BACKEND,
     ));
     for server in servers {
         // No `check`: the HAProxy-mode healthproxy is the single authority on membership (it flips
@@ -95,7 +95,7 @@ fn haproxy_cfg(version: &str, servers: &[BackendServer]) -> String {
     cfg
 }
 
-/// The HAProxy StatefulSet: `DEMO_HAPROXY_REPLICAS` pods, each the same plain Ubuntu + agent image
+/// The HAProxy StatefulSet: `HAPROXY_REPLICAS` pods, each the same plain Ubuntu + agent image
 /// as every other node, enrolling through the same gateway and installing HAProxy from the signed
 /// bundle at runtime. In the headless `agents` Service so `haproxy-<n>.agents` resolves for the
 /// healthproxy's admin-socket reach.
@@ -103,14 +103,14 @@ pub(crate) fn haproxy_statefulset() -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
-        "metadata": { "name": "haproxy", "namespace": "updated-system" },
+        "metadata": { "name": "haproxy", "namespace": NAMESPACE },
         "spec": {
             "serviceName": "agents",
-            "replicas": DEMO_HAPROXY_REPLICAS,
+            "replicas": HAPROXY_REPLICAS,
             "podManagementPolicy": "Parallel",
-            "selector": { "matchLabels": { "app": "updated-agent", "demo.updated.dev/kind": "haproxy" } },
+            "selector": { "matchLabels": { "app": "updated-agent", KIND_LABEL: "haproxy" } },
             "template": {
-                "metadata": { "labels": { "app": "updated-agent", "demo.updated.dev/kind": "haproxy" } },
+                "metadata": { "labels": { "app": "updated-agent", KIND_LABEL: "haproxy" } },
                 "spec": {
                     "securityContext": { "fsGroup": 65532, "seccompProfile": { "type": "RuntimeDefault" } },
                     "containers": [{
@@ -120,7 +120,7 @@ pub(crate) fn haproxy_statefulset() -> serde_json::Value {
                         "command": ["/usr/local/bin/run-agent"],
                         "ports": [
                             { "name": "http", "containerPort": 8080 },
-                            { "name": "admin", "containerPort": DEMO_HAPROXY_ADMIN_PORT }
+                            { "name": "admin", "containerPort": HAPROXY_ADMIN_PORT }
                         ],
                         // The workload's own frontend, which is what "this pod can serve" means
                         // here. Node health has one path — reconciler hook verdict -> signed
@@ -176,7 +176,7 @@ pub(crate) fn publish_haproxy_bundles(
 ) -> Result<HaproxyRelease, Box<dyn std::error::Error>> {
     // 1. The provider set: the reconciler that owns the HAProxy process on every node.
     let repository = release_repository_flags();
-    let provider = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
+    let provider = output(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
         "-c",
@@ -208,10 +208,8 @@ pub(crate) fn publish_haproxy_bundles(
     //    publishes AND patches, so a seed group is how we publish without assigning a live cohort —
     //    the same pattern the sample-app baseline uses.
     let servers = backend_servers();
-    let (v1_path, v1_sha) =
-        publish_haproxy_app(seed_deployment, platform, DEMO_HAPROXY_V1, &servers)?;
-    let (v2_path, v2_sha) =
-        publish_haproxy_app(seed_deployment, platform, DEMO_HAPROXY_V2, &servers)?;
+    let (v1_path, v1_sha) = publish_haproxy_app(seed_deployment, platform, HAPROXY_V1, &servers)?;
+    let (v2_path, v2_sha) = publish_haproxy_app(seed_deployment, platform, HAPROXY_V2, &servers)?;
     Ok(HaproxyRelease {
         provider_path,
         provider_sha,
@@ -235,16 +233,16 @@ fn publish_haproxy_app(
     apply_json(&serde_json::json!({
         "apiVersion": "updated.dev/v1alpha1",
         "kind": "UpdateGroup",
-        "metadata": {"name": seed, "namespace": "updated-system"},
+        "metadata": {"name": seed, "namespace": NAMESPACE},
         "spec": {
             "repositoryRef": {"name": "default"},
-            "selector": {"matchLabels": {"demo.updated.dev/cohort": "__haproxy-seed-unmatched__"}},
+            "selector": {"matchLabels": {COHORT_LABEL: "__haproxy-seed-unmatched__"}},
             // A full clone of edge's deployment (CRD-valid); `updatectl deploy` overwrites application.
             "deployment": seed_deployment
         }
     }))?;
     // Stage the bundle tree: the real distro haproxy binary + the launch entrypoint.
-    run(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
+    run(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
         "-c",
@@ -258,14 +256,14 @@ fn publish_haproxy_app(
     ]))?;
     // Pipe the generated config in over stdin — no shell escaping of its quotes/braces/newlines.
     pipe_into_release_server("cat > /tmp/hap-app/config/haproxy.cfg", &cfg)?;
-    run(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
+    run(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
         "sh",
         "-c",
         &format!(
             "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
              updatectl deploy --keys-dir /data/release-keys {repository} \
-             --namespace updated-system --group {seed} --product haproxy --channel stable --version {version} \
+             --namespace {NAMESPACE} --group {seed} --product haproxy --channel stable --version {version} \
              --entrypoint bin/launch --platform {platform} --source /tmp/hap-app"
         ),
     ]))?;
@@ -275,9 +273,9 @@ fn publish_haproxy_app(
         &seed,
         "{.spec.deployment.application.sha256}",
     )?;
-    run(Command::new("kubectl").args([
+    run(kubectl().args([
         "-n",
-        "updated-system",
+        NAMESPACE,
         "delete",
         "updategroup",
         &seed,
@@ -289,10 +287,10 @@ fn publish_haproxy_app(
 /// Run `sh -c "<command>"` in the release-server pod with `stdin` piped to it — the escaping-free
 /// way to land arbitrary bytes (a generated config) inside the pod.
 fn pipe_into_release_server(command: &str, stdin: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("kubectl")
+    let mut child = kubectl()
         .args([
             "-n",
-            "updated-system",
+            NAMESPACE,
             "exec",
             "-i",
             "deployment/release-server",
@@ -334,16 +332,19 @@ fn haproxy_group_deployment(
     release: &HaproxyRelease,
 ) -> serde_json::Value {
     let mut deployment = edge["spec"]["deployment"].clone();
-    deployment["name"] = format!("{DEMO_HAPROXY_GROUP}@{DEMO_HAPROXY_V1}").into();
+    deployment["name"] = format!("{HAPROXY_GROUP}@{HAPROXY_V1}").into();
     deployment["application"] =
         serde_json::json!({"path": release.v1_path, "sha256": release.v1_sha});
     deployment["providerSet"] =
         serde_json::json!({"path": release.provider_path, "sha256": release.provider_sha});
     deployment["releaseRepository"] = minio_release_repository(release_root);
-    deployment["reportUrl"] = DEMO_REPORT_URL.into();
+    deployment["reportUrl"] = REPORT_URL.into();
     deployment["orderedInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
-    deployment["runtime"]["installRoot"] = "/var/lib/updated/haproxy".into();
+    // No install-root override: a node's install root is pinned at enrollment and the agent fails
+    // closed on an assignment that would move it. Each node runs exactly one product, so the
+    // enrollment-verified root is the right one for HAProxy too — overriding it made the tier
+    // install only when labelling happened to win the race against the node's first assignment.
     deployment["runtime"]["timeouts"] = serde_json::json!({
         "checkIntervalSeconds": 1,
         "healthGraceSeconds": 12,
@@ -356,26 +357,26 @@ fn haproxy_group_deployment(
     deployment
 }
 
-/// Bring up the whole HAProxy tier onto an already-provisioned demo cluster: the StatefulSet, the
+/// Bring up the whole HAProxy tier onto an already-provisioned cluster: the StatefulSet, the
 /// published bundles, the `haproxy` UpdateGroup at 1.0.0 (annotated with the pre-published 2.0.0
 /// target the e2e upgrade patches in), the HAProxy-mode healthproxy that programs backend
 /// membership, and the front Service. Idempotent enough to re-run: applies are declarative.
 pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("[demo] deploying the updated-managed HAProxy tier ({DEMO_HAPROXY_REPLICAS} HAProxies fronting the external slice)");
+    println!("[e2e] deploying the updated-managed HAProxy tier ({HAPROXY_REPLICAS} HAProxies fronting the external slice)");
     // Start the pods enrolling now; they install HAProxy while we publish the bundles below.
     apply_json(&haproxy_statefulset())?;
     // Clone the fully-valid `edge` deployment as the template for every HAProxy deployment spec, so
     // no CRD-required field is ever missing. The MinIO root is what the HAProxy bundles are pinned to.
-    let edge: serde_json::Value = serde_json::from_str(&output(Command::new("kubectl").args([
+    let edge: serde_json::Value = serde_json::from_str(&output(kubectl().args([
         "-n",
-        "updated-system",
+        NAMESPACE,
         "get",
         "updategroup",
         "edge",
         "-o",
         "json",
     ]))?)?;
-    let release_root = output(Command::new("kubectl").args(RELEASE_SERVER_EXEC).args([
+    let release_root = output(kubectl().args(RELEASE_SERVER_EXEC).args([
         "--",
         "cat",
         "/data/release-keys/root.json",
@@ -389,16 +390,16 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
         "apiVersion": "updated.dev/v1alpha1",
         "kind": "UpdateGroup",
         "metadata": {
-            "name": DEMO_HAPROXY_GROUP,
-            "namespace": "updated-system",
+            "name": HAPROXY_GROUP,
+            "namespace": NAMESPACE,
             "annotations": {
-                DEMO_HAPROXY_NEXT_PATH_ANNOTATION: &release.v2_path,
-                DEMO_HAPROXY_NEXT_SHA_ANNOTATION: &release.v2_sha,
+                HAPROXY_NEXT_PATH_ANNOTATION: &release.v2_path,
+                HAPROXY_NEXT_SHA_ANNOTATION: &release.v2_sha,
             }
         },
         "spec": {
             "repositoryRef": {"name": "default"},
-            "selector": {"matchLabels": {"demo.updated.dev/cohort": DEMO_HAPROXY_COHORT}},
+            "selector": {"matchLabels": {COHORT_LABEL: HAPROXY_COHORT}},
             "deployment": base,
             "maxUnavailable": 1
         }
@@ -406,10 +407,10 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
     label_haproxy_agents()?;
     apply_haproxy_front_service()?;
     deploy_haproxy_healthproxy()?;
-    println!("[demo] waiting for the HAProxy tier to install and become ready");
-    run(Command::new("kubectl").args([
+    println!("[e2e] waiting for the HAProxy tier to install and become ready");
+    run(kubectl().args([
         "-n",
-        "updated-system",
+        NAMESPACE,
         "rollout",
         "status",
         "statefulset/haproxy",
@@ -421,14 +422,14 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
 /// Label each HAProxy pod's enrolled `UpdateAgent` into the `haproxy` cohort the group selects.
 /// Retries until the agent has registered (`patch_agent_labels` waits).
 pub(crate) fn label_haproxy_agents() -> Result<(), Box<dyn std::error::Error>> {
-    for ordinal in 0..DEMO_HAPROXY_REPLICAS {
+    for ordinal in 0..HAPROXY_REPLICAS {
         let node = format!("haproxy-{ordinal}");
         patch_agent_labels(
             &resource_name(&node),
             serde_json::json!({
-                "demo.updated.dev/node": node,
-                "demo.updated.dev/cohort": DEMO_HAPROXY_COHORT,
-                "demo.updated.dev/kind": "haproxy"
+                NODE_LABEL: node,
+                COHORT_LABEL: HAPROXY_COHORT,
+                KIND_LABEL: "haproxy"
             }),
         )?;
     }
@@ -442,9 +443,9 @@ pub(crate) fn apply_haproxy_front_service() -> Result<(), Box<dyn std::error::Er
     apply_json(&serde_json::json!({
         "apiVersion": "v1",
         "kind": "Service",
-        "metadata": {"name": DEMO_HAPROXY_FRONT_SERVICE, "namespace": "updated-system"},
+        "metadata": {"name": HAPROXY_FRONT_SERVICE, "namespace": NAMESPACE},
         "spec": {
-            "selector": {"app": "updated-agent", "demo.updated.dev/kind": "haproxy"},
+            "selector": {"app": "updated-agent", KIND_LABEL: "haproxy"},
             "ports": [{"name": "http", "port": 80, "targetPort": "http"}]
         }
     }))
@@ -461,19 +462,19 @@ pub(crate) fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::error::Err
         .map(|server| {
             // Append each node's pinned public key so the healthproxy verifies the signed report,
             // not merely its shape — the same key the control-plane throttle pins.
-            let key = crate::setup::agent_pinned_public_key(&server.node)?;
+            let key = agent_pinned_public_key(&server.node)?;
             Ok(format!("{}={}={key}", server.node, server.address))
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
         .join(",");
-    let endpoints = (0..DEMO_HAPROXY_REPLICAS)
-        .map(|ordinal| format!("haproxy-{ordinal}.agents:{}", DEMO_HAPROXY_ADMIN_PORT))
+    let endpoints = (0..HAPROXY_REPLICAS)
+        .map(|ordinal| format!("haproxy-{ordinal}.agents:{}", HAPROXY_ADMIN_PORT))
         .collect::<Vec<_>>()
         .join(",");
     apply_json(&serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": {"name": "haproxy-healthproxy", "namespace": "updated-system"},
+        "metadata": {"name": "haproxy-healthproxy", "namespace": NAMESPACE},
         "spec": {
             "replicas": 1,
             "selector": {"matchLabels": {"app": "haproxy-healthproxy"}},
@@ -486,19 +487,19 @@ pub(crate) fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::error::Err
                         "imagePullPolicy": "Never",
                         "command": ["/usr/local/bin/updated-healthproxy"],
                         "env": [
-                            {"name": "HEALTHPROXY_HEALTH_BASE", "value": DEMO_HEALTH_CDN},
+                            {"name": "HEALTHPROXY_HEALTH_BASE", "value": HEALTH_CDN},
                             {"name": "HEALTHPROXY_MEMBERS", "value": members},
                             {"name": "HEALTHPROXY_HAPROXY_ENDPOINTS", "value": endpoints},
-                            {"name": "HEALTHPROXY_HAPROXY_BACKEND", "value": DEMO_HAPROXY_BACKEND}
+                            {"name": "HEALTHPROXY_HAPROXY_BACKEND", "value": HAPROXY_BACKEND}
                         ]
                     }]
                 }
             }
         }
     }))?;
-    run(Command::new("kubectl").args([
+    run(kubectl().args([
         "-n",
-        "updated-system",
+        NAMESPACE,
         "rollout",
         "status",
         "deployment/haproxy-healthproxy",
@@ -516,19 +517,19 @@ pub(crate) fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::error::Err
 /// is gated on the durable control-plane `reportedVersion`, never on transient probing.
 pub(crate) async fn assert_haproxy_zero_downtime_upgrade() -> Result<(), Box<dyn std::error::Error>>
 {
-    println!("[demo] verifying the updated-managed HAProxy tier and its zero-downtime upgrade");
+    println!("[e2e] verifying the updated-managed HAProxy tier and its zero-downtime upgrade");
     // Both HAProxies must already be serving 1.0.0 before we start.
-    wait_for_haproxy_version(DEMO_HAPROXY_V1, 240).await?;
+    wait_for_haproxy_version(HAPROXY_V1, 240).await?;
 
     // Port-forward the front Service and confirm traffic proxies THROUGH HAProxy to a backend
     // service (a non-empty /version body) before we touch anything.
-    let port = std::env::var("UPDATEC_DEMO_HAPROXY_PORT").unwrap_or_else(|_| "8099".into());
-    let mut forward = Command::new("kubectl")
+    let port = std::env::var("UPDATEC_HAPROXY_PORT").unwrap_or_else(|_| "8099".into());
+    let mut forward = kubectl()
         .args([
             "-n",
-            "updated-system",
+            NAMESPACE,
             "port-forward",
-            &format!("service/{DEMO_HAPROXY_FRONT_SERVICE}"),
+            &format!("service/{HAPROXY_FRONT_SERVICE}"),
             &format!("{port}:80"),
         ])
         .stdout(Stdio::null())
@@ -545,9 +546,7 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
         .timeout(Duration::from_millis(800))
         .build()?;
     wait_for_front_serving(&client, &front).await?;
-    println!(
-        "[demo] HAProxy front is serving backend traffic; starting the load probe and upgrade"
-    );
+    println!("[e2e] HAProxy front is serving backend traffic; starting the load probe and upgrade");
 
     // A continuous readiness-respecting probe against the front, exactly like the fleet's synthetic
     // load test: it records every outcome while the upgrade runs.
@@ -573,10 +572,10 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
     // Upgrade the self-protecting group to the pre-published 2.0.0 target. Intra-group admission
     // publishes it to the two HAProxies one at a time. Bracket notation for the annotation key — and
     // kubectl's jsonpath still requires the DOTS escaped even inside the brackets, so
-    // `demo.updated.dev/...` must be written `demo\.updated\.dev/...` or the selector returns empty.
-    let path_key = DEMO_HAPROXY_NEXT_PATH_ANNOTATION.replace('.', "\\.");
-    let sha_key = DEMO_HAPROXY_NEXT_SHA_ANNOTATION.replace('.', "\\.");
-    let annotated = DEMO_HAPROXY_GROUP;
+    // `e2e.updated.dev/...` must be written `e2e\.updated\.dev/...` or the selector returns empty.
+    let path_key = HAPROXY_NEXT_PATH_ANNOTATION.replace('.', "\\.");
+    let sha_key = HAPROXY_NEXT_SHA_ANNOTATION.replace('.', "\\.");
+    let annotated = HAPROXY_GROUP;
     let next_path = kubectl_value(
         "updategroup",
         annotated,
@@ -594,25 +593,25 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
         let _ = probe.await;
         return Err("HAProxy group carries no pre-published 2.0.0 target annotation".into());
     }
-    run(Command::new("kubectl").args([
+    run(kubectl().args([
         "-n",
-        "updated-system",
+        NAMESPACE,
         "patch",
         "updategroup",
-        DEMO_HAPROXY_GROUP,
+        HAPROXY_GROUP,
         "--type=merge",
         "-p",
         &serde_json::to_string(&serde_json::json!({"spec": {"deployment": {
-            "name": format!("{DEMO_HAPROXY_GROUP}@{DEMO_HAPROXY_V2}"),
+            "name": format!("{HAPROXY_GROUP}@{HAPROXY_V2}"),
             "application": {"path": next_path, "sha256": next_sha}
         }}}))?,
     ]))?;
 
     // Gate convergence on the durable control-plane reportedVersion — never on the probe.
-    let converged = wait_for_haproxy_version(DEMO_HAPROXY_V2, 240).await;
+    let converged = wait_for_haproxy_version(HAPROXY_V2, 240).await;
     // And confirm the running config actually re-execed (the front now reports 2.0.0).
     let reexeced = converged.is_ok()
-        && wait_for_front_version(&client, &front, DEMO_HAPROXY_V2)
+        && wait_for_front_version(&client, &front, HAPROXY_V2)
             .await
             .is_ok();
 
@@ -641,7 +640,7 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
     } else {
         (total - failed) as f64 / total as f64 * 100.0
     };
-    // The SLA line the whole demo holds the fleet to. A correct SIGUSR2 re-exec (and rolling the two
+    // The availability line this tier is held to. A correct SIGUSR2 re-exec (and rolling the two
     // HAProxies one at a time) drops no connection, so availability stays pinned here; a botched
     // upgrade that dropped the front would tank it far below. A tiny tolerance absorbs port-forward
     // reconnect blips (the probe crosses the host↔cluster boundary), not a real outage.
@@ -651,14 +650,14 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
         )
         .into());
     }
-    if availability < DEMO_SLA_TARGET {
+    if availability < HAPROXY_SLA_TARGET {
         return Err(format!(
-            "HAProxy upgrade dropped traffic: {failed}/{total} requests failed ({availability:.2}% available, SLA {DEMO_SLA_TARGET}%)"
+            "HAProxy upgrade dropped traffic: {failed}/{total} requests failed ({availability:.2}% available, SLA {HAPROXY_SLA_TARGET}%)"
         )
         .into());
     }
     println!(
-        "HAPROXY PASS: {DEMO_HAPROXY_REPLICAS} updated-managed HAProxies upgraded {DEMO_HAPROXY_V1}\u{2192}{DEMO_HAPROXY_V2} in place with {availability:.2}% front availability ({failed}/{total} failed) across the SIGUSR2 re-exec"
+        "HAPROXY PASS: {HAPROXY_REPLICAS} updated-managed HAProxies upgraded {HAPROXY_V1}\u{2192}{HAPROXY_V2} in place with {availability:.2}% front availability ({failed}/{total} failed) across the SIGUSR2 re-exec"
     );
     Ok(())
 }
@@ -668,7 +667,7 @@ async fn wait_for_haproxy_version(
     version: &str,
     attempts: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let nodes: Vec<String> = (0..DEMO_HAPROXY_REPLICAS)
+    let nodes: Vec<String> = (0..HAPROXY_REPLICAS)
         .map(|ordinal| resource_name(&format!("haproxy-{ordinal}")))
         .collect();
     for _ in 0..attempts {
@@ -785,7 +784,7 @@ mod tests {
         })
     }
 
-    /// The demo writes its CRs as untyped JSON, so a field the contract has dropped is silently
+    /// This driver writes its CRs as untyped JSON, so a field the contract has dropped is silently
     /// pruned by the API server instead of failing anywhere the author can see. Round-tripping
     /// through the typed spec is what makes any key the spec cannot express fail loudly: a bare
     /// deserialize would not, since equality is what proves nothing was dropped.
@@ -804,11 +803,11 @@ mod tests {
             },
         );
         let typed: updatec::DeploymentSpec = serde_json::from_value(built.clone())
-            .expect("the demo's deployment must deserialize into the published spec");
+            .expect("the built deployment must deserialize into the published spec");
         assert_eq!(
             serde_json::to_value(typed).unwrap(),
             built,
-            "the demo wrote a key the typed deployment spec cannot express"
+            "the built deployment wrote a key the typed deployment spec cannot express"
         );
     }
 }

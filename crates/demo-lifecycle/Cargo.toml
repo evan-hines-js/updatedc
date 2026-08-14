@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 foundation = { path = "../foundation" }
+# `setsid` and `kill`: this reconciler owns the release's workload process, so it detaches it from
+# the hook's contained tree and stops it again on the next release.
+libc.workspace = true
 updated-contracts = { path = "../updated-contracts" }
 ureq.workspace = true
 

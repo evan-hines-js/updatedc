@@ -6,10 +6,10 @@ launcher="$install/launcher"
 mkdir -p "$launcher"
 # This node's self-asserted enrollment name — the `CN` the gateway mints and the `UpdateAgent` it
 # creates. Derived deterministically from the hostname so it is stable across restarts, and read
-# from the single definition of that derivation (`resource_name`, crates/updatec-demo/src/setup.rs)
-# rather than re-implemented here, so the name a node asserts and the name the demo/e2e address it
+# from the single definition of that derivation (`resource_name`, crates/updatec-e2e/src/cluster.rs)
+# rather than re-implemented here, so the name a node asserts and the name the e2e addresses it
 # by cannot drift.
-node_name="$(updatec-demo agent-name "$HOSTNAME")"
+node_name="$(updatec-e2e agent-name "$HOSTNAME")"
 # Identity is mutual TLS: the agent presents the shared fleet enrollment certificate (issued by
 # cert-manager and mounted at /etc/agent-tls) that the gateway verifies against the fleet CA. The
 # config file holds only a name and paths — no secret.

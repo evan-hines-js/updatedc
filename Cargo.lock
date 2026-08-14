@@ -656,6 +656,7 @@ name = "demo-lifecycle"
 version = "0.1.0"
 dependencies = [
  "foundation",
+ "libc",
  "tempfile",
  "updated-contracts",
  "ureq",
@@ -3445,7 +3446,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "updatec-demo"
+name = "updatec-e2e"
 version = "0.1.0"
 dependencies = [
  "demo-lifecycle",
@@ -3455,7 +3456,6 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "updatec",
  "updated",

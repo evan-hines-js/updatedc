@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Node reconciler for the "jenkins" product on a plain Ubuntu + agent node. This is the
-# whole point of the demo: the agent does its TUF job (download + verify the signed
+# whole point: the agent does its TUF job (download + verify the signed
 # release), then hands everything else to this custom code through the four operations:
 #
 #   apply       : first boot installs a JRE + real Jenkins LTS onto the node's volume; an

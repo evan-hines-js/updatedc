@@ -1,12 +1,13 @@
 [package]
-name = "updatec-demo"
+name = "updatec-e2e"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# The lifecycle fixture owns the provider timeout it is published with, so the value signed into
-# the provider sets here and the fixture's own apply budget are one constant.
+# The lifecycle reconciler the green release runs owns the provider timeout it is published with,
+# so the value signed into the provider set here and the reconciler's own apply budget are one
+# constant.
 demo-lifecycle = { path = "../demo-lifecycle" }
 futures.workspace = true
 k8s-openapi.workspace = true
@@ -14,9 +15,6 @@ kube.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# The private scratch directory the external-VM playbook's enrollment vars (and the fleet client
-# key) are written into: unpredictable name, exclusive create at 0700, removed on drop.
-tempfile.workspace = true
 tokio.workspace = true
 updated = { path = "../updated" }
 updated-contracts = { path = "../updated-contracts" }

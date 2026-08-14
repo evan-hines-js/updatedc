@@ -133,7 +133,7 @@ mkdir -p "$BIN" "$WORK/launcher-state"
 (cd "$ROOT" && cargo build --release -p server -p launcher -p agent)
 cp "$ROOT/target/release/"{server,updated-launcher,updated-agent} "$BIN/"
 # The lifecycle provider and its helpers are the real, tested bundle scripts under scripts/haproxy/ —
-# the same bytes the demo publishes — so this e2e proves the shipped provider, not an inline copy.
+# the same bytes the fleet e2e publishes — so this proves the shipped provider, not an inline copy.
 cp "$ROOT/scripts/haproxy/lifecycle" "$BIN/lifecycle"
 cp "$ROOT/scripts/haproxy/lib.sh" "$BIN/lib.sh"
 chmod 0755 "$BIN/lifecycle"
@@ -156,7 +156,7 @@ make_config "$WORK/bundle-3.0.0" 3.0.0 invalid-binary
 # The agent starts no workload process, ever, so the bundle's own launcher is what the reconciler's
 # `apply` runs when no master is up. It puts HAProxy at a
 # stable path; every subsequent upgrade is HAProxy's own SIGUSR2 re-exec of that same master. It is
-# the real bundle launcher (scripts/haproxy/launch), the same one the demo ships.
+# the real bundle launcher (scripts/haproxy/launch), the same one the fleet e2e ships.
 for tree in "$WORK"/bundle-*; do
   cp "$ROOT/scripts/haproxy/launch" "$tree/bin/launch"
   chmod 0755 "$tree/bin/launch"
