@@ -152,6 +152,25 @@ impl Transaction {
         )
     }
 
+    /// Whether this journal may be destroyed. The single definition of the rule the store
+    /// enforces: a transaction that may have displaced machine state (any phase from
+    /// `ActivateStarted` on) owes the machine either a completed commit or a settled rollback —
+    /// `Committed` and `RolledBack` are the only phases that discharge that debt, and reaching
+    /// `RolledBack` is what runs (or durably abandons) the compensating `rollback` hook. Before
+    /// `ActivateStarted` nothing was displaced, so there is nothing to compensate and the journal
+    /// is mere intent.
+    pub fn may_discard(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::PreflightStarted
+                | Phase::PreflightCompleted
+                | Phase::PrepareStarted
+                | Phase::Prepared
+                | Phase::Committed
+                | Phase::RolledBack
+        )
+    }
+
     pub fn advance(&mut self, next: Phase) -> io::Result<()> {
         let forward = matches!(
             (self.phase, next),
@@ -176,6 +195,12 @@ impl Transaction {
                 | (Phase::PredecessorActivated, Phase::RollbackHealthStarted)
                 | (Phase::RollbackHealthStarted, Phase::PredecessorHealthy)
                 | (Phase::PredecessorHealthy, Phase::RollbackFinalizeStarted)
+                // Finalization may also begin when the health gate is durably ABANDONED, not only
+                // when it passes: the bounded-unhealthy descend concludes the rollback after its
+                // one recorded compensation attempt, and the journal may only be discarded from a
+                // terminal phase — so the abandonment path must be able to reach `RolledBack`
+                // through the same edges as the healthy one.
+                | (Phase::RollbackHealthStarted, Phase::RollbackFinalizeStarted)
                 | (Phase::RollbackFinalizeStarted, Phase::RolledBack)
         );
         if !(forward || begin_rollback || rollback) {
@@ -335,6 +360,38 @@ mod tests {
             supervised.advance(phase).unwrap();
         }
         assert!(supervised.advance(Phase::RollbackStarted).is_err());
+    }
+
+    /// An abandoned health gate concludes through the same terminal edges as a passed one: the
+    /// bounded-unhealthy descend must be able to reach `RolledBack` (where the journal becomes
+    /// discardable) without lying about `PredecessorHealthy`.
+    #[test]
+    fn an_abandoned_health_gate_still_reaches_the_rollback_terminal() {
+        let mut transaction = tx();
+        transaction.phase = Phase::RollbackHealthStarted;
+        transaction.advance(Phase::RollbackFinalizeStarted).unwrap();
+        transaction.advance(Phase::RolledBack).unwrap();
+        assert!(transaction.may_discard());
+    }
+
+    /// The discard rule the store enforces: displaced-but-unsettled phases hold the journal.
+    #[test]
+    fn may_discard_admits_only_settled_or_never_displaced_transactions() {
+        let mut transaction = tx();
+        for (phase, discardable) in [
+            (Phase::PreflightStarted, true),
+            (Phase::Prepared, true),
+            (Phase::ActivateStarted, false),
+            (Phase::CandidateHealthy, false),
+            (Phase::CommitStarted, false),
+            (Phase::Committed, true),
+            (Phase::RollbackStarted, false),
+            (Phase::RollbackFinalizeStarted, false),
+            (Phase::RolledBack, true),
+        ] {
+            transaction.phase = phase;
+            assert_eq!(transaction.may_discard(), discardable, "{phase:?}");
+        }
     }
 
     #[test]

@@ -14,10 +14,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp /src/target/release/updatectl /out-updatectl && \
     cp /src/target/release/stateful-like /out-stateful-like
 
-# Raw Ubuntu + our agent, nothing else. Any managed application — the sample app, or a real
-# Jenkins — is installed INTO this vanilla container at runtime by the update/lifecycle
-# mechanism, never baked into a bespoke image. `curl`/`unzip` are ordinary base tooling a
-# runtime installer uses; the JRE and Jenkins are not here.
+# Raw Ubuntu + our node stack, nothing else. Every workload — the sample app, or a real
+# Jenkins — is installed INTO this vanilla container at runtime by a signed release and started by
+# that release's own reconciler, never baked into a bespoke image. `curl`/`unzip` are ordinary
+# base tooling a runtime installer uses; the JRE and Jenkins are not here.
 FROM ubuntu:22.04
 # `haproxy` is an ordinary distro package here so the release-server can copy the binary into a
 # signed bundle and every agent (same base image, so the shared libs are present) can run it after
@@ -37,12 +37,12 @@ COPY --from=build /out-stateful-like /usr/local/bin/stateful-like
 COPY crates/updatec/e2e/release-server.sh /usr/local/bin/release-server
 COPY crates/updatec/e2e/agent.sh /usr/local/bin/run-agent
 COPY scripts/lib/publish-fuzz-plan.sh /usr/local/lib/publish-fuzz-plan.sh
-# The jenkins product's launcher and its install reconciler — published into the
+# The jenkins product's entrypoint and its install reconciler — published into the
 # release repo by release-server and downloaded by the agent at runtime, never baked into a
 # node image (the node is plain Ubuntu + agent; Jenkins itself is installed at runtime).
 COPY crates/updatec/e2e/jenkins/app.sh /usr/local/share/jenkins/app.sh
 COPY crates/updatec/e2e/jenkins/install.sh /usr/local/share/jenkins/install.sh
-# The HAProxy lifecycle provider (a clean bash state machine) and its launcher — published into the
+# The HAProxy reconciler (a clean bash state machine) and its entrypoint — published into the
 # release repo by release-server and downloaded at runtime, never a bespoke image. This is the same
 # reexec provider proven by scripts/linux-haproxy-e2e.sh.
 COPY scripts/haproxy/lifecycle /usr/local/share/haproxy/lifecycle
