@@ -15,7 +15,7 @@
 //! - `install` — a cold node must reconverge to a live, committed 1.0.0. Only this round wipes the
 //!   disk (emptyDir restart churn); an upgrade never does.
 //! - `broken-rollout` — the head is re-signed to a 2.0.0 that stages and verifies but whose
-//!   entrypoint cannot exec (a signed bundle with a broken executable, exactly like the demo's
+//!   entrypoint cannot exec (a signed bundle with a broken executable, exactly like the fleet e2e's
 //!   broken rollout versions — NOT an ingest-malformed archive). The node ACTIVATES it, the launch
 //!   fails, and it rolls back to the committed 1.0.0 and holds there. Persistent disk — no wipes.
 //! - `roll-forward` — a healthy 3.0.0 supersedes the failing 2.0.0 head; the node must abandon the
@@ -267,7 +267,7 @@ fn run() -> R {
     )?;
 
     // Round 2 — a broken 2.0.0 begins rolling out. Its bundle stages and verifies (a valid, signed
-    // archive) but its entrypoint cannot exec — exactly like the demo's broken rollout versions — so
+    // archive) but its entrypoint cannot exec — exactly like the fleet e2e's broken rollout versions — so
     // the node ACTIVATES it, the launch fails, and it rolls back to the committed 1.0.0. Publishing
     // it re-signs the live assignment head to 2.0.0. Persistent disk — no wipes; a kill at any
     // instant of the rollout/rollback must still leave a live, committed 1.0.0.

@@ -409,7 +409,7 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     // The good release below the broken heads.
     ctx.publish(&dir, "app", "1.0.0", &app_v(ctx, "1.0.0"))?;
     // Two heads whose apply hook fails: bytes that verify and stage but whose entrypoint cannot
-    // exec, exactly like the demo's broken rollout versions. The assigned head is the newest
+    // exec, exactly like the fleet e2e's broken rollout versions. The assigned head is the newest
     // (3.0.0), so recovery must descend past both 3.0.0 and 2.0.0 to reach the healthy 1.0.0.
     let broken = dir.join("broken-app");
     std::fs::write(&broken, b"not-a-runnable-application-entrypoint\n").map_err(str_err)?;

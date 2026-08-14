@@ -4,4 +4,4 @@
 /// (`updatectl publish-provider-set --provider-timeout-ms`). The agent bounds the *entire*
 /// hook invocation by it, so one `apply` — every fixed step plus BOTH dwells — must finish inside
 /// it or a healthy release is killed mid-apply and the cohort rolls back.
-pub const PROVIDER_TIMEOUT_MS: u64 = 15_000;
+pub const PROVIDER_TIMEOUT_MS: u64 = 25_000;

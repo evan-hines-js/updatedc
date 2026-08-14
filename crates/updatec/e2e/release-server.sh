@@ -66,8 +66,13 @@ done
 
 # The service address every peer in the fleet reaches this node's workload on.
 address=0.0.0.0:8080
-pidfile="$state_dir/workload.pid"
-releasefile="$state_dir/workload.release"
+# The workload record is shared by every release of this node, not scoped to this reconciler: the
+# next release may ship a DIFFERENT reconciler, and that one has to be able to stop the process
+# this one started. It therefore sits beside the per-provider state directories — the same path
+# the enterprise lifecycle reconciler derives from its own --state-dir (crates/demo-lifecycle).
+record_dir=$(dirname "$state_dir")
+pidfile="$record_dir/workload.pid"
+releasefile="$record_dir/workload.release"
 
 # Whether the recorded workload is still serving. A detached workload is reparented to whatever
 # runs as pid 1, which reaps its own children and nothing else, so a crashed one lingers as a

@@ -15,7 +15,7 @@ members = [
     "crates/windows-service",
     "crates/updatec",
     "crates/updatectl",
-    "crates/updatec-demo",
+    "crates/updatec-e2e",
     "crates/updated-healthproxy",
     "crates/demo-lifecycle",
 ]

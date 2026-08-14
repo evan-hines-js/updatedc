@@ -175,8 +175,8 @@ jobs:
       - if: failure()
         run: kubectl -n updated-system logs deployment/updatec || true
 
-  updatec-demo-e2e:
-    name: one-click operator fleet demo
+  updatec-fleet-e2e:
+    name: updatec fleet E2E (lifecycle, rollback, HAProxy)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -185,23 +185,24 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with: {install_only: true}
-      # The single pass/fail demo e2e: stands up the kind cluster (operator + CDN + fleet +
-      # Magnolia) and asserts fleet convergence, set isolation, external-endpoint reconciliation,
-      # ordered lifecycle hooks, and group rollback. `--exit` returns 0 on "E2E PASS", non-zero on
-      # any failed assertion. (`scripts/demo.sh` is the human, ansible/VM bring-up path, not this.)
-      - name: Exercise UI publication, lifecycle hooks, per-node failure, rollback, and upgrade
-        run: cargo run -p updatec-demo -- e2e --exit
-      - name: Preserve demo diagnostics
+      # The single pass/fail fleet e2e: stands up the kind cluster (operator + CDN + fleet +
+      # Jenkins + HAProxy) and asserts the ordered red-to-green lifecycle transaction, per-set
+      # isolation, reconciler-programmed external endpoints, a zero-downtime HAProxy upgrade, and
+      # one seeded chaos generation in which half the cohorts roll back to their exact
+      # predecessors while the other half advance, then converge. It exits non-zero on any failed
+      # assertion.
+      - name: Exercise lifecycle hooks, per-node failure, rollback, and upgrade
+        run: cargo run -p updatec-e2e
+      - name: Preserve diagnostics
         if: failure()
         run: |
           kubectl -n updated-system get pods,updateagents,updategroups -o wide || true
           kubectl -n updated-system logs deployment/updatec-controller --tail=200 || true
-          kubectl -n updated-system logs deployment/updatec-demo --tail=200 || true
 
   release:
     name: Publish immutable release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, semgrep, trivy, windows-scm-e2e, linux-haproxy-e2e, updatec-e2e, updatec-demo-e2e]
+    needs: [test, semgrep, trivy, windows-scm-e2e, linux-haproxy-e2e, updatec-e2e, updatec-fleet-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: write

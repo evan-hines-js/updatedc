@@ -88,67 +88,6 @@ and replays every operation the way crash recovery does — checking replay tole
 purity, fingerprint stability, output-manifest bounds, and the refusals for an unknown operation
 and an unimplemented protocol. It needs no repository, keys, or Kubernetes access.
 
-## One-command operator demo
-
-With Docker, Kind, kubectl, Cargo, and curl installed, run:
-
-```sh
-./scripts/demo-local.sh
-```
-
-That runs `updatec-demo start`, which builds the Kind environment, applies the demo layer, and
-port-forwards the in-cluster demo service to [http://127.0.0.1:8088](http://127.0.0.1:8088)
-(override the port with `UPDATEC_DEMO_PORT`); it opens the browser for you. The first run takes a
-few minutes. Keep the script running while using the page.
-
-`scripts/demo.sh` is the other, Ansible-driven path. It takes no subcommands — its single optional
-argument is an SSH host:
-
-```sh
-./scripts/demo.sh                  # run deploy/ansible/demo.yml on this machine (Linux;
-                                   # needs ansible) — UI at http://localhost/ via nginx
-./scripts/demo.sh root@10.0.0.206  # rsync the workspace to that host, run the same
-                                   # playbook there, tunnel its port 80 to 127.0.0.1:8088
-```
-
-This opens a local page with a red application and a small typed `release.json`. Publishing it
-creates the deployment through the real Kubernetes operator. The demo service holds no signing keys
-or bucket credentials: `updatec` signs and uploads the new routing generation to MinIO, then the
-real agent downloads, verifies, and activates it.
-
-The green release selects a signed reconciler that models an intentionally elaborate enterprise
-deployment: compatibility preflight, mutable-state backup, generated configuration, load-balancer
-drain, artifact activation, cache warmup, health verification, schema migration, traffic
-restoration, rollback, and an audit receipt. The page turns green only after that transaction
-finishes and the application reports the new version.
-
-Below the release transaction, the page renders the operator's groups and an 80-service fleet. "Run
-seeded fleet chaos" keeps agents in sixteen permanent five-service cohorts and selects two whole
-groups per seeded generation. One receives a signed but unlaunchable release while the other
-receives the valid release. The failed group rolls every member back to its exact predecessor while
-the successful group advances. The demo verifies that exact mixed result, holds it for ten seconds,
-increments the seed, and repeats. CI runs one bounded generation; the interactive demo runs
-continuously.
-
-Delete the demo cluster with:
-
-```sh
-./scripts/demo-local.sh reset
-```
-
-The same browser-button path is an executable E2E test:
-
-```sh
-cargo run -p updatec-demo -- e2e --exit    # or: ./scripts/demo-local.sh e2e --exit
-```
-
-CI (`.github/workflows/ci.yml`) runs it in its own Kind job and blocks release publication unless
-the red-to-green lifecycle transaction and the complete failure/rollback/recovery scenario both
-pass.
-
-`updatec-demo` accepts `start`, `setup`, `e2e [--exit]`, `exercise [passes]`, `serve`, and `reset`;
-`scripts/demo-local.sh` passes its arguments straight through and defaults to `start`.
-
 ## Architecture
 
 Every node runs two small processes; workloads belong to the releases themselves, and the control
@@ -372,6 +311,14 @@ Run the cross-platform end-to-end system:
 cargo run -p e2e
 ```
 
+Run the Kubernetes operator suites against a disposable Kind cluster (Docker, Kind, kubectl, and
+curl required; each builds its own cluster and tears it down):
+
+```sh
+./scripts/kind-updatec-e2e.sh     # operator, enrollment, throttled rollout, rollback
+cargo run -p updatec-e2e          # the full fleet: lifecycle transaction, rollback, HAProxy
+```
+
 Run the complete workspace suite:
 
 ```sh
@@ -394,6 +341,12 @@ CI additionally runs:
 - the E2E system on Linux, Intel/ARM macOS, and Windows;
 - the full Kind operator E2E (`updatec` publishing across groups, enrollment, throttled rollout, and
   rollback);
+- the Kind fleet E2E (`cargo run -p updatec-e2e`): a 32-node fleet in eight sets, a Jenkins tier, an
+  out-of-cluster slice fronted by the real `updated-healthproxy`, and an `updated`-managed HAProxy
+  pair — asserting the ordered red-to-green lifecycle transaction, per-set isolation,
+  reconciler-programmed endpoints, a zero-downtime HAProxy upgrade, and a seeded chaos generation
+  in which half the cohorts roll back to their exact predecessors while the other half advance,
+  before every cohort converges onto one version;
 - native Windows Service Control Manager lifecycle testing;
 - concurrent macOS publication fuzzing; and
 - real HAProxy master-worker binary upgrades on Linux.

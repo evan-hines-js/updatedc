@@ -21,9 +21,19 @@ use updated_contracts::reconciler::{attempt, Operation};
 type Error = Box<dyn std::error::Error>;
 
 /// Wall time an update `apply` spends outside its two dwells: one second each in `preflight`,
-/// `prepare`, `drain` and `start`, plus two seconds for the filesystem work of the remaining
-/// steps.
-const APPLY_FIXED_WORK_MS: u64 = 6_000;
+/// `prepare`, `drain` and `start`, two seconds for the filesystem work of the remaining steps,
+/// and the budget `start` spends stopping the running workload and proving the candidate's own
+/// entrypoint serves ([`WORKLOAD_START_BUDGET_MS`]).
+const APPLY_FIXED_WORK_MS: u64 = 6_000 + WORKLOAD_START_BUDGET_MS;
+
+/// How long `start` waits for the candidate's workload to answer on [`WORKLOAD_ADDRESS`] before
+/// failing the activation. A release whose entrypoint cannot serve fails its own apply here,
+/// rather than leaving the agent to infer it from a health observation.
+const WORKLOAD_START_BUDGET_MS: u64 = 5_000;
+
+/// The address this product's workload serves the fleet on — what the pod, its peers, and this
+/// reconciler's own health observation all reach it at.
+const WORKLOAD_ADDRESS: &str = "0.0.0.0:8080";
 
 /// Headroom the dwell band leaves the timeout for everything wall time this fixture does not
 /// control: process spawn, artifact staging, and a demo cluster under load.
@@ -241,7 +251,10 @@ impl Deployment {
 
     fn stop(&self) -> Result<(), Error> {
         self.require("drain")?;
-        expect(&self.live.join("removed-from-load-balancer"), &self.attempt)
+        expect(&self.live.join("removed-from-load-balancer"), &self.attempt)?;
+        // The drained workload is this hook's to stop; `start` brings the candidate's own
+        // entrypoint up in its place.
+        self.stop_workload()
     }
 
     fn activate(&self) -> Result<(), Error> {
@@ -258,7 +271,18 @@ impl Deployment {
         Ok(())
     }
 
+    /// Materialize the release's durable state, then converge the process onto it. This hook owns
+    /// the workload — the agent starts none — so starting it is what `start` means. Convergence,
+    /// not restart: a workload already running these bytes is left alone, so its pid is stable
+    /// across agent boots, restarts and self-updates.
     fn start(&self) -> Result<(), Error> {
+        self.publish_release()?;
+        self.converge_workload()
+    }
+
+    /// The durable half of `start`: everything the release must have on disk before its process
+    /// may run.
+    fn publish_release(&self) -> Result<(), Error> {
         if self.attempt == attempt::BOOT {
             // Cold install and ordinary restart have no update transaction. Materialize any
             // provider-owned steady state that an update's activate/finalize phases would have
@@ -364,7 +388,16 @@ impl Deployment {
         )
     }
 
+    /// Restore the predecessor's durable state, then converge the process back onto it. On a
+    /// rollback `--candidate` IS the release being restored, so both directions converge the
+    /// workload the same way onto the same argument.
     fn rollback(&self) -> Result<(), Error> {
+        self.restore_release()?;
+        self.converge_workload()
+    }
+
+    /// The durable half of `rollback`.
+    fn restore_release(&self) -> Result<(), Error> {
         for name in ROLLBACK_SET {
             let source = self.backup.join(name);
             if source.is_file() {
@@ -421,6 +454,154 @@ impl Deployment {
         writeln!(log, "{}\t{}\t{event}", self.phase.as_str(), self.attempt)?;
         log.sync_all()?;
         Ok(())
+    }
+}
+
+/// Workload ownership: starting, stopping, and observing the release's own entrypoint.
+///
+/// The agent runs packages and never starts, stops, or holds a pid of a workload, so the release's
+/// reconciler is the only thing that can. The record of what is running is deliberately *not*
+/// per-provider: a node's next release may ship a different reconciler, and that reconciler has to
+/// be able to stop the process its predecessor started. It therefore lives beside the per-provider
+/// state directories, at the same path the base fleet's reconciler derives from its own
+/// `--state-dir` (`crates/updatec/e2e/release-server.sh`).
+impl Deployment {
+    fn workload_record(&self, name: &str) -> PathBuf {
+        self.state
+            .parent()
+            .unwrap_or(self.state.as_path())
+            .join(name)
+    }
+
+    fn workload_pid(&self) -> Option<i32> {
+        fs::read_to_string(self.workload_record("workload.pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Whether the recorded workload is still serving. A detached workload is reparented to
+    /// whatever runs as pid 1, which reaps its own children and nothing else, so a crashed one
+    /// lingers as a zombie that answers `kill -0` and serves nothing: the process state, not its
+    /// mere existence, is what says the workload is still there.
+    fn workload_running(&self) -> bool {
+        let Some(pid) = self.workload_pid() else {
+            return false;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // The comm field is parenthesized and may itself contain spaces; the process state is the
+        // first field after the closing parenthesis.
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+    }
+
+    /// Stop the running workload, whichever release's reconciler started it, and forget it.
+    fn stop_workload(&self) -> Result<(), Error> {
+        if let Some(pid) = self.workload_pid() {
+            signal(pid, libc::SIGTERM);
+            for _ in 0..5 {
+                if !self.workload_running() {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+            if self.workload_running() {
+                signal(pid, libc::SIGKILL);
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+        remove_if_present(&self.workload_record("workload.pid"))?;
+        remove_if_present(&self.workload_record("workload.release"))
+    }
+
+    /// Converge the workload onto the candidate: leave one already running these bytes alone,
+    /// otherwise stop what is running and start the candidate's own entrypoint, detached into its
+    /// own session so it belongs to the release rather than to this bounded invocation (the agent
+    /// tears the hook's process tree down the moment the hook returns).
+    fn converge_workload(&self) -> Result<(), Error> {
+        let release =
+            fs::read_to_string(self.workload_record("workload.release")).unwrap_or_default();
+        if self.workload_running() && release.trim() == self.candidate {
+            return Ok(());
+        }
+        self.stop_workload()?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.workload_record("workload.log"))?;
+        let pidfile = self.workload_record("workload.pid");
+        let mut command = std::process::Command::new(self.candidate_dir.join("bin/app"));
+        command
+            .current_dir(&self.candidate_dir)
+            .args(["--addr", WORKLOAD_ADDRESS, "--await-record"])
+            .arg(&pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        detach(&mut command);
+        let child = command.spawn()?;
+        // The entrypoint refuses to serve until this record names it: a workload nothing can name
+        // is a workload nothing can stop.
+        self.write(pidfile, format!("{}\n", child.id()).as_bytes())?;
+        self.await_workload()?;
+        self.write(
+            self.workload_record("workload.release"),
+            format!("{}\n", self.candidate).as_bytes(),
+        )
+    }
+
+    /// Wait for the started workload to serve its own version, within the budget `apply`'s dwell
+    /// arithmetic reserves for it. A release whose entrypoint cannot run at all fails its own
+    /// activation here.
+    fn await_workload(&self) -> Result<(), Error> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(WORKLOAD_START_BUDGET_MS);
+        let mut last = String::from("no response");
+        while std::time::Instant::now() < deadline {
+            match self.observed_version() {
+                Ok(observed) if observed.trim() == self.candidate => return Ok(()),
+                Ok(observed) => last = format!("serving {observed:?}"),
+                Err(error) => last = error.to_string(),
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        Err(format!(
+            "the workload from {} never served {} ({last})",
+            self.candidate_dir.display(),
+            self.candidate
+        )
+        .into())
+    }
+
+    fn observed_version(&self) -> Result<String, Error> {
+        Ok(ureq::get("http://127.0.0.1:8080/version")
+            .timeout(Duration::from_secs(2))
+            .call()?
+            .into_string()?)
+    }
+}
+
+/// Move the workload into its own session, out of the hook invocation's contained tree.
+#[cfg(unix)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // Safety: `setsid` is async-signal-safe and touches no allocator or lock the forked child
+    // could have inherited mid-update.
+    unsafe {
+        command.pre_exec(|| match libc::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+}
+
+#[cfg(unix)]
+fn signal(pid: i32, signal: libc::c_int) {
+    // Safety: `kill` on a pid that has exited fails with ESRCH; nothing here is unsound.
+    unsafe {
+        libc::kill(pid, signal);
     }
 }
 
@@ -610,7 +791,7 @@ mod tests {
         fs::create_dir_all(&deployment.live).unwrap();
 
         assert!(!deployment.effects.join("activate.done").exists());
-        deployment.start().unwrap();
+        deployment.publish_release().unwrap();
         expect(&deployment.live.join("application.war"), "22.0.0").unwrap();
         expect(
             &deployment.live.join("content.repository"),
@@ -666,7 +847,7 @@ mod tests {
         deployment.prepare().unwrap();
         expect(&deployment.backup.join("application.war"), "1.0.0").unwrap();
 
-        deployment.rollback().unwrap();
+        deployment.restore_release().unwrap();
         expect(&deployment.live.join("application.war"), "1.0.0").unwrap();
     }
 

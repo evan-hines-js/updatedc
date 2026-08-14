@@ -105,7 +105,7 @@ mod dependency_isolation {
             "killfuzz",
             "sampleapp",
             "server",
-            "updatec-demo",
+            "updatec-e2e",
         ];
         for (package, manifest) in PRODUCTION_MANIFESTS {
             for dependency in foundation::manifest::shipped_dependency_names(manifest) {

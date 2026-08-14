@@ -35,7 +35,7 @@ done
 echo "Kind E2E fleet-fuzz rounds: $FUZZ_ROUNDS"
 NAME="${UPDATEC_KIND_CLUSTER:-updatec-e2e}"
 KUBE_CONTEXT="kind-$NAME"
-# Never depend on kubectl's process-global current context. The demo, CI, and a
+# Never depend on kubectl's process-global current context. The fleet e2e, CI, and a
 # developer's separate Kind run may execute concurrently; pinning every operation is
 # the only way namespace creation and all later resources remain in the same cluster.
 kubectl() { command kubectl --context "$KUBE_CONTEXT" "$@"; }
@@ -82,7 +82,7 @@ apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
     # Lets an ingress-nginx controller schedule (its nodeSelector is ingress-ready=true),
-    # so the demo can front each set's pods with a real per-set Ingress.
+    # so the fleet e2e can front each set's pods with per-set Services.
     labels:
       ingress-ready: "true"
     # Publish the ingress controller on the host's ports 80/443, so both the browser AND the
@@ -113,9 +113,9 @@ kubectl -n updated-system wait pod/minio-init --for=condition=Ready=false --time
 kubectl -n updated-system wait pod/minio-init --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s
 
 # Ingress controller: cluster infrastructure, provisioned here alongside minio so every
-# environment built from this script is ingress-capable. The demo fronts each set's
+# environment built from this script is ingress-capable. The fleet e2e fronts each set's
 # load-balancer Service with a per-set Ingress on this controller, so Kubernetes — not the
-# demo's own routing — guarantees a set is only ever answered by its own pods. Scheduled
+# driver's own routing — guarantees a set is only ever answered by its own pods. Scheduled
 # onto the ingress-ready control-plane node (see the kind config above).
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
 kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=180s
@@ -656,12 +656,12 @@ YAML
 echo "waiting for all five real agent nodes to reach their assigned versions"
 kubectl -n updated-system rollout status statefulset/agent --timeout=240s
 # The `UpdateAgent` name pod `agent-<ordinal>` enrolls under. Read from the single definition of
-# that derivation (`resource_name`, crates/updatec-demo/src/setup.rs) — the same one the pods
-# themselves use through `updatec-demo agent-name` — never re-derived here. Derived once for all
+# that derivation (`resource_name`, crates/updatec-e2e/src/cluster.rs) — the same one the pods
+# themselves use through `updatec-e2e agent-name` — never re-derived here. Derived once for all
 # five ordinals, in assignment position: a substitution in *argument* position would not abort
 # under `set -e` on failure, and would hand kubectl an empty resource name.
 agent_resource_name() {
-  cargo run -q -p updatec-demo -- agent-name "agent-$1"
+  cargo run -q -p updatec-e2e -- agent-name "agent-$1"
 }
 declare -a AGENT_RESOURCES
 for ordinal in 0 1 2 3 4; do

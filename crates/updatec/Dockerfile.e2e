@@ -3,12 +3,12 @@ WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p launcher -p agent -p server -p sampleapp -p updatec-demo -p demo-lifecycle -p updated-healthproxy -p updatectl && \
+    cargo build --release -p launcher -p agent -p server -p sampleapp -p updatec-e2e -p demo-lifecycle -p updated-healthproxy -p updatectl && \
     cp /src/target/release/updated-launcher /out-launcher && \
     cp /src/target/release/updated-agent /out-agent && \
     cp /src/target/release/server /out-server && \
     cp /src/target/release/sampleapp /out-sampleapp && \
-    cp /src/target/release/updatec-demo /out-updatec-demo && \
+    cp /src/target/release/updatec-e2e /out-updatec-e2e && \
     cp /src/target/release/demo-lifecycle /out-demo-lifecycle && \
     cp /src/target/release/updated-healthproxy /out-updated-healthproxy && \
     cp /src/target/release/updatectl /out-updatectl && \
@@ -29,7 +29,7 @@ COPY --from=build /out-launcher /usr/local/bin/updated-launcher
 COPY --from=build /out-agent /usr/local/bin/updated-agent
 COPY --from=build /out-server /usr/local/bin/server
 COPY --from=build /out-sampleapp /usr/local/bin/sampleapp
-COPY --from=build /out-updatec-demo /usr/local/bin/updatec-demo
+COPY --from=build /out-updatec-e2e /usr/local/bin/updatec-e2e
 COPY --from=build /out-demo-lifecycle /usr/local/bin/demo-lifecycle
 COPY --from=build /out-updated-healthproxy /usr/local/bin/updated-healthproxy
 COPY --from=build /out-updatectl /usr/local/bin/updatectl
