@@ -10,14 +10,17 @@
 
 use std::env;
 
+mod alertsink;
 mod chaos;
 mod cluster;
+mod controls;
 mod fleet;
 mod haproxy;
 mod labeler;
 mod layout;
 pub(crate) use chaos::*;
 pub(crate) use cluster::*;
+pub(crate) use controls::*;
 pub(crate) use fleet::*;
 pub(crate) use haproxy::*;
 pub(crate) use labeler::*;
@@ -37,9 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", resource_name(&hostname));
             Ok(())
         }
+        // The in-cluster webhook receiver the alerting assertion reads (see `alertsink`). It runs
+        // from this same binary — already in the node image — so the receiver is not a bespoke
+        // image or a shell one-liner nobody tests.
+        Some("alert-sink") => alertsink::run().await,
         None => run_e2e().await,
         Some(command) => {
-            Err(format!("unknown command {command:?}; use `agent-name <hostname>` or no argument to run the e2e").into())
+            Err(format!("unknown command {command:?}; use `agent-name <hostname>`, `alert-sink`, or no argument to run the e2e").into())
         }
     }
 }
@@ -57,18 +64,23 @@ async fn run_e2e() -> Result<(), Box<dyn std::error::Error>> {
     assert_external_endpoints_reconciled().await?;
     assert_lifecycle_transaction().await?;
     assert_haproxy_zero_downtime_upgrade().await?;
-    Chaos {
-        fleet,
-        platform: layout.platform,
-        provider_path: layout.provider_path,
-        provider_sha: layout.provider_sha,
-    }
-    .run()
-    .await?;
+    let chaos = Chaos {
+        fleet: fleet.clone(),
+        layout: layout.clone(),
+    };
+    chaos.run().await?;
+    // Composed into the same run, on the same cluster, above the version the chaos generation
+    // converged the fleet onto: each scenario publishes the next major to the one group it
+    // exercises, so they cost a single group's rollout apiece rather than a fleet's.
+    let baseline = version_major(BASELINE_VERSION).ok_or("unparseable baseline version")?;
+    assert_node_controls(&layout, &fleet, &format!("{}.0.0", baseline + 4)).await?;
+    assert_staleness_fails_closed(&layout, &fleet, &format!("{}.0.0", baseline + 5)).await?;
     println!(
         "E2E PASS: {COHORT_COUNT} cohorts exercised the ordered lifecycle transaction, per-set \
-         isolation, reconciler-programmed endpoints, a zero-downtime HAProxy upgrade, seeded \
-         rollback, and exact fleet convergence"
+         isolation, reconciler-programmed endpoints, a zero-downtime HAProxy upgrade, a seeded \
+         rollback whose rejecting cohorts released their sets' slots to their siblings, the \
+         fleet-wide regression halt and its delivered alert, the per-node hold/cordon controls, \
+         staleness failing closed, and exact fleet convergence"
     );
     Ok(())
 }

@@ -63,5 +63,8 @@ duration fields named above.
 
 Condition derivation is planner-pure: unit tests per condition, both directions. The webhook
 client is tested against a local listener for transition-only firing, deadline, and drop
-semantics. (Not yet implemented: an e2e chaos scenario asserting `RolloutStuck` rises on an
-induced wedge and clears after the fix generation.)
+semantics. The fleet e2e closes the loop end to end: an in-cluster receiver records every delivery
+to a durable file, and the chaos generation's regression halt is asserted on all three of its
+outputs — the set's `status.halted`, each affected group's `DeploymentHalted` condition, and the
+fields of the document the control plane actually delivered. (Not yet implemented: an e2e scenario
+asserting `RolloutStuck` rises on an induced wedge and clears after the fix generation.)

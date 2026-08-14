@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // page, while another replica had meanwhile reconciled cleanly and cleared the
             // condition on every set.
             Ok(false) => {
-                hooks.consecutive_failures = 0;
+                hooks.end_leadership_epoch();
                 // A follower has no fleet view: serving the last leader-epoch snapshot as if it
                 // were current let a scrape read week-old gauges as fresh. The failure counter
                 // stays — it is this process's own history.
@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             Err(error) => {
-                hooks.consecutive_failures = 0;
+                hooks.end_leadership_epoch();
                 tracing::error!(%error, "leader lease operation failed");
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
@@ -225,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A cancelled pass (lost lease) is a follower outcome, not a failure — and it ends
             // this replica's leadership epoch, so the streak resets with it for the same reason
             // the non-leader arms above reset it.
-            None => hooks.consecutive_failures = 0,
+            None => hooks.end_leadership_epoch(),
         }
         // Poll for desired-state changes once per second so a freshly patched
         // rollout is republished promptly and the fleet starts converging fast.

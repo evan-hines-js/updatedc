@@ -1,6 +1,14 @@
 # Fleet-level regression response
 
-Status: implemented, in `plan_rollouts` (`regression_halts`). The evidence is the report sequence this document describes — an update transaction in flight on the new assignment (`updating=true`), then settled again on the pre-attempt archive — remembered across passes by an in-memory `ObservationLog`, because a single snapshot cannot tell a fleet rolling back FROM a bad deployment apart from an operator retargeting TO the predecessor. Losing that memory (a restart, a leader change) only delays a halt until the contained nodes' sequences re-prove it. The verdict is enforced FLEET-WIDE per deployment identity (the effective threshold is the tightest `maxRegressions` among the sets naming it, default 1), and is projected onto each bound group's own status as well as the set's, so a halted set-less group is never an invisible freeze — bound meaning the halt stops the group's admitted current from taking further nodes OR stops its desired body from being admitted at all, since both freeze it. Evidence requires the node to be settled healthy on the target while running an archive that is neither the target's own application (that is a commit, not a rollback) nor the application of the body it moved from (a change that keeps the application has no distinguishable rollback), so retargeting a group back onto the deployment its contained nodes are already running — the documented exit from a halt — cannot halt the recovery target.
+Status: implemented, in `plan_rollouts` (`regression_verdict`). The evidence is the node's own
+signed statement that it has DURABLY REJECTED the release its assignment names
+(`NodeReport::rejected`, schema 7) — never an inference from a report sequence. The verdict is
+enforced FLEET-WIDE per deployment identity (the effective threshold is the tightest
+`maxRegressions` among the sets naming it, default 1), and is projected onto each bound group's own
+status as well as the set's, so a halted set-less group is never an invisible freeze — bound meaning
+the halt stops the group's admitted current from taking further nodes OR stops its desired body from
+being admitted at all, since both freeze it. The same evidence answers a second, per-group question:
+see "A rejected rollout is OVER" below.
 
 ## Problem
 
@@ -15,21 +23,37 @@ admitting anyone else to it.
 
 ## Evidence
 
-No new channel. The evidence is what nodes already assert through the signed `NodeReport`:
+No new channel and no inference: the node SAYS SO. The agent already keeps a durable
+rejection-by-content-hash record — the one that makes a proven-bad candidate never retried — and the
+signed `NodeReport` carries one bit derived from it: *the release this assignment names is one I
+have refused for good* (`NodeReport::rejected`).
 
-- A node assigned deployment X that reports the predecessor's `archive_sha256` with
-  `settled=true` after its report previously showed X with an update transaction in flight has
-  attempted X and rolled back. This is the report sequence the agent already publishes: the
-  heartbeat emits every tick, `settled=false` with `updating=true` during the confirmation
-  window, and the committed digest after commit or rollback. `updating` is reported separately
-  from `settled` because an unsettled report also covers an ordinary readiness failure with no
-  update anywhere near it, which is not evidence of anything.
-- The control plane already tracks, per group, which nodes are placed on which body and what
-  they last reported — the same `Observations` the admission gate reads.
+A `regressed(deployment, node)` fact is therefore a node's own claim about the exact bytes it was
+assigned, read straight off the report the control plane already fetches.
 
-A `regressed(deployment, node)` fact is therefore derivable inside `plan_rollouts` from state
-it already holds. Nodes do not report "I rejected X" explicitly, and should not: the report
-stays a statement of running state, not a general data channel.
+The alternative — inferring it from the report sequence an update transaction leaves behind
+(`updating=true` on the new assignment, then settled again on the pre-attempt archive) — was
+implemented first and is wrong in two ways that no amount of care fixes:
+
+- **It cannot see the most ordinary bad release.** A rejection is recorded for a candidate that
+  fails its ACTIVATION just as much as for one that fails its confirmation window, and a release
+  that cannot start at all runs no update transaction: there is no sequence, so there is no
+  evidence, so the fleet-wide halt never fires and the group containing it never stops rolling.
+- **A missed transient is missed for ever.** The node never retries bytes it has rejected, so a
+  control plane that was restarting, had just changed leader, or was merely slow during the few
+  seconds `updating` was true could never learn the fact afterwards. The evidence had to be
+  WATCHED, which made a durable verdict depend on uptime.
+
+The report stays a statement of running state — this is the node describing itself, not a general
+data channel — and the field carries a serde default in the fail-safe direction, so a node older
+than schema 7 simply proves nothing (see [`wire-compatibility-design.md`](wire-compatibility-design.md)).
+
+The plane remembers each claim it has seen (node, assignment identity) so that one unreadable report
+object cannot un-halt a proven-bad release for a pass; the memory is monotone, is bounded by the
+live fleet and the live deployment identities, and needs no durability because the claim stands in
+the node's own report and is re-read on the next pass. A node WITHDRAWING its claim — the operator
+break-glassed its rejection record — is honoured, because the alternative is a halt whose evidence
+the operator has already destroyed.
 
 ## Verdict
 
@@ -51,6 +75,31 @@ to 1 when none does — the deployment is **halted** FLEET-WIDE:
   evidence still stands — corrected bytes have a new digest, which is the same rule the node's
   own rejection record enforces.
 
+## A rejected rollout is OVER
+
+The same evidence answers a second question the halt cannot: **can this group's rollout still make
+progress?** It is per-group and has no threshold — a rejecting group deadlocks its set's siblings
+whether or not enough nodes rejected to halt the fleet — and the answer decides settlement, not
+admission.
+
+A node's report is healthy on the assignment it was handed while it executes the archive it rolled
+back to, so it never reports the identity it was assigned: the group stayed `Rolling` for ever and
+held its set's `maxConcurrent` slot for ever, and every sibling queued behind it waited on a rollout
+the control plane would never finish. `plan_rollouts` therefore classifies a group whose nodes are
+all either committed or durably rejected, with nothing left that can move, as **`Failed`**:
+
+- It releases its set's concurrency slot — nothing is in flight to protect.
+- It is NEVER counted settled: `dependsOn` does not open, the set's `settled` list excludes it, and
+  the metrics carry it under its own `failed` state. It has its own `UpdateGroup` condition
+  (`Ready=False`, reason `Rejected`) and its own `UpdateGroupSet.status.failed` list, so a failed
+  rollout can never be read as a landed one.
+- The exit is a deployment with a different identity, exactly as for the halt.
+
+The verdict requires the node's own CLAIM, never the report's shape. A node healthy on the new
+assignment while executing the old archive is also exactly what a node writes when it fetched the
+assignment and could not yet fetch its archive — that one converges on a later tick, and calling its
+group failed would release the set's slot mid-rollout and report a failure that never happened.
+
 ## Explicitly not automatic
 
 No automatic fleet retarget to the predecessor. Nodes that attempted the bad release have
@@ -63,6 +112,15 @@ a signed publication by an operator.
 ## Testing
 
 Planner unit tests: evidence below threshold admits normally; threshold halts the set;
-a changed deployment identity clears the halt; nodes already on the halted body are not moved.
-(Not yet implemented: an e2e chaos case asserting the halt lands before the second cohort is
-admitted.)
+a changed deployment identity clears the halt; nodes already on the halted body are not moved; a
+rejecting group releases its set's slot so a sibling rolls in the same pass, a transient fetch
+failure does not (it is still in flight), and a group still converging around one rejection is
+`Rolling` until its last node lands. A wiring test drives the whole projection from a real signed
+report in the store and asserts the halt, the conditions, and the failed-rollout verdict survive a
+controller restart.
+
+The fleet e2e (`updatec-e2e`) drives it end to end: its chaos generation rolls a broken release to
+one group of every even set with a sibling queued behind it, and asserts the sibling advances in the
+SAME generation, that every affected set publishes the halt with its evidence count, that each
+group's `DeploymentHalted` condition is True, and that the alert webhook actually received the
+transition document.

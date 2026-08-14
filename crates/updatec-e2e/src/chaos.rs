@@ -13,12 +13,10 @@ use std::time::Instant;
 #[derive(Clone)]
 pub(crate) struct Chaos {
     pub(crate) fleet: Fleet,
-    /// The platform the release repository publishes bundles for, as the release-server reports it.
-    pub(crate) platform: String,
-    /// The signed reconciler set every published release ships with, so an ordered-fallback
-    /// rollback re-selects exactly these providers — app and providers roll back as one unit.
-    pub(crate) provider_path: String,
-    pub(crate) provider_sha: String,
+    /// The signed identities every release this run publishes is built from — the ONE description
+    /// of "how to publish a release into this fleet", shared with the node-control and staleness
+    /// scenarios so there is a single publishing path.
+    pub(crate) layout: FleetLayout,
 }
 
 impl Chaos {
@@ -51,24 +49,37 @@ impl Chaos {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let good_version = format!("{good_major}.0.0");
         let bad_version = format!("{bad_major}.0.0");
-        // Exactly ONE group per set is exercised, and it is the set's first: the set's other group
-        // stays on the baseline and keeps serving ([`UPTIME_MARGIN`]). This is not a pacing
-        // preference — a cohort that rolls back never reports the identity it was assigned, so its
-        // group stays "rolling" in the operator's view and holds its set's single slot. Queueing a
-        // second group behind it in the same set would wait forever on a rollout the control plane
-        // will never admit.
-        let exercised: Vec<usize> = (0..COHORT_COUNT)
-            .filter(|cohort| cohort.is_multiple_of(GROUPS_PER_SET))
-            .collect();
-        let broken_groups: Vec<String> = exercised
+        // EVERY group of every set is exercised, both of each set's two. The set's own throttle
+        // still admits one at a time, so its other group keeps serving while the first rolls
+        // ([`UPTIME_MARGIN`]) — and the second only starts once the first has released the slot.
+        //
+        // That second half is the regression test for the planner's done-failed verdict. A cohort
+        // that rolls back never reports the identity it was assigned, so its group used to stay
+        // "rolling" for ever and hold its set's single slot for ever; queueing a sibling behind it
+        // waited on a rollout the control plane would never finish, which is why this generation
+        // used to drive one group per set. The rejecting group now ends its rollout — durable
+        // rejection is the evidence, and the group is released rather than in flight — so the
+        // sibling below MUST advance inside this same generation.
+        let exercised: Vec<usize> = (0..COHORT_COUNT).collect();
+        // The BROKEN release goes to the first group of each even set: the one the set admits
+        // first, so the sibling queued behind it is the one whose progress proves the slot was
+        // released. Every other group takes the valid release.
+        let is_broken = |cohort: &usize| {
+            cohort.is_multiple_of(GROUPS_PER_SET) && cohort_set_index(*cohort).is_multiple_of(2)
+        };
+        let broken_cohorts: Vec<usize> = exercised.iter().copied().filter(is_broken).collect();
+        let broken_groups: Vec<String> = broken_cohorts.iter().copied().map(cohort_group).collect();
+        // Each broken cohort's siblings in the same set — admitted only once the broken one stops
+        // holding the slot, and asserted below to have advanced in this same generation.
+        let queued_behind: Vec<String> = broken_cohorts
             .iter()
-            .filter(|cohort| cohort_set_index(**cohort).is_multiple_of(2))
-            .map(|cohort| cohort_group(*cohort))
+            .flat_map(|cohort| (cohort + 1..cohort + GROUPS_PER_SET).map(cohort_group))
             .collect();
         let valid_groups: Vec<String> = exercised
             .iter()
-            .filter(|cohort| !cohort_set_index(**cohort).is_multiple_of(2))
-            .map(|cohort| cohort_group(*cohort))
+            .copied()
+            .filter(|cohort| !is_broken(cohort))
+            .map(cohort_group)
             .collect();
 
         // Vary the fleet-wide rollout width for this wave (deterministic from the seed): [4, 8]
@@ -85,15 +96,29 @@ impl Chaos {
             )
             .await?;
         println!(
-            "[e2e] generation (seed {seed}, width {width}/{SET_COUNT}): BROKEN {bad_version} -> {} cohorts; VALID {good_version} -> {} cohorts (one group per set; the others keep serving)",
+            "[e2e] generation (seed {seed}, width {width}/{SET_COUNT}): BROKEN {bad_version} -> {} cohorts; VALID {good_version} -> {} cohorts (both groups of every set; each set rolls one at a time)",
             broken_groups.len(),
             valid_groups.len()
         );
         let patch_start = Instant::now();
         // The broken release's own content digest, read back from the group the deploy patched:
         // it is what each broken cohort's nodes must be found to have rejected.
-        let bad_sha = self.deploy(&broken_groups, &bad_version, true).await?;
-        self.deploy(&valid_groups, &good_version, false).await?;
+        let bad_sha = deploy_release(
+            &self.layout,
+            &self.fleet,
+            &broken_groups,
+            &bad_version,
+            true,
+        )
+        .await?;
+        deploy_release(
+            &self.layout,
+            &self.fleet,
+            &valid_groups,
+            &good_version,
+            false,
+        )
+        .await?;
         println!(
             "[e2e] control-plane patch applied in {}ms; broken release digest {bad_sha}",
             patch_start.elapsed().as_millis()
@@ -104,7 +129,14 @@ impl Chaos {
         // ([`UPTIME_MARGIN`] is the floor this leaves) — and sometimes the controller, so it
         // exercises PVC-backed recovery of an interrupted install, update, and rollback.
         let injector = self.clone();
-        let rolling: Vec<String> = broken_groups.iter().chain(&valid_groups).cloned().collect();
+        // Chaos still targets only the FIRST group of each set — the one the set admits first.
+        // Widening it to every exercised group would let it SIGKILL the pods of a group that is
+        // still serving while its sibling rolls, which is the one thing this layout guarantees
+        // never happens ([`UPTIME_MARGIN`]).
+        let rolling: Vec<String> = (0..COHORT_COUNT)
+            .filter(|cohort| cohort.is_multiple_of(GROUPS_PER_SET))
+            .map(cohort_group)
+            .collect();
         tokio::spawn(async move { injector.inject_chaos(seed, rolling).await });
 
         let wait_start = Instant::now();
@@ -142,10 +174,17 @@ impl Chaos {
                     );
                 }
             }
-            // Broken cohorts flip to "rollback complete" only once every node is healthy BELOW the
-            // broken release and carries the rejection record naming that release's bytes: the
-            // durable proof it attempted the release and refused it, not merely that it never
-            // arrived.
+            // A broken cohort is "contained" only once every node of it is healthy BELOW the broken
+            // release AND at least one of them carries the durable rejection record naming that
+            // release's own bytes — the proof it attempted the release and refused it for good,
+            // rather than merely never having received it.
+            //
+            // At least one, not all, and that is the fleet verdict working: the first node's
+            // rejection is evidence enough to HALT the deployment (`maxRegressions` defaults to
+            // one), and a halted body is moved to nobody else — so the cohort's remaining nodes
+            // are deliberately never handed the release and can have no record of it. Requiring
+            // every node to hold one would be requiring the bad release to reach every node, which
+            // is precisely what the regression response exists to prevent.
             for group in &broken_groups {
                 if settled_broken.contains(group) {
                     continue;
@@ -167,11 +206,12 @@ impl Chaos {
                 if held
                     && nodes
                         .iter()
-                        .all(|node| rejected_release(&node.node, &bad_sha))
+                        .any(|node| rejected_release(&node.node, &bad_sha))
                 {
                     settled_broken.insert(group.clone());
                     println!(
-                        "[e2e] ROLLBACK complete — {group} rejected {bad_version} and holds its predecessor ({}s)",
+                        "[e2e] CONTAINED — {group} attempted {bad_version}, rejected its bytes, and \
+                         holds its predecessor ({}s)",
                         wait_start.elapsed().as_secs()
                     );
                 }
@@ -181,7 +221,13 @@ impl Chaos {
             if settled_broken.len() == broken_groups.len()
                 && settled_valid.len() == valid_groups.len()
             {
-                println!("[e2e] generation settled in {elapsed}s");
+                println!(
+                    "[e2e] generation settled in {elapsed}s, including the {} cohorts queued behind \
+                     a rejecting sibling in their own set",
+                    queued_behind.len()
+                );
+                self.assert_halt_and_alert(&broken_cohorts, &bad_version)
+                    .await?;
                 return Ok(());
             }
             if elapsed >= last_logged_secs + 15 {
@@ -196,12 +242,112 @@ impl Chaos {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
+        // The deadlock this generation is the regression test for has ONE signature, so the timeout
+        // names it: a group queued behind a rejecting sibling never advances, because the sibling's
+        // rollout is still counted in flight and still holds its set's only slot.
+        let wedged: Vec<&String> = queued_behind
+            .iter()
+            .filter(|group| !settled_valid.contains(*group))
+            .collect();
         Err(format!(
-            "generation did not settle within {FLEET_ROLLOUT_TIMEOUT_SECS} seconds: {} of {} cohorts settled",
+            "generation did not settle within {FLEET_ROLLOUT_TIMEOUT_SECS} seconds: {} of {} \
+             cohorts settled; {} of the cohorts queued behind a rejecting sibling never advanced \
+             {wedged:?} — a rejecting group is holding its set's slot",
             settled_broken.len() + settled_valid.len(),
-            exercised.len()
+            exercised.len(),
+            wedged.len(),
         )
         .into())
+    }
+
+    /// The fleet-level regression response, end to end: enough nodes independently proved the
+    /// broken release bad, so every set governing one of those groups HALTS it — and the operator
+    /// is told.
+    ///
+    /// Three records, no log scraping: the set's own `status.halted` (the verdict, with its
+    /// evidence count), the group's `DeploymentHalted` condition (the one place a halt is visible
+    /// for a group no set governs), and the document the control plane actually delivered to the
+    /// webhook, read back from the receiver's durable record. The condition and the delivery are
+    /// asserted TOGETHER because they are the two halves of the design: the condition is the
+    /// durable fact and the webhook is one delivery of its transition, and a system that publishes
+    /// the first while silently dropping the second is exactly the "contained but silent" failure
+    /// the alerting exists to end.
+    async fn assert_halt_and_alert(
+        &self,
+        broken_cohorts: &[usize],
+        bad_version: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // The halt is a planner verdict recomputed every pass and published with the status, so it
+        // is present within a reconcile or two of the rollback; the webhook delivery is bounded and
+        // retried behind it. This waits for both rather than sampling once.
+        let mut last = String::new();
+        for _ in 0..120 {
+            let mut pending = Vec::new();
+            for cohort in broken_cohorts {
+                let group = cohort_group(*cohort);
+                let set = set_name(cohort_set_index(*cohort));
+                // The deployment identity the group was rolled to, spelled exactly as `deploy`
+                // patched it — so this cannot pass on a halt of some other body.
+                let deployment = format!("{group}@{bad_version}");
+                if !halted_deployments(&set).contains(&deployment) {
+                    pending.push(format!("{set}.status.halted lacks {deployment}"));
+                    continue;
+                }
+                if condition_status(&group, "DeploymentHalted").as_deref() != Some("True") {
+                    pending.push(format!("{group}/DeploymentHalted is not True"));
+                }
+            }
+            let delivered = delivered_alerts();
+            let alerted: Vec<&serde_json::Value> = delivered
+                .iter()
+                .filter(|alert| {
+                    alert["condition"] == "DeploymentHalted" && alert["state"] == "True"
+                })
+                .collect();
+            if pending.is_empty() && !alerted.is_empty() {
+                // The payload is the generic document `alerting-design.md` specifies — every field
+                // present, naming the resource whose condition flipped and carrying the evidence
+                // behind the verdict. A delivery that arrived shaped differently would satisfy a
+                // "did anything arrive" check and be useless to a receiver.
+                let alert = alerted[0];
+                for field in [
+                    "resource",
+                    "condition",
+                    "state",
+                    "reason",
+                    "evidence",
+                    "timestamp",
+                ] {
+                    if !alert[field].is_string() {
+                        return Err(
+                            format!("the delivered alert is missing {field}: {alert}").into()
+                        );
+                    }
+                }
+                let resource = alert["resource"].as_str().unwrap_or_default();
+                if !resource.starts_with("UpdateGroupSet/") && !resource.starts_with("UpdateGroup/")
+                {
+                    return Err(
+                        format!("the delivered alert names no known resource: {alert}").into(),
+                    );
+                }
+                println!(
+                    "[e2e] regression halt on {bad_version} is published on every affected set and \
+                     group, and {} DeploymentHalted alert(s) were delivered to the webhook (e.g. \
+                     {resource}: {})",
+                    alerted.len(),
+                    alert["evidence"].as_str().unwrap_or_default()
+                );
+                return Ok(());
+            }
+            last = if pending.is_empty() {
+                "no DeploymentHalted alert has been delivered to the webhook receiver".to_string()
+            } else {
+                pending.join("; ")
+            };
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Err(format!("the regression halt never reached its records or its webhook: {last}").into())
     }
 
     /// Converge the whole fleet: roll `converge_major` to every cohort and wait for all of them —
@@ -212,7 +358,7 @@ impl Chaos {
         let converge_version = format!("{converge_major}.0.0");
         println!("[e2e] CONVERGENCE: upgrading all {COHORT_COUNT} cohorts to {converge_version}");
         let groups: Vec<String> = (0..COHORT_COUNT).map(cohort_group).collect();
-        self.deploy(&groups, &converge_version, false).await?;
+        deploy_release(&self.layout, &self.fleet, &groups, &converge_version, false).await?;
 
         // The budget is [`FLEET_ROLLOUT_TIMEOUT_SECS`] of *admitting* time, not wall-clock: a frozen
         // set admits no new rollout, so its time cannot count against convergence, and a freeze
@@ -254,79 +400,6 @@ impl Chaos {
             "fleet did not converge onto {converge_version} within {FLEET_ROLLOUT_TIMEOUT_SECS} seconds"
         )
         .into())
-    }
-
-    /// Publish one release major — a valid sample app, or an intentionally corrupt entrypoint
-    /// every agent rejects at activation — and roll `groups` to it through the real **`updatectl
-    /// deploy`**: the CI release tool builds the deterministic bundle, signs it, publishes it to
-    /// the release repository (MinIO), and merge-patches each group's `application`. It runs
-    /// inside the release-server pod, the one place that holds the repository's signing keys,
-    /// reaches MinIO, and carries `updatectl` — the same executor that seeded the baseline.
-    ///
-    /// `updatectl deploy` patches the application ref but not the deployment *identity*, so that
-    /// is bumped to `group@version` here — the throttle counts a member settled only once every
-    /// one of its agents reports exactly that identity, healthy. Returns the published bundle's
-    /// content digest, the identity every node's rejection record names it by.
-    async fn deploy(
-        &self,
-        groups: &[String],
-        version: &str,
-        broken: bool,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let entrypoint = if broken {
-            "printf 'intentionally corrupt entrypoint\\n' >/tmp/gen/bin/app"
-        } else {
-            "cp /usr/local/bin/sampleapp /tmp/gen/bin/app"
-        };
-        let repository = release_repository_flags();
-        let (platform, provider_path, provider_sha) =
-            (&self.platform, &self.provider_path, &self.provider_sha);
-        let deploys = groups
-            .iter()
-            .map(|group| {
-                format!(
-                    "updatectl deploy --keys-dir /data/release-keys {repository} \
-                     --namespace {NAMESPACE} --group {group} --product app --channel stable \
-                     --version {version} --entrypoint bin/app --platform {platform} \
-                     --source /tmp/gen --provider-set-path {provider_path} \
-                     --provider-set-sha256 {provider_sha}"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let script = format!(
-            "set -e; export AWS_ACCESS_KEY_ID=minio AWS_SECRET_ACCESS_KEY=minio123; \
-             rm -rf /tmp/gen && mkdir -p /tmp/gen/bin /tmp/gen/config; {entrypoint}; \
-             chmod 0755 /tmp/gen/bin/app; \
-             printf 'version = \"{version}\"\\n' >/tmp/gen/config/release.toml; {deploys}"
-        );
-        let status = tokio::process::Command::new("kubectl")
-            .args(kubectl_context_args())
-            .args(RELEASE_SERVER_EXEC)
-            .args(["--", "sh", "-c", &script])
-            .status()
-            .await?;
-        if !status.success() {
-            return Err(format!("updatectl deploy failed for {version}").into());
-        }
-        for group in groups {
-            self.fleet
-                .groups()
-                .patch(
-                    group,
-                    &PatchParams::default(),
-                    &Patch::Merge(serde_json::json!({"spec":{"deployment":{
-                        "name": format!("{group}@{version}")
-                    }}})),
-                )
-                .await?;
-        }
-        let first = groups.first().ok_or("a deploy needs at least one group")?;
-        kubectl_value(
-            "updategroup",
-            first,
-            "{.spec.deployment.application.sha256}",
-        )
     }
 
     /// Whether the operator currently has any throttle set frozen (a set outside its rollout

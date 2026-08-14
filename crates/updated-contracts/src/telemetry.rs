@@ -365,12 +365,44 @@ pub struct NodeReport {
     /// confirmation window is closed.
     ///
     /// Added in schema 6, so it defaults for reports the compatibility window still admits from
-    /// older agents — and the default is the FAIL-SAFE reading: absent means "no transaction
-    /// was ever observed", which proves nothing to the regression verdict. A pre-6 node's
-    /// rollbacks therefore produce no halt evidence until it upgrades — strictly weaker evidence,
-    /// never a false verdict and never a drained fleet.
+    /// older agents — and the default is the FAIL-SAFE reading: absent means "no transaction was
+    /// ever observed".
+    ///
+    /// No VERDICT reads it. The regression evidence is [`NodeReport::rejected`], which the node
+    /// states outright instead of leaving a sequence for a reader to catch. This stays part of the
+    /// contract for two reasons: the reader window still admits schema-6 payloads, which carry the
+    /// key, and this struct is `deny_unknown_fields`, so dropping the field would refuse every one
+    /// of them; and it is the half of `healthy == false` that says a transaction genuinely ran,
+    /// which `is_wellformed` enforces (never true together with `healthy`). It goes when
+    /// `MIN_SUPPORTED_SCHEMA` passes 6.
     #[serde(default)]
     pub updating: bool,
+    /// Whether this node has DURABLY REJECTED the release its assignment names: the archive
+    /// [`NodeReport::assignment_sha256`] resolves to is in the node's rejection record, written by
+    /// content hash when a candidate failed and kept for good.
+    ///
+    /// This is the node stating a TERMINAL fact about itself, and it is the only honest source for
+    /// it. The control plane cannot infer it: a rejection is recorded for a candidate that failed
+    /// its ACTIVATION as well as for one that failed its confirmation window, and the first —
+    /// a release that cannot start at all, the most ordinary bad release there is — runs no update
+    /// transaction, so it leaves no report sequence to observe. Inferring it from a sequence also
+    /// required catching a transient (`updating`) as it went past, which a control plane that was
+    /// restarting, had just changed leader, or was simply slow that second never saw again: the
+    /// node never retries rejected bytes, so a missed sequence was missed for ever, and the group
+    /// containing it stayed "rolling" — holding its set's concurrency slot against every sibling —
+    /// with no exit but an operator retargeting it by hand.
+    ///
+    /// It is a fact about BYTES, so it is stable across reboots and reports: the record never
+    /// expires, and corrected bytes have a new digest, which is the same rule the fleet-wide halt
+    /// enforces.
+    ///
+    /// Added in schema 7, so it defaults for reports the compatibility window still admits from
+    /// older agents — and the default is the FAIL-SAFE reading: absent means "this node claims no
+    /// rejection", which proves nothing and can only make the plane's verdict weaker, never wrong.
+    /// A pre-7 node's rejections are therefore invisible until it upgrades, and
+    /// `updatec_report_schema` is what makes that population visible while it lasts.
+    #[serde(default)]
+    pub rejected: bool,
     /// Milliseconds since the Unix epoch when the node wrote this report (see [`now_ms`]). A
     /// reader ages the report against this so a node that dies without writing a not-ready
     /// report cannot stay trusted forever — a stale report fails closed.
@@ -387,7 +419,7 @@ pub struct NodeReport {
 }
 
 impl NodeReport {
-    pub const SCHEMA: u32 = 6;
+    pub const SCHEMA: u32 = 7;
 
     /// The oldest report schema every reader still accepts — the reader-side half of the wire
     /// compatibility policy (see `docs/wire-compatibility-design.md`).
@@ -409,9 +441,10 @@ impl NodeReport {
     /// own commit, made only when no supported fleet still runs the older agent.
     pub const MIN_SUPPORTED_SCHEMA: u32 = 5;
 
-    /// A report of a node that is NOT mid-transaction. [`NodeReport::updating`] is set by the one
-    /// writer that knows (the agent's heartbeat, from its own unconfirmed-update journal);
-    /// every other constructor is describing a settled or merely not-ready node.
+    /// A report of a node that is NOT mid-transaction and claims no rejection.
+    /// [`NodeReport::updating`] and [`NodeReport::rejected`] are set by the one writer that knows
+    /// (the agent's heartbeat, from its own unconfirmed-update journal and its own rejection
+    /// record); every other constructor is describing a settled or merely not-ready node.
     pub fn new(
         node: impl Into<String>,
         deployment: impl Into<String>,
@@ -429,6 +462,7 @@ impl NodeReport {
             archive_sha256: archive_sha256.into(),
             healthy,
             updating: false,
+            rejected: false,
             reported_at_ms: now_ms(),
             fingerprint: None,
             outputs: None,
@@ -634,6 +668,28 @@ pub fn report_is_authentic_and_fresh(
     public_key_point: &[u8],
     now_ms: u64,
 ) -> Option<NodeReport> {
+    report_is_authentic(envelope, expected_node, public_key_point)
+        .filter(|report| report.is_fresh(now_ms))
+}
+
+/// The same trust gate WITHOUT the freshness bound: the envelope is authentic, attributed to this
+/// node, and of a schema this build understands, but it may be of any age.
+///
+/// Deliberately narrow, and never a substitute for [`report_is_authentic_and_fresh`]: almost
+/// everything a report says is a perishable fact about a machine RIGHT NOW (is it healthy, is it on
+/// this deployment), and reading a stale one as current is what keeps a dead node in rotation.
+///
+/// One claim in a report is not perishable — [`NodeReport::rejected`], which is a statement about
+/// BYTES: this node durably refused this release, a record that never expires and that the node
+/// never revisits. Requiring freshness there made one contained node going quiet for longer than
+/// [`REPORT_FRESHNESS`] — a rejection restarts the app and often reboots the host, so this is the
+/// ordinary case — drop the fleet's evidence below its threshold, clear the halt for that pass, and
+/// admit another batch onto the proven-bad body, one blip at a time.
+pub fn report_is_authentic(
+    envelope: &Envelope,
+    expected_node: &str,
+    public_key_point: &[u8],
+) -> Option<NodeReport> {
     use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
     use base64::Engine as _;
 
@@ -663,7 +719,7 @@ pub fn report_is_authentic_and_fresh(
     }
 
     let report: NodeReport = serde_json::from_slice(&payload).ok()?;
-    let usable = report.is_wellformed() && report.node == expected_node && report.is_fresh(now_ms);
+    let usable = report.is_wellformed() && report.node == expected_node;
 
     usable.then_some(report)
 }
@@ -731,7 +787,8 @@ mod tests {
     fn a_previous_schema_report_still_verifies() {
         use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-        // A verbatim schema-5 document: no `updating` field, because schema 5 had none.
+        // A verbatim schema-5 document: no `updating` and no `rejected` field, because schema 5
+        // had neither.
         let payload = format!(
             concat!(
                 "{{\"schema\":5,\"node\":\"agent-9\",\"deployment\":\"deploy-2\",",
@@ -760,8 +817,8 @@ mod tests {
             .expect("a report from an agent inside the compatibility window must verify");
         assert_eq!(report.schema, 5);
         assert!(
-            !report.updating,
-            "a field the old schema could not assert defaults to the fail-safe reading"
+            !report.updating && !report.rejected,
+            "every field the old schema could not assert defaults to the fail-safe reading"
         );
     }
 

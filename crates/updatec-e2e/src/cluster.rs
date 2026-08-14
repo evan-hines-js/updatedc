@@ -119,6 +119,7 @@ pub(crate) async fn bring_up_cluster() -> Result<(), Box<dyn std::error::Error>>
 
 /// The signed identities the fleet layout is built on: the reconciler set every cohort release
 /// ships with, and the platform its bundles are published for.
+#[derive(Clone)]
 pub(crate) struct FleetLayout {
     pub(crate) platform: String,
     pub(crate) provider_path: String,
@@ -187,11 +188,91 @@ pub(crate) async fn prepare_fleet() -> Result<FleetLayout, Box<dyn std::error::E
     prepare_haproxy_tier(&platform).await?;
     println!("[e2e] deploying the healthproxy reconciler for the out-of-cluster slice");
     deploy_external_reconciler()?;
+    deploy_alert_sink().await?;
     Ok(FleetLayout {
         platform,
         provider_path,
         provider_sha,
     })
+}
+
+/// Stand up the webhook receiver and point the controller's alert sink at it.
+///
+/// `updatec` takes its alert URL from the environment at startup, so the receiver is deployed and
+/// the controller is restarted onto it HERE — before any cohort rolls — rather than at the moment
+/// the assertion wants a delivery: an alert is edge-triggered on a condition TRANSITION, so a sink
+/// configured after the transition receives nothing at all and the assertion would be asserting on
+/// the wrong run of the loop.
+async fn deploy_alert_sink() -> Result<(), Box<dyn std::error::Error>> {
+    println!("[e2e] deploying the alert webhook receiver and pointing the controller at it");
+    apply_json(&serde_json::json!({
+        "apiVersion": "v1", "kind": "List", "items": [
+            {
+                "apiVersion":"apps/v1","kind":"Deployment",
+                "metadata":{"name":ALERT_SINK,"namespace":NAMESPACE},
+                "spec":{"replicas":1,"selector":{"matchLabels":{"app":ALERT_SINK}},
+                    "template":{"metadata":{"labels":{"app":ALERT_SINK}},
+                    "spec":{"containers":[{
+                        "name":"sink","image":"updatec-e2e:kind","imagePullPolicy":"Never",
+                        "command":["/usr/local/bin/updatec-e2e","alert-sink"],
+                        "ports":[{"name":"http","containerPort":ALERT_PORT}],
+                        "readinessProbe":{"tcpSocket":{"port":"http"},"periodSeconds":2}
+                    }]}}
+                }
+            },
+            {
+                "apiVersion":"v1","kind":"Service",
+                "metadata":{"name":ALERT_SINK,"namespace":NAMESPACE},
+                "spec":{"selector":{"app":ALERT_SINK},
+                    "ports":[{"name":"http","port":ALERT_PORT,"targetPort":"http"}]}
+            }
+        ]
+    }))?;
+    run(kubectl().args([
+        "-n",
+        NAMESPACE,
+        "rollout",
+        "status",
+        &format!("deployment/{ALERT_SINK}"),
+        "--timeout=120s",
+    ]))?;
+    run(kubectl().args([
+        "-n",
+        NAMESPACE,
+        "set",
+        "env",
+        "deployment/updatec-controller",
+        &format!("UPDATED_ALERT_URL={}", alert_url()),
+    ]))?;
+    run(kubectl().args([
+        "-n",
+        NAMESPACE,
+        "rollout",
+        "status",
+        "deployment/updatec-controller",
+        "--timeout=180s",
+    ]))
+}
+
+/// Every alert document the receiver has recorded, newest last, parsed. An unreadable record (the
+/// pod not yet scheduled, no delivery yet) is an empty list, never an error: the assertion polls.
+pub(crate) fn delivered_alerts() -> Vec<serde_json::Value> {
+    output(kubectl().args([
+        "-n",
+        NAMESPACE,
+        "exec",
+        &format!("deployment/{ALERT_SINK}"),
+        "--",
+        "cat",
+        ALERT_RECORD,
+    ]))
+    .map(|record| {
+        record
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Prove the per-set isolation end to end: every endpoint backing a set's load-balancer Service

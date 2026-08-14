@@ -171,6 +171,27 @@ pub(crate) const FLEET_SET: &str = "fleet-all";
 pub(crate) const FLEET_LABEL: &str = "e2e.updated.dev/fleet";
 pub(crate) const FLEET_VALUE: &str = "managed";
 
+/// The freshness bound a report ages out on — the ONE staleness definition, read from the contract
+/// rather than restated, so a change to it moves this wait with it.
+pub(crate) const REPORT_FRESHNESS_SECS: usize =
+    updated_contracts::telemetry::REPORT_FRESHNESS.as_secs() as usize;
+/// How long the staleness scenario watches a wedged rollout before accepting that it is genuinely
+/// held. Long enough to cover several reconciles and several agent check intervals (both are
+/// ~1s here), so "it did not advance" is a property of the planner and not of the sampling.
+pub(crate) const STALENESS_HOLD_SECS: usize = 30;
+
+/// The in-cluster webhook receiver for `updatec`'s alerts, and the port/record its subcommand
+/// serves on (`crate::alertsink`). The controller is pointed at it during fleet preparation, so a
+/// condition TRANSITION anywhere in the run is delivered and durably recorded.
+pub(crate) const ALERT_SINK: &str = "alert-sink";
+pub(crate) const ALERT_PORT: u16 = crate::alertsink::ALERT_PORT;
+pub(crate) const ALERT_RECORD: &str = crate::alertsink::ALERT_RECORD;
+
+/// The URL the controller delivers alerts to — the Service above, spelled once.
+pub(crate) fn alert_url() -> String {
+    format!("http://{ALERT_SINK}:{ALERT_PORT}/alerts")
+}
+
 /// Where cohort agents write their rollout telemetry — the in-cluster routing gateway. The
 /// gateway admits only fleet-CA client certs, so this is https and every node PUTs under its
 /// own mTLS identity (the same one it fetches its repository with); the gateway persists each
