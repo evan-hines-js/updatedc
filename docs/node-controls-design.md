@@ -83,5 +83,9 @@ at most one poll interval.
 
 Planner unit tests: hold excludes from admission and republishes the recorded body, fails
 closed on an unresolvable body, and releases cleanly; cordon projects drained endpoints while
-reports stay fresh, and admission treats the node as absent. (Not yet implemented: an e2e kind
-case asserting traffic drains while the update still lands.)
+reports stay fresh, and admission treats the node as absent.
+
+The fleet e2e holds and cordons one machine of a live cohort, then rolls a release at its group:
+the node is published as drained in the endpoint projection, its group settles on the new release
+around it (`heldAgents: 1`, `Ready=True`) while the node itself stays on the old one, and clearing
+both controls converges it and returns it to rotation.

@@ -20,5 +20,8 @@ updated = { path = "../updated" }
 updated-contracts = { path = "../updated-contracts" }
 updatec = { path = "../updatec" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 fips = ["updatec/fips", "updated/fips"]

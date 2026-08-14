@@ -382,6 +382,13 @@ pub struct UpdateGroupSetStatus {
     /// "settled as far as anything can be observed".
     #[serde(default)]
     pub settled: Vec<String>,
+    /// Member groups whose rollout ENDED IN FAILURE: their nodes attempted the admitted deployment
+    /// and durably rejected it (rolling back to what they were running), and nothing is still moving
+    /// toward it. They hold no concurrency slot — there is nothing in flight to protect — and they
+    /// are never listed as settled, so nothing gated on them opens and no progress count includes
+    /// them. The exit is a deployment with a different identity: corrected bytes have a new digest.
+    #[serde(default)]
+    pub failed: Vec<String>,
     /// Member groups no evidence can ever come from: they select no agent, or EVERY agent they
     /// select has no pinned public key (offline-provisioned, never enrolled). They hold no
     /// concurrency slot and will never settle, so anything gated on them waits forever — which is

@@ -42,7 +42,8 @@ already aggregates every fact a node is allowed to assert.
   `updatec_reconcile_failures_total` — is the loop alive and converging.
 - `updatec_generation{deployment=...}` — the published generation, labeled per deployment name.
 - `updatec_group_progress{group=...,state=...} 1` — one-hot projection of the planner verdict
-  (staging, held, settled, unobservable). Quarantine is not a planner verdict — a quarantined
+  (staging, held, settled, failed, unobservable — `failed` being a rollout its nodes durably
+  rejected, which is neither in flight nor done). Quarantine is not a planner verdict — a quarantined
   group is not planned at all — so it is reported by `updatec_quarantined_groups` and by the
   group's own failed `Ready` condition, never as a `group_progress` state.
 - `updatec_group_nodes{group=...}` / `updatec_group_nodes_on_target{group=...}` — rollout
@@ -52,9 +53,9 @@ already aggregates every fact a node is allowed to assert.
 - `updatec_report_schema{schema=...}` — nodes with a fresh authentic report, by the report schema
   they wrote. The compatibility window (docs/wire-compatibility-design.md) admits older reports
   with newer fields at their fail-safe default, which degrades what the fleet can prove without
-  changing anything else an operator can see: a pre-6 agent cannot assert `updating`, so its
-  rollbacks mint no regression evidence and "no node rolled back" reads identically to "every
-  rollback was invisible". This is also the only in-system answer to the question raising
+  changing anything else an operator can see: a pre-7 agent cannot assert `rejected`, so its
+  durable rejections mint no regression evidence and "no node rejected the release" reads
+  identically to "every rejection was invisible". This is also the only in-system answer to the question raising
   `MIN_SUPPORTED_SCHEMA` depends on — whether any supported fleet still runs the older agent.
   Bounded by the number of live schemas, not by nodes.
 - `updatec_quarantined_groups` — size of the quarantine set.

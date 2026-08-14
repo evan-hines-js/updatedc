@@ -187,3 +187,30 @@ pub(crate) const COHORT_LABEL: &str = "e2e.updated.dev/cohort";
 pub(crate) const KIND_LABEL: &str = "e2e.updated.dev/kind";
 /// Label carrying a Jenkins node's instance role (`ci`, `release`).
 pub(crate) const ROLE_LABEL: &str = "e2e.updated.dev/role";
+
+/// The deployments an `UpdateGroupSet` currently reports HALTED by the regression verdict, by name.
+/// An unreadable status is an empty list, never an error: every caller polls, and a transient API
+/// failure must not be mistaken for a verdict.
+pub(crate) fn halted_deployments(set: &str) -> Vec<String> {
+    kubectl_value("updategroupset", set, "{.status.halted[*].deployment}")
+        .map(|names| {
+            names
+                .split_whitespace()
+                .map(|name| name.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `status` of one condition on an `UpdateGroup` (`True`/`False`), or `None` when the condition
+/// has not been published yet.
+pub(crate) fn condition_status(group: &str, condition: &str) -> Option<String> {
+    let status = kubectl_value(
+        "updategroup",
+        group,
+        &format!("{{.status.conditions[?(@.type=='{condition}')].status}}"),
+    )
+    .ok()?;
+    let status = status.trim().to_string();
+    (!status.is_empty()).then_some(status)
+}

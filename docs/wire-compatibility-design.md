@@ -28,8 +28,9 @@ are always running before any node can write it. Readers therefore accept a wind
 `[MIN_SUPPORTED_SCHEMA, SCHEMA]`; writers always write `SCHEMA`.
 
 - Every field added inside the window carries a serde default chosen in the FAIL-SAFE direction,
-  documented at the field. `updating` (schema 6) defaults false: an old node's reports prove
-  nothing to the regression verdict — evidence is weaker during the upgrade, never wrong.
+  documented at the field. `rejected` (schema 7) defaults false: an old node's reports claim no
+  rejection, so its containment is invisible to the regression verdict until it upgrades — evidence
+  is weaker during the upgrade, never wrong. `updating` (schema 6) defaults the same way.
 - The exact bytes a floor-schema writer signs are locked by a literal-payload test, so a
   defaultless field cannot land while the window claims to cover the old shape.
 - Above the window is a writer newer than the reader — a violation of the supported order, and a

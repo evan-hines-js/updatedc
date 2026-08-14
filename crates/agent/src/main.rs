@@ -1150,6 +1150,19 @@ struct Settlement {
     updating: bool,
 }
 
+/// Whether this node has durably rejected the release `assignment` names — its own rejection
+/// record, keyed by the repository lineage and the archive digest exactly as every acquisition path
+/// keys it. A node that has is finished with those bytes for good: it never retries them, so no
+/// later report of it will ever name that release as running, and the control plane has to be told
+/// or it waits for a convergence that cannot happen.
+fn rejects_assigned_release(
+    store: &dyn Store,
+    assignment: &updated_contracts::assignment::RepositoryAssignment,
+) -> bool {
+    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+    store.is_rejected(&lineage, &assignment.application.sha256)
+}
+
 impl Heartbeat {
     /// Write one best-effort report of what this node is running.
     ///
@@ -1181,6 +1194,7 @@ impl Heartbeat {
         let repo = repo.expect("an assignment came from a repository");
         let archive_sha256 = installed_archive_sha256(store);
         let manifest_sha256 = installed_manifest_sha256(store);
+        let rejected = rejects_assigned_release(store, assignment);
         telemetry::report_running_state(
             &self.client,
             assignment.report_url.as_deref(),
@@ -1192,6 +1206,7 @@ impl Heartbeat {
                 archive_sha256: &archive_sha256,
                 healthy: state.settled,
                 updating: state.updating,
+                rejected,
                 fingerprint,
                 install_root: &opts.paths.install_root,
                 manifest_sha256: &manifest_sha256,
@@ -2909,6 +2924,61 @@ mod tests {
                 agent_check_interval_seconds: 3600,
             },
         }
+    }
+
+    /// The one bit the control plane cannot derive for itself, locked to the key the acquisition
+    /// paths actually write. A rejection is recorded under `(repository lineage, archive digest)`;
+    /// the heartbeat has to ask the same question with the same key, and a drift between the two
+    /// would not fail anything here — it would silently report "no rejection" for ever, so the
+    /// fleet-wide halt would never fire and the rejecting group would hold its set's rollout slot
+    /// with nothing naming the cause.
+    #[test]
+    fn the_heartbeat_reports_a_rejection_of_exactly_the_assigned_release() {
+        use updated_contracts::artifact::TargetReference;
+        use updated_contracts::assignment::RepositoryAssignment;
+
+        let assignment = RepositoryAssignment {
+            schema: RepositoryAssignment::SCHEMA,
+            deployment: "deployment".into(),
+            metadata_url: "https://repo/metadata/".into(),
+            targets_url: "https://repo/targets/".into(),
+            report_url: Some("https://control/telemetry".into()),
+            application: TargetReference {
+                path: "releases/app/2/app.bundle".into(),
+                sha256: "a".repeat(64),
+            },
+            ordered_install_fallback: false,
+            provider_set: TargetReference {
+                path: "provider-sets/default.json".into(),
+                sha256: "b".repeat(64),
+            },
+            release_root: serde_json::json!({}),
+            runtime: runtime(),
+        };
+        let mut store = MemStore::default();
+        assert!(
+            !rejects_assigned_release(&store, &assignment),
+            "a node with no rejection record claims none"
+        );
+
+        // Recorded through the very call every failure path uses, so this cannot pass on a key the
+        // production writer never produces.
+        let lineage = RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+        store.reject(&lineage, &"c".repeat(64)).unwrap();
+        assert!(
+            !rejects_assigned_release(&store, &assignment),
+            "a rejection of OTHER bytes says nothing about the assigned release"
+        );
+        store
+            .reject(&lineage, &assignment.application.sha256)
+            .unwrap();
+        assert!(rejects_assigned_release(&store, &assignment));
+
+        // A different repository lineage is a different key: the same digest published through
+        // another repository is not the release this node refused.
+        let mut elsewhere = assignment.clone();
+        elsewhere.metadata_url = "https://other-repo/metadata/".into();
+        assert!(!rejects_assigned_release(&store, &elsewhere));
     }
 
     #[test]

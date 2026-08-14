@@ -45,6 +45,12 @@ pub struct RunningState<'a> {
     /// transaction genuinely ran, told apart from an ordinary readiness failure — and only this
     /// writer can tell them apart, so it is reported rather than guessed at by a reader.
     pub updating: bool,
+    /// This node has DURABLY REJECTED the release its assignment names: the assignment's own
+    /// application archive is in the node's rejection record, which is written by content hash when
+    /// a candidate fails and never expires. Only this node knows it — the record covers a candidate
+    /// that failed its ACTIVATION as well as one that failed its confirmation window, and the first
+    /// runs no update transaction at all, so no observer of the report stream can infer it.
+    pub rejected: bool,
     /// Latest successful opaque node-state fingerprint, when one is currently publishable.
     pub fingerprint: Option<&'a updated_contracts::telemetry::Fingerprint>,
     /// Where installed archives live, and the manifest digest identifying the running one — the
@@ -179,6 +185,7 @@ pub async fn report_running_state(
         state.healthy,
     );
     report.updating = state.updating;
+    report.rejected = state.rejected;
     report.fingerprint = state.fingerprint.cloned();
     // Outputs describe what the running archive settled on, so an unsettled node has none to
     // publish — and no reason to pay the read. One gate, at the one place that attaches them.
@@ -336,6 +343,7 @@ mod tests {
                 archive_sha256: "archive",
                 healthy: false,
                 updating: false,
+                rejected: false,
                 fingerprint: None,
                 install_root: std::path::Path::new("/nonexistent"),
                 manifest_sha256: "",

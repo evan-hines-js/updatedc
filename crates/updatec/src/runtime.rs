@@ -796,10 +796,10 @@ async fn metadata_expiry(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
 pub struct ReconcileHooks {
     pub alerts: Option<Arc<crate::alerts::AlertSink>>,
     pub progress: crate::alerts::ProgressTracker,
-    /// Cross-pass memory about the fleet's nodes (`evidence::ObservationLog`): which assignments
-    /// each node has been seen attempting, and which nodes have ever reported at all. Losing it (a
-    /// restart, a leader change) only delays a halt until the still-contained nodes' report
-    /// sequences re-prove it, and re-derives "has reported" from the next readable store listing.
+    /// Cross-pass memory about the fleet's nodes (`evidence::ObservationLog`): which nodes have
+    /// ever reported at all. Nothing else the planner decides is remembered — the regression
+    /// verdict and every settlement verdict are functions of the reports readable this pass — so
+    /// losing this costs one staleness alert's baseline until each node reports again.
     pub observation_log: crate::evidence::ObservationLog,
     /// Failed passes in a row WITHIN one leadership epoch. Reset by a successful publish, and by
     /// the loop whenever this replica stops being the leader — a streak that spanned the gap let
@@ -815,6 +815,14 @@ impl ReconcileHooks {
             observation_log: crate::evidence::ObservationLog::new(),
             consecutive_failures: 0,
         }
+    }
+
+    /// This replica has stopped being the leader (or never was this round), so the epoch-scoped
+    /// consecutive-failure streak `ReconcileFailing` counts ends with it: carrying it across the gap
+    /// let one ordinary transient after a handover reach the threshold on its own, while another
+    /// replica had meanwhile reconciled cleanly and cleared the condition on every set.
+    pub fn end_leadership_epoch(&mut self) {
+        self.consecutive_failures = 0;
     }
 }
 
@@ -2002,6 +2010,7 @@ async fn publish_group_set_statuses(
             rolling_count: Some(status.rolling.len() as u32),
             rolling: status.rolling.clone(),
             settled: status.settled.clone(),
+            failed: status.failed.clone(),
             unobservable: status.unobservable.clone(),
             shared: status.shared.clone(),
             emergency: status.emergency.clone(),
@@ -2614,6 +2623,18 @@ async fn publish_resource_statuses(
                 group.metadata.generation,
                 "Published",
                 "This group's deployment is fully admitted in the published routing generation.",
+            ),
+            // The rollout is over and it FAILED: this group's nodes attempted the admitted
+            // deployment and durably rejected it, and nothing is still moving toward it. NOT ready
+            // — the operator's change is not live and never will be under these bytes — and a
+            // distinct reason from `Rolling`, because nothing here is advancing and waiting changes
+            // nothing. The exit is a deployment with a different identity.
+            crate::rollout::GroupProgress::Failed => failed_condition(
+                group.metadata.generation,
+                "Rejected",
+                "This group's nodes attempted its admitted deployment and durably rejected it, \
+                 rolling back to what they were running; the rollout has ended. Publish corrected \
+                 bytes (a new digest) to move this group.",
             ),
             // Published in full, but nothing can confirm it: every agent this group selects was
             // provisioned offline (no pinned key) or it selects none at all. Ready — it is not
@@ -4370,6 +4391,44 @@ mod wiring_tests {
         )
     }
 
+    /// A node key pair for the wiring tests: `.0` is the PKCS#8 signing key, `.1` the pinned public
+    /// point an `UpdateAgent` carries as hex. One pair for the module — identity binding is proven
+    /// in `join`/`telemetry`; here a report only has to verify against the pin.
+    static NODE_KEY: std::sync::LazyLock<(Vec<u8>, Vec<u8>)> = std::sync::LazyLock::new(|| {
+        let key_pem = updated::csr::generate_key().unwrap();
+        let pkcs8 = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
+        let csr = updated::csr::csr_for(&key_pem, "wiring-test").unwrap();
+        let public = crate::join::csr_public_key(&csr).unwrap();
+        (pkcs8, public)
+    });
+
+    /// Put a node's signed report into the store exactly where the controller reads it from, so a
+    /// wiring test drives the planner through the real report path rather than reaching into the
+    /// planner's own state. `mutate` shapes the report the node is claiming.
+    fn publish_report(
+        objects: &StdMutex<BTreeMap<String, Vec<u8>>>,
+        node: &str,
+        deployment: &str,
+        identity: &str,
+        mutate: impl FnOnce(&mut updated_contracts::telemetry::NodeReport),
+    ) {
+        let mut report = updated_contracts::telemetry::NodeReport::new(
+            node,
+            deployment,
+            identity,
+            "1.0.0",
+            "1".repeat(64),
+            true,
+        );
+        mutate(&mut report);
+        let envelope =
+            updated_contracts::telemetry::sign_report(&report, &NODE_KEY.0).expect("signed report");
+        objects.lock().expect("s3").insert(
+            format!("routing/telemetry/{node}.json"),
+            serde_json::to_vec(&envelope).expect("encoded envelope"),
+        );
+    }
+
     /// The full fixture: repository pointed at the in-process S3, one healthy group over one
     /// agent, plus whatever `mutate` adds. Returns everything a test asserts against.
     async fn fleet(
@@ -4512,31 +4571,13 @@ mod wiring_tests {
         .await;
         let client = apiserver_for(cluster.clone(), "wiring-test");
         let mut hooks = ReconcileHooks::new(None);
-        // The quarantined agent carries rollback-evidence memory into the pass: quarantine is a
-        // status condition, not a departure, and forgetting a contained node's proof over it
-        // weakened the fleet-wide verdict for as long as the quarantine lasted. The identity must
-        // be one a generation still names, so it is the group's own desired deployment.
-        let target = crate::deployment_identity(
-            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
-        )
-        .unwrap();
-        let origin = "a".repeat(64);
-        let archive = "b".repeat(64);
-        let mut settled = updated_contracts::telemetry::NodeReport::new(
-            "n2", "origin", &origin, "1.0.0", &archive, true,
-        );
-        hooks.observation_log.observe("n2", &settled);
-        settled.assignment_sha256 = target.clone();
-        settled.healthy = false;
-        settled.updating = true;
-        hooks.observation_log.observe("n2", &settled);
-        settled.healthy = true;
-        settled.updating = false;
-        hooks.observation_log.observe("n2", &settled);
-        assert!(hooks
+        // The quarantined agent has been HEARD FROM: quarantine is a status condition, not a
+        // departure, so the pass must not forget that — a node dropped from that memory reads as
+        // "never reported", which silences the staleness alert for the one machine an operator is
+        // already looking at.
+        hooks
             .observation_log
-            .rolled_back("n2", &target)
-            .is_some_and(|seed| seed.archive == archive));
+            .note_reported(std::iter::once(&"n2".to_string()));
         reconcile_once(
             client,
             "default",
@@ -4549,16 +4590,12 @@ mod wiring_tests {
         .await
         .expect("the pass succeeds around the quarantined agent");
         assert!(
-            drained_in(&objects).contains("n2"),
-            "the quarantined agent's drain must stay published"
+            hooks.observation_log.has_reported("n2"),
+            "a quarantined agent has not left the fleet, so its observability memory stands"
         );
         assert!(
-            hooks
-                .observation_log
-                .rolled_back("n2", &target)
-                .is_some_and(|seed| seed.archive == archive),
-            "quarantine is a status condition, not a departure: the contained node's rollback \
-             proof survives the pass"
+            drained_in(&objects).contains("n2"),
+            "the quarantined agent's drain must stay published"
         );
     }
 
@@ -4732,7 +4769,7 @@ mod wiring_tests {
     /// the only wiring test touching the log asserts that evidence SURVIVES a pass — which deleting
     /// the call satisfies too. Unbound, the log grows for the lifetime of a leader reconciling once
     /// a second across a churning fleet, and a machine returning under a departed name inherits its
-    /// predecessor's settled origin, seeding a movement record from hardware that no longer exists.
+    /// predecessor's observability history.
     #[tokio::test]
     async fn a_departed_agents_memory_is_pruned_by_the_pass_that_stops_selecting_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4746,24 +4783,8 @@ mod wiring_tests {
         .await;
         let state = tmp.path().join("state");
         let mut hooks = ReconcileHooks::new(None);
-        // n2 carries a complete rollback proof and a "has uploaded something" mark into the pass.
-        let target = crate::deployment_identity(
-            &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
-        )
-        .unwrap();
-        let origin = "a".repeat(64);
-        let archive = "b".repeat(64);
-        let mut settled = updated_contracts::telemetry::NodeReport::new(
-            "n2", "origin", &origin, "1.0.0", &archive, true,
-        );
-        hooks.observation_log.observe("n2", &settled);
-        settled.assignment_sha256 = target.clone();
-        settled.healthy = false;
-        settled.updating = true;
-        hooks.observation_log.observe("n2", &settled);
-        settled.healthy = true;
-        settled.updating = false;
-        hooks.observation_log.observe("n2", &settled);
+        // n2 carries a "has uploaded something" mark into the pass — the baseline `ReportsStale`
+        // measures freshness against.
         hooks
             .observation_log
             .note_reported(std::iter::once(&"n2".to_string()));
@@ -4783,7 +4804,6 @@ mod wiring_tests {
             hooks.observation_log.has_reported("n2"),
             "a member of the fleet keeps its memory"
         );
-        assert!(hooks.observation_log.rolled_back("n2", &target).is_some());
 
         // The machine is decommissioned: its UpdateAgent is deleted. Nothing else changes.
         cluster
@@ -4804,25 +4824,26 @@ mod wiring_tests {
         .expect("the second pass succeeds");
         assert!(
             !hooks.observation_log.has_reported("n2"),
-            "the pass that stopped selecting the node forgot it"
-        );
-        assert!(
-            hooks.observation_log.rolled_back("n2", &target).is_none(),
-            "including its rollback proof, so a same-name replacement starts from nothing"
+            "the pass that stopped selecting the node forgot it, so a machine returning under the \
+             same name is counted as one that has never reported rather than one gone quiet"
         );
     }
 
     /// The halt's whole PROJECTION was unreached by the wiring harness: the set fixture's
-    /// `maxRegressions` was inert (no pinned key, no telemetry object), so the log stayed empty and
-    /// `plan_rollouts` always took the `halts.is_empty()` fast path — the set test only ever proved
-    /// a `DeploymentHalted` of status False. A fleet-wide freeze could therefore be published as
-    /// invisible on every CR, with a rollout silently stopped and nothing naming the cause.
+    /// `maxRegressions` was inert (no pinned key, no telemetry object), so `plan_rollouts` always
+    /// took the `halts.is_empty()` fast path — the set test only ever proved a `DeploymentHalted`
+    /// of status False. A fleet-wide freeze could therefore be published as invisible on every CR,
+    /// with a rollout silently stopped and nothing naming the cause.
+    ///
+    /// Driven the way production drives it: a real signed report in the store, carrying the node's
+    /// own durable rejection of the release it was assigned.
     #[tokio::test]
     async fn a_fleet_wide_halt_reaches_both_the_set_and_the_group_status() {
         let tmp = tempfile::tempdir().unwrap();
         let objects = Arc::new(StdMutex::new(BTreeMap::new()));
         let endpoint = s3_endpoint(objects.clone()).await;
         let cluster = fleet(tmp.path(), endpoint, |cluster| {
+            cluster.agents[0].spec.identity.public_key = Some(hex::encode(&NODE_KEY.1));
             cluster.groups[0].metadata.labels =
                 Some(BTreeMap::from([("tier".to_string(), "edge".to_string())]));
             let mut set = UpdateGroupSet::new(
@@ -4845,7 +4866,7 @@ mod wiring_tests {
         .await;
         let state = tmp.path().join("state");
         let mut hooks = ReconcileHooks::new(None);
-        // Pass one admits edge-v1, so it is the ORIGIN body the movement's guard resolves against.
+        // Pass one admits edge-v1 and publishes it to n1.
         reconcile_once(
             apiserver_for(cluster.clone(), "wiring-test"),
             "default",
@@ -4858,37 +4879,16 @@ mod wiring_tests {
         .await
         .expect("the first pass admits the group's deployment");
 
-        // The operator stages a genuinely different release: a new application target, which is
-        // what makes a rollback distinguishable at all.
-        let mut next = crate::tests::deployment_spec("edge-v2");
-        next.application.sha256 = "3".repeat(64);
-        cluster
-            .lock()
-            .expect("cluster")
-            .groups
-            .iter_mut()
-            .for_each(|group| group.spec.deployment = next.clone());
+        // n1 attempted edge-v1 and durably refused those bytes: healthy, on that assignment, still
+        // executing what it had before. This is the whole evidence — no sequence to catch, and
+        // nothing the control plane has to have been watching for.
         let v1 = crate::deployment_identity(
             &crate::DesiredDeployment::try_from(crate::tests::deployment_spec("edge-v1")).unwrap(),
         )
         .unwrap();
-        let v2 =
-            crate::deployment_identity(&crate::DesiredDeployment::try_from(next).unwrap()).unwrap();
-        // n1's report sequence: settled on edge-v1, a transaction toward edge-v2 in flight, then
-        // settled back on edge-v2's assignment still running edge-v1's archive — a rollback.
-        let archive = "1".repeat(64);
-        let mut report = updated_contracts::telemetry::NodeReport::new(
-            "n1", "edge-v1", &v1, "1.0.0", &archive, true,
-        );
-        hooks.observation_log.observe("n1", &report);
-        report.assignment_sha256 = v2.clone();
-        report.healthy = false;
-        report.updating = true;
-        hooks.observation_log.observe("n1", &report);
-        report.healthy = true;
-        report.updating = false;
-        hooks.observation_log.observe("n1", &report);
-
+        publish_report(&objects, "n1", "edge-v1", &v1, |report| {
+            report.rejected = true;
+        });
         reconcile_once(
             apiserver_for(cluster.clone(), "wiring-test"),
             "default",
@@ -4901,7 +4901,6 @@ mod wiring_tests {
         .await
         .expect("the second pass succeeds with the deployment halted");
 
-        let cluster = cluster.lock().expect("cluster");
         let condition = |patch: &serde_json::Value, name: &str| -> serde_json::Value {
             patch["status"]["conditions"]
                 .as_array()
@@ -4911,36 +4910,70 @@ mod wiring_tests {
                 .expect("the condition is published")
                 .clone()
         };
-        let set_patch = cluster
-            .status_patches
-            .iter()
-            .rev()
-            .find(|(path, _)| path.ends_with("/updategroupsets/edge-set/status"))
-            .expect("the set's status was written");
+        let published = |cluster: &Arc<StdMutex<Cluster>>, path: &str| -> serde_json::Value {
+            cluster
+                .lock()
+                .expect("cluster")
+                .status_patches
+                .iter()
+                .rev()
+                .find(|(written, _)| written.ends_with(path))
+                .unwrap_or_else(|| panic!("{path} was written"))
+                .1
+                .clone()
+        };
+        let set_patch = published(&cluster, "/updategroupsets/edge-set/status");
         assert_eq!(
-            set_patch.1["status"]["halted"],
-            serde_json::json!([{"deployment": "edge-v2", "evidence": 1}]),
-            "the set names the halted body and its evidence: {}",
-            set_patch.1
+            set_patch["status"]["halted"],
+            serde_json::json!([{"deployment": "edge-v1", "evidence": 1}]),
+            "the set names the halted body and its evidence: {set_patch}"
         );
         assert_eq!(
-            condition(&set_patch.1, "DeploymentHalted")["status"],
+            condition(&set_patch, "DeploymentHalted")["status"],
             "True",
-            "{}",
-            set_patch.1
+            "{set_patch}"
         );
-        let group_patch = cluster
-            .status_patches
-            .iter()
-            .rev()
-            .find(|(path, _)| path.ends_with("/updategroups/edge/status"))
-            .expect("the group's status was written");
+        let group_patch = published(&cluster, "/updategroups/edge/status");
         assert_eq!(
-            condition(&group_patch.1, "DeploymentHalted")["status"],
+            condition(&group_patch, "DeploymentHalted")["status"],
             "True",
-            "a set-less group learns of a halt the same way, so this is the one place it is \
-             ever visible: {}",
-            group_patch.1
+            "a set-less group learns of a halt the same way, so this is the one place it is ever \
+             visible: {group_patch}"
+        );
+        // The group's own rollout verdict is the second, independent reading of the same evidence:
+        // every node it selects has rejected the release, so the rollout is OVER — not eternally
+        // "rolling", which is what held its set's concurrency slot against every sibling.
+        assert_eq!(
+            condition(&group_patch, "Ready")["reason"],
+            "Rejected",
+            "{group_patch}"
+        );
+        assert_eq!(set_patch["status"]["failed"], serde_json::json!(["edge"]));
+        assert_eq!(set_patch["status"]["rollingCount"], 0);
+
+        // A controller CRASH must not un-decide any of it. The node never attempts rejected bytes
+        // again, so a verdict that depended on having WATCHED the rollback would be lost for ever
+        // here; this one is recomputed from the standing report, so a brand-new process publishes
+        // exactly the same thing.
+        cluster.lock().expect("cluster").status_patches.clear();
+        let mut restarted = ReconcileHooks::new(None);
+        reconcile_once(
+            apiserver_for(cluster.clone(), "wiring-test"),
+            "default",
+            "default",
+            &state,
+            "https://public",
+            "wiring-test",
+            &mut restarted,
+        )
+        .await
+        .expect("the pass after the restart succeeds");
+        let set_patch = published(&cluster, "/updategroupsets/edge-set/status");
+        assert_eq!(
+            set_patch["status"]["halted"],
+            serde_json::json!([{"deployment": "edge-v1", "evidence": 1}]),
+            "the halt stands across the restart rather than silently reopening the proven-bad body \
+             to the rest of the fleet: {set_patch}"
         );
     }
 

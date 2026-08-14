@@ -55,13 +55,17 @@ pub type SharedMetrics = Arc<std::sync::RwLock<MetricsState>>;
 
 /// The one-hot label set, spelled once: the renderer emits exactly these states and
 /// `progress_label` maps into them, so the two cannot drift into a label the other never uses.
-const PROGRESS_STATES: [&str; 4] = ["staging", "held", "settled", "unobservable"];
+const PROGRESS_STATES: [&str; 5] = ["staging", "held", "settled", "failed", "unobservable"];
 
 fn progress_label(progress: GroupProgress) -> &'static str {
     match progress {
         GroupProgress::Held => "held",
         GroupProgress::Rolling => "staging",
         GroupProgress::Settled => "settled",
+        // Its own state, never folded into "settled" or "staging": a group whose rollout ended in
+        // durable rejection is neither done nor in flight, and counting it as either is what makes
+        // a fleet dashboard say a bad release landed.
+        GroupProgress::Failed => "failed",
         GroupProgress::Unobservable => "unobservable",
     }
 }
