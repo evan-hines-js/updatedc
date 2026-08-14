@@ -4,6 +4,10 @@
 # fuzzer (scripts/kind-updatec-e2e.sh) and the container release server
 # (crates/updatec/e2e/release-server.sh). Keep artifact selection and
 # corrupt-candidate construction here so both exercise the same update sequence.
+#
+# The names are the identities the workloads themselves serve on `/artifact`
+# (`sampleapp` and the `stateful-like` binary's `stateful`), so an update is proven to have
+# replaced the executable rather than merely rewritten the version file beside it.
 publish_fuzz_artifact() {
   version=$1
   checksum=$(printf '%s\n' "$version" | awk -F. '{
@@ -14,7 +18,7 @@ publish_fuzz_artifact() {
     print sum
   }')
   if [ $((checksum % 2)) -eq 0 ]; then
-    printf '%s\n' jenkins
+    printf '%s\n' stateful
   else
     printf '%s\n' sampleapp
   fi

@@ -1635,6 +1635,17 @@ fn bound_unhealthy_rollback(
                  complete; descending uncompensated rather than relaunching into it forever",
             );
         }
+        // Conclude the rollback through its own terminal edges before touching durable state:
+        // the store refuses to discard a journal that is not settled, and `RolledBack` is the
+        // phase that records this machine's obligation as discharged — by the compensation above,
+        // or by its one durably-recorded attempt. Guarded per edge so a boot that died between
+        // these writes resumes instead of tripping the phase machine.
+        if tx.recovery_pending(TransactionPhase::RollbackFinalizeStarted) {
+            update::advance_transaction(store, tx, TransactionPhase::RollbackFinalizeStarted)?;
+        }
+        if tx.recovery_pending(TransactionPhase::RolledBack) {
+            update::advance_transaction(store, tx, TransactionPhase::RolledBack)?;
+        }
         store.reject(&tx.previous_repository_lineage, &tx.previous_archive_sha256)?;
         store.commit_installed(&updated::state::InstalledState::provisional(
             tx.previous_repository_lineage.clone(),
@@ -2119,6 +2130,110 @@ mod tests {
             Installed::Present(state) => assert_eq!(state.lifecycle, after_repair.1),
             _ => panic!("expected the repaired record"),
         }
+    }
+
+    /// The store refuses to destroy a journal whose transaction still owes the machine a commit
+    /// or a settled rollback. This is the structural guarantee behind "an abandoned rollback can
+    /// never skip its compensation": no call site — present or future — can discard mid-flight
+    /// evidence, because the refusal lives on the destroy operation itself. Pre-activation
+    /// journals displaced nothing and terminal phases have settled their debt, so those (and
+    /// only those) may go.
+    #[test]
+    fn a_journal_that_owes_compensation_cannot_be_discarded() {
+        for (phase, discardable) in [
+            (Phase::PreflightStarted, true),
+            (Phase::Prepared, true),
+            (Phase::ActivateStarted, false),
+            (Phase::CandidateActivated, false),
+            (Phase::HealthStarted, false),
+            (Phase::CommitStarted, false),
+            (Phase::RollbackStarted, false),
+            (Phase::RollbackHealthStarted, false),
+            (Phase::RollbackFinalizeStarted, false),
+            (Phase::Committed, true),
+            (Phase::RolledBack, true),
+        ] {
+            let situation = interrupted_revert(Some(phase));
+            let mut store = MemStore {
+                journal: situation.journal,
+                ..MemStore::default()
+            };
+            let cleared = store.clear_journal();
+            assert_eq!(
+                cleared.is_ok(),
+                discardable,
+                "clear_journal at {phase:?} must {}",
+                if discardable { "succeed" } else { "be refused" }
+            );
+            assert_eq!(
+                store.journal().unwrap().is_none(),
+                discardable,
+                "the journal at {phase:?} must {}",
+                if discardable { "be gone" } else { "survive" }
+            );
+        }
+        // No journal at all is trivially clearable — recovery retries a failed post-commit delete.
+        assert!(MemStore::default().clear_journal().is_ok());
+    }
+
+    /// The other door into evidence destruction: persisting transaction B over transaction A's
+    /// unsettled journal buries A's compensation obligation just as surely as deleting it. Same
+    /// id passes freely (that is every replay and phase advance); a different id needs A settled.
+    #[test]
+    fn an_unsettled_journal_cannot_be_buried_by_another_transaction() {
+        let situation = interrupted_revert(Some(Phase::RollbackHealthStarted));
+        let unsettled = situation.journal.unwrap();
+        let mut store = MemStore {
+            journal: Some(unsettled.clone()),
+            ..MemStore::default()
+        };
+
+        // The same transaction advancing is the normal durable path.
+        let mut same = unsettled.clone();
+        same.rollback_health_failures += 1;
+        assert!(store.write_journal(&same).is_ok());
+
+        // A different transaction must not bury it...
+        let mut other = unsettled.clone();
+        other.id = "another-attempt".into();
+        assert!(store.write_journal(&other).is_err());
+        assert_eq!(store.journal().unwrap().unwrap().id, unsettled.id);
+
+        // ...until the first is settled.
+        let mut settled = same;
+        settled.advance(Phase::RollbackFinalizeStarted).unwrap();
+        settled.advance(Phase::RolledBack).unwrap();
+        store.write_journal(&settled).unwrap();
+        assert!(store.write_journal(&other).is_ok());
+    }
+
+    /// A rejection is never-retry evidence; only the machine's own proof that the exact bytes
+    /// later succeeded — they are the committed head — may erase one.
+    #[test]
+    fn a_rejection_is_erased_only_for_the_committed_head() {
+        let situation = interrupted_revert(None);
+        let Installed::Present(installed) = situation.installed else {
+            panic!("the fixture commits a head");
+        };
+        let lineage = installed.repository_lineage.clone();
+        let mut store = MemStore {
+            installed: Some(*installed.clone()),
+            ..MemStore::default()
+        };
+        store.reject(&lineage, "not-the-committed-archive").unwrap();
+        store.reject(&lineage, &installed.archive_sha256).unwrap();
+
+        // Bytes that never became the head keep their rejection.
+        assert!(store
+            .clear_rejection(&lineage, "not-the-committed-archive")
+            .is_err());
+        assert!(store.is_rejected(&lineage, "not-the-committed-archive"));
+
+        // The committed head's own stale rejection is the one erasure with proof behind it.
+        store
+            .clear_rejection(&lineage, &installed.archive_sha256)
+            .unwrap();
+        assert!(!store.is_rejected(&lineage, &installed.archive_sha256));
     }
 
     /// A node whose update committed (installed = candidate, pending = predecessor) and whose

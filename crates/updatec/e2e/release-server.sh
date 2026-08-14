@@ -25,7 +25,7 @@ if [ ! -f /data/ready ]; then
     else
       artifact=$(publish_fuzz_artifact "$version")
       case "$artifact" in
-        jenkins) cp /usr/local/bin/stateful-like "$source/bin/app" ;;
+        stateful) cp /usr/local/bin/stateful-like "$source/bin/app" ;;
         sampleapp) cp /usr/local/bin/sampleapp "$source/bin/app" ;;
         *) echo "unknown fuzz artifact: $artifact" >&2; exit 1 ;;
       esac
@@ -35,26 +35,101 @@ if [ ! -f /data/ready ]; then
       --product app --channel stable --version "$version" --entrypoint bin/app \
       --bundle "$platform=$source"
   done
-  # Every release now carries exactly one signed node reconciler — there is no reconciler-less
-  # provider set. The ordinary fleet runs plain, launcher-owned HTTP apps, so its `default` set uses
-  # a MINIMAL, stateless reconciler: the launcher owns process lifecycle, so every phase is a no-op
-  # except health verification. `verify` (the update gate) and `periodic` (the steady-state liveness
-  # signal) confirm the managed app answers `/healthz`; a non-zero exit fails the update and rolls
-  # back. It must be stateless — a stateful provider that gates `verify` on a prior `start` marker
-  # (like the demo's enterprise reconciler) can never pass a Managed-mode cold install, whose first
-  # boot health-gates the freshly installed release without running a transaction's start phase.
+  # Every release carries exactly one signed node reconciler, and the reconciler OWNS the
+  # workload: the agent runs packages and never starts, stops, or holds a PID of one. The ordinary
+  # fleet runs a plain HTTP application, so its `default` set uses the smallest hook that owns a
+  # process honestly — `apply`/`rollback` converge the workload onto `--candidate` (kill-then-start
+  # against a pidfile, detached with `setsid` so it escapes the invocation's contained tree),
+  # `healthcheck` observes `/healthz`, `inspect` reports the running release. Convergence, not
+  # restart: an already-correct running workload is left alone, so its PID is stable across agent
+  # boots, restarts and self-updates.
   mkdir -p "$fixtures/default-provider/bin"
   cat >"$fixtures/default-provider/bin/lifecycle" <<'RECONCILER'
 #!/bin/sh
-case "$1" in
-  verify|periodic)
-    curl -fsS -o /dev/null --max-time 3 http://127.0.0.1:8080/healthz || {
-      echo "managed application failed its health check during $1" >&2
-      exit 1
-    }
-    ;;
+set -eu
+
+operation=${1:?missing reconciler operation}
+shift
+protocol= candidate= state_dir=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --protocol) protocol=$2; shift 2 ;;
+    --candidate) candidate=$2; shift 2 ;;
+    --state-dir) state_dir=$2; shift 2 ;;
+    --attempt-id|--reason|--install-root|--candidate-version|--predecessor|\
+--predecessor-version|--input-file|--output-file) shift 2 ;;
+    --) shift; break ;;
+    *) echo "default-reconciler: unknown argument '$1'" >&2; exit 2 ;;
+  esac
+done
+[ "$protocol" = 1 ] || { echo "default-reconciler: unsupported protocol" >&2; exit 2; }
+
+# The service address every peer in the fleet reaches this node's workload on.
+address=0.0.0.0:8080
+pidfile="$state_dir/workload.pid"
+releasefile="$state_dir/workload.release"
+
+# Whether the recorded workload is still serving. A detached workload is reparented to whatever
+# runs as pid 1, which reaps its own children and nothing else, so a crashed one lingers as a
+# zombie that answers `kill -0` and serves nothing: the process state, not its mere existence, is
+# what says the workload is still there.
+running() {
+  [ -f "$pidfile" ] || return 1
+  pid=$(cat "$pidfile")
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ "$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1)" != Z ]
+}
+
+# Converge the workload onto $candidate: leave it alone when it already runs these bytes,
+# otherwise stop what is running and start the candidate's own entrypoint.
+converge() {
+  if running && [ "$(cat "$releasefile" 2>/dev/null || true)" = "$candidate" ]; then
+    return 0
+  fi
+  if running; then
+    pid=$(cat "$pidfile")
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      running || break
+      sleep 1
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pidfile" "$releasefile"
+  # The workload is started by a shell that records its OWN pid before exec'ing the entrypoint,
+  # and the entrypoint refuses to serve until the pidfile names it: this hook can be killed at any
+  # instant, and a workload nothing can name is a workload nothing can stop. `setsid` moves it out
+  # of this invocation's contained tree, which the agent tears down when the hook returns.
+  setsid /bin/sh -c '
+    cd "$1" || exit 1
+    printf "%s\n" "$$" >"$2.tmp"
+    mv "$2.tmp" "$2"
+    exec ./bin/app --addr "$3" --await-record "$2"
+  ' sh "$candidate" "$pidfile" "$address" </dev/null >>"$state_dir/workload.log" 2>&1 &
+  # A release whose entrypoint cannot run at all fails its own activation here, rather than
+  # leaving the agent to infer it from a health observation.
+  waited=0
+  while [ ! -f "$pidfile" ] && [ "$waited" -lt 3 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  sleep 1
+  running || {
+    echo "default-reconciler: the workload from $candidate did not stay up" >&2
+    tail -n 20 "$state_dir/workload.log" >&2 || true
+    exit 1
+  }
+  printf '%s\n' "$candidate" >"$releasefile"
+}
+
+case "$operation" in
+  # On a rollback --candidate IS the release being restored, so both directions converge the
+  # same way onto the same argument.
+  apply|rollback) converge ;;
+  healthcheck) curl -fsS -o /dev/null --max-time 3 http://127.0.0.1:8080/healthz ;;
+  inspect) printf 'release=%s\n' "$(cat "$releasefile" 2>/dev/null || true)" ;;
+  *) echo "default-reconciler: unknown operation '$operation'" >&2; exit 2 ;;
 esac
-exit 0
 RECONCILER
   chmod 0755 "$fixtures/default-provider/bin/lifecycle"
   server publish-provider-artifact --repo "$repo" --keys "$keys" \
@@ -65,12 +140,10 @@ RECONCILER
   server publish-provider-set --repo "$repo" --keys "$keys" --id default \
     --provider-path "$provider_path" --provider-sha256 "$provider_sha" \
     --provider-timeout-ms 15000
-  # Real Jenkins as a managed product — ONLY on linux-x86_64 (the install provider fetches
-  # an x86_64 JRE), so an arm64 kind cluster (Apple Silicon Docker) publishes no Jenkins bundle
-  # and the demo skips it. Installed at runtime on a plain Ubuntu + agent node — nothing
-  # Jenkins-specific is baked into any image; v1 -> v2 is a real rolling restart drained one
-  # node at a time.
-  if [ "$platform" = "linux-x86_64" ]; then
+  # Real Jenkins as a managed product, on every architecture: the WAR is architecture-independent
+  # and the reconciler fetches the JRE matching the node's own `uname -m`. Installed at runtime on
+  # a plain Ubuntu + agent node — nothing Jenkins-specific is baked into any image; v1 -> v2 is a
+  # real rolling restart, drained one node at a time by the reconciler's quiet-down.
   for jenkins_version in 1.0.0 2.0.0; do
     source="$fixtures/jenkins-$jenkins_version"
     mkdir -p "$source/bin" "$source/config"
@@ -95,7 +168,6 @@ RECONCILER
   server publish-provider-set --repo "$repo" --keys "$keys" --id jenkins \
     --provider-path "$jenkins_provider_path" --provider-sha256 "$jenkins_provider_sha" \
     --provider-timeout-ms 300000
-  fi
   printf '%s\n' "$platform" >/data/platform
   touch /data/ready
 fi

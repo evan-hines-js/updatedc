@@ -1014,8 +1014,22 @@ pub fn kill_pid(pid: u32) {
 /// process answers; a fully-gone one gives `ESRCH`). Used to assert a tree was reaped.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, 0) == 0
+    {
+        // `kill(pid, 0)` alone answers true for a ZOMBIE — a workload that crashed under an init
+        // that has not reaped it — which is precisely the state a "did the workload survive?"
+        // assertion must count as dead. `ps` reports state `Z` for a defunct process on both
+        // Linux and macOS, so signal reachability is only the first half of the check.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return false;
+        }
+        Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .map(|out| {
+                let state = String::from_utf8_lossy(&out.stdout);
+                out.status.success() && !state.trim_start().starts_with('Z')
+            })
+            .unwrap_or(false)
     }
     #[cfg(windows)]
     {

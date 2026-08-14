@@ -16,12 +16,22 @@ pub(crate) trait Store {
     fn active_release(&self) -> io::Result<Option<ReleaseId>>;
     fn is_rejected(&self, lineage: &RepositoryLineage, digest: &str) -> bool;
     fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()>;
-    fn write_journal(&mut self, tx: &Transaction) -> io::Result<()>;
-    fn clear_journal(&mut self) -> io::Result<()>;
+    /// Write the journal bytes, unconditionally. The implementation detail behind
+    /// [`Store::write_journal`] — call that instead: it is the one place the replace rule is
+    /// enforced, and a direct `record_journal` can silently bury another transaction's
+    /// compensation obligation.
+    fn record_journal(&mut self, tx: &Transaction) -> io::Result<()>;
+    /// Remove the journal file, unconditionally. The implementation detail behind
+    /// [`Store::clear_journal`] — call that instead: it is the one place the discard rule is
+    /// enforced, and a direct `remove_journal` bypasses the machine's compensation guarantee.
+    fn remove_journal(&mut self) -> io::Result<()>;
     fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()>;
     fn clear_install_journal(&mut self) -> io::Result<()>;
     fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()>;
-    fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()>;
+    /// Delete a rejection record, unconditionally. The implementation detail behind
+    /// [`Store::clear_rejection`] — call that instead: a rejection is never-retry evidence, and
+    /// only proof that the same bytes later succeeded may erase it.
+    fn remove_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()>;
     /// Re-hash the exact bytes a pointer is about to name. Ingest verifies a release once, but
     /// activation runs again on paths that never re-checked *these* bytes (a crash-recovered
     /// rollback activates the PREDECESSOR; drift restore re-points at the committed release), so
@@ -37,6 +47,67 @@ pub(crate) trait Store {
     fn activate(&mut self, release: &ReleaseId) -> io::Result<()> {
         self.verify_release(release)?;
         self.point_active(release)
+    }
+    /// Destroy the journal — but only when its transaction no longer owes the machine anything.
+    /// [`Transaction::may_discard`] is the rule: before `ActivateStarted` nothing was displaced,
+    /// and `Committed`/`RolledBack` have settled their debt (reaching `RolledBack` is what runs,
+    /// or durably abandons, the compensating `rollback` hook). Every other phase is a machine
+    /// whose displaced state still has an obligation on record, and discarding the record would
+    /// silently skip the compensation — so the refusal lives here, on the destroy operation
+    /// itself, where no future call site can forget it.
+    fn clear_journal(&mut self) -> io::Result<()> {
+        if let Some(tx) = self.journal()? {
+            if !tx.may_discard() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to discard a journal at {:?}: the transaction still owes a \
+                         commit or a settled rollback",
+                        tx.phase
+                    ),
+                ));
+            }
+        }
+        self.remove_journal()
+    }
+    /// Persist a transaction — but never over a DIFFERENT transaction that still owes the
+    /// machine anything. Replays and phase advances of the same transaction (same id) pass
+    /// freely; burying another unsettled journal is the same evidence destruction as
+    /// [`Store::clear_journal`] refuses, through a different door.
+    fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
+        if let Some(existing) = self.journal()? {
+            if existing.id != tx.id && !existing.may_discard() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to bury the journal of transaction {} at {:?} under \
+                         transaction {}: the existing transaction still owes a commit or a \
+                         settled rollback",
+                        existing.id, existing.phase, tx.id
+                    ),
+                ));
+            }
+        }
+        self.record_journal(tx)
+    }
+    /// Erase a rejection — but only with proof of settlement: the exact rejected bytes are the
+    /// currently committed head, so the machine itself has demonstrated they work. A rejection is
+    /// the durable reason a release is never retried; erasing one on any weaker evidence
+    /// re-admits bytes the machine judged bad.
+    fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+        let settled = matches!(
+            self.installed(),
+            Installed::Present(ref state)
+                if state.repository_lineage.rejection_key(&state.archive_sha256)
+                    == lineage.rejection_key(digest)
+        );
+        if !settled {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to erase a rejection for bytes that are not the committed head",
+            ));
+        }
+        self.remove_rejection(lineage, digest)
     }
 }
 
@@ -74,10 +145,10 @@ impl Store for FileStore {
     fn commit_installed(&mut self, state: &InstalledState) -> io::Result<()> {
         write_installed(&self.paths.installed, state)
     }
-    fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
+    fn record_journal(&mut self, tx: &Transaction) -> io::Result<()> {
         transaction::write(&self.paths.journal, tx)
     }
-    fn clear_journal(&mut self) -> io::Result<()> {
+    fn remove_journal(&mut self) -> io::Result<()> {
         transaction::clear(&self.paths.journal)
     }
     fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
@@ -89,7 +160,7 @@ impl Store for FileStore {
     fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
         self.rejected.reject(&lineage.rejection_key(digest))
     }
-    fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+    fn remove_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
         self.rejected.clear(&lineage.rejection_key(digest))
     }
     fn verify_release(&self, release: &ReleaseId) -> io::Result<()> {
@@ -140,11 +211,11 @@ impl Store for MemStore {
         self.installed = Some(state.clone());
         Ok(())
     }
-    fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
+    fn record_journal(&mut self, tx: &Transaction) -> io::Result<()> {
         self.journal = Some(tx.clone());
         Ok(())
     }
-    fn clear_journal(&mut self) -> io::Result<()> {
+    fn remove_journal(&mut self) -> io::Result<()> {
         self.journal = None;
         Ok(())
     }
@@ -163,7 +234,7 @@ impl Store for MemStore {
         self.rejected.insert(lineage.rejection_key(digest));
         Ok(())
     }
-    fn clear_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
+    fn remove_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
         self.rejected.remove(&lineage.rejection_key(digest));
         Ok(())
     }

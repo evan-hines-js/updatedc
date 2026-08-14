@@ -22,5 +22,5 @@ client_key = "/etc/agent-tls/tls.key"
 ca = "/etc/agent-tls/ca.crt"
 EOF
 
-exec launcher --state-dir "$launcher" --config /tmp/config.toml \
+exec /usr/local/bin/updated-launcher --state-dir "$launcher" --config /tmp/config.toml \
   --agent /usr/local/bin/updated-agent --ready-timeout 30 --confirm-timeout 2

@@ -95,7 +95,7 @@ pub struct GroupOutputReference {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DeploymentSpec {
     pub name: String,
     pub release_repository: ReleaseRepositorySpec,
@@ -113,7 +113,7 @@ pub struct DeploymentSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ReleaseRepositorySpec {
     pub metadata_url: String,
     pub targets_url: String,
@@ -123,7 +123,7 @@ pub struct ReleaseRepositorySpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeSpec {
     pub product: String,
     pub channel: String,
@@ -136,7 +136,7 @@ pub struct RuntimeSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SecretReferenceSpec {
     pub environment: String,
     /// Secret in the control-plane namespace, which the gateway serves to the assigned node at
@@ -151,14 +151,14 @@ pub struct SecretReferenceSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RepositoryLimitsSpec {
     pub metadata_limit: u64,
     pub target_limit: u64,
     pub transport_timeout_seconds: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageSpec {
     pub inactive_releases: usize,
     pub inactive_providers: usize,
@@ -167,7 +167,7 @@ pub struct StorageSpec {
     pub inactive_repository_caches: usize,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct TimeoutsSpec {
     pub check_interval_seconds: u64,
     pub health_grace_seconds: u64,
@@ -179,7 +179,6 @@ pub struct TimeoutsSpec {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct TargetSpec {
     pub path: String,
     pub sha256: String,
@@ -1127,6 +1126,45 @@ pub(crate) async fn read_object_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The API server refuses a CRD whose schema carries `additionalProperties` beside
+    /// `properties` — closedness for custom resources comes from structural pruning, never from
+    /// serde's `deny_unknown_fields` (which schemars would translate into exactly that illegal
+    /// pair). This walks every generated CRD schema and enforces the server's own rule, so the
+    /// mistake fails `cargo test` instead of the first `kubectl apply`.
+    #[test]
+    fn crd_schemas_are_structural() {
+        use kube::CustomResourceExt;
+
+        fn assert_structural(value: &serde_json::Value, path: &str) {
+            if let Some(object) = value.as_object() {
+                assert!(
+                    !(object.contains_key("properties")
+                        && object.contains_key("additionalProperties")),
+                    "{path}: additionalProperties beside properties is refused by the API server"
+                );
+                for (key, child) in object {
+                    assert_structural(child, &format!("{path}.{key}"));
+                }
+            } else if let Some(items) = value.as_array() {
+                for (index, child) in items.iter().enumerate() {
+                    assert_structural(child, &format!("{path}[{index}]"));
+                }
+            }
+        }
+
+        for crd in [
+            UpdateGroup::crd(),
+            UpdateGroupSet::crd(),
+            UpdateAgent::crd(),
+            UpdateRepository::crd(),
+            UpdateSubscription::crd(),
+        ] {
+            let name = crd.metadata.name.clone().unwrap_or_default();
+            let value = serde_json::to_value(&crd).expect("a CRD serializes");
+            assert_structural(&value, &name);
+        }
+    }
 
     fn group_set(max_concurrent: Option<u32>) -> UpdateGroupSetSpec {
         UpdateGroupSetSpec {

@@ -70,6 +70,10 @@ kubectl_log_contains() {
 }
 trap finish EXIT
 cleanup
+# The run provisions everything from scratch, so its working directory starts empty too: keys,
+# CA material and rendered manifests left by a previous run are not inputs to this one, and
+# `server init` fails closed rather than reuse a signing key it finds already there.
+rm -rf "$WORK"
 mkdir -p "$WORK"
 
 cat >"$WORK/kind.yaml" <<'YAML'
@@ -178,6 +182,29 @@ YAML
 kubectl -n updated-system wait --for=condition=Ready certificate/gateway-tls --timeout=120s
 kubectl -n updated-system wait --for=condition=Ready certificate/agent-tls --timeout=120s
 kubectl -n updated-system wait --for=condition=Ready certificate/intruder-tls --timeout=120s
+
+# The fleet CA's own key, used exactly where an operator's out-of-band provisioning would use it:
+# to issue a node's steady-state leaf without the gateway. One issuing function, so the offline
+# node's preplaced identity and the rotation test's short-lived replacement cannot describe the
+# node differently — a node's identity is `CN=<agent>` plus its SPIFFE node SAN, and nothing else.
+FLEET_CA="$WORK/fleet-ca"
+mkdir -p "$FLEET_CA"
+kubectl -n updated-system get secret fleet-ca -o jsonpath='{.data.tls\.crt}' \
+  | openssl base64 -d -A >"$FLEET_CA/ca.crt"
+kubectl -n updated-system get secret fleet-ca -o jsonpath='{.data.tls\.key}' \
+  | openssl base64 -d -A >"$FLEET_CA/ca.key"
+sign_node_leaf() {
+  local name=$1 key=$2 out=$3 days=$4
+  openssl req -new -key "$key" -subj "/CN=$name" -out "$out.csr"
+  cat >"$out.cnf" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=clientAuth
+subjectAltName=URI:spiffe://updated.fleet/scope/default/node/$name
+EOF
+  openssl x509 -req -in "$out.csr" -CA "$FLEET_CA/ca.crt" -CAkey "$FLEET_CA/ca.key" \
+    -CAcreateserial -days "$days" -extfile "$out.cnf" -out "$out"
+}
 
 docker build -f crates/updatec/Dockerfile.e2e -t updatec-e2e:kind .
 kind load docker-image --name "$NAME" updatec-e2e:kind
@@ -315,10 +342,12 @@ if ! kubectl_log_contains deployment/updatec-controller 'desired state reconcile
 fi
 echo "initial routing generation published"
 
-# Exercise the operator-driven enrollment route end to end. The controller turns a manual
-# UpdateAgent into an immutable signed enrollment Secret. The init container places only that
-# trust artifact; the agent then performs the same repository-backed cold install used by
-# every other fresh node.
+# Exercise the offline provisioning route end to end. The controller turns a manual UpdateAgent
+# into an immutable signed enrollment Secret. A `manual` identity is deliberately never completable
+# over the shared fleet bootstrap certificate — `/enroll` refuses it — so the operator provisions
+# BOTH halves out of band: the signed bundle (routing, assignment, initial config) and the node's
+# own steady-state leaf, issued here from the fleet CA exactly as an offline PKI would. The agent
+# then performs the same repository-backed cold install every other fresh node performs.
 cat <<'YAML' | kubectl apply -f -
 apiVersion: updated.dev/v1alpha1
 kind: UpdateAgent
@@ -343,6 +372,13 @@ if [[ -z "${MANUAL_ENROLLMENT_SECRET:-}" ]]; then
   kubectl -n updated-system get updateagent manual-offline -o yaml >&2 || true
   exit 1
 fi
+MANUAL_IDENTITY="$WORK/manual-offline-identity"
+mkdir -p "$MANUAL_IDENTITY"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -out "$MANUAL_IDENTITY/agent.key" 2>/dev/null
+sign_node_leaf manual-offline "$MANUAL_IDENTITY/agent.key" "$MANUAL_IDENTITY/agent.crt" 90
+kubectl -n updated-system create secret generic manual-offline-identity \
+  --from-file="$MANUAL_IDENTITY/agent.crt" --from-file="$MANUAL_IDENTITY/agent.key"
 cat >"$WORK/manual-offline.yaml" <<YAML
 apiVersion: v1
 kind: ConfigMap
@@ -351,9 +387,9 @@ data:
   config.toml: |
     [enrollment]
     # The preplaced signed bundle gives this node its routing/assignment/initial config for a
-    # network-free first start, so it never fetches the bundle over the network. Identity is
-    # separate: it still mints its per-node steady-state leaf at /enroll the first time it reaches
-    # the real gateway (the node generates its own key + CSR — the key never leaves the node).
+    # network-free first start, and the preplaced leaf gives it its steady-state identity, so it
+    # reaches the gateway only for the repository content its assignment names. The shared fleet
+    # certificate below authenticates nothing for this node — a manual identity never enrolls.
     url = "https://updatec-gateway"
     name = "manual-offline"
     client_cert = "/etc/agent-tls/tls.crt"
@@ -378,9 +414,13 @@ spec:
         - |
           mkdir -p /var/lib/updated/launcher
           cp /signed/enrollment.json /var/lib/updated/launcher/enrollment.json
+          cp /identity/agent.crt /var/lib/updated/launcher/agent.crt
+          cp /identity/agent.key /var/lib/updated/launcher/agent.key
+          chmod 0600 /var/lib/updated/launcher/agent.key
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
         - {name: enrollment, mountPath: /signed, readOnly: true}
+        - {name: identity, mountPath: /identity, readOnly: true}
   containers:
     - name: agent
       image: updatec-e2e:kind
@@ -405,23 +445,37 @@ spec:
     - {name: state, emptyDir: {}}
     - name: enrollment
       secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
+    - {name: identity, secret: {secretName: manual-offline-identity}}
     - name: launcher-config
       configMap: {name: manual-offline-config}
     - {name: agent-tls, secret: {secretName: agent-tls}}
 YAML
 kubectl apply -f "$WORK/manual-offline.yaml"
 kubectl -n updated-system wait pod/manual-offline --for=condition=Ready --timeout=120s
-MANUAL_VERSION="$(kubectl -n updated-system exec manual-offline -c agent -- \
-  curl -fsS http://127.0.0.1:8080/version)"
+# The workload belongs to the release's own reconciler, so the proof it converged is the
+# application answering — reached with a bounded wait rather than assumed to be up the instant the
+# container reports ready.
+MANUAL_VERSION=""
+for attempt in {1..60}; do
+  MANUAL_VERSION="$(kubectl -n updated-system exec manual-offline -c agent -- \
+    curl -fsS --max-time 2 http://127.0.0.1:8080/version 2>/dev/null || true)"
+  [[ "$MANUAL_VERSION" == 1.0.0 ]] && break
+  sleep 2
+done
 [[ "$MANUAL_VERSION" == 1.0.0 ]] || {
-  echo "FAIL: pre-enrolled manual agent launched version '$MANUAL_VERSION', expected 1.0.0" >&2
+  echo "FAIL: offline-provisioned manual agent runs version '$MANUAL_VERSION', expected 1.0.0" >&2
+  kubectl -n updated-system logs manual-offline -c agent --tail=100 >&2 || true
   exit 1
 }
-kubectl_log_contains manual-offline 'started managed application pid' -c agent
-echo "manual CRD export enrolled, cold-installed, and launched 1.0.0"
+kubectl_log_contains manual-offline \
+  'cold-installed application 1.0.0 from the first trusted assignment' -c agent || {
+  echo "FAIL: manual agent did not cold-install from its preplaced enrollment bundle" >&2
+  exit 1
+}
+echo "manual CRD export cold-installed offline and its reconciler started 1.0.0"
 
-# A malformed enrollment artifact is terminal: it must never fall back to the URL/key or launch
-# an application. `timeout` bounds the launcher's intentional supervision retries so Kubernetes
+# A malformed enrollment artifact is terminal: it must never fall back to the URL/key or install
+# an application. `timeout` bounds the launcher's intentional relaunch retries so Kubernetes
 # records an observable failed container for this negative test.
 cat >"$WORK/manual-bad-enrollment.yaml" <<YAML
 apiVersion: v1
@@ -472,8 +526,8 @@ done
 }
 BAD_LOG="$(kubectl -n updated-system logs manual-bad-enrollment -c agent)"
 [[ "$BAD_LOG" == *"resolving signed managed configuration"* ]]
-[[ "$BAD_LOG" != *"started application pid"* ]]
-echo "corrupted installer enrollment failed closed before application launch"
+[[ "$BAD_LOG" != *"cold-installed application"* ]]
+echo "corrupted installer enrollment failed closed before any application was installed"
 
 # Invalid online credentials are also fail-closed and may not leave registration state. The gateway
 # creates the UpdateAgent under the name the node self-asserts in its config file, so that is the
@@ -599,7 +653,7 @@ spec:
     - metadata: {name: state}
       spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
 YAML
-echo "waiting for all five real agent towers to reach their assigned versions"
+echo "waiting for all five real agent nodes to reach their assigned versions"
 kubectl -n updated-system rollout status statefulset/agent --timeout=240s
 # The `UpdateAgent` name pod `agent-<ordinal>` enrolls under. Read from the single definition of
 # that derivation (`resource_name`, crates/updatec-demo/src/setup.rs) — the same one the pods
@@ -640,10 +694,11 @@ done
 echo "all five empty agents enrolled online and cold-installed the network assignment"
 
 # Exercise certificate renewal through the live gateway without restarting the pod, container, or
-# application. Replace agent-4's leaf with a fleet-CA-signed one-day leaf for the SAME durable key,
-# terminate only the agent, and let the launcher adopt the still-running application. The new
-# agent sees the short lifetime immediately, calls /renew with that current identity, installs
-# the replacement atomically, and exits once so the launcher rebuilds every authenticated client.
+# workload. Replace agent-4's leaf with a fleet-CA-signed one-day leaf for the SAME durable key and
+# terminate only the agent; the workload belongs to the release's reconciler, so nothing in the
+# node stack can disturb it. The new agent sees the short lifetime immediately, calls /renew with
+# that current identity, installs the replacement atomically, and exits once so the launcher
+# rebuilds every authenticated client.
 ROTATION_AGENT=agent-4
 ROTATION_RESOURCE="${AGENT_RESOURCES[4]}"
 ROTATION_STATE=/var/lib/updated/launcher
@@ -653,21 +708,7 @@ kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
   cat "$ROTATION_STATE/agent.key" >"$ROTATION_DIR/agent.key"
 kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
   cat "$ROTATION_STATE/agent.crt" >"$ROTATION_DIR/original.crt"
-kubectl -n updated-system get secret fleet-ca -o jsonpath='{.data.tls\.crt}' \
-  | openssl base64 -d -A >"$ROTATION_DIR/ca.crt"
-kubectl -n updated-system get secret fleet-ca -o jsonpath='{.data.tls\.key}' \
-  | openssl base64 -d -A >"$ROTATION_DIR/ca.key"
-openssl req -new -key "$ROTATION_DIR/agent.key" \
-  -subj "/CN=$ROTATION_RESOURCE" -out "$ROTATION_DIR/agent.csr"
-cat >"$ROTATION_DIR/extensions.cnf" <<EOF
-basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature
-extendedKeyUsage=clientAuth
-subjectAltName=URI:spiffe://updated.fleet/scope/default/node/$ROTATION_RESOURCE
-EOF
-openssl x509 -req -in "$ROTATION_DIR/agent.csr" \
-  -CA "$ROTATION_DIR/ca.crt" -CAkey "$ROTATION_DIR/ca.key" -CAcreateserial \
-  -days 1 -extfile "$ROTATION_DIR/extensions.cnf" -out "$ROTATION_DIR/short.crt"
+sign_node_leaf "$ROTATION_RESOURCE" "$ROTATION_DIR/agent.key" "$ROTATION_DIR/short.crt" 1
 
 pod_uid_before="$(kubectl -n updated-system get pod "$ROTATION_AGENT" -o jsonpath='{.metadata.uid}')"
 restart_before="$(kubectl -n updated-system get pod "$ROTATION_AGENT" \
@@ -676,6 +717,9 @@ key_before="$(sha256sum "$ROTATION_DIR/agent.key" | awk '{print $1}')"
 original_cert="$(sha256sum "$ROTATION_DIR/original.crt" | awk '{print $1}')"
 short_cert="$(sha256sum "$ROTATION_DIR/short.crt" | awk '{print $1}')"
 [[ "$short_cert" != "$original_cert" ]]
+# `/proc/<pid>/comm` is the kernel's 15-character name, so the process this looks for is named by
+# exactly what the kernel records: the agent runs as `updated-agent`, the workload the release's
+# reconciler started runs as its entrypoint, `app`.
 process_pid() {
   local process="$1"
   kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- sh -ec '
@@ -687,7 +731,7 @@ process_pid() {
     exit 1
   ' sh "$process"
 }
-agent_before="$(process_pid agent)"
+agent_before="$(process_pid updated-agent)"
 application_before="$(process_pid app)"
 
 cat <<'YAML' | kubectl apply -f -
@@ -733,7 +777,7 @@ for attempt in $(seq 1 90); do
   kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
     cat "$ROTATION_STATE/agent.crt" >"$ROTATION_DIR/renewed.crt"
   renewed_cert="$(sha256sum "$ROTATION_DIR/renewed.crt" | awk '{print $1}')"
-  agent_after="$(process_pid agent 2>/dev/null || true)"
+  agent_after="$(process_pid updated-agent 2>/dev/null || true)"
   if [[ "$renewed_cert" != "$short_cert" && -n "$agent_after" \
       && "$agent_after" != "$agent_before" ]]; then
     renewed=true
@@ -834,8 +878,8 @@ spec:
                 echo "$agent: expected $expected, got ${actual:-unreachable}" >&2
                 return 1
               }
-              check agent-0 2.0.0 jenkins
-              check agent-1 2.0.0 jenkins
+              check agent-0 2.0.0 stateful
+              check agent-1 2.0.0 stateful
               check agent-2 3.0.0 sampleapp
               check agent-3 3.0.0 sampleapp
               check agent-4 1.0.0 sampleapp
@@ -844,34 +888,53 @@ YAML
 kubectl -n updated-system wait --for=condition=complete job/verify-agent-versions --timeout=150s
 kubectl -n updated-system logs job/verify-agent-versions
 
-# A real application crash is not a planned drain. The launcher marks the tower
-# failed, exits with the application, and lets Kubernetes restart the container.
-# The pod and its emptyDir survive that container restart, so the new launcher must
-# verify and relaunch the same committed bundle before readiness returns.
+# A workload crash is the release's problem, not the node stack's: the agent runs packages and
+# holds no handle on the process, so a crashed application must leave the agent, the container and
+# the pod exactly where they were. Recovery is the reconciler's `apply` — here through the boot
+# converge the launcher's next agent runs — and it must bring the SAME committed release back.
 restart_before="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+agent_before="$(process_pid updated-agent)"
 kubectl -n updated-system exec agent-4 -c agent -- \
   sh -c 'curl -fsS http://127.0.0.1:8080/crash >/dev/null || true' || true
-restarted=false
-for attempt in $(seq 1 60); do
-  restart_after="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-  if [ "$restart_after" -gt "$restart_before" ]; then
-    restarted=true
+crashed=false
+for attempt in $(seq 1 30); do
+  if ! kubectl -n updated-system exec agent-4 -c agent -- \
+    curl -fsS --max-time 2 http://127.0.0.1:8080/version >/dev/null 2>&1; then
+    crashed=true
     break
   fi
   sleep 1
 done
-[[ "$restarted" == true ]] || {
-  echo "FAIL: Kubernetes did not restart agent-4 after its managed application crashed" >&2
-  kubectl -n updated-system logs agent-4 -c agent --previous >&2 || true
+[[ "$crashed" == true ]] || {
+  echo "FAIL: agent-4's application kept answering after it was told to crash" >&2
+  exit 1
+}
+restart_after="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+[[ "$restart_after" == "$restart_before" ]] || {
+  echo "FAIL: agent-4's container restarted over a workload crash the agent does not own" >&2
+  exit 1
+}
+[[ "$(process_pid updated-agent)" == "$agent_before" ]] || {
+  echo "FAIL: agent-4's agent process died with the workload it does not own" >&2
+  exit 1
+}
+# Restart only the agent. Its boot converge runs the committed release's own `apply`, and the
+# reconciler — the one thing that owns this process — starts the workload again.
+kubectl -n updated-system exec agent-4 -c agent -- kill -TERM "$agent_before"
+recovered_version=""
+for attempt in $(seq 1 90); do
+  recovered_version="$(kubectl -n updated-system exec agent-4 -c agent -- \
+    curl -fsS --max-time 2 http://127.0.0.1:8080/version 2>/dev/null || true)"
+  [[ -n "$recovered_version" ]] && break
+  sleep 2
+done
+[[ "$recovered_version" == 1.0.0 ]] || {
+  echo "FAIL: agent-4 recovered as '$recovered_version', expected committed 1.0.0" >&2
+  kubectl -n updated-system logs agent-4 -c agent --tail=100 >&2 || true
   exit 1
 }
 kubectl -n updated-system wait --for=condition=ready pod/agent-4 --timeout=120s
-recovered_version="$(kubectl -n updated-system exec agent-4 -c agent -- curl -fsS http://127.0.0.1:8080/version)"
-[[ "$recovered_version" == 1.0.0 ]] || {
-  echo "FAIL: agent-4 recovered as '$recovered_version', expected committed 1.0.0" >&2
-  exit 1
-}
-echo "managed application crash failed the launcher tower; Kubernetes restarted it and readiness recovered"
+echo "a workload crash left the node stack untouched; the boot converge re-applied committed 1.0.0"
 
 if (( FUZZ_ROUNDS > 0 )); then
 cat <<'YAML' | kubectl apply -f -
@@ -1095,21 +1158,33 @@ corrupt_sha="$(app_sha 18.0.0)"
 for role in edge batch default; do
   replace_group_deployment "$role" 18.0.0 "$corrupt_sha"
 done
-sleep 8
-verify_fleet verify-fuzz-rollback "$expected"
+# Wait for the rejection itself, node by node, rather than sampling the logs once after a fixed
+# pause: nodes are admitted to a deployment in the control plane's own order, so "has this node
+# rejected these bytes yet" is a durable fact that arrives when it arrives. Only once every node
+# has recorded it is the fleet's exact predecessor state a meaningful assertion.
 for index in 0 1 2 3 4; do
-  # Do not pipe `kubectl logs` into `grep -q` under pipefail. Once grep finds
-  # the line it closes the pipe; a sufficiently large log then gives kubectl
-  # SIGPIPE and turns a successful assertion into a false failure. Capture both
-  # restart generations because rejection recovery may itself roll the tower.
-  if ! kubectl_log_contains "agent-$index" \
-      'recovery: rejected 18.0.0 after failed activation' -c agent \
-    && ! kubectl_log_contains "agent-$index" \
-      'recovery: rejected 18.0.0 after failed activation' -c agent --previous; then
+  rejected=false
+  for attempt in $(seq 1 90); do
+    # Do not pipe `kubectl logs` into `grep -q` under pipefail. Once grep finds
+    # the line it closes the pipe; a sufficiently large log then gives kubectl
+    # SIGPIPE and turns a successful assertion into a false failure. Capture both
+    # restart generations because rejection recovery may itself restart the container.
+    if kubectl_log_contains "agent-$index" \
+        'recovery: rejected 18.0.0 after failed activation' -c agent \
+      || kubectl_log_contains "agent-$index" \
+        'recovery: rejected 18.0.0 after failed activation' -c agent --previous; then
+      rejected=true
+      break
+    fi
+    sleep 2
+  done
+  [[ "$rejected" == true ]] || {
     echo "FAIL: agent-$index did not record rejection of corrupt 18.0.0" >&2
+    kubectl -n updated-system logs "agent-$index" -c agent --tail=100 >&2 || true
     exit 1
-  fi
+  }
 done
+verify_fleet verify-fuzz-rollback "$expected"
 echo "all agents rejected 18.0.0 and retained their exact predecessors"
 
 for recovery_version in 19.0.0 20.0.0; do
@@ -1124,7 +1199,7 @@ for recovery_version in 19.0.0 20.0.0; do
   done
   verify_fleet "verify-fuzz-recovery-${recovery_version%%.*}" "$recovery_expected"
 done
-echo "fleet recovered through sampleapp 19.0.0 -> Jenkins-shaped 20.0.0"
+echo "fleet recovered through sampleapp 19.0.0 -> stateful-like 20.0.0"
 echo "fleet observer transitions during chaos:"
 kubectl -n updated-system logs -l job-name=observe-fleet-chaos --prefix --all-containers=true
 kubectl -n updated-system delete job observe-fleet-chaos --wait=true >/dev/null
