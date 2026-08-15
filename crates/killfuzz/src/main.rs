@@ -402,8 +402,14 @@ fn run() -> R {
             ));
         }
 
-        // SIGKILL the whole tree with the broken transaction still journaled.
+        // SIGKILL the whole tree with the broken transaction still journaled, then reap the
+        // straggler workload. The hook-managed workload lives in a session of its own, so the
+        // group kill never reaches it: whether one is still serving here depends on where the
+        // broken activation was interrupted (its drain stops the predecessor's workload before the
+        // entrypoint it cannot exec), and a round that only passes when the kill lands after the
+        // drain is a race, not a test.
         drop(stack);
+        reap(&dir);
         if !wait_until(20, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(format!(
@@ -442,7 +448,11 @@ fn run() -> R {
             || stack.log_contains(&format!("activation of {broken_v} never landed"))
             || stack.log_contains(&format!("completing rollback from {broken_v}"));
         let log = stack.captured_log();
+        // The settle boot converged onto a healthy release, so its hook started a workload — which
+        // outlives the stack's process group by construction. Reap it, exactly as every phase's
+        // settle boot does, or the next trial's stack meets the service address already bound.
         drop(stack);
+        reap(&dir);
         if !live || !settled {
             drop(server);
             return fail(format!(

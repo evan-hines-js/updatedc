@@ -182,11 +182,13 @@ exit 0
         --output (Join-Path $launcherState 'enrollment.json')
     if ($LASTEXITCODE) { throw 'exporting enrollment bundle failed' }
     # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never
-    # calls /enroll — but the config must still be a complete, valid EnrollmentBootstrap. The name
-    # and cert paths are never read in this offline path; they only satisfy config validation.
+    # calls /enroll — but the config must still be a complete, valid EnrollmentBootstrap. The name,
+    # URL and cert paths are never read in this offline path; they only satisfy config validation,
+    # which requires HTTPS (the gateway is always TLS). Nothing dials it — this test's repository is
+    # the plain-HTTP dev CDN above, reached through the signed routing in enrollment.json.
     $configText = @"
 [enrollment]
-url = 'http://127.0.0.1:$repoPort/enroll'
+url = 'https://127.0.0.1:$repoPort/enroll'
 name = 'agent'
 client_cert = 'unused-preplaced.crt'
 client_key = 'unused-preplaced.key'

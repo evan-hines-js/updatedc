@@ -192,11 +192,13 @@ fn stage_published(scratch: &Scratch) -> Result<(std::fs::File, PathBuf)> {
 /// rewritten afterwards, so the damage is permanent. Callers fsync the destination directory once
 /// they have committed every file of a generation.
 ///
+/// The fsync goes through `foundation::durable::sync_file`, which opens the staged file for
+/// writing: `File::open` alone yields a read-only handle, which Windows refuses to flush
+/// (`ERROR_ACCESS_DENIED`).
+///
 /// Blocking: run it under [`blocking`], never directly on a runtime worker.
 fn commit_published(staged: &Path, destination: &Path) -> Result<()> {
-    std::fs::File::open(staged)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| err("syncing published file", e))?;
+    foundation::durable::sync_file(staged).map_err(|e| err("syncing published file", e))?;
     foundation::durable::replace(staged, destination)
         .map_err(|e| err("committing published file", e))
 }

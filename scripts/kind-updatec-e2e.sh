@@ -1158,34 +1158,84 @@ corrupt_sha="$(app_sha 18.0.0)"
 for role in edge batch default; do
   replace_group_deployment "$role" 18.0.0 "$corrupt_sha"
 done
-# Wait for the rejection itself, node by node, rather than sampling the logs once after a fixed
-# pause: nodes are admitted to a deployment in the control plane's own order, so "has this node
-# rejected these bytes yet" is a durable fact that arrives when it arrives. Only once every node
-# has recorded it is the fleet's exact predecessor state a meaningful assertion.
+# Wait for the rejection itself rather than sampling the logs once after a fixed pause: nodes are
+# admitted to a deployment in the control plane's own order, so "has this node rejected these bytes
+# yet" is a durable fact that arrives when it arrives.
+#
+# The unit of the assertion is the GROUP, not the node, because containment is the behaviour under
+# test. One node's rejection is proof enough to halt the deployment (`maxRegressions` defaults to
+# one), and a node that rejected keeps its group's single `maxUnavailable` slot rather than
+# releasing it, so the group's remaining nodes are deliberately never handed the corrupt bytes and
+# can have no record of them. Requiring every node to hold one would be requiring the bad release to
+# reach every node — precisely what the regression response exists to prevent. The fleet e2e states
+# the same rule (crates/updatec-e2e/src/chaos.rs).
+#
+# Do not pipe `kubectl logs` into `grep -q` under pipefail. Once grep finds the line it closes the
+# pipe; a sufficiently large log then gives kubectl SIGPIPE and turns a successful assertion into a
+# false failure. Both restart generations are read because rejection recovery may itself restart
+# the container.
+rejected_corrupt() {
+  kubectl_log_contains "agent-$1" \
+      'recovery: rejected 18.0.0 after failed activation' -c agent \
+    || kubectl_log_contains "agent-$1" \
+      'recovery: rejected 18.0.0 after failed activation' -c agent --previous
+}
+
+# Read the roles back out of the API rather than from the mutation loop's plan, so the oracle for
+# "which nodes share a rollout slot" is the state the control plane actually acted on.
+declare -a role_of=()
 for index in 0 1 2 3 4; do
-  rejected=false
+  applied_role="$(kubectl -n updated-system get updateagent "${AGENT_RESOURCES[index]}" \
+    -o jsonpath='{.spec.labels.updated\.dev/role}')"
+  role_of[index]="${applied_role:-default}"
+done
+
+declare -a rejector_of=()
+for role in edge batch default; do
+  members=()
+  for index in 0 1 2 3 4; do
+    if [[ "${role_of[index]}" == "$role" ]]; then
+      members+=("$index")
+    fi
+  done
+  [[ ${#members[@]} -gt 0 ]] || continue
+  rejector=""
   for attempt in $(seq 1 90); do
-    # Do not pipe `kubectl logs` into `grep -q` under pipefail. Once grep finds
-    # the line it closes the pipe; a sufficiently large log then gives kubectl
-    # SIGPIPE and turns a successful assertion into a false failure. Capture both
-    # restart generations because rejection recovery may itself restart the container.
-    if kubectl_log_contains "agent-$index" \
-        'recovery: rejected 18.0.0 after failed activation' -c agent \
-      || kubectl_log_contains "agent-$index" \
-        'recovery: rejected 18.0.0 after failed activation' -c agent --previous; then
-      rejected=true
+    for index in "${members[@]}"; do
+      if rejected_corrupt "$index"; then
+        rejector="$index"
+        break
+      fi
+    done
+    if [[ -n "$rejector" ]]; then
       break
     fi
     sleep 2
   done
-  [[ "$rejected" == true ]] || {
-    echo "FAIL: agent-$index did not record rejection of corrupt 18.0.0" >&2
-    kubectl -n updated-system logs "agent-$index" -c agent --tail=100 >&2 || true
+  [[ -n "$rejector" ]] || {
+    echo "FAIL: no $role node recorded rejection of corrupt 18.0.0 (members: ${members[*]})" >&2
+    for index in "${members[@]}"; do
+      kubectl -n updated-system logs "agent-$index" -c agent --tail=100 >&2 || true
+    done
     exit 1
   }
+  rejector_of[$rejector]=1
+  echo "$role: agent-$rejector rejected corrupt 18.0.0"
 done
 verify_fleet verify-fuzz-rollback "$expected"
-echo "all agents rejected 18.0.0 and retained their exact predecessors"
+# Now that the whole fleet has settled back on its predecessors, no OTHER node may hold a record of
+# the corrupt bytes: the halt has had every chance to fail to contain them, and did not.
+for index in 0 1 2 3 4; do
+  if [[ -n "${rejector_of[index]:-}" ]]; then
+    continue
+  fi
+  if rejected_corrupt "$index"; then
+    echo "FAIL: corrupt 18.0.0 also reached agent-$index (${role_of[index]}); the halt did not \
+contain it to the node that proved the regression" >&2
+    exit 1
+  fi
+done
+echo "one node per group rejected 18.0.0, the halt kept it from the rest, and every node retained its exact predecessor"
 
 for recovery_version in 19.0.0 20.0.0; do
   recovery_sha="$(app_sha "$recovery_version")"
