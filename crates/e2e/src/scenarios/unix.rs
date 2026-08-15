@@ -100,14 +100,24 @@ pub(crate) fn lifecycle_healthcheck_gates_readiness(ctx: &Ctx) -> R {
     if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         return fail("the lifecycle-gated deployment never upgraded to v2.0.0");
     }
-    let observations = fixture::operations(&fixture::root(&dir));
-    let gates: Vec<&str> = observations
-        .iter()
-        .filter(|invocation| invocation.operation == "healthcheck")
-        .map(|invocation| invocation.id.as_str())
-        .collect();
-    let gated_install = gates.contains(&attempt::BOOT);
-    let gated_upgrade = gates.iter().any(|id| !attempt::is_reserved(id));
+    // The upgrade's readiness gate runs AFTER its workload is already serving 2.0.0: `apply` starts
+    // the candidate, and only then does the transaction's `healthcheck` run under the attempt id.
+    // So the version probe above returns strictly before the gate is recorded, and reading the
+    // receipt once only ever passed by out-racing that window — which on a slower machine it loses.
+    // Poll for both gates instead; the deadline is what makes "never gated" mean never.
+    let mut gates: Vec<String> = Vec::new();
+    let mut gated_install = false;
+    let mut gated_upgrade = false;
+    wait_until(EVENT_TIMEOUT, || {
+        gates = fixture::operations(&fixture::root(&dir))
+            .into_iter()
+            .filter(|invocation| invocation.operation == "healthcheck")
+            .map(|invocation| invocation.id)
+            .collect();
+        gated_install = gates.iter().any(|id| id == attempt::BOOT);
+        gated_upgrade = gates.iter().any(|id| !attempt::is_reserved(id));
+        gated_install && gated_upgrade
+    });
     if !gated_install {
         return fail(format!(
             "the reconciler's healthcheck operation never gated the first install: {gates:?}"

@@ -1078,9 +1078,12 @@ pub fn make_owner_writable(path: &Path) -> R {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::PermissionsExt;
-        const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
-        permissions.set_attributes(permissions.attributes() & !FILE_ATTRIBUTE_READONLY);
+        // `Permissions::set_readonly(false)` IS the clear of `FILE_ATTRIBUTE_READONLY` on Windows,
+        // and it is stable — the `attributes()`/`set_attributes()` pair that reads the same bit
+        // directly is still unstable (`windows_permissions_ext`), so reaching for it does not
+        // compile on stable at all. Windows has no group/other bits to widen, so this grants
+        // exactly the owner write the Unix arm above does and nothing more.
+        permissions.set_readonly(false);
     }
     std::fs::set_permissions(path, permissions).map_err(str_err)
 }

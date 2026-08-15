@@ -10,6 +10,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${UPDATED_HAPROXY_E2E_DIR:-$ROOT/target/haproxy-e2e}"
 REPO="$WORK/repo"
 KEYS="$WORK/keys"
+CERTS="$WORK/certs"
 INSTALL="$WORK/install"
 BIN="$WORK/bin"
 CONFIG="$WORK/config.toml"
@@ -121,8 +122,8 @@ assign() {
   local version="$1" app_path="products/app/stable/$1/linux-x86_64/app" set_path="provider-sets/default.json"
   "$BIN/server" publish-assignment --repo "$REPO" --keys "$KEYS" \
     --name assignments/agents/agent.json --deployment "app-$version" \
-    --metadata-url "http://127.0.0.1:$REPO_PORT/metadata/" \
-    --targets-url "http://127.0.0.1:$REPO_PORT/targets/" \
+    --metadata-url "https://127.0.0.1:$REPO_PORT/metadata/" \
+    --targets-url "https://127.0.0.1:$REPO_PORT/targets/" \
     --application-path "$app_path" --application-sha256 "$(target_sha256 "$app_path")" \
     --provider-set-path "$set_path" --provider-set-sha256 "$(target_sha256 "$set_path")" \
     --runtime "$RUNTIME"
@@ -139,6 +140,10 @@ cp "$ROOT/scripts/haproxy/lib.sh" "$BIN/lib.sh"
 chmod 0755 "$BIN/lifecycle"
 
 "$BIN/server" init --repo "$REPO" --keys "$KEYS"
+# The repository listener is the gateway's shape: mTLS is mandatory, so mint the fleet CA, its
+# server cert (loopback SANs cover https://127.0.0.1:$REPO_PORT) and the client cert the node
+# presents. There is no plain-HTTP CDN to fall back to.
+"$BIN/server" gen-certs --dir "$CERTS" --san 127.0.0.1 --san localhost
 mkdir -p "$WORK/adapter/bin"
 cp "$ROOT/scripts/haproxy/lifecycle" "$WORK/adapter/bin/lifecycle"
 cp "$ROOT/scripts/haproxy/lib.sh" "$WORK/adapter/bin/lib.sh"
@@ -167,25 +172,30 @@ cat >"$RUNTIME" <<EOF
 EOF
 publish 1.0.0 "$WORK/bundle-1.0.0"
 "$BIN/server" export-enrollment --repo "$REPO" --assignment assignments/agents/agent.json \
-  --agent-id agent --routing-base-url "http://127.0.0.1:$REPO_PORT/" \
+  --agent-id agent --routing-base-url "https://127.0.0.1:$REPO_PORT/" \
   --output "$WORK/launcher-state/enrollment.json"
 # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never calls
-# /enroll — but the node config must still be a complete, valid EnrollmentBootstrap. The name, URL
-# and cert paths are never read in this offline path; they only satisfy config validation, which
-# requires the enrollment URL to be HTTPS (the gateway is always TLS). Nothing dials it — the
-# repository this test serves is the plain-HTTP dev CDN at $REPO_PORT, reached through the signed
-# routing in enrollment.json above.
+# /enroll — but only because its steady-state identity is preplaced too. A preplaced bundle whose
+# routing base URL is remote makes the node mint a per-node leaf at `/enroll` on first boot unless
+# `agent.crt`/`agent.key` already exist in the state dir, and that mint reads the config's cert
+# paths for real. Seed them with the fleet client cert, exactly as the installer would: the
+# repository verifies it against the same CA, and this test needs no per-node attribution.
+cp "$CERTS/client.crt" "$WORK/launcher-state/agent.crt"
+cp "$CERTS/client.key" "$WORK/launcher-state/agent.key"
+# Every path here is loaded, not decorative: the CA and client cert are the identity the node
+# presents to the mTLS repository on every metadata and target fetch.
 cat >"$CONFIG" <<EOF
 [enrollment]
 url = "https://127.0.0.1:$REPO_PORT/"
 name = "agent"
-client_cert = "unused-preplaced.crt"
-client_key = "unused-preplaced.key"
-ca = "unused-preplaced-ca.crt"
+client_cert = "$CERTS/client.crt"
+client_key = "$CERTS/client.key"
+ca = "$CERTS/ca.crt"
 EOF
 
 : >"$STACK_LOG"; : >"$REPO_LOG"; : >"$TRAFFIC_LOG"
-"$BIN/server" serve --repo "$REPO" --addr "127.0.0.1:$REPO_PORT" >>"$REPO_LOG" 2>&1 &
+"$BIN/server" serve --repo "$REPO" --addr "127.0.0.1:$REPO_PORT" \
+  --cert "$CERTS/server.crt" --key "$CERTS/server.key" --ca "$CERTS/ca.crt" >>"$REPO_LOG" 2>&1 &
 REPO_PID="$!"
 "$BIN/updated-launcher" --state-dir "$WORK/launcher-state" --config "$CONFIG" \
   --agent "$BIN/updated-agent" --stop-grace 2 >>"$STACK_LOG" 2>&1 &
