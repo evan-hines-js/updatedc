@@ -6,10 +6,13 @@ license.workspace = true
 
 [dependencies]
 foundation = { path = "../foundation" }
-# `setsid` and `kill`: this reconciler owns the release's workload process, so it detaches it from
-# the hook's contained tree and stops it again on the next release.
-libc.workspace = true
 updated-contracts = { path = "../updated-contracts" }
+
+# The reconciler binary is unix-only (src/main.rs), so are the crates it needs: `setsid` and `kill`
+# — it owns the release's workload process, detaching it from the hook's contained tree and
+# stopping it again on the next release — and the HTTP probe of the workload it started.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]

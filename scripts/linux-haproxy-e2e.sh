@@ -170,11 +170,14 @@ publish 1.0.0 "$WORK/bundle-1.0.0"
   --agent-id agent --routing-base-url "http://127.0.0.1:$REPO_PORT/" \
   --output "$WORK/launcher-state/enrollment.json"
 # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never calls
-# /enroll — but the node config must still be a complete, valid EnrollmentBootstrap. The name
-# and cert paths are never read in this offline path; they only satisfy config validation.
+# /enroll — but the node config must still be a complete, valid EnrollmentBootstrap. The name, URL
+# and cert paths are never read in this offline path; they only satisfy config validation, which
+# requires the enrollment URL to be HTTPS (the gateway is always TLS). Nothing dials it — the
+# repository this test serves is the plain-HTTP dev CDN at $REPO_PORT, reached through the signed
+# routing in enrollment.json above.
 cat >"$CONFIG" <<EOF
 [enrollment]
-url = "http://127.0.0.1:$REPO_PORT/"
+url = "https://127.0.0.1:$REPO_PORT/"
 name = "agent"
 client_cert = "unused-preplaced.crt"
 client_key = "unused-preplaced.key"

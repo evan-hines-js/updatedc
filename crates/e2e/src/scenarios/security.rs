@@ -53,7 +53,7 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
     let svc = "127.0.0.1:21140";
     let dir = ctx.work.join("signed-local-repair");
     std::fs::create_dir_all(&dir).map_err(str_err)?;
-    let _workload = fixture::workload(&dir);
+    let workload = fixture::workload(&dir);
     let v1 = app_v(ctx, "1.0.0");
     let v2 = app_v(ctx, "2.0.0");
     ctx.init_repo(&dir)?;
@@ -91,9 +91,19 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
         .ok_or("active release directory was not found")?;
     let entrypoint = active_dir.join(format!("bin/app{}", ctx.exe));
     drop(stack);
+    // The workload the release started outlives the node stack by design, and it is the process
+    // executing this very entrypoint — writing to a running executable is `ETXTBSY` on Linux, so
+    // the modification this scenario is about is only possible once it is gone. Ending it is also
+    // what gives the check below its meaning: with nothing left serving the address, reaching
+    // 2.0.0 again can only be the repaired binary, launched by the hook of the release the node
+    // rebuilt from its local signed deployment.
+    workload.stop();
     make_owner_writable(&entrypoint)?;
     std::fs::write(&entrypoint, b"locally modified and no longer trusted").map_err(str_err)?;
 
+    // Re-arm the guard before the stack that will start the replacement, so the workload the
+    // repaired release brings up is still ended by scope rather than by hand.
+    let _workload = fixture::workload(&dir);
     let repaired = Service::spawn("local-repair-restart", &cmd);
     if !wait_for_version(svc, "2.0.0", EVENT_TIMEOUT) {
         return fail(format!(

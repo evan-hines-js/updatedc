@@ -62,6 +62,13 @@ jobs:
       # OS — preinstalled on the runners — plus NASM on Windows MSVC, which is not.
       - if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
+      # `--all-features` turns on the workspace's `fips` feature, which swaps aws-lc-rs for
+      # aws-lc-fips-sys — a FIPS module whose CMake build generates code with Go. Only the macOS
+      # images ship without a Go toolchain, and its absence fails the build outright ("Could not
+      # find Go"), so this job installs one rather than testing a different crypto backend there.
+      - if: runner.os == 'macOS'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: {go-version: 'stable', cache: false}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       # Compile and run the test artifacts first. Clippy then reuses Cargo's

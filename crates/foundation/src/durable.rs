@@ -455,6 +455,31 @@ fn is_transient_lock(error: &io::Error) -> bool {
     }
 }
 
+/// fsync the file at `path` — the durable primitive for bytes some *earlier* step wrote and
+/// closed, where the writing handle is gone but the rename that publishes them has not happened
+/// yet.
+///
+/// The handle is opened for **writing**, and that is the whole point of routing this through one
+/// primitive: on Windows `FlushFileBuffers` — what `File::sync_all` calls — requires write access
+/// on the handle, so the POSIX habit of `File::open(path)?.sync_all()` fails there with
+/// `ERROR_ACCESS_DENIED` (os error 5) on a file the caller owns and can write. Reading is
+/// requested alongside it so the mode says "an existing file", never a truncation.
+///
+/// The file must exist: this proves bytes durable, it never creates them.
+pub fn sync_file(path: &Path) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+/// fsync a directory's dirents, so a rename or unlink already visible in it survives a power loss.
+///
+/// Unix only, by nature: a directory handle cannot be opened for writing, and Windows has no
+/// directory-flush call at all (its `CreateFileW` backup-semantics handle does not accept
+/// `FlushFileBuffers`), so there the metadata is ordered by the filesystem itself and this is a
+/// no-op rather than a failure.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
@@ -492,6 +517,24 @@ mod tests {
         let d = guard.path().join(name);
         fs::create_dir_all(&d).unwrap();
         (guard, d)
+    }
+
+    /// Proving already-written bytes durable must work on every platform this tower publishes
+    /// from, and the open mode is what decides that: a read-only handle cannot be flushed on
+    /// Windows, so the primitive owns the mode rather than each caller re-deriving it.
+    #[test]
+    fn sync_file_flushes_a_closed_file_and_reports_a_missing_one() {
+        let (_guard, d) = dir("sync-file");
+        let path = d.join("published.json");
+        fs::write(&path, b"{\"signed\":1}").unwrap();
+        sync_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{\"signed\":1}");
+        assert_eq!(
+            sync_file(&d.join("never-written"))
+                .expect_err("fsync cannot prove bytes that do not exist")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
