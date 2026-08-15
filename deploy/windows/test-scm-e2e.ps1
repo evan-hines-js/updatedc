@@ -22,6 +22,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $work = Join-Path $root 'target\scm-e2e'
 $repo = Join-Path $work 'repo'
 $keys = Join-Path $work 'keys'
+$certs = Join-Path $work 'certs'
 $launcherState = Join-Path $work 'launcher-state'
 $install = Join-Path $work 'install'
 $bundle = Join-Path $work 'bundle-1.0.0'
@@ -141,6 +142,11 @@ exit 0
 
     & (Join-Path $bin 'server.exe') init --repo $repo --keys $keys
     if ($LASTEXITCODE) { throw 'repository initialization failed' }
+    # The repository listener is the gateway's shape: mTLS is mandatory, so mint the fleet CA, its
+    # server cert (loopback SANs cover https://127.0.0.1:$repoPort) and the client cert the node
+    # presents. There is no plain-HTTP CDN to fall back to.
+    & (Join-Path $bin 'server.exe') gen-certs --dir $certs --san 127.0.0.1 --san localhost
+    if ($LASTEXITCODE) { throw 'minting the fleet mTLS material failed' }
     & (Join-Path $bin 'server.exe') publish-app --repo $repo --keys $keys --product app `
         --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }
@@ -164,35 +170,48 @@ exit 0
         product = 'app'; channel = 'stable'; install_root = $install
         repository = @{metadata_limit=1048576; target_limit=536870912; transport_timeout_seconds=30}
         storage = @{inactive_releases=2; inactive_providers=2; inactive_agents=1; inactive_bytes=1073741824; inactive_repository_caches=2}
-        timeouts = @{check_interval_seconds=60; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; agent_check_interval_seconds=3600}
+        # `check_interval_seconds` is capped at MAX_CHECK_INTERVAL_SECONDS (16) — three of a node's
+        # report gaps must fit inside the 60s freshness window every reader ages reports against, so
+        # a signed assignment carrying a slower cadence is rejected at publish. This test only wants
+        # a cadence slow enough not to churn, so sit at the ceiling.
+        timeouts = @{check_interval_seconds=16; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; agent_check_interval_seconds=3600}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
     & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
-        --name assignments/agents/agent.json --metadata-url "http://127.0.0.1:$repoPort/metadata/" `
-        --targets-url "http://127.0.0.1:$repoPort/targets/" --deployment initial `
+        --name assignments/agents/agent.json --metadata-url "https://127.0.0.1:$repoPort/metadata/" `
+        --targets-url "https://127.0.0.1:$repoPort/targets/" --deployment initial `
         --application-path $appTarget --application-sha256 $appSha `
         --provider-set-path $setTarget --provider-set-sha256 $setSha --runtime $runtime
     if ($LASTEXITCODE) { throw 'publishing routing assignment failed' }
 
     $serverProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
-        -ArgumentList @('serve', '--repo', $repo, '--addr', "127.0.0.1:$repoPort")
+        -ArgumentList @('serve', '--repo', $repo, '--addr', "127.0.0.1:$repoPort",
+            '--cert', (Join-Path $certs 'server.crt'),
+            '--key', (Join-Path $certs 'server.key'),
+            '--ca', (Join-Path $certs 'ca.crt'))
     & (Join-Path $bin 'server.exe') export-enrollment --repo $repo `
         --assignment assignments/agents/agent.json --agent-id agent `
-        --routing-base-url "http://127.0.0.1:$repoPort/" `
+        --routing-base-url "https://127.0.0.1:$repoPort/" `
         --output (Join-Path $launcherState 'enrollment.json')
     if ($LASTEXITCODE) { throw 'exporting enrollment bundle failed' }
     # Enrollment is preplaced (export-enrollment wrote enrollment.json above), so the agent never
-    # calls /enroll — but the config must still be a complete, valid EnrollmentBootstrap. The name,
-    # URL and cert paths are never read in this offline path; they only satisfy config validation,
-    # which requires HTTPS (the gateway is always TLS). Nothing dials it — this test's repository is
-    # the plain-HTTP dev CDN above, reached through the signed routing in enrollment.json.
+    # calls /enroll — but only because its steady-state identity is preplaced too. A preplaced
+    # bundle whose routing base URL is remote makes the node mint a per-node leaf at /enroll on
+    # first boot unless agent.crt/agent.key already exist in the state dir, and that mint reads the
+    # config's cert paths for real. Seed them with the fleet client cert, exactly as the installer
+    # would: the repository verifies it against the same CA, and this test needs no per-node
+    # attribution.
+    Copy-Item (Join-Path $certs 'client.crt') (Join-Path $launcherState 'agent.crt')
+    Copy-Item (Join-Path $certs 'client.key') (Join-Path $launcherState 'agent.key')
+    # Every path here is loaded, not decorative: the CA and client cert are the identity the node
+    # presents to the mTLS repository on every metadata and target fetch.
     $configText = @"
 [enrollment]
 url = 'https://127.0.0.1:$repoPort/enroll'
 name = 'agent'
-client_cert = 'unused-preplaced.crt'
-client_key = 'unused-preplaced.key'
-ca = 'unused-preplaced-ca.crt'
+client_cert = '$(Join-Path $certs 'client.crt')'
+client_key = '$(Join-Path $certs 'client.key')'
+ca = '$(Join-Path $certs 'ca.crt')'
 "@
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
 
