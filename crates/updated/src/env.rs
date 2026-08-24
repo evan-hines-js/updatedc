@@ -6,8 +6,10 @@
 //!
 //! The launcher⇄agent launch contract (the control-channel endpoint, the readiness nonce, the
 //! state directory) lives in the frozen `control` crate, not here — the launcher depends on
-//! nothing in this crate. A reconciler is told everything it needs on argv, under a cleared
-//! environment, so nothing in this file crosses that boundary.
+//! nothing in this crate. A reconciler is told everything it needs on argv, under the one
+//! invocation environment [`crate::reconciler::apply_environment`] builds — a cleared environment
+//! plus a minimal search path and the deployment's secrets — so nothing in this file crosses that
+//! boundary either.
 
 // ── test-only fault injection ──────────────────────────────────────────────────
 

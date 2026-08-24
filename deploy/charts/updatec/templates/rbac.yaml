@@ -1,0 +1,169 @@
+{{- if .Values.rbac.create }}
+# ── Controller ────────────────────────────────────────────────────────────────
+# The reconciling half. It reads and writes the whole namespace's updated.dev objects, holds the
+# publisher lease, and owns the durable rollout-admission ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "updatec.controllerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # Every Secret is operator-owned input (TUF keys, S3 credentials, and webhook keys). The
+    # controller resolves referenced names on demand and never creates, mutates, lists, or watches
+    # Secret objects.
+    verbs: ["get"]
+  # The durable rollout state has one deterministic index and two deterministic 64-name shard
+  # slots. Reads and CAS replacements are pinned to that exact finite set. Kubernetes cannot
+  # resourceName-restrict CREATE because authorization runs before a create request has a resource
+  # name; the admission policy below supplies that missing object-level boundary.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - {{ include "updatec.admittedConfigMapName" . | quote }}
+      {{- range $index := until 64 }}
+      - {{ printf "%s-a-%02d" (include "updatec.admittedConfigMapName" $) $index | quote }}
+      - {{ printf "%s-b-%02d" (include "updatec.admittedConfigMapName" $) $index | quote }}
+      {{- end }}
+    verbs: ["get", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  # Backend inventory names follow UpdateBackend objects created after this Role is installed, so
+  # static RBAC cannot enumerate them. The controller only patches and deletes them; a fail-closed
+  # admission policy constrains those requests to exact operator-owned inventory objects.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["patch", "delete"]
+  # Per-UpdateBackend identities. The operator creates one ServiceAccount even for HAProxy (with
+  # token automount disabled) so every generated workload has a stable, isolated identity.
+  # `create` is required alongside `patch`: the controller writes every backend resource through
+  # one server-side-apply, and Kubernetes authorizes an apply that materializes a missing object
+  # as a CREATE — patch-only RBAC 403s the very first reconcile of every backend.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "patch", "delete"]
+  # Kubernetes refuses Role creation as privilege escalation unless the creator already possesses
+  # every delegated permission. Generated healthproxy Roles narrow the ongoing verbs to two
+  # resourceNames each (create cannot be name-constrained anywhere); this controller rule is
+  # necessarily namespace-wide so it can delegate dynamically named slices — and the
+  # controller-no-endpointslices admission policy denies the controller identity every one of
+  # these writes, leaving the generated healthproxy identities as the only real writers.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "create", "patch", "delete"]
+  # Read-only. The reconciling half OBSERVES this inventory and writes only its `/status`
+  # subresources (below) and the one UpdateRepository finalizer patch. It creates none of these:
+  # `/enroll` is the only thing that mints an UpdateAgent, and it runs under the gateway identity
+  # with its own Role and a ValidatingAdmissionPolicy fencing exactly that write. Granting the
+  # controller `create` here handed the reconciling identity the same power to mint a node identity
+  # — with the labels that decide its group, and therefore its deployment — and unlike the gateway
+  # it has no admission policy over updated.dev objects to constrain it. Nothing used it.
+  - apiGroups: ["updated.dev"]
+    resources: ["updategroups", "updategroupsets", "updateagents", "updaterepositories", "updatesubscriptions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["updated.dev"]
+    resources: ["updatebackends"]
+    verbs: ["list", "patch"]
+  # Admission policy is operator-owned configuration. The controller resolves the one referenced
+  # object but has no legitimate reason to create or mutate the authority that gates its writes.
+  - apiGroups: ["updated.dev"]
+    resources: ["updateadmissionpolicies"]
+    verbs: ["get", "list", "watch"]
+  # The controller finalizes its UpdateRepository: it patches `.metadata.finalizers` to hold a
+  # deleted repository open through capability drain and cleanup of its exact S3, ConfigMap, and
+  # local-state epoch, then patches the finalizer off so deletion completes. That is a patch of the
+  # main resource, distinct from the `/status` patch below.
+  - apiGroups: ["updated.dev"]
+    resources: ["updaterepositories"]
+    verbs: ["patch", "update"]
+  - apiGroups: ["updated.dev"]
+    resources: ["updategroups/status", "updategroupsets/status", "updateagents/status", "updaterepositories/status", "updatesubscriptions/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["updated.dev"]
+    resources: ["updatebackends/status"]
+    verbs: ["patch"]
+  # Leader election. Every replica acquires or renews this lease before reconciling and a follower
+  # reconciles nothing, which is what makes more than one replica safe.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "updatec.controllerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "updatec.controllerName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "updatec.controllerServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# ── Gateway ───────────────────────────────────────────────────────────────────
+# The externally exposed half, and therefore the one whose credentials an attacker reaches first.
+# It is scoped to exactly what `/enroll` and repository resolution do, and nothing else: it never
+# touches groups, sets, subscriptions, configmaps, or any status subresource. Its one Lease grant is
+# exact-name get/update for enrollment serialization, and it holds no cluster-scoped permission.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "updatec.gatewayName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+rules:
+  {{- with .Values.gateway.secretResourceNames }}
+  # The gateway reads only the repository's object-store credentials. Application data, including
+  # secrets, is already in private S3 and never creates Kubernetes Secret authority here.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: {{- toYaml . | nindent 6 }}
+    verbs: ["get"]
+  {{- end }}
+  # `/enroll` creates a self-asserted agent, and completes an operator-reserved
+  # (`identity.kind: reserved`) UpdateAgent in place — stamping the node's minted identity (pinned
+  # public key + registration) onto it via a resourceVersion-guarded replace.
+  - apiGroups: ["updated.dev"]
+    resources: ["updateagents"]
+    verbs: ["get", "list", "create", "update"]
+  # Exact-name CAS lock around live inventory count + agent creation. The Lease is pre-created by
+  # the chart, so the gateway never receives namespace-wide create authority.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: [{{ include "updatec.gatewayEnrollmentLeaseName" . | quote }}]
+    verbs: ["get", "update"]
+  # Resolving the repository it serves, to find its object-store destination. Read-only.
+  - apiGroups: ["updated.dev"]
+    resources: ["updaterepositories"]
+    resourceNames: [{{ .Values.repository | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "updatec.gatewayName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "updatec.gatewayName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "updatec.gatewayServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

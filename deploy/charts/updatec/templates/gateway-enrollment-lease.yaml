@@ -1,0 +1,11 @@
+# Pre-created so the externally exposed gateway needs only exact-name get/update, never the
+# namespace-wide `leases:create` Kubernetes cannot resourceName-restrict. Gateway replicas use its
+# resourceVersion as the compare-and-swap boundary around count-and-create enrollment.
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ include "updatec.gatewayEnrollmentLeaseName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec: {}

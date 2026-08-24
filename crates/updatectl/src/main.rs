@@ -24,6 +24,9 @@
 //!   replay tolerance, observation purity, fingerprint stability, and the two refusals. It touches
 //!   no repository, no keys, and no Kubernetes.
 //!
+//! * `node-public-key` derives the canonical inventory pin from a manually provisioned P-256 key.
+//!   It reuses the online enrollment parser, so offline and online identity have one encoding.
+//!
 //! Keys are always just a directory of `root.pk8`, `targets.pk8`, `snapshot.pk8`, and
 //! `timestamp.pk8`. Delivery (Vault → Secret → mount) is the platform's job; `updatectl`
 //! stays out of the secret business. It only ever *mints and signs* — it never verifies;
@@ -41,7 +44,20 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod cli;
+mod deploy;
+mod keys;
+mod publish;
 mod reconciler_check;
+mod repository;
+mod root;
+
+use cli::*;
+use deploy::*;
+use keys::*;
+use publish::*;
+use repository::*;
+use root::*;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
@@ -53,281 +69,30 @@ use updated_tuf::repo::{self, PublishTarget};
 
 type Error = Box<dyn std::error::Error>;
 
-/// The online role keys a release publish signs with. Root keys are not among them.
-const ONLINE_KEYS: [&str; 3] = ["targets.pk8", "snapshot.pk8", "timestamp.pk8"];
-
-/// Every role key a trust root is built from: the active root, its standby successor, and the
-/// three online roles. `trust-root` mints all five and must find none of them already present.
-const ROLE_KEYS: [&str; 5] = [
-    "root.pk8",
-    "root.next.pk8",
-    "targets.pk8",
-    "snapshot.pk8",
-    "timestamp.pk8",
-];
-
-/// Mint trust roots and publish signed releases from CI, without kubectl.
-#[derive(Parser, Debug)]
-#[command(name = "updatectl", about, long_about = None, disable_version_flag = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Mint a fresh TUF trust root: generate role keys into a directory, initialize the
-    /// empty release repository in S3, and print root.json. Needs no Kubernetes access.
-    TrustRoot(TrustRootArgs),
-    /// Rotate the trust root: activate the standby key, mint a new successor, and publish a
-    /// co-signed new root version. Existing devices follow the chain automatically.
-    RotateRoot(RotateRootArgs),
-    /// Build, sign, and publish an application bundle, then roll a named UpdateGroup onto it.
-    Deploy(DeployArgs),
-    /// Build, sign, and publish a lifecycle-provider artifact bundle as
-    /// a signed target. Like `deploy` but publishes only the target — no group is rolled. A
-    /// provider set then references the resulting `path`+`sha256`.
-    PublishProviderArtifact(ProviderArtifactArgs),
-    /// Check a release's node reconciler against the published protocol: replay tolerance,
-    /// observation purity, fingerprint stability, and the two refusals. Runs the hook against a
-    /// scratch install root; needs no repository, keys, or Kubernetes access.
-    ReconcilerCheck(reconciler_check::ReconcilerCheckArgs),
-    /// Sign and publish an immutable provider set (`provider-sets/<id>.json`) as a target,
-    /// binding the required lifecycle provider artifact by path+sha256. This is the
-    /// S3-native counterpart of `server publish-provider-set`.
-    PublishProviderSet(ProviderSetArgs),
-}
-
-/// The release repository backend, shared by every subcommand. AWS credentials come from
-/// the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment.
-#[derive(Args, Debug)]
-struct Backend {
-    /// Directory of ed25519 role keys. `deploy` needs only the online keys (`targets.pk8`,
-    /// `snapshot.pk8`, `timestamp.pk8`) — in production a Vault-backed Secret mounted
-    /// read-only. `trust-root`/`rotate-root` also use the root keys (`root.pk8` active plus
-    /// `root.next.pk8` standby). `trust-root` mints freshly generated keys here and refuses a
-    /// directory that already holds any role key — a fresh trust root never reuses one, and no
-    /// key it did not mint itself is ever signed into it. A `trust-root` whose publish does not
-    /// land writes nothing here, so retrying the bootstrap is the identical re-run.
-    #[arg(long, env = "UPDATECTL_KEYS_DIR")]
-    keys_dir: PathBuf,
-
-    /// Release-repository S3 bucket.
-    #[arg(long, env = "UPDATECTL_BUCKET")]
-    bucket: String,
-
-    /// Release-repository S3 region.
-    #[arg(long, env = "UPDATECTL_REGION")]
-    region: String,
-
-    /// Key prefix within the bucket. Empty means the bucket root.
-    #[arg(long, env = "UPDATECTL_PREFIX", default_value = "")]
-    prefix: String,
-
-    /// Optional S3 endpoint override (e.g. MinIO). Omit for real AWS.
-    #[arg(long, env = "UPDATECTL_ENDPOINT")]
-    endpoint: Option<String>,
-}
-
-#[derive(Args, Debug)]
-struct TrustRootArgs {
-    #[command(flatten)]
-    backend: Backend,
-
-    /// Days until the freshly signed root/targets/snapshot/timestamp metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    expiry_days: i64,
-
-    /// Write root.json here instead of stdout. Either way it is the value to paste into a
-    /// group's `release_repository.root_json`.
-    #[arg(long, env = "UPDATECTL_ROOT_OUT")]
-    root_out: Option<PathBuf>,
-
-    /// Re-initialize an already-initialized repository. This invalidates everything signed
-    /// under the old root — used deliberately.
-    #[arg(long)]
-    force: bool,
-
-    #[arg(long, value_enum, env = "UPDATECTL_OUTPUT", default_value_t = OutputFormat::Text)]
-    output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-struct RotateRootArgs {
-    #[command(flatten)]
-    backend: Backend,
-
-    /// Where the freshly minted successor root key is written (mode 0600), once the rotation has
-    /// published. Load it into Vault as the new standby after rotation. Must not already exist —
-    /// an attempt whose publish does not land writes nothing here, so retrying the ceremony is
-    /// the identical re-run.
-    #[arg(long, env = "UPDATECTL_NEW_KEY_OUT")]
-    new_key_out: PathBuf,
-
-    /// Days until the new root metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    expiry_days: i64,
-
-    /// Write the new root.json here instead of stdout (the anchor for new enrollments).
-    #[arg(long, env = "UPDATECTL_ROOT_OUT")]
-    root_out: Option<PathBuf>,
-
-    #[arg(long, value_enum, env = "UPDATECTL_OUTPUT", default_value_t = OutputFormat::Text)]
-    output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-struct DeployArgs {
-    #[command(flatten)]
-    backend: Backend,
-
-    /// Namespace holding the UpdateGroup.
-    #[arg(long, env = "UPDATECTL_NAMESPACE", default_value = "updated-system")]
-    namespace: String,
-
-    /// UpdateGroup to roll onto the new bundle (its `spec.deployment.application`).
-    #[arg(long, env = "UPDATECTL_GROUP")]
-    group: String,
-
-    /// Product name; also the bundle target's component segment.
-    #[arg(long, env = "UPDATECTL_PRODUCT")]
-    product: String,
-
-    /// Release channel.
-    #[arg(long, env = "UPDATECTL_CHANNEL", default_value = "stable")]
-    channel: String,
-
-    /// Semantic version of this release.
-    #[arg(long, env = "UPDATECTL_VERSION")]
-    version: String,
-
-    /// Bundle-relative path of the launched executable (e.g. `bin/app`).
-    #[arg(long, env = "UPDATECTL_ENTRYPOINT")]
-    entrypoint: String,
-
-    /// Source to publish: a prepared directory tree, or a single executable file that is
-    /// wrapped into a one-file bundle at `--entrypoint`.
-    #[arg(long, env = "UPDATECTL_SOURCE")]
-    source: PathBuf,
-
-    /// Target platform `<os>-<arch>`. Defaults to the host's `linux-<arch>`.
-    #[arg(long, env = "UPDATECTL_PLATFORM")]
-    platform: Option<String>,
-
-    /// Target path of the provider set this release ships with. When set (together with
-    /// `--provider-set-sha256`), it is signed into the app target's custom metadata, so an
-    /// ordered-fallback descent to this version re-selects exactly these providers — app and
-    /// providers roll back as one unit. Omit to leave provider selection to the assignment head.
-    #[arg(
-        long,
-        env = "UPDATECTL_PROVIDER_SET_PATH",
-        requires = "provider_set_sha256"
-    )]
-    provider_set_path: Option<String>,
-
-    /// sha256 of the provider set named by `--provider-set-path`.
-    #[arg(
-        long,
-        env = "UPDATECTL_PROVIDER_SET_SHA256",
-        requires = "provider_set_path"
-    )]
-    provider_set_sha256: Option<String>,
-
-    /// Days until the re-signed TUF metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    expiry_days: i64,
-
-    /// Declare this publish an EMERGENCY CORRECTION: the operator admits it immediately, without
-    /// waiting for the governing `UpdateGroupSet`'s rollout schedule. Nothing else is bypassed —
-    /// concurrency slots, `maxUnavailable` staging, inputs, and prerequisites all still apply.
-    ///
-    /// Use it to escape a release the fleet cannot report on at all (one that bricks the agent),
-    /// which is precisely the case no health signal could ever detect. The flag is written into
-    /// `spec.emergencyCorrection` on every deploy, set or cleared, so an ordinary deploy of this
-    /// group afterwards turns it back off — an override can never be silently permanent.
-    #[arg(long, env = "UPDATECTL_EMERGENCY")]
-    emergency: bool,
-
-    /// Result format written to stdout. Diagnostics always go to stderr, so `json` yields a
-    /// single clean object a pipeline can capture and parse.
-    #[arg(long, value_enum, env = "UPDATECTL_OUTPUT", default_value_t = OutputFormat::Text)]
-    output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-struct ProviderArtifactArgs {
-    #[command(flatten)]
-    backend: Backend,
-
-    /// Product name; also the bundle target's component segment. The published target is
-    /// `products/<product>/<channel>/<version>/<platform>/<product>`.
-    #[arg(long, env = "UPDATECTL_PRODUCT")]
-    product: String,
-
-    /// Release channel.
-    #[arg(long, env = "UPDATECTL_CHANNEL", default_value = "stable")]
-    channel: String,
-
-    /// Semantic version of this provider artifact.
-    #[arg(long, env = "UPDATECTL_VERSION")]
-    version: String,
-
-    /// Bundle-relative path of the provider executable (e.g. `bin/lifecycle`).
-    #[arg(long, env = "UPDATECTL_ENTRYPOINT")]
-    entrypoint: String,
-
-    /// Source to publish: a prepared directory tree, or a single executable file that is
-    /// wrapped into a one-file bundle at `--entrypoint`.
-    #[arg(long, env = "UPDATECTL_SOURCE")]
-    source: PathBuf,
-
-    /// Target platform `<os>-<arch>`. Defaults to the host's `linux-<arch>`.
-    #[arg(long, env = "UPDATECTL_PLATFORM")]
-    platform: Option<String>,
-
-    /// Days until the re-signed TUF metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    expiry_days: i64,
-}
-
-#[derive(Args, Debug)]
-struct ProviderSetArgs {
-    #[command(flatten)]
-    backend: Backend,
-
-    /// Provider set id; the published target is `provider-sets/<id>.json`.
-    #[arg(long, env = "UPDATECTL_PROVIDER_SET_ID")]
-    id: String,
-
-    /// Lifecycle provider artifact target path (from `publish-provider-artifact`).
-    #[arg(long)]
-    provider_path: String,
-
-    /// sha256 of the lifecycle provider artifact.
-    #[arg(long)]
-    provider_sha256: String,
-
-    /// Extra argument passed to the lifecycle provider (repeatable).
-    #[arg(long)]
-    provider_arg: Vec<String>,
-
-    /// Lifecycle provider timeout, milliseconds.
-    #[arg(long, default_value_t = 300_000)]
-    provider_timeout_ms: u64,
-
-    /// Days until the re-signed TUF metadata expires.
-    #[arg(long, env = "UPDATECTL_EXPIRY_DAYS", default_value_t = 365)]
-    expiry_days: i64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum OutputFormat {
-    Text,
-    Json,
+/// Every role-key file a trust root is built from, standing in `dir`: the active root, its standby
+/// successor, and the three online roles.
+///
+/// The names come from [`repo::Keys`] rather than a list of this tool's own. `repo::generate_keys`
+/// mints exactly the key set `Keys::in_dir` reads, and this tool renames that set out of its
+/// staging directory — a second copy of the list here would silently strand a key the library
+/// started minting, in the one place that reports the bootstrap as having succeeded. `Keys::in_dir`
+/// names the standby successor only where one is present, so over a freshly minted staging
+/// directory this is the full set, and over `--keys-dir` it is exactly the role keys standing there.
+fn role_key_names(dir: &Path) -> Result<Vec<String>, Error> {
+    let keys = repo::Keys::in_dir(dir)?;
+    Ok(keys
+        .roots
+        .iter()
+        .chain([&keys.targets, &keys.snapshot, &keys.timestamp])
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .collect())
 }
 
 #[tokio::main]
-async fn main() -> std::process::ExitCode {
+pub(crate) async fn main() -> std::process::ExitCode {
     // The kube client and S3 store both drive rustls; install the workspace's one provider.
     updated::tls::install_crypto_provider();
     let result = match Cli::parse().command {
@@ -336,6 +101,7 @@ async fn main() -> std::process::ExitCode {
         Command::Deploy(args) => deploy(args).await,
         Command::PublishProviderArtifact(args) => publish_provider_artifact(args).await,
         Command::PublishProviderSet(args) => publish_provider_set(args).await,
+        Command::NodePublicKey(args) => print_node_public_key(args),
         // Local and synchronous: it drives child processes against a scratch directory and touches
         // no repository at all.
         Command::ReconcilerCheck(args) => reconciler_check::reconciler_check(args),
@@ -349,1195 +115,25 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-/// Wire up the S3 object store for the release repository. Credentials come from the
-/// standard AWS environment (empty for anonymous/dev stores such as public MinIO).
-fn build_store(backend: &Backend) -> Result<(S3Destination, Arc<dyn ObjectStore>), Error> {
-    let destination = S3Destination {
-        bucket: backend.bucket.clone(),
-        prefix: backend.prefix.clone(),
-        region: backend.region.clone(),
-        credentials_secret_ref: None,
-        endpoint: backend.endpoint.clone(),
-    };
-    let access = std::env::var("AWS_ACCESS_KEY_ID").ok();
-    let secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
-    // Temporary credentials (STS AssumeRole, SSO, IRSA) are only valid with their session token.
-    let token = std::env::var("AWS_SESSION_TOKEN").ok();
-    let store = updatec::runtime::s3_store(
-        &destination,
-        updatec::runtime::S3Credentials {
-            access_key: access.as_deref(),
-            secret_key: secret.as_deref(),
-            session_token: token.as_deref(),
-        },
-    )?;
-    Ok((destination, store))
-}
-
-async fn trust_root(args: TrustRootArgs) -> Result<(), Error> {
-    let backend = &args.backend;
-    let (destination, store) = build_store(backend)?;
-
-    // ONE probe of the live repository answers both questions this ceremony asks of it: is
-    // anything published here, and how high have its roles gone. Reading them from different
-    // objects is how a half-deleted repository (say root.json expired out from under a live
-    // timestamp) gets re-initialized at version 1 with no flag and no warning.
-    let live = RoleVersions::live(store.as_ref(), &destination).await?;
-
-    // Refuse to silently invalidate an already-published repository.
-    if !args.force && live.is_initialized() {
-        return Err(format!(
-            "release repository at s3://{}/{} is already initialized ({}); pass --force to \
-             replace it (this invalidates everything signed under the old root)",
-            backend.bucket,
-            backend.prefix,
-            live.describe_present()
-        )
-        .into());
-    }
-    // A replacement must start ABOVE the versions the live repository has already published.
-    // TUF clients remember the highest version they accepted and refuse anything lower, so a
-    // replacement republished at version 1 is silently rejected by every node that ever saw the
-    // old repository — no error at the publisher, and every agent stalled indefinitely. The floor
-    // comes from the same reading that decided the repository is live, so no partial deletion can
-    // put the two answers out of step; on an empty prefix it is 0 and the fresh root starts at 1.
-    let start_version = live.highest() + 1;
-    if live.is_initialized() {
-        eprintln!(
-            "replacing a live repository ({}): starting its metadata at version {start_version} \
-             so clients past the old versions still accept it (nodes must still be re-pinned to \
-             the new root)",
-            live.describe_present()
-        );
-    }
-
-    // Mint the role keys into a private staging directory inside --keys-dir, then build an empty
-    // signed repository in a throwaway temp dir. Nothing lands in --keys-dir until the repository
-    // is published, so an attempt whose publish fails leaves the directory exactly as it found it
-    // and the identical re-run completes the bootstrap.
-    let pending = PendingRoleKeys::mint(&backend.keys_dir).await?;
-    let repo_dir = tempfile::tempdir()?;
-    repo::init_from_version(
-        repo_dir.path(),
-        pending.keys(),
-        args.expiry_days,
-        start_version,
-    )
-    .await?;
-    let root_json = tokio::fs::read(repo_dir.path().join("metadata/root.json")).await?;
-
-    updatec::runtime::publish_repository(store.as_ref(), &destination, repo_dir.path()).await?;
-    eprintln!(
-        "initialized release repository at s3://{}/{}",
-        backend.bucket, backend.prefix
-    );
-
-    // The repository is published, so the staged keys are now the only copy of a live trust root's
-    // role keys — they are delivered BEFORE anything else this command does. Emitting root.json can
-    // fail for its own routine reasons (a missing `--root-out` parent, EPIPE on a piped stdout), and
-    // every one of those failures returns before `commit`, which is where the keys are placed:
-    // losing them strands a published repository that can never be signed into or rotated again.
-    // The root document itself is recoverable — it is served at metadata/root.json under the very
-    // prefix that was just published — so it is the emission, not the delivery, that goes second.
-    pending.commit().map_err(|error| {
-        format!(
-            "{error}\nThe root document was not emitted; it can be fetched from \
-             metadata/root.json under s3://{}/{}, so the groups can still be pinned — only the \
-             keys are unplaced.",
-            backend.bucket, backend.prefix
-        )
-    })?;
-    eprintln!("minted fresh role keys in {}", backend.keys_dir.display());
-
-    emit_root(
-        &root_json,
-        args.root_out.as_deref(),
-        args.output,
-        serde_json::json!({
-            "bucket": backend.bucket,
-            "prefix": backend.prefix,
-            "keysDir": backend.keys_dir,
-        }),
-    )
-    .await
-}
-
-async fn rotate_root(args: RotateRootArgs) -> Result<(), Error> {
-    let backend = &args.backend;
-
-    // Nothing is minted, signed or uploaded until the destination for the successor key is known
-    // to be free: the key that ends up at --new-key-out must be one this ceremony minted.
-    ensure_new_key_out_is_free(&args.new_key_out)?;
-    let (destination, store) = build_store(backend)?;
-
-    // The current root must carry two keys (active + standby) so one can sign the transition.
-    let keys = repo::Keys::in_dir(&backend.keys_dir);
-    if keys.roots.len() < 2 {
-        return Err(format!(
-            "--keys-dir {} does not hold a standby root key (root.next.pk8); the root was \
-             minted single-key and cannot be rotated in place — re-mint with `trust-root`",
-            backend.keys_dir.display()
-        )
-        .into());
-    }
-
-    // Pull the current metadata so the new root version bumps from it.
-    let checkout = checkout_metadata(store.as_ref(), &destination, backend).await?;
-
-    // Mint the successor into a private staging file, then publish a new root version co-signed by
-    // the retained standby (which retires the old active key) and the successor. The staged key
-    // only moves to --new-key-out after the publish lands; an attempt that fails removes it, so
-    // the retry is a plain re-run that mints again.
-    let pending = PendingRootKey::mint(&args.new_key_out).await?;
-    let retained = &keys.roots[1..];
-    repo::rotate_root(checkout.path(), retained, pending.path(), args.expiry_days).await?;
-    let root_json = tokio::fs::read(checkout.path().join("metadata").join("root.json")).await?;
-    checkout.publish(store.as_ref(), &destination).await?;
-    pending.commit()?;
-
-    eprintln!(
-        "rotated root at s3://{}/{}; minted successor key at {}",
-        backend.bucket,
-        backend.prefix,
-        args.new_key_out.display()
-    );
-    eprintln!(
-        "in Vault: promote the standby (root.next.pk8) to active (root.pk8), then install {} \
-         as the new root.next.pk8",
-        args.new_key_out.display()
-    );
-    eprintln!("existing devices follow the new root automatically; no group changes needed");
-
-    emit_root(
-        &root_json,
-        args.root_out.as_deref(),
-        args.output,
-        serde_json::json!({
-            "bucket": backend.bucket,
-            "prefix": backend.prefix,
-            "newKeyOut": args.new_key_out,
-        }),
-    )
-    .await
-}
-
-/// Deliver the root document a ceremony just signed: to `--root-out` when the operator named a
-/// file, to stdout when the run is human-readable and named none, and inside the JSON summary when
-/// the run is machine-readable. `context` carries the keys that differ per ceremony.
-async fn emit_root(
-    root_json: &[u8],
-    root_out: Option<&Path>,
-    output: OutputFormat,
-    context: serde_json::Value,
-) -> Result<(), Error> {
-    match root_out {
-        Some(path) => {
-            tokio::fs::write(path, root_json).await?;
-            eprintln!("wrote root.json to {}", path.display());
-        }
-        None if output == OutputFormat::Text => {
-            use std::io::Write;
-            std::io::stdout().write_all(root_json)?;
-        }
-        None => {}
-    }
-    if output == OutputFormat::Json {
-        let mut document = context;
-        document["root"] = String::from_utf8_lossy(root_json).into_owned().into();
-        println!("{}", serde_json::to_string(&document)?);
-    }
+pub(crate) fn print_node_public_key(args: NodePublicKeyArgs) -> Result<(), Error> {
+    println!("{}", node_public_key(&args.key)?);
     Ok(())
 }
 
-async fn deploy(args: DeployArgs) -> Result<(), Error> {
-    let backend = &args.backend;
-    semver::Version::parse(&args.version)
-        .map_err(|error| format!("--version {:?} is not valid semver: {error}", args.version))?;
-    let platform = args
-        .platform
-        .clone()
-        .unwrap_or_else(|| format!("linux-{}", std::env::consts::ARCH));
-    let (os, arch) = platform
-        .split_once('-')
-        .ok_or_else(|| format!("--platform must be <os>-<arch>, got {platform:?}"))?;
-
-    let (destination, store) = build_store(backend)?;
-    let store = store.as_ref();
-    let keys = open_keys(&backend.keys_dir)?;
-
-    // Confirm the group exists before doing any signing work.
-    let client = Client::try_default().await?;
-    let groups: Api<UpdateGroup> = Api::namespaced(client, &args.namespace);
-    groups.get(&args.group).await.map_err(|error| {
-        format!(
-            "UpdateGroup {} not found in {}: {error}",
-            args.group, args.namespace
-        )
-    })?;
-
-    // Work in a throwaway temp dir: the repository checkout never outlives the process.
-    let checkout = checkout_metadata(store, &destination, backend).await?;
-
-    // Resolve the provider set against the metadata in hand, before any bundle is built.
-    let provider_set = resolve_provider_set(
-        &checkout,
-        args.provider_set_path.as_deref(),
-        args.provider_set_sha256.as_deref(),
-    )
-    .await?;
-
-    // Build the bundle into a scratch dir, then register it as a signed target.
-    let build_dir = tempfile::tempdir()?;
-    let archive = build_dir.path().join("bundle.tar.zst");
-    build_bundle(
-        &args.source,
-        &archive,
-        build_dir.path(),
-        &args.product,
-        &args.version,
-        &platform,
-        &args.entrypoint,
-    )?;
-
-    let mut target = PublishTarget::application(
-        &args.product,
-        &args.channel,
-        &args.version,
-        os,
-        arch,
-        &args.product,
-        archive,
-    );
-    // Bind the resolved provider set into this app version's signed metadata, so a later
-    // ordered-fallback descent rolls providers back with it.
-    if let Some((path, sha256)) = &provider_set {
-        target = target.with_provider_set(path, sha256);
-    }
-    let target_name = target.name.clone();
-    repo::add_release(checkout.path(), &keys, vec![target], args.expiry_days).await?;
-    let sha256 = repo::target_sha256(checkout.path(), &target_name).await?;
-
-    // Upload immutable target bytes first and re-signed metadata last (timestamp is the
-    // commit point) — the operator's exact publication order. The group patch below references
-    // this generation, so a concurrent publisher must abort the upload rather than drop it.
-    checkout.publish(store, &destination).await?;
-    eprintln!("published signed target {target_name} (sha256 {sha256})");
-
-    // Roll the group. A JSON merge patch touches only the application reference, leaving
-    // the rest of the deployment spec intact; the operator republishes assignments.
-    //
-    // `emergencyCorrection` is written on EVERY deploy, true or false. A merge patch that omitted
-    // it would leave a previous `true` in place, so a one-off emergency would silently keep every
-    // later release of this group exempt from its set's rollout schedule.
-    let patch = group_patch(&target_name, &sha256, args.emergency);
-    groups
-        .patch(&args.group, &PatchParams::default(), &Patch::Merge(&patch))
-        .await?;
-    eprintln!(
-        "rolled UpdateGroup {} in {} to {} {}",
-        args.group, args.namespace, args.product, args.version
-    );
-    if args.emergency {
-        eprintln!(
-            "declared an emergency correction: this deployment is admitted without waiting for \
-             the governing UpdateGroupSet's rollout schedule"
-        );
-    }
-
-    report_deploy(&args, &platform, &target_name, &sha256)
-}
-
-/// Resolve `--provider-set-path`/`--provider-set-sha256` against the signed metadata this publish
-/// already holds, returning the normalized reference to sign into the app target.
-///
-/// The reference is signed into the app version's custom metadata and then read exactly once,
-/// much later: when an ordered-fallback descent picks this version on a node, `stage_providers`
-/// calls `exact_target` on it. A well-formed but unresolvable reference — a stale copy-paste of a
-/// previous set's path against the new set's digest, or a set published under a different prefix —
-/// is accepted by every syntactic check and only fails there, leaving the node unable to complete
-/// the rollback it is in the middle of. The checkout in hand is the same signed targets metadata
-/// the node will verify against, so resolving it here turns that into a publish-time refusal with
-/// nothing signed or uploaded. Digest comparison is case-insensitive and the lowercase form is
-/// what gets signed, matching the hex every agent compares against.
-async fn resolve_provider_set(
-    checkout: &Checkout,
-    path: Option<&str>,
-    sha256: Option<&str>,
-) -> Result<Option<(String, String)>, Error> {
-    // clap's `requires` makes the flags all-or-nothing.
-    let (Some(path), Some(sha256)) = (path, sha256) else {
-        return Ok(None);
-    };
-    if !updated_contracts::is_sha256_hex(sha256) {
-        return Err(
-            format!("--provider-set-sha256 {sha256:?} is not a 64-character hex SHA-256").into(),
-        );
-    }
-    let sha256 = sha256.to_ascii_lowercase();
-    let signed = repo::target_sha256(checkout.path(), path)
-        .await
-        .map_err(|error| {
-            format!(
-            "--provider-set-path {path:?} does not resolve in this repository's signed metadata: \
-             {error}. Publish the provider set with `publish-provider-set` against this same \
-             bucket and prefix first, and pass the path it prints. Nothing was signed or uploaded."
-        )
-        })?;
-    if signed != sha256 {
-        return Err(format!(
-            "--provider-set-sha256 {sha256} does not match the signed digest of \
-             --provider-set-path {path:?}, which is {signed}: the two flags name different \
-             provider sets. Nothing was signed or uploaded."
-        )
-        .into());
-    }
-    Ok(Some((path.to_string(), sha256)))
-}
-
-/// The merge patch that rolls an `UpdateGroup` onto a freshly published target.
-///
-/// `emergencyCorrection` is always written, true or false. A merge patch that omitted it would
-/// leave a previous `true` in place, so a one-off emergency would silently keep every later release
-/// of this group exempt from its `UpdateGroupSet`'s rollout schedule.
-fn group_patch(target: &str, sha256: &str, emergency: bool) -> serde_json::Value {
-    serde_json::json!({
-        "spec": {
-            "deployment": { "application": { "path": target, "sha256": sha256 } },
-            "emergencyCorrection": emergency,
-        }
-    })
-}
-
-/// Check out the release repository's current signed metadata into a throwaway temp dir, ready
-/// for a new target to be added and republished. Shared by the provider publish commands.
-async fn checkout_repository(
-    backend: &Backend,
-) -> Result<(S3Destination, Arc<dyn ObjectStore>, repo::Keys, Checkout), Error> {
-    let (destination, store) = build_store(backend)?;
-    let keys = open_keys(&backend.keys_dir)?;
-    let checkout = checkout_metadata(store.as_ref(), &destination, backend).await?;
-    Ok((destination, store, keys, checkout))
-}
-
-/// One checked-out generation of a release repository's signed metadata, plus the per-role
-/// versions it was taken at.
-///
-/// Publishing is read-modify-write over shared S3 metadata: the checkout carries generation N,
-/// `repo::add_release` signs N+1 locally, and the upload overwrites `N+1.targets.json`,
-/// `N+1.snapshot.json`, and `timestamp.json` unconditionally. Two publishers against one prefix
-/// therefore each sign an N+1 that omits the other's targets, and the loser's freshly patched
-/// UpdateGroup points at a target that is no longer in verified metadata — every node in that
-/// group stalls on "desired target absent from verified metadata" until someone republishes.
-/// A single publisher per lineage is the documented model, so the recorded generation is not a
-/// lock; it is the check that makes the unsupported case abort loudly with nothing uploaded
-/// instead of silently dropping another publisher's signed targets.
-struct Checkout {
-    dir: tempfile::TempDir,
-    generation: RoleVersions,
-}
-
-impl Checkout {
-    fn path(&self) -> &Path {
-        self.dir.path()
-    }
-
-    /// Publish the edited checkout, refusing to overwrite a generation this process never saw.
-    async fn publish(
-        &self,
-        store: &dyn ObjectStore,
-        destination: &S3Destination,
-    ) -> Result<(), Error> {
-        let live = RoleVersions::live(store, destination).await?;
-        if let Some(moved) = live.moved_since(&self.generation) {
-            return Err(format!(
-                "release repository at s3://{}/{} moved {moved} while this publish was building \
-                 and signing: another publisher is writing the same prefix. Nothing was uploaded \
-                 — re-run this command once that publish has settled, and publish one release \
-                 lineage from one place.",
-                destination.bucket, destination.prefix
-            )
-            .into());
-        }
-        updatec::runtime::publish_repository(store, destination, self.path()).await?;
-        Ok(())
-    }
-}
-
-/// Check out a repository's current TUF metadata into a throwaway temp dir: create `metadata/` and
-/// `targets/`, download the metadata, and confirm the repository is initialized (has
-/// `metadata/root.json`). The single definition of that checkout preamble — deploy, root rotation,
-/// and the provider-publish path all go through it, so they cannot drift on the directory layout or
-/// the uninitialized-repository guard.
-async fn checkout_metadata(
-    store: &dyn ObjectStore,
-    destination: &S3Destination,
-    backend: &Backend,
-) -> Result<Checkout, Error> {
-    let repo_dir = tempfile::tempdir()?;
-    let metadata_dir = repo_dir.path().join("metadata");
-    tokio::fs::create_dir_all(&metadata_dir).await?;
-    tokio::fs::create_dir_all(repo_dir.path().join("targets")).await?;
-    download_metadata(store, destination, &metadata_dir).await?;
-    if !metadata_dir.join("root.json").exists() {
-        return Err(format!(
-            "release repository at s3://{}/{} is not initialized (no metadata/root.json); run \
-             `updatectl trust-root` first",
-            backend.bucket, backend.prefix
-        )
-        .into());
-    }
-    // Record the generation these bytes are, not the one the store holds a moment later: the
-    // republish compares against exactly what this checkout was built from.
-    let generation = RoleVersions::checkout(&metadata_dir).await?;
-    Ok(Checkout {
-        dir: repo_dir,
-        generation,
-    })
-}
-
-/// Publish a provider artifact bundle as a signed target, without rolling any group.
-async fn publish_provider_artifact(args: ProviderArtifactArgs) -> Result<(), Error> {
-    let backend = &args.backend;
-    semver::Version::parse(&args.version)
-        .map_err(|error| format!("--version {:?} is not valid semver: {error}", args.version))?;
-    let platform = args
-        .platform
-        .clone()
-        .unwrap_or_else(|| format!("linux-{}", std::env::consts::ARCH));
-    let (os, arch) = platform
-        .split_once('-')
-        .ok_or_else(|| format!("--platform must be <os>-<arch>, got {platform:?}"))?;
-
-    let (destination, store, keys, checkout) = checkout_repository(backend).await?;
-
-    let build_dir = tempfile::tempdir()?;
-    let archive = build_dir.path().join("bundle.tar.zst");
-    build_bundle(
-        &args.source,
-        &archive,
-        build_dir.path(),
-        &args.product,
-        &args.version,
-        &platform,
-        &args.entrypoint,
-    )?;
-
-    let target = PublishTarget::application(
-        &args.product,
-        &args.channel,
-        &args.version,
-        os,
-        arch,
-        &args.product,
-        archive,
-    );
-    let target_name = target.name.clone();
-    repo::add_release(checkout.path(), &keys, vec![target], args.expiry_days).await?;
-    let sha256 = repo::target_sha256(checkout.path(), &target_name).await?;
-    checkout.publish(store.as_ref(), &destination).await?;
-    // stdout carries the machine-readable `path sha256` for the caller to reference; diagnostics
-    // go to stderr.
-    println!("{target_name} {sha256}");
-    eprintln!("published provider artifact {target_name} (sha256 {sha256})");
-    Ok(())
-}
-
-/// Publish an immutable provider set (`provider-sets/<id>.json`) as a signed target.
-async fn publish_provider_set(args: ProviderSetArgs) -> Result<(), Error> {
-    let backend = &args.backend;
-    let set = provider_set(&args)?;
-
-    let (destination, store, keys, checkout) = checkout_repository(backend).await?;
-    repo::verify_provider_set_reconciler(checkout.path(), &set).await?;
-
-    let build_dir = tempfile::tempdir()?;
-    let source = build_dir.path().join("provider-set.json");
-    tokio::fs::write(&source, serde_json::to_vec(&set)?).await?;
-    let target_name = format!("provider-sets/{}.json", set.id);
-    let target = PublishTarget {
-        name: target_name.clone(),
-        source,
-        custom: Default::default(),
-    };
-    repo::add_release(checkout.path(), &keys, vec![target], args.expiry_days).await?;
-    let sha256 = repo::target_sha256(checkout.path(), &target_name).await?;
-    checkout.publish(store.as_ref(), &destination).await?;
-    println!("{target_name} {sha256}");
-    eprintln!("published provider set {target_name} (sha256 {sha256})");
-    Ok(())
-}
-
-/// Build the provider-set document this command will sign, and hold it to exactly the rule every
-/// agent applies.
-///
-/// A published set is an immutable signed target: a document that fails `ProviderSet::validate`
-/// (a zero or over-long timeout, an id the grammar rejects, an unconfined provider path, too many
-/// arguments) is accepted by no node in the fleet, and the only remedy is publishing a corrected
-/// id. So the same `validate` the agent runs at staging time runs here, before any signing or
-/// upload, rather than a weaker digest-only approximation of it.
-fn provider_set(args: &ProviderSetArgs) -> Result<updated_contracts::artifact::ProviderSet, Error> {
-    let set = updated_contracts::artifact::ProviderSet {
-        schema: updated_contracts::artifact::ProviderSet::SCHEMA,
-        id: args.id.clone(),
-        reconciler: updated_contracts::artifact::Reconciler {
-            artifact: updated_contracts::artifact::TargetReference {
-                path: args.provider_path.clone(),
-                sha256: args.provider_sha256.to_ascii_lowercase(),
-            },
-            args: args.provider_arg.clone(),
-            timeout_millis: args.provider_timeout_ms,
-        },
-    };
-    set.validate().map_err(|error| {
-        format!(
-            "refusing to publish provider set {:?}: {error} (nothing was signed or uploaded)",
-            args.id
-        )
-    })?;
-    Ok(set)
-}
-
-/// Emit the machine-readable deploy result: a clean stdout payload (text or JSON) plus,
-/// under GitHub Actions, `target`/`sha256`/`version` step outputs for later steps.
-fn report_deploy(
-    args: &DeployArgs,
-    platform: &str,
-    target: &str,
-    sha256: &str,
-) -> Result<(), Error> {
-    match args.output {
-        OutputFormat::Text => {
-            println!("target={target}");
-            println!("sha256={sha256}");
-        }
-        OutputFormat::Json => {
-            let document = serde_json::json!({
-                "namespace": args.namespace,
-                "group": args.group,
-                "product": args.product,
-                "channel": args.channel,
-                "version": args.version,
-                "platform": platform,
-                "target": target,
-                "sha256": sha256,
-                "emergency": args.emergency,
-            });
-            println!("{}", serde_json::to_string(&document)?);
-        }
-    }
-    emit_github_outputs(&[
-        ("target", target),
-        ("sha256", sha256),
-        ("version", &args.version),
-    ])
-}
-
-/// Append `key=value` lines to the file named by `$GITHUB_OUTPUT`, the idiomatic way a
-/// GitHub Actions step exposes outputs. A no-op elsewhere. Values here are single-line.
-fn emit_github_outputs(pairs: &[(&str, &str)]) -> Result<(), Error> {
-    let Some(path) = std::env::var_os("GITHUB_OUTPUT") else {
-        return Ok(());
-    };
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    for (key, value) in pairs {
-        writeln!(file, "{key}={value}")?;
-    }
-    Ok(())
-}
-
-/// Refuse a `--keys-dir` that already holds any role key.
-///
-/// `trust-root` mints a *fresh* trust root, and the operator who runs it after a key disclosure
-/// is running it precisely to retire the exposed key. Reusing a leftover file there would pin the
-/// compromised key into the new root and report success, so the reuse is refused outright rather
-/// than made a flag: minting into a clean directory is the only way to get a root whose keys are
-/// all new, and `--force` is about replacing the published *repository*, never about overwriting
-/// private keys in place.
-///
-/// This runs immediately before minting — after every S3 round trip — and again before the minted
-/// keys are moved into place, so there is no window in which a file that appeared mid-run is
-/// adopted. It cannot be a leftover from an aborted `trust-root`: that ceremony stages its keys
-/// (see `PendingRoleKeys`) and writes nothing at these paths unless the publish landed. What an
-/// aborted run *can* leave is its staging directory, which `sweep_stale_staging` removes and this
-/// check deliberately ignores.
-fn ensure_keys_dir_is_empty(dir: &Path) -> Result<(), Error> {
-    let present: Vec<&str> = ROLE_KEYS
-        .into_iter()
-        .filter(|key| dir.join(key).exists())
-        .collect();
-    if present.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "--keys-dir {} already holds role keys ({}); `trust-root` mints a fresh trust root and \
-         will not reuse an existing key — a root minted over a disclosed key would still be \
-         signed by it. Point --keys-dir at an empty directory (move the old keys aside if they \
-         are still needed to serve the current repository). No key reaches these paths without a \
-         successful publish, so these are not the remains of an interrupted run — that leaves \
-         only a `.trust-root.pending.*` staging directory, which the next run removes on its own.",
-        dir.display(),
-        present.join(", ")
-    )
-    .into())
-}
-
-/// The staging stem `trust-root` mints its role key set under, inside `--keys-dir`.
-const ROLE_KEYS_STEM: &str = "trust-root";
-
-/// One piece of private key material staged on its way to the operator, and the crash-consistency
-/// protocol both key ceremonies deliver material with — written once, so the two cannot drift.
-///
-/// The protocol has five steps and every one of them is load bearing:
-///
-/// 1. **Sweep.** A mint first removes anything left under `.<stem>.pending.` in the same
-///    directory. `Drop` covers every failure the process survives, but a signal does not go
-///    through it: a Ctrl-C or a runner timeout during the S3 leg of a ceremony kills the process
-///    outright and leaves private key material on disk. The emptiness pre-flights look only at the
-///    delivery names, so without the sweep each interrupted run left one more, against the
-///    documented promise that an operator never has to hand-delete key material. Sweeping is safe
-///    on two counts: *provenance* — only this tool writes under the prefix, so an entry is its own
-///    abandoned staging; and *value* — a run still under the pending prefix never reached `commit`
-///    and so published nothing, because step 4 renames out of the prefix before anything that can
-///    fail. Those are keys of a root that never existed.
-/// 2. **Mint under a name this process picks.** `<stem>.pending.<pid>.<nanos>`, created
-///    exclusively by the caller's mint, so no file or directory another local principal planted
-///    can be adopted into a fresh root.
-/// 3. **Drop removes it.** A ceremony is mint-then-publish and the publish is allowed to fail for
-///    routine reasons (S3 transients, a generation guard aborting on another publisher). Such a
-///    failure delivers nothing, so the identical re-run mints again and completes the ceremony.
-/// 4. **Publish the name before anything fallible.** The moment the repository is live this
-///    material is the only copy of a LIVE root's keys, so it is renamed to `.<stem>.published.` —
-///    a prefix step 1 does not sweep — before the delivery moves that can fail. Under the pending
-///    name, the next automated re-run swept away the live root's keys.
-/// 5. **Deliver.** Ceremony-specific, and the one part that differs: `trust-root` moves five role
-///    keys into `--keys-dir`, `rotate-root` moves one successor key to `--new-key-out`.
-struct PendingKeyMaterial {
-    /// The directory the staging entry lives in; also the namespace the sweep scans.
-    dir: PathBuf,
-    /// Names the `.<stem>.pending.`/`.<stem>.published.` prefixes.
-    stem: String,
-    /// Where the material is right now: the pending name, or the published one after `publish`.
-    staged: PathBuf,
-    committed: bool,
-}
-
-impl PendingKeyMaterial {
-    /// Sweep abandoned staging (step 1) and name a fresh, private staging path (step 2). The
-    /// caller mints its material at [`Self::path`]; until it does, dropping this guard is a no-op
-    /// on a path that does not exist.
-    fn stage(dir: &Path, stem: &str, command: &'static str) -> Result<Self, Error> {
-        sweep_stale_staging(dir, stem, command)?;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or_default();
-        let staged = dir.join(format!(
-            "{}{}.{nonce}",
-            pending_prefix(stem),
-            std::process::id()
-        ));
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            stem: stem.to_string(),
-            staged,
-            committed: false,
-        })
-    }
-
-    /// Where the material is: the staging path before [`Self::publish`], the published one after.
-    fn path(&self) -> &Path {
-        &self.staged
-    }
-
-    /// Step 4: take the material out of the swept namespace, because what it holds is now the only
-    /// copy of a live root's keys. Called first thing in a `commit`, before any delivery step that
-    /// can fail; the caller wraps the error with what the operator must do about it.
-    fn publish(&mut self) -> Result<(), Error> {
-        self.committed = true;
-        let suffix = self
-            .staged
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let pending = pending_prefix(&self.stem);
-        let suffix = suffix.strip_prefix(&pending).unwrap_or(&suffix).to_string();
-        let published = self
-            .dir
-            .join(format!("{}{suffix}", published_prefix(&self.stem)));
-        std::fs::rename(&self.staged, &published).map_err(|error| {
-            format!(
-                "renaming the staged key material {} to {}: {error}",
-                self.staged.display(),
-                published.display()
-            )
-        })?;
-        self.staged = published;
-        Ok(())
-    }
-}
-
-impl Drop for PendingKeyMaterial {
-    /// Step 3. Whatever was minted — a directory of five keys or a single key file — goes with the
-    /// process unless it was published.
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = remove_staged(&self.staged);
-        }
-    }
-}
-
-/// The staging prefix: what a mint names its material under, and the one namespace the sweep
-/// removes from.
-fn pending_prefix(stem: &str) -> String {
-    format!(".{stem}.pending.")
-}
-
-/// The name staged material is renamed to the moment its repository is published, before any step
-/// of the delivery that can fail. It shares no prefix with the pending name, so the material a
-/// half-finished `commit` leaves behind — the only copy a live trust root has — is outside what
-/// the sweep removes, and an automated re-run cannot destroy it.
-fn published_prefix(stem: &str) -> String {
-    format!(".{stem}.published.")
-}
-
-/// Remove one staged entry, whichever shape the ceremony minted.
-fn remove_staged(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
-}
-
-/// Step 1 of [`PendingKeyMaterial`]: remove the staged material of runs that died before they
-/// could clean up. Concurrent runs of one ceremony against one directory are not a supported
-/// configuration (they race for the same destination paths regardless), so the sweep does not
-/// coordinate with them.
-fn sweep_stale_staging(dir: &Path, stem: &str, command: &str) -> Result<(), Error> {
-    let pending = pending_prefix(stem);
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("reading {}: {error}", dir.display()).into()),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("reading {}: {error}", dir.display()))?;
-        if !entry.file_name().to_string_lossy().starts_with(&pending) {
-            continue;
-        }
-        let path = entry.path();
-        remove_staged(&path).map_err(|error| {
-            format!(
-                "removing {}, the key material an interrupted `{command}` left behind: {error}",
-                path.display()
-            )
-        })?;
-        eprintln!(
-            "removed {}: private key material staged by a `{command}` that was interrupted before \
-             it published, so it is the material of a root that never existed",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// The five role keys of a fresh trust root, minted into a private staging directory inside
-/// `--keys-dir` and moved into place only once the new repository has been published.
-///
-/// The staging protocol is [`PendingKeyMaterial`]'s; what this adds is the bootstrap's own
-/// delivery — five role keys into `--keys-dir` — and its own no-adoption rule: the staging
-/// directory is created exclusively under a name this process picks, and `repo::generate_keys`
-/// creates every key with `create_new`, so no file another local principal planted, before the run
-/// or during it, can end up signed into the new root. The emptiness of `--keys-dir` is checked
-/// here, after every S3 round trip, and again at commit, so the check and the mint are not
-/// separated by seconds of network wall clock.
-struct PendingRoleKeys {
-    material: PendingKeyMaterial,
-    destination: PathBuf,
-    keys: repo::Keys,
-}
-
-impl PendingRoleKeys {
-    /// Mint the full role key set into a fresh staging directory under `destination`.
-    async fn mint(destination: &Path) -> Result<Self, Error> {
-        tokio::fs::create_dir_all(destination)
-            .await
-            .map_err(|error| format!("creating --keys-dir {}: {error}", destination.display()))?;
-        let material = PendingKeyMaterial::stage(destination, ROLE_KEYS_STEM, "trust-root")?;
-        ensure_keys_dir_is_empty(destination)?;
-
-        // Exclusive: a directory another principal pre-planted at this name is a hard error, not
-        // a place this ceremony mints into.
-        std::fs::create_dir(material.path()).map_err(|error| {
-            format!(
-                "staging fresh role keys at {}: {error}",
-                material.path().display()
-            )
-        })?;
-        // Dropping `material` from here on removes whatever the mint managed to write.
-        let keys = repo::generate_keys(material.path()).await?;
-        Ok(Self {
-            material,
-            destination: destination.to_path_buf(),
-            keys,
-        })
-    }
-
-    fn keys(&self) -> &repo::Keys {
-        &self.keys
-    }
-
-    /// Move the staged keys into `--keys-dir`. Called only after the fresh repository is
-    /// published, at which point the keys must be delivered to the operator: if a role key
-    /// appeared at the destination since the pre-flight check, the staged set is kept and named
-    /// rather than clobbered.
-    fn commit(mut self) -> Result<(), Error> {
-        self.material.publish().map_err(|error| {
-            format!(
-                "the repository was initialized and published, but {error}. The role keys are in \
-                 {} — that is the only copy, so move them somewhere safe and load them into Vault \
-                 before running `trust-root` again in this --keys-dir.",
-                self.material.path().display()
-            )
-        })?;
-        ensure_keys_dir_is_empty(&self.destination).map_err(|error| {
-            format!(
-                "{error}\nThe repository WAS initialized and published. Its role keys are in {} \
-                 — that is the only copy, so move them somewhere safe and load them into Vault.",
-                self.material.path().display()
-            )
-        })?;
-        for name in ROLE_KEYS {
-            std::fs::rename(self.material.path().join(name), self.destination.join(name)).map_err(
-                |error| {
-                    format!(
-                        "the repository was initialized and published, but moving role key \
-                     {name} to {}: {error}. The remaining keys are in {} — move them \
-                     somewhere safe and load them into Vault.",
-                        self.destination.display(),
-                        self.material.path().display()
-                    )
-                },
-            )?;
-        }
-        let _ = std::fs::remove_dir(self.material.path());
-        Ok(())
-    }
-}
-
-/// `--new-key-out` must name a path that does not exist. Whatever ends up there becomes a root
-/// key at threshold 1 for the whole fleet, so it has to be a key this ceremony minted — a file
-/// found at the path is of unknown provenance (planted by another local principal on a shared
-/// runner, or a stale copy of an online role key) and is never adopted, whatever its mode.
-fn ensure_new_key_out_is_free(path: &Path) -> Result<(), Error> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("inspecting --new-key-out {}: {error}", path.display()).into()),
-        Ok(_) => Err(format!(
-            "--new-key-out {} already exists; `rotate-root` signs the key at this path into the \
-             new root at threshold 1 and will only ever do that for a key it minted itself, so a \
-             pre-existing file is refused rather than adopted. A rotation whose publish did not \
-             land writes nothing here — retry the identical command. If this is a successor key \
-             from a completed rotation, point --new-key-out at a fresh path. Nothing was minted, \
-             signed, or uploaded.",
-            path.display()
-        )
-        .into()),
-    }
-}
-
-/// The successor root key, minted into a private staging file next to `--new-key-out` and moved
-/// there only once the rotated root has been published.
-///
-/// The staging protocol is [`PendingKeyMaterial`]'s; what this adds is the rotation's own
-/// delivery. It is what makes the ceremony — the one that answers a suspected root-key disclosure
-/// — retryable without trusting a file on disk: a publish that fails uploads nothing, so the root
-/// is *not* rotated, the guard's drop removes the staged key, `--new-key-out` is still free, and
-/// the identical re-run mints a fresh successor and completes the ceremony. No path exists by
-/// which a key the ceremony did not mint reaches the new root.
-struct PendingRootKey {
-    material: PendingKeyMaterial,
-    destination: PathBuf,
-}
-
-/// The staging stem a `rotate-root` successor key is named under: the `--new-key-out` file name,
-/// so two rotations writing different successor paths in one directory do not sweep each other.
-fn successor_stem(destination: &Path) -> String {
-    destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "root-successor".to_string())
-}
-
-impl PendingRootKey {
-    /// Mint a fresh ed25519 key into a staging file. `repo::generate_root_key` creates it
-    /// exclusively at mode 0600, so a name another principal pre-planted is a hard error here
-    /// rather than an adoption.
-    async fn mint(destination: &Path) -> Result<Self, Error> {
-        let dir = destination.parent().unwrap_or_else(|| Path::new("."));
-        let material = PendingKeyMaterial::stage(dir, &successor_stem(destination), "rotate-root")?;
-        repo::generate_root_key(material.path()).await?;
-        Ok(Self {
-            material,
-            destination: destination.to_path_buf(),
-        })
-    }
-
-    fn path(&self) -> &Path {
-        self.material.path()
-    }
-
-    /// Move the staged key to `--new-key-out`. Called only after the rotated root is published,
-    /// at which point the key must be delivered to the operator: if the destination was taken
-    /// since the pre-flight check, the staged file is kept and named rather than clobbered or
-    /// deleted.
-    fn commit(mut self) -> Result<(), Error> {
-        self.material.publish().map_err(|error| {
-            format!(
-                "the root was rotated and published, but {error}. The key is at {} — move it \
-                 somewhere safe and load it into Vault as the new standby.",
-                self.material.path().display()
-            )
-        })?;
-        ensure_new_key_out_is_free(&self.destination).map_err(|error| {
-            format!(
-                "{error}\nThe root WAS rotated and published. The successor key is at {} — move \
-                 it somewhere safe and load it into Vault as the new standby.",
-                self.material.path().display()
-            )
-        })?;
-        std::fs::rename(self.material.path(), &self.destination).map_err(|error| {
-            format!(
-                "the root was rotated and published, but moving the successor key to {}: {error}. \
-                 The key is at {} — move it somewhere safe and load it into Vault as the new \
-                 standby.",
-                self.destination.display(),
-                self.material.path().display()
-            )
-        })?;
-        Ok(())
-    }
-}
-
-/// Resolve the signing keys from a mounted directory. `deploy` signs only the online roles
-/// (targets/snapshot/timestamp), so the root keys are deliberately **not** required here —
-/// a release pipeline never needs the root private keys, only `trust-root`/`rotate-root` do.
-fn open_keys(dir: &Path) -> Result<repo::Keys, Error> {
-    for key in ONLINE_KEYS {
-        let path = dir.join(key);
-        if !path.exists() {
-            return Err(format!("--keys-dir {} is missing {key}", dir.display()).into());
-        }
-    }
-    Ok(repo::Keys::in_dir(dir))
-}
-
-/// The four top-level TUF roles, the documents whose versions a publish bumps.
-const TOP_LEVEL_METADATA: [&str; 4] = [
-    "root.json",
-    "timestamp.json",
-    "snapshot.json",
-    "targets.json",
-];
-
-/// The version each top-level TUF role currently declares, held per role rather than collapsed
-/// into one number.
-///
-/// A single maximum cannot serve as the concurrent-publish measure: the roles advance
-/// independently. `repo::publish_release` bumps targets/snapshot/timestamp and leaves root alone,
-/// while `repo::rotate_root` and `repo::renew_root` bump only root, so one root rotation would
-/// park a single maximum above the timestamp and mask the next publisher's commit entirely.
-/// Comparing role by role means every publish path advances a role the guard is watching.
-///
-/// Every role is read from BOTH its unversioned document and its versioned copies. Under
-/// `consistent_snapshot` (what `repo::init_from_version` writes) the snapshot and targets roles
-/// exist ONLY at `<N>.<role>.json`, so reading unversioned names alone left those two slots empty
-/// forever and collapsed the floor below to `max(root, timestamp)` — losing `metadata/timestamp.json`
-/// while fifty versioned targets stood then re-initialized the repository at version 2, which every
-/// node that had accepted targets v51 refuses as a rollback, permanently and with no publisher error.
-///
-/// A role is `None` when its document is absent, distinct from a document that declares version
-/// 0: this one reading is also the answer to "is anything published here", and a repository is
-/// live if ANY top-level role stands, not only if `root.json` does. Deriving liveness from a
-/// single object and the version floor from all four is how a half-deleted prefix — root.json
-/// gone, timestamp still at 47 — gets re-initialized at version 1 and wedges every node.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RoleVersions([Option<u64>; TOP_LEVEL_METADATA.len()]);
-
-impl RoleVersions {
-    /// Read the live repository's role versions from S3. An absent document is `None`; an
-    /// unreadable one is present at version 0 — the guard only cares that a role's document is
-    /// byte-for-byte the generation this process saw.
-    async fn live(store: &dyn ObjectStore, destination: &S3Destination) -> Result<Self, Error> {
-        let mut versions = Self::default();
-        for (slot, name) in TOP_LEVEL_METADATA.iter().enumerate() {
-            let key = updatec::object_key(&destination.prefix, &format!("metadata/{name}"));
-            let bytes = match store.get(&key).await {
-                Ok(result) => result.bytes().await?,
-                Err(object_store::Error::NotFound { .. }) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            versions.0[slot] = Some(updatec::runtime::signed_version(&bytes).unwrap_or(0));
-        }
-        // The versioned copies carry their version in the object name, so the floor is read from
-        // the listing without fetching any of them.
-        let prefix = updatec::object_key(&destination.prefix, "metadata");
-        let mut listing = store.list(Some(&prefix));
-        while let Some(entry) = listing.next().await {
-            if let Some(filename) = entry?.location.filename() {
-                versions.note_versioned(filename);
-            }
-        }
-        Ok(versions)
-    }
-
-    /// The same measure taken over a local checkout's downloaded copies, so a checkout is
-    /// compared against exactly the bytes it was built from.
-    async fn checkout(metadata_dir: &Path) -> Result<Self, Error> {
-        let mut versions = Self::default();
-        for (slot, name) in TOP_LEVEL_METADATA.iter().enumerate() {
-            match tokio::fs::read(metadata_dir.join(name)).await {
-                Ok(bytes) => {
-                    versions.0[slot] = Some(updatec::runtime::signed_version(&bytes).unwrap_or(0))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        // `download_metadata` copies every object under the prefix, versioned names included, so
-        // the checkout is measured exactly the way the live repository is.
-        let mut entries = tokio::fs::read_dir(metadata_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            if let Some(filename) = entry.file_name().to_str() {
-                versions.note_versioned(filename);
-            }
-        }
-        Ok(versions)
-    }
-
-    /// Raise a role's version from a versioned metadata name, `<N>.<role>.json`. Anything else —
-    /// a delegated role, a stray object — names no top-level role and is ignored.
-    fn note_versioned(&mut self, filename: &str) {
-        let Some((version, role)) = filename.split_once('.') else {
-            return;
-        };
-        let Ok(version) = version.parse::<u64>() else {
-            return;
-        };
-        let Some(slot) = TOP_LEVEL_METADATA.iter().position(|name| *name == role) else {
-            return;
-        };
-        self.0[slot] = Some(self.0[slot].unwrap_or(0).max(version));
-    }
-
-    /// Whether the repository is live: any top-level role document is present. Nodes pin
-    /// versioned roots and follow `timestamp.json`, so a prefix that still serves a timestamp is
-    /// serving a fleet whether or not the unversioned `root.json` survived.
-    fn is_initialized(&self) -> bool {
-        self.0.iter().any(Option::is_some)
-    }
-
-    /// The highest version any role has published — the floor a replacement repository must
-    /// start above, because a TUF client refuses any role document below the version it last
-    /// accepted for that role. Zero when nothing is published.
-    fn highest(&self) -> u64 {
-        self.0.iter().flatten().copied().max().unwrap_or(0)
-    }
-
-    /// The roles that are actually present, named with their versions, for a diagnostic that has
-    /// to tell an operator what is standing at a prefix they are about to replace.
-    fn describe_present(&self) -> String {
-        let present: Vec<String> = TOP_LEVEL_METADATA
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, name)| {
-                self.0[slot].map(|version| format!("{name} at version {version}"))
-            })
-            .collect();
-        present.join(", ")
-    }
-
-    /// The first role whose version differs from `base`, described for an operator, or `None`
-    /// when every role still stands where `base` saw it.
-    fn moved_since(&self, base: &Self) -> Option<String> {
-        TOP_LEVEL_METADATA
-            .iter()
-            .enumerate()
-            .find(|(slot, _)| self.0[*slot] != base.0[*slot])
-            .map(|(slot, name)| {
-                format!(
-                    "{name} from {} to {}",
-                    describe_version(base.0[slot]),
-                    describe_version(self.0[slot])
-                )
-            })
-    }
-}
-
-/// One role's standing, for operator-facing text: a version, or the absence of the document.
-fn describe_version(version: Option<u64>) -> String {
-    match version {
-        Some(version) => format!("version {version}"),
-        None => "absent".to_string(),
-    }
-}
-
-/// Mirror every metadata object under `<prefix>/metadata/` into `metadata_dir` so the TUF
-/// editor can load the current generation and bump from it.
-async fn download_metadata(
-    store: &dyn ObjectStore,
-    destination: &S3Destination,
-    metadata_dir: &Path,
-) -> Result<(), Error> {
-    let prefix = updatec::object_key(&destination.prefix, "metadata");
-    let mut listing = store.list(Some(&prefix));
-    while let Some(entry) = listing.next().await {
-        let meta = entry?;
-        let filename = meta
-            .location
-            .filename()
-            .ok_or_else(|| format!("release metadata object {} has no name", meta.location))?;
-        let payload = store.get(&meta.location).await?.bytes().await?;
-        tokio::fs::write(metadata_dir.join(filename), &payload).await?;
-    }
-    Ok(())
-}
-
-/// Build the deterministic application archive. A directory is bundled as-is; a single file
-/// is wrapped into a fresh tree at `--entrypoint` (matching `server publish-app`). Both the
-/// wrapping shorthand and the archive format live in `updated::bundle` so every publish front end
-/// emits byte-identical trees.
-#[allow(clippy::too_many_arguments)]
-fn build_bundle(
-    source: &Path,
-    archive: &Path,
-    scratch: &Path,
-    product: &str,
-    version: &str,
-    platform: &str,
-    entrypoint: &str,
-) -> Result<(), Error> {
-    updated::bundle::create_bundle_from_source(
-        source,
-        archive,
-        &scratch.join("tree"),
-        product,
-        version,
-        platform,
-        entrypoint,
-    )
-    .map_err(|error| format!("building bundle: {error}"))?;
-    Ok(())
+/// Derive the exact public-key encoding online enrollment extracts from a CSR. Reusing that parser
+/// keeps manual inventory on the same canonical P-256 path rather than introducing another key
+/// parser or encoding convention.
+pub(crate) fn node_public_key(path: &Path) -> Result<String, Error> {
+    let key = updated::tls::read_private_key_pem(path, foundation::file::FinalSymlink::Follow)?;
+    let csr = updated::csr::csr_for(&key, "manual identity")?;
+    Ok(updatec::join::csr_public_key(&csr)?.to_hex())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use object_store::ObjectStoreExt as _;
     use updated_tuf::repo;
 
     fn scratch(label: &str) -> (tempfile::TempDir, PathBuf) {
@@ -1554,6 +150,7 @@ mod tests {
             region: "us-east-1".into(),
             credentials_secret_ref: None,
             endpoint: None,
+            public_endpoint: None,
         }
     }
 
@@ -1574,11 +171,24 @@ mod tests {
             backend: backend("releases/app"),
             id: "web-linux-v4".into(),
             provider_path: "providers/lifecycle/1.0.0/linux-x86_64/lifecycle".into(),
-            provider_sha256: "A".repeat(64),
+            provider_sha256: "a".repeat(64),
             provider_arg: Vec::new(),
             provider_timeout_ms: 300_000,
             expiry_days: 365,
         }
+    }
+
+    #[test]
+    fn manual_node_pin_uses_the_online_enrollment_encoding() {
+        let (guard, dir) = scratch("node-key");
+        let path = dir.join("agent.key");
+        let key = updated::csr::generate_key().unwrap();
+        std::fs::write(&path, &key).unwrap();
+
+        let csr = updated::csr::csr_for(&key, "online enrollment").unwrap();
+        let expected = updatec::join::csr_public_key(&csr).unwrap().to_hex();
+        assert_eq!(node_public_key(&path).unwrap(), expected);
+        drop(guard);
     }
 
     /// A published provider set is an immutable signed target. Every flag combination the agent's
@@ -1590,7 +200,7 @@ mod tests {
         assert_eq!(
             set.reconciler.artifact.sha256,
             "a".repeat(64),
-            "the digest is normalized to the lowercase hex every agent compares against"
+            "the canonical digest is preserved exactly"
         );
 
         let cases = [
@@ -1612,6 +222,11 @@ mod tests {
             ("artifact reference", {
                 let mut args = provider_set_args();
                 args.provider_sha256 = "not-a-digest".into();
+                args
+            }),
+            ("artifact reference", {
+                let mut args = provider_set_args();
+                args.provider_sha256 = "A".repeat(64);
                 args
             }),
             ("arguments", {
@@ -1698,6 +313,250 @@ mod tests {
         repo::verify_provider_set_reconciler(checkout.path(), &provider_set(&args).unwrap())
             .await
             .expect("the published reconciler resolves");
+    }
+
+    #[tokio::test]
+    async fn consecutive_metadata_only_publishes_retain_remote_target_bytes() {
+        let (_tmp, root) = scratch("metadata-only-publishes");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        let origin = root.join("origin");
+        repo::init(&origin, &keys, 365).await.unwrap();
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        let backend = backend("releases/app");
+        updatec::runtime::publish_repository(&store, &dest, &origin)
+            .await
+            .unwrap();
+
+        let first_source = root.join("first.tar.zst");
+        tokio::fs::write(&first_source, b"first").await.unwrap();
+        let first = PublishTarget::application(
+            "app",
+            "stable",
+            "1.0.0",
+            "linux",
+            "x86_64",
+            "app",
+            first_source,
+        );
+        let first_name = first.name.clone();
+        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        repo::add_release(checkout.path(), &keys, vec![first], 365)
+            .await
+            .unwrap();
+        checkout.publish(&store, &dest).await.unwrap();
+        let first_digest = repo::target_sha256(checkout.path(), &first_name)
+            .await
+            .unwrap();
+
+        let second_source = root.join("second.tar.zst");
+        tokio::fs::write(&second_source, b"second").await.unwrap();
+        let second = PublishTarget::application(
+            "provider",
+            "stable",
+            "1.0.0",
+            "linux",
+            "x86_64",
+            "provider",
+            second_source,
+        );
+        let second_name = second.name.clone();
+        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        assert!(
+            std::fs::read_dir(checkout.path().join("targets"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "a metadata checkout must not download old target bodies"
+        );
+        repo::add_release(checkout.path(), &keys, vec![second], 365)
+            .await
+            .unwrap();
+        checkout.publish(&store, &dest).await.unwrap();
+        let second_digest = repo::target_sha256(checkout.path(), &second_name)
+            .await
+            .unwrap();
+
+        for (name, digest) in [(first_name, first_digest), (second_name, second_digest)] {
+            let key = updatec::object_key(&dest.prefix, &format!("targets/{digest}.{name}"));
+            store
+                .head(&key)
+                .await
+                .unwrap_or_else(|error| panic!("retained target {key} is absent: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_wrong_sized_retained_target_aborts_before_any_publication_write() {
+        let (_tmp, root) = scratch("missing-retained-target");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        let origin = root.join("origin");
+        repo::init(&origin, &keys, 365).await.unwrap();
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        let backend = backend("releases/app");
+        updatec::runtime::publish_repository(&store, &dest, &origin)
+            .await
+            .unwrap();
+
+        let first_source = root.join("first.tar.zst");
+        tokio::fs::write(&first_source, b"first").await.unwrap();
+        let first = PublishTarget::application(
+            "app",
+            "stable",
+            "1.0.0",
+            "linux",
+            "x86_64",
+            "app",
+            first_source,
+        );
+        let first_name = first.name.clone();
+        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        repo::add_release(checkout.path(), &keys, vec![first], 365)
+            .await
+            .unwrap();
+        checkout.publish(&store, &dest).await.unwrap();
+        let first_digest = repo::target_sha256(checkout.path(), &first_name)
+            .await
+            .unwrap();
+        let first_key = updatec::object_key(
+            &dest.prefix,
+            &format!("targets/{first_digest}.{first_name}"),
+        );
+        store.delete(&first_key).await.unwrap();
+        let generation = RoleVersions::live(&store, &dest).await.unwrap();
+
+        let second_source = root.join("second.tar.zst");
+        tokio::fs::write(&second_source, b"second").await.unwrap();
+        let second = PublishTarget::application(
+            "provider",
+            "stable",
+            "1.0.0",
+            "linux",
+            "x86_64",
+            "provider",
+            second_source,
+        );
+        let second_name = second.name.clone();
+        let checkout = checkout_metadata(&store, &dest, &backend).await.unwrap();
+        repo::add_release(checkout.path(), &keys, vec![second], 365)
+            .await
+            .unwrap();
+        let second_digest = repo::target_sha256(checkout.path(), &second_name)
+            .await
+            .unwrap();
+        let second_key = updatec::object_key(
+            &dest.prefix,
+            &format!("targets/{second_digest}.{second_name}"),
+        );
+
+        let error = checkout
+            .publish(&store, &dest)
+            .await
+            .expect_err("metadata must never commit over a missing retained target")
+            .to_string();
+        assert!(error.contains("retained target"), "{error}");
+        assert!(
+            store.head(&second_key).await.is_err(),
+            "new bytes were written"
+        );
+        assert_eq!(
+            RoleVersions::live(&store, &dest).await.unwrap(),
+            generation,
+            "metadata advanced despite the missing retained target"
+        );
+
+        store
+            .put(
+                &first_key,
+                object_store::PutPayload::from_bytes(b"wrong-size".to_vec().into()),
+            )
+            .await
+            .unwrap();
+        let error = checkout
+            .publish(&store, &dest)
+            .await
+            .expect_err("metadata must never commit over a wrong-sized retained target")
+            .to_string();
+        assert!(error.contains("signed length"), "{error}");
+        assert!(
+            store.head(&second_key).await.is_err(),
+            "new bytes were written after the retained-target size check failed"
+        );
+        assert_eq!(
+            RoleVersions::live(&store, &dest).await.unwrap(),
+            generation,
+            "metadata advanced despite the wrong-sized retained target"
+        );
+    }
+
+    /// A shared bucket is not a trusted local directory. Only the active TUF closure is an input
+    /// to a new signature; unrelated objects and nested keys must neither be flattened into the
+    /// checkout nor uploaded again by the next publish.
+    #[tokio::test]
+    async fn metadata_checkout_ignores_objects_outside_the_active_tuf_closure() {
+        let (_tmp, root) = scratch("metadata-closure");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        let origin = root.join("origin");
+        repo::init(&origin, &keys, 365).await.unwrap();
+
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        updatec::runtime::publish_repository(&store, &dest, &origin)
+            .await
+            .unwrap();
+        for relative in ["metadata/junk.json", "metadata/nested/root.json"] {
+            let key = updatec::object_key(&dest.prefix, relative);
+            store
+                .put(
+                    &key,
+                    object_store::PutPayload::from_bytes(b"untrusted".to_vec().into()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mirror = root.join("mirror");
+        tokio::fs::create_dir_all(&mirror).await.unwrap();
+        download_metadata(&store, &dest, &mirror).await.unwrap();
+        let mut names = std::fs::read_dir(&mirror)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "1.root.json",
+                "1.snapshot.json",
+                "1.targets.json",
+                "root.json",
+                "timestamp.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_checkout_uses_the_shared_object_size_bound() {
+        let store = InMemory::new();
+        let dest = destination("releases/app");
+        let root = updatec::object_key(&dest.prefix, "metadata/root.json");
+        store
+            .put(
+                &root,
+                object_store::PutPayload::from_bytes(
+                    vec![0; updatec::OBJECT_BYTES_LIMIT as usize + 1].into(),
+                ),
+            )
+            .await
+            .unwrap();
+        let mirror = tempfile::tempdir().unwrap();
+
+        let error = download_metadata(&store, &dest, mirror.path())
+            .await
+            .expect_err("oversized metadata must be refused before collection")
+            .to_string();
+        assert!(error.contains("over the 8388608-byte limit"), "{error}");
     }
 
     /// Publishing is read-modify-write over shared signed metadata: two publishers against one
@@ -1893,12 +752,11 @@ mod tests {
             pending.material.path().to_path_buf()
         };
         assert!(!staged.exists(), "the failed attempt removed its staging");
-        for name in ROLE_KEYS {
-            assert!(
-                !keys_dir.join(name).exists(),
-                "a bootstrap that did not publish writes no {name} to --keys-dir"
-            );
-        }
+        assert_eq!(
+            std::fs::read_dir(&keys_dir).unwrap().count(),
+            0,
+            "a bootstrap that did not publish writes no key material to --keys-dir"
+        );
 
         // Attempt two: the same command, from the state attempt one left behind.
         let pending = PendingRoleKeys::mint(&keys_dir)
@@ -1907,8 +765,10 @@ mod tests {
         let staged = pending.material.path().to_path_buf();
         pending.commit().unwrap();
         assert!(!staged.exists(), "the staging directory is cleaned up");
-        for name in ROLE_KEYS {
-            let path = keys_dir.join(name);
+        let delivered = role_key_names(&keys_dir).unwrap();
+        assert_eq!(delivered.len(), 5, "the full role set is delivered");
+        for name in delivered {
+            let path = keys_dir.join(&name);
             assert!(
                 path.exists(),
                 "{name} is delivered once the bootstrap lands"
@@ -1922,9 +782,45 @@ mod tests {
         }
     }
 
+    /// The delivery moves exactly the key set the mint produced, and leaves nothing behind.
+    ///
+    /// The names come from `repo::Keys`, not from a list this tool keeps of its own, precisely so
+    /// this holds: a key `repo::generate_keys` began minting that `commit` did not know to move
+    /// would sit in the staging directory of a LIVE trust root — the only copy of a published
+    /// root's key — while the operator was told the bootstrap had succeeded.
+    #[tokio::test]
+    async fn the_delivery_moves_every_key_the_mint_produced() {
+        let (_tmp, scratch_dir) = scratch("trust-root-delivers-all");
+        let keys_dir = scratch_dir.join("keys");
+        let pending = PendingRoleKeys::mint(&keys_dir).await.unwrap();
+        let staged = pending.material.path().to_path_buf();
+        let mut minted = entry_names(&staged);
+        minted.sort();
+        assert!(!minted.is_empty(), "the mint produced a role key set");
+
+        pending.commit().unwrap();
+        assert!(
+            !staged.exists(),
+            "no minted key is stranded in the staging directory"
+        );
+        let mut delivered = entry_names(&keys_dir);
+        delivered.sort();
+        assert_eq!(
+            delivered, minted,
+            "--keys-dir holds exactly what was minted for it"
+        );
+    }
+
+    fn entry_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
     /// `Drop` covers every failure the process survives, but a signal does not go through it: a
     /// Ctrl-C or a runner timeout during the S3 publish leaves a staging directory of five private
-    /// keys behind. It is invisible to the `ROLE_KEYS` emptiness check, so it used to accumulate
+    /// keys behind. It is invisible to the role-key emptiness check, so it used to accumulate
     /// one per interrupted run against a documented promise of nothing to hand-delete. The next
     /// `trust-root` sweeps it: the bootstrap is not blocked and nothing is left over.
     #[tokio::test]
@@ -1958,8 +854,9 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        let mut expected: Vec<String> = ROLE_KEYS.iter().map(|name| name.to_string()).collect();
+        let mut expected = role_key_names(&keys_dir).unwrap();
         expected.sort();
+        assert_eq!(expected.len(), 5, "the full role set is delivered");
         assert_eq!(
             left, expected,
             "--keys-dir holds the five delivered keys and no staging directory of any vintage"
@@ -1998,7 +895,9 @@ mod tests {
         std::fs::write(keys_dir.join("targets.pk8"), b"planted").unwrap();
         pending.commit().expect_err("delivery is refused");
         let preserved = preserved_key_dir(&keys_dir);
-        for name in ROLE_KEYS {
+        let published_root = role_key_names(&preserved).unwrap();
+        assert_eq!(published_root.len(), 5, "the whole role set is preserved");
+        for name in &published_root {
             assert!(
                 preserved.join(name).exists(),
                 "{name} of the published root is kept"
@@ -2025,7 +924,7 @@ mod tests {
                 .exists(),
             "abandoned pre-publish staging is still swept"
         );
-        for name in ROLE_KEYS {
+        for name in &published_root {
             assert!(
                 preserved.join(name).exists(),
                 "{name} of the published root survives the re-run's sweep"
@@ -2220,19 +1119,15 @@ mod tests {
             None,
             "omitting the flags leaves provider selection to the assignment head"
         );
-        assert_eq!(
-            resolve_provider_set(
-                &checkout,
-                Some("provider-sets/web-v4.json"),
-                Some(&sha.to_ascii_uppercase())
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .1,
-            sha,
-            "digests compare case-insensitively and are normalized before signing"
-        );
+        let error = resolve_provider_set(
+            &checkout,
+            Some("provider-sets/web-v4.json"),
+            Some(&sha.to_ascii_uppercase()),
+        )
+        .await
+        .expect_err("noncanonical digest aliases must be refused before signing")
+        .to_string();
+        assert!(error.contains("canonical lowercase"), "{error}");
 
         // The stale copy-paste: a path that was never published, paired with a valid digest.
         let error = resolve_provider_set(&checkout, Some("provider-sets/web-v3.json"), Some(&sha))
@@ -2261,7 +1156,7 @@ mod tests {
                 .await
                 .expect_err("a malformed digest is still rejected")
                 .to_string();
-        assert!(error.contains("64-character hex"), "{error}");
+        assert!(error.contains("canonical lowercase SHA-256"), "{error}");
     }
 
     /// An emergency override must be self-clearing. The deploy patch therefore states
@@ -2341,19 +1236,14 @@ mod tests {
         // Attempt two: the same command, from the state attempt one left behind.
         ensure_new_key_out_is_free(&successor)
             .expect("the re-run is not blocked by the interrupted attempt");
-        let work = root.join("work");
-        let work_metadata = work.join("metadata");
-        tokio::fs::create_dir_all(&work_metadata).await.unwrap();
-        download_metadata(&store, &dest, &work_metadata)
+        let checkout = checkout_metadata(&store, &dest, &backend("releases/app"))
             .await
             .unwrap();
         let pending = PendingRootKey::mint(&successor).await.unwrap();
-        repo::rotate_root(&work, &keys.roots[1..], pending.path(), 365)
+        repo::rotate_root(checkout.path(), &keys.roots[1..], pending.path(), 365)
             .await
             .unwrap();
-        updatec::runtime::publish_repository(&store, &dest, &work)
-            .await
-            .unwrap();
+        checkout.publish(&store, &dest).await.unwrap();
         pending.commit().unwrap();
         let published = store
             .get(&updatec::object_key(&dest.prefix, "metadata/root.json"))
@@ -2447,47 +1337,35 @@ mod tests {
             "publishing makes the store report initialized"
         );
 
-        // Pull the metadata back down, as `rotate_root`/`deploy` do.
-        let work = root.join("work");
-        let work_metadata = work.join("metadata");
-        tokio::fs::create_dir_all(&work_metadata).await.unwrap();
-        tokio::fs::create_dir_all(work.join("targets"))
+        // Pull the metadata back down through the one production checkout path.
+        let checkout = checkout_metadata(&store, &dest, &backend("releases/app"))
             .await
             .unwrap();
-        download_metadata(&store, &dest, &work_metadata)
-            .await
-            .unwrap();
-        let pinned = tokio::fs::read(work_metadata.join("1.root.json"))
+        let pinned = tokio::fs::read(checkout.path().join("metadata/1.root.json"))
             .await
             .unwrap();
 
         // Rotate against the downloaded copy, then re-publish it.
         let successor = root.join("successor.pk8");
         repo::generate_root_key(&successor).await.unwrap();
-        repo::rotate_root(&work, &keys.roots[1..], &successor, 365)
+        repo::rotate_root(checkout.path(), &keys.roots[1..], &successor, 365)
             .await
             .unwrap();
-        updatec::runtime::publish_repository(&store, &dest, &work)
-            .await
-            .unwrap();
+        checkout.publish(&store, &dest).await.unwrap();
 
-        // Download once more into a clean dir and verify through the real client.
-        let mirror = root.join("mirror");
-        let mirror_metadata = mirror.join("metadata");
-        tokio::fs::create_dir_all(&mirror_metadata).await.unwrap();
-        tokio::fs::create_dir_all(mirror.join("targets"))
+        // Download once more into a clean checkout and verify through the real client.
+        let mirror = checkout_metadata(&store, &dest, &backend("releases/app"))
             .await
             .unwrap();
-        download_metadata(&store, &dest, &mirror_metadata)
-            .await
-            .unwrap();
+        let mirror_metadata = mirror.path().join("metadata");
 
         let metadata_url =
             url::Url::from_directory_path(std::fs::canonicalize(&mirror_metadata).unwrap())
                 .unwrap();
-        let targets_url =
-            url::Url::from_directory_path(std::fs::canonicalize(mirror.join("targets")).unwrap())
-                .unwrap();
+        let targets_url = url::Url::from_directory_path(
+            std::fs::canonicalize(mirror.path().join("targets")).unwrap(),
+        )
+        .unwrap();
         let repo = tough::RepositoryLoader::new(&pinned, metadata_url, targets_url)
             .transport(tough::FilesystemTransport)
             .expiration_enforcement(tough::ExpirationEnforcement::Safe)

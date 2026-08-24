@@ -20,8 +20,10 @@ $ErrorActionPreference = 'Stop'
 $service = 'SelfUpdateAgent'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $work = Join-Path $root 'target\scm-e2e'
-$repo = Join-Path $work 'repo'
-$keys = Join-Path $work 'keys'
+$routingRepo = Join-Path $work 'routing-repo'
+$routingKeys = Join-Path $work 'routing-keys'
+$releaseRepo = Join-Path $work 'release-repo'
+$releaseKeys = Join-Path $work 'release-keys'
 $certs = Join-Path $work 'certs'
 $launcherState = Join-Path $work 'launcher-state'
 $install = Join-Path $work 'install'
@@ -31,7 +33,9 @@ $receipt = Join-Path $work 'reconciler-operations.log'
 $config = Join-Path $work 'config.toml'
 $runtime = Join-Path $work 'runtime.json'
 $repoPort = 21980
-$serverProcess = $null
+$objectPort = 21981
+$gatewayProcess = $null
+$objectProcess = $null
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -132,6 +136,13 @@ if ((Value '--protocol') -ne '1') { exit 2 }
 `$line = "`$operation`t`$(Value '--attempt-id')`t`$(Value '--reason')`t`$(Value '--candidate-version')"
 Add-Content -LiteralPath '$receipt' -Value `$line
 if (`$operation -eq 'inspect') { Write-Output "candidate-version=`$(Value '--candidate-version')" }
+if (`$operation -eq 'apply' -or `$operation -eq 'rollback') {
+    [IO.File]::WriteAllText(
+        (Value '--result-file'),
+        '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}',
+        [Text.UTF8Encoding]::new(`$false)
+    )
+}
 exit 0
 "@
     [IO.File]::WriteAllText(
@@ -140,31 +151,32 @@ exit 0
         [Text.UTF8Encoding]::new($false)
     )
 
-    & (Join-Path $bin 'server.exe') init --repo $repo --keys $keys
-    if ($LASTEXITCODE) { throw 'repository initialization failed' }
-    # The repository listener is the gateway's shape: mTLS is mandatory, so mint the fleet CA, its
-    # server cert (loopback SANs cover https://127.0.0.1:$repoPort) and the client cert the node
-    # presents. There is no plain-HTTP CDN to fall back to.
+    & (Join-Path $bin 'server.exe') init --repo $routingRepo --keys $routingKeys
+    if ($LASTEXITCODE) { throw 'routing repository initialization failed' }
+    & (Join-Path $bin 'server.exe') init --repo $releaseRepo --keys $releaseKeys
+    if ($LASTEXITCODE) { throw 'release repository initialization failed' }
+    # One TLS hierarchy covers two origins with distinct duties: routing authenticates the node
+    # before minting an exact bearer; the release origin never receives the node identity.
     & (Join-Path $bin 'server.exe') gen-certs --dir $certs --san 127.0.0.1 --san localhost
     if ($LASTEXITCODE) { throw 'minting the fleet mTLS material failed' }
-    & (Join-Path $bin 'server.exe') publish-app --repo $repo --keys $keys --product app `
+    & (Join-Path $bin 'server.exe') publish-app --repo $releaseRepo --keys $releaseKeys --product app `
         --channel stable --version 1.0.0 --bundle "windows-x86_64=$bundle" --entrypoint bin/app.exe
     if ($LASTEXITCODE) { throw 'publishing baseline bundle failed' }
-    & (Join-Path $bin 'server.exe') publish-provider-artifact --repo $repo --keys $keys `
+    & (Join-Path $bin 'server.exe') publish-provider-artifact --repo $releaseRepo --keys $releaseKeys `
         --product app-lifecycle --version 1.0.0 --bundle "windows-x86_64=$providerSource" `
         --entrypoint bin/reconciler.ps1
     if ($LASTEXITCODE) { throw 'publishing the node reconciler failed' }
     $providerTarget = 'products/app-lifecycle/stable/1.0.0/windows-x86_64/app-lifecycle'
-    $providerSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $providerTarget).Trim()
+    $providerSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $providerTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the reconciler hash failed' }
-    & (Join-Path $bin 'server.exe') publish-provider-set --repo $repo --keys $keys --id default `
+    & (Join-Path $bin 'server.exe') publish-provider-set --repo $releaseRepo --keys $releaseKeys --id default `
         --provider-path $providerTarget --provider-sha256 $providerSha --provider-timeout-ms 30000
     if ($LASTEXITCODE) { throw 'publishing provider set failed' }
     $appTarget = 'products/app/stable/1.0.0/windows-x86_64/app'
     $setTarget = 'provider-sets/default.json'
-    $appSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $appTarget).Trim()
+    $appSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $appTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published application hash failed' }
-    $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $repo --name $setTarget).Trim()
+    $setSha = (& (Join-Path $bin 'server.exe') target-sha256 --repo $releaseRepo --name $setTarget).Trim()
     if ($LASTEXITCODE) { throw 'resolving the published provider-set hash failed' }
     $runtimeJson = @{
         product = 'app'; channel = 'stable'; install_root = $install
@@ -177,19 +189,25 @@ exit 0
         timeouts = @{check_interval_seconds=16; health_grace_seconds=10; health_successes=1; health_interval_seconds=1; refresh_retry_seconds=5; confirmation_window_seconds=120; agent_check_interval_seconds=3600}
     } | ConvertTo-Json -Depth 5 -Compress
     [IO.File]::WriteAllText($runtime, $runtimeJson, [Text.UTF8Encoding]::new($false))
-    & (Join-Path $bin 'server.exe') publish-assignment --repo $repo --keys $keys `
-        --name assignments/agents/agent.json --metadata-url "https://127.0.0.1:$repoPort/metadata/" `
-        --targets-url "https://127.0.0.1:$repoPort/targets/" --deployment initial `
+    & (Join-Path $bin 'server.exe') publish-assignment --repo $routingRepo --keys $routingKeys `
+        --release-root (Join-Path $releaseRepo 'metadata\root.json') `
+        --name assignments/agents/agent.json --metadata-url "https://127.0.0.1:$objectPort/metadata/" `
+        --targets-url "https://127.0.0.1:$objectPort/targets/" --deployment initial `
         --application-path $appTarget --application-sha256 $appSha `
         --provider-set-path $setTarget --provider-set-sha256 $setSha --runtime $runtime
     if ($LASTEXITCODE) { throw 'publishing routing assignment failed' }
 
-    $serverProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
-        -ArgumentList @('serve', '--repo', $repo, '--addr', "127.0.0.1:$repoPort",
+    $gatewayProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
+        -ArgumentList @('serve-capability', '--repo', $routingRepo, '--addr', "127.0.0.1:$repoPort",
+            '--public-url', "https://127.0.0.1:$repoPort",
             '--cert', (Join-Path $certs 'server.crt'),
             '--key', (Join-Path $certs 'server.key'),
             '--ca', (Join-Path $certs 'ca.crt'))
-    & (Join-Path $bin 'server.exe') export-enrollment --repo $repo `
+    $objectProcess = Start-Process -PassThru -WindowStyle Hidden (Join-Path $bin 'server.exe') `
+        -ArgumentList @('serve-object', '--repo', $releaseRepo, '--addr', "127.0.0.1:$objectPort",
+            '--cert', (Join-Path $certs 'server.crt'),
+            '--key', (Join-Path $certs 'server.key'))
+    & (Join-Path $bin 'server.exe') export-enrollment --repo $routingRepo `
         --assignment assignments/agents/agent.json --agent-id agent `
         --routing-base-url "https://127.0.0.1:$repoPort/" `
         --output (Join-Path $launcherState 'enrollment.json')
@@ -198,30 +216,44 @@ exit 0
     # calls /enroll — but only because its steady-state identity is preplaced too. A preplaced
     # bundle whose routing base URL is remote makes the node mint a per-node leaf at /enroll on
     # first boot unless agent.crt/agent.key already exist in the state dir, and that mint reads the
-    # config's cert paths for real. Seed them with the fleet client cert, exactly as the installer
-    # would: the repository verifies it against the same CA, and this test needs no per-node
-    # attribution.
+    # config's identity paths for real. Seed them with this fixture node's named client leaf,
+    # exactly as an offline installer would; the repository verifies it against the same CA.
     Copy-Item (Join-Path $certs 'client.crt') (Join-Path $launcherState 'agent.crt')
     Copy-Item (Join-Path $certs 'client.key') (Join-Path $launcherState 'agent.key')
-    # Every path here is loaded, not decorative: the CA and client cert are the identity the node
-    # presents to the mTLS repository on every metadata and target fetch.
+    # The node identity is presented only to the routing capability origin. Release bytes are
+    # downloaded through the anonymous object client, which trusts the same local CA.
     $configText = @"
 [enrollment]
 url = 'https://127.0.0.1:$repoPort/enroll'
 name = 'agent'
-client_cert = '$(Join-Path $certs 'client.crt')'
-client_key = '$(Join-Path $certs 'client.key')'
 ca = '$(Join-Path $certs 'ca.crt')'
 "@
     [IO.File]::WriteAllText($config, $configText, [Text.UTF8Encoding]::new($false))
 
     $wrapper = Join-Path $bin 'selfupdate-service.exe'
     $launcher = Join-Path $bin 'updated-launcher.exe'
-    $binPath = "`"$wrapper`" --launcher `"$launcher`" --state-dir `"$launcherState`" --config `"$config`" --agent `"$initialAgent`""
-    & sc.exe create $service binPath= $binPath start= demand | Out-Null
-    if ($LASTEXITCODE) { throw 'SCM service creation failed' }
-
-    & sc.exe start $service | Out-Null
+    $installerVariables = @{
+        UPDATED_WINDOWS_SERVICE = $service
+        UPDATED_WINDOWS_WRAPPER = $wrapper
+        UPDATED_WINDOWS_LAUNCHER = $launcher
+        UPDATED_WINDOWS_STATE_DIR = $launcherState
+        UPDATED_WINDOWS_CONFIG = $config
+        UPDATED_WINDOWS_AGENT = $initialAgent
+        UPDATED_WINDOWS_START = 'demand'
+    }
+    foreach ($entry in $installerVariables.GetEnumerator()) {
+        Set-Item -Path "Env:$($entry.Key)" -Value $entry.Value
+    }
+    try {
+        & (Join-Path $PSScriptRoot 'install-updated-agent.bat') | Out-Null
+        if ($LASTEXITCODE) { throw "production Windows installer failed with exit code $LASTEXITCODE" }
+    } finally {
+        foreach ($name in $installerVariables.Keys) { Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue }
+    }
+    $installedService = Get-CimInstance Win32_Service -Filter "Name='$service'"
+    if (-not $installedService -or $installedService.StartName -ne 'LocalSystem') {
+        throw "installer did not grant the configuration agent machine authority: $($installedService.StartName)"
+    }
     Wait-ServiceState 'Running'
 
     # The agent converged the release the only way it can: through the release's own hooks. The
@@ -276,5 +308,6 @@ finally {
         try { Wait-ServiceState 'Stopped' 10 } catch { }
     }
     & sc.exe delete $service 2>$null | Out-Null
-    if ($serverProcess) { Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue }
+    if ($gatewayProcess) { Stop-Process -Id $gatewayProcess.Id -Force -ErrorAction SilentlyContinue }
+    if ($objectProcess) { Stop-Process -Id $objectProcess.Id -Force -ErrorAction SilentlyContinue }
 }

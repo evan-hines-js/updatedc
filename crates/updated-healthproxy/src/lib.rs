@@ -1,9 +1,12 @@
 //! Health-driven load-balancer membership for the fleet.
 //!
-//! A node's `updated` agent publishes a signed [`updated_contracts::telemetry::NodeReport`] to shared storage (the CDN);
+//! A node's `updated` agent publishes a signed [`updated_contracts::telemetry::NodeReport`],
+//! which the control plane folds into one indexed generation of bounded shards in shared storage
+//! (the CDN);
 //! the control plane can never reach the node, but anything that *can* read that storage can
-//! learn which nodes are healthy. This component reads those reports for a configured set of
-//! nodes and programs a load balancer's backend set so traffic reaches only the healthy,
+//! learn which nodes are healthy. This component fetches the stable index and its bounded shard
+//! set each cycle, verifies each node's envelope against its
+//! pinned key, and programs a load balancer's backend set so traffic reaches only the healthy,
 //! settled ones — and drains a node the instant its report says it left service.
 //!
 //! Crucially it does **not** sit in the data path. It *programs membership*; the load
@@ -30,9 +33,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::{stream, StreamExt as _};
+use updated_contracts::backend;
+use updated_contracts::backend::BackendInventoryMember;
+use updated_contracts::key::P256PublicKey;
 use updated_contracts::telemetry::{
-    is_uncompressed_p256_point, now_ms, report_is_authentic_and_fresh, report_url, Envelope,
-    REPORT_FRESHNESS,
+    now_ms, report_is_authentic_and_fresh, Envelope, FleetReports, REPORT_FRESHNESS,
 };
 
 /// One node the load balancer may route to: its identity, a routable address, and whether it
@@ -40,50 +46,11 @@ use updated_contracts::telemetry::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub node: String,
-    /// Routable host or IP the load balancer sends traffic to (the VM's address, or a pod IP).
+    /// Routable host or IP the load balancer sends traffic to. Empty is the single explicit
+    /// control-plane-cordon sentinel: stateful balancers still receive the identity to drain,
+    /// while topology balancers omit the endpoint entirely.
     pub address: String,
     pub ready: bool,
-}
-
-/// One node in the fleet this proxy fronts: its identity, the address the load balancer routes to,
-/// and the public key its health reports are pinned against. The key is the raw EC point from the
-/// node's enrollment identity (the same key the control-plane throttle pins) and must reach this
-/// proxy over a trusted channel — the operator's config — never the CDN it reads reports from, or
-/// an attacker able to write the report could supply the key that verifies it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FleetNode {
-    pub node: String,
-    pub address: String,
-    pub public_key: PinnedKey,
-}
-
-/// A pinned report-verification key whose shape has already been checked.
-///
-/// Only [`PinnedKey::parse`] constructs one, so a key of the wrong length or encoding cannot
-/// reach the verifier: there it would fail every signature check and drain a perfectly healthy
-/// node forever, logged identically to a genuinely unhealthy one. Pasting a certificate digest or
-/// a PEM-derived blob into the inventory is therefore a startup error, which is what the operator
-/// can act on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PinnedKey(Vec<u8>);
-
-impl PinnedKey {
-    /// Parse a hex-encoded uncompressed EC point, rejecting anything the report verifier could
-    /// not use.
-    pub fn parse(hex_point: &str) -> Result<Self, String> {
-        let point = hex::decode(hex_point).map_err(|_| "is not hex".to_string())?;
-        if !is_uncompressed_p256_point(&point) {
-            return Err(format!(
-                "is not an uncompressed P-256 point (65 bytes starting 0x04), got {} byte(s)",
-                point.len()
-            ));
-        }
-        Ok(Self(point))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
 }
 
 /// A load balancer whose backend membership is reconciled from health. An implementation maps
@@ -95,111 +62,110 @@ pub trait LoadBalancer {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String>;
 }
 
-/// Interpret a fetched health document. Ready only when the body is an *authentic* [`updated_contracts::telemetry::NodeReport`]
-/// *for this node* — its signature verifies against the node's pinned `public_key` — whose node has
-/// settled healthy *and whose timestamp is within
+/// Interpret one node's report envelope. Ready only when it is an *authentic*
+/// [`updated_contracts::telemetry::NodeReport`] *for this node* — its signature verifies against
+/// the node's pinned `public_key` — whose node has settled healthy *and whose timestamp is within
 /// [`updated_contracts::telemetry::REPORT_FRESHNESS`]*. Anything else — a report
-/// for a different node, an unsigned or forged report (a compromised gateway or a direct bucket
-/// write cannot forge one without the node's key), malformed JSON, an empty body, or a stale report
+/// for a different node, an unsigned or forged report (a compromised control plane writing the
+/// indexed fleet generation cannot forge one without the node's key), an unusable payload, or a stale report
 /// from a node that stopped heartbeating — is not-ready. The pin's shape is guaranteed by
-/// [`PinnedKey`], so an unverifiable report here always means the *report* is wrong, never that
+/// [`P256PublicKey`], so an unverifiable report here always means the *report* is wrong, never that
 /// the configuration is.
-pub fn report_is_ready(node: &str, public_key: &PinnedKey, body: &[u8]) -> bool {
+// This binary's own single trust gate. It is a different process from the controller with a
+// different decision to make (load-balancer membership, not rollout admission), and it holds no
+// verified-report cache to read from, so it calls the contract gate directly — here and nowhere
+// else in this crate.
+#[allow(clippy::disallowed_methods)]
+pub fn report_is_ready(node: &str, public_key: &P256PublicKey, envelope: &Envelope) -> bool {
     // The gate hands back the report only when the envelope is authentic and usable, so `healthy` here
     // is necessarily read from bytes this node signed — there is no path that reads a report first and
     // remembers to check it second.
-    serde_json::from_slice::<Envelope>(body)
-        .ok()
-        .and_then(|envelope| {
-            report_is_authentic_and_fresh(&envelope, node, public_key.as_bytes(), now_ms())
-        })
+    report_is_authentic_and_fresh(envelope, node, public_key, now_ms())
         .is_some_and(|report| report.healthy)
 }
 
-/// Upper bound on one fetched health document: the shared
-/// [`updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES`], the same number the writer's
-/// manifest allowance is derived from, so no report a node may legitimately sign is unreadable
-/// here. The reports live in storage this component reads but does not control, so — exactly as on
-/// the agent side — a declared length is only a claim and the running total is what actually caps
-/// the read. Enforced through the one shared bounded-read helper so this path cannot drift from
-/// the agent's.
-const REPORT_BYTES_LIMIT: usize = updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES;
-
-/// Fetch one node's raw health document from the CDN. `Some(body)` only on a 2xx with a readable,
-/// bounded body; any transport error, non-success status, unreadable body, or a body exceeding
-/// [`REPORT_BYTES_LIMIT`] is `None` — "could not determine right now", which the caller resolves
-/// against the node's last known report rather than by instantly draining it. (Whether that body
-/// actually marks the node ready is a separate judgment, [`report_is_ready`], so a genuine
-/// not-ready report still drains the node.)
-pub async fn fetch_report(
-    client: &reqwest::Client,
-    health_base: &str,
-    node: &str,
-) -> Option<Vec<u8>> {
-    let url = report_url(health_base, node);
-    let response = client.get(&url).send().await.ok()?;
-    updated::http::read_bounded(response, "node health report", REPORT_BYTES_LIMIT)
-        .await
-        .ok()
-}
-
-/// Fetch the control plane's endpoint projection — the cordoned set — from the same base the
-/// reports come from, resolving through [`LastKnownGood`] exactly as a report fetch does: a blip
-/// of the checker's own dependency must not flap a deliberate cordon.
+/// Fetch the stable fleet index and the bounded shards that can contain configured inventory
+/// members. The index supplies the exact active count and canonical placement, so readers have no
+/// layout knob or hash implementation of their own and cannot disagree with the writer. Both the
+/// index and each selected shard are bounded while streaming; missing, corrupt, or oversized
+/// shards yield a partial observation whose absent nodes resolve through last-known-good state. An
+/// unusable index yields `None` because there is no generation identity against which a shard can
+/// be authenticated.
 ///
-/// Fails OPEN in every terminal direction (see `updated_contracts::endpoints`): a store that has
-/// no projection (404), a document that cannot be read or decoded, and a cache that aged out all
-/// end at "nobody is cordoned" — health alone then governs, which is the safe steady state.
-/// Terminal is the operative word: a document that cannot be USED is a failed observation like any
-/// other, so the cordons are bridged from the last usable projection first and released only when
-/// that ages out.
+/// `health_timeout` is the operator's budget for ONE fetch — the index, and then each shard — not
+/// for the pass. One budget spanning the whole fan-out discarded partial progress: a single slow
+/// shard voided the entire cycle's observation and dropped EVERY node to last-known-good, which is
+/// precisely what the partial-observation rule above promises it does not do.
 ///
-/// Returns the cordoned set and whether a USABLE projection was actually OBSERVED this cycle.
-/// Failing open is deliberate; failing open SILENTLY is not — the caller stamps the observation
-/// into the metrics exposition and logs the edges, so "every cordon was released because the
-/// projection stopped being readable" is an alertable fact rather than something an operator infers
-/// from a node quietly taking production traffic again.
-pub async fn fetch_drained(
+/// `None` also when the index parsed but not one selected shard could be read. Readiness is read
+/// from the SHARDS, so an empty `FleetReports` there is not an observation of a silent fleet: the
+/// writer commits every shard of a generation before the index that names it
+/// (`gateway::flush_fleet_reports`), so a readable index over unreadable shards is a broken read —
+/// a negative-cached or swept per-generation prefix, an ACL on it, a partially published
+/// generation. Reported as `Some` it drained the entire inventory one freshness window later while
+/// the caller's edge log stayed quiet and its freshness gauge kept advancing: the exact fleet-wide
+/// silent drain the observation flag exists to make alertable. An inventory selecting no shard at
+/// all (an empty inventory) has nothing to read and stays an observation.
+async fn fetch_fleet_reports(
     client: &reqwest::Client,
     health_base: &str,
     health_timeout: Duration,
-    cache: &mut LastKnownGood<std::collections::BTreeSet<String>>,
-) -> (std::collections::BTreeSet<String>, bool) {
-    let url = updated_contracts::endpoints::endpoints_url(health_base);
-    let fetch = async {
+    inventory: &[BackendInventoryMember],
+) -> Option<FleetReports> {
+    // An all-cordoned inventory has no report-dependent decision to make. Treat it as a complete
+    // empty observation without touching S3: bucket availability and contents cannot weaken a
+    // control-plane drain. With no active member, report availability is vacuously usable.
+    if inventory.iter().all(BackendInventoryMember::is_cordoned) {
+        return Some(FleetReports::default());
+    }
+    let url = updated_contracts::telemetry::fleet_index_url(health_base);
+    let body = tokio::time::timeout(health_timeout, async {
         let response = client.get(&url).send().await.ok()?;
-        // A 404 — no projection ever published — is simply a failed observation here, resolved
-        // through the cache like any other: special-casing it as a definitive empty document
-        // CACHED that emptiness, so one transient 404 both un-cordoned the fleet for the cycle
-        // and destroyed the last-known-good the cordon was supposed to be bridged with. A store
-        // that genuinely has no projection resolves to an empty cache, which reads as "nobody is
-        // cordoned" below — the same fail-open answer, without the poisoning.
         updated::http::read_bounded(
             response,
-            "endpoint projection",
-            updated_contracts::endpoints::MAX_PROJECTION_BYTES,
+            "fleet report index",
+            updated_contracts::telemetry::MAX_FLEET_INDEX_BYTES,
         )
         .await
         .ok()
-    };
-    // A body that arrived is not an observation: it must also DECODE into a projection this build
-    // knows. Deciding "observed" on readability alone made a corrupt or newer-schema document —
-    // a truncated object, a 200 error page from a CDN, or a control plane one release ahead of
-    // this replica — release every cordon, cache the garbage over the last known good so the
-    // release outlived the bad cycle, and stamp the freshness gauge as current, with no edge
-    // logged. Decoding first turns exactly that case back into a failed observation: the cordons
-    // are bridged from the last usable projection, age out on the normal clock, and say so.
-    let usable = tokio::time::timeout(health_timeout, fetch)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    let index = updated_contracts::telemetry::FleetIndex::parse(&body)?;
+    let locations = index.shard_locations_for(
+        inventory
+            .iter()
+            .filter(|node| !node.is_cordoned())
+            .map(BackendInventoryMember::node),
+    );
+    let selected = locations.len();
+    let mut fetches = stream::iter(locations.into_iter().map(|location| async move {
+        let body = tokio::time::timeout(health_timeout, async {
+            let response = client.get(location.url(health_base)).send().await.ok()?;
+            updated::http::read_bounded(
+                response,
+                "fleet report shard",
+                updated_contracts::telemetry::MAX_FLEET_REPORT_SHARD_BYTES,
+            )
+            .await
+            .ok()
+        })
         .await
         .ok()
-        .flatten()
-        .as_deref()
-        .and_then(updated_contracts::endpoints::EndpointProjection::parse);
-    let observed = usable.is_some();
-    let cordoned = cache
-        .resolve("endpoints", usable, Instant::now())
-        .unwrap_or_default();
-    (cordoned, observed)
+        .flatten()?;
+        FleetReports::parse_shard(&body, &location)
+    }))
+    .buffered(updated_contracts::telemetry::FLEET_SHARD_IO_CONCURRENCY);
+    let mut reports = FleetReports::default();
+    let mut read = 0usize;
+    while let Some(shard) = fetches.next().await {
+        if let Some(shard) = shard {
+            read += 1;
+            reports.overlay(shard);
+        }
+    }
+    (read > 0 || selected == 0).then_some(reports)
 }
 
 /// Whether a drained node's drain is explained by report STALENESS: nothing usable was observed
@@ -207,24 +173,25 @@ pub async fn fetch_drained(
 /// classification only — the drain itself was already decided by the one trust gate — so the
 /// timestamp is read off the unverified document, which cannot make anything more trusted than
 /// the gate already decided.
-pub fn drain_is_stale(now_ms: u64, body: Option<&[u8]>) -> bool {
-    let Some(body) = body else {
+// Metric classification, never a trust decision — see the doc above. The unverified read is
+// deliberate and confined to this one function.
+#[allow(clippy::disallowed_methods)]
+pub fn drain_is_stale(now_ms: u64, envelope: Option<&Envelope>) -> bool {
+    let Some(envelope) = envelope else {
         return true;
     };
-    serde_json::from_slice::<Envelope>(body)
-        .ok()
-        .and_then(|envelope| updated_contracts::telemetry::unverified_report(&envelope))
+    updated_contracts::telemetry::unverified_report(envelope)
         .is_some_and(|report| !report.is_fresh(now_ms))
 }
 
-/// The floor on the width of every per-cycle fan-out: the node report poll here, and the
-/// load-balancer backend's own fan-out across its instances. A fan-out at least this wide is what
-/// keeps a cycle from serializing — one hung peer stalling the rest, risking a cycle longer than
-/// [`updated_contracts::telemetry::REPORT_FRESHNESS`] — while staying a modest number of
-/// simultaneous connections on the small fleets where nothing forces it wider.
+/// The floor on the width of every per-cycle fan-out — the load-balancer backends' fan-outs
+/// across their instances, and the EndpointSlice backend's hostname lookups. A fan-out at least
+/// this wide is what keeps a cycle from serializing — one hung peer stalling the rest, risking a
+/// cycle longer than [`updated_contracts::telemetry::REPORT_FRESHNESS`] — while staying a modest
+/// number of simultaneous connections on the small fleets where nothing forces it wider.
 ///
 /// It is a floor, not a cap: [`fanout_width`] raises a fan-out above it when the work needs it,
-/// bounded by that fan-out's share of the blocking pool. The load-balancer fan-outs, which resolve
+/// bounded by its share of the blocking pool. The load-balancer fan-outs, which resolve
 /// no names and have no pass deadline, use it as-is against [`RECONCILE_TIMEOUT`]. One constant
 /// rather than one per fan-out so the starting width the whole component reasons about has a single
 /// value — two copies that agree today would silently stop agreeing.
@@ -236,34 +203,27 @@ pub(crate) const FANOUT_CONCURRENCY: usize = 32;
 /// `tokio::net::lookup_host` is not async: every lookup occupies one thread of the blocking pool for
 /// its whole duration, so the pool size is a hard ceiling on the DNS fan-out's *real* width — a
 /// wider fan-out simply queues, and queued waves are waves. Pinned here rather than left to tokio's
-/// default, because both name-resolving fan-outs' widths are derived from it (see
-/// [`NAME_LOOKUP_CONCURRENCY`] and [`REPORT_POLL_CONCURRENCY`]), and a derivation resting on a
+/// default, because the name-resolving fan-out's width is derived from it (see
+/// [`NAME_LOOKUP_CONCURRENCY`]), and a derivation resting on a
 /// default is one that silently stops holding when the default moves. The binary builds its runtime
 /// with exactly this value.
 pub const BLOCKING_POOL_THREADS: usize = 512;
 
-/// The half of [`BLOCKING_POOL_THREADS`] the EndpointSlice backend's hostname lookups may occupy
-/// (`endpointslice::NameResolver`).
+/// The share of [`BLOCKING_POOL_THREADS`] the EndpointSlice backend's hostname lookups may occupy
+/// (`endpointslice::NameResolver`): everything except one floor's worth, reserved for the bounded
+/// fleet-shard HTTP fan-out, whose `health_base` resolves through
+/// hyper's `GaiResolver` — the same blocking pool. The reservation keeps a lookup storm from
+/// starving the reads the whole cycle exists to make.
 ///
 /// `tokio::net::lookup_host` holds one blocking thread for the whole `getaddrinfo`, and abandoning
 /// the future does *not* free that thread, so this is not merely a per-pass width: it is a
 /// reservation held by a semaphore whose permits are released only when the blocking call really
 /// returns, across cycles. Without that, a blackholed resolver (20-40s per call) against a 2s
 /// reconcile interval fills the pool with lookups whose answers were already discarded.
-pub(crate) const NAME_LOOKUP_CONCURRENCY: usize = BLOCKING_POOL_THREADS / 2;
+pub(crate) const NAME_LOOKUP_CONCURRENCY: usize = BLOCKING_POOL_THREADS - FANOUT_CONCURRENCY;
 
-/// The other half of [`BLOCKING_POOL_THREADS`]: the widest the report poll ([`poll_plan`]) may run.
-///
-/// The poll's requests look like pure network I/O, but each one needs `health_base` resolved
-/// through hyper's `GaiResolver` — the same blocking pool the hostname lookups use. A poll width
-/// past this share is width on paper only: the surplus requests queue behind the pool and run as a
-/// further wave, and it eats the reservation the lookup pass was sized against.
-pub(crate) const REPORT_POLL_CONCURRENCY: usize = BLOCKING_POOL_THREADS - NAME_LOOKUP_CONCURRENCY;
-
-// Both halves must leave room for the floor, or `fanout_width`'s clamp has an empty range.
-const _: () = assert!(
-    FANOUT_CONCURRENCY <= NAME_LOOKUP_CONCURRENCY && FANOUT_CONCURRENCY <= REPORT_POLL_CONCURRENCY
-);
+// The reservation must leave room for the floor, or `fanout_width`'s clamp has an empty range.
+const _: () = assert!(FANOUT_CONCURRENCY <= NAME_LOOKUP_CONCURRENCY);
 
 /// How wide one fan-out runs: one task in flight per unit of `wanted` work, floored at
 /// [`FANOUT_CONCURRENCY`] so a small fleet never serializes, and capped at `cap` — that fan-out's
@@ -277,144 +237,80 @@ pub(crate) fn fanout_width(wanted: usize, cap: usize) -> usize {
     wanted.clamp(FANOUT_CONCURRENCY, cap)
 }
 
-/// The share of [`updated_contracts::telemetry::REPORT_FRESHNESS`] one report-poll pass may spend,
-/// as a divisor: a quarter, leaving the rest of the window for the node's own report cadence, the
-/// reconcile that follows the pass, and the sleep between cycles.
-const POLL_SHARE: u32 = 4;
-
-/// How one report-poll pass is spread across the fleet: what each request gets, and how wide the
-/// fan-out must run for the whole pass to fit its share of the freshness window.
-struct PollPlan {
-    /// The budget for one report fetch. Always exactly the operator's configured
-    /// `HEALTHPROXY_HEALTH_TIMEOUT_SECS` — see [`poll_plan`] for why this is never scaled down.
-    timeout: Duration,
-    /// How many fetches are in flight at once, so `ceil(nodes / concurrency)` waves of `timeout`
-    /// fit the pass's share. Never narrower than [`FANOUT_CONCURRENCY`], never wider than
-    /// [`REPORT_POLL_CONCURRENCY`].
-    concurrency: usize,
-}
-
-/// Plan one report-poll pass over `nodes` given the operator's per-request `health_timeout`.
-///
-/// The pass gates rotation on freshness, so it must finish well inside
-/// [`updated_contracts::telemetry::REPORT_FRESHNESS`]: a body fetched in the first wave is judged
-/// against a clock read after the last one, so a pass that outlives the window ages out reports
-/// that were fresh when they were read and drains healthy nodes — the mass eviction
-/// [`LastKnownGood`] exists to prevent, caused here by the checker's own cycle time.
-///
-/// What is derived from the window is the fan-out *width*, never the per-request budget. Deriving
-/// the budget instead is the same failure wearing the other mask: dividing the share across the
-/// waves a fixed width implies drives the per-request timeout under a real HTTPS round trip at
-/// fleet scale, at which point *every* fetch in the pass times out, the whole fleet falls to its
-/// last known report, and one freshness window later the entire fleet reads not-ready. So the
-/// operator's timeout stands and the fleet gets the parallelism it needs: `floor(share /
-/// health_timeout)` waves of that budget fit the share, and the width is whatever covers `nodes` in
-/// that many waves.
-///
-/// The width is capped at [`REPORT_POLL_CONCURRENCY`] all the same, because width past the pool is
-/// not width. Each fetch needs its host resolved through the same blocking pool the hostname
-/// lookups reserve their half of, so claiming more only queues the surplus behind the pool *and*
-/// starves the other fan-out. Past that size the arithmetic below stops fitting the share and the
-/// pass may run long; [`run`] says so once at startup rather than letting a derivation assert a
-/// fan-out the runtime cannot perform.
-///
-/// A `health_timeout` wider than the share itself cannot be both honored and bounded. The
-/// operator's budget wins — one wave, and the pass may run past its share — because a timeout below
-/// the round trip is worse than a slow cycle. [`run`] says so once at startup, since the operator's
-/// own setting is the cause.
-fn poll_plan(nodes: usize, health_timeout: Duration) -> PollPlan {
-    let share = REPORT_FRESHNESS / POLL_SHARE;
-    // `floor(share / health_timeout)`, at least one: a budget at or above the share still buys the
-    // one wave above. `max(1)` on the divisor because a zero timeout must not divide by zero.
-    let waves_allowed = usize::try_from(share.as_nanos() / health_timeout.as_nanos().max(1))
-        .unwrap_or(usize::MAX)
-        .max(1);
-    PollPlan {
-        timeout: health_timeout,
-        concurrency: fanout_width(nodes.div_ceil(waves_allowed), REPORT_POLL_CONCURRENCY),
-    }
-}
-
 /// Resolve the desired membership: every configured node, with its readiness read from its
-/// current health report. Nodes are polled with bounded concurrency — one slow or hung node's
-/// per-fetch timeout must not serialize onto the others.
+/// entry in this cycle's bounded fleet generation.
 ///
-/// A node whose report cannot be *fetched* this cycle (a transient CDN/transport error) falls back
-/// to its last successfully fetched report, still bound by
+/// A node whose entry cannot be *observed* this cycle — the document fetch failed (a transient
+/// CDN/transport error), or the document was readable but simply has no entry for the node yet —
+/// falls back to its last successfully observed envelope, still bound by
 /// [`updated_contracts::telemetry::REPORT_FRESHNESS`]. This is what keeps
 /// a brief CDN outage from draining the whole healthy fleet at once: the checker's own dependency
 /// blinking is not evidence a node is down. It remains fail-closed — a report that is genuinely
 /// not-ready still drains the node, and a cached report older than the freshness window is
 /// not-ready — so the only behavior this changes is refusing to mass-evict on a checker blip.
 ///
-/// `health_timeout` is the operator's per-request budget; the fan-out widens with the fleet to keep
-/// the pass inside its share of the freshness window (see [`poll_plan`]).
+/// `health_timeout` is the operator's per-fetch budget, applied by [`fetch_fleet_reports`] to the
+/// index and to each shard separately (the setting the CRD and `HEALTHPROXY_HEALTH_TIMEOUT_SECS`
+/// have always described). Order is preserved so the programmed set is stable, and `cache` carries
+/// the last observed envelope per node across cycles (bounded by the fixed inventory).
 ///
-/// `cache` carries the last good body per node across cycles (bounded by the fixed inventory) and is
-/// updated on every successful fetch. Order is preserved so the programmed set is stable.
+/// Returns the membership and whether a USABLE fleet generation — the index AND at least one of the
+/// shards it names — was actually OBSERVED this cycle. Report failure drains the entire active
+/// fleet once cached reports age out. `reports_stale_total` counts those drains one node at a time
+/// and cannot tell "the generation is unreadable" from "every node stopped heartbeating", so the
+/// caller logs the edge and stamps the observation into metrics.
 pub async fn resolve_members(
     client: &reqwest::Client,
     health_base: &str,
-    inventory: &[FleetNode],
+    inventory: &[BackendInventoryMember],
     health_timeout: Duration,
-    cache: &mut LastKnownGood<Vec<u8>>,
-) -> Vec<Member> {
-    use futures::stream::StreamExt;
-    // Concurrent, cache-free fetch pass: gather this cycle's fresh bodies in parallel (the shared
-    // cache is not touched here), each tagged with its inventory index to restore order afterward.
-    // Each fetch gets the operator's full budget and the pass runs as wide as fitting inside its
-    // share of the freshness window requires — a hung CDN costs one node's last-known-good fallback,
-    // never a cycle so long that bodies read at its start have aged out by the time they are judged.
-    let plan = poll_plan(inventory.len(), health_timeout);
-    let budget = plan.timeout;
-    let fetched: Vec<(usize, Option<Vec<u8>>)> = futures::stream::iter(
-        inventory
-            .iter()
-            .enumerate()
-            .map(|(index, member)| async move {
-                let fetch = fetch_report(client, health_base, &member.node);
-                (
-                    index,
-                    tokio::time::timeout(budget, fetch).await.ok().flatten(),
-                )
-            }),
-    )
-    .buffer_unordered(plan.concurrency)
-    .collect()
-    .await;
-    let mut fresh: Vec<Option<Vec<u8>>> = vec![None; inventory.len()];
-    for (index, body) in fetched {
-        fresh[index] = body;
-    }
-    // Sequential resolve pass: a fresh fetch updates the cache; a failed one falls back to the
-    // cached body; readiness is always judged through the freshness bound AND the pinned-key
-    // signature check in `report_is_ready`.
-    inventory
+    cache: &mut LastKnownGood<Envelope>,
+) -> (Vec<Member>, bool) {
+    let mut fetched = fetch_fleet_reports(client, health_base, health_timeout, inventory).await;
+    let observed = fetched.is_some();
+    let members = inventory
         .iter()
-        .zip(fresh)
-        .map(|(member, fresh_body)| Member {
-            node: member.node.clone(),
-            address: member.address.clone(),
-            ready: resolve_readiness(&member.node, &member.public_key, fresh_body, cache),
+        .map(|member| match member {
+            BackendInventoryMember::Active {
+                node,
+                address,
+                public_key,
+            } => Member {
+                node: node.clone(),
+                address: address.clone(),
+                ready: resolve_readiness(
+                    node,
+                    public_key,
+                    fetched.as_mut().and_then(|reports| reports.remove(node)),
+                    cache,
+                ),
+            },
+            BackendInventoryMember::Cordoned { node } => Member {
+                node: node.clone(),
+                address: String::new(),
+                ready: false,
+            },
         })
-        .collect()
+        .collect();
+    (members, observed)
 }
 
-/// Resolve one node's readiness from this cycle's fetch outcome and the cross-cycle cache. A fresh
-/// body (`Some`) becomes the node's last known report and is judged now; a failed fetch (`None`)
-/// falls back to the last known report through [`LastKnownGood`]. Either way readiness passes
+/// Resolve one node's readiness from this cycle's observation and the cross-cycle cache. A fresh
+/// envelope (`Some`) becomes the node's last known report and is judged now; a failed observation
+/// (`None` — the indexed generation was unreadable, or carried no entry for this node) falls back to
+/// the last known envelope through [`LastKnownGood`]. Either way readiness passes
 /// through the freshness bound in [`report_is_ready`], so a cached report keeps a node ready only
 /// until it ages out. The one place the fail-closed / fail-operational readiness rule lives, so it
 /// can be fuzzed without any I/O.
 pub fn resolve_readiness(
     node: &str,
-    public_key: &PinnedKey,
-    fresh: Option<Vec<u8>>,
-    cache: &mut LastKnownGood<Vec<u8>>,
+    public_key: &P256PublicKey,
+    fresh: Option<Envelope>,
+    cache: &mut LastKnownGood<Envelope>,
 ) -> bool {
     cache
         .resolve(node, fresh, Instant::now())
-        .is_some_and(|body| report_is_ready(node, public_key, &body))
+        .is_some_and(|envelope| report_is_ready(node, public_key, &envelope))
 }
 
 /// The last value a checker successfully observed for each node, and how long a failure to
@@ -458,6 +354,12 @@ impl<T: Clone> LastKnownGood<T> {
             return None;
         }
         Some(value.clone())
+    }
+
+    /// Drop identities that no longer belong to this backend. Without this, a bounded live fleet
+    /// could still grow the process forever by cycling through distinct historical members.
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.entries.retain(|key, _| keep(key));
     }
 }
 
@@ -503,24 +405,30 @@ pub fn classify_transition(previous: Option<bool>, ready: bool) -> Option<Transi
 /// or rejoins the pool (the control plane can never reach it), so it records each edge. That
 /// makes an out-of-cluster drain — the mirror of an in-cluster pod going NotReady — visible in
 /// the logs instead of silent.
-pub async fn run(
+pub async fn run<S>(
     client: reqwest::Client,
-    config: Config,
+    mut config: Config,
     load_balancer: Arc<dyn LoadBalancer + Send + Sync>,
-) {
+    shutdown: S,
+) where
+    S: std::future::Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
     let mut previous: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    // Last good health body per node, so a transient CDN outage falls back to the last known report
-    // (still freshness-bounded) instead of draining every healthy node at once.
-    let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
-    // The control plane's endpoint projection (cordoned nodes), through the same last-known-good
-    // discipline as the reports it travels beside. It caches the DECODED set, so only a document
-    // this build could actually act on can ever become the value a cordon is bridged with.
-    let mut drained_cache: LastKnownGood<std::collections::BTreeSet<String>> = LastKnownGood::new();
-    // Whether a usable projection was observed last cycle, and who it cordoned — the two things
-    // the edge logs below need, so a lost cordon says so instead of reading as a health event.
-    // It starts true so the FIRST failed observation is an edge and gets logged.
-    let mut projection_usable = true;
-    let mut prior_drained: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Last observed envelope per node, so a transient CDN outage falls back to the last known
+    // report (still freshness-bounded) instead of draining every healthy node at once.
+    let mut cache: LastKnownGood<Envelope> = LastKnownGood::new();
+    // Whether the fleet report generation was usable last cycle. An unreadable
+    // generation is the one failure that drains everything, and it must say so rather than arriving
+    // as N per-node staleness drains. Starts true so the first failed read is an edge.
+    let mut reports_usable = true;
+    let mut inventory_error: Option<String> = None;
+    let mut prior_drained: std::collections::BTreeSet<String> = config
+        .inventory
+        .iter()
+        .filter(|member| member.is_cordoned())
+        .map(|member| member.node().to_string())
+        .collect();
     // The scrape state, updated at the bottom of every cycle; the listener only reads it.
     let shared_metrics: metrics::Shared = Arc::default();
     if let Some(address) = config.metrics_address {
@@ -531,85 +439,76 @@ pub async fn run(
             }
         });
     }
-    // A per-request budget wider than the whole share a poll may spend cannot be both honored and
-    // bounded; the operator's budget wins (see [`poll_plan`]), so name the setting that causes it.
-    let share = REPORT_FRESHNESS / POLL_SHARE;
-    if config.health_timeout > share {
+    // A budget wider than the freshness window cannot be honored: a fetch that slow returns a
+    // document whose fresh entries have already aged out by the time they are judged. The
+    // operator's budget still wins — a timeout below the round trip is worse — so name the setting.
+    if config.health_timeout > REPORT_FRESHNESS {
         eprintln!(
-            "healthproxy: HEALTHPROXY_HEALTH_TIMEOUT_SECS={}s is wider than the {}s one report poll may spend of the {}s freshness window — a single fetch wave can outlast that share",
+            "healthproxy: HEALTHPROXY_HEALTH_TIMEOUT_SECS={}s is wider than the {}s report freshness window — a fetch that slow returns already-stale reports",
             config.health_timeout.as_secs(),
-            share.as_secs(),
-            REPORT_FRESHNESS.as_secs()
-        );
-    }
-    // The poll's width is capped by the blocking pool it resolves through, so past a certain fleet
-    // size no width fits the pass into its share: the fleet is simply larger than one checker can
-    // poll in that window. Say it once, at startup, rather than letting the arithmetic claim a
-    // fan-out the runtime cannot perform — the answer is more checkers or a coarser cadence.
-    let plan = poll_plan(config.inventory.len(), config.health_timeout);
-    let waves = config.inventory.len().div_ceil(plan.concurrency).max(1) as u32;
-    if waves > 1 && plan.timeout.saturating_mul(waves) > share {
-        eprintln!(
-            "healthproxy: polling {} nodes takes {waves} wave(s) of {}s at the widest fan-out this runtime can resolve ({}), past the {}s share one poll may spend of the {}s freshness window — reports may age out mid-pass",
-            config.inventory.len(),
-            plan.timeout.as_secs(),
-            plan.concurrency,
-            share.as_secs(),
             REPORT_FRESHNESS.as_secs()
         );
     }
     loop {
-        // The projection fetch runs BESIDE the report poll, not before it: serialized, its
-        // timeout added up to a full `health_timeout` of dead time outside the share `poll_plan`
-        // sizes the pass to fit inside the freshness window.
-        let ((drained, projection_observed), mut members) = tokio::join!(
-            fetch_drained(
-                &client,
-                &config.health_base,
-                config.health_timeout,
-                &mut drained_cache,
-            ),
-            resolve_members(
-                &client,
-                &config.health_base,
-                &config.inventory,
-                config.health_timeout,
-                &mut cache,
-            )
-        );
-        // The projection fails OPEN, so its own failure is the one thing that must not be silent:
-        // once the last-known-good ages out, every cordon is released and the benched machines
-        // take production traffic again while `UpdateAgent.status.cordoned` still reads true. Both
-        // edges are logged, and the metrics exposition carries when it was last observed so the
-        // release is alertable rather than inferred.
-        if projection_observed != projection_usable {
-            projection_usable = projection_observed;
-            if projection_observed {
+        match load_inventory(&config.inventory_dir).await {
+            Ok(inventory) => {
+                if inventory_error.take().is_some() {
+                    eprintln!("healthproxy: projected inventory is usable again");
+                }
+                {
+                    let present: std::collections::HashSet<&str> =
+                        inventory.iter().map(BackendInventoryMember::node).collect();
+                    let active: std::collections::HashSet<&str> = inventory
+                        .iter()
+                        .filter(|member| !member.is_cordoned())
+                        .map(BackendInventoryMember::node)
+                        .collect();
+                    previous.retain(|node, _| present.contains(node.as_str()));
+                    cache.retain(|node| active.contains(node));
+                }
+                config.inventory = inventory;
+            }
+            Err(error) if inventory_error.as_deref() != Some(&error) => {
                 eprintln!(
-                    "healthproxy: endpoint projection at {} is usable again",
-                    updated_contracts::endpoints::endpoints_url(&config.health_base)
+                    "healthproxy: projected inventory is unusable; retaining the last valid membership: {error}"
+                );
+                inventory_error = Some(error);
+            }
+            Err(_) => {}
+        }
+        let drained: std::collections::BTreeSet<String> = config
+            .inventory
+            .iter()
+            .filter(|member| member.is_cordoned())
+            .map(|member| member.node().to_string())
+            .collect();
+        let (members, reports_observed) = resolve_members(
+            &client,
+            &config.health_base,
+            &config.inventory,
+            config.health_timeout,
+            &mut cache,
+        )
+        .await;
+        // While the generation is unreadable every active node resolves through
+        // its cached report, and once those age out the WHOLE inventory is programmed out of the
+        // backend set. The per-node `reports_stale_total` drains that follow look identical to a
+        // fleet that genuinely went silent, so the cause is logged here — and only here. The
+        // generation is the index AND the shards it names, so losing every shard under a readable
+        // index logs the same edge: the drain it causes is identical.
+        if reports_observed != reports_usable {
+            reports_usable = reports_observed;
+            if reports_observed {
+                eprintln!(
+                    "healthproxy: the fleet report generation at {} is readable again",
+                    updated_contracts::telemetry::fleet_index_url(&config.health_base)
                 );
             } else {
                 eprintln!(
-                    "healthproxy: endpoint projection at {} is unreadable or does not decode; cordons hold from the last observed projection for up to {}s and are then released",
-                    updated_contracts::endpoints::endpoints_url(&config.health_base),
-                    LastKnownGood::<std::collections::BTreeSet<String>>::STALENESS.as_secs()
+                    "healthproxy: the fleet report generation at {} is unreadable — its index, or every shard the index names, failed to read or parse; readiness holds from the last observed reports for up to {}s, after which every node drains",
+                    updated_contracts::telemetry::fleet_index_url(&config.health_base),
+                    LastKnownGood::<Envelope>::STALENESS.as_secs()
                 );
-            }
-        }
-        if !prior_drained.is_empty() && drained.is_empty() && !projection_observed {
-            eprintln!(
-                "healthproxy: the endpoint projection aged out — {} cordon(s) released, health alone now governs {}",
-                prior_drained.len(),
-                config.target()
-            );
-        }
-        // A cordoned node is programmed drained WHATEVER its report says — the same drained state
-        // a stale report produces, so the backend handling is unchanged. Applied after health is
-        // resolved so an uncordon restores the node's real readiness the same cycle.
-        for member in &mut members {
-            if drained.contains(&member.node) {
-                member.ready = false;
             }
         }
         for member in &members {
@@ -625,10 +524,9 @@ pub async fn run(
                     member.node, config.target()
                 ),
                 // A rejoin has TWO causes and they are not interchangeable: the node's health
-                // report went ready, or its cordon was lifted — either by the operator or by the
-                // projection ageing out, which puts a deliberately benched machine back into
-                // production traffic. Claiming "health report ready" for the second named the
-                // wrong cause for the one edge an operator most needs explained.
+                // report went ready, or its cordon was lifted. Claiming "health report ready" for
+                // the second names the wrong cause for the one edge an operator most needs
+                // explained.
                 Some(Transition::Joined) if prior_drained.contains(&member.node) => eprintln!(
                     "healthproxy: {} rejoined {} (no longer cordoned)",
                     member.node,
@@ -659,7 +557,7 @@ pub async fn run(
             ) && !drained.contains(&member.node)
             {
                 let body = cache.resolve(&member.node, None, Instant::now());
-                if drain_is_stale(now_ms(), body.as_deref()) {
+                if drain_is_stale(now_ms(), body.as_ref()) {
                     shared_metrics
                         .lock()
                         .expect("metrics lock")
@@ -668,15 +566,12 @@ pub async fn run(
             }
         }
         prior_drained = drained;
-        // Stamped on the OBSERVATION, not on the reconcile: this series answers "is the cordon
-        // set this proxy is programming still coming from the control plane", and a scrape that
-        // sees it fall more than `LastKnownGood::STALENESS` behind wall clock is watching every
-        // cordon get released.
-        if projection_observed {
-            shared_metrics
-                .lock()
-                .expect("metrics lock")
-                .endpoints_timestamp_seconds = now_ms() / 1000;
+        // Stamped on the report OBSERVATION: a scrape that watches this stop advancing while the
+        // fleet is still reporting is watching the fleet generation go unreadable, which is the one
+        // thing the per-node staleness counter cannot say.
+        if reports_observed {
+            let mut metrics = shared_metrics.lock().expect("metrics lock");
+            metrics.reports_timestamp_seconds = now_ms() / 1000;
         }
         match tokio::time::timeout(RECONCILE_TIMEOUT, load_balancer.reconcile(&members)).await {
             // The scrape state describes what was PROGRAMMED, so it is stamped only when the
@@ -702,15 +597,35 @@ pub async fn run(
                 RECONCILE_TIMEOUT.as_secs()
             ),
         }
-        tokio::time::sleep(config.interval).await;
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = tokio::time::sleep(config.interval) => {}
+        }
+    }
+
+    // Kubernetes terminates the workload before the operator removes its permission. Program an
+    // empty set while that authority is still valid so deleting a backend cannot strand stale
+    // traffic. This is also what makes HAProxy membership replacement safe: the old process knows
+    // which runtime servers it owned, whereas its replacement only knows the new inventory.
+    match tokio::time::timeout(RECONCILE_TIMEOUT, load_balancer.reconcile(&[])).await {
+        Ok(Ok(())) => eprintln!("healthproxy: drained {} before shutdown", config.target()),
+        Ok(Err(error)) => eprintln!(
+            "healthproxy: failed to drain {} before shutdown: {error}",
+            config.target()
+        ),
+        Err(_) => eprintln!(
+            "healthproxy: draining {} timed out after {}s during shutdown",
+            config.target(),
+            RECONCILE_TIMEOUT.as_secs()
+        ),
     }
 }
 
 /// Runtime configuration, resolved from `HEALTHPROXY_*` environment variables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// Base URL of the CDN/object store nodes write their reports to; a node's report is at
-    /// `<health_base>/telemetry/<node>.json`.
+    /// Base URL of the CDN/object store the control plane folds node reports into; the stable fleet
+    /// index is at `<health_base>/telemetry/fleet.json` and names its bounded shards.
     pub health_base: String,
     /// Namespace of the target Service/EndpointSlice (Kubernetes backend).
     pub namespace: String,
@@ -724,7 +639,10 @@ pub struct Config {
     /// The fleet this load balancer fronts. Readiness per node comes from its signed health report,
     /// verified against the node's pinned public key; the address is where the balancer routes when
     /// the node is ready.
-    pub inventory: Vec<FleetNode>,
+    pub inventory: Vec<BackendInventoryMember>,
+    /// Operator-owned projected inventory. Its fixed shard set is re-read every reconcile so
+    /// membership changes do not restart this process or expose a partial ConfigMap update.
+    pub inventory_dir: std::path::PathBuf,
     pub interval: Duration,
     pub health_timeout: Duration,
     /// When set, program a cluster of HAProxy instances via the Runtime API instead of a
@@ -756,24 +674,49 @@ impl Config {
         }
     }
 
-    pub fn from_env() -> Result<Self, String> {
-        Self::build(|key| std::env::var(key).ok())
+    pub async fn from_env() -> Result<Self, String> {
+        // The parameter type is spelled out so the closure stays general over the borrow's
+        // lifetime: inferred from its first use, it would be pinned to that one call and refuse
+        // the higher-ranked `impl Fn(&str)` bound `build` requires.
+        let get = |key: &str| std::env::var(key).ok();
+        let inventory_dir =
+            std::path::PathBuf::from(require(&get, backend::HEALTHPROXY_INVENTORY_DIR_ENV)?);
+        let inventory = load_inventory(&inventory_dir).await?;
+        Self::build(get, inventory_dir, inventory)
     }
 
     /// Environment-independent core of [`from_env`](Self::from_env), so parsing is testable
     /// without mutating process-global state.
-    pub fn build(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let health_base = require(&get, "HEALTHPROXY_HEALTH_BASE")?;
-        let namespace = get("HEALTHPROXY_NAMESPACE").unwrap_or_else(|| "default".into());
-        let port_name = get("HEALTHPROXY_PORT_NAME").unwrap_or_else(|| "http".into());
-        let port = parse_port(&get, "HEALTHPROXY_PORT", 8080)?;
-        let inventory = parse_inventory(&require(&get, "HEALTHPROXY_MEMBERS")?)?;
-        let interval = Duration::from_secs(parse_secs(&get, "HEALTHPROXY_INTERVAL_SECS", 2)?);
-        let health_timeout =
-            Duration::from_secs(parse_secs(&get, "HEALTHPROXY_HEALTH_TIMEOUT_SECS", 2)?);
+    pub fn build(
+        get: impl Fn(&str) -> Option<String>,
+        inventory_dir: std::path::PathBuf,
+        inventory: Vec<BackendInventoryMember>,
+    ) -> Result<Self, String> {
+        let health_base = require(&get, backend::HEALTHPROXY_HEALTH_BASE_ENV)?;
+        // Validate at the process boundary even though updatec also validates the CR before it
+        // projects this environment variable. The binary is independently runnable, and this is
+        // the one parser used by both paths rather than security inherited from a particular
+        // launcher.
+        let health_base = updated::http::network_endpoint(
+            &health_base,
+            updated::http::EndpointTransport::HttpOrHttps,
+            backend::HEALTHPROXY_HEALTH_BASE_ENV,
+        )
+        .map_err(|error| error.to_string())?
+        .to_string();
+        let namespace = get(backend::HEALTHPROXY_NAMESPACE_ENV).unwrap_or_else(|| "default".into());
+        let port_name = get(backend::HEALTHPROXY_PORT_NAME_ENV).unwrap_or_else(|| "http".into());
+        let port = parse_port(&get, backend::HEALTHPROXY_PORT_ENV, 8080)?;
+        let interval =
+            Duration::from_secs(parse_secs(&get, backend::HEALTHPROXY_INTERVAL_SECS_ENV, 2)?);
+        let health_timeout = Duration::from_secs(parse_secs(
+            &get,
+            backend::HEALTHPROXY_HEALTH_TIMEOUT_SECS_ENV,
+            2,
+        )?);
         // Selecting the HAProxy backend: a non-empty endpoint list switches from EndpointSlices to
         // programming that cluster of HAProxy admin sockets. Absent ⇒ the EndpointSlice backend.
-        let haproxy = match get("HEALTHPROXY_HAPROXY_ENDPOINTS") {
+        let haproxy = match get(backend::HEALTHPROXY_HAPROXY_ENDPOINTS_ENV) {
             Some(raw) if !raw.trim().is_empty() => {
                 let endpoints: Vec<String> = raw
                     .split(',')
@@ -781,32 +724,44 @@ impl Config {
                     .filter(|endpoint| !endpoint.is_empty())
                     .map(str::to_owned)
                     .collect();
-                if endpoints.is_empty() {
-                    return Err("HEALTHPROXY_HAPROXY_ENDPOINTS listed no endpoints".into());
+                if endpoints.is_empty()
+                    || endpoints
+                        .iter()
+                        .any(|endpoint| !updated_contracts::backend::is_tcp_endpoint(endpoint))
+                {
+                    return Err(format!(
+                        "{} must list TCP host:port endpoints",
+                        backend::HEALTHPROXY_HAPROXY_ENDPOINTS_ENV
+                    ));
                 }
                 // The backend name is interpolated into the same `;`-joined admin batch as the node
                 // identity (`set server {backend}/{node} state …`), so it faces the same gate, for
                 // the same two reasons: `;` or whitespace in it appends a second command to a
                 // `level admin` socket, and anything HAProxy answers with an error fails EVERY
                 // reconcile forever — the whole fleet never programmed again behind one log line.
-                let backend = get("HEALTHPROXY_HAPROXY_BACKEND").unwrap_or_else(|| "fleet".into());
-                if backend.is_empty() || !is_balancer_safe(&backend) {
+                let name =
+                    get(backend::HEALTHPROXY_HAPROXY_BACKEND_ENV).unwrap_or_else(|| "fleet".into());
+                if !backend::is_balancer_safe(&name) {
                     return Err(format!(
-                        "HEALTHPROXY_HAPROXY_BACKEND={backend:?} is not a usable HAProxy backend \
-                         name: it must be non-empty and contain no `;` and no whitespace, or it \
-                         would end the command it is written into"
+                        "{}={name:?} is not a usable HAProxy backend name: it must be non-empty \
+                         and contain no `;` and no whitespace, or it would end the command it is \
+                         written into",
+                        backend::HEALTHPROXY_HAPROXY_BACKEND_ENV
                     ));
                 }
-                Some(HAProxyTarget { endpoints, backend })
+                Some(HAProxyTarget {
+                    endpoints,
+                    backend: name,
+                })
             }
             _ => None,
         };
         // The target Kubernetes Service is required only for the EndpointSlice backend; the HAProxy
         // backend programs admin sockets and never touches a Service, so it does not need one.
         let service = if haproxy.is_some() {
-            get("HEALTHPROXY_SERVICE").unwrap_or_default()
+            get(backend::HEALTHPROXY_SERVICE_ENV).unwrap_or_default()
         } else {
-            require(&get, "HEALTHPROXY_SERVICE")?
+            require(&get, backend::HEALTHPROXY_SERVICE_ENV)?
         };
         Ok(Self {
             health_base,
@@ -815,17 +770,21 @@ impl Config {
             port_name,
             port,
             inventory,
+            inventory_dir,
             interval,
             health_timeout,
             haproxy,
             // Validated here so a typo is a startup error, not a listener that silently never
             // came up behind a Ready process.
-            metrics_address: get("HEALTHPROXY_METRICS_ADDRESS")
+            metrics_address: get(backend::HEALTHPROXY_METRICS_ADDRESS_ENV)
                 .filter(|value| !value.is_empty())
                 .map(|value| {
-                    value
-                        .parse::<SocketAddr>()
-                        .map_err(|error| format!("HEALTHPROXY_METRICS_ADDRESS={value:?}: {error}"))
+                    value.parse::<SocketAddr>().map_err(|error| {
+                        format!(
+                            "{}={value:?}: {error}",
+                            backend::HEALTHPROXY_METRICS_ADDRESS_ENV
+                        )
+                    })
                 })
                 .transpose()?,
         })
@@ -836,6 +795,43 @@ fn require(get: &impl Fn(&str) -> Option<String>, key: &str) -> Result<String, S
     get(key)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{key} is required"))
+}
+
+fn decode_inventory_shard(
+    bytes: Vec<u8>,
+    path: &std::path::Path,
+) -> Result<updated_contracts::backend::BackendInventoryShard, String> {
+    if bytes.len() > updated_contracts::backend::BACKEND_INVENTORY_SHARD_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the {}-byte inventory shard limit",
+            path.display(),
+            updated_contracts::backend::BACKEND_INVENTORY_SHARD_MAX_BYTES
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("decoding {}: {error}", path.display()))
+}
+
+async fn load_inventory(
+    directory: &std::path::Path,
+) -> Result<Vec<BackendInventoryMember>, String> {
+    let mut shards = Vec::with_capacity(updated_contracts::backend::BACKEND_INVENTORY_SHARDS);
+    for index in 0..updated_contracts::backend::BACKEND_INVENTORY_SHARDS {
+        let path = directory.join(format!("inventory-{index:02}.json"));
+        let read_path = path.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            foundation::file::read_bounded_regular(
+                &read_path,
+                updated_contracts::backend::BACKEND_INVENTORY_SHARD_MAX_BYTES,
+                foundation::file::FinalSymlink::Follow,
+            )
+        })
+        .await
+        .map_err(|error| format!("reading {}: task failed: {error}", path.display()))?
+        .map_err(|error| format!("reading {}: {error}", path.display()))?;
+        shards.push(decode_inventory_shard(bytes, &path)?);
+    }
+    let members = updated_contracts::backend::assemble_backend_inventory(shards)?;
+    parse_inventory(members)
 }
 
 fn parse_port(
@@ -871,145 +867,19 @@ fn parse_secs(
     }
 }
 
-/// Parse `node=address=pubkeyhex,node=address=pubkeyhex,…` into [`FleetNode`]s. The node identity
-/// must satisfy [`updated_contracts::telemetry::is_valid_node`] — the same grammar the write path
-/// enforces on `telemetry/<node>.json` — because a name only this side accepts is a node whose
-/// report can never be stored where [`fetch_report`] looks for it: the URL 404s every cycle and the
-/// node is drained forever behind the same log line as a genuinely unhealthy one. The same identity
-/// is the server name this programs into the balancer, so the one property that grammar does not
-/// cover — [`is_balancer_safe`] — is checked once, here, rather than at each use. The address must
-/// parse as a host — see [`host_of`] — but the port is carried by the Service, so only the host
-/// portion is kept, and an address of no recognizable shape is a startup error rather than a
-/// guessed-at host that is silently left out of rotation forever. The pinned public key is the node's enrollment EC point in hex; it is
-/// required, and required to be a usable [`PinnedKey`]: a key that is missing, or present but of a
-/// shape no report could ever verify against, is a configuration error rather than a node that is
-/// silently drained forever with the same log line as an unhealthy one.
-fn parse_inventory(raw: &str) -> Result<Vec<FleetNode>, String> {
-    let mut inventory = Vec::new();
-    for entry in raw
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let mut parts = entry.splitn(3, '=');
-        let node = parts.next().unwrap_or_default().trim();
-        let address = parts.next().unwrap_or_default().trim();
-        let key_hex = parts.next().unwrap_or_default().trim();
-        if node.is_empty() || address.is_empty() || key_hex.is_empty() {
-            return Err(format!(
-                "HEALTHPROXY_MEMBERS entry {entry:?} must be node=address=pubkeyhex"
-            ));
-        }
-        if !updated_contracts::telemetry::is_valid_node(node) {
-            return Err(format!(
-                "HEALTHPROXY_MEMBERS entry {entry:?} has node identity {node:?}, which is not a \
-                 valid node name: it must be a single path component (no `/`, `\\`, `:`, control \
-                 character, `.` or `..`) and must contain none of `. % ? #`"
-            ));
-        }
-        if !is_balancer_safe(node) {
-            return Err(format!(
-                "HEALTHPROXY_MEMBERS entry {entry:?} has node identity {node:?}, which is not a \
-                 usable balancer server name: it must contain no `;` and no whitespace, or it would \
-                 end the command it is written into"
-            ));
-        }
-        let public_key = PinnedKey::parse(key_hex).map_err(|reason| {
-            format!("HEALTHPROXY_MEMBERS entry {entry:?} has a pinned public key that {reason}")
-        })?;
-        let host = host_of(address).ok_or_else(|| {
-            format!("HEALTHPROXY_MEMBERS entry {entry:?} has an address that is not an IP literal, an [IPv6] literal, a hostname, or any of those with a port")
-        })?;
-        inventory.push(FleetNode {
-            node: node.to_string(),
-            address: host,
-            public_key,
-        });
-    }
-    if inventory.is_empty() {
-        return Err("HEALTHPROXY_MEMBERS listed no members".into());
-    }
-    Ok(inventory)
-}
-
-/// Whether an operator-supplied name can be written into a balancer command verbatim. Both names
-/// `haproxy::state_batches` interpolates go through it — the node identity that becomes the server
-/// name, and the `backend` section that qualifies it — because they share one command line and one
-/// consequence.
+/// Revalidate the projected member list at the shared protocol gate.
 ///
-/// [`updated_contracts::telemetry::is_valid_node`] is a URL/path grammar — it rejects `/ \ :`,
-/// `. % ? #`, and control characters — and none of that covers the syntax of the balancer the name
-/// is programmed into: the HAProxy Runtime API separates commands on a line with `;` and a
-/// command's own words with whitespace. A name carrying either does not name a server, it appends a
-/// second command to a `level admin` socket (`agent-0; shutdown frontend public` really does take
-/// the frontend down). Whitespace alone is enough to matter without any malice: `HAPROXY_BACKEND`
-/// with a copy-pasted trailing space emits `set server fleet /agent-0 state ready`, which HAProxy
-/// answers with an error for every member, so every reconcile fails and nothing is ever programmed.
-///
-/// It is applied where the value is *parsed* — [`parse_inventory`] for the identity,
-/// [`Config::build`] for the backend — because a name problem is a configuration error. Refusing it
-/// where it is interpolated instead would convert one operator typo into a fleet-wide outage: the
-/// backend would fail the whole reconcile, so *no* member — including every correctly named one —
-/// would ever be programmed again, every cycle, behind a single log line. That is exactly the
-/// "drained forever behind a log line" harm [`parse_inventory`] exists to prevent.
-fn is_balancer_safe(name: &str) -> bool {
-    !name.contains(|character: char| character == ';' || character.is_whitespace())
-}
-
-/// Extract the routable host from a configured member address, or `None` if the address is not a
-/// shape this component can route to.
-///
-/// The Service owns the port, so only the host is kept: a bare IP literal (v4 or v6) is kept
-/// verbatim — an unbracketed IPv6 like `::1` has no port to strip and must not be split on its own
-/// colons — a bracketed IPv6 is unwrapped with or without a trailing port, and an `ip:port` or
-/// `host:port` has its port dropped. A hostname may be root-anchored (`vm-db.internal.`): that
-/// trailing dot is the root label, not an empty one, and is dropped along with any port.
-///
-/// Anything else is `None`, which [`parse_inventory`] turns into a startup error. That is the same
-/// fail-closed policy as a mis-shaped pin, for the same reason: a host this function guessed at
-/// resolves to nothing on every cycle, so the node is left out of rotation forever behind a log
-/// line indistinguishable from a genuinely unreachable one. `[fd00::5]` — the natural bracketed
-/// spelling without a port — is exactly that case: split on its last colon it yields the host
-/// `[fd00:`, which is neither an IP literal nor a resolvable name.
-fn host_of(address: &str) -> Option<String> {
-    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
-        return Some(ip.to_string());
-    }
-    if let Ok(socket) = address.parse::<SocketAddr>() {
-        return Some(socket.ip().to_string());
-    }
-    if let Some(rest) = address.strip_prefix('[') {
-        // A bracketed literal `SocketAddr` could not parse: either there is no port, or the port
-        // is unusable. Only the first is a routable address.
-        let (literal, after) = rest.split_once(']')?;
-        let ip: std::net::Ipv6Addr = literal.parse().ok()?;
-        return after.is_empty().then(|| ip.to_string());
-    }
-    // A hostname, optionally with a port. A name carries no colons of its own, so the only colon
-    // that may appear is the port separator — and it must actually introduce a port.
-    let (host, port) = match address.rsplit_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (address, None),
-    };
-    if port.is_some_and(|port| port.parse::<u16>().is_err()) {
-        return None;
-    }
-    // A root-anchored FQDN (`vm-db.internal.`) is a legal spelling an operator may reasonably paste
-    // out of a DNS zone, so the one trailing dot is the root label rather than an empty one: drop it
-    // and validate what is left. Only that single dot is forgiven, so `host..example` and a bare `.`
-    // are still refused. The dot is dropped from the kept host too — the balancers this programs
-    // take a plain name, and the two spellings resolve identically.
-    let host = host.strip_suffix('.').unwrap_or(host);
-    let labelled = !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        });
-    labelled.then(|| host.to_string())
+/// There is no second, runtime representation to build: an entry that survives
+/// [`updated_contracts::backend::BackendInventoryMember::validate`] already carries its canonical
+/// routable address and its pinned key as a [`P256PublicKey`]. Reconstructing those into a
+/// proxy-local type is how the proxy's idea of a member and the control plane's drifted apart.
+fn parse_inventory(
+    entries: Vec<BackendInventoryMember>,
+) -> Result<Vec<BackendInventoryMember>, String> {
+    entries
+        .into_iter()
+        .map(BackendInventoryMember::validate)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1019,23 +889,37 @@ mod tests {
     use std::collections::HashMap;
     use updated_contracts::telemetry::NodeReport;
 
-    static TEST_KEY: std::sync::LazyLock<(Vec<u8>, PinnedKey)> = std::sync::LazyLock::new(|| {
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let key =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
-        (
-            pkcs8.as_ref().to_vec(),
-            PinnedKey::parse(&hex::encode(key.public_key().as_ref())).unwrap(),
-        )
-    });
+    static TEST_KEY: std::sync::LazyLock<(Vec<u8>, P256PublicKey)> =
+        std::sync::LazyLock::new(|| {
+            let rng = aws_lc_rs::rand::SystemRandom::new();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+            let key =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
+            (
+                pkcs8.as_ref().to_vec(),
+                P256PublicKey::parse_hex(&hex::encode(key.public_key().as_ref())).unwrap(),
+            )
+        });
 
-    /// A hex pin of the exact shape the report verifier requires. Config fixtures must use a
-    /// usable pin: the parser refuses anything else, which is the whole point of [`PinnedKey`].
+    /// A real, distinct pin per `seed`. Config fixtures must use a key the verifier could actually
+    /// use — the parser proves the point is on the curve, which is the whole point of
+    /// [`P256PublicKey`] — so a fabricated `04`-prefixed string cannot stand in for one.
     fn pin(seed: u8) -> String {
-        let mut point = vec![4u8; 65];
-        point[64] = seed;
-        hex::encode(point)
+        static PINS: std::sync::LazyLock<std::sync::Mutex<HashMap<u8, String>>> =
+            std::sync::LazyLock::new(Default::default);
+        PINS.lock()
+            .unwrap()
+            .entry(seed)
+            .or_insert_with(|| {
+                let rng = aws_lc_rs::rand::SystemRandom::new();
+                let pkcs8 =
+                    EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+                let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref())
+                    .unwrap();
+                hex::encode(key.public_key().as_ref())
+            })
+            .clone()
     }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -1046,20 +930,74 @@ mod tests {
         move |key: &str| map.get(key).cloned()
     }
 
+    fn active(node: &str, address: &str, key: &str) -> backend::BackendInventoryMember {
+        backend::BackendInventoryMember::active(node, address, key).unwrap()
+    }
+
+    fn config(
+        pairs: &[(&str, &str)],
+        inventory: &[backend::BackendInventoryMember],
+    ) -> Result<Config, String> {
+        Config::build(
+            env(pairs),
+            "/inventory".into(),
+            parse_inventory(inventory.to_vec())?,
+        )
+    }
+
     /// A well-formed running digest. The proxy never reads it — membership follows health — but it
     /// must be present and well-formed for a report to pass the shared trust gate at all.
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     /// A report the node signs *after* `mutate` runs, so a fixture can be authentically signed and
     /// still be one the trust gate must refuse.
-    fn report_with(node: &str, healthy: bool, mutate: impl FnOnce(&mut NodeReport)) -> Vec<u8> {
-        let mut report = NodeReport::new(node, "deploy-3", DIGEST, "3.0.0", DIGEST, healthy);
+    fn report_with(node: &str, healthy: bool, mutate: impl FnOnce(&mut NodeReport)) -> Envelope {
+        let mut report =
+            NodeReport::new(node, "deploy-3", DIGEST, "3.0.0", DIGEST, DIGEST, healthy);
         mutate(&mut report);
-        let envelope = updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
-        serde_json::to_vec(&envelope).unwrap()
+        bind_reconciliation(&mut report);
+        updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap()
     }
 
-    fn report(node: &str, healthy: bool) -> Vec<u8> {
+    fn bind_reconciliation(report: &mut NodeReport) {
+        use updated_contracts::reconciler::{
+            HostAction, LastReconciliation, Operation, Reason, ReconciledRelease,
+            ReconcilerIdentity, ResultDocument, ResultStatus,
+        };
+        let running = ReconciledRelease {
+            version: report.version.clone(),
+            manifest_sha256: DIGEST.into(),
+            archive_sha256: report.archive_sha256.clone(),
+        };
+        report.reconciliation = Some(LastReconciliation {
+            schema: LastReconciliation::SCHEMA,
+            operation: Operation::Apply,
+            reason: Reason::Restart,
+            attempt_id: updated_contracts::reconciler::attempt::CONVERGE.into(),
+            candidate: running.clone(),
+            predecessor: running,
+            reconciler: ReconcilerIdentity {
+                provider_set_sha256: report.provider_set_sha256.clone(),
+                product: "system".into(),
+                release: ReconciledRelease {
+                    version: "1.0.0".into(),
+                    manifest_sha256: DIGEST.into(),
+                    archive_sha256: DIGEST.into(),
+                },
+            },
+            result: ResultDocument {
+                schema: ResultDocument::SCHEMA,
+                status: ResultStatus::Succeeded,
+                changed: false,
+                host_action: HostAction::None,
+                retry_after_seconds: None,
+                message: None,
+            },
+            completed_at_ms: 1,
+        });
+    }
+
+    fn report(node: &str, healthy: bool) -> Envelope {
         report_with(node, healthy, |_| {})
     }
 
@@ -1089,14 +1027,20 @@ mod tests {
         Outcome::WrongSchema,
     ];
 
-    /// The fetched body an outcome produces for `node` (`None` = the fetch failed this cycle).
-    fn body_for(outcome: Outcome, node: &str) -> Option<Vec<u8>> {
+    /// The observed envelope an outcome produces for `node` (`None` = the node was not observed
+    /// this cycle: the indexed generation fetch failed, or it carried no entry for the node).
+    fn body_for(outcome: Outcome, node: &str) -> Option<Envelope> {
         match outcome {
             Outcome::HealthyFresh => Some(report(node, true)),
             Outcome::Unhealthy => Some(report(node, false)),
             // A healthy report, but for a *different* node — must never mark this one ready.
             Outcome::WrongNode => Some(report("someone-else", true)),
-            Outcome::Malformed => Some(b"{ not valid json".to_vec()),
+            // An envelope whose payload is not a report at all — a corrupt fleet-document entry.
+            Outcome::Malformed => Some(Envelope {
+                payload: "eyBub3QgdmFsaWQganNvbg==".into(),
+                payload_type: updated_contracts::telemetry::REPORT_PAYLOAD_TYPE.into(),
+                signatures: Vec::new(),
+            }),
             // Healthy and genuinely signed, but refused by the shared trust gate — a node whose
             // report this build cannot interpret must drain, not linger in rotation.
             Outcome::MalformedDigest => Some(report_with(node, true, |report| {
@@ -1166,7 +1110,7 @@ mod tests {
             let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
             // Per-node cross-cycle state: the real cache under test, the model's view of what body is
             // cached, and the previous readiness the transition classifier saw.
-            let mut cache: LastKnownGood<Vec<u8>> = LastKnownGood::new();
+            let mut cache: LastKnownGood<Envelope> = LastKnownGood::new();
             let mut cached_kind: HashMap<String, Outcome> = HashMap::new();
             let mut previous: HashMap<String, bool> = HashMap::new();
 
@@ -1255,82 +1199,113 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_empty_documents_fail_closed() {
-        assert!(!report_is_ready("agent-7", &TEST_KEY.1, b""));
-        assert!(!report_is_ready("agent-7", &TEST_KEY.1, b"not json"));
-        assert!(!report_is_ready("agent-7", &TEST_KEY.1, b"{}"));
+    fn unusable_envelopes_fail_closed() {
+        // Not a report payload type, no signatures, garbage payload: each fails closed alone.
+        for envelope in [
+            Envelope {
+                payload: String::new(),
+                payload_type: "application/other".into(),
+                signatures: Vec::new(),
+            },
+            Envelope {
+                payload: "!!!not base64!!!".into(),
+                payload_type: updated_contracts::telemetry::REPORT_PAYLOAD_TYPE.into(),
+                signatures: Vec::new(),
+            },
+        ] {
+            assert!(!report_is_ready("agent-7", &TEST_KEY.1, &envelope));
+        }
     }
 
     #[test]
     fn config_requires_base_service_and_members() {
-        let members = format!(
-            "agent-0=10.0.0.1:8080={}, agent-1=10.0.0.2={}",
-            pin(1),
-            pin(2)
-        );
-        let ok = Config::build(env(&[
-            ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
-            ("HEALTHPROXY_SERVICE", "vm-db"),
-            ("HEALTHPROXY_MEMBERS", &members),
-        ]))
+        let members = vec![
+            active("agent-0", "10.0.0.1", &pin(1)),
+            active("agent-1", "10.0.0.2", &pin(2)),
+        ];
+        let ok = config(
+            &[
+                ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
+                ("HEALTHPROXY_SERVICE", "vm-db"),
+            ],
+            &members,
+        )
         .unwrap();
         assert_eq!(ok.namespace, "default");
         assert_eq!(ok.port, 8080);
         assert_eq!(
             ok.inventory,
             vec![
-                FleetNode {
+                BackendInventoryMember::Active {
                     node: "agent-0".into(),
                     address: "10.0.0.1".into(),
-                    public_key: PinnedKey::parse(&pin(1)).unwrap(),
+                    public_key: P256PublicKey::parse_hex(&pin(1)).unwrap(),
                 },
-                FleetNode {
+                BackendInventoryMember::Active {
                     node: "agent-1".into(),
                     address: "10.0.0.2".into(),
-                    public_key: PinnedKey::parse(&pin(2)).unwrap(),
+                    public_key: P256PublicKey::parse_hex(&pin(2)).unwrap(),
                 },
             ]
         );
 
-        assert!(Config::build(env(&[
-            ("HEALTHPROXY_SERVICE", "x"),
-            ("HEALTHPROXY_MEMBERS", &members)
-        ]))
-        .is_err());
-        assert!(Config::build(env(&[
-            ("HEALTHPROXY_HEALTH_BASE", "x"),
-            ("HEALTHPROXY_MEMBERS", &members)
-        ]))
-        .is_err());
-        assert!(Config::build(env(&[
-            ("HEALTHPROXY_HEALTH_BASE", "x"),
-            ("HEALTHPROXY_SERVICE", "s")
-        ]))
+        assert!(config(&[("HEALTHPROXY_SERVICE", "x")], &members).is_err());
+        assert!(config(&[("HEALTHPROXY_HEALTH_BASE", "x")], &members).is_err());
+        for invalid in [
+            "file:///health",
+            "http://user@health.example/",
+            "https://health.example/?token=secret",
+            "https://health.example/#fragment",
+        ] {
+            let error = config(
+                &[
+                    ("HEALTHPROXY_HEALTH_BASE", invalid),
+                    ("HEALTHPROXY_SERVICE", "vm-db"),
+                ],
+                &members,
+            )
+            .unwrap_err();
+            assert!(!error.contains("secret"), "URL leaked in {error}");
+        }
+        // A membership of nobody never reaches `Config::build`: `parse_inventory` is the one place a
+        // `Vec<BackendInventoryMember>` comes into existence, so it is the one place that refuses an empty one —
+        // the same order `from_env` runs them in.
+        assert!(config(
+            &[
+                ("HEALTHPROXY_HEALTH_BASE", "x"),
+                ("HEALTHPROXY_SERVICE", "s")
+            ],
+            &[]
+        )
         .is_err());
     }
 
     #[test]
     fn haproxy_endpoints_select_the_haproxy_backend() {
         // No HAProxy endpoints ⇒ the EndpointSlice backend.
-        let one = format!("agent-0=10.0.0.1={}", pin(1));
-        let slice = Config::build(env(&[
-            ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
-            ("HEALTHPROXY_SERVICE", "vm-db"),
-            ("HEALTHPROXY_MEMBERS", &one),
-        ]))
+        let one = vec![active("agent-0", "10.0.0.1", &pin(1))];
+        let slice = config(
+            &[
+                ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
+                ("HEALTHPROXY_SERVICE", "vm-db"),
+            ],
+            &one,
+        )
         .unwrap();
         assert_eq!(slice.haproxy, None);
 
         // A non-empty endpoint list ⇒ the HAProxy backend, default backend name "fleet".
-        let haproxy = Config::build(env(&[
-            ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
-            ("HEALTHPROXY_SERVICE", "fleet-haproxy"),
-            ("HEALTHPROXY_MEMBERS", &one),
-            (
-                "HEALTHPROXY_HAPROXY_ENDPOINTS",
-                "10.0.0.9:9999, 10.0.0.10:9999",
-            ),
-        ]))
+        let haproxy = config(
+            &[
+                ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
+                ("HEALTHPROXY_SERVICE", "fleet-haproxy"),
+                (
+                    "HEALTHPROXY_HAPROXY_ENDPOINTS",
+                    "10.0.0.9:9999, 10.0.0.10:9999",
+                ),
+            ],
+            &one,
+        )
         .unwrap();
         assert_eq!(
             haproxy.haproxy,
@@ -1353,15 +1328,17 @@ mod tests {
     /// interpolation, where it would be that fleet-wide outage.
     #[test]
     fn an_unsafe_haproxy_backend_name_is_a_startup_error() {
-        let one = format!("agent-0=10.0.0.1={}", pin(1));
+        let one = vec![active("agent-0", "10.0.0.1", &pin(1))];
         let with_backend = |backend: &str| {
-            Config::build(env(&[
-                ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
-                ("HEALTHPROXY_SERVICE", "fleet-haproxy"),
-                ("HEALTHPROXY_MEMBERS", &one),
-                ("HEALTHPROXY_HAPROXY_ENDPOINTS", "10.0.0.9:9999"),
-                ("HEALTHPROXY_HAPROXY_BACKEND", backend),
-            ]))
+            config(
+                &[
+                    ("HEALTHPROXY_HEALTH_BASE", "http://gw"),
+                    ("HEALTHPROXY_SERVICE", "fleet-haproxy"),
+                    ("HEALTHPROXY_HAPROXY_ENDPOINTS", "10.0.0.9:9999"),
+                    ("HEALTHPROXY_HAPROXY_BACKEND", backend),
+                ],
+                &one,
+            )
         };
         for refused in [
             // Command injection on the admin socket.
@@ -1383,8 +1360,12 @@ mod tests {
             );
         }
         // The same predicate as the node identity, so one gate really is one gate.
-        assert!(!is_balancer_safe("fleet; shutdown frontend public"));
-        assert!(is_balancer_safe("fleet-eu-west"));
+        assert!(!updated_contracts::backend::is_balancer_safe(
+            "fleet; shutdown frontend public"
+        ));
+        assert!(updated_contracts::backend::is_balancer_safe(
+            "fleet-eu-west"
+        ));
         // And an ordinary name still starts.
         assert_eq!(
             with_backend("fleet-eu-west")
@@ -1396,105 +1377,57 @@ mod tests {
         );
     }
 
-    /// The report poll gates rotation on freshness, so the pass that reads the reports must finish
-    /// well inside the freshness window at EVERY fleet size. Past that point bodies read in the
-    /// first wave age out before the pass ends and healthy nodes are drained — by the checker's own
-    /// cycle time, not by anything the nodes did.
-    ///
-    /// The pass may only buy that with *width*. Buying it by shrinking the per-request budget is
-    /// the same mass eviction by another route: below a real HTTPS round trip every fetch in the
-    /// pass times out, the whole fleet falls to last-known-good, and one window later the whole
-    /// fleet reads not-ready. So the operator's budget is a floor at every size.
-    ///
-    /// And the width it is bought with is a width the runtime can really deliver. Each fetch
-    /// resolves `health_base` through the same blocking pool the hostname lookups reserve half of,
-    /// so past [`REPORT_POLL_CONCURRENCY`] the surplus requests queue rather than run — an uncapped
-    /// derivation would "fit" the share only on paper (100_000 nodes asked for 14_286 simultaneous
-    /// requests against a 512-thread pool) while starving the other fan-out of the pool it was
-    /// sized against. Beyond the size the cap can cover, the honest answer is that the pass does not
-    /// fit and `run` says so at startup — not an arithmetic that claims otherwise.
-    #[test]
-    fn the_report_poll_fits_inside_its_share_of_the_freshness_window_at_every_fleet_size() {
-        let share = REPORT_FRESHNESS / POLL_SHARE;
-        for health_timeout in [
-            Duration::from_secs(1),
-            // The `HEALTHPROXY_HEALTH_TIMEOUT_SECS` default.
-            Duration::from_secs(2),
-            Duration::from_secs(10),
-            share,
-            // Wider than the whole share: one wave at the operator's budget, and it may overrun.
-            share * 2,
-        ] {
-            // 225 / 1000 / 4000 are the sizes at which the derived-budget form fell to 1.87s,
-            // 468ms and 117ms respectively — all under a real round trip, 225 already under the
-            // 2s default.
-            for nodes in [0, 1, FANOUT_CONCURRENCY, 96, 225, 1000, 4000, 100_000] {
-                let plan = poll_plan(nodes, health_timeout);
-                // (a) The operator's per-request budget is never shrunk to make the pass fit.
-                assert_eq!(
-                    plan.timeout, health_timeout,
-                    "{nodes} nodes must not shrink the operator's {health_timeout:?} budget"
-                );
-                assert!(plan.concurrency >= FANOUT_CONCURRENCY);
-                // (b) The width is one the runtime can actually run: never past this fan-out's
-                // share of the blocking pool every request resolves through.
-                assert!(
-                    plan.concurrency <= REPORT_POLL_CONCURRENCY,
-                    "{nodes} nodes ask for width {}, past the {REPORT_POLL_CONCURRENCY} requests the blocking pool can really resolve at once",
-                    plan.concurrency
-                );
-                // (c) The waves that width implies fit the share — whenever a width within the cap
-                // can make them fit at all. Exactly one wave is the other acceptable answer: it is
-                // all a budget at or above the share can afford, and all a fleet larger than the
-                // cap can cover in one.
-                let waves = nodes.div_ceil(plan.concurrency).max(1) as u32;
-                let fits_the_pool =
-                    nodes.div_ceil(REPORT_POLL_CONCURRENCY) as u32 * plan.timeout <= share;
-                assert!(
-                    waves == 1 || !fits_the_pool || plan.timeout * waves <= share,
-                    "{nodes} nodes take {waves} wave(s) of {:?} at width {}, past the {share:?} poll share a width within the pool could have fit",
-                    plan.timeout,
-                    plan.concurrency
-                );
-            }
-        }
-        // A fleet that fits the base width in the waves its budget allows is not fanned out wider
-        // than it needs to be.
-        assert_eq!(
-            poll_plan(FANOUT_CONCURRENCY, Duration::from_secs(2)).concurrency,
-            FANOUT_CONCURRENCY
-        );
-        // A fleet that does not gets exactly the parallelism that fits it into its allowed waves...
-        let waves_allowed = (share.as_secs() / 2) as usize;
-        assert_eq!(
-            poll_plan(1000, Duration::from_secs(2)).concurrency,
-            1000usize.div_ceil(waves_allowed)
-        );
-        // ...up to the pool's ceiling, which a fleet this size asks well past (4000 nodes wanted
-        // 572, 100_000 wanted 14_286 — 28x the whole pool).
-        assert_eq!(
-            poll_plan(4000, Duration::from_secs(2)).concurrency,
-            REPORT_POLL_CONCURRENCY
-        );
-        assert_eq!(
-            poll_plan(100_000, Duration::from_secs(2)).concurrency,
-            REPORT_POLL_CONCURRENCY
-        );
-        // The two name-resolving fan-outs partition the pool rather than each claiming all of it.
-        const { assert!(REPORT_POLL_CONCURRENCY + NAME_LOOKUP_CONCURRENCY <= BLOCKING_POOL_THREADS) };
-    }
-
     #[test]
     fn inventory_rejects_malformed_entries() {
-        assert!(parse_inventory("agent-0").is_err());
-        assert!(parse_inventory(&format!("=10.0.0.1={}", pin(1))).is_err());
-        assert!(parse_inventory("agent-0=").is_err());
-        assert!(parse_inventory("").is_err());
-        // A member without a pinned key is rejected — a keyless node could never verify, so it is a
-        // configuration error rather than a silently-never-ready node.
-        assert!(parse_inventory("agent-0=10.0.0.1").is_err());
-        // A non-hex pinned key is rejected.
-        assert!(parse_inventory("agent-0=10.0.0.1=zz").is_err());
+        assert!(backend::BackendInventoryMember::active("", "10.0.0.1", &pin(1)).is_err());
+        assert!(backend::BackendInventoryMember::active("agent-0", "", &pin(1)).is_err());
+        assert!(backend::BackendInventoryMember::active("agent-0", "10.0.0.1", "zz").is_err());
+        // A complete signed-revision inventory of nobody is an explicit drain, distinct from a
+        // missing/corrupt projection, which `load_inventory` rejects before this parser.
+        assert_eq!(parse_inventory(Vec::new()).unwrap(), Vec::new());
+        let duplicate = vec![
+            active("agent-0", "10.0.0.1", &pin(1)),
+            active("agent-0", "10.0.0.2", &pin(2)),
+        ];
+        assert!(backend::shard_backend_inventory(&duplicate).is_err());
+    }
+
+    #[tokio::test]
+    async fn projected_inventory_is_complete_and_one_revision_or_not_adopted() {
+        let directory = tempfile::tempdir().unwrap();
+        let members = vec![
+            active("agent-0", "10.0.0.1", &pin(1)),
+            active("agent-1", "10.0.0.2", &pin(2)),
+        ];
+        let shards = updated_contracts::backend::shard_backend_inventory(&members).unwrap();
+        for shard in &shards {
+            std::fs::write(
+                directory
+                    .path()
+                    .join(format!("inventory-{:02}.json", shard.index)),
+                serde_json::to_vec(shard).unwrap(),
+            )
+            .unwrap();
+        }
+        let loaded = load_inventory(directory.path()).await.unwrap();
+        assert_eq!(loaded.len(), members.len());
+
+        let mut mixed = shards[1].clone();
+        mixed.revision = "0".repeat(64);
+        std::fs::write(
+            directory.path().join("inventory-01.json"),
+            serde_json::to_vec(&mixed).unwrap(),
+        )
+        .unwrap();
+        assert!(load_inventory(directory.path()).await.is_err());
+
+        std::fs::write(
+            directory.path().join("inventory-00.json"),
+            vec![b'x'; updated_contracts::backend::BACKEND_INVENTORY_SHARD_MAX_BYTES + 1],
+        )
+        .unwrap();
+        let error = load_inventory(directory.path()).await.unwrap_err();
+        assert!(error.contains("size limit"), "{error}");
     }
 
     /// A pin of the wrong shape verifies nothing, so a node carrying one would be drained forever
@@ -1502,37 +1435,34 @@ mod tests {
     #[test]
     fn a_pin_the_verifier_could_never_use_is_a_startup_error() {
         // A certificate digest (32 bytes) and a compressed point are the realistic paste errors.
-        assert!(PinnedKey::parse(&"ab".repeat(32)).is_err());
-        assert!(PinnedKey::parse(&format!("02{}", "ab".repeat(32))).is_err());
-        // 65 bytes, but not an uncompressed point, and the all-zero encoding.
-        assert!(PinnedKey::parse(&format!("03{}", "ab".repeat(64))).is_err());
-        assert!(PinnedKey::parse(&format!("04{}", "00".repeat(64))).is_err());
-        assert!(PinnedKey::parse(&pin(1)).is_ok());
+        assert!(P256PublicKey::parse_hex(&"ab".repeat(32)).is_err());
+        assert!(P256PublicKey::parse_hex(&format!("02{}", "ab".repeat(32))).is_err());
+        // 65 bytes, but not an uncompressed point; the all-zero encoding; and — the paste error
+        // shape alone never caught — a correctly tagged 65-byte point that is not on the curve.
+        assert!(P256PublicKey::parse_hex(&format!("03{}", "ab".repeat(64))).is_err());
+        assert!(P256PublicKey::parse_hex(&format!("04{}", "00".repeat(64))).is_err());
+        assert!(P256PublicKey::parse_hex(&format!("04{}", "ab".repeat(64))).is_err());
+        assert!(P256PublicKey::parse_hex(&pin(1)).is_ok());
 
-        let error = parse_inventory(&format!("agent-3=10.0.0.1={}", "ab".repeat(32)))
-            .expect_err("a malformed pin is refused at config time");
+        let error =
+            backend::BackendInventoryMember::active("agent-3", "10.0.0.1", &"ab".repeat(32))
+                .expect_err("a malformed pin is refused at config time");
         assert!(error.contains("uncompressed P-256 point"), "{error}");
     }
 
-    /// A node identity this side accepts but the write path's grammar rejects is a node whose
-    /// report can never exist at `telemetry/<node>.json`: the fetch 404s every cycle and the node
-    /// is drained forever behind the same line as an unhealthy one. So the inventory is gated on
-    /// the very predicate the write path uses, and both sides are asserted to agree here.
+    /// Inventory and report maps use the same Kubernetes DNS-subdomain identity grammar.
     #[test]
-    fn a_node_identity_the_write_path_could_never_store_is_a_startup_error() {
-        for node in ["agent-0", "agent_7", "AGENT-7", "a"] {
-            let parsed = parse_inventory(&format!("{node}=10.0.0.1={}", pin(1)))
-                .expect("a name the write path accepts is configurable");
-            assert_eq!(parsed[0].node, node);
-            assert_eq!(
-                updated_contracts::telemetry::node_from_path(&format!("/telemetry/{node}.json")),
-                Some(node),
-                "{node} must round-trip through the write path it was accepted for"
-            );
+    fn a_node_identity_outside_the_shared_grammar_is_a_startup_error() {
+        for node in ["agent-0", "rack-1.agent-7", "a"] {
+            let parsed = backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1))
+                .expect("a valid node name is configurable");
+            assert_eq!(parsed.node(), node);
+            assert!(updated_contracts::telemetry::is_valid_node(node));
         }
         for node in [
             "agent#1",
-            "agent.7",
+            "agent_7",
+            "AGENT-7",
             "agent/7",
             "agent\\7",
             "agent:7",
@@ -1542,31 +1472,38 @@ mod tests {
             "..",
             "agent\n7",
         ] {
-            let error = parse_inventory(&format!("{node}=10.0.0.1={}", pin(1)))
+            let error = backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1))
                 .expect_err("a name the write path rejects is refused at config time");
             // The offending name is named back to the operator, escaped — a name whose damage is a
             // stray `\n` must be legible in the log line that refuses it.
             assert!(error.contains(&format!("{node:?}")), "{error}");
-            assert!(error.contains("valid node name"), "{error}");
-            assert_eq!(
-                updated_contracts::telemetry::node_from_path(&format!("/telemetry/{node}.json")),
-                None,
-                "{node} must be refused for exactly the reason claimed"
-            );
+            assert!(error.contains("invalid node identity"), "{error}");
+            assert!(!updated_contracts::telemetry::is_valid_node(node));
         }
-        // The empty identity is refused too, by the `node=address=pubkeyhex` shape check that
-        // already ran — the grammar agrees, but the earlier message is the more useful one.
-        assert!(parse_inventory(&format!("=10.0.0.1={}", pin(1))).is_err());
-        // Length is not part of the grammar: a long-but-safe name is configurable.
-        assert!(parse_inventory(&format!("{}=10.0.0.1={}", "a".repeat(512), pin(1))).is_ok());
+        assert!(backend::BackendInventoryMember::active("", "10.0.0.1", &pin(1)).is_err());
+        // The shared grammar carries Kubernetes' object-name ceiling because every production
+        // node identity must be representable as an UpdateAgent.
+        let maximum = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(maximum.len(), updated_contracts::telemetry::MAX_NODE_BYTES);
+        assert!(backend::BackendInventoryMember::active(&maximum, "10.0.0.1", &pin(1)).is_ok());
+        assert!(backend::BackendInventoryMember::active(
+            "a".repeat(updated_contracts::telemetry::MAX_NODE_BYTES + 1),
+            "10.0.0.1",
+            &pin(1)
+        )
+        .is_err());
     }
 
     /// The identity is also the server name programmed into the balancer, where `;` separates
-    /// commands and whitespace separates a command's words — neither of which the write path's
-    /// URL/path grammar forbids. `agent-0; shutdown frontend public` would be two commands on a
-    /// `level admin` socket, so it must be refused *here*, at startup, where it is one operator's
-    /// typo: refusing it at the point of interpolation instead fails the whole reconcile, so every
-    /// correctly named node in the fleet stops being programmed too, every cycle, forever.
+    /// commands and whitespace separates words. The shared DNS-subdomain identity grammar already
+    /// refuses those bytes; the sink-specific guard remains defense in depth if that grammar is
+    /// ever widened.
     #[test]
     fn a_node_identity_that_could_end_a_balancer_command_is_a_startup_error() {
         for node in [
@@ -1575,16 +1512,17 @@ mod tests {
             "agent-0 state maint",
             "agent\t0",
         ] {
-            let error = parse_inventory(&format!("{node}=10.0.0.1={}", pin(1)))
+            let error = backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1))
                 .expect_err("a name that would end the command it is written into is refused");
             assert!(error.contains(&format!("{node:?}")), "{error}");
-            assert!(!is_balancer_safe(node));
+            assert!(!updated_contracts::backend::is_balancer_safe(node));
         }
-        // Everything the inventory grammar actually intends as an identity still passes, and it is
-        // the same set the write path accepts — one gate, not two disagreeing ones.
-        for node in ["agent-0", "vm_db-17", "AGENT-7"] {
-            assert!(is_balancer_safe(node));
-            assert!(parse_inventory(&format!("{node}=10.0.0.1={}", pin(1))).is_ok());
+        // Everything the shared identity grammar accepts is safe for the balancer too, including
+        // dotted cluster-scoped names.
+        for node in ["agent-0", "vm-db-17", "agent-7.prod"] {
+            assert!(updated_contracts::telemetry::is_valid_node(node));
+            assert!(updated_contracts::backend::is_balancer_safe(node));
+            assert!(backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1)).is_ok());
         }
     }
 
@@ -1622,25 +1560,31 @@ mod tests {
         );
     }
 
-    /// Every address spelling an operator may reasonably write, and what host it must yield.
-    /// A bracketed IPv6 *without* a port is the one that used to be split on its last colon into
-    /// `[fd00:` — accepted at startup, unresolvable forever after.
     #[test]
-    fn every_address_form_yields_its_host() {
+    fn removing_members_prunes_their_last_known_reports() {
+        let mut known: LastKnownGood<String> = LastKnownGood::new();
+        let now = Instant::now();
+        known.resolve("departed", Some("old".into()), now);
+        known.resolve("active", Some("current".into()), now);
+        known.retain(|node| node == "active");
+        assert_eq!(known.resolve("departed", None, now), None);
+        assert_eq!(known.resolve("active", None, now), Some("current".into()));
+    }
+
+    /// The backend address has one meaning and one grammar: a host. A port belongs to the
+    /// `UpdateBackend` target; accepting one here and discarding it made a typo look configured
+    /// while traffic went somewhere else.
+    #[test]
+    fn backend_addresses_have_one_host_only_form() {
         for (address, expected) in [
             ("10.0.0.1", "10.0.0.1"),
-            ("10.0.0.1:8443", "10.0.0.1"),
             ("fd00::5", "fd00::5"),
-            ("[fd00::5]", "fd00::5"),
-            ("[fd00::5]:8443", "fd00::5"),
             ("host.example", "host.example"),
-            ("host.example:8443", "host.example"),
             // Root-anchored FQDNs: the trailing dot is the root label, not an empty one.
             ("vm-db.internal.", "vm-db.internal"),
-            ("vm-db.internal.:5432", "vm-db.internal"),
         ] {
             assert_eq!(
-                host_of(address).as_deref(),
+                updated_contracts::backend::routable_host(address).as_deref(),
                 Some(expected),
                 "address {address:?}"
             );
@@ -1659,47 +1603,58 @@ mod tests {
             "[fd00::5]:notaport",
             "[fd00::5]junk",
             "host.example:notaport",
+            "host.example:8443",
+            "10.0.0.1:8443",
+            "[fd00::5]",
             // Only ONE trailing dot is the root label; a doubled dot is still an empty label.
             "host..example",
             "host.example..",
+            "bad_name.example",
+            "-host.example",
+            "host-.example",
+            // An invalid IP must not fall through into platform-dependent numeric-host parsing.
+            "999.999.999.999",
             ".",
-            // Out of the port range: fail-closed, since the Service owns the port and a member
-            // written with an impossible one is a configuration error, not a routable host.
             "host.example:65536",
             "10.0.0.1:99999",
             "",
         ] {
-            assert_eq!(host_of(address), None, "address {address:?}");
+            assert_eq!(
+                updated_contracts::backend::routable_host(address),
+                None,
+                "address {address:?}"
+            );
         }
-        let error = parse_inventory(&format!("agent-3=[fd00::5]junk={}", pin(1)))
+        let error = backend::BackendInventoryMember::active("agent-3", "[fd00::5]junk", &pin(1))
             .expect_err("an address of no recognizable shape is refused at config time");
-        assert!(error.contains("not an IP literal"), "{error}");
+        assert!(error.contains("unroutable address"), "{error}");
     }
 
     #[test]
-    fn inventory_keeps_only_the_host_across_address_forms() {
+    fn inventory_keeps_canonical_host_spellings() {
         let key = pin(1);
-        let parsed = parse_inventory(&format!(
-            "v4=10.0.0.1={key}, v4p=10.0.0.2:8080={key}, v6=::1={key}, v6p=[fe80::1]:8080={key}, \
-             v6b=[fd00::5]={key}, h=vm-db.internal={key}, hp=vm-db.internal:5432={key}"
-        ))
+        let parsed = parse_inventory(vec![
+            active("v4", "10.0.0.1", &key),
+            active("v6", "::1", &key),
+            active("h", "vm-db.internal", &key),
+            active("rooted", "rooted.internal.", &key),
+        ])
         .unwrap();
         let hosts: Vec<(String, String)> = parsed
             .into_iter()
-            .map(|member| (member.node, member.address))
+            .map(|member| match member {
+                BackendInventoryMember::Active { node, address, .. } => (node, address),
+                BackendInventoryMember::Cordoned { node } => panic!("unexpected cordon {node}"),
+            })
             .collect();
         assert_eq!(
             hosts,
             vec![
                 ("v4".into(), "10.0.0.1".to_string()),
-                ("v4p".into(), "10.0.0.2".to_string()),
                 // A bare, unbracketed IPv6 must be kept whole — not split on its own colons.
                 ("v6".into(), "::1".to_string()),
-                ("v6p".into(), "fe80::1".to_string()),
-                // Bracketed without a port: the brackets are stripped, not split on.
-                ("v6b".into(), "fd00::5".to_string()),
                 ("h".into(), "vm-db.internal".to_string()),
-                ("hp".into(), "vm-db.internal".to_string()),
+                ("rooted".into(), "rooted.internal".to_string()),
             ]
         );
     }
@@ -1720,51 +1675,19 @@ mod tests {
             !drain_is_stale(now, Some(&report("agent-7", false))),
             "a fresh not-ready report is a health drain, not a staleness drain"
         );
+        let garbage = Envelope {
+            payload: "!!!not base64!!!".into(),
+            payload_type: updated_contracts::telemetry::REPORT_PAYLOAD_TYPE.into(),
+            signatures: Vec::new(),
+        };
         assert!(
-            !drain_is_stale(now, Some(b"not json")),
-            "an unusable body is not attributed to staleness"
+            !drain_is_stale(now, Some(&garbage)),
+            "an unusable envelope is not attributed to staleness"
         );
         let stale = report_with("agent-7", true, |report| {
             report.reported_at_ms =
                 now.saturating_sub(REPORT_FRESHNESS.as_millis() as u64 + 10_000);
         });
         assert!(drain_is_stale(now, Some(&stale)));
-    }
-
-    /// docs/node-controls-design.md — cordon: the endpoint projection resolves through the same
-    /// last-known-good discipline as the reports, and fails OPEN: no projection, or one that aged
-    /// out entirely, means nobody is cordoned and health alone governs.
-    #[test]
-    fn the_drained_projection_is_sticky_across_blips_and_fails_open() {
-        use std::collections::BTreeSet;
-        let mut cache: LastKnownGood<BTreeSet<String>> = LastKnownGood::new();
-        let projection = BTreeSet::from(["agent-0".to_string()]);
-        let now = Instant::now();
-
-        // A fresh fetch programs the cordon.
-        let drained = cache
-            .resolve("endpoints", Some(projection.clone()), now)
-            .unwrap_or_default();
-        assert!(drained.contains("agent-0"));
-
-        // A checker-side blip reuses the last known projection: a deliberate cordon must not flap
-        // because the CDN blinked.
-        let drained = cache
-            .resolve("endpoints", None, now + Duration::from_secs(1))
-            .unwrap_or_default();
-        assert!(drained.contains("agent-0"));
-
-        // Aged out entirely: fail open — nobody cordoned, health alone governs. This is also what
-        // a store that never published a projection resolves to: every fetch (404 included) is a
-        // failed observation, and an empty cache reads as an empty set — never a cached empty
-        // document that would erase a real cordon on one transient 404.
-        let drained = cache
-            .resolve(
-                "endpoints",
-                None,
-                now + LastKnownGood::<BTreeSet<String>>::STALENESS + Duration::from_secs(1),
-            )
-            .unwrap_or_default();
-        assert!(drained.is_empty());
     }
 }

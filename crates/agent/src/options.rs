@@ -25,16 +25,20 @@ pub(crate) async fn parse_args() -> Result<Options, String> {
     // Only the client is built here. The bundle itself is fetched from `run`, behind the launcher
     // readiness signal, because that fetch waits out a control-plane outage and nothing that waits
     // may sit in front of a candidate agent's readiness deadline.
-    let secrets = secrets::SecretManager::new(&cfg.routing, &cfg.application.secrets)?;
+    let runtime_data =
+        runtime_data::RuntimeDataManager::new(&cfg.routing, &cfg.application.input_selection)?;
     Ok(Options {
         deployment: cfg.deployment,
+        assignment_sha256: cfg.assignment_sha256,
         routing: cfg.routing,
         application: cfg.application,
+        inputs: updated_contracts::dataflow::FileSnapshot::default(),
         timeouts,
         storage: cfg.storage,
         paths,
         agent_update,
-        secrets,
+        runtime_data,
+        runtime_converge_pending: false,
         identity_renewal: IdentityRenewal { config, state_dir },
     })
 }

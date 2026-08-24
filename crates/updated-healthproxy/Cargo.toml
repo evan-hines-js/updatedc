@@ -13,6 +13,8 @@ name = "updated-healthproxy"
 path = "src/main.rs"
 
 [dependencies]
+# Files projected by Kubernetes still cross one bounded opened-handle filesystem boundary.
+foundation = { path = "../foundation" }
 # The one telemetry contract every part of the system already speaks; membership readiness
 # is derived from the exact `NodeReport` a managed node publishes to the CDN.
 updated = { path = "../updated" }
@@ -34,3 +36,4 @@ k8s-openapi = { workspace = true }
 # Tests mint a per-node keypair to sign the health reports readiness is verified against — the
 # same aws-lc-rs ECDSA path a real node's telemetry signing and the control-plane pin use.
 aws-lc-rs = { workspace = true }
+tempfile = { workspace = true }

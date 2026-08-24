@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 # The lifecycle reconciler the green release runs owns the provider timeout it is published with,
 # so the value signed into the provider set here and the reconciler's own apply budget are one
 # constant.
 demo-lifecycle = { path = "../demo-lifecycle" }
-futures.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 reqwest.workspace = true

@@ -1,0 +1,66 @@
+rules:
+  - id: no-remote-semgrep-auto-configuration
+    languages: [generic]
+    severity: ERROR
+    message: Use the checked-in Semgrep policy; remote auto-configuration is mutable and may disclose repository metadata.
+    paths:
+      include:
+        - /scripts/**
+        - /.github/**
+    pattern-regex: '(?m)semgrep\s+scan[^\n]*--config(?:=|\s+)auto(?:\s|$)'
+
+  - id: no-disabled-rust-tls-verification
+    languages: [rust]
+    severity: ERROR
+    message: TLS certificate and hostname verification must never be disabled.
+    pattern-either:
+      - pattern: $CLIENT.danger_accept_invalid_certs(true)
+      - pattern: $CLIENT.danger_accept_invalid_hostnames(true)
+
+  - id: no-shell-eval
+    languages: [bash]
+    severity: ERROR
+    message: Do not evaluate dynamically constructed shell source.
+    pattern: eval $SOURCE
+
+  - id: no-insecure-curl
+    languages: [generic]
+    severity: ERROR
+    message: Do not disable TLS verification for downloads.
+    paths:
+      include:
+        - /scripts/**
+        - /install.sh
+        - /deploy/**
+        - /.github/**
+    pattern-regex: '(?m)\bcurl\b[^\n]*(?:--insecure|(?:^|\s)-k(?:\s|$))'
+
+  - id: no-pipe-download-to-shell
+    languages: [generic]
+    severity: ERROR
+    message: Download code, authenticate it, and execute it as separate operations.
+    paths:
+      include:
+        - /scripts/**
+        - /install.sh
+        - /deploy/**
+        - /.github/**
+    pattern-regex: '(?m)\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b'
+
+  - id: no-world-writable-installation
+    languages: [generic]
+    severity: ERROR
+    message: Installation and runtime paths must not be world-writable.
+    paths:
+      include:
+        - /scripts/**
+        - /install.sh
+        - /deploy/**
+        - /.github/**
+    pattern-regex: '(?m)\bchmod\s+(?:-R\s+)?(?:0?777|a\+rwx)\b'
+
+  - id: no-committed-private-key
+    languages: [generic]
+    severity: ERROR
+    message: Private key material must not be committed to the repository.
+    pattern-regex: '-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'

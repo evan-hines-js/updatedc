@@ -5,6 +5,22 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ONE pin for the Helm two jobs need: `charts` lints, renders and schema-checks the chart with it,
+# and `release` packages the tarball operators install with it. Two copies of the pin would agree
+# only until one is bumped, and then the published artifact would be built by a Helm that never
+# validated it. The digest is pinned beside the version because both jobs authenticate the download
+# before executing it.
+env:
+  HELM_VERSION: v3.20.2
+  HELM_SHA256: 258e830a9e613c8a7a302d6059b4bb3b9758f2f3e1bb8ea0d707ce10a9a72fea
+
 jobs:
   semgrep:
     name: Semgrep static analysis
@@ -12,29 +28,12 @@ jobs:
     permissions:
       contents: read
     container:
-      # Version tags for the official image are immutable.
-      image: semgrep/semgrep:1.170.0
+      # Pin the Linux/amd64 manifest, not the mutable registry tag.
+      image: semgrep/semgrep:1.170.0@sha256:f42392ee2c00f0de06702135e0e20415f481935900790fbe37aa778591be3999
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Scan source code
-        run: semgrep scan --config auto --error .
-
-  trivy:
-    name: Trivy filesystem scan
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Scan dependencies, secrets, and configuration
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln,secret,misconfig
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: 1
+        run: ./scripts/ci.sh semgrep
 
   test:
     strategy:
@@ -46,6 +45,11 @@ jobs:
         include:
           - os: ubuntu-latest
             release: linux-x86_64
+          # A native arm64 Linux runner, so the aarch64 archive and the arm64 .deb/.rpm the
+          # installer offers are really built and really tested, rather than cross-compiled
+          # against a C-heavy crypto dependency and hoped for.
+          - os: ubuntu-24.04-arm
+            release: linux-aarch64
           - os: macos-15-intel
             release: macos-x86_64
           - os: macos-14
@@ -53,52 +57,29 @@ jobs:
           - os: windows-latest
             release: windows-x86_64
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_NAME: ${{ matrix.release }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: 1.95.0
           components: rustfmt, clippy
       # aws-lc-rs (via the `tough` TUF client) builds its C with CMake on every
       # OS — preinstalled on the runners — plus NASM on Windows MSVC, which is not.
       - if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
-      # `--all-features` turns on the workspace's `fips` feature, which swaps aws-lc-rs for
-      # aws-lc-fips-sys — a FIPS module whose CMake build generates code with Go. Only the macOS
-      # images ship without a Go toolchain, and its absence fails the build outright ("Could not
-      # find Go"), so this job installs one rather than testing a different crypto backend there.
-      - if: runner.os == 'macOS'
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with: {go-version: 'stable', cache: false}
+      # `--all-features` turns on the workspace's `fips` feature, whose CMake build generates code
+      # with Go. Pin that compiler on every OS so runner-image updates cannot silently change the
+      # tested crypto build (and so macOS, which has no preinstalled Go, builds it at all).
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with: {go-version: '1.26.2', cache: false}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo fmt --all --check
-      # Compile and run the test artifacts first. Clippy then reuses Cargo's
-      # dependency artifacts and analyzes only this workspace's code.
-      - run: cargo test --workspace --all-targets --all-features
-      - run: cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings
-      # Portable updater scenarios run identically on every OS. The arbitrary-kill fuzzer
-      # (killfuzz) runs concurrently with the suite on Unix: it SIGKILLs whole process trees at
-      # random instants (its reaper shells out to `pkill`, so it is Unix-only). The two coexist by
-      # construction — separate lock files (`target/{e2e,killfuzz}.lock`) and separate
-      # `CARGO_TARGET_DIR`s (`target/{e2e,killfuzz}-cargo`) — so neither clobbers the other's build
-      # output or workdir. The step fails if either the suite or the fuzzer fails.
-      - name: Updater E2E suite (kill fuzzer in parallel on Unix)
+      # This is also the developer entrypoint. CI selects a suite only to retain independent jobs;
+      # the commands and assertions have one implementation in the repository.
+      - name: Rust, generated schemas, and portable updater E2E
         shell: bash
-        run: |
-          set -uo pipefail
-          if [[ "${{ runner.os }}" != "Windows" ]]; then
-            cargo run -p killfuzz &
-            killfuzz_pid=$!
-          fi
-          cargo run -p e2e
-          e2e_rc=$?
-          if [[ -n "${killfuzz_pid:-}" ]]; then
-            wait "$killfuzz_pid"
-            killfuzz_rc=$?
-          else
-            killfuzz_rc=0
-          fi
-          echo "e2e exit=$e2e_rc, killfuzz exit=$killfuzz_rc"
-          [[ $e2e_rc -eq 0 && $killfuzz_rc -eq 0 ]]
+        run: ./scripts/ci.sh rust
 
       # A main build produces the continuously-running update tower for each desktop
       # target.
@@ -106,15 +87,67 @@ jobs:
         shell: bash
         run: |
           cargo build --release -p launcher -p agent
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
             cargo build --release -p windows-service
           fi
-      - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os != 'Windows'
+      # The archive carries the service definition next to the binaries, so `install.sh` places the
+      # SHIPPED unit instead of writing its own copy. One definition of the service, whether a node
+      # is bootstrapped by package, by installer, or by hand.
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os == 'Linux'
         shell: bash
         run: |
           mkdir -p dist
-          tar -C target/release -czf "dist/updated-${{ matrix.release }}.tar.gz" \
-            updated-launcher updated-agent
+          tar -czf "dist/updated-${RELEASE_NAME}.tar.gz" \
+            -C target/release updated-launcher updated-agent \
+            -C "$GITHUB_WORKSPACE/deploy/systemd" updated-agent.service
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/updated-${RELEASE_NAME}.tar.gz" \
+            -C target/release updated-launcher updated-agent \
+            -C "$GITHUB_WORKSPACE/deploy/launchd" dev.updated.agent.plist
+      # The node bootstrap packages, built from the binaries this job just compiled and tested —
+      # not from a second, separately-compiled build of the same source. One nfpm description
+      # produces both .deb and .rpm, so the two packages cannot describe a node differently.
+      - name: Build the .deb and .rpm bootstrap packages
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          NFPM_VERSION: 2.47.0
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64)
+              nfpm_arch=x86_64
+              nfpm_sha256=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+              ;;
+            ARM64)
+              nfpm_arch=arm64
+              nfpm_sha256=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c
+              ;;
+            *) echo "unsupported runner arch $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${nfpm_arch}.tar.gz"
+          printf '%s  %s\n' "$nfpm_sha256" /tmp/nfpm.tar.gz | sha256sum -c -
+          tar -C /tmp -xzf /tmp/nfpm.tar.gz nfpm
+          sudo install -m0755 /tmp/nfpm /usr/local/bin/nfpm
+          # Pull requests exercise the real package definition with the already-tested debug
+          # binaries. Main substitutes the release binaries and keeps the resulting packages.
+          bindir=target/debug
+          out="$RUNNER_TEMP/updated-package-validation"
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+            bindir=target/release
+            out=dist
+          else
+            cargo build -p launcher -p agent
+          fi
+          ./packaging/build.sh --bindir "$bindir" --out "$out"
+
+      # Same rule as the Linux and macOS archives above: the service definition ships beside the
+      # binaries, so registering the service never requires a checkout of this repository. On
+      # Windows the definition is the SCM registration script rather than an init unit.
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os == 'Windows'
         shell: powershell
         run: |
@@ -123,8 +156,9 @@ jobs:
             "target/release/updated-launcher.exe"
             "target/release/updated-agent.exe"
             "target/release/selfupdate-service.exe"
+            "deploy/windows/install-updated-agent.bat"
           )
-          Compress-Archive -Path $files -DestinationPath "dist/updated-${{ matrix.release }}.zip"
+          Compress-Archive -Path $files -DestinationPath "dist/updated-$env:RELEASE_NAME.zip"
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -132,6 +166,43 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  charts:
+    name: Helm charts and Trivy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+        with:
+          version: v0.74.0
+          cache: true
+      # Download exact releases and authenticate their bytes before executing either tool.
+      - name: Install helm and kubeconform
+        shell: bash
+        env:
+          KUBECONFORM_VERSION: v0.7.0
+          KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/helm.tar.gz \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          printf '%s  %s\n' "$HELM_SHA256" /tmp/helm.tar.gz | sha256sum -c -
+          tar -C /tmp -xzf /tmp/helm.tar.gz linux-amd64/helm
+          sudo install -m0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          printf '%s  %s\n' "$KUBECONFORM_SHA256" /tmp/kubeconform.tar.gz | sha256sum -c -
+          tar -C /tmp -xzf /tmp/kubeconform.tar.gz kubeconform
+          sudo install -m0755 /tmp/kubeconform /usr/local/bin/kubeconform
+          helm version --short
+          kubeconform -v
+      - name: Lint, guardrails, rendered permissions, and Kubernetes schemas
+        shell: bash
+        run: ./scripts/ci.sh charts
+      - name: Scan dependencies, secrets, configuration, and rendered charts
+        shell: bash
+        run: ./scripts/ci.sh trivy
   windows-scm-e2e:
     name: Windows Service Control Manager E2E
     runs-on: windows-latest
@@ -139,6 +210,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with: {toolchain: 1.95.0}
       # aws-lc-rs requires NASM when building for Windows MSVC.
       - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -155,11 +227,12 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with: {toolchain: 1.95.0}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install HAProxy test dependencies
         run: sudo apt-get update && sudo apt-get install -y haproxy
       - name: Exercise real master-worker binary upgrades
-        run: ./scripts/linux-haproxy-e2e.sh
+        run: ./scripts/ci.sh haproxy
       - name: Preserve failure diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -175,10 +248,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with: {toolchain: 1.95.0}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with: {install_only: true}
-      - run: ./scripts/kind-updatec-e2e.sh
+      - run: ./scripts/ci.sh kind
       - if: failure()
         run: kubectl -n updated-system logs deployment/updatec || true
 
@@ -189,6 +263,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with: {toolchain: 1.95.0}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with: {install_only: true}
@@ -199,17 +274,152 @@ jobs:
       # predecessors while the other half advance, then converge. It exits non-zero on any failed
       # assertion.
       - name: Exercise lifecycle hooks, per-node failure, rollback, and upgrade
-        run: cargo run -p updatec-e2e
+        run: ./scripts/ci.sh fleet
       - name: Preserve diagnostics
         if: failure()
         run: |
           kubectl -n updated-system get pods,updateagents,updategroups -o wide || true
           kubectl -n updated-system logs deployment/updatec-controller --tail=200 || true
 
+  # The container images the Helm charts pull. Until these exist, a chart is a manifest with
+  # nothing to install: `image: updatec:kind` only ever resolved inside a side-loaded kind cluster.
+  #
+  # Built natively per architecture rather than under emulation — this tree's crypto dependency
+  # compiles C, and a QEMU-emulated arm64 build of it is both slow and a different build than the
+  # one anyone tested. The manifest job below stitches the two into one multi-arch tag.
+  image:
+    name: Publish container images (${{ matrix.arch }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, semgrep, charts]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Authenticate to the registry
+        env:
+          REGISTRY_ACTOR: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_ACTOR" --password-stdin
+      - name: Build and push the per-architecture images
+        shell: bash
+        env:
+          IMAGE_ARCH: ${{ matrix.arch }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$REGISTRY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          mkdir -p image-digests
+          for component in updatec updated-healthproxy; do
+            case "$component" in
+              updatec) dockerfile=crates/updatec/Dockerfile ;;
+              updated-healthproxy) dockerfile=crates/updated-healthproxy/Dockerfile ;;
+            esac
+            tag="ghcr.io/$owner/$component:${GITHUB_SHA}-${IMAGE_ARCH}"
+            # A commit-shaped tag is still mutable registry state. Always rebuild and push the
+            # artifact this run tested, and carry buildx's content digest to the manifest job as a
+            # workflow artifact. That job composes digest references, never re-resolves these tags.
+            metadata="$RUNNER_TEMP/$component-image-metadata.json"
+            docker buildx build --file "$dockerfile" --platform "linux/$IMAGE_ARCH" \
+              --tag "$tag" --push --metadata-file "$metadata" .
+            digest="$(jq -er '.["containerimage.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' "$metadata")"
+            printf '%s\n' "$digest" >"image-digests/$component-$IMAGE_ARCH"
+            echo "$tag -> $digest"
+          done
+      - name: Preserve exact per-architecture image digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-digests-${{ matrix.arch }}
+          path: image-digests/*
+          if-no-files-found: error
+
+  image-manifest:
+    name: Publish multi-architecture image tags
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [image]
+    runs-on: ubuntu-latest
+    outputs:
+      updatec_name: ${{ steps.manifests.outputs.updatec_name }}
+      updatec_digest: ${{ steps.manifests.outputs.updatec_digest }}
+      healthproxy_name: ${{ steps.manifests.outputs.healthproxy_name }}
+      healthproxy_digest: ${{ steps.manifests.outputs.healthproxy_digest }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download exact per-architecture image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: image-digests-*
+          path: image-digests
+          merge-multiple: true
+      - name: Authenticate to the registry
+        env:
+          REGISTRY_ACTOR: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_ACTOR" --password-stdin
+      - name: Stitch the per-architecture images into one tag
+        id: manifests
+        shell: bash
+        env:
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$REGISTRY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          for component in updatec updated-healthproxy; do
+            repo="ghcr.io/$owner/$component"
+            amd64="$(cat "image-digests/$component-amd64")"
+            arm64="$(cat "image-digests/$component-arm64")"
+            for digest in "$amd64" "$arm64"; do
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+                echo "invalid $component architecture digest: $digest" >&2
+                exit 1
+              }
+            done
+            docker buildx imagetools create --tag "$repo:$GITHUB_SHA" \
+              "$repo@$amd64" "$repo@$arm64"
+            manifest="$(docker buildx imagetools inspect "$repo:$GITHUB_SHA" --format '{{json .Manifest}}')"
+            digest="$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<<"$manifest")"
+            case "$component" in
+              updatec)
+                echo "updatec_name=$repo" >>"$GITHUB_OUTPUT"
+                echo "updatec_digest=$digest" >>"$GITHUB_OUTPUT"
+                ;;
+              updated-healthproxy)
+                echo "healthproxy_name=$repo" >>"$GITHUB_OUTPUT"
+                echo "healthproxy_digest=$digest" >>"$GITHUB_OUTPUT"
+                ;;
+            esac
+            echo "$repo:$GITHUB_SHA -> $digest"
+          done
+      - name: Attest the updatec image digest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ steps.manifests.outputs.updatec_name }}
+          subject-digest: ${{ steps.manifests.outputs.updatec_digest }}
+          push-to-registry: true
+      - name: Attest the healthproxy image digest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ steps.manifests.outputs.healthproxy_name }}
+          subject-digest: ${{ steps.manifests.outputs.healthproxy_digest }}
+          push-to-registry: true
+
   release:
     name: Publish immutable release
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, semgrep, trivy, windows-scm-e2e, linux-haproxy-e2e, updatec-e2e, updatec-fleet-e2e]
+    needs: [test, semgrep, charts, windows-scm-e2e, linux-haproxy-e2e, updatec-e2e, updatec-fleet-e2e, image-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -224,14 +434,70 @@ jobs:
           pattern: updated-*
           path: dist
           merge-multiple: true
+      # The install-time artifacts an operator should never need a Rust toolchain or a checkout to
+      # obtain: the CRDs generated from the Rust types and the one control-plane chart. Backend
+      # topology is operator-owned UpdateBackend state; there is no second healthproxy chart.
+      - name: Package the charts and the CRDs for release
+        shell: bash
+        env:
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+          UPDATEC_IMAGE_DIGEST: ${{ needs.image-manifest.outputs.updatec_digest }}
+          HEALTHPROXY_IMAGE_DIGEST: ${{ needs.image-manifest.outputs.healthproxy_digest }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/helm.tar.gz \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          printf '%s  %s\n' "$HELM_SHA256" /tmp/helm.tar.gz | sha256sum -c -
+          tar -C /tmp -xzf /tmp/helm.tar.gz linux-amd64/helm
+          sudo install -m0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          install -m0755 install.sh dist/install.sh
+          cp deploy/charts/updatec/crds/updated.dev_crds.yaml dist/updated.dev_crds.yaml
+          owner="$(printf '%s' "$REGISTRY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          sed -i -E "s#^(  repository: )ghcr.io/[^/]+/updatec\$#\1ghcr.io/$owner/updatec#" \
+            deploy/charts/updatec/values.yaml
+          sed -i -E "s#^(    repository: )ghcr.io/[^/]+/updated-healthproxy\$#\1ghcr.io/$owner/updated-healthproxy#" \
+            deploy/charts/updatec/values.yaml
+          grep -Fxq "  repository: ghcr.io/$owner/updatec" deploy/charts/updatec/values.yaml
+          grep -Fxq "    repository: ghcr.io/$owner/updated-healthproxy" deploy/charts/updatec/values.yaml
+          for digest in "$UPDATEC_IMAGE_DIGEST" "$HEALTHPROXY_IMAGE_DIGEST"; do
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "Invalid image digest from manifest job: $digest" >&2
+              exit 1
+            }
+          done
+          sed -i -E "s#^(  digest: ).*#\1\"$UPDATEC_IMAGE_DIGEST\"#" deploy/charts/updatec/values.yaml
+          sed -i -E "s#^(    digest: ).*#\1\"$HEALTHPROXY_IMAGE_DIGEST\"#" deploy/charts/updatec/values.yaml
+          printf 'updatec %s\nupdated-healthproxy %s\n' \
+            "$UPDATEC_IMAGE_DIGEST" "$HEALTHPROXY_IMAGE_DIGEST" >dist/IMAGE_DIGESTS
+          # The released chart binds the exact two multi-architecture manifests this workflow built;
+          # appVersion remains the source identity, but no runtime pull depends on a mutable tag.
+          helm package deploy/charts/updatec --app-version "$GITHUB_SHA" --destination dist
+          helm show chart dist/updatec-*.tgz | grep -Fxq "appVersion: $GITHUB_SHA"
+          helm template updatec dist/updatec-*.tgz -n updated-system \
+            --set publicUrl=https://updates.example >"$RUNNER_TEMP/released-chart.yaml"
+          grep -Fq "image: ghcr.io/$owner/updatec@$UPDATEC_IMAGE_DIGEST" \
+            "$RUNNER_TEMP/released-chart.yaml"
+          grep -Fq "ghcr.io/$owner/updated-healthproxy@$HEALTHPROXY_IMAGE_DIGEST" \
+            "$RUNNER_TEMP/released-chart.yaml"
+          # Stable asset name inside the immutable build release selected by the installer.
+          cp dist/updatec-*.tgz dist/updatec-chart.tgz
       - name: Verify all platform packages were downloaded
         shell: bash
         run: |
           packages=(
             dist/updated-linux-x86_64.tar.gz
+            dist/updated-linux-aarch64.tar.gz
             dist/updated-macos-x86_64.tar.gz
             dist/updated-macos-aarch64.tar.gz
             dist/updated-windows-x86_64.zip
+            dist/updated-agent_amd64.deb
+            dist/updated-agent_amd64.rpm
+            dist/updated-agent_arm64.deb
+            dist/updated-agent_arm64.rpm
+            dist/install.sh
+            dist/IMAGE_DIGESTS
+            dist/updated.dev_crds.yaml
+            dist/updatec-chart.tgz
           )
           for package in "${packages[@]}"; do
             test -s "$package" || {
@@ -239,31 +505,61 @@ jobs:
               exit 1
             }
           done
-      - name: Generate release checksums
+      # Every asset, not a prefix-matched subset: install.sh and the Ansible role refuse to install
+      # an artifact SHA256SUMS does not list, so an unlisted asset is an uninstallable one.
+      #
+      # The manifest must not list itself, and the exclusion is a glob because the redirect target
+      # is in the directory being listed: the shell creates it when it forks the pipeline, BEFORE
+      # `find` reads the directory, so `find` hands it to `sha256sum`, which records the digest of
+      # whatever partial content it holds at that instant. Excluding only the final name leaves the
+      # same defect under the temporary one. The `rm -f` prevents a stale self-line, not a fresh
+      # one. The `--check` is not decoration: it asserts that the verification docs/agent-install.md
+      # tells operators to run passes on the bytes this release publishes, and fails the release
+      # rather than shipping a manifest operators are told to trust and cannot.
+      - name: Generate and verify release checksums
         working-directory: dist
-        run: sha256sum updated-* > SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%P\n' | sort \
+            | xargs sha256sum > SHA256SUMS.tmp
+          mv SHA256SUMS.tmp SHA256SUMS
+          sha256sum --check SHA256SUMS
+          cat SHA256SUMS
       - name: Attest release packages and checksums
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             dist/updated-*
+            dist/updated.dev_crds.yaml
+            dist/updatec-*
+            dist/install.sh
+            dist/IMAGE_DIGESTS
             dist/SHA256SUMS
       - name: Publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
+          UPDATEC_IMAGE_NAME: ${{ needs.image-manifest.outputs.updatec_name }}
+          UPDATEC_IMAGE_DIGEST: ${{ needs.image-manifest.outputs.updatec_digest }}
+        shell: bash
         run: |
-          packages=(
-            dist/updated-linux-x86_64.tar.gz
-            dist/updated-macos-x86_64.tar.gz
-            dist/updated-macos-aarch64.tar.gz
-            dist/updated-windows-x86_64.zip
-            dist/SHA256SUMS
-          )
+          set -euo pipefail
+          mapfile -t packages < <(find dist -maxdepth 1 -type f | sort)
           release_tag="build-$GITHUB_SHA"
           gh release create "$release_tag" "${packages[@]}" \
             --target "$GITHUB_SHA" \
             --title "Verified build $GITHUB_SHA" \
-            --notes "Immutable, attested build of main at $GITHUB_SHA."
+            --notes "Immutable, attested build of main at $GITHUB_SHA.
+
+          Node bootstrap: verify the attested \`install.sh\` asset, then use it with this immutable
+          \`$release_tag\`; direct packages and per-platform archives are available too.
+          Control plane: \`updatec-chart.tgz\` and \`updated.dev_crds.yaml\`, with images at
+          \`$UPDATEC_IMAGE_NAME@$UPDATEC_IMAGE_DIGEST\` and the healthproxy digest in
+          \`IMAGE_DIGESTS\`.
+
+          After bootstrap, agents update themselves through the fleet's own signed TUF channel —
+          these packages are not the upgrade path."
           release_assets="$(gh release view "$release_tag" --json assets --jq '.assets[].name')"
           for package in "${packages[@]}"; do
             name="${package##*/}"

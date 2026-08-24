@@ -1,5 +1,5 @@
 use super::super::*;
-use updated_contracts::reconciler::attempt;
+use updated_contracts::reconciler::{attempt, Operation};
 
 /// The never-healthy twin of `cold_install_descends_past_broken_head`. There the assigned heads
 /// fail their `apply`; here `apply` succeeds — the workload starts and stays alive — but the
@@ -33,15 +33,14 @@ pub(crate) fn cold_install_descends_past_unhealthy_head(ctx: &Ctx) -> R {
         .health_grace("3s")
         .launcher()?;
     let node = Service::spawn("cold-install-wedge", &command);
-    const DESCENT_TIMEOUT: u64 = 120;
     // Catch the wedged head's own process while it is running, so the descent can be shown to have
     // ended it rather than merely to have installed something else.
-    let wedged_pid = wait_until(DESCENT_TIMEOUT, || fixture::workload_pid(&dir).is_some())
+    let wedged_pid = wait_until(CONVERGE_TIMEOUT, || fixture::workload_pid(&dir).is_some())
         .then(|| fixture::workload_pid(&dir))
         .flatten()
         .ok_or("the wedged head's apply never started a workload")?;
     // Recovery is proven only when the healthy 1.0.0 actually serves.
-    if !wait_for_version(svc, "1.0.0", DESCENT_TIMEOUT) {
+    if !wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT) {
         let log = node.captured_log();
         return fail(format!(
             "the cold node stranded on wedged assigned heads instead of stopping them and \
@@ -49,13 +48,7 @@ pub(crate) fn cold_install_descends_past_unhealthy_head(ctx: &Ctx) -> R {
         ));
     }
     // Durability: the committed record names 1.0.0, so a restart never climbs back onto a wedged head.
-    let state_path = dir.join("install/state/installed.json");
-    let settled = wait_until(DESCENT_TIMEOUT, || {
-        matches!(
-            updated::state::read_installed(&state_path),
-            updated::state::Installed::Present(ref state) if state.release.version == "1.0.0"
-        )
-    });
+    let settled = wait_for_installed_version(&dir, "1.0.0", CONVERGE_TIMEOUT);
     let wedge_stopped = !pid_alive(wedged_pid);
     drop(node);
     if !settled {
@@ -111,7 +104,7 @@ pub(crate) fn lifecycle_healthcheck_gates_readiness(ctx: &Ctx) -> R {
     wait_until(EVENT_TIMEOUT, || {
         gates = fixture::operations(&fixture::root(&dir))
             .into_iter()
-            .filter(|invocation| invocation.operation == "healthcheck")
+            .filter(|invocation| invocation.operation == Operation::Healthcheck)
             .map(|invocation| invocation.id)
             .collect();
         gated_install = gates.iter().any(|id| id == attempt::BOOT);

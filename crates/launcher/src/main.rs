@@ -129,7 +129,7 @@ fn usage() {
 /// Every flag the launcher accepts, as one list. `parse_args` matches exactly these and `usage`
 /// documents exactly these, and the checked-in launch sites below are scanned against them — so a
 /// flag deleted from the parser fails `cargo test` rather than crash-looping a pod.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 const ACCEPTED_FLAGS: &[&str] = &[
     "--state-dir",
     "--config",
@@ -163,15 +163,13 @@ mod launch_sites {
             "deploy/systemd/updated-agent.service",
             include_str!("../../../deploy/systemd/updated-agent.service"),
         ),
+        // These two files are the ONLY launcher command lines shipped for a node. The Ansible role
+        // installs the package (which ships the unit above), and `install.sh` places whichever of
+        // these two the release archive carries — none of them re-spell the invocation, so there is
+        // nothing else here to scan.
         (
-            "deploy/ansible/roles/updated_agent/templates/updated-agent.service.j2",
-            include_str!(
-                "../../../deploy/ansible/roles/updated_agent/templates/updated-agent.service.j2"
-            ),
-        ),
-        (
-            "deploy/launchd/com.example.updated-agent.plist",
-            include_str!("../../../deploy/launchd/com.example.updated-agent.plist"),
+            "deploy/launchd/dev.updated.agent.plist",
+            include_str!("../../../deploy/launchd/dev.updated.agent.plist"),
         ),
     ];
 
@@ -197,6 +195,32 @@ mod launch_sites {
             } else {
                 Vec::new()
             };
+        }
+        // Markdown prose legitimately names launcher and reconciler flags next to one another.
+        // Only fenced examples that actually invoke the launcher are launch sites; treating every
+        // consecutive flag-bearing prose line as argv makes an unrelated layout comment such as
+        // "the reconciler's --output-dir" look like a launcher option.
+        if path.ends_with(".md") {
+            let mut found = Vec::new();
+            let mut block = String::new();
+            let mut in_fence = false;
+            for line in text.lines() {
+                if line.trim_start().starts_with("```") {
+                    if in_fence && block.contains("updated-launcher") {
+                        let invocation: Vec<String> =
+                            block.lines().flat_map(flags).map(str::to_owned).collect();
+                        if invocation.iter().any(|flag| flag == "--state-dir") {
+                            found.push(invocation);
+                        }
+                    }
+                    block.clear();
+                    in_fence = !in_fence;
+                } else if in_fence {
+                    block.push_str(line);
+                    block.push('\n');
+                }
+            }
+            return found;
         }
         let mut found = Vec::new();
         let mut run: Vec<String> = Vec::new();

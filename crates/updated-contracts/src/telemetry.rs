@@ -1,16 +1,25 @@
 //! Node → control-plane rollout telemetry.
 //!
 //! The control plane can never reach a node, so completion feedback flows the other
-//! way through shared storage: a node writes a small [`NodeReport`] to the report
-//! location signed into its assignment,
-//! and the control plane reads it back out of the same object store it publishes to.
+//! way through shared storage: a node obtains an exact short-lived S3 POST capability and uploads a
+//! small signed [`NodeReport`] to its own private object. The controller projects those raw objects
+//! into canonical fleet report shards, and readers fetch that fixed-width shard set.
 //! Reporting is strictly best-effort — a node that cannot write its report keeps
 //! running, and a control plane that finds no report rolls without completion gating.
+
+// This module DEFINES the report gates that `clippy.toml` bans elsewhere. The ban exists so that
+// consumers go through their one door — the controller's verified-report cache, the healthproxy's
+// single gate — rather than verifying bytes a pass has already checked. Neither the composition
+// below (`report_is_authentic_and_fresh` is `report_is_authentic` plus a clock) nor this module's
+// own tests are such a consumer, so the ban does not apply to the file that owns the functions.
+#![allow(clippy::disallowed_methods)]
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::key::P256PublicKey;
 
 /// How old a healthy report may be before a reader treats it as not-ready / not-settled. Shared by
 /// every consumer (the control-plane rollout throttle AND the healthproxy) so they agree on when a
@@ -74,50 +83,122 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The namespace, under a report base, that every node report lives in. A store that accepts
-/// report writes must serve this namespace back: the writer and every reader derive their path
-/// from this one name, so a store that knows only its write half returns 404 to every consumer.
+/// Namespace containing the controller's healthproxy-compatible fleet projection.
 pub const REPORT_NAMESPACE: &str = "telemetry";
 
-/// The relative object key, under a report base, a node writes its report to. Keyed by
-/// node identity so the control plane can attribute a report to the agent it selected.
-pub fn report_object_key(node: &str) -> String {
-    format!("{REPORT_NAMESPACE}/{node}.json")
+/// Stable index object every reader fetches first. It names one layout generation and the exact
+/// number of shards in that generation; readers never guess layout from local configuration.
+pub const FLEET_INDEX_OBJECT_KEY: &str = "telemetry/fleet.json";
+#[cfg(test)]
+const FLEET_INDEX_BASENAME: &str = "fleet";
+
+/// The stable fleet-index URL below a health CDN base.
+pub fn fleet_index_url(base: &str) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), FLEET_INDEX_OBJECT_KEY)
 }
 
-/// The absolute URL of a node's report under a base location: `<base>/telemetry/<node>.json`,
-/// tolerant of a trailing slash on the base. The single place a report base and a node identity
-/// become one fetchable/writable URL — shared by the agent that writes its report and any reader
-/// (the health proxy) that fetches it, so the two can never drift.
-pub fn report_url(base: &str, node: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), report_object_key(node))
+/// Hard ceiling for the runtime shard-count knob. The operator may choose any value from 1 through
+/// this limit without changing wire format; the index advertises the active count and a change
+/// causes the next flush to rebalance the whole fleet into a new generation.
+///
+/// Private: a caller reaches it only by asking [`FleetShardLimit::new`] (or the parser above it) to
+/// accept a value, so a shard count that has crossed a module boundary has necessarily crossed this
+/// check — there is no way to re-implement the range test against the raw number.
+const MAX_FLEET_REPORT_SHARDS: usize = 64;
+
+/// Shared bound on concurrent fleet-shard I/O. Writers and readers use the same fan-out ceiling,
+/// so raising the shard-count knob does not create a second, component-specific memory multiplier.
+pub const FLEET_SHARD_IO_CONCURRENCY: usize = 16;
+
+/// The one configuration surface for the serialized fleet-report ceiling.
+pub const FLEET_REPORT_MAX_SHARDS_ENV: &str = "UPDATED_FLEET_REPORT_MAX_SHARDS";
+
+/// A shard ceiling that has passed the one shared range check. Writers and the rebalancer accept
+/// this type instead of a raw integer, so no caller can invent a second interpretation of the
+/// operator's memory knob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FleetShardLimit(u16);
+
+impl FleetShardLimit {
+    pub fn new(shards: usize) -> Result<Self, String> {
+        if !(1..=MAX_FLEET_REPORT_SHARDS).contains(&shards) {
+            return Err(format!(
+                "{FLEET_REPORT_MAX_SHARDS_ENV} must be between 1 and {MAX_FLEET_REPORT_SHARDS}"
+            ));
+        }
+        Ok(Self(
+            u16::try_from(shards).expect("the absolute shard bound fits u16"),
+        ))
+    }
+
+    pub fn get(self) -> usize {
+        usize::from(self.0)
+    }
 }
 
-/// The request path a node `PUT`s its report to, relative to the report base.
-pub const REPORT_PATH_PREFIX: &str = "/telemetry/";
+/// Default for [`FLEET_REPORT_MAX_SHARDS_ENV`]. Four 16 MiB shards preserve the monolith's old
+/// 64 MiB total byte ceiling while removing its one-object contention point.
+pub const DEFAULT_FLEET_REPORT_MAX_SHARDS: FleetShardLimit = FleetShardLimit(4);
 
-#[test]
-fn the_report_path_prefix_is_the_report_namespace() {
-    assert_eq!(REPORT_PATH_PREFIX, format!("/{REPORT_NAMESPACE}/"));
+/// Parse the shard-count knob once, including its default and absolute safety bound. Both the
+/// production gateway and the local server use this function so the same setting cannot mean two
+/// different report-byte ceilings.
+pub fn parse_fleet_report_max_shards(value: Option<&str>) -> Result<FleetShardLimit, String> {
+    let shards = match value {
+        Some(value) => value.parse::<usize>().map_err(|error| {
+            format!("{FLEET_REPORT_MAX_SHARDS_ENV} must be an integer: {error}")
+        })?,
+        None => return Ok(DEFAULT_FLEET_REPORT_MAX_SHARDS),
+    };
+    FleetShardLimit::new(shards)
 }
 
-/// Recover the node identity from a report request path (`/telemetry/<node>.json`),
-/// rejecting traversal or unsafe characters. Shared by every control plane so the write
-/// path is validated identically wherever a `report_url` happens to point.
-pub fn node_from_path(request_path: &str) -> Option<&str> {
-    let node = request_path
-        .strip_prefix(REPORT_PATH_PREFIX)?
-        .strip_suffix(".json")?;
-    is_valid_node(node).then_some(node)
-}
+/// Kubernetes object names, and therefore enrolled node identities, cannot exceed 253 bytes. The
+/// shared identity grammar states that same bound so report-map accounting has one authoritative
+/// maximum and non-Kubernetes consumers cannot create identities the control plane could not own.
+pub const MAX_NODE_BYTES: usize = 253;
+
+/// Exact byte ceiling for one fetched or stored fleet-report shard. Together with
+/// `UPDATED_FLEET_REPORT_MAX_SHARDS`, this gives an operator an explicit upper bound on active
+/// pending and stored serialized report bytes: `max_shards × 16 MiB`, plus the small index.
+pub const MAX_FLEET_REPORT_SHARD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The index is fixed-size control metadata, never a place report data can accumulate.
+pub const MAX_FLEET_INDEX_BYTES: usize = 4 * 1024;
+
+/// Obsolete projection generations remain readable across an index race, then are eligible for
+/// deletion. Two freshness windows outlive any useful report read while bounding orphaned storage.
+pub const FLEET_GENERATION_RETENTION: Duration =
+    Duration::from_secs(REPORT_FRESHNESS.as_secs() * 2);
 
 /// The segment that separates a routing-assignment prefix from the node it addresses. The control
 /// plane publishes each node's assignment at exactly `<prefix>/agents/<node>.json`.
-pub const ASSIGNMENT_AGENTS_SEGMENT: &str = "/agents/";
+///
+/// Private, like its sibling below: publishing the raw segment would re-open the door the accessors
+/// close, letting a caller format its own `<prefix>/agents/<node>.json` — a second speller of the
+/// layout, which is exactly what [`assignment_object_key`] and [`split_assignment_path`] exist to
+/// make impossible.
+const ASSIGNMENT_AGENTS_SEGMENT: &str = "/agents/";
 
 /// The segment that separates a routing-assignment prefix from the content-addressed deployment
 /// document the node's assignment points at: `<prefix>/configs/<id>.json`.
-pub const ASSIGNMENT_CONFIGS_SEGMENT: &str = "/configs/";
+const ASSIGNMENT_CONFIGS_SEGMENT: &str = "/configs/";
+
+/// The digest that stands for a node wherever its name itself cannot appear.
+///
+/// A node name is operator-chosen and variable-length, so anything that needs a fixed-width, safe,
+/// collision-free stand-in for it uses this: the private object keys for a node's reports and
+/// outputs, its enrollment generation prefix, and the `registrationSha256` an enrolled agent is
+/// pinned to.
+///
+/// One function because these are one fact. The gateway *writes* an agent's registration digest and
+/// the control plane *checks* it; the dataflow scanner *derives* a report key and the sweeper
+/// *matches* it. Spelled out separately — as `sha256_bytes(node.as_bytes())`, eight times — a change
+/// to the convention would have moved the writers and left the readers looking in the old place,
+/// which reads as a node that silently never reports rather than as a mistake.
+pub fn node_object_digest(node: &str) -> String {
+    crate::digest::sha256_bytes(node.as_bytes())
+}
 
 /// The routing-assignment target a node's document is published at, `<prefix>/agents/<node>.json`,
 /// tolerant of stray slashes on the prefix. The one writer of that layout — every control plane
@@ -152,21 +233,27 @@ pub fn split_assignment_path(assignment: &str) -> Option<(&str, &str)> {
     (!prefix.is_empty() && is_valid_node(node)).then_some((prefix, node))
 }
 
-/// The one grammar a node identity must satisfy. Traversal safety is the shared component check
-/// ([`crate::path::is_safe_component`]); on top of that a report node is a URL segment and a clean
-/// identity, so it additionally forbids `.` (any dot, not just `.`/`..`) and the URL-significant
-/// `% ? #`.
-///
-/// This is the predicate, not a copy of it: [`node_from_path`] gates the write path on it, and any
-/// component that *configures* node identities (the health proxy's member inventory) validates
-/// against the same function at startup. A name only one side accepts is a node whose report can
-/// never be stored where the other side looks for it — drained from rotation forever behind a log
-/// line indistinguishable from a genuinely unhealthy node — so there is exactly one definition.
-///
-/// Length is deliberately unbounded here: the identity is bounded downstream by the object key and
-/// URL it forms, and no hop imposes a shorter limit than those.
+/// The one node-identity grammar: a Kubernetes DNS subdomain, at most 253 bytes, made of labels no
+/// longer than 63 bytes. Raw report objects use hashed keys, so identity syntax is not coupled to
+/// URL or object-path layout.
 pub fn is_valid_node(node: &str) -> bool {
-    crate::path::is_safe_component(node) && !node.contains(['.', '%', '?', '#'])
+    !node.is_empty()
+        && node.len() <= MAX_NODE_BYTES
+        && node.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
 }
 
 /// An opaque measurement of node state produced by the signed reconciler's `fingerprint` phase.
@@ -181,109 +268,18 @@ pub struct Fingerprint {
 }
 
 /// The one bound on a published report, stated in the units it actually crosses the wire in: the
-/// bytes of the signed DSSE envelope. Every hop enforces exactly this number — the gateway's and
-/// the dev CDN's request-body limits on the write, the healthproxy's bounded read on the way back —
-/// so there is no size a node may sign that some hop then refuses.
-///
-/// This matters because a rejected write is silent and permanent in effect: report writes are
-/// best-effort and never retried, and outputs ride only on *healthy* reports, so a node whose
-/// healthy report is too large keeps publishing nothing while its last unhealthy report stands, and
-/// it is drained from rotation forever while being perfectly healthy. The writer-side bound is
-/// therefore derived from this one ([`MAX_OUTPUT_MANIFEST_BYTES`]) rather than written beside it.
+/// bytes of the signed DSSE envelope. Health reports never carry dataflow values; secret-bearing
+/// snapshots use the authenticated dataflow API instead.
 pub const MAX_REPORT_ENVELOPE_BYTES: usize = 64 * 1024;
-
-/// What one signed envelope costs on top of the output manifest it carries, worst case: base64
-/// expands the whole report payload by 4/3 with padding, and on top of that sit the envelope's JSON
-/// scaffolding, the payload type, the base64 signature, and every report field that is
-/// not the manifest (node and deployment identities, two digests, the timestamp, the fingerprint).
-/// Reserved generously — the cost of reserving too much is a slightly smaller manifest allowance,
-/// the cost of reserving too little is a node that can never publish.
-const REPORT_ENVELOPE_OVERHEAD_BYTES: usize = 8 * 1024;
-
-/// The largest output manifest a node may attach to a report — the writer-side bound, derived so
-/// the WORST-CASE signed envelope for a manifest of exactly this size still fits
-/// [`MAX_REPORT_ENVELOPE_BYTES`] after base64 expansion and envelope overhead. Enforced by
-/// `agent::telemetry::load_outputs` before a manifest is ever attached, and asserted against
-/// a real signed envelope by this module's tests, so the two bounds cannot drift into agreeing on
-/// a number while disagreeing on its units.
-pub const MAX_OUTPUT_MANIFEST_BYTES: usize =
-    (MAX_REPORT_ENVELOPE_BYTES - REPORT_ENVELOPE_OVERHEAD_BYTES) * 3 / 4;
-
-/// Small, typed dataflow values emitted by a reconciler for dependent groups. The manifest is
-/// carried inside the node's signed report, so its producer identity, deployment, running archive,
-/// health, and freshness are authenticated together. Secret values never appear here; only the
-/// reference already understood by the authenticated secret-delivery path does.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct OutputManifest {
-    pub schema: u32,
-    pub values: BTreeMap<String, OutputValue>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum OutputValue {
-    String { value: String },
-    SecretRef { secret: String, key: String },
-}
-
-impl OutputManifest {
-    pub const SCHEMA: u32 = 1;
-    /// Manifests ride inside node reports, so they answer to the same reader window as
-    /// [`NodeReport::MIN_SUPPORTED_SCHEMA`] and the same field-default rule — an exact-schema
-    /// gate here would fail a whole report over the manifest it carries.
-    ///
-    /// This contract is DUAL-DIRECTION, and only the report half is covered by that window. The
-    /// values a producer publishes here are resolved by the control plane into
-    /// `ManagedRuntime.inputs` — a field of the signed [`crate::assignment::RepositoryAssignment`]
-    /// that NODES read — so [`OutputValue`]'s own shape answers to the writer-restraint rule
-    /// instead (`docs/wire-compatibility-design.md`). A new variant, or a new field on an existing
-    /// one, is refused by every not-yet-upgraded consumer node: the enum is internally tagged and
-    /// `deny_unknown_fields`, and the failure is the WHOLE assignment, not just the input. That is
-    /// the deadlock with no in-band cure, and the rollout order makes it the enforced one —
-    /// dependents are admitted only after their prerequisite settles, so the producer group has
-    /// upgraded by construction while the consumers that would be stranded have not. It needs no
-    /// schema bump to happen: `RepositoryAssignment` hardcodes `schema: OutputManifest::SCHEMA`
-    /// when it embeds a value, so the window above is never exercised on that path. No new variant
-    /// may be published in an assignment until the fleet floor reads it.
-    pub const MIN_SUPPORTED_SCHEMA: u32 = 1;
-    pub const MAX_VALUES: usize = 64;
-    pub const MAX_STRING_BYTES: usize = 4 * 1024;
-
-    pub fn validate(&self) -> Result<(), String> {
-        if !(Self::MIN_SUPPORTED_SCHEMA..=Self::SCHEMA).contains(&self.schema)
-            || self.values.len() > Self::MAX_VALUES
-        {
-            return Err("node output manifest schema or value count is invalid".into());
-        }
-        for (name, value) in &self.values {
-            if !crate::path::is_safe_component(name) || name.len() > 128 {
-                return Err("node output name is invalid".into());
-            }
-            match value {
-                OutputValue::String { value }
-                    if value.len() <= Self::MAX_STRING_BYTES && !value.contains('\0') => {}
-                OutputValue::SecretRef { secret, key }
-                    if !secret.is_empty()
-                        && secret.len() <= 253
-                        && !key.is_empty()
-                        && key.len() <= 253 => {}
-                _ => return Err("node output value is invalid".into()),
-            }
-        }
-        Ok(())
-    }
-}
 
 impl Fingerprint {
     pub fn from_output(
         definition_sha256: impl Into<String>,
         output: &[u8],
     ) -> Result<Self, String> {
-        use aws_lc_rs::digest::{digest, SHA256};
         let fingerprint = Self {
             definition_sha256: definition_sha256.into(),
-            output_sha256: hex::encode(digest(&SHA256, output).as_ref()),
+            output_sha256: crate::digest::sha256_bytes(output),
         };
         fingerprint
             .is_wellformed()
@@ -292,7 +288,8 @@ impl Fingerprint {
     }
 
     pub fn is_wellformed(&self) -> bool {
-        crate::is_sha256_hex(&self.definition_sha256) && crate::is_sha256_hex(&self.output_sha256)
+        crate::is_canonical_sha256(&self.definition_sha256)
+            && crate::is_canonical_sha256(&self.output_sha256)
     }
 }
 
@@ -342,8 +339,13 @@ pub struct NodeReport {
     /// the predecessor that really answered.
     ///
     /// Empty only before the first install completes, matching [`NodeReport::version`]. Any
-    /// other non-`is_sha256_hex` value is malformed and fails the trust gate closed.
+    /// other non-`is_canonical_sha256` value is malformed and fails the trust gate closed.
     pub archive_sha256: String,
+    /// SHA-256 of the signed provider-set document whose reconciler is actually installed.
+    /// Application bytes and their lifecycle provider are one deployed unit; reporting both keeps
+    /// a provider-only assignment from looking settled while the node still runs the old hooks.
+    /// Empty only before the first install, alongside [`NodeReport::archive_sha256`].
+    pub provider_set_sha256: String,
     /// Whether the node has *settled* on that deployment: it has finished acting on the
     /// assignment (installed and confirmed it, or attempted and rolled back from it) and
     /// its running app is healthy. A node with an unconfirmed update still in flight reports
@@ -364,18 +366,10 @@ pub struct NodeReport {
     /// readiness blip. Never true together with [`NodeReport::healthy`]: settled means the
     /// confirmation window is closed.
     ///
-    /// Added in schema 6, so it defaults for reports the compatibility window still admits from
-    /// older agents — and the default is the FAIL-SAFE reading: absent means "no transaction was
-    /// ever observed".
-    ///
     /// No VERDICT reads it. The regression evidence is [`NodeReport::rejected`], which the node
-    /// states outright instead of leaving a sequence for a reader to catch. This stays part of the
-    /// contract for two reasons: the reader window still admits schema-6 payloads, which carry the
-    /// key, and this struct is `deny_unknown_fields`, so dropping the field would refuse every one
-    /// of them; and it is the half of `healthy == false` that says a transaction genuinely ran,
-    /// which `is_wellformed` enforces (never true together with `healthy`). It goes when
-    /// `MIN_SUPPORTED_SCHEMA` passes 6.
-    #[serde(default)]
+    /// states outright instead of leaving a sequence for a reader to catch. This remains the half
+    /// of `healthy == false` that says a transaction genuinely ran, which `is_wellformed` enforces
+    /// (never true together with `healthy`).
     pub updating: bool,
     /// Whether this node has DURABLY REJECTED the release its assignment names: the archive
     /// [`NodeReport::assignment_sha256`] resolves to is in the node's rejection record, written by
@@ -396,12 +390,6 @@ pub struct NodeReport {
     /// expires, and corrected bytes have a new digest, which is the same rule the fleet-wide halt
     /// enforces.
     ///
-    /// Added in schema 7, so it defaults for reports the compatibility window still admits from
-    /// older agents — and the default is the FAIL-SAFE reading: absent means "this node claims no
-    /// rejection", which proves nothing and can only make the plane's verdict weaker, never wrong.
-    /// A pre-7 node's rejections are therefore invisible until it upgrades, and
-    /// `updatec_report_schema` is what makes that population visible while it lasts.
-    #[serde(default)]
     pub rejected: bool,
     /// Milliseconds since the Unix epoch when the node wrote this report (see [`now_ms`]). A
     /// reader ages the report against this so a node that dies without writing a not-ready
@@ -411,35 +399,20 @@ pub struct NodeReport {
     /// bounded observation failed or was cancelled for a deployment.
     #[serde(deserialize_with = "crate::required_option")]
     pub fingerprint: Option<Fingerprint>,
-    /// Versioned reconciler outputs. Absent when the running artifact has not emitted any. Outputs
-    /// are usable only through the same authenticity/freshness/health/deployment gate as the rest
-    /// of this report.
+    /// SHA-256 of the exact output-publication bytes successfully written before this report.
+    /// The publication lives in a separate private object, so signing its exact content identity
+    /// is what prevents an untrusted object store from substituting different dependency values.
+    /// Absent when the node is unhealthy, has no declared outputs, or could not publish them.
     #[serde(deserialize_with = "crate::required_option")]
-    pub outputs: Option<OutputManifest>,
+    pub output_sha256: Option<String>,
+    /// Platform-owned evidence for the latest successful state-changing reconciler invocation.
+    /// The node persists this before accepting the invocation, then signs it into every heartbeat.
+    #[serde(deserialize_with = "crate::required_option")]
+    pub reconciliation: Option<crate::reconciler::LastReconciliation>,
 }
 
 impl NodeReport {
-    pub const SCHEMA: u32 = 7;
-
-    /// The oldest report schema every reader still accepts — the reader-side half of the wire
-    /// compatibility policy (see `docs/wire-compatibility-design.md`).
-    ///
-    /// A fleet never upgrades atomically, and its readers upgrade FIRST by construction: nodes
-    /// receive their new agent through this very system, so the control plane and healthproxy
-    /// that will read schema-N reports are running before any node can write one. What a bare
-    /// `schema == SCHEMA` gate did to that ordering was catastrophic: the moment a reader
-    /// upgraded, every not-yet-upgraded node's reports failed verification — the healthproxy
-    /// DRAINED the entire healthy fleet and every rollout stalled — and the only cure was the
-    /// node upgrade the stalled system was now unable to deliver.
-    ///
-    /// So readers accept the window `[MIN_SUPPORTED_SCHEMA, SCHEMA]`, writers always write
-    /// `SCHEMA`, and every field added since `MIN_SUPPORTED_SCHEMA` MUST carry a serde default
-    /// chosen in the fail-safe direction, documented at the field (`updating`: absent means
-    /// "proves nothing"). The exact bytes a `MIN_SUPPORTED_SCHEMA` agent signs are locked by
-    /// `a_previous_schema_report_still_verifies`, so a defaultless field cannot land while the
-    /// window still claims to cover the old shape. Raising this floor is a deliberate act in its
-    /// own commit, made only when no supported fleet still runs the older agent.
-    pub const MIN_SUPPORTED_SCHEMA: u32 = 5;
+    pub const SCHEMA: u32 = 12;
 
     /// A report of a node that is NOT mid-transaction and claims no rejection.
     /// [`NodeReport::updating`] and [`NodeReport::rejected`] are set by the one writer that knows
@@ -451,6 +424,7 @@ impl NodeReport {
         assignment_sha256: impl Into<String>,
         version: impl Into<String>,
         archive_sha256: impl Into<String>,
+        provider_set_sha256: impl Into<String>,
         healthy: bool,
     ) -> Self {
         Self {
@@ -460,12 +434,14 @@ impl NodeReport {
             assignment_sha256: assignment_sha256.into(),
             version: version.into(),
             archive_sha256: archive_sha256.into(),
+            provider_set_sha256: provider_set_sha256.into(),
             healthy,
             updating: false,
             rejected: false,
             reported_at_ms: now_ms(),
             fingerprint: None,
-            outputs: None,
+            output_sha256: None,
+            reconciliation: None,
         }
     }
 
@@ -488,23 +464,42 @@ impl NodeReport {
     /// one signed report asserting simultaneously that a rollout has completed and that the
     /// transaction behind it is still in flight.
     pub fn is_wellformed(&self) -> bool {
-        (Self::MIN_SUPPORTED_SCHEMA..=Self::SCHEMA).contains(&self.schema)
-            && !self.node.is_empty()
-            && !self.deployment.is_empty()
+        self.schema == Self::SCHEMA
+            && is_valid_node(&self.node)
+            && crate::identity::is_segment(&self.deployment)
             && self.reported_at_ms > 0
             && (self.version.is_empty() == self.archive_sha256.is_empty())
+            && (self.version.is_empty() || crate::identity::is_release_version(&self.version))
+            && (self.archive_sha256.is_empty() == self.provider_set_sha256.is_empty())
             && (!self.healthy || !self.archive_sha256.is_empty())
             && !(self.healthy && self.updating)
-            && (self.archive_sha256.is_empty() || crate::is_sha256_hex(&self.archive_sha256))
-            && (self.assignment_sha256.is_empty() || crate::is_sha256_hex(&self.assignment_sha256))
+            && (self.archive_sha256.is_empty() || crate::is_canonical_sha256(&self.archive_sha256))
+            && (self.provider_set_sha256.is_empty()
+                || crate::is_canonical_sha256(&self.provider_set_sha256))
+            && (self.assignment_sha256.is_empty()
+                || crate::is_canonical_sha256(&self.assignment_sha256))
             && self
                 .fingerprint
                 .as_ref()
                 .is_none_or(Fingerprint::is_wellformed)
             && self
-                .outputs
+                .output_sha256
+                .as_deref()
+                .is_none_or(crate::is_canonical_sha256)
+            && (self.healthy || (self.fingerprint.is_none() && self.output_sha256.is_none()))
+            && self
+                .reconciliation
                 .as_ref()
-                .is_none_or(|outputs| outputs.validate().is_ok())
+                .is_none_or(|record| record.validate().is_ok())
+            && match &self.reconciliation {
+                None => self.version.is_empty(),
+                Some(record) => {
+                    !self.version.is_empty()
+                        && record.candidate.version == self.version
+                        && record.candidate.archive_sha256 == self.archive_sha256
+                        && record.reconciler.provider_set_sha256 == self.provider_set_sha256
+                }
+            }
     }
 
     /// Whether this report is inside the shared freshness window as seen from `now_ms`.
@@ -519,6 +514,27 @@ impl NodeReport {
         now_ms != 0
             && self.reported_at_ms <= now_ms.saturating_add(REPORT_MAX_SKEW.as_millis() as u64)
             && now_ms.saturating_sub(self.reported_at_ms) <= REPORT_FRESHNESS.as_millis() as u64
+    }
+
+    /// Whether this report proves convergence to one exact desired-state unit.
+    ///
+    /// Health alone describes the release that is actually serving and deliberately remains true
+    /// after a successful rollback. Convergence additionally binds the signed assignment, the
+    /// application archive, and its provider set, and excludes a standing rejection of that
+    /// assignment. Rollout settlement and dataflow admission share this predicate so neither can
+    /// mistake a healthy predecessor for the desired release.
+    pub fn is_converged_to(
+        &self,
+        assignment_sha256: &str,
+        archive_sha256: &str,
+        provider_set_sha256: &str,
+    ) -> bool {
+        self.is_wellformed()
+            && self.healthy
+            && !self.rejected
+            && self.assignment_sha256 == assignment_sha256
+            && self.archive_sha256 == archive_sha256
+            && self.provider_set_sha256 == provider_set_sha256
     }
 }
 
@@ -546,6 +562,18 @@ pub struct Envelope {
 }
 
 impl Envelope {
+    /// The wire bytes, under the same ceiling every reader decodes with.
+    ///
+    /// Pairs with [`accept_report_envelope`]. Without it the node encoded its report with a bare
+    /// `serde_json::to_vec` and uploaded whatever came out, while every consumer refused anything
+    /// past [`MAX_REPORT_ENVELOPE_BYTES`] — so a report that grew past the ceiling would be dropped
+    /// by the whole fleet at once and read as a node that had gone quiet: it holds its group's
+    /// rollout open and drains from the load balancer, with nothing anywhere naming the cause.
+    /// Encoding under the ceiling makes that a diagnosable failure on the one machine responsible.
+    pub fn to_bounded_json(&self) -> Result<Vec<u8>, String> {
+        crate::bounded::encode(self, "node report envelope", MAX_REPORT_ENVELOPE_BYTES)
+    }
+
     /// The most signatures a report envelope may carry. A node signs with exactly one key, so this
     /// is generous; it exists because verification is the expensive step and the count is otherwise
     /// attacker-chosen — a body full of bogus signatures with the valid one last would cost a full
@@ -606,45 +634,100 @@ pub fn sign_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Envelope, St
 /// The one write-side acceptance gate for a report envelope: the rule every hop that *stores* a
 /// report applies before it stores it.
 ///
-/// Returns the decoded report only when the body is an envelope of the report payload type, carries
-/// no more than [`Envelope::MAX_SIGNATURES`] signatures, decodes to a report that is well formed
-/// (which includes a schema inside the compatibility window — the same predicate every reader
-/// applies, so a record no reader can use is never stored), and names `node` — the node the caller
+/// Returns an opaque accepted report only when the body fits [`MAX_REPORT_ENVELOPE_BYTES`], is an envelope
+/// of the report payload type, carries one to [`Envelope::MAX_SIGNATURES`] signatures, and decodes
+/// to a report that is well formed
+/// (which includes the exact current schema — the same fail-closed predicate every reader applies,
+/// so a record no reader can use is never stored), and names `node` — the node the caller
 /// is filing it under. The signature is deliberately NOT
 /// verified here, and this is the only function that decodes a payload without checking it: a writer
 /// hop authorizes by the transport identity that presented the bytes, and the signature is
 /// end-to-end evidence for the consumers that later read them back, every one of which must go
 /// through [`report_is_authentic_and_fresh`] instead.
 ///
-/// It lives here, beside the envelope types, because the production gateway and the dev CDN both
-/// enforce it and must enforce the *same* thing: maintained as two copies, a tightening on one side
-/// silently makes the test path accept what production refuses, or the reverse.
-pub fn accept_report_envelope(body: &[u8], node: &str) -> Option<NodeReport> {
-    let envelope: Envelope = serde_json::from_slice(body).ok()?;
-    if envelope.payload_type != REPORT_PAYLOAD_TYPE
-        || envelope.signatures.len() > Envelope::MAX_SIGNATURES
-    {
-        return None;
-    }
-    use base64::Engine as _;
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(&envelope.payload)
-        .ok()?;
-    let report: NodeReport = serde_json::from_slice(&payload).ok()?;
-    (report.node == node && report.is_wellformed()).then_some(report)
+/// It lives here, beside the envelope types, because every production ingestion/projection path
+/// and every fixture must enforce the *same* thing. Maintained as copies, a tightening in one path
+/// would silently make another accept a report no consumer can use.
+pub fn accept_report_envelope(body: &[u8], node: &str) -> Option<AcceptedReport> {
+    let envelope: Envelope =
+        crate::bounded::decode(body, "node report envelope", MAX_REPORT_ENVELOPE_BYTES).ok()?;
+    report_envelope_is_acceptable(&envelope, node).then_some(AcceptedReport {
+        node: node.to_string(),
+        envelope,
+        accepted_at_ms: now_ms(),
+    })
 }
 
-/// Whether `point` is a well-formed uncompressed SEC1 P-256 point: `0x04` followed by two 32-byte
-/// coordinates, and not the all-zero encoding. Shape only — proving a point is on the curve is the
-/// verifier's job; this exists so a malformed *pin* is refused as a configuration error rather than
-/// silently behaving like a node whose every report is forged.
+/// The single structural predicate for an envelope entering an indexed fleet generation, whether it arrived
+/// at the live write gate or is being recovered from stored bytes. Signature authenticity remains
+/// a reader concern; this gate guarantees only that a reader can safely attempt it and that the
+/// decoded report is usable and attributed to its map key.
+fn report_envelope_is_acceptable(envelope: &Envelope, node: &str) -> bool {
+    if envelope.payload_type != REPORT_PAYLOAD_TYPE
+        || envelope.signatures.is_empty()
+        || envelope.signatures.len() > Envelope::MAX_SIGNATURES
+    {
+        return false;
+    }
+    use base64::Engine as _;
+    let Ok(payload) = base64::engine::general_purpose::STANDARD.decode(&envelope.payload) else {
+        return false;
+    };
+    let Ok(report) = serde_json::from_slice::<NodeReport>(&payload) else {
+        return false;
+    };
+    is_valid_node(node) && report.node == node && report.is_wellformed()
+}
+
+/// Proof that a report passed [`accept_report_envelope`].
 ///
-/// Public because the shape must be enforced where a pin is *configured*, not only where it is
-/// used: a pin that reaches [`report_is_authentic_and_fresh`] malformed drains its node forever
-/// with a log line indistinguishable from a genuinely unhealthy one. Every consumer validates
-/// against this one rule, so the boundary check and the verification check cannot drift.
-pub fn is_uncompressed_p256_point(point: &[u8]) -> bool {
-    point.len() == 65 && point[0] == 4 && point[1..].iter().any(|byte| *byte != 0)
+/// The fields are intentionally private: writers cannot construct or alter this value and
+/// [`FleetReports::record`] accepts no raw envelope. Consequently every report entering a fleet
+/// generation has exactly one validation path, and the envelope parsed by the gate is the envelope
+/// stored by the writer rather than a second parse of the same request body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedReport {
+    node: String,
+    envelope: Envelope,
+    /// When the gate accepted these exact bytes.
+    ///
+    /// A property of the acceptance, never of the moment someone asks. [`FleetReports`] evicts by
+    /// this value, so a holder that re-derives it by pushing a stored envelope back through the
+    /// gate does not merely waste the parse — it restamps every report with the current instant,
+    /// collapsing "evict the stalest" into "evict whichever node sorts first". Hold this value;
+    /// do not recompute it.
+    accepted_at_ms: u64,
+}
+
+impl AcceptedReport {
+    /// Consume the proof and return the exact envelope parsed by the shared acceptance gate.
+    ///
+    /// Caches that need to retain the raw signed envelope use this instead of reparsing the
+    /// untrusted request body after validation. Construction remains private, so obtaining an
+    /// envelope this way is itself proof that the one write-side gate accepted it.
+    pub fn into_envelope(self) -> Envelope {
+        self.envelope
+    }
+
+    /// The accepted envelope, for a holder that must keep the proof as well.
+    pub fn envelope(&self) -> &Envelope {
+        &self.envelope
+    }
+
+    /// The node these bytes are attributed to, as the gate confirmed it.
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    fn into_stored(self) -> (String, StoredReport) {
+        (
+            self.node,
+            StoredReport {
+                envelope: self.envelope,
+                accepted_at_ms: self.accepted_at_ms,
+            },
+        )
+    }
 }
 
 /// The one trust gate for consuming a node report.
@@ -665,10 +748,10 @@ pub fn is_uncompressed_p256_point(point: &[u8]) -> bool {
 pub fn report_is_authentic_and_fresh(
     envelope: &Envelope,
     expected_node: &str,
-    public_key_point: &[u8],
+    public_key: &P256PublicKey,
     now_ms: u64,
 ) -> Option<NodeReport> {
-    report_is_authentic(envelope, expected_node, public_key_point)
+    report_is_authentic(envelope, expected_node, public_key)
         .filter(|report| report.is_fresh(now_ms))
 }
 
@@ -688,9 +771,8 @@ pub fn report_is_authentic_and_fresh(
 pub fn report_is_authentic(
     envelope: &Envelope,
     expected_node: &str,
-    public_key_point: &[u8],
+    public_key: &P256PublicKey,
 ) -> Option<NodeReport> {
-    use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
     use base64::Engine as _;
 
     if envelope.payload_type != REPORT_PAYLOAD_TYPE
@@ -702,18 +784,14 @@ pub fn report_is_authentic(
     let payload = b64.decode(&envelope.payload).ok()?;
     let pae = pae(&payload, REPORT_PAYLOAD_TYPE);
 
-    // The pinned key must be a well-formed uncompressed P-256 point. An empty key would make every signature
-    // unverifiable (the fail-closed default rather than "no key, no check"), but so would a truncated key, a
-    // stray PEM header, or a config typo — and those are indistinguishable from a forged report unless the
-    // shape is checked. The pin arrives from operator config, which is exactly where such a mistake happens.
-    let verified = is_uncompressed_p256_point(public_key_point)
-        && envelope.signatures.iter().any(|signature| {
-            b64.decode(&signature.sig).is_ok_and(|sig| {
-                UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key_point)
-                    .verify(&pae, &sig)
-                    .is_ok()
-            })
-        });
+    // The pin cannot be malformed here: [`P256PublicKey`] is the only shape this takes and its
+    // constructors are the only way to make one, so a truncated key, a stray PEM header, or a
+    // config typo was already refused where the operator configured it. That matters because such a
+    // pin fails every signature and is indistinguishable in the logs from a genuinely forged report.
+    let verified = envelope.signatures.iter().any(|signature| {
+        b64.decode(&signature.sig)
+            .is_ok_and(|sig| public_key.verify_asn1(&pae, &sig))
+    });
     if !verified {
         return None;
     }
@@ -741,6 +819,496 @@ pub fn unverified_report(envelope: &Envelope) -> Option<NodeReport> {
     serde_json::from_slice(&payload).ok()
 }
 
+/// The index readers use to discover one complete fleet generation. Its fields are private and it
+/// is not `Serialize`: only [`FleetReports::rebalance`] can publish an index, so there is one way to
+/// produce a layout and changing the shard-count knob always runs through the same rebalancer.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetIndex {
+    schema: u32,
+    generation: String,
+    max_shards: u16,
+    #[serde(deserialize_with = "crate::required_option")]
+    rebalance_to: Option<u16>,
+}
+
+impl FleetIndex {
+    const SCHEMA: u32 = 1;
+
+    /// Parse the bounded stable index. One schema admits one exact shape, and generation names are
+    /// fixed-width lowercase hex so derived object keys cannot escape their namespace.
+    pub fn parse(body: &[u8]) -> Option<Self> {
+        let index: Self =
+            crate::bounded::decode(body, "fleet report index", MAX_FLEET_INDEX_BYTES).ok()?;
+        let generation_ok = index.generation.len() == 32
+            && index
+                .generation
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        (index.schema == Self::SCHEMA
+            && generation_ok
+            && (1..=MAX_FLEET_REPORT_SHARDS).contains(&usize::from(index.max_shards))
+            && index.rebalance_to.is_none_or(|target| {
+                target != index.max_shards
+                    && (1..=MAX_FLEET_REPORT_SHARDS).contains(&usize::from(target))
+            }))
+        .then_some(index)
+    }
+
+    /// Produce the one immutable transition marker that freezes steady-state writes before a full
+    /// rebalance reads this generation. A marker is never cancelled or retargeted: every replica
+    /// that sees one helps finish it, which makes rolling configuration changes serializable.
+    pub fn begin_rebalance(&self, target: FleetShardLimit) -> Result<(Self, Vec<u8>), String> {
+        if self.rebalance_to.is_some() {
+            return Err("the fleet generation is already marked for rebalance".into());
+        }
+        if self.max_shards == target.0 {
+            return Err("the fleet generation already has the requested shard limit".into());
+        }
+        let mut transition = self.clone();
+        transition.rebalance_to = Some(target.0);
+        let body = transition.encode()?;
+        Ok((transition, body))
+    }
+
+    /// Immutable shard locations for this exact generation, in canonical order.
+    pub fn shard_locations(&self) -> impl ExactSizeIterator<Item = FleetShardLocation> + '_ {
+        (0..self.max_shards).map(|shard| FleetShardLocation {
+            generation: self.generation.clone(),
+            shard,
+            max_shards: self.max_shards,
+        })
+    }
+
+    /// Canonical, deduplicated shard locations containing `nodes`. A reader that needs only a
+    /// configured subset of the fleet must not download unrelated shards; full rebalance and
+    /// repair continue to use [`Self::shard_locations`].
+    pub fn shard_locations_for<'a>(
+        &self,
+        nodes: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<FleetShardLocation> {
+        let max_shards = usize::from(self.max_shards);
+        let wanted: BTreeSet<u16> = nodes
+            .into_iter()
+            .map(|node| {
+                u16::try_from(FleetReports::shard_for(node, max_shards))
+                    .expect("the absolute shard bound fits u16")
+            })
+            .collect();
+        self.shard_locations()
+            .filter(|location| wanted.contains(&location.shard))
+            .collect()
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        #[derive(Serialize)]
+        struct Document<'a> {
+            schema: u32,
+            generation: &'a str,
+            max_shards: u16,
+            rebalance_to: Option<u16>,
+        }
+        // Under the same ceiling the reader decodes with. This was a `debug_assert!`, which is
+        // compiled out of the release binaries that actually ship: an index past the ceiling would
+        // have been written happily and then refused by every healthproxy that fetched it. The
+        // index is the DISCOVERY document — no readable index means no shards are found at all, so
+        // the whole fleet reads as absent rather than as one oversized object.
+        crate::bounded::encode(
+            &Document {
+                schema: self.schema,
+                generation: &self.generation,
+                max_shards: self.max_shards,
+                rebalance_to: self.rebalance_to,
+            },
+            "fleet report index",
+            MAX_FLEET_INDEX_BYTES,
+        )
+    }
+}
+
+/// One CAS-updated shard named by a [`FleetIndex`]. Readers use this value for both its derived
+/// location and the generation/index binding checked inside the shard body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FleetShardLocation {
+    generation: String,
+    shard: u16,
+    max_shards: u16,
+}
+
+impl FleetShardLocation {
+    pub fn object_key(&self) -> String {
+        format!(
+            "{REPORT_NAMESPACE}/fleet/{}/{:04x}.json",
+            self.generation, self.shard
+        )
+    }
+
+    pub fn url(&self, base: &str) -> String {
+        format!("{}/{}", base.trim_end_matches('/'), self.object_key())
+    }
+}
+
+/// One encoded shard of a generation: where it lives and the exact bytes stored there.
+pub type EncodedShard = (FleetShardLocation, Vec<u8>);
+
+/// One fully encoded generation produced by [`FleetReports::rebalance`]. Consuming it yields the
+/// stable index bytes, every initial shard body, and the number of oldest entries evicted to stay
+/// inside the operator's exact `max_shards × MAX_FLEET_REPORT_SHARD_BYTES` serialized budget.
+pub struct FleetGeneration {
+    index: FleetIndex,
+    index_body: Vec<u8>,
+    shards: Vec<EncodedShard>,
+    evicted: usize,
+}
+
+impl FleetGeneration {
+    pub fn into_parts(self) -> (FleetIndex, Vec<u8>, Vec<EncodedShard>, usize) {
+        (self.index, self.index_body, self.shards, self.evicted)
+    }
+}
+
+/// In-memory fleet reports: every node's most recently accepted envelope, keyed by node identity.
+/// Stored bytes are always a generation of bounded shards referenced by [`FLEET_INDEX_OBJECT_KEY`];
+/// this aggregate is never serialized directly.
+///
+/// This is TRANSPORT, not authority. Each envelope is consumed only through
+/// [`report_is_authentic_and_fresh`] against its node's pinned key. Reordering or dropping an entry
+/// only drains a node; forging one still requires its private key.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FleetReports {
+    reports: BTreeMap<String, StoredReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredReport {
+    accepted_at_ms: u64,
+    envelope: Envelope,
+}
+
+impl FleetReports {
+    const SHARD_SCHEMA: u32 = 1;
+
+    /// Parse one shard only when its bounded body agrees with the generation and position named by
+    /// the index. Entries that could not have passed the shared write gate are dropped individually
+    /// as storage corruption rather than poisoning the rest of the shard.
+    pub fn parse_shard(body: &[u8], location: &FleetShardLocation) -> Option<Self> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Document {
+            schema: u32,
+            generation: String,
+            shard: u16,
+            reports: BTreeMap<String, serde_json::Value>,
+        }
+
+        let document: Document =
+            crate::bounded::decode(body, "fleet report shard", MAX_FLEET_REPORT_SHARD_BYTES)
+                .ok()?;
+        if document.schema != Self::SHARD_SCHEMA
+            || document.generation != location.generation
+            || document.shard != location.shard
+        {
+            return None;
+        }
+        let reports = document
+            .reports
+            .into_iter()
+            .filter_map(|(node, value)| {
+                let stored: StoredReport = serde_json::from_value(value).ok()?;
+                (serde_json::to_vec(&stored.envelope)
+                    .is_ok_and(|body| body.len() <= MAX_REPORT_ENVELOPE_BYTES)
+                    && report_envelope_is_acceptable(&stored.envelope, &node)
+                    && Self::shard_for(&node, usize::from(location.max_shards))
+                        == usize::from(location.shard))
+                .then_some((node, stored))
+            })
+            .collect();
+        Some(Self { reports })
+    }
+
+    /// Record a report produced by the shared write gate. Acceptance order, never an unverified
+    /// payload timestamp, decides which report wins.
+    pub fn record(&mut self, accepted: AcceptedReport) {
+        let (node, stored) = accepted.into_stored();
+        self.reports.insert(node, stored);
+    }
+
+    /// Overlay a later accepted/read set onto this one. Object-store CAS decides replica ordering;
+    /// payload timestamps do not act as a second concurrency mechanism.
+    pub fn overlay(&mut self, newer: Self) {
+        self.reports.extend(newer.reports);
+    }
+
+    /// Remove one node's envelope for consumption. Readers ask only for their configured fleet, so
+    /// unknown stored nodes never escape the transport aggregate.
+    pub fn remove(&mut self, node: &str) -> Option<Envelope> {
+        self.reports.remove(node).map(|stored| stored.envelope)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.reports.is_empty()
+    }
+
+    /// Deterministically rebalance the entire fleet into exactly `max_shards` bounded objects and a
+    /// new generation. A node's SHA-256 identity chooses its shard, which makes steady-state writes
+    /// touch only shards carrying this flush's nodes; changing the knob rehashes the full fleet.
+    pub fn rebalance(self, max_shards: FleetShardLimit) -> Result<FleetGeneration, String> {
+        let max_shards = max_shards.get();
+        use aws_lc_rs::rand::SecureRandom as _;
+        let mut random = [0u8; 16];
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(&mut random)
+            .map_err(|_| "generating a fleet report generation ID".to_string())?;
+        let generation = hex::encode(random);
+
+        let mut bins: Vec<BTreeMap<String, StoredReport>> =
+            (0..max_shards).map(|_| BTreeMap::new()).collect();
+        for (node, stored) in self.reports {
+            let shard = Self::shard_for(&node, max_shards);
+            bins[shard].insert(node, stored);
+        }
+
+        let index = FleetIndex {
+            schema: FleetIndex::SCHEMA,
+            generation: generation.clone(),
+            max_shards: u16::try_from(max_shards).expect("the absolute shard bound fits u16"),
+            rebalance_to: None,
+        };
+        let index_body = index.encode()?;
+
+        let mut evicted = 0;
+        let mut shards = Vec::with_capacity(max_shards);
+        for (reports, location) in bins.into_iter().zip(index.shard_locations()) {
+            let (body, removed) = Self::encode_shard(reports, &location);
+            evicted += removed;
+            shards.push((location, body));
+        }
+        Ok(FleetGeneration {
+            index,
+            index_body,
+            shards,
+            evicted,
+        })
+    }
+
+    /// Split a buffered batch by the current layout. This is the only steady-state placement path;
+    /// it uses the same hash function as full rebalance, so a node can never acquire two homes.
+    pub fn into_shard_updates(self, index: &FleetIndex) -> Vec<FleetShardUpdate> {
+        let shard_count = usize::from(index.max_shards);
+        let locations: Vec<_> = index.shard_locations().collect();
+        let mut updates: BTreeMap<u16, FleetReports> = BTreeMap::new();
+        for (node, stored) in self.reports {
+            let shard = u16::try_from(Self::shard_for(&node, shard_count))
+                .expect("the absolute shard bound fits u16");
+            updates
+                .entry(shard)
+                .or_default()
+                .reports
+                .insert(node, stored);
+        }
+        updates
+            .into_iter()
+            .map(|(shard, reports)| FleetShardUpdate {
+                location: locations[usize::from(shard)].clone(),
+                reports,
+            })
+            .collect()
+    }
+
+    fn shard_for(node: &str, shard_count: usize) -> usize {
+        // The placement rule is wire-visible: writer and reader must land a node on the same
+        // shard, so it is defined on the canonical digest spelling every other identity uses —
+        // the leading 64 bits, read big-endian out of the first sixteen hex characters.
+        let digest = crate::digest::sha256_bytes(node.as_bytes());
+        let prefix = u64::from_str_radix(&digest[..16], 16).expect("sixteen hex characters");
+        let divisor = u64::try_from(shard_count).expect("the absolute shard bound fits u64");
+        usize::try_from(prefix % divisor).expect("a shard index fits usize")
+    }
+
+    fn entry_len(node: &str, stored: &StoredReport) -> usize {
+        serde_json::to_vec(node)
+            .expect("a string always encodes")
+            .len()
+            + 1
+            + serde_json::to_vec(stored)
+                .expect("a stored report of integers and strings always encodes")
+                .len()
+    }
+
+    fn encode_shard(
+        mut reports: BTreeMap<String, StoredReport>,
+        location: &FleetShardLocation,
+    ) -> (Vec<u8>, usize) {
+        #[derive(Serialize)]
+        struct Document<'a> {
+            schema: u32,
+            generation: &'a str,
+            shard: u16,
+            reports: &'a BTreeMap<String, StoredReport>,
+        }
+
+        let empty = BTreeMap::new();
+        let base_len = serde_json::to_vec(&Document {
+            schema: Self::SHARD_SCHEMA,
+            generation: &location.generation,
+            shard: location.shard,
+            reports: &empty,
+        })
+        .expect("a fleet shard header always encodes")
+        .len();
+        let mut entries: Vec<(u64, String, usize)> = reports
+            .iter()
+            .map(|(node, stored)| {
+                (
+                    stored.accepted_at_ms,
+                    node.clone(),
+                    Self::entry_len(node, stored),
+                )
+            })
+            .collect();
+        let mut encoded_len = base_len
+            + entries.iter().map(|(_, _, len)| len).sum::<usize>()
+            + entries.len().saturating_sub(1);
+        entries.sort_by(|left, right| (left.0, left.1.as_str()).cmp(&(right.0, right.1.as_str())));
+
+        let mut evicted = 0;
+        for (_, node, entry_len) in entries {
+            if encoded_len <= MAX_FLEET_REPORT_SHARD_BYTES {
+                break;
+            }
+            let entries_before = reports.len();
+            reports.remove(&node);
+            encoded_len -= entry_len + usize::from(entries_before > 1);
+            evicted += 1;
+        }
+        let body = serde_json::to_vec(&Document {
+            schema: Self::SHARD_SCHEMA,
+            generation: &location.generation,
+            shard: location.shard,
+            reports: &reports,
+        })
+        .expect("a fleet shard always encodes");
+        debug_assert_eq!(body.len(), encoded_len);
+        (body, evicted)
+    }
+}
+
+/// The buffered reports assigned to one current-generation shard. Its fields are private so a
+/// writer cannot choose a different placement or a second encoding path.
+#[derive(Clone)]
+pub struct FleetShardUpdate {
+    location: FleetShardLocation,
+    reports: FleetReports,
+}
+
+impl FleetShardUpdate {
+    pub fn location(&self) -> &FleetShardLocation {
+        &self.location
+    }
+
+    /// Merge this accepted batch over the currently stored shard (or repair an unusable shard) and
+    /// return the one canonical bounded encoding plus its capacity-eviction count.
+    pub fn merge(&self, current: Option<&[u8]>) -> (Vec<u8>, usize) {
+        let mut reports = current
+            .and_then(|body| FleetReports::parse_shard(body, &self.location))
+            .unwrap_or_default();
+        reports.overlay(self.reports.clone());
+        FleetReports::encode_shard(reports.reports, &self.location)
+    }
+}
+
+/// The bounded ingress form of [`FleetReports`]. It applies the same identity hash, exact encoded
+/// entry accounting, per-shard byte ceiling, and receiver-acceptance eviction order as persisted
+/// shards. A gateway therefore cannot exceed its configured serialized report budget in the gap
+/// before a flush and cannot disagree with the writer about which entries fit.
+pub struct FleetReportBuffer {
+    reports: FleetReports,
+    max_shards: FleetShardLimit,
+    shards: Vec<BufferedFleetShard>,
+}
+
+struct BufferedFleetShard {
+    encoded_len: usize,
+    eviction_order: BTreeSet<(u64, String)>,
+}
+
+impl FleetReportBuffer {
+    /// The only constructor: the shard ceiling is the operator's, never a default this type picks.
+    /// This is the ingress half of an accounting the persisted layout owns the other half of, and a
+    /// buffer that silently substituted [`DEFAULT_FLEET_REPORT_MAX_SHARDS`] is exactly how the two
+    /// halves get to disagree about which entries fit.
+    pub fn new(max_shards: FleetShardLimit) -> Self {
+        let accounting_index = FleetIndex {
+            schema: FleetIndex::SCHEMA,
+            generation: "0".repeat(32),
+            max_shards: max_shards.0,
+            rebalance_to: None,
+        };
+        let shards = accounting_index
+            .shard_locations()
+            .map(|location| {
+                let (empty, evicted) = FleetReports::encode_shard(BTreeMap::new(), &location);
+                debug_assert_eq!(evicted, 0);
+                BufferedFleetShard {
+                    encoded_len: empty.len(),
+                    eviction_order: BTreeSet::new(),
+                }
+            })
+            .collect();
+        Self {
+            reports: FleetReports::default(),
+            max_shards,
+            shards,
+        }
+    }
+
+    /// Record one accepted report and return the number evicted from its shard to preserve the
+    /// exact encoded-body ceiling. At most one existing node is replaced, but a maximum-sized new
+    /// value can evict multiple older small entries.
+    pub fn record(&mut self, accepted: AcceptedReport) -> usize {
+        let (node, stored) = accepted.into_stored();
+        let shard_index = FleetReports::shard_for(&node, self.max_shards.get());
+        let shard = &mut self.shards[shard_index];
+        let entries_before = shard.eviction_order.len();
+        if let Some(previous) = self.reports.reports.insert(node.clone(), stored.clone()) {
+            shard.encoded_len -= FleetReports::entry_len(&node, &previous);
+            shard
+                .eviction_order
+                .remove(&(previous.accepted_at_ms, node.clone()));
+        } else if entries_before > 0 {
+            shard.encoded_len += 1;
+        }
+        shard.encoded_len += FleetReports::entry_len(&node, &stored);
+        shard.eviction_order.insert((stored.accepted_at_ms, node));
+
+        let mut evicted = 0;
+        while shard.encoded_len > MAX_FLEET_REPORT_SHARD_BYTES {
+            let (_, oldest) = shard
+                .eviction_order
+                .pop_first()
+                .expect("an overfull shard contains an entry");
+            let entries_before = shard.eviction_order.len() + 1;
+            let removed = self
+                .reports
+                .reports
+                .remove(&oldest)
+                .expect("eviction order and report map stay in lockstep");
+            shard.encoded_len -=
+                FleetReports::entry_len(&oldest, &removed) + usize::from(entries_before > 1);
+            evicted += 1;
+        }
+        evicted
+    }
+
+    /// Take the bounded batch while retaining its configured shard budget for the next arrivals.
+    pub fn drain(&mut self) -> FleetReports {
+        let reports = std::mem::take(&mut self.reports);
+        *self = Self::new(self.max_shards);
+        reports
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,93 +1323,96 @@ mod tests {
         base64::engine::general_purpose::STANDARD
     }
 
-    /// A keypair plus the raw uncompressed public point the control plane pins at enrollment.
-    fn keypair() -> (Vec<u8>, Vec<u8>) {
+    fn shard_limit(value: usize) -> FleetShardLimit {
+        FleetShardLimit::new(value).unwrap()
+    }
+
+    /// A keypair plus the public key the control plane pins at enrollment.
+    fn keypair() -> (Vec<u8>, P256PublicKey) {
         let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
         let key =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
-        (pkcs8.as_ref().to_vec(), key.public_key().as_ref().to_vec())
+        let public = P256PublicKey::from_point(key.public_key().as_ref()).unwrap();
+        (pkcs8.as_ref().to_vec(), public)
     }
 
     fn report() -> NodeReport {
-        NodeReport::new("agent-9", "deploy-2", OTHER_DIGEST, "2.0.0", DIGEST, true)
+        let mut report = NodeReport::new(
+            "agent-9",
+            "deploy-2",
+            OTHER_DIGEST,
+            "2.0.0",
+            DIGEST,
+            DIGEST,
+            true,
+        );
+        report.reconciliation = Some(reconciliation());
+        report
     }
 
     /// A report the node genuinely signed *after* `mutate` ran. Signing last is the point: it isolates
     /// what the gate refuses on policy grounds from what it refuses because a signature broke.
-    fn signed(mutate: impl FnOnce(&mut NodeReport)) -> (Envelope, Vec<u8>) {
-        let (pkcs8, point) = keypair();
+    fn signed(mutate: impl FnOnce(&mut NodeReport)) -> (Envelope, P256PublicKey) {
+        let (pkcs8, public) = keypair();
         let mut report = report();
         mutate(&mut report);
-        (sign_report(&report, &pkcs8).unwrap(), point)
+        (sign_report(&report, &pkcs8).unwrap(), public)
     }
 
-    /// The EXACT BYTES a schema-5 agent signs — a literal payload, not a re-serialization of
-    /// the current struct — must verify for as long as [`NodeReport::MIN_SUPPORTED_SCHEMA`] claims
-    /// to cover it. A fleet's readers upgrade before its nodes (nodes receive their agent
-    /// THROUGH this system), so the pass where this bound broke drained every not-yet-upgraded
-    /// node out of rotation and stalled the very rollout that would have delivered the upgrade.
-    /// This test is what makes the window real: adding a defaultless field fails it immediately.
-    #[test]
-    fn a_previous_schema_report_still_verifies() {
-        use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
-
-        // A verbatim schema-5 document: no `updating` and no `rejected` field, because schema 5
-        // had neither.
-        let payload = format!(
-            concat!(
-                "{{\"schema\":5,\"node\":\"agent-9\",\"deployment\":\"deploy-2\",",
-                "\"assignment_sha256\":\"{assignment}\",\"version\":\"2.0.0\",",
-                "\"archive_sha256\":\"{archive}\",\"healthy\":true,",
-                "\"reported_at_ms\":{now},\"fingerprint\":null,\"outputs\":null}}"
-            ),
-            assignment = OTHER_DIGEST,
-            archive = DIGEST,
-            now = now_ms(),
-        );
-        let (pkcs8, point) = keypair();
-        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8).unwrap();
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        let signature = key
-            .sign(&rng, &pae(payload.as_bytes(), REPORT_PAYLOAD_TYPE))
-            .unwrap();
-        let envelope = Envelope {
-            payload: b64().encode(payload.as_bytes()),
-            payload_type: REPORT_PAYLOAD_TYPE.to_string(),
-            signatures: vec![Signature {
-                sig: b64().encode(signature.as_ref()),
-            }],
-        };
-        let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
-            .expect("a report from an agent inside the compatibility window must verify");
-        assert_eq!(report.schema, 5);
-        assert!(
-            !report.updating && !report.rejected,
-            "every field the old schema could not assert defaults to the fail-safe reading"
-        );
+    fn reconciliation() -> crate::reconciler::LastReconciliation {
+        crate::reconciler::LastReconciliation {
+            schema: crate::reconciler::LastReconciliation::SCHEMA,
+            operation: crate::reconciler::Operation::Apply,
+            reason: crate::reconciler::Reason::Update,
+            attempt_id: crate::reconciler::attempt::CONVERGE.into(),
+            candidate: crate::reconciler::ReconciledRelease {
+                version: "2.0.0".into(),
+                manifest_sha256: DIGEST.into(),
+                archive_sha256: DIGEST.into(),
+            },
+            predecessor: crate::reconciler::ReconciledRelease {
+                version: "1.0.0".into(),
+                manifest_sha256: OTHER_DIGEST.into(),
+                archive_sha256: OTHER_DIGEST.into(),
+            },
+            reconciler: crate::reconciler::ReconcilerIdentity {
+                provider_set_sha256: DIGEST.into(),
+                product: "system".into(),
+                release: crate::reconciler::ReconciledRelease {
+                    version: "3.0.0".into(),
+                    manifest_sha256: DIGEST.into(),
+                    archive_sha256: OTHER_DIGEST.into(),
+                },
+            },
+            result: crate::reconciler::ResultDocument {
+                schema: crate::reconciler::ResultDocument::SCHEMA,
+                status: crate::reconciler::ResultStatus::Succeeded,
+                changed: true,
+                host_action: crate::reconciler::HostAction::Reboot,
+                retry_after_seconds: None,
+                message: Some("kernel changed".into()),
+            },
+            completed_at_ms: 1,
+        }
     }
 
-    /// The window has two hard edges: below the floor is an agent no release supports, above
-    /// the ceiling is a writer NEWER than this reader — a report it cannot interpret and must not
-    /// guess at (the supported upgrade order is readers first, which makes that shape a fault,
-    /// not a transition).
+    fn accepted(node: &str, envelope: &Envelope) -> AcceptedReport {
+        let body = serde_json::to_vec(envelope).unwrap();
+        accept_report_envelope(&body, node).unwrap()
+    }
+
     #[test]
-    fn schemas_outside_the_window_are_refused() {
-        for schema in [NodeReport::MIN_SUPPORTED_SCHEMA - 1, NodeReport::SCHEMA + 1] {
+    fn every_non_current_schema_is_refused() {
+        for schema in [NodeReport::SCHEMA - 1, NodeReport::SCHEMA + 1] {
             let (envelope, point) = signed(|report| report.schema = schema);
             assert!(
                 report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
                 "schema {schema} must be refused"
             );
         }
-        for schema in [NodeReport::MIN_SUPPORTED_SCHEMA, NodeReport::SCHEMA] {
-            let (envelope, point) = signed(|report| report.schema = schema);
-            assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_some(),
-                "schema {schema} is inside the window"
-            );
-        }
+        let (envelope, point) = signed(|_| {});
+        assert!(report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_some());
     }
 
     #[test]
@@ -885,115 +1456,105 @@ mod tests {
         assert!(report_is_authentic_and_fresh(&malformed, "agent-9", &point, now_ms()).is_none());
     }
 
-    /// The writer-side allowance and the reader-side body limit must be the SAME bound, not the
-    /// same number in two different units. A manifest of exactly [`MAX_OUTPUT_MANIFEST_BYTES`],
-    /// attached to a report whose every other field is at its worst-case length, must sign into an
-    /// envelope that still fits [`MAX_REPORT_ENVELOPE_BYTES`] after base64 expansion — otherwise a
-    /// perfectly healthy node publishes nothing (writes are best-effort and never retried, and
-    /// outputs ride only on healthy reports) and is drained from rotation forever.
     #[test]
-    fn the_worst_case_envelope_for_a_max_size_manifest_fits_the_body_limit() {
-        let size = |manifest: &OutputManifest| serde_json::to_vec(manifest).unwrap().len();
-        let mut manifest = OutputManifest {
-            schema: OutputManifest::SCHEMA,
-            values: BTreeMap::new(),
-        };
-        // Fill to the cap with maximum-length values, then top the last one up so the manifest is
-        // exactly at the bound rather than merely near it.
-        for index in 0.. {
-            let mut candidate = manifest.clone();
-            candidate.values.insert(
-                format!("output-{index:03}"),
-                OutputValue::String {
-                    value: "x".repeat(OutputManifest::MAX_STRING_BYTES),
-                },
+    fn only_a_settled_healthy_report_can_attest_observations_or_outputs() {
+        for mutate in [
+            (|report: &mut NodeReport| {
+                report.healthy = false;
+                report.fingerprint = Some(Fingerprint {
+                    definition_sha256: DIGEST.into(),
+                    output_sha256: OTHER_DIGEST.into(),
+                });
+            }) as fn(&mut NodeReport),
+            |report: &mut NodeReport| {
+                report.healthy = false;
+                report.output_sha256 = Some(DIGEST.into());
+            },
+        ] {
+            let (envelope, point) = signed(mutate);
+            assert!(
+                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none()
             );
-            if size(&candidate) > MAX_OUTPUT_MANIFEST_BYTES {
-                break;
-            }
-            manifest = candidate;
         }
-        let name = "output-top".to_string();
-        let mut probe = manifest.clone();
-        probe.values.insert(
-            name.clone(),
-            OutputValue::String {
-                value: String::new(),
-            },
-        );
-        let fill = MAX_OUTPUT_MANIFEST_BYTES - size(&probe);
-        manifest.values.insert(
-            name,
-            OutputValue::String {
-                value: "x".repeat(fill),
-            },
-        );
-        assert_eq!(size(&manifest), MAX_OUTPUT_MANIFEST_BYTES);
-        manifest
-            .validate()
-            .expect("a manifest at the byte cap must be a valid one a node can actually attach");
-
-        // Worst case around it: the longest identities and every optional field present.
-        let mut report = NodeReport::new(
-            "n".repeat(253),
-            "d".repeat(253),
-            OTHER_DIGEST,
-            "1.2.3-rc.1+build.9999",
-            DIGEST,
-            true,
-        );
-        report.fingerprint = Some(Fingerprint {
-            definition_sha256: DIGEST.into(),
-            output_sha256: OTHER_DIGEST.into(),
-        });
-        report.outputs = Some(manifest);
-        let (pkcs8, _) = keypair();
-        let envelope = serde_json::to_vec(&sign_report(&report, &pkcs8).unwrap()).unwrap();
-        assert!(
-            envelope.len() <= MAX_REPORT_ENVELOPE_BYTES,
-            "a max-size manifest signs into a {}-byte envelope, past the {MAX_REPORT_ENVELOPE_BYTES}-byte limit every reader enforces",
-            envelope.len()
-        );
     }
 
     #[test]
-    fn typed_outputs_are_bounded_and_covered_by_the_report_signature() {
-        let (envelope, point) = signed(|report| {
-            report.outputs = Some(OutputManifest {
-                schema: OutputManifest::SCHEMA,
-                values: BTreeMap::from([
-                    (
-                        "leader-address".into(),
-                        OutputValue::String {
-                            value: "https://vault-0:8200".into(),
-                        },
-                    ),
-                    (
-                        "join-token".into(),
-                        OutputValue::SecretRef {
-                            secret: "vault-bootstrap".into(),
-                            key: "join-token".into(),
-                        },
-                    ),
-                ]),
-            });
-        });
+    fn a_restored_healthy_predecessor_can_attest_the_rejected_assignment() {
+        let (envelope, point) = signed(|report| report.rejected = true);
         let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
-            .expect("signed typed outputs must verify");
-        assert_eq!(report.outputs.unwrap().values.len(), 2);
+            .expect("a rollback reports both the restored release health and the rejection");
+        assert!(report.healthy);
+        assert!(report.rejected);
+        assert!(!report.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
+    }
 
-        let (oversized, point) = signed(|report| {
-            report.outputs = Some(OutputManifest {
-                schema: OutputManifest::SCHEMA,
-                values: BTreeMap::from([(
-                    "value".into(),
-                    OutputValue::String {
-                        value: "x".repeat(OutputManifest::MAX_STRING_BYTES + 1),
-                    },
-                )]),
-            });
+    #[test]
+    fn exact_convergence_has_one_assignment_release_and_provider_predicate() {
+        let report = report();
+        assert!(report.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
+        assert!(!report.is_converged_to(DIGEST, DIGEST, DIGEST));
+        assert!(!report.is_converged_to(OTHER_DIGEST, OTHER_DIGEST, DIGEST));
+        assert!(!report.is_converged_to(OTHER_DIGEST, DIGEST, OTHER_DIGEST));
+
+        let mut unhealthy = report.clone();
+        unhealthy.healthy = false;
+        assert!(!unhealthy.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
+
+        let mut rejected = report;
+        rejected.rejected = true;
+        assert!(!rejected.is_converged_to(OTHER_DIGEST, DIGEST, DIGEST));
+    }
+
+    #[test]
+    fn reconciliation_audit_evidence_is_validated_inside_the_signed_report() {
+        let (envelope, point) = signed(|report| {
+            report.reconciliation = Some(reconciliation());
         });
-        assert!(report_is_authentic_and_fresh(&oversized, "agent-9", &point, now_ms()).is_none());
+        let verified = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
+            .expect("valid audit evidence remains inside the signed report");
+        assert_eq!(
+            verified
+                .reconciliation
+                .expect("the report contains audit evidence")
+                .result
+                .host_action,
+            crate::reconciler::HostAction::Reboot
+        );
+
+        let (malformed, point) = signed(|report| {
+            let mut record = reconciliation();
+            record.operation = crate::reconciler::Operation::Inspect;
+            report.reconciliation = Some(record);
+        });
+        assert!(report_is_authentic_and_fresh(&malformed, "agent-9", &point, now_ms()).is_none());
+    }
+
+    #[test]
+    fn an_installed_report_must_bind_reconciliation_to_its_running_bytes_and_provider_set() {
+        for mutate in [
+            (|report: &mut NodeReport| report.reconciliation = None) as fn(&mut NodeReport),
+            |report| {
+                report
+                    .reconciliation
+                    .as_mut()
+                    .unwrap()
+                    .candidate
+                    .archive_sha256 = OTHER_DIGEST.into();
+            },
+            |report| {
+                report
+                    .reconciliation
+                    .as_mut()
+                    .unwrap()
+                    .reconciler
+                    .provider_set_sha256 = OTHER_DIGEST.into();
+            },
+        ] {
+            let (envelope, point) = signed(mutate);
+            assert!(
+                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none()
+            );
+        }
     }
 
     #[test]
@@ -1022,33 +1583,14 @@ mod tests {
             "a re-pointed payload must not verify"
         );
 
-        let (_, other_point) = keypair();
+        let (_, other_key) = keypair();
         assert!(
-            report_is_authentic_and_fresh(&envelope, "agent-9", &other_point, now_ms()).is_none(),
+            report_is_authentic_and_fresh(&envelope, "agent-9", &other_key, now_ms()).is_none(),
             "another node's key must not verify this report"
         );
-
-        // A malformed pin is refused on shape, so a configuration mistake is not mistaken for a node
-        // whose every report is forged. Empty, truncated, wrong tag, and all-zero all fail closed.
-        for bad in [
-            vec![],
-            vec![4u8; 10],
-            {
-                let mut compressed = vec![2u8];
-                compressed.extend_from_slice(&[7u8; 64]);
-                compressed
-            },
-            {
-                let mut zeroed = vec![4u8];
-                zeroed.extend_from_slice(&[0u8; 64]);
-                zeroed
-            },
-        ] {
-            assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &bad, now_ms()).is_none(),
-                "a malformed pinned key must fail closed: {bad:?}"
-            );
-        }
+        // A malformed pin cannot reach this gate at all: `P256PublicKey` is the only shape it
+        // accepts, and `crate::key` is where every way of making one is proven to refuse a
+        // truncated, wrongly tagged, zeroed, or off-curve point.
     }
 
     #[test]
@@ -1163,6 +1705,12 @@ mod tests {
             "a report must not be storable under another node's name"
         );
         assert!(accept_report_envelope(b"not json", "agent-9").is_none());
+        let mut padded = body.clone();
+        padded.resize(MAX_REPORT_ENVELOPE_BYTES + 1, b' ');
+        assert!(
+            accept_report_envelope(&padded, "agent-9").is_none(),
+            "the shared write gate owns the envelope byte bound"
+        );
 
         // Wrong payload type: an envelope this node legitimately signed for something else.
         let mut retyped = envelope.clone();
@@ -1182,6 +1730,13 @@ mod tests {
         .collect();
         assert!(
             accept_report_envelope(&serde_json::to_vec(&stuffed).unwrap(), "agent-9").is_none()
+        );
+
+        let mut unsigned = envelope.clone();
+        unsigned.signatures.clear();
+        assert!(
+            accept_report_envelope(&serde_json::to_vec(&unsigned).unwrap(), "agent-9").is_none(),
+            "an envelope no reader can authenticate must be refused before storage"
         );
 
         // A payload that parses but is not well formed: the reader-side shape gate, applied on write.
@@ -1235,11 +1790,12 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_refuses_a_malformed_running_digest_even_when_signed() {
+    fn the_gate_refuses_malformed_content_digests_even_when_signed() {
         for malformed in [
             "deadbeef".to_string(),
             DIGEST[..63].to_string(),
             format!("{DIGEST}0"),
+            DIGEST.to_ascii_uppercase(),
             "z".repeat(64),
             format!("sha256:{DIGEST}"),
         ] {
@@ -1247,6 +1803,45 @@ mod tests {
             assert!(
                 report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
                 "a digest a reader cannot join on must fail the gate: {malformed}"
+            );
+        }
+        let (envelope, point) = signed(|r| r.provider_set_sha256 = "not-a-digest".into());
+        assert!(
+            report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+            "the provider half of the running identity must fail closed too"
+        );
+        for malformed in ["deadbeef".to_string(), "A".repeat(64), "z".repeat(64)] {
+            let (envelope, point) = signed(|r| r.output_sha256 = Some(malformed.clone()));
+            assert!(
+                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                "an output identity not produced by the exact-byte hasher must fail closed: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_names_are_bounded_by_the_same_grammars_as_their_producers() {
+        for deployment in [
+            "nested/deployment".to_string(),
+            "a".repeat(crate::identity::MAX_SEGMENT_BYTES + 1),
+        ] {
+            let (envelope, point) = signed(|report| report.deployment = deployment.clone());
+            assert!(
+                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                "invalid deployment identity must fail closed: {deployment:?}"
+            );
+        }
+        for version in [
+            "latest".to_string(),
+            format!(
+                "1.0.0+{}",
+                "a".repeat(crate::identity::MAX_RELEASE_VERSION_BYTES)
+            ),
+        ] {
+            let (envelope, point) = signed(|report| report.version = version.clone());
+            assert!(
+                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                "invalid release version must fail closed: {version:?}"
             );
         }
     }
@@ -1258,12 +1853,15 @@ mod tests {
         let (envelope, point) = signed(|r| {
             r.version = String::new();
             r.archive_sha256 = String::new();
+            r.provider_set_sha256 = String::new();
+            r.reconciliation = None;
             r.healthy = false;
         });
 
         let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).unwrap();
         assert!(report.version.is_empty());
         assert!(report.archive_sha256.is_empty());
+        assert!(report.provider_set_sha256.is_empty());
     }
 
     #[test]
@@ -1290,6 +1888,24 @@ mod tests {
         );
     }
 
+    /// The producer and the consumer of a report envelope share one ceiling.
+    #[test]
+    fn an_envelope_is_encoded_under_the_ceiling_its_readers_enforce() {
+        let (envelope, _) = signed(|_| {});
+        let bytes = envelope.to_bounded_json().expect("a real report fits");
+        assert!(bytes.len() <= MAX_REPORT_ENVELOPE_BYTES);
+        assert!(
+            accept_report_envelope(&bytes, "agent-9").is_some(),
+            "what the producer emits is exactly what the one acceptance gate takes"
+        );
+
+        // An envelope past the ceiling fails at the node instead of being dropped by every reader.
+        let mut bloated = envelope.clone();
+        bloated.payload = "A".repeat(MAX_REPORT_ENVELOPE_BYTES + 1);
+        let error = bloated.to_bounded_json().expect_err("over the ceiling");
+        assert!(error.contains("node report envelope"), "{error}");
+    }
+
     #[test]
     fn the_envelope_round_trips_and_rejects_unknown_fields() {
         let (envelope, _) = signed(|_| {});
@@ -1305,9 +1921,347 @@ mod tests {
         .is_err());
     }
 
+    /// Last accepted report per node, overlay semantics, and the full storage round trip:
+    /// rebalance into an index plus its initial shards, then recover the identical fleet by
+    /// walking exactly what a reader walks — parse the index, parse each named shard.
     #[test]
-    fn report_key_is_namespaced_by_node() {
-        assert_eq!(report_object_key("agent-7"), "telemetry/agent-7.json");
+    fn the_fleet_round_trips_through_its_index_and_shards() {
+        let (pkcs8, _) = keypair();
+        let sign_at = |node: &str, at: u64| {
+            let mut report = report();
+            report.node = node.to_string();
+            report.reported_at_ms = at;
+            sign_report(&report, &pkcs8).unwrap()
+        };
+
+        let mut reports = FleetReports::default();
+        let future = sign_at("a", u64::MAX);
+        reports.record(accepted("a", &future));
+        let correction = sign_at("a", 50);
+        reports.record(accepted("a", &correction));
+        assert_eq!(
+            reports.clone().remove("a"),
+            Some(correction.clone()),
+            "an untrusted future timestamp must not pin an unusable report"
+        );
+
+        // The flusher's conditional read-merge-write overlays the accepted batch on the stored
+        // fleet. Payload timestamps do not act as a second concurrency mechanism.
+        let mut stored = FleetReports::default();
+        let stored_a = sign_at("a", 200);
+        let stored_b = sign_at("b", 200);
+        let stored_c = sign_at("c", 300);
+        stored.record(accepted("a", &stored_a));
+        stored.record(accepted("b", &stored_b));
+        stored.record(accepted("c", &stored_c));
+        stored.overlay(reports);
+        assert_eq!(stored.clone().remove("a"), Some(correction.clone()));
+
+        let (index, index_body, shards, evicted) = stored
+            .rebalance(shard_limit(2))
+            .expect("a small fleet rebalances")
+            .into_parts();
+        assert_eq!(evicted, 0);
+        assert_eq!(
+            FleetIndex::parse(&index_body),
+            Some(index.clone()),
+            "the published index bytes name the generation that was built"
+        );
+        assert_eq!(index.shard_locations().len(), 2);
+        let locations: Vec<_> = index.shard_locations().collect();
+        assert_eq!(
+            index.shard_locations_for(["a", "a"]),
+            vec![locations[FleetReports::shard_for("a", 2)].clone()],
+            "subset readers fetch one canonical shard once"
+        );
+        assert_eq!(index.max_shards, shard_limit(2).0);
+        assert_eq!(index.rebalance_to, None);
+        assert_eq!(shards.len(), 2);
+
+        // Locations derived from the index and locations the writer stored under are one set,
+        // and every key stays inside the fleet namespace under the reserved basename.
+        let mut recovered = FleetReports::default();
+        for (location, body) in &shards {
+            assert!(index.shard_locations().any(|derived| derived == *location));
+            assert!(location
+                .object_key()
+                .starts_with(&format!("{REPORT_NAMESPACE}/{FLEET_INDEX_BASENAME}/")));
+            assert_eq!(
+                location.url("https://cdn/"),
+                format!("https://cdn/{}", location.object_key())
+            );
+            recovered
+                .overlay(FleetReports::parse_shard(body, location).expect("a stored shard parses"));
+        }
+        assert_eq!(recovered.remove("a"), Some(correction));
+        assert_eq!(recovered.remove("b"), Some(stored_b));
+        assert_eq!(recovered.remove("c"), Some(stored_c));
+        assert!(recovered.is_empty(), "nothing beyond what was recorded");
+    }
+
+    #[test]
+    fn steady_state_updates_only_the_canonical_shard_and_preserve_the_index() {
+        let (pkcs8, _) = keypair();
+        let sign_at = |node: &str, at: u64| {
+            let mut report = report();
+            report.node = node.into();
+            report.reported_at_ms = at;
+            sign_report(&report, &pkcs8).unwrap()
+        };
+        let original_a = sign_at("a", 1);
+        let original_b = sign_at("b", 1);
+        let mut fleet = FleetReports::default();
+        fleet.record(accepted("a", &original_a));
+        fleet.record(accepted("b", &original_b));
+        let (index, index_body, shards, _) = fleet.rebalance(shard_limit(2)).unwrap().into_parts();
+        let mut stored: BTreeMap<String, (FleetShardLocation, Vec<u8>)> = shards
+            .into_iter()
+            .map(|(location, body)| (location.object_key(), (location, body)))
+            .collect();
+
+        let replacement = sign_at("a", 2);
+        let mut pending = FleetReports::default();
+        pending.record(accepted("a", &replacement));
+        let updates = pending.into_shard_updates(&index);
+        assert_eq!(updates.len(), 1, "one node has exactly one shard home");
+        for update in updates {
+            let key = update.location().object_key();
+            let current = stored.get(&key).map(|(_, body)| body.as_slice());
+            let (body, evicted) = update.merge(current);
+            assert_eq!(evicted, 0);
+            stored.insert(key, (update.location().clone(), body));
+        }
+
+        assert_eq!(FleetIndex::parse(&index_body), Some(index.clone()));
+        let mut recovered = FleetReports::default();
+        for (location, body) in stored.values() {
+            recovered.overlay(FleetReports::parse_shard(body, location).unwrap());
+        }
+        assert_eq!(recovered.remove("a"), Some(replacement));
+        assert_eq!(recovered.remove("b"), Some(original_b));
+    }
+
+    #[test]
+    fn a_rebalance_marker_keeps_the_old_layout_readable_and_has_one_encoding() {
+        let fleet = FleetReports::default();
+        let (index, _, _, _) = fleet.rebalance(shard_limit(2)).unwrap().into_parts();
+        let old_locations: Vec<_> = index.shard_locations().collect();
+        let (transition, body) = index.begin_rebalance(shard_limit(1)).unwrap();
+        assert_eq!(FleetIndex::parse(&body), Some(transition.clone()));
+        assert_eq!(transition.rebalance_to, Some(shard_limit(1).0));
+        assert_eq!(transition.max_shards, shard_limit(2).0);
+        assert_eq!(
+            transition.shard_locations().collect::<Vec<_>>(),
+            old_locations
+        );
+
+        assert!(transition.begin_rebalance(shard_limit(2)).is_err());
+        assert!(index.begin_rebalance(shard_limit(2)).is_err());
+    }
+
+    #[test]
+    fn index_and_shard_parsing_fail_closed_on_schema_identity_and_bounds() {
+        let (envelope, _) = signed(|_| {});
+        let mut fleet = FleetReports::default();
+        fleet.record(accepted("agent-9", &envelope));
+        let (index, index_body, shards, _) = fleet.rebalance(shard_limit(1)).unwrap().into_parts();
+        let location = index.shard_locations().next().unwrap();
+        let (stored_location, body) = &shards[0];
+        assert_eq!(*stored_location, location);
+
+        // The index: garbage, a future schema, a malformed generation, and an impossible shard
+        // count are each not a layout a reader may act on.
+        assert_eq!(FleetIndex::parse(b"not json"), None);
+        let tamper_index = |mutate: &dyn Fn(&mut serde_json::Value)| {
+            let mut value: serde_json::Value = serde_json::from_slice(&index_body).unwrap();
+            mutate(&mut value);
+            FleetIndex::parse(&serde_json::to_vec(&value).unwrap())
+        };
+        assert_eq!(tamper_index(&|v| v["schema"] = 2.into()), None);
+        assert_eq!(tamper_index(&|v| v["generation"] = "short".into()), None);
+        assert_eq!(
+            tamper_index(&|v| v["generation"] = "G".repeat(32).into()),
+            None,
+            "generation names are lowercase hex or they could escape their key namespace"
+        );
+        assert_eq!(tamper_index(&|v| v["max_shards"] = 0.into()), None);
+        assert_eq!(
+            tamper_index(&|v| { v["max_shards"] = (MAX_FLEET_REPORT_SHARDS as u64 + 1).into() }),
+            None
+        );
+        assert_eq!(tamper_index(&|v| v["rebalance_to"] = 0.into()), None);
+        assert_eq!(tamper_index(&|v| v["rebalance_to"] = 1.into()), None);
+        assert!(tamper_index(&|v| v["rebalance_to"] = 2.into()).is_some());
+        assert_eq!(
+            tamper_index(&|v| {
+                v.as_object_mut().unwrap().remove("rebalance_to");
+            }),
+            None,
+            "the stable index carries an explicit null transition, never an omitted old shape"
+        );
+        assert_eq!(
+            tamper_index(&|v| v["future_field"] = true.into()),
+            None,
+            "one schema admits exactly one index shape"
+        );
+        let mut oversized_index = index_body.clone();
+        oversized_index.resize(MAX_FLEET_INDEX_BYTES + 1, b' ');
+        assert_eq!(FleetIndex::parse(&oversized_index), None);
+
+        // The shard: it must agree with the exact generation and position the index named —
+        // a body served from another generation or slot is not this shard.
+        let other_fleet = {
+            let mut other = FleetReports::default();
+            other.record(accepted("agent-9", &envelope));
+            other
+        };
+        let (_, _, other_shards, _) = other_fleet.rebalance(shard_limit(1)).unwrap().into_parts();
+        assert_eq!(
+            FleetReports::parse_shard(&other_shards[0].1, &location),
+            None,
+            "a shard from another generation must not satisfy this index"
+        );
+        let mut oversized_shard = body.clone();
+        oversized_shard.resize(MAX_FLEET_REPORT_SHARD_BYTES + 1, b' ');
+        assert_eq!(FleetReports::parse_shard(&oversized_shard, &location), None);
+
+        // Entries a write gate could never have produced are dropped individually as storage
+        // corruption, never poisoning the rest of the shard.
+        let mut value: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let mut unknown_shard_field = value.clone();
+        unknown_shard_field["future_field"] = true.into();
+        assert_eq!(
+            FleetReports::parse_shard(
+                &serde_json::to_vec(&unknown_shard_field).unwrap(),
+                &location
+            ),
+            None,
+            "one schema admits exactly one shard shape"
+        );
+        let mut missing_reports = value.clone();
+        missing_reports.as_object_mut().unwrap().remove("reports");
+        assert_eq!(
+            FleetReports::parse_shard(&serde_json::to_vec(&missing_reports).unwrap(), &location),
+            None,
+            "an empty shard is encoded as an explicit empty report map, not a second shape"
+        );
+        let entries = value["reports"].as_object_mut().unwrap();
+        let stored = entries["agent-9"].clone();
+        entries.insert("../escape".into(), stored.clone());
+        entries.insert(FLEET_INDEX_BASENAME.into(), stored.clone());
+        let mut oversized = stored;
+        oversized["envelope"]["payload"] = "A".repeat(MAX_REPORT_ENVELOPE_BYTES).into();
+        entries.insert("oversized".into(), oversized);
+        entries.insert(
+            "malformed".into(),
+            serde_json::json!({"accepted_at_ms": "not an integer"}),
+        );
+        let tampered = serde_json::to_vec(&value).unwrap();
+        let mut parsed = FleetReports::parse_shard(&tampered, &location).unwrap();
+        assert_eq!(parsed.remove("agent-9"), Some(envelope));
+        assert!(parsed.remove("oversized").is_none());
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn an_authentic_report_filed_in_the_wrong_shard_is_dropped() {
+        let (envelope, _) = signed(|_| {});
+        let mut fleet = FleetReports::default();
+        fleet.record(accepted("agent-9", &envelope));
+        let (_, _, shards, _) = fleet.rebalance(shard_limit(2)).unwrap().into_parts();
+        let canonical = FleetReports::shard_for("agent-9", 2);
+        let stored: serde_json::Value = serde_json::from_slice(&shards[canonical].1).unwrap();
+        let entry = stored["reports"]["agent-9"].clone();
+
+        let wrong = 1 - canonical;
+        let (location, body) = &shards[wrong];
+        let mut misplaced: serde_json::Value = serde_json::from_slice(body).unwrap();
+        misplaced["reports"]["agent-9"] = entry;
+        let parsed =
+            FleetReports::parse_shard(&serde_json::to_vec(&misplaced).unwrap(), location).unwrap();
+
+        assert!(
+            parsed.is_empty(),
+            "a valid envelope has exactly one home in its indexed generation"
+        );
+    }
+
+    /// A shard that cannot fit its byte ceiling sheds entries in receiver acceptance order, never
+    /// by a node-controlled payload timestamp, and what remains is a well-formed bounded shard.
+    #[test]
+    fn an_overfull_shard_evicts_the_stalest_entries_and_stays_readable() {
+        let (envelope, _) = signed(|_| {});
+        let mut seed = FleetReports::default();
+        seed.record(accepted("agent-9", &envelope));
+        let (index, _, _, _) = seed.rebalance(shard_limit(1)).unwrap().into_parts();
+        let location = index.shard_locations().next().unwrap();
+
+        // Nine ~2.7 MiB envelopes overflow the 16 MiB ceiling. Their claimed stamps run opposite
+        // their receiver acceptance order: if eviction trusted the payload, the newest accepted
+        // records would be removed first.
+        let big_envelope = |claimed_stamp: u64| {
+            let report = format!(
+                r#"{{"reported_at_ms":{claimed_stamp},"padding":"{}"}}"#,
+                "p".repeat(2 * 1024 * 1024)
+            );
+            Envelope {
+                payload: b64().encode(report.as_bytes()),
+                payload_type: REPORT_PAYLOAD_TYPE.into(),
+                signatures: Vec::new(),
+            }
+        };
+        let reports: BTreeMap<String, StoredReport> = (1..=9u64)
+            .map(|accepted_at_ms| {
+                (
+                    format!("agent-{accepted_at_ms}"),
+                    StoredReport {
+                        accepted_at_ms,
+                        envelope: big_envelope(10 - accepted_at_ms),
+                    },
+                )
+            })
+            .collect();
+        let (body, evicted) = FleetReports::encode_shard(reports.clone(), &location);
+        assert!(evicted > 0, "nine ~2.7 MiB entries cannot fit 16 MiB");
+        assert!(body.len() <= MAX_FLEET_REPORT_SHARD_BYTES);
+
+        // Exactly the oldest receiver stamps went despite their newest claimed timestamps.
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let survivors: Vec<&String> = value["reports"].as_object().unwrap().keys().collect();
+        assert!(!survivors.is_empty(), "eviction trims, it does not empty");
+        for stamp in 1..=evicted as u64 {
+            assert!(
+                !value["reports"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key(&format!("agent-{stamp}")),
+                "the {evicted} oldest stamps are the ones evicted"
+            );
+        }
+
+        let mut buffer = FleetReportBuffer::new(shard_limit(1));
+        let mut buffer_evicted = 0;
+        for (node, stored) in reports {
+            buffer_evicted += buffer.record(AcceptedReport {
+                node,
+                envelope: stored.envelope,
+                accepted_at_ms: stored.accepted_at_ms,
+            });
+        }
+        assert_eq!(
+            buffer_evicted, evicted,
+            "pending and persisted forms apply the same exact byte budget"
+        );
+        let (_, _, shards, rebalance_evicted) = buffer
+            .drain()
+            .rebalance(shard_limit(1))
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            rebalance_evicted, 0,
+            "a bounded pending batch needs no second capacity policy at flush time"
+        );
+        assert!(shards[0].1.len() <= MAX_FLEET_REPORT_SHARD_BYTES);
     }
 
     #[test]
@@ -1335,39 +2289,62 @@ mod tests {
     }
 
     #[test]
-    fn report_url_joins_base_and_key_without_a_double_slash() {
-        // The writer (agent) and every reader (health proxy) resolve a report URL through here, so
-        // a trailing slash on the base must not produce `//` either way.
+    fn fleet_index_url_joins_without_a_double_slash() {
         assert_eq!(
-            report_url("https://cdn/", "agent-1"),
-            "https://cdn/telemetry/agent-1.json"
-        );
-        assert_eq!(
-            report_url("https://cdn", "agent-1"),
-            "https://cdn/telemetry/agent-1.json"
+            fleet_index_url("https://cdn/"),
+            "https://cdn/telemetry/fleet.json"
         );
     }
 
     #[test]
-    fn node_recovers_from_its_report_path() {
-        assert_eq!(node_from_path("/telemetry/agent-7.json"), Some("agent-7"));
-        // The key a node writes and the path it PUTs are the two halves of one contract.
+    fn the_shard_limit_knob_has_one_parser_and_exact_bounds() {
         assert_eq!(
-            node_from_path(&format!("/{}", report_object_key("agent-7"))),
-            Some("agent-7")
+            parse_fleet_report_max_shards(None),
+            Ok(DEFAULT_FLEET_REPORT_MAX_SHARDS)
         );
-    }
-
-    #[test]
-    fn node_path_rejects_traversal_and_unsafe_names() {
-        for path in [
-            "/telemetry/../secret.json",
-            "/telemetry/a/b.json",
-            "/telemetry/.json",
-            "/telemetry/agent-7.txt",
-            "/other/agent-7.json",
-        ] {
-            assert_eq!(node_from_path(path), None, "{path}");
+        assert_eq!(parse_fleet_report_max_shards(Some("1")), Ok(shard_limit(1)));
+        assert_eq!(
+            parse_fleet_report_max_shards(Some(&MAX_FLEET_REPORT_SHARDS.to_string())),
+            Ok(shard_limit(MAX_FLEET_REPORT_SHARDS))
+        );
+        for invalid in ["", "0", " 4", "4 ", "1.0", "65"] {
+            assert!(
+                parse_fleet_report_max_shards(Some(invalid)).is_err(),
+                "{invalid:?} must not silently select another report-byte budget"
+            );
         }
+    }
+
+    #[test]
+    fn node_identity_is_a_kubernetes_dns_subdomain() {
+        assert!(is_valid_node("agent-7"));
+        assert!(is_valid_node("rack-1.agent-7"));
+        assert!(is_valid_node(&format!(
+            "{}.{}",
+            "a".repeat(63),
+            "b".repeat(63)
+        )));
+        for invalid in [
+            "", ".", "..", "a/b", "a\\b", "a:b", "a%b", "a?b", "a#b", "A", "a_b", "-a", "a-",
+            "a..b", "a\nb",
+        ] {
+            assert!(!is_valid_node(invalid), "{invalid:?} must be refused");
+        }
+        assert!(!is_valid_node(&"a".repeat(MAX_NODE_BYTES + 1)));
+        assert!(report().is_wellformed());
+        let mut malformed = report();
+        malformed.node = "Agent-7".into();
+        assert!(
+            !malformed.is_wellformed(),
+            "the report gate must consume the shared node grammar"
+        );
+    }
+
+    #[test]
+    fn fleet_index_has_the_projection_namespace() {
+        assert_eq!(
+            FLEET_INDEX_OBJECT_KEY,
+            format!("{REPORT_NAMESPACE}/{FLEET_INDEX_BASENAME}.json")
+        );
     }
 }

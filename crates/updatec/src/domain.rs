@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use updated_contracts::key::P256PublicKey;
 use updated_contracts::telemetry::Envelope;
 
 use crate::rollout::{plan_rollouts, AdmittedDeployment, GroupProgress, RolloutInputs, SetStatus};
@@ -40,6 +41,9 @@ pub struct DesiredState<'a> {
     /// treated as absent by rollout accounting, still updated, and projected as drained to the
     /// healthproxy by the runtime.
     pub cordons: &'a BTreeSet<String>,
+    /// Exact deployment identities an external admission policy currently blocks. This is the
+    /// sole external movement gate for grouped and default deployments alike.
+    pub blocked_deployments: &'a BTreeSet<String>,
     /// The subset of `quarantined` that has a durable pin, with the deployment each is still
     /// pinned to.
     ///
@@ -53,8 +57,17 @@ pub struct DesiredState<'a> {
 
 pub struct ObservedState<'a> {
     pub reports: &'a HashMap<String, Envelope>,
-    pub public_keys: &'a HashMap<String, Vec<u8>>,
+    /// Sensitive node output publications loaded from their private S3 objects. They are joined
+    /// with signed health below but never enter telemetry or the publication plan.
+    pub outputs: &'a HashMap<String, crate::dataflow::ExactOutputPublication>,
+    /// Repository-private HMAC key used to turn a resolved snapshot into a non-guessable public
+    /// generation identifier.
+    pub dataflow_key: &'a [u8],
+    pub public_keys: &'a HashMap<String, P256PublicKey>,
     pub admitted: &'a BTreeMap<String, AdmittedDeployment>,
+    /// Deployment identities an `onRegression: rollback` response has durably vetoed, persisted
+    /// beside `admitted` — see `crate::VetoedDeployment`.
+    pub vetoed: &'a BTreeMap<String, crate::VetoedDeployment>,
     /// Node → group as of the LAST published generation. Publication replaces the entire target
     /// set, so this is what a node's existing assignment is derived from when its own group cannot
     /// be planned this pass.
@@ -69,7 +82,14 @@ pub struct ObservedState<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReconcilePlan {
     pub publication: PublicationPlan,
+    /// Opaque generation → sensitive bytes the adapter must durably create before publishing the
+    /// assignment that names the generation.
+    pub input_snapshots: BTreeMap<String, updated_contracts::dataflow::FileSnapshot>,
     pub admitted: BTreeMap<String, AdmittedDeployment>,
+    /// The vetoed-deployment record after this pass — `observed.vetoed` plus anything the
+    /// rollback response minted, minus identities nothing names any more — persisted beside
+    /// `admitted` in the same durable document.
+    pub vetoed: BTreeMap<String, crate::VetoedDeployment>,
     /// The routing this generation publishes, to be persisted alongside `admitted`.
     pub routing: BTreeMap<String, String>,
     /// The node → deployment identity this generation publishes, persisted alongside `routing`.
@@ -83,18 +103,20 @@ pub struct ReconcilePlan {
     /// Per-group node accounting from the planner, for the metrics exposition and the alert
     /// conditions ([`crate::rollout::GroupNodes`]).
     pub node_counts: BTreeMap<String, crate::rollout::GroupNodes>,
-    /// Groups bound by the regression verdict, with the halted deployment each is bound by, for
-    /// the per-group `DeploymentHalted` condition.
+    /// Cohorts bound by the regression verdict, with the halted deployment each is bound by, for
+    /// the `DeploymentHalted` conditions — the planner's map, passed through unchanged
+    /// ([`crate::rollout::RolloutPlan::halted_groups`], which states what each key is for). Keyed
+    /// by `UpdateGroup` name plus the reserved [`crate::DEFAULT_GROUP`] key, whose entry is the
+    /// repository default cohort's halt and belongs on the `UpdateRepository`'s own status: that
+    /// cohort has no group and no set, so it is the only place its freeze can be seen.
     pub halted_groups: BTreeMap<String, crate::HaltedDeployment>,
-    /// Nodes reporting under each report schema, for the metrics exposition
-    /// ([`crate::rollout::RolloutPlan::report_schemas`]).
-    pub report_schemas: BTreeMap<u32, usize>,
 }
 
 pub fn plan_reconcile(
     desired: DesiredState<'_>,
     observed: ObservedState<'_>,
     attempts: &mut crate::evidence::ObservationLog,
+    verified: &mut crate::evidence::VerifiedReports,
 ) -> Result<ReconcilePlan, PlanError> {
     let quarantined_names: BTreeSet<String> = desired.quarantined.keys().cloned().collect();
     crate::validate_dependency_graph(desired.groups, &quarantined_names)?;
@@ -103,14 +125,44 @@ pub fn plan_reconcile(
         desired.nodes.iter().cloned(),
     )?;
     let mut groups = desired.groups.clone();
+    // The pass's ONE verification, before anything reads a report. It has to be here rather than
+    // deeper in: input resolution below judges producer health, and it runs before the rollout
+    // planner does. `verify_fleet` is idempotent, so the planner's own call is a lookup per node.
+    verified.verify_fleet(observed.reports, observed.public_keys);
     resolve_group_inputs(
         &mut groups,
-        &node_groups,
-        observed.reports,
-        observed.public_keys,
-        observed.now.timestamp_millis().max(0) as u64,
+        &InputResolution {
+            node_groups: &node_groups,
+            reports: observed.reports,
+            outputs: observed.outputs,
+            public_keys: observed.public_keys,
+            verified,
+            cordons: desired.cordons,
+            now_ms: observed.now.timestamp_millis().max(0) as u64,
+            dataflow_key: observed.dataflow_key,
+        },
     );
+    // Nodes that match no `UpdateGroup` route to the pseudo-group "default" and receive the
+    // repository's `default_deployment` directly. This cohort is DELIBERATELY NOT throttled: it has
+    // no `UpdateGroup`/`UpdateGroupSet` to carry a `maxUnavailable` or health gate, so there is no
+    // staged rollout to apply — changing `default_deployment` moves every unmatched node at once.
+    // The safety guarantees (one-at-a-time staging, health/telemetry gating, concurrency caps) are a
+    // property of *grouped* rollouts; a node that needs them must be placed in a group. Treat
+    // `default_deployment` as a fleet-wide switch, not a throttled rollout.
+    // `DEFAULT_GROUP` is a reserved name (`resolve_node_groups` refuses a real group that claims
+    // it), so a node routed to it is unambiguously a node that matched nothing.
+    //
+    // Converted BEFORE the rollout planner runs because the planner is handed the body: the
+    // fleet-wide regression verdict is computed there, and its projection onto this cohort
+    // ([`crate::rollout::RolloutPlan::halted_groups`], reserved key) has to be judged on the body
+    // the repository asks for NOW — the one `default_blocked` below withholds on — so the planner
+    // has to be given it. An unconvertible default therefore also fails the pass one step earlier
+    // than it used to, before any of the planner's cross-pass memory has been touched.
+    let default = DesiredDeployment::try_from(desired.repository.default_deployment.clone())
+        .map_err(PlanError::InvalidDeployment)?;
+    let default_identity = crate::deployment_identity(&default);
     let mut admitted = observed.admitted.clone();
+    let mut vetoed = observed.vetoed.clone();
     let mut rollout = plan_rollouts(
         desired.sets,
         RolloutInputs {
@@ -123,23 +175,25 @@ pub fn plan_reconcile(
             held: desired.held,
             holds: desired.holds,
             cordons: desired.cordons,
+            blocked_deployments: desired.blocked_deployments,
+            default_deployment: &default,
         },
         &mut admitted,
+        &mut vetoed,
         attempts,
+        verified,
         observed.now,
     );
 
-    // Nodes that match no `UpdateGroup` route to the pseudo-group "default" and receive the
-    // repository's `default_deployment` directly. This cohort is DELIBERATELY NOT throttled: it has
-    // no `UpdateGroup`/`UpdateGroupSet` to carry a `maxUnavailable` or health gate, so there is no
-    // staged rollout to apply — changing `default_deployment` moves every unmatched node at once.
-    // The safety guarantees (one-at-a-time staging, health/telemetry gating, concurrency caps) are a
-    // property of *grouped* rollouts; a node that needs them must be placed in a group. Treat
-    // `default_deployment` as a fleet-wide switch, not a throttled rollout.
-    // `DEFAULT_GROUP` is a reserved name (`resolve_node_groups` refuses a real group that claims
-    // it), so a node routed to it is unambiguously a node that matched nothing.
-    let default = DesiredDeployment::try_from(desired.repository.default_deployment.clone())
-        .map_err(PlanError::InvalidDeployment)?;
+    // Withheld on the SAME verdict a group's nodes are: external compliance blocks and the
+    // fleet-wide regression halts/vetoes alike ([`crate::rollout::RolloutPlan::blocked`]). The
+    // default cohort is deliberately unthrottled, but "unthrottled" is not "exempt from proof": a
+    // body some group's nodes proved bad must not reach the unmatched machines — freshly enrolled
+    // ones included — through this door. Nodes already on it keep running it; the carry-forward
+    // below republishes the exact body their last generation recorded.
+    let default_blocked = default_identity
+        .as_ref()
+        .is_some_and(|identity| rollout.blocked.contains(identity));
     // A node whose labels select a QUARANTINED group is not an unmatched node. Its group is merely
     // absent from the plan this pass, so `resolve_node_groups` had nothing to match it against and
     // resolved it to `default`. Handing it `default_deployment` is the fleet-wide, unthrottled,
@@ -180,6 +234,7 @@ pub fn plan_reconcile(
         if selected == crate::DEFAULT_GROUP
             && !quarantined.contains_key(node)
             && !desired.holds.contains(node)
+            && !default_blocked
         {
             rollout
                 .node_deployments
@@ -221,20 +276,22 @@ pub fn plan_reconcile(
     // default — held, or withheld behind a quarantined group — had no recoverable placement the
     // moment the operator edited `default_deployment`, and the generation faulted closed
     // fleet-wide with nothing able to clear it.
-    if let Some(identity) = crate::deployment_identity(&default) {
-        match admitted.entry(crate::DEFAULT_GROUP.to_string()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(AdmittedDeployment {
-                    current: default.clone(),
-                    previous: Vec::new(),
-                });
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let state = entry.get_mut();
-                if crate::deployment_identity(&state.current).as_ref() != Some(&identity) {
-                    let superseded = std::mem::replace(&mut state.current, default.clone());
-                    if !state.previous.contains(&superseded) {
-                        state.previous.insert(0, superseded);
+    if !default_blocked {
+        if let Some(identity) = default_identity {
+            match admitted.entry(crate::DEFAULT_GROUP.to_string()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(AdmittedDeployment {
+                        current: default.clone(),
+                        previous: Vec::new(),
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let state = entry.get_mut();
+                    if crate::deployment_identity(&state.current).as_ref() != Some(&identity) {
+                        let superseded = std::mem::replace(&mut state.current, default.clone());
+                        if !state.previous.contains(&superseded) {
+                            state.previous.insert(0, superseded);
+                        }
                     }
                 }
             }
@@ -304,6 +361,7 @@ pub fn plan_reconcile(
             Some(last)
                 if quarantined.contains_key(node)
                     || desired.holds.contains(node)
+                    || (default_blocked && last == crate::DEFAULT_GROUP)
                     || (last != crate::DEFAULT_GROUP && admitted.contains_key(last)) =>
             {
                 let deployment = placed_deployment(observed.assignments.get(node), &bodies)
@@ -360,6 +418,13 @@ pub fn plan_reconcile(
         return Err(PlanError::RoutingLoss(dropped));
     }
 
+    let input_snapshots = groups
+        .values()
+        .filter_map(|group| {
+            let snapshot = group.input_snapshot.clone()?;
+            Some((group.deployment.runtime.inputs.generation.clone(), snapshot))
+        })
+        .collect();
     let publication = build_publication_plan(
         desired.repository,
         published_nodes,
@@ -369,14 +434,15 @@ pub fn plan_reconcile(
     let assignments = publication.node_assignments.clone();
     Ok(ReconcilePlan {
         publication,
+        input_snapshots,
         admitted,
+        vetoed,
         routing,
         assignments,
         set_statuses: rollout.sets,
         groups: rollout.groups,
         node_counts: rollout.node_counts,
         halted_groups: rollout.halted_groups,
-        report_schemas: rollout.report_schemas,
     })
 }
 
@@ -411,12 +477,22 @@ fn placed_deployment(
         .map(|deployment| (*deployment).clone())
 }
 
+struct InputResolution<'a> {
+    node_groups: &'a BTreeMap<String, String>,
+    reports: &'a HashMap<String, Envelope>,
+    outputs: &'a HashMap<String, crate::dataflow::ExactOutputPublication>,
+    public_keys: &'a HashMap<String, P256PublicKey>,
+    /// The pass's verified reports. Read, never produced: verification happened once, for the whole
+    /// fleet, before any of this ran — see [`crate::evidence::VerifiedReports`].
+    verified: &'a crate::evidence::VerifiedReports,
+    cordons: &'a BTreeSet<String>,
+    now_ms: u64,
+    dataflow_key: &'a [u8],
+}
+
 fn resolve_group_inputs(
     groups: &mut BTreeMap<String, ResolvedGroup>,
-    node_groups: &BTreeMap<String, String>,
-    reports: &HashMap<String, Envelope>,
-    public_keys: &HashMap<String, Vec<u8>>,
-    now_ms: u64,
+    context: &InputResolution<'_>,
 ) {
     // Resolve in dependency order, and read producers from the map being BUILT rather than from a
     // snapshot taken before any resolution. A producer that consumes inputs of its own has its
@@ -426,14 +502,7 @@ fn resolve_group_inputs(
     let mut resolved: BTreeMap<String, ResolvedGroup> = BTreeMap::new();
     for name in dependency_order(groups) {
         let mut group = groups[&name].clone();
-        resolve_one(
-            &mut group,
-            &resolved,
-            node_groups,
-            reports,
-            public_keys,
-            now_ms,
-        );
+        resolve_one(&mut group, &resolved, context);
         resolved.insert(name, group);
     }
     *groups = resolved;
@@ -472,65 +541,128 @@ fn dependency_order(groups: &BTreeMap<String, ResolvedGroup>) -> Vec<String> {
 fn resolve_one(
     group: &mut ResolvedGroup,
     resolved: &BTreeMap<String, ResolvedGroup>,
-    node_groups: &BTreeMap<String, String>,
-    reports: &HashMap<String, Envelope>,
-    public_keys: &HashMap<String, Vec<u8>>,
-    now_ms: u64,
+    context: &InputResolution<'_>,
 ) {
     if group.inputs.is_empty() {
-        group.inputs_ready = true;
+        group.input_snapshot = None;
+        group.deployment.runtime.inputs = updated_contracts::dataflow::InputSelection::default();
         return;
     }
     let mut values = BTreeMap::new();
     let ready = group.inputs.iter().all(|(input, reference)| {
-        let producers: Vec<&String> = node_groups
+        // The producer cohort, defined exactly as the rollout defines every other cohort of a
+        // group (`Observations::progress`, `fully_handed`): a cordoned node is ABSENT — the
+        // operator benched it, and it is usually benched precisely because it stopped reporting —
+        // and a BLIND node with no pinned key is absent too, since no report of it is evidence of
+        // anything and none ever can be. Counting either held every consumer of a settled producer
+        // group `Held` forever, naming "its inputs" and no node.
+        let producers: Vec<&String> = context
+            .node_groups
             .iter()
             .filter_map(|(node, selected)| (selected == &reference.group).then_some(node))
+            .filter(|node| {
+                !context.cordons.contains(*node) && context.public_keys.contains_key(*node)
+            })
             .collect();
-        let [node] = producers.as_slice() else {
+        if producers.is_empty() {
             return false;
-        };
-        let (Some(envelope), Some(key)) = (reports.get(*node), public_keys.get(*node)) else {
-            return false;
-        };
-        let Some(report) = updated_contracts::telemetry::report_is_authentic_and_fresh(
-            envelope, node, key, now_ms,
-        ) else {
-            return false;
-        };
-        // The producer must be healthy on the EXACT configuration desired for it, not merely
-        // on something sharing its deployment name: an output read off an older revision of
-        // that deployment would be wired into the consumer as if it were current.
-        // The producer as RESOLVED this pass — inputs of its own already filled in.
+        }
+        // The producer group as RESOLVED this pass — inputs of its own already filled in.
         let Some(producer) = resolved.get(&reference.group) else {
             return false;
         };
         let identity = crate::deployment_identity(&producer.deployment);
-        // And it must be RUNNING what that configuration installs. The agent stamps the
-        // assignment it RESOLVED, so a producer that fetched the new assignment and installed
-        // nothing — or attempted it and rolled itself back — reports healthy on the new identity
-        // while executing the predecessor's bytes, and its outputs are read off the predecessor's
-        // manifest. Wiring those into the consumer publishes the old release's endpoints under
-        // the new deployment, with the control plane believing the producer moved.
-        if !report.healthy
-            || Some(&report.assignment_sha256) != identity.as_ref()
-            || report.archive_sha256 != producer.deployment.application.sha256
-        {
-            return false;
+        // EVERY producer node must independently state the SAME value, verified from its own
+        // signed report. Unanimity is the multi-node reading of the single-node rule below, and
+        // the disagreement case is not an error to paper over: a producer mid-rollout genuinely
+        // has nodes on two revisions, and whichever value were picked would wire the wrong
+        // revision's output into the consumer for the other half. Not-ready holds the consumer
+        // exactly until the producer settles, which is when the values agree by construction.
+        let mut unanimous: Option<updated_contracts::dataflow::FileValue> = None;
+        for node in producers {
+            let (Some(envelope), Some(key)) =
+                (context.reports.get(node), context.public_keys.get(node))
+            else {
+                return false;
+            };
+            // The same gate the planner reads through, so a producer's health is judged from the
+            // one verification this pass performed rather than a second one of its own. Freshness
+            // is applied here, on top: it is a clock comparison, never part of the crypto.
+            let Some(report) = context
+                .verified
+                .authentic(node, envelope, key)
+                .filter(|report| report.is_fresh(context.now_ms))
+            else {
+                return false;
+            };
+            // The producer node must be healthy on the EXACT configuration desired for its
+            // group, not merely on something sharing its deployment name: an output read off an
+            // older revision of that deployment would be wired into the consumer as if it were
+            // current.
+            //
+            // And it must be RUNNING what that configuration installs. The agent stamps the
+            // assignment it RESOLVED, so a producer that fetched the new assignment and
+            // installed nothing — or attempted it and rolled itself back — reports healthy on
+            // the new identity while executing the predecessor's bytes, and its outputs are read
+            // off the predecessor's manifest. Wiring those into the consumer publishes the old
+            // release's endpoints under the new deployment, with the control plane believing the
+            // producer moved.
+            if !identity.as_deref().is_some_and(|identity| {
+                report.is_converged_to(
+                    identity,
+                    &producer.deployment.application.sha256,
+                    &producer.deployment.provider_set.sha256,
+                )
+            }) {
+                return false;
+            }
+            let Some(output) = context.outputs.get(node) else {
+                return false;
+            };
+            let publication = output.publication();
+            if publication.validate(node).is_err()
+                || publication.deployment != producer.deployment.deployment
+                || publication.assignment_sha256 != report.assignment_sha256
+                || publication.archive_sha256 != report.archive_sha256
+                || report.output_sha256.as_deref() != Some(output.sha256())
+            {
+                return false;
+            }
+            let Some(value) = publication.snapshot.files.get(&reference.output) else {
+                return false;
+            };
+            match &unanimous {
+                Some(agreed) if agreed != value => return false,
+                Some(_) => {}
+                None => unanimous = Some(value.clone()),
+            }
         }
-        let Some(value) = report
-            .outputs
-            .as_ref()
-            .and_then(|outputs| outputs.values.get(&reference.output))
-        else {
-            return false;
-        };
-        values.insert(input.clone(), value.clone());
+        let value = unanimous.expect("a non-empty producer set resolved a value or returned");
+        values.insert(input.clone(), value);
         true
     });
-    group.inputs_ready = ready;
     if ready {
-        group.deployment.runtime.inputs = values;
+        let snapshot = updated_contracts::dataflow::FileSnapshot { files: values };
+        let Ok(publication) = updated_contracts::dataflow::InputPublication::from_snapshot(
+            snapshot.clone(),
+            context.dataflow_key,
+        ) else {
+            group.input_snapshot = None;
+            group.deployment.runtime.inputs =
+                updated_contracts::dataflow::InputSelection::default();
+            return;
+        };
+        let Ok(selection) = publication.selection() else {
+            group.input_snapshot = None;
+            group.deployment.runtime.inputs =
+                updated_contracts::dataflow::InputSelection::default();
+            return;
+        };
+        group.deployment.runtime.inputs = selection;
+        group.input_snapshot = Some(snapshot);
+    } else {
+        group.input_snapshot = None;
+        group.deployment.runtime.inputs = updated_contracts::dataflow::InputSelection::default();
     }
 }
 
@@ -538,9 +670,40 @@ fn resolve_one(
 mod tests {
     use super::*;
     use updated_contracts::artifact::TargetReference;
-    use updated_contracts::telemetry::{NodeReport, OutputManifest, OutputValue};
+    use updated_contracts::dataflow::{FileSnapshot, FileValue, OutputPublication};
+    use updated_contracts::telemetry::NodeReport;
 
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const DATAFLOW_KEY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
+
+    fn file(value: &str) -> FileValue {
+        FileValue::from_bytes(value.as_bytes()).unwrap()
+    }
+
+    fn outputs(name: &str, value: &str) -> FileSnapshot {
+        FileSnapshot {
+            files: BTreeMap::from([(name.to_string(), file(value))]),
+        }
+    }
+
+    fn publication(
+        report: &mut NodeReport,
+        name: &str,
+        value: &str,
+    ) -> crate::dataflow::ExactOutputPublication {
+        let publication = OutputPublication {
+            schema: OutputPublication::SCHEMA,
+            node: report.node.clone(),
+            deployment: report.deployment.clone(),
+            assignment_sha256: report.assignment_sha256.clone(),
+            archive_sha256: report.archive_sha256.clone(),
+            snapshot: outputs(name, value),
+        };
+        let body = publication.to_bounded_body().unwrap();
+        let output = crate::dataflow::ExactOutputPublication::decode(&body, &report.node).unwrap();
+        report.output_sha256 = Some(output.sha256().to_string());
+        output
+    }
 
     fn deployment(name: &str) -> DesiredDeployment {
         DesiredDeployment {
@@ -548,7 +711,6 @@ mod tests {
             deployment: name.into(),
             metadata_url: "https://cdn/metadata/".into(),
             targets_url: "https://cdn/targets/".into(),
-            report_url: Some("https://control".into()),
             application: TargetReference {
                 path: "app".into(),
                 sha256: DIGEST.into(),
@@ -563,8 +725,14 @@ mod tests {
         }
     }
 
+    /// The multi-node reading of the producer rule: every node of the producer group must
+    /// independently state the SAME value, from its own verified report, before the consumer's
+    /// input resolves. A producer mid-rollout genuinely has nodes answering with two revisions'
+    /// values; whichever were picked would wire the wrong revision's output into the consumer for
+    /// the other half, so disagreement is NOT-READY — and the moment the producer settles, the
+    /// values agree by construction and the input resolves.
     #[test]
-    fn authentic_single_producer_outputs_become_typed_consumer_inputs() {
+    fn a_multi_node_producer_resolves_only_on_unanimous_outputs() {
         let key_pem = updated::csr::generate_key().unwrap();
         let private = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
         let public =
@@ -572,21 +740,261 @@ mod tests {
                 .unwrap();
         let now_ms = updated_contracts::telemetry::now_ms();
         let identity = crate::deployment_identity(&deployment("init-v1")).unwrap();
-        let mut report = NodeReport::new("producer", "init-v1", identity, "1.0.0", DIGEST, true);
+        let signed = |node: &str, value: &str| {
+            let mut report = NodeReport::new(
+                node,
+                "init-v1",
+                identity.clone(),
+                "1.0.0",
+                DIGEST,
+                DIGEST,
+                true,
+            );
+            report.reported_at_ms = now_ms;
+            let output = publication(&mut report, "endpoint", value);
+            (
+                crate::test_support::sign_report(&mut report, &private),
+                output,
+            )
+        };
+        let keys = HashMap::from([
+            ("p0".to_string(), public.clone()),
+            ("p1".to_string(), public),
+        ]);
+        let nodes = BTreeMap::from([
+            ("p0".to_string(), "initialize".to_string()),
+            ("p1".to_string(), "initialize".to_string()),
+            ("consumer".to_string(), "join".to_string()),
+        ]);
+        let groups = || {
+            BTreeMap::from([
+                (
+                    "initialize".to_string(),
+                    ResolvedGroup {
+                        name: "initialize".into(),
+                        match_labels: BTreeMap::new(),
+                        depends_on: vec![],
+                        inputs: BTreeMap::new(),
+                        input_snapshot: None,
+                        deployment: deployment("init-v1"),
+                        max_unavailable: 1,
+                        emergency_correction: false,
+                    },
+                ),
+                (
+                    "join".to_string(),
+                    ResolvedGroup {
+                        name: "join".into(),
+                        match_labels: BTreeMap::new(),
+                        depends_on: vec!["initialize".into()],
+                        inputs: BTreeMap::from([(
+                            "leader".to_string(),
+                            crate::GroupOutputReference {
+                                group: "initialize".into(),
+                                output: "endpoint".into(),
+                            },
+                        )]),
+                        input_snapshot: None,
+                        deployment: deployment("join-v1"),
+                        max_unavailable: 1,
+                        emergency_correction: false,
+                    },
+                ),
+            ])
+        };
+
+        // Split answers — the mid-rollout shape — hold the consumer.
+        let (p0_report, p0_output) = signed("p0", "https://vault-0:8200");
+        let (p1_report, p1_output) = signed("p1", "https://vault-1:8200");
+        let split = HashMap::from([("p0".to_string(), p0_report), ("p1".to_string(), p1_report)]);
+        let split_outputs =
+            HashMap::from([("p0".to_string(), p0_output), ("p1".to_string(), p1_output)]);
+        let mut disagreeing = groups();
+        let mut verified = crate::evidence::VerifiedReports::default();
+        verified.verify_fleet(&split, &keys);
+        resolve_group_inputs(
+            &mut disagreeing,
+            &InputResolution {
+                node_groups: &nodes,
+                reports: &split,
+                outputs: &split_outputs,
+                public_keys: &keys,
+                verified: &verified,
+                cordons: &BTreeSet::new(),
+                now_ms,
+                dataflow_key: DATAFLOW_KEY,
+            },
+        );
+        assert!(
+            !disagreeing["join"].inputs_ready(),
+            "a split producer must hold the consumer, not pick a side"
+        );
+
+        // Unanimity resolves.
+        let (p0_report, p0_output) = signed("p0", "https://vault-0:8200");
+        let (p1_report, p1_output) = signed("p1", "https://vault-0:8200");
+        let agreed = HashMap::from([("p0".to_string(), p0_report), ("p1".to_string(), p1_report)]);
+        let agreed_outputs =
+            HashMap::from([("p0".to_string(), p0_output), ("p1".to_string(), p1_output)]);
+        let mut agreeing = groups();
+        let mut verified = crate::evidence::VerifiedReports::default();
+        verified.verify_fleet(&agreed, &keys);
+        resolve_group_inputs(
+            &mut agreeing,
+            &InputResolution {
+                node_groups: &nodes,
+                reports: &agreed,
+                outputs: &agreed_outputs,
+                public_keys: &keys,
+                verified: &verified,
+                cordons: &BTreeSet::new(),
+                now_ms,
+                dataflow_key: DATAFLOW_KEY,
+            },
+        );
+        assert!(agreeing["join"].inputs_ready());
+        assert_eq!(
+            agreeing["join"].input_snapshot.as_ref().unwrap().files["leader"],
+            file("https://vault-0:8200")
+        );
+
+        // One silent node of the pair is not unanimity either: half a producer is not a producer.
+        let (p0_report, p0_output) = signed("p0", "https://vault-0:8200");
+        let half = HashMap::from([("p0".to_string(), p0_report)]);
+        let half_outputs = HashMap::from([("p0".to_string(), p0_output)]);
+        let mut partial = groups();
+        let mut verified = crate::evidence::VerifiedReports::default();
+        verified.verify_fleet(&half, &keys);
+        resolve_group_inputs(
+            &mut partial,
+            &InputResolution {
+                node_groups: &nodes,
+                reports: &half,
+                outputs: &half_outputs,
+                public_keys: &keys,
+                verified: &verified,
+                cordons: &BTreeSet::new(),
+                now_ms,
+                dataflow_key: DATAFLOW_KEY,
+            },
+        );
+        assert!(!partial["join"].inputs_ready());
+    }
+
+    /// The producer cohort is the same cohort every other rollout judgement uses: a BLIND node
+    /// (no pinned key) and a CORDONED node are absent from it.
+    ///
+    /// Neither can ever contribute a value — a blind node's report is evidence of nothing and never
+    /// will be, and a cordoned machine is benched, usually because it stopped reporting — so
+    /// requiring one to answer held every consumer of the group `Held` forever, under a reason
+    /// naming "its inputs" and no node, while the producer group itself was reported Settled and
+    /// its ordering edge was open to everything else.
+    #[test]
+    fn a_blind_or_cordoned_producer_node_is_absent_from_the_input_cohort() {
+        let key_pem = updated::csr::generate_key().unwrap();
+        let private = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
+        let public =
+            crate::join::csr_public_key(&updated::csr::csr_for(&key_pem, "producer").unwrap())
+                .unwrap();
+        let now_ms = updated_contracts::telemetry::now_ms();
+        let identity = crate::deployment_identity(&deployment("init-v1")).unwrap();
+        let mut report = NodeReport::new("p0", "init-v1", identity, "1.0.0", DIGEST, DIGEST, true);
         report.reported_at_ms = now_ms;
-        report.outputs = Some(OutputManifest {
-            schema: OutputManifest::SCHEMA,
-            values: BTreeMap::from([(
-                "endpoint".into(),
-                OutputValue::String {
-                    value: "https://vault-0:8200".into(),
+        let output = publication(&mut report, "endpoint", "https://vault-0:8200");
+        let reports = HashMap::from([(
+            "p0".to_string(),
+            crate::test_support::sign_report(&mut report, &private),
+        )]);
+        let outputs = HashMap::from([("p0".to_string(), output)]);
+        // p1 was provisioned offline and has no pinned key; p2 is cordoned and silent. Only p0 is
+        // keyed, and only p0 reports.
+        let keys = HashMap::from([("p0".to_string(), public)]);
+        let nodes = BTreeMap::from([
+            ("p0".to_string(), "initialize".to_string()),
+            ("p1".to_string(), "initialize".to_string()),
+            ("p2".to_string(), "initialize".to_string()),
+            ("consumer".to_string(), "join".to_string()),
+        ]);
+        let mut groups = BTreeMap::from([
+            (
+                "initialize".to_string(),
+                ResolvedGroup {
+                    name: "initialize".into(),
+                    match_labels: BTreeMap::new(),
+                    depends_on: vec![],
+                    inputs: BTreeMap::new(),
+                    input_snapshot: None,
+                    deployment: deployment("init-v1"),
+                    max_unavailable: 1,
+                    emergency_correction: false,
                 },
-            )]),
-        });
+            ),
+            (
+                "join".to_string(),
+                ResolvedGroup {
+                    name: "join".into(),
+                    match_labels: BTreeMap::new(),
+                    depends_on: vec!["initialize".into()],
+                    inputs: BTreeMap::from([(
+                        "leader".to_string(),
+                        crate::GroupOutputReference {
+                            group: "initialize".into(),
+                            output: "endpoint".into(),
+                        },
+                    )]),
+                    input_snapshot: None,
+                    deployment: deployment("join-v1"),
+                    max_unavailable: 1,
+                    emergency_correction: false,
+                },
+            ),
+        ]);
+
+        let cordons = BTreeSet::from(["p2".to_string()]);
+        let mut verified = crate::evidence::VerifiedReports::default();
+        verified.verify_fleet(&reports, &keys);
+        resolve_group_inputs(
+            &mut groups,
+            &InputResolution {
+                node_groups: &nodes,
+                reports: &reports,
+                outputs: &outputs,
+                public_keys: &keys,
+                verified: &verified,
+                cordons: &cordons,
+                now_ms,
+                dataflow_key: DATAFLOW_KEY,
+            },
+        );
+        assert!(
+            groups["join"].inputs_ready(),
+            "the observable producer answered, and the two nodes that never can are absent"
+        );
+        assert_eq!(
+            groups["join"].input_snapshot.as_ref().unwrap().files["leader"],
+            file("https://vault-0:8200")
+        );
+    }
+
+    #[test]
+    fn authentic_single_producer_outputs_become_file_consumer_inputs() {
+        let key_pem = updated::csr::generate_key().unwrap();
+        let private = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
+        let public =
+            crate::join::csr_public_key(&updated::csr::csr_for(&key_pem, "producer").unwrap())
+                .unwrap();
+        let now_ms = updated_contracts::telemetry::now_ms();
+        let identity = crate::deployment_identity(&deployment("init-v1")).unwrap();
+        let mut report = NodeReport::new(
+            "producer", "init-v1", identity, "1.0.0", DIGEST, DIGEST, true,
+        );
+        report.reported_at_ms = now_ms;
+        let output = publication(&mut report, "endpoint", "https://vault-0:8200");
         let reports = HashMap::from([(
             "producer".into(),
-            updated_contracts::telemetry::sign_report(&report, &private).unwrap(),
+            crate::test_support::sign_report(&mut report, &private),
         )]);
+        let outputs = HashMap::from([("producer".into(), output.clone())]);
         let keys = HashMap::from([("producer".into(), public)]);
         let nodes = BTreeMap::from([
             ("producer".into(), "initialize".into()),
@@ -600,7 +1008,7 @@ mod tests {
                     match_labels: BTreeMap::new(),
                     depends_on: vec![],
                     inputs: BTreeMap::new(),
-                    inputs_ready: true,
+                    input_snapshot: None,
                     deployment: deployment("init-v1"),
                     max_unavailable: 1,
                     emergency_correction: false,
@@ -619,7 +1027,7 @@ mod tests {
                             output: "endpoint".into(),
                         },
                     )]),
-                    inputs_ready: false,
+                    input_snapshot: None,
                     deployment: deployment("join-v1"),
                     max_unavailable: 1,
                     emergency_correction: false,
@@ -627,13 +1035,67 @@ mod tests {
             ),
         ]);
 
-        resolve_group_inputs(&mut groups, &nodes, &reports, &keys, now_ms);
-        assert!(groups["join"].inputs_ready);
+        let mut verified = crate::evidence::VerifiedReports::default();
+        verified.verify_fleet(&reports, &keys);
+        resolve_group_inputs(
+            &mut groups,
+            &InputResolution {
+                node_groups: &nodes,
+                reports: &reports,
+                outputs: &outputs,
+                public_keys: &keys,
+                verified: &verified,
+                cordons: &BTreeSet::new(),
+                now_ms,
+                dataflow_key: DATAFLOW_KEY,
+            },
+        );
+        assert!(groups["join"].inputs_ready());
         assert_eq!(
-            groups["join"].deployment.runtime.inputs["leader"],
-            OutputValue::String {
-                value: "https://vault-0:8200".into()
-            }
+            groups["join"].input_snapshot.as_ref().unwrap().files["leader"],
+            file("https://vault-0:8200")
+        );
+
+        // Storage is transport, not authority. Even a fully valid publication carrying the same
+        // node, deployment, assignment, and archive must resolve nothing when S3 substituted its
+        // exact bytes after the node signed the report.
+        let mut substituted_publication = output.publication().clone();
+        substituted_publication.snapshot = FileSnapshot {
+            files: BTreeMap::from([("endpoint".into(), file("https://attacker:8200"))]),
+        };
+        let substituted_body = substituted_publication.to_bounded_body().unwrap();
+        let substituted =
+            crate::dataflow::ExactOutputPublication::decode(&substituted_body, "producer").unwrap();
+        let substituted_outputs = HashMap::from([("producer".into(), substituted)]);
+        let mut substitution_groups = BTreeMap::from([
+            ("initialize".into(), groups["initialize"].clone()),
+            (
+                "join".into(),
+                ResolvedGroup {
+                    input_snapshot: None,
+                    deployment: deployment("join-v1"),
+                    ..groups["join"].clone()
+                },
+            ),
+        ]);
+        let mut verified = crate::evidence::VerifiedReports::default();
+        verified.verify_fleet(&reports, &keys);
+        resolve_group_inputs(
+            &mut substitution_groups,
+            &InputResolution {
+                node_groups: &nodes,
+                reports: &reports,
+                outputs: &substituted_outputs,
+                public_keys: &keys,
+                verified: &verified,
+                cordons: &BTreeSet::new(),
+                now_ms,
+                dataflow_key: DATAFLOW_KEY,
+            },
+        );
+        assert!(
+            !substitution_groups["join"].inputs_ready(),
+            "a store-substituted output must fail the signed exact-byte join"
         );
 
         // The same producer, on the same assignment, healthy — but EXECUTING the predecessor's
@@ -644,25 +1106,38 @@ mod tests {
         let predecessor = "b".repeat(64);
         let mut stale = report.clone();
         stale.archive_sha256 = predecessor;
-        stale.outputs = report.outputs.clone();
         let stale_reports = HashMap::from([(
             "producer".into(),
-            updated_contracts::telemetry::sign_report(&stale, &private).unwrap(),
+            crate::test_support::sign_report(&mut stale, &private),
         )]);
         let mut groups = BTreeMap::from([
             ("initialize".into(), groups["initialize"].clone()),
             (
                 "join".into(),
                 ResolvedGroup {
-                    inputs_ready: false,
+                    input_snapshot: None,
                     deployment: deployment("join-v1"),
                     ..groups["join"].clone()
                 },
             ),
         ]);
-        resolve_group_inputs(&mut groups, &nodes, &stale_reports, &keys, now_ms);
+        let mut verified = crate::evidence::VerifiedReports::default();
+        verified.verify_fleet(&stale_reports, &keys);
+        resolve_group_inputs(
+            &mut groups,
+            &InputResolution {
+                node_groups: &nodes,
+                reports: &stale_reports,
+                outputs: &outputs,
+                public_keys: &keys,
+                verified: &verified,
+                cordons: &BTreeSet::new(),
+                now_ms,
+                dataflow_key: DATAFLOW_KEY,
+            },
+        );
         assert!(
-            !groups["join"].inputs_ready,
+            !groups["join"].inputs_ready(),
             "a producer that has not installed what its configuration names resolves nothing"
         );
         assert!(groups["join"].deployment.runtime.inputs.is_empty());
@@ -671,8 +1146,6 @@ mod tests {
     fn repository() -> UpdateRepositorySpec {
         UpdateRepositorySpec {
             default_deployment: crate::DeploymentSpec {
-                name: "default".into(),
-                report_url: "https://control".into(),
                 release_repository: crate::ReleaseRepositorySpec {
                     metadata_url: "https://cdn/metadata/".into(),
                     targets_url: "https://cdn/targets/".into(),
@@ -682,27 +1155,14 @@ mod tests {
                     path: "app".into(),
                     sha256: DIGEST.into(),
                 },
-                ordered_install_fallback: false,
                 provider_set: crate::TargetSpec {
                     path: "providers".into(),
                     sha256: DIGEST.into(),
                 },
-                runtime: crate::tests::runtime_spec(),
+                ..crate::tests::deployment_spec("default")
             },
-            signing_secret_ref: crate::LocalSecretReference {
-                name: "tuf-signing-keys".into(),
-            },
-            enrollment: crate::EnrollmentSpec {
-                labels: BTreeMap::new(),
-            },
-            s3: crate::S3Destination {
-                bucket: "updates".into(),
-                prefix: "routing".into(),
-                region: "us-east-1".into(),
-                credentials_secret_ref: None,
-                endpoint: None,
-            },
-            assignment_prefix: "assignments".into(),
+            s3: crate::tests::repository_storage(),
+            ..crate::tests::repository()
         }
     }
 
@@ -748,16 +1208,21 @@ mod tests {
                 held,
                 holds: &BTreeSet::new(),
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted,
+                vetoed: &BTreeMap::new(),
                 routing,
                 assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
     }
 
@@ -767,7 +1232,7 @@ mod tests {
             match_labels: BTreeMap::from([("role".to_string(), role.to_string())]),
             depends_on,
             inputs: BTreeMap::new(),
-            inputs_ready: true,
+            input_snapshot: None,
             deployment: deployment(&format!("{name}-v1")),
             max_unavailable: 1,
             emergency_correction: false,
@@ -878,16 +1343,21 @@ mod tests {
                 held: &held,
                 holds: &BTreeSet::new(),
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &admitted,
+                vetoed: &BTreeMap::new(),
                 routing: &routing,
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -975,16 +1445,21 @@ mod tests {
                 held: &held,
                 holds: &BTreeSet::new(),
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &admitted,
+                vetoed: &BTreeMap::new(),
                 routing: &routing,
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .expect("removing the label is plannable");
         assert_eq!(planned.publication.node_groups["n1"], crate::DEFAULT_GROUP);
@@ -1133,16 +1608,21 @@ mod tests {
                 held: &held,
                 holds: &BTreeSet::new(),
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &admitted,
+                vetoed: &BTreeMap::new(),
                 routing: &routing,
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -1235,16 +1715,21 @@ mod tests {
                 held: &BTreeMap::new(),
                 holds: &BTreeSet::new(),
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &admitted,
+                vetoed: &BTreeMap::new(),
                 routing: &routing,
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .expect("a quarantined group is survivable");
 
@@ -1309,17 +1794,22 @@ mod tests {
                 quarantined: &BTreeMap::new(),
                 holds: &holds,
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
                 held: &BTreeMap::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &admitted,
+                vetoed: &BTreeMap::new(),
                 routing: &routing,
                 assignments: &assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .expect("a held node is plannable");
         assert_eq!(
@@ -1344,22 +1834,371 @@ mod tests {
                 quarantined: &BTreeMap::new(),
                 holds: &holds,
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
                 held: &BTreeMap::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &admitted,
+                vetoed: &BTreeMap::new(),
                 routing: &routing,
                 assignments: &gone,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .expect_err("a hold whose body is gone must never become a move");
         assert!(
             matches!(error, PlanError::UnknownPlacement { ref node, .. } if node == "n1"),
             "unexpected error: {error:?}"
+        );
+    }
+
+    /// The fleet-wide regression verdict gates the repository default exactly as an external
+    /// compliance block does — the default cohort is unthrottled, not exempt from proof.
+    ///
+    /// The reachable shape is a group whose deployment body is byte-identical to
+    /// `default_deployment`, so both resolve to one identity: the group's node attempts it, rolls
+    /// itself back, and the identity is halted fleet-wide. Nodes already on it keep running it (the
+    /// carry-forward republishes the recorded body), but a freshly enrolled unmatched node must not
+    /// be handed a body the plane has proof is bad — the second door `admit_pending` closes for
+    /// every group, including the greenfield ones.
+    #[test]
+    fn a_halted_default_deployment_is_withheld_from_newly_enrolled_nodes() {
+        let repository = repository();
+        let default = DesiredDeployment::try_from(repository.default_deployment.clone()).unwrap();
+        let identity = crate::deployment_identity(&default).unwrap();
+        // One group over the edge node, published with the very same body as the default.
+        let groups = BTreeMap::from([(
+            "g".to_string(),
+            ResolvedGroup {
+                name: "g".into(),
+                match_labels: BTreeMap::from([("role".to_string(), "edge".to_string())]),
+                depends_on: vec![],
+                inputs: BTreeMap::new(),
+                input_snapshot: None,
+                deployment: default.clone(),
+                max_unavailable: 1,
+                emergency_correction: false,
+            },
+        )]);
+        let mut nodes = edge_node();
+        nodes.push(ResolvedNode {
+            name: "n2".into(),
+            labels: BTreeMap::new(),
+        });
+        let first = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
+                public_keys: &HashMap::new(),
+                admitted: &BTreeMap::new(),
+                vetoed: &BTreeMap::new(),
+                routing: &BTreeMap::new(),
+                assignments: &BTreeMap::new(),
+                now: chrono::Utc::now(),
+            },
+            &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            first.assignments["n2"], identity,
+            "the unmatched node follows the default"
+        );
+
+        // n1 attempts the body and durably rejects it: one prover is the whole threshold for a
+        // group no set governs, so the identity is halted fleet-wide.
+        let key_pem = updated::csr::generate_key().unwrap();
+        let private = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
+        let public =
+            crate::join::csr_public_key(&updated::csr::csr_for(&key_pem, "n1").unwrap()).unwrap();
+        let mut report = NodeReport::new(
+            "n1",
+            &default.deployment,
+            identity.clone(),
+            "1.0.0",
+            "b".repeat(64),
+            default.provider_set.sha256.clone(),
+            false,
+        );
+        report.rejected = true;
+        report.reported_at_ms = updated_contracts::telemetry::now_ms();
+        let reports = HashMap::from([(
+            "n1".to_string(),
+            crate::test_support::sign_report(&mut report, &private),
+        )]);
+        let keys = HashMap::from([("n1".to_string(), public)]);
+        // n3 enrolls after the proof exists.
+        nodes.push(ResolvedNode {
+            name: "n3".into(),
+            labels: BTreeMap::new(),
+        });
+        let halted = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &groups,
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &reports,
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
+                public_keys: &keys,
+                admitted: &first.admitted,
+                vetoed: &BTreeMap::new(),
+                routing: &first.routing,
+                assignments: &first.assignments,
+                now: chrono::Utc::now(),
+            },
+            &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            halted.assignments["n2"], identity,
+            "a node already running the body keeps its recorded assignment"
+        );
+        assert!(
+            !halted.assignments.contains_key("n3"),
+            "but the halt refuses the default to a node that was never published it"
+        );
+    }
+
+    /// The unmatched cohort's OWN rejections are evidence: a `default_deployment` the machines no
+    /// group governs proved bad is halted by their proof alone, with no group anywhere naming the
+    /// same body.
+    ///
+    /// Counting evidence per planned GROUP made this unreachable. The default's lineage is keyed in
+    /// the admitted map under the reserved pseudo-group name, which is never a planned group, and
+    /// the unmatched machines are nobody's members — so their claims were collected, retained, and
+    /// never once read. `default_blocked` could then only ever be tripped by external admission or
+    /// by a body some grouped cohort happened to share, and a bad default was published to every
+    /// machine that enrolled afterwards, one after another, indefinitely.
+    ///
+    /// The threshold for this cohort is the set-less default of one: there is no `UpdateGroupSet`
+    /// to carry a `maxRegressions`, which is the same reading a group no set governs gets.
+    #[test]
+    fn an_unmatched_nodes_own_rejection_halts_the_repository_default() {
+        let repository = repository();
+        let default = DesiredDeployment::try_from(repository.default_deployment.clone()).unwrap();
+        let identity = crate::deployment_identity(&default).unwrap();
+        // No groups at all: every node here is unmatched and takes the unthrottled default.
+        let mut nodes = edge_node();
+        let first = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
+                public_keys: &HashMap::new(),
+                admitted: &BTreeMap::new(),
+                vetoed: &BTreeMap::new(),
+                routing: &BTreeMap::new(),
+                assignments: &BTreeMap::new(),
+                now: chrono::Utc::now(),
+            },
+            &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            first.assignments["n1"], identity,
+            "the unmatched node is handed the default, unthrottled"
+        );
+
+        // n1 attempts those bytes, durably rejects them, and is healthy again on what it was
+        // running before.
+        let key_pem = updated::csr::generate_key().unwrap();
+        let private = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
+        let public =
+            crate::join::csr_public_key(&updated::csr::csr_for(&key_pem, "n1").unwrap()).unwrap();
+        let mut report = NodeReport::new(
+            "n1",
+            &default.deployment,
+            identity.clone(),
+            "1.0.0",
+            "b".repeat(64),
+            default.provider_set.sha256.clone(),
+            false,
+        );
+        report.rejected = true;
+        report.reported_at_ms = updated_contracts::telemetry::now_ms();
+        let reports = HashMap::from([(
+            "n1".to_string(),
+            crate::test_support::sign_report(&mut report, &private),
+        )]);
+        let keys = HashMap::from([("n1".to_string(), public)]);
+        // n2 enrolls after the proof exists — the autoscaler scale-out, the replacement machine.
+        nodes.push(ResolvedNode {
+            name: "n2".into(),
+            labels: BTreeMap::new(),
+        });
+        let halted = plan_reconcile(
+            DesiredState {
+                repository: &repository,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &reports,
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
+                public_keys: &keys,
+                admitted: &first.admitted,
+                vetoed: &BTreeMap::new(),
+                routing: &first.routing,
+                assignments: &first.assignments,
+                now: chrono::Utc::now(),
+            },
+            &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert!(
+            !halted.assignments.contains_key("n2"),
+            "'unthrottled' is not 'exempt from proof': the machine that enrolled after the proof \
+             is not handed the body its peer refused"
+        );
+        assert_eq!(
+            halted.assignments["n1"], identity,
+            "while the node already on it keeps running exactly what it was published"
+        );
+        // The other half of the halt: the freeze has to be READABLE. This cohort has no
+        // `UpdateGroup` and no `UpdateGroupSet`, so the reserved key is the only place its status
+        // can come from — without it the repository reports Published on the new digest while
+        // nothing can be handed the body, and every later enrollment is withheld with no stated
+        // cause anywhere.
+        assert_eq!(
+            halted.halted_groups.get(crate::DEFAULT_GROUP),
+            Some(&crate::HaltedDeployment {
+                deployment: default.deployment.clone(),
+                evidence: 1,
+                rolled_back: false,
+            }),
+            "the frozen fleet-wide switch is projected under the reserved key, with the evidence \
+             that froze it"
+        );
+    }
+
+    #[test]
+    fn blocked_default_preserves_existing_nodes_and_withholds_new_ones() {
+        let repository_v1 = repository();
+        let mut nodes = edge_node();
+        let first = plan_reconcile(
+            DesiredState {
+                repository: &repository_v1,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
+                public_keys: &HashMap::new(),
+                admitted: &BTreeMap::new(),
+                vetoed: &BTreeMap::new(),
+                routing: &BTreeMap::new(),
+                assignments: &BTreeMap::new(),
+                now: chrono::Utc::now(),
+            },
+            &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        let old_identity = first.assignments["n1"].clone();
+
+        let mut repository_v2 = repository();
+        repository_v2.default_deployment.application.sha256 = "3".repeat(64);
+        let new_default =
+            DesiredDeployment::try_from(repository_v2.default_deployment.clone()).unwrap();
+        let blocked = BTreeSet::from([crate::deployment_identity(&new_default).unwrap()]);
+        nodes.push(ResolvedNode {
+            name: "n2".into(),
+            labels: BTreeMap::new(),
+        });
+        let frozen = plan_reconcile(
+            DesiredState {
+                repository: &repository_v2,
+                groups: &BTreeMap::new(),
+                group_labels: &BTreeMap::new(),
+                sets: &[],
+                nodes: &nodes,
+                quarantined: &BTreeMap::new(),
+                holds: &BTreeSet::new(),
+                cordons: &BTreeSet::new(),
+                blocked_deployments: &blocked,
+                held: &BTreeMap::new(),
+            },
+            ObservedState {
+                reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
+                public_keys: &HashMap::new(),
+                admitted: &first.admitted,
+                vetoed: &first.vetoed,
+                routing: &first.routing,
+                assignments: &first.assignments,
+                now: chrono::Utc::now(),
+            },
+            &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
+        )
+        .unwrap();
+        assert_eq!(frozen.assignments["n1"], old_identity);
+        assert!(!frozen.assignments.contains_key("n2"));
+        assert_eq!(
+            crate::deployment_identity(&frozen.admitted[crate::DEFAULT_GROUP].current).unwrap(),
+            old_identity
         );
     }
 
@@ -1385,17 +2224,22 @@ mod tests {
                 quarantined: &BTreeMap::new(),
                 holds: &BTreeSet::new(),
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
                 held: &BTreeMap::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &BTreeMap::new(),
+                vetoed: &BTreeMap::new(),
                 routing: &BTreeMap::new(),
                 assignments: &BTreeMap::new(),
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .unwrap();
         let old_identity = crate::deployment_identity(&old_default).unwrap();
@@ -1420,17 +2264,22 @@ mod tests {
                 quarantined: &BTreeMap::new(),
                 holds: &holds,
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
                 held: &BTreeMap::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &first.admitted,
+                vetoed: &first.vetoed,
                 routing: &first.routing,
                 assignments: &first.assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .expect("a held default node with a recorded lineage is plannable");
         assert_eq!(
@@ -1449,17 +2298,22 @@ mod tests {
                 quarantined: &BTreeMap::new(),
                 holds: &BTreeSet::new(),
                 cordons: &BTreeSet::new(),
+                blocked_deployments: &BTreeSet::new(),
                 held: &BTreeMap::new(),
             },
             ObservedState {
                 reports: &HashMap::new(),
+                outputs: &HashMap::new(),
+                dataflow_key: DATAFLOW_KEY,
                 public_keys: &HashMap::new(),
                 admitted: &second.admitted,
+                vetoed: &second.vetoed,
                 routing: &second.routing,
                 assignments: &second.assignments,
                 now: chrono::Utc::now(),
             },
             &mut crate::evidence::ObservationLog::default(),
+            &mut Default::default(),
         )
         .unwrap();
         let new_default =
@@ -1489,6 +2343,7 @@ mod tests {
                     quarantined: &BTreeMap<String, BTreeMap<String, String>>,
                     previous: Option<&ReconcilePlan>| {
             let empty_admitted = BTreeMap::new();
+            let empty_vetoed = BTreeMap::new();
             let empty_map = BTreeMap::new();
             plan_reconcile(
                 DesiredState {
@@ -1500,17 +2355,22 @@ mod tests {
                     quarantined,
                     holds: &BTreeSet::new(),
                     cordons: &BTreeSet::new(),
+                    blocked_deployments: &BTreeSet::new(),
                     held,
                 },
                 ObservedState {
                     reports: &HashMap::new(),
+                    outputs: &HashMap::new(),
+                    dataflow_key: DATAFLOW_KEY,
                     public_keys: &HashMap::new(),
                     admitted: previous.map_or(&empty_admitted, |plan| &plan.admitted),
+                    vetoed: previous.map_or(&empty_vetoed, |plan| &plan.vetoed),
                     routing: previous.map_or(&empty_map, |plan| &plan.routing),
                     assignments: previous.map_or(&empty_map, |plan| &plan.assignments),
                     now: chrono::Utc::now(),
                 },
                 &mut crate::evidence::ObservationLog::default(),
+                &mut Default::default(),
             )
             .unwrap()
         };

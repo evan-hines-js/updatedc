@@ -19,6 +19,17 @@ pub(crate) const RELEASE_SERVER_EXEC: [&str; 6] = [
     "release-server",
 ];
 
+/// A `kubectl` invocation that execs into one node's agent container, ready for the command to
+/// run. Every per-node read the e2e makes (durable rejection records, reconciler audit logs and
+/// receipts, resolved inputs, signals) goes through it for the same reason
+/// [`RELEASE_SERVER_EXEC`] exists: the namespace and the container name are stated once, so
+/// renaming either cannot leave half the assertions addressing a container that is gone.
+pub(crate) fn agent_exec(pod: &str) -> Command {
+    let mut command = kubectl();
+    command.args(["-n", NAMESPACE, "exec", pod, "-c", "agent", "--"]);
+    command
+}
+
 const LIFECYCLE_STATE: &str = "/var/lib/updated/providers/state/demo-enterprise-lifecycle";
 
 /// The enterprise sub-phases the lifecycle reconciler runs, in order, inside one `apply`. Each one
@@ -59,6 +70,19 @@ pub(crate) fn kubectl() -> Command {
     let mut command = Command::new("kubectl");
     command.args(kubectl_context_args());
     command
+}
+
+/// `helm`, pinned to this run's cluster for the same reason [`kubectl`] is.
+pub(crate) fn helm() -> Command {
+    let mut command = Command::new("helm");
+    command.args(["--kube-context", &kube_context()]);
+    command
+}
+
+/// The published chart directory for `name`. The e2e installs the *shipped* charts rather than
+/// manifests written for the test, so the thing an operator runs is the thing this suite proves.
+pub(crate) fn chart_path(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(workspace_root()?.join("deploy/charts").join(name))
 }
 
 /// Build the kind environment this e2e runs against: the operator, CDN, gateway, and base fleet
@@ -126,6 +150,16 @@ pub(crate) struct FleetLayout {
     pub(crate) provider_sha: String,
 }
 
+/// The two signed targets that make the optional Jenkins tier complete. Absence means the tier is
+/// not published for this platform; there is no half-enabled state made from booleans and empty
+/// path/hash sentinels.
+struct JenkinsResources {
+    application_path: String,
+    application_sha: String,
+    provider_path: String,
+    provider_sha: String,
+}
+
 /// Apply the fleet layout onto the provisioned, scaled cluster: detect the platform and whether
 /// Jenkins is published for it, deploy the Jenkins fleet when it is, assign every enrolled node
 /// its labels, apply the per-set/per-cohort resources, wait for the StatefulSet to roll out,
@@ -137,8 +171,19 @@ pub(crate) async fn prepare_fleet() -> Result<FleetLayout, Box<dyn std::error::E
     // Run the full test (with Jenkins) on an x86_64 box.
     let platform = repository_platform()?.trim().to_string();
     let jenkins_path = format!("products/jenkins/stable/1.0.0/{platform}/app");
-    let jenkins_enabled = repository_target_sha(&jenkins_path).is_ok();
-    if jenkins_enabled {
+    let jenkins = match repository_target_sha(&jenkins_path) {
+        Ok(application_sha) => {
+            let provider_path = "provider-sets/jenkins.json".to_string();
+            Some(JenkinsResources {
+                application_path: jenkins_path,
+                application_sha,
+                provider_sha: repository_target_sha(&provider_path)?,
+                provider_path,
+            })
+        }
+        Err(_) => None,
+    };
+    if jenkins.is_some() {
         println!("[e2e] deploying {JENKINS_TOTAL} Jenkins nodes (ci + release controller pairs)");
         apply_jenkins_fleet()?;
     } else {
@@ -146,32 +191,15 @@ pub(crate) async fn prepare_fleet() -> Result<FleetLayout, Box<dyn std::error::E
     }
     println!("[e2e] waiting for enrollment and assigning every new node");
     label_cohort_agents()?;
-    if jenkins_enabled {
+    if jenkins.is_some() {
         label_jenkins_agents()?;
     }
     label_external_agents()?;
     // The sample-app cohorts resolve their provider set from MinIO; its sha is published and
     // returned by `bootstrap_minio_release_repo`, not read from the release-server repo here.
     let provider_path = "provider-sets/rube-goldberg.json".to_owned();
-    // Jenkins bundle refs, resolved only when it is published for this platform.
-    let (jenkins_sha, jenkins_provider_path, jenkins_provider_sha) = if jenkins_enabled {
-        (
-            repository_target_sha(&jenkins_path)?,
-            "provider-sets/jenkins.json".to_string(),
-            repository_target_sha("provider-sets/jenkins.json")?,
-        )
-    } else {
-        (String::new(), String::new(), String::new())
-    };
     println!("[e2e] applying the RBAC, per-set services, and per-cohort groups");
-    let provider_sha = apply_resources(
-        &provider_path,
-        jenkins_enabled,
-        &jenkins_path,
-        jenkins_sha.trim(),
-        &jenkins_provider_path,
-        jenkins_provider_sha.trim(),
-    )?;
+    let provider_sha = apply_resources(&provider_path, jenkins.as_ref())?;
     println!("[e2e] waiting for all assigned agents to become ready");
     run(kubectl().args([
         "-n",
@@ -181,13 +209,19 @@ pub(crate) async fn prepare_fleet() -> Result<FleetLayout, Box<dyn std::error::E
         "statefulset/agent",
         "--timeout=480s",
     ]))?;
+    // Every `UpdateBackend` resolves its members' routable addresses from
+    // `UpdateAgent.spec.backendAddress`, and both backends below select the external slice — so
+    // the addresses are recorded FIRST, in one place. Creating the HAProxy backend before them
+    // left the operator refusing the whole projection (`AgentAddressMissing`) for agents whose
+    // addresses were only patched by a later step.
+    assign_external_backend_addresses()?;
     // The updated-managed HAProxy tier: 2 HAProxies (installed from a signed tarball, upgraded in
     // place) fronting the external slice, with a HAProxy-mode healthproxy programming their backend
     // membership from signed CDN health. Runs after the release keys + external slice exist. Sits
     // outside the cohort/set/chaos machinery, so it never perturbs the convergence math.
     prepare_haproxy_tier(&platform).await?;
     println!("[e2e] deploying the healthproxy reconciler for the out-of-cluster slice");
-    deploy_external_reconciler()?;
+    deploy_external_reconciler().await?;
     deploy_alert_sink().await?;
     Ok(FleetLayout {
         platform,
@@ -236,13 +270,20 @@ async fn deploy_alert_sink() -> Result<(), Box<dyn std::error::Error>> {
         &format!("deployment/{ALERT_SINK}"),
         "--timeout=120s",
     ]))?;
-    run(kubectl().args([
-        "-n",
+    // Through the chart, not `kubectl set env`: the alert sink is a supported chart value, and a
+    // hand-patched Deployment would both skip that path and be silently reverted by the next
+    // `helm upgrade`. `--reuse-values` keeps the install's image and URL overrides.
+    run(helm().args([
+        "upgrade",
+        "updatec",
+        chart_path("updatec")?
+            .to_str()
+            .ok_or("chart path is not valid UTF-8")?,
+        "--namespace",
         NAMESPACE,
-        "set",
-        "env",
-        "deployment/updatec-controller",
-        &format!("UPDATED_ALERT_URL={}", alert_url()),
+        "--reuse-values",
+        "--set",
+        &format!("controller.alerting.url={}", alert_url()),
     ]))?;
     run(kubectl().args([
         "-n",
@@ -281,19 +322,37 @@ pub(crate) fn delivered_alerts() -> Vec<serde_json::Value> {
 /// to populate (a timing concern), but a *cross-set* endpoint is an immediate hard failure, not
 /// something to wait out.
 pub(crate) async fn assert_set_isolation() -> Result<(), Box<dyn std::error::Error>> {
+    let mut last = String::new();
     for _ in 0..90 {
         let mut all_populated = true;
         for set in 0..SET_COUNT {
             let service = set_service_name(set);
+            // A transient read failure is not a verdict: it is retried like a Service whose
+            // endpoints have not populated yet, and reported only if the wait runs out. Only a
+            // *cross-set* endpoint below is an immediate hard failure.
+            let endpoints = match service_endpoints(&service) {
+                Ok((_, endpoints)) => endpoints,
+                Err(error) => {
+                    last = error.to_string();
+                    all_populated = false;
+                    continue;
+                }
+            };
             let mut ready_here = 0usize;
-            for (pod, ready) in set_service_endpoints(&service)? {
+            // Every endpoint is checked for set membership regardless of readiness (a stray
+            // cross-set pod is a violation even while draining); readiness only decides whether
+            // the set is currently serving.
+            for endpoint in endpoints {
+                let Some(pod) = endpoint.pod else {
+                    continue;
+                };
                 if node_set_index(&pod) != Some(set) {
                     return Err(format!(
                         "set isolation violated: set {set}'s Service {service} is backed by {pod}, which is not in set {set}"
                     )
                     .into());
                 }
-                if ready {
+                if endpoint.ready {
                     ready_here += 1;
                 }
             }
@@ -309,7 +368,15 @@ pub(crate) async fn assert_set_isolation() -> Result<(), Box<dyn std::error::Err
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    Err("per-set load-balancer Services never populated their endpoints".into())
+    Err(format!(
+        "per-set load-balancer Services never populated their endpoints{}{last}",
+        if last.is_empty() {
+            ""
+        } else {
+            "; last error: "
+        }
+    )
+    .into())
 }
 
 /// Prove the reconciler dogfood: the real `updated-healthproxy` binary programmed the
@@ -318,48 +385,44 @@ pub(crate) async fn assert_set_isolation() -> Result<(), Box<dyn std::error::Err
 /// exact product code path (the one that fronts VMs) end to end against a live cluster.
 pub(crate) async fn assert_external_endpoints_reconciled() -> Result<(), Box<dyn std::error::Error>>
 {
-    for _ in 0..90 {
-        let json = output(kubectl().args([
-            "-n",
-            NAMESPACE,
-            "get",
-            "endpointslices",
-            "-l",
-            &format!("kubernetes.io/service-name={EXTERNAL_SERVICE}"),
-            "-o",
-            "json",
-        ]))?;
-        let parsed: serde_json::Value = serde_json::from_str(&json)?;
-        let mut managed_by_reconciler = false;
-        let mut ready = 0usize;
-        for slice in parsed["items"].as_array().into_iter().flatten() {
-            if slice["metadata"]["labels"]["endpointslice.kubernetes.io/managed-by"].as_str()
-                == Some("updated-healthproxy")
-            {
-                managed_by_reconciler = true;
-            }
-            for endpoint in slice["endpoints"].as_array().into_iter().flatten() {
-                if endpoint["conditions"]["ready"].as_bool().unwrap_or(false) {
-                    ready += 1;
-                }
-            }
-        }
-        if managed_by_reconciler && ready >= EXTERNAL_COUNT {
-            println!(
-                "[e2e] verified the healthproxy reconciler programmed {EXTERNAL_COUNT} out-of-cluster endpoints from CDN health"
-            );
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    Err("the external healthproxy never programmed the expected ready endpoints".into())
+    await_for(
+        90,
+        "the external healthproxy to program its ready endpoints",
+        || {
+            let (managers, endpoints) = service_endpoints(EXTERNAL_SERVICE)?;
+            let ready = endpoints.iter().filter(|endpoint| endpoint.ready).count();
+            Ok(managers
+                .iter()
+                .any(|manager| manager == "updated-healthproxy")
+                && ready >= EXTERNAL_COUNT)
+        },
+    )
+    .await?;
+    println!(
+        "[e2e] verified the healthproxy reconciler programmed {EXTERNAL_COUNT} out-of-cluster endpoints from CDN health"
+    );
+    Ok(())
 }
 
-/// The `(pod name, ready)` endpoints currently backing a per-set Service, read from its
-/// EndpointSlices. Every endpoint is checked for set membership regardless of readiness (a
-/// stray cross-set pod is a violation even while draining); readiness only decides whether
-/// the set is currently serving.
-fn set_service_endpoints(service: &str) -> Result<Vec<(String, bool)>, Box<dyn std::error::Error>> {
+/// One endpoint backing a Service, as its EndpointSlices report it.
+pub(crate) struct ServiceEndpoint {
+    /// The pod behind the endpoint (`targetRef.name`), absent for the selectorless `external`
+    /// Service: the healthproxy fronts machines that are not pods at all, so what it programs is
+    /// an address literal per member and nothing else.
+    pub(crate) pod: Option<String>,
+    pub(crate) addresses: Vec<String>,
+    pub(crate) ready: bool,
+}
+
+/// Every endpoint currently backing `service`, read from its EndpointSlices, together with the
+/// `endpointslice.kubernetes.io/managed-by` value each of those slices carries.
+///
+/// **The only reading of that document.** Readiness is decided here once (`conditions.ready`), so
+/// the scenarios that ask about backing pods, programmed addresses, or the controller that
+/// programmed them cannot disagree about which endpoints are serving.
+pub(crate) fn service_endpoints(
+    service: &str,
+) -> Result<(Vec<String>, Vec<ServiceEndpoint>), Box<dyn std::error::Error>> {
     let json = output(kubectl().args([
         "-n",
         NAMESPACE,
@@ -371,17 +434,28 @@ fn set_service_endpoints(service: &str) -> Result<Vec<(String, bool)>, Box<dyn s
         "json",
     ]))?;
     let parsed: serde_json::Value = serde_json::from_str(&json)?;
+    let mut managers = Vec::new();
     let mut endpoints = Vec::new();
     for slice in parsed["items"].as_array().into_iter().flatten() {
+        if let Some(manager) =
+            slice["metadata"]["labels"]["endpointslice.kubernetes.io/managed-by"].as_str()
+        {
+            managers.push(manager.to_string());
+        }
         for endpoint in slice["endpoints"].as_array().into_iter().flatten() {
-            let Some(pod) = endpoint["targetRef"]["name"].as_str() else {
-                continue;
-            };
-            let ready = endpoint["conditions"]["ready"].as_bool().unwrap_or(false);
-            endpoints.push((pod.to_string(), ready));
+            endpoints.push(ServiceEndpoint {
+                pod: endpoint["targetRef"]["name"].as_str().map(str::to_string),
+                addresses: endpoint["addresses"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|address| address.as_str().map(str::to_string))
+                    .collect(),
+                ready: endpoint["conditions"]["ready"].as_bool().unwrap_or(false),
+            });
         }
     }
-    Ok(endpoints)
+    Ok((managers, endpoints))
 }
 
 /// Prove the red→green lifecycle transaction ran through the real operator: the reconciler
@@ -391,19 +465,19 @@ fn set_service_endpoints(service: &str) -> Result<Vec<(String, bool)>, Box<dyn s
 /// (each sub-phase requires its predecessor's marker, so the full marker set is the ordering
 /// evidence), and the receipt proves it ran for the green release.
 pub(crate) async fn assert_lifecycle_transaction() -> Result<(), Box<dyn std::error::Error>> {
-    let mut transaction = None;
-    for _ in 0..60 {
-        if let Ok(lifecycle) = lifecycle_audit() {
-            if let Some(attempt) = latest_completed_transaction(&lifecycle) {
-                transaction = Some(attempt);
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    let Some(attempt) = transaction else {
-        return Err("no lifecycle update transaction completed its apply operation".into());
-    };
+    let mut attempt = String::new();
+    await_for(
+        60,
+        "a lifecycle update transaction to complete its apply operation",
+        || {
+            let Some(completed) = latest_completed_transaction(&lifecycle_audit()?) else {
+                return Ok(false);
+            };
+            attempt = completed;
+            Ok(true)
+        },
+    )
+    .await?;
     let missing = missing_sub_phase_markers(&lifecycle_attempt_markers(&attempt)?);
     if !missing.is_empty() {
         return Err(format!(
@@ -411,14 +485,7 @@ pub(crate) async fn assert_lifecycle_transaction() -> Result<(), Box<dyn std::er
         )
         .into());
     }
-    let receipt = output(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "exec",
-        LIFECYCLE_NODE,
-        "-c",
-        "agent",
-        "--",
+    let receipt = output(agent_exec(LIFECYCLE_NODE).args([
         "cat",
         &format!("{LIFECYCLE_STATE}/legacy-java-home/change-ticket.receipt"),
     ]))?;
@@ -430,24 +497,16 @@ pub(crate) async fn assert_lifecycle_transaction() -> Result<(), Box<dyn std::er
 }
 
 fn lifecycle_audit() -> Result<String, Box<dyn std::error::Error>> {
-    output(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "exec",
-        LIFECYCLE_NODE,
-        "-c",
-        "agent",
-        "--",
-        "cat",
-        &format!("{LIFECYCLE_STATE}/audit/lifecycle.tsv"),
-    ]))
+    output(
+        agent_exec(LIFECYCLE_NODE).args(["cat", &format!("{LIFECYCLE_STATE}/audit/lifecycle.tsv")]),
+    )
 }
 
 /// The attempt id of the newest completed update transaction in the reconciler's audit log.
 ///
 /// The reconciler appends one `<operation>\t<attempt>\t<event>` row per invocation. An update
 /// transaction is exactly one [`Operation::Apply`] under a deployment attempt id; the reserved
-/// ids (`boot`, `periodic`, `fingerprint`) name observations that belong to no transaction and
+/// ids (`boot`, `converge`, `periodic`, `fingerprint`) name operations that belong to no transaction and
 /// must never be mistaken for one.
 fn latest_completed_transaction(audit: &str) -> Option<String> {
     audit.lines().rev().find_map(|line| {
@@ -474,14 +533,7 @@ fn missing_sub_phase_markers(markers: &[String]) -> Vec<&'static str> {
 
 /// The completion markers the reconciler left in one attempt's effects directory.
 fn lifecycle_attempt_markers(attempt: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(output(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "exec",
-        LIFECYCLE_NODE,
-        "-c",
-        "agent",
-        "--",
+    Ok(output(agent_exec(LIFECYCLE_NODE).args([
         "ls",
         "-1",
         &format!("{LIFECYCLE_STATE}/attempts/{attempt}"),
@@ -558,7 +610,7 @@ pub(crate) fn patch_agent_labels(
 fn label_cohort_agents() -> Result<(), Box<dyn std::error::Error>> {
     for ordinal in 0..NODE_COUNT {
         patch_agent_labels(
-            &agent_resource_name(ordinal as u8),
+            &agent_resource_name(ordinal),
             serde_json::json!({
                 NODE_LABEL: format!("agent-{ordinal}"),
                 COHORT_LABEL: cohort_label(ordinal / COHORT_SIZE),
@@ -639,18 +691,13 @@ fn jenkins_statefulset(role: &str, replicas: usize) -> serde_json::Value {
                         "readinessProbe": { "httpGet": { "path": "/login", "port": "http" }, "periodSeconds": 3, "failureThreshold": 200 },
                         "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] }, "runAsNonRoot": true, "runAsUser": 65532 },
                         "resources": { "requests": { "cpu": "250m", "memory": "1Gi" }, "limits": { "memory": "1500Mi" } },
-                        "volumeMounts": [
-                            { "name": "state", "mountPath": "/var/lib/updated" },
-                            { "name": "jenkins-data", "mountPath": "/var/lib/jenkins" },
-                            { "name": "jenkins-backups", "mountPath": "/var/lib/jenkins-backups" },
-                            { "name": "agent-tls", "mountPath": "/etc/agent-tls", "readOnly": true },
-                            { "name": "tmp", "mountPath": "/tmp" }
-                        ]
+                        "volumeMounts": agent_volume_mounts(vec![
+                            serde_json::json!({ "name": "state", "mountPath": "/var/lib/updated" }),
+                            serde_json::json!({ "name": "jenkins-data", "mountPath": "/var/lib/jenkins" }),
+                            serde_json::json!({ "name": "jenkins-backups", "mountPath": "/var/lib/jenkins-backups" })
+                        ])
                     }],
-                    "volumes": [
-                        { "name": "tmp", "emptyDir": {} },
-                        { "name": "agent-tls", "secret": { "secretName": "agent-tls" } }
-                    ]
+                    "volumes": agent_volumes(vec![])
                 }
             },
             "volumeClaimTemplates": [
@@ -674,12 +721,16 @@ fn jenkins_statefulset(role: &str, replicas: usize) -> serde_json::Value {
 /// `updatec-e2e agent-name <hostname>` rather than re-deriving it, so the name cannot drift
 /// between producer and consumers.
 pub(crate) fn resource_name(hostname: &str) -> String {
-    let nonce = updated::hash::sha256_bytes(hostname.as_bytes());
-    let registration = updated::hash::sha256_bytes(nonce.as_bytes());
+    let nonce = updated_contracts::digest::sha256_bytes(hostname.as_bytes());
+    // The registration digest a node is pinned to, through the one function that defines it.
+    let registration = updated_contracts::telemetry::node_object_digest(&nonce);
     format!("agent-{}", &registration[..24])
 }
 
-pub(crate) fn agent_resource_name(ordinal: u8) -> String {
+/// [`resource_name`] for the sample-app node with this fleet ordinal. `usize`, the type every
+/// caller's ordinal already has: the layout constants are tunable, and narrowing here would let a
+/// fleet grown past 255 nodes silently wrap onto another node's CR.
+pub(crate) fn agent_resource_name(ordinal: usize) -> String {
     resource_name(&format!("agent-{ordinal}"))
 }
 
@@ -727,33 +778,13 @@ pub(crate) fn kubectl_value(
     ]))
 }
 
-/// The node's pinned public key (hex EC point) the control plane recorded on its `UpdateAgent` at
-/// enrollment. The healthproxy verifies each node's signed health report against it, so it must be
-/// handed the same key the throttle pins — read here from the trusted in-cluster resource (never the
-/// CDN). Enrollment is asynchronous, so retry until the key appears rather than deploy a healthproxy
-/// that can never mark the node ready.
-pub(crate) fn agent_pinned_public_key(
-    resource: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    for _ in 0..60 {
-        if let Ok(key) = kubectl_value("updateagent", resource, "{.spec.identity.publicKey}") {
-            let key = key.trim().to_string();
-            if !key.is_empty() {
-                return Ok(key);
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    Err(format!("UpdateAgent {resource} never published a pinned public key to verify its health reports against").into())
-}
-
 /// Label the external agents into the `external` cohort the external UpdateGroup selects. No
 /// set/fleet label — they sit outside the per-set machinery on purpose.
 fn label_external_agents() -> Result<(), Box<dyn std::error::Error>> {
     for index in 0..EXTERNAL_COUNT {
         let ordinal = external_ordinal(index);
         patch_agent_labels(
-            &agent_resource_name(ordinal as u8),
+            &agent_resource_name(ordinal),
             serde_json::json!({
                 NODE_LABEL: format!("agent-{ordinal}"),
                 COHORT_LABEL: EXTERNAL_COHORT,
@@ -764,13 +795,42 @@ fn label_external_agents() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Deploy the real `updated-healthproxy` reconciler for the external slice. It is handed a
-/// **static** `node=address` inventory — exactly as a real deployment would hand it an
-/// OpenStack/VMware VM list — built here from the external pods' identities and current IPs.
-/// The reconciler then programs the selectorless `external` Service's EndpointSlice purely
-/// from those nodes' CDN health, with no knowledge that they happen to be pods.
-fn deploy_external_reconciler() -> Result<(), Box<dyn std::error::Error>> {
-    let mut members = Vec::with_capacity(EXTERNAL_COUNT);
+/// Wait for an operator-created Deployment to EXIST, then for its rollout to land. The operator
+/// materializes a backend's workload on its own reconcile cadence after the `UpdateBackend` is
+/// applied, and `kubectl rollout status` fails instantly on a name that is not there yet — a
+/// bounded existence poll first is what makes waiting on operator output race-free.
+pub(crate) async fn await_operator_deployment(
+    name: &str,
+    seconds: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    await_for(
+        seconds,
+        &format!("the operator to create deployment {name}"),
+        || {
+            Ok(kubectl()
+                .args(["-n", NAMESPACE, "get", "deployment", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?
+                .success())
+        },
+    )
+    .await?;
+    run(kubectl().args([
+        "-n",
+        NAMESPACE,
+        "rollout",
+        "status",
+        &format!("deployment/{name}"),
+        "--timeout=180s",
+    ]))
+}
+
+/// Record each external machine's routable address on its `UpdateAgent` — the one inventory
+/// fact the e2e supplies, exactly as a VM inventory controller would. Runs before ANY
+/// `UpdateBackend` that selects these agents exists, because the operator fails a backend closed
+/// over a selected agent with no address.
+fn assign_external_backend_addresses() -> Result<(), Box<dyn std::error::Error>> {
     for index in 0..EXTERNAL_COUNT {
         let ordinal = external_ordinal(index);
         let pod = format!("agent-{ordinal}");
@@ -779,40 +839,42 @@ fn deploy_external_reconciler() -> Result<(), Box<dyn std::error::Error>> {
         if ip.is_empty() {
             return Err(format!("external agent {pod} has no pod IP yet").into());
         }
-        // The node key is the enrolled identity its NodeReport is written under, not the pod
-        // name — the reconciler reads `<report>/telemetry/<identity>.json`. The pinned public key
-        // is appended so the healthproxy verifies the report's signature, not merely its shape.
-        let node = agent_resource_name(ordinal as u8);
-        let key = agent_pinned_public_key(&node)?;
-        members.push(format!("{node}={ip}={key}"));
+        let node = agent_resource_name(ordinal);
+        run(kubectl().args([
+            "-n",
+            NAMESPACE,
+            "patch",
+            "updateagent",
+            &node,
+            "--type=merge",
+            "-p",
+            &serde_json::json!({"spec": {"backendAddress": ip}}).to_string(),
+        ]))?;
     }
-    let members = members.join(",");
+    Ok(())
+}
+
+/// Declare the external slice backend. The operator derives membership, public-key pins, workload,
+/// and exact EndpointSlice RBAC from this CRD and the selected agents; the e2e supplies only each
+/// external machine's routable address, just as a VM inventory controller would.
+async fn deploy_external_reconciler() -> Result<(), Box<dyn std::error::Error>> {
     apply_json(&serde_json::json!({
-        "apiVersion":"apps/v1","kind":"Deployment",
-        "metadata":{"name":"external-healthproxy","namespace":NAMESPACE},
-        "spec":{"replicas":1,"selector":{"matchLabels":{"app":"external-healthproxy"}},
-            "template":{"metadata":{"labels":{"app":"external-healthproxy"}},
-            "spec":{"serviceAccountName":"external-healthproxy","containers":[{
-                "name":"healthproxy","image":"updatec-e2e:kind","imagePullPolicy":"Never",
-                "command":["/usr/local/bin/updated-healthproxy"],
-                "env":[
-                    {"name":"HEALTHPROXY_HEALTH_BASE","value":HEALTH_CDN},
-                    {"name":"HEALTHPROXY_NAMESPACE","value":NAMESPACE},
-                    {"name":"HEALTHPROXY_SERVICE","value":EXTERNAL_SERVICE},
-                    {"name":"HEALTHPROXY_PORT","value":"8080"},
-                    {"name":"HEALTHPROXY_MEMBERS","value":members}
-                ]
-            }]}}
+        "apiVersion": "updated.dev/v1alpha1",
+        "kind": "UpdateBackend",
+        "metadata": {"name": "external", "namespace": NAMESPACE},
+        "spec": {
+            "repositoryRef": {"name": "default"},
+            "selector": {"matchLabels": {COHORT_LABEL: EXTERNAL_COHORT}},
+            "healthBase": HEALTH_CDN,
+            "target": {
+                "kind": "endpointSlice",
+                "service": EXTERNAL_SERVICE,
+                "port": 8080,
+                "portName": "http"
+            }
         }
     }))?;
-    run(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "rollout",
-        "status",
-        "deployment/external-healthproxy",
-        "--timeout=120s",
-    ]))
+    await_operator_deployment("updated-backend-external", 120).await
 }
 
 /// `(release_root, baseline_path, baseline_sha, provider_sha)` — the signed identities
@@ -954,16 +1016,9 @@ fn bootstrap_minio_release_repo(
 
 /// Apply every resource the fleet layout needs and return the published reconciler set's sha —
 /// the identity each cohort release is signed with.
-// The four `jenkins_*` parameters are what push this over the argument threshold; they are the
-// data of one optional tier, resolved by the caller that detects whether it is published.
-#[allow(clippy::too_many_arguments)]
 fn apply_resources(
     provider_path: &str,
-    jenkins_enabled: bool,
-    jenkins_path: &str,
-    jenkins_sha: &str,
-    jenkins_provider_path: &str,
-    jenkins_provider_sha: &str,
+    jenkins: Option<&JenkinsResources>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let edge: serde_json::Value = serde_json::from_str(&output(kubectl().args([
         "-n",
@@ -1008,8 +1063,6 @@ fn apply_resources(
         // patches. The Jenkins groups below keep edge's release-server repo (the default path).
         deployment["releaseRepository"] = minio_release_repository.clone();
         deployment["providerSet"] = provider.clone();
-        // Nodes write rollout telemetry here so the control plane can throttle the fleet.
-        deployment["reportUrl"] = REPORT_URL.into();
         // Signed opt-in to first-install ordered fallback: a killed, stateless agent
         // pod returns cold and must descend from its assigned version to the newest
         // healthy release rather than stranding on a broken head. This is what makes
@@ -1062,40 +1115,45 @@ fn apply_resources(
     // they are upgraded one node at a time by the same agent mechanism (zero downtime across each
     // pair) yet sit entirely outside the convergence throttling and pod-kill chaos that drive the
     // sample-app cohorts.
-    for (role, _replicas) in JENKINS_COHORTS.into_iter().filter(|_| jenkins_enabled) {
-        let name = format!("jenkins-{role}");
-        let mut deployment = edge["spec"]["deployment"].clone();
-        deployment["name"] = name.clone().into();
-        deployment["application"] =
-            serde_json::json!({"path": jenkins_path, "sha256": jenkins_sha});
-        deployment["providerSet"] =
-            serde_json::json!({"path": jenkins_provider_path, "sha256": jenkins_provider_sha});
-        deployment["reportUrl"] = REPORT_URL.into();
-        deployment["orderedInstallFallback"] = serde_json::json!(false);
-        deployment["runtime"]["product"] = "jenkins".into();
-        // The Jenkins reconciler backs JENKINS_HOME up before activation and reuses it; the
-        // hook owns the process, and rollback restores the backup. Jenkins's first install
-        // runs for minutes; give it a boot-sized health grace and a relaxed cadence rather
-        // than the fleet's sub-second timings.
-        deployment["runtime"]["timeouts"] = serde_json::json!({
-            "checkIntervalSeconds": 5,
-            "healthGraceSeconds": 360,
-            "healthSuccesses": 1,
-            "healthIntervalSeconds": 3,
-            "refreshRetrySeconds": 5,
-            "confirmationWindowSeconds": 10,
-            "agentCheckIntervalSeconds": 3600
-        });
-        items.push(serde_json::json!({
-            "apiVersion":"updated.dev/v1alpha1",
-            "kind":"UpdateGroup",
-            "metadata":{"name": name, "namespace":NAMESPACE},
-            "spec":{
-                "repositoryRef":{"name":"default"},
-                "selector": {"matchLabels":{KIND_LABEL:"jenkins", ROLE_LABEL: role}},
-                "deployment": deployment
-            }
-        }));
+    if let Some(jenkins) = jenkins {
+        for (role, _replicas) in JENKINS_COHORTS {
+            let name = format!("jenkins-{role}");
+            let mut deployment = edge["spec"]["deployment"].clone();
+            deployment["name"] = name.clone().into();
+            deployment["application"] = serde_json::json!({
+                "path": jenkins.application_path,
+                "sha256": jenkins.application_sha.trim()
+            });
+            deployment["providerSet"] = serde_json::json!({
+                "path": jenkins.provider_path,
+                "sha256": jenkins.provider_sha.trim()
+            });
+            deployment["orderedInstallFallback"] = serde_json::json!(false);
+            deployment["runtime"]["product"] = "jenkins".into();
+            // The Jenkins reconciler backs JENKINS_HOME up before activation and reuses it; the
+            // hook owns the process, and rollback restores the backup. Jenkins's first install
+            // runs for minutes; give it a boot-sized health grace and a relaxed cadence rather
+            // than the fleet's sub-second timings.
+            deployment["runtime"]["timeouts"] = serde_json::json!({
+                "checkIntervalSeconds": 5,
+                "healthGraceSeconds": 360,
+                "healthSuccesses": 1,
+                "healthIntervalSeconds": 3,
+                "refreshRetrySeconds": 5,
+                "confirmationWindowSeconds": 10,
+                "agentCheckIntervalSeconds": 3600
+            });
+            items.push(serde_json::json!({
+                "apiVersion":"updated.dev/v1alpha1",
+                "kind":"UpdateGroup",
+                "metadata":{"name": name, "namespace":NAMESPACE},
+                "spec":{
+                    "repositoryRef":{"name":"default"},
+                    "selector": {"matchLabels":{KIND_LABEL:"jenkins", ROLE_LABEL: role}},
+                    "deployment": deployment
+                }
+            }));
+        }
     }
     // Per-set UpdateGroupSet (default maxConcurrent = members-1): never both groups of a
     // set roll at once, so every set always keeps a group serving.
@@ -1132,13 +1190,10 @@ fn apply_resources(
         .expect("group metadata is an object")
         .remove("labels");
     items.push(external_group);
-    // RBAC for the `updated-healthproxy` reconciler that programs the external Service's
-    // EndpointSlice from the external nodes' CDN health.
-    items.push(serde_json::json!({"apiVersion":"v1","kind":"ServiceAccount","metadata":{"name":"external-healthproxy","namespace":NAMESPACE}}));
-    items.push(serde_json::json!({"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role","metadata":{"name":"external-healthproxy","namespace":NAMESPACE},"rules":[
-        {"apiGroups":["discovery.k8s.io"],"resources":["endpointslices"],"verbs":["get","list","watch","create","update","patch"]}
-    ]}));
-    items.push(serde_json::json!({"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding","metadata":{"name":"external-healthproxy","namespace":NAMESPACE},"subjects":[{"kind":"ServiceAccount","name":"external-healthproxy","namespace":NAMESPACE}],"roleRef":{"apiGroup":"rbac.authorization.k8s.io","kind":"Role","name":"external-healthproxy"}}));
+    // No healthproxy RBAC here: the operator mints it. `runtime::reconcile_backend_access` applies
+    // the ServiceAccount, the Role from `runtime::backend_role`, and the RoleBinding per
+    // UpdateBackend, owner-referenced to the CR — so there is exactly one definition of what that
+    // reconciler is allowed to do, and this run exercises the shipping one rather than a copy.
     // Per-set load-balancer Services: each selects only that set's pods (by the set label the pod
     // labeler keeps current), so Kubernetes — not this driver — guarantees a set is only ever
     // answered by its own pods. `publishNotReadyAddresses` is intentionally omitted so a

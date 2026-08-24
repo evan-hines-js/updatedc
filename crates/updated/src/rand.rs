@@ -16,6 +16,21 @@ pub fn token() -> io::Result<String> {
     Ok(hex::encode(bytes))
 }
 
+/// Whether a value could have been emitted by [`token`].
+///
+/// The one reader-side grammar for everything [`token`] produces: durable attempt identities on
+/// deserialization (journals, installed rollback intent), and capability tokens on the way back in
+/// off the wire. All of them become filenames, map keys, or reconciler idempotency keys, so none of
+/// them may be an arbitrary non-empty string.
+///
+/// Public because the check has to live where the *producer* lives. A consumer that spells the
+/// grammar out for itself — "64 characters, hexadecimal" — is a second definition that drifts:
+/// `is_ascii_hexdigit` accepts uppercase, [`token`] never emits it, and the two disagree about
+/// whether `A9…` is a token this system could have issued.
+pub fn is_token(value: &str) -> bool {
+    updated_contracts::is_canonical_sha256(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -26,5 +41,7 @@ mod tests {
         let b = token().unwrap();
         assert_eq!(a.len(), 64, "256 bits as hex");
         assert_ne!(a, b, "two tokens must not collide");
+        assert!(is_token(&a));
+        assert!(!is_token("attempt"));
     }
 }

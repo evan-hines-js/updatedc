@@ -32,12 +32,45 @@ stage_runtime() {
   [[ -f "$release/config/haproxy.cfg" ]] || die "release $release has no config/haproxy.cfg"
   mkdir -p "$runtime"
   local bin_tmp="$runtime/.haproxy.$$" cfg_tmp="$runtime/.haproxy.cfg.$$"
-  # shellcheck disable=SC2064
-  trap "rm -f '$bin_tmp' '$cfg_tmp'" RETURN
-  cp "$release/bin/haproxy" "$bin_tmp" && chmod 0755 "$bin_tmp"
-  cp "$release/config/haproxy.cfg" "$cfg_tmp" && chmod 0644 "$cfg_tmp"
-  mv -f "$bin_tmp" "$runtime/haproxy"
-  mv -f "$cfg_tmp" "$runtime/haproxy.cfg"
+  if ! cp "$release/bin/haproxy" "$bin_tmp" ||
+     ! chmod 0755 "$bin_tmp" ||
+     ! cp "$release/config/haproxy.cfg" "$cfg_tmp" ||
+     ! chmod 0644 "$cfg_tmp" ||
+     ! mv -f "$bin_tmp" "$runtime/haproxy" ||
+     ! mv -f "$cfg_tmp" "$runtime/haproxy.cfg"; then
+    rm -f "$bin_tmp" "$cfg_tmp"
+    die "could not project HAProxy release $release onto the stable runtime"
+  fi
+}
+
+# Whether the running master has already loaded this exact immutable release. The receipt is
+# written only after a successful start/re-exec, while configuration equality and the Linux
+# executable inode prove neither the stable projection nor the live image drifted afterwards. On a
+# platform without /proc, `live_master` has already performed its documented basename identity
+# check; the receipt plus configuration are the strongest available evidence there.
+live_release_matches() {
+  local release="$1" runtime="$2" pid="$3" recorded
+  command -v cmp >/dev/null 2>&1 || return 1
+  [[ -r "$runtime/live-release.path" ]] || return 1
+  IFS= read -r recorded <"$runtime/live-release.path" || return 1
+  [[ "$recorded" == "$release" ]] || return 1
+  cmp -s "$release/config/haproxy.cfg" "$runtime/haproxy.cfg" || return 1
+  if [[ -e "/proc/$pid/exe" ]]; then
+    [[ "$runtime/haproxy" -ef "/proc/$pid/exe" ]]
+  else
+    return 0
+  fi
+}
+
+# Commit the evidence used by `live_release_matches`. A partial write can only cause another
+# idempotent convergence: the atomic rename never lets a truncated receipt suppress one.
+record_live_release() {
+  local release="$1" runtime="$2" temporary="$2/.live-release.$$"
+  if ! printf '%s\n' "$release" >"$temporary" ||
+     ! mv -f "$temporary" "$runtime/live-release.path"; then
+    rm -f "$temporary"
+    die "could not record the live HAProxy release"
+  fi
 }
 
 # Liveness of `pid`, as three distinct answers, because "we could not tell" is not "dead":
@@ -160,12 +193,15 @@ reload_master() {
 # Start HAProxy from `release` under install root `root`.
 #
 # The start line is the application bundle's own `bin/launch` — the single place HAProxy is ever
-# started — so this provider owns *when* a master is started, never *how*. `launch` projects that
-# release onto the stable runtime paths and leaves a detached master-worker behind under the runtime
-# pid file, which is what makes the resulting master reloadable in place forever after.
+# started — so this provider owns *when* a master is started, never *how*. Projection remains here,
+# in the same `stage_runtime` path reload uses; `launch` only leaves a detached master-worker behind
+# under the runtime pid file, which makes the resulting master reloadable in place forever after.
 start_master() {
   local release="$1" root="$2" runtime="$2/runtime"
   [[ -x "$release/bin/launch" ]] || die "release $release has no executable bin/launch"
+  # Projection has one implementation, `stage_runtime`, for both the absent-master and reload
+  # paths. The release launcher only owns how to start the already-projected stable executable.
+  stage_runtime "$release" "$runtime"
   UPDATED_INSTALL_ROOT="$root" "$release/bin/launch" >/dev/null \
     || die "launching HAProxy from $release failed"
   live_master "$runtime" || die "launching HAProxy from $release left no running master behind"
@@ -175,15 +211,22 @@ start_master() {
 # only in the release they name.
 #
 # A master of ours that is already running takes the new bytes in place — that re-exec is the point
-# of this provider. Where nothing of ours is running the release is started instead: the agent
-# launches no workload process, so the first deployment on a node (and any later operation that
-# finds the master gone) has no other way into service.
+# of this provider. If that master already carries this exact immutable release, convergence is a
+# real no-op: at-least-once apply/rollback replay must not manufacture a second reload. Where
+# nothing of ours is running the release is started instead: the agent launches no workload
+# process, so the first deployment on a node (and any later operation that finds the master gone)
+# has no other way into service.
 converge_release() {
   local release="$1" root="$2" runtime="$2/runtime"
   if live_master "$runtime"; then
+    if live_release_matches "$release" "$runtime" "$master_pid"; then
+      return
+    fi
     stage_runtime "$release" "$runtime"
     reload_master "$master_pid"
+    record_live_release "$release" "$runtime"
   else
     start_master "$release" "$root"
+    record_live_release "$release" "$runtime"
   fi
 }

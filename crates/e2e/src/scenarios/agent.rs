@@ -1,4 +1,5 @@
 use super::super::*;
+use updated_contracts::reconciler::{Operation, Reason};
 
 /// The agent is disposable and the workload is not its to hold. Kill the agent outright: the
 /// hook-managed workload keeps its PID and keeps answering, the launcher relaunches the agent, and
@@ -53,7 +54,7 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
         slice
             .iter()
             .filter(|invocation| {
-                invocation.operation == "apply"
+                invocation.operation == Operation::Apply
                     && invocation.id == updated_contracts::reconciler::attempt::BOOT
             })
             .count()
@@ -98,14 +99,14 @@ pub(crate) fn agent_crash_never_disturbs_the_workload(ctx: &Ctx) -> R {
     // The boot converge and the boot gate belong to the same boot, so they carry the same
     // `--reason` — `install` on the first boot, `restart` afterwards — and never `update`. A gate
     // that invents its own reason contradicts the converge that just ran.
-    let mut converge_reason = String::new();
+    let mut converge_reason: Option<Reason> = None;
     for invocation in &fixture::operations(&fixture::root(&dir)) {
         if invocation.id != updated_contracts::reconciler::attempt::BOOT {
             continue;
         }
-        match invocation.operation.as_str() {
-            "apply" => converge_reason = invocation.reason.clone(),
-            "healthcheck" if invocation.reason != converge_reason => {
+        match invocation.operation {
+            Operation::Apply => converge_reason = Some(invocation.reason),
+            Operation::Healthcheck if Some(invocation.reason) != converge_reason => {
                 return fail(format!(
                     "the boot gate was invoked with --reason {} while its boot converge ran with \
                      --reason {converge_reason:?}",

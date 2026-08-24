@@ -15,17 +15,20 @@ jobs:
     name: updatec fleet fuzz
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with: {toolchain: 1.95.0}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with: {install_only: true}
       - name: Run the extended deterministic fleet soak
         env:
           UPDATEC_FUZZ_SEED: "20260718"
-          FUZZ_ROUNDS: ${{ inputs.rounds || '20' }}
-        run: ./scripts/kind-updatec-e2e.sh --fuzz-rounds "$FUZZ_ROUNDS"
+          UPDATEC_FUZZ_ROUNDS: ${{ inputs.rounds || '20' }}
+        run: ./scripts/ci.sh kind
       - name: Preserve diagnostics
         if: failure()
         run: |

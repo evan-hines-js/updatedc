@@ -1,0 +1,101 @@
+{{- if .Values.certManager.enabled }}
+{{- $bootstrapIssuer := .Values.certManager.bootstrapIssuer.name | default (printf "%s-selfsigned" (include "updatec.fullname" .)) }}
+{{- $caIssuer := printf "%s-ca-issuer" (include "updatec.fullname" .) }}
+{{- if and .Values.certManager.bootstrapIssuer.create (ne .Values.certManager.bootstrapIssuer.kind "Issuer") }}
+{{- fail (printf "certManager.bootstrapIssuer.kind is %q while certManager.bootstrapIssuer.create is true, but the object this chart creates is always a namespaced Issuer. The reference would name something nothing renders, cert-manager would never issue the fleet CA, and the gateway would wait on a Secret that never appears. `kind` exists for rooting the fleet CA in an issuer you already have: pair it with certManager.bootstrapIssuer.create=false." .Values.certManager.bootstrapIssuer.kind) }}
+{{- end }}
+{{- if .Values.certManager.bootstrapIssuer.create }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $bootstrapIssuer }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+{{- end }}
+{{- if .Values.certManager.fleetCA.create }}
+# The fleet root. Every identity in the fleet — the gateway's server certificate and every node's
+# client certificate — chains to this one CA, so mutual TLS against it IS the enrollment identity
+# and there is no shared enrollment secret anywhere.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.gateway.issuingCaSecretName }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: {{ .Values.certManager.fleetCA.commonName }}
+  duration: {{ .Values.certManager.fleetCA.duration }}
+  secretName: {{ .Values.gateway.issuingCaSecretName }}
+  privateKey: {{- toYaml .Values.certManager.fleetCA.privateKey | nindent 4 }}
+  issuerRef:
+    name: {{ $bootstrapIssuer }}
+    kind: {{ .Values.certManager.bootstrapIssuer.kind }}
+---
+{{- end }}
+# The issuer every leaf below is minted from. It needs nothing but the fleet CA Secret, so it is
+# rendered whenever cert-manager resources are enabled — NOT only when the chart also creates that
+# CA. `fleetCA.create=false` means "I supply the fleet-ca Secret myself", and the gateway and agent
+# Certificates still name this Issuer; rendering it with the CA left them pointing at an Issuer
+# nothing in the release created, which cert-manager reports as IssuerNotFound while the gateway
+# waits forever on an unmounted Secret.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $caIssuer }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ .Values.gateway.issuingCaSecretName }}
+---
+{{- if .Values.certManager.gatewayCertificate.create }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.gateway.tlsSecretName }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.gateway.tlsSecretName }}
+  duration: {{ .Values.certManager.gatewayCertificate.duration }}
+  commonName: {{ include "updatec.gatewayName" . }}
+  # The in-cluster Service name is always present; `certManager.gatewayCertificate.dnsNames` adds
+  # the external hostname agents actually resolve (the host in `publicUrl`).
+  dnsNames:
+    - {{ include "updatec.gatewayName" . }}
+    - {{ printf "%s.%s.svc" (include "updatec.gatewayName" .) .Release.Namespace }}
+    {{- with .Values.certManager.gatewayCertificate.dnsNames }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  usages: [server auth]
+  issuerRef:
+    name: {{ $caIssuer }}
+    kind: Issuer
+---
+{{- end }}
+{{- if .Values.certManager.agentCertificate.create }}
+{{- if ne .Values.certManager.agentCertificate.commonName .Values.gateway.enrollmentClientCN }}
+{{- fail (printf "certManager.agentCertificate.commonName (%s) must equal gateway.enrollmentClientCN (%s): the gateway admits a bootstrap client only by that CN, so a mismatch rejects every enrollment with a TLS-level error that names neither value." .Values.certManager.agentCertificate.commonName .Values.gateway.enrollmentClientCN) }}
+{{- end }}
+# The shared bootstrap identity a node presents to /enroll. Per-node certificates from your own PKI
+# are the better production shape — one shared key means any holder can claim any node name. See
+# docs/agent-install.md for the reserved-identity flow that closes that gap.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.certManager.agentCertificate.secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.certManager.agentCertificate.secretName }}
+  commonName: {{ .Values.certManager.agentCertificate.commonName }}
+  usages: [client auth]
+  issuerRef:
+    name: {{ $caIssuer }}
+    kind: Issuer
+{{- end }}
+{{- end }}

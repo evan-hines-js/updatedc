@@ -1,20 +1,105 @@
-//! Best-effort rollout telemetry: the node writes its running state to the report
-//! location signed into its current assignment, so the control plane — which can never
-//! reach the node — can read rollout progress out of shared storage.
-//!
-//! This is driven entirely by the *current* assignment each cycle: a new assignment
-//! that adds `report_url` starts the heartbeat, one that drops it stops the heartbeat,
-//! with no persistent telemetry state to reconcile. Every failure path here is a
-//! logged no-op — a node that cannot report keeps updating and serving exactly as if
-//! telemetry were never configured.
+//! Best-effort rollout telemetry. A remotely enrolled node requests one exact report-object
+//! capability from its routing gateway and writes its signed state directly to S3. Local/offline
+//! routing has no capability endpoint and therefore emits no heartbeat.
 
 use std::time::{Duration, Instant};
 
 use updated::config::Routing;
-use updated_contracts::telemetry::{
-    report_url as telemetry_report_url, sign_report, NodeReport, OutputManifest,
-    MAX_OUTPUT_MANIFEST_BYTES,
-};
+use updated_contracts::dataflow::{FileSnapshot, OutputPublication, MAX_DATAFLOW_BODY_BYTES};
+use updated_contracts::telemetry::{sign_report, NodeReport};
+
+async fn upload_via_capability(
+    control_client: &reqwest::Client,
+    object_client: &reqwest::Client,
+    endpoint: &str,
+    body: Vec<u8>,
+    what: &str,
+) -> Result<(), CapabilityWriteError> {
+    let response = control_client
+        .get(endpoint)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|error| {
+            CapabilityWriteError::Failed(
+                updated::http::redacted_reqwest_error(
+                    &format!("requesting {what} capability"),
+                    &error,
+                )
+                .to_string(),
+            )
+        })?;
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err(CapabilityWriteError::Refused);
+    }
+    if !response.status().is_success() {
+        return Err(CapabilityWriteError::Failed(format!(
+            "requesting {what} capability returned HTTP {}",
+            response.status()
+        )));
+    }
+    let bytes = updated::http::read_bounded(
+        response,
+        "object write capability",
+        updated_contracts::dataflow::MAX_CAPABILITY_BODY_BYTES,
+    )
+    .await
+    .map_err(|error| CapabilityWriteError::Failed(error.to_string()))?;
+    let capability: updated_contracts::dataflow::UploadCapability = serde_json::from_slice(&bytes)
+        .map_err(|error| {
+            CapabilityWriteError::Failed(format!("decoding {what} capability: {error}"))
+        })?;
+    capability
+        .validate()
+        .map_err(CapabilityWriteError::Failed)?;
+    let mut form = reqwest::multipart::Form::new();
+    for (name, value) in capability.fields {
+        form = form.text(name, value);
+    }
+    // S3 requires the file field last. `Part::bytes` also lets reqwest calculate the multipart
+    // length up front; S3 evaluates the signed `content-length-range` against this upload.
+    form = form.part("file", reqwest::multipart::Part::bytes(body));
+    let response = object_client
+        .post(&capability.url)
+        .timeout(Duration::from_secs(5))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            CapabilityWriteError::Failed(
+                updated::http::redacted_reqwest_error(
+                    &format!("writing {what} to object storage"),
+                    &error,
+                )
+                .to_string(),
+            )
+        })?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(CapabilityWriteError::Failed(format!(
+            "writing {what} to object storage returned HTTP {}",
+            response.status()
+        )))
+    }
+}
+
+#[derive(Debug)]
+enum CapabilityWriteError {
+    /// The mTLS control plane rejected the live node identity. A 403 from S3 itself is not this
+    /// verdict: signed-URL expiry and storage policy failures remain ordinary transient errors.
+    Refused,
+    Failed(String),
+}
+
+impl std::fmt::Display for CapabilityWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused => formatter.write_str("the capability endpoint refused this identity"),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
 
 /// The node's own identity, derived from the exact routing target it resolves
 /// (`<prefix>/agents/<node>.json`), read through the one parser of that layout. Returns `None` if
@@ -32,12 +117,14 @@ pub struct RunningState<'a> {
     pub deployment: &'a str,
     /// Digest of the exact signed assignment document behind that deployment name. This is what
     /// lets the control plane stage a change that keeps the name — a new archive, argument,
-    /// secret, or resolved input — one `maxUnavailable` batch at a time.
+    /// input file or resolved dependency — one `maxUnavailable` batch at a time.
     pub assignment_sha256: &'a str,
     /// The version actually answering, empty before the first install completes.
     pub version: &'a str,
     /// The SHA-256 of the archive that version was installed from, empty alongside `version`.
     pub archive_sha256: &'a str,
+    /// The signed provider-set document whose reconciler is actually installed.
+    pub provider_set_sha256: &'a str,
     /// Settled: acted on the assignment and healthy. Never true mid-rollout.
     pub healthy: bool,
     /// An update transaction is in flight: this node committed an update whose confirmation window
@@ -45,74 +132,71 @@ pub struct RunningState<'a> {
     /// transaction genuinely ran, told apart from an ordinary readiness failure — and only this
     /// writer can tell them apart, so it is reported rather than guessed at by a reader.
     pub updating: bool,
-    /// This node has DURABLY REJECTED the release its assignment names: the assignment's own
-    /// application archive is in the node's rejection record, which is written by content hash when
-    /// a candidate fails and never expires. Only this node knows it — the record covers a candidate
-    /// that failed its ACTIVATION as well as one that failed its confirmation window, and the first
-    /// runs no update transaction at all, so no observer of the report stream can infer it.
+    /// This node has DURABLY REJECTED the release its assignment names: either its application
+    /// archive or provider-set document is in the node's content-addressed rejection record. Only
+    /// this node knows it — the record covers a candidate that failed its ACTIVATION as well as one
+    /// that failed its confirmation window, and the first runs no completed update transaction, so
+    /// no observer of the report stream can infer it.
     pub rejected: bool,
     /// Latest successful opaque node-state fingerprint, when one is currently publishable.
     pub fingerprint: Option<&'a updated_contracts::telemetry::Fingerprint>,
-    /// Where installed archives live, and the manifest digest identifying the running one — the
-    /// two inputs [`load_outputs`] needs. The outputs themselves are read here, not by the caller,
-    /// so the rule that only a settled report carries them is enforced in exactly one place.
-    pub install_root: &'a std::path::Path,
+    /// The node's layout and the manifest digest identifying the running archive — the two inputs
+    /// [`load_outputs`] needs to find this release's output snapshot. The outputs themselves are
+    /// read here, not by the caller, so the rule that only a settled report carries them is
+    /// enforced in exactly one place.
+    pub paths: &'a updated::config::Paths,
     pub manifest_sha256: &'a str,
 }
 
-/// Read and validate the running archive's bounded output manifest. A missing file means the
+/// Read and validate the running archive's bounded output snapshot. A missing file means the
 /// reconciler emitted no outputs; malformed or oversized data is omitted rather than weakening
 /// the health report itself.
-pub fn load_outputs(
-    install_root: &std::path::Path,
-    archive_sha256: &str,
-) -> Option<OutputManifest> {
-    if archive_sha256.is_empty() {
+pub fn load_outputs(paths: &updated::config::Paths, manifest_sha256: &str) -> Option<FileSnapshot> {
+    if manifest_sha256.is_empty() {
         return None;
     }
-    let path = crate::update::reconciler_output_path(install_root, archive_sha256);
-    let metadata = std::fs::metadata(&path).ok()?;
+    let path = paths.reconciler_output_snapshot(manifest_sha256);
     // The size bound is the *envelope* bound worked backwards (see
-    // `MAX_OUTPUT_MANIFEST_BYTES`): a manifest larger than this signs into a report no hop on the
+    // `MAX_OUTPUT_SNAPSHOT_BYTES`): a snapshot larger than this signs into a report no hop on the
     // publish path would accept, and since outputs ride only on healthy reports, attaching it
     // would silently drain a healthy node forever. Omitting the outputs keeps the node published.
-    if !metadata.is_file() || metadata.len() > MAX_OUTPUT_MANIFEST_BYTES as u64 {
-        crate::warn("reconciler output manifest is not a bounded regular file; omitting outputs");
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    let manifest: OutputManifest = match serde_json::from_slice(&bytes) {
-        Ok(manifest) => manifest,
+    let bytes = match foundation::file::read_bounded_regular(
+        &path,
+        MAX_DATAFLOW_BODY_BYTES,
+        foundation::file::FinalSymlink::Refuse,
+    ) {
+        Ok(bytes) => bytes,
         Err(error) => {
             crate::warn(&format!(
-                "decoding reconciler output manifest failed ({error}); omitting outputs"
+                "reconciler output snapshot is not a bounded regular file ({error}); omitting outputs"
             ));
             return None;
         }
     };
-    if let Err(error) = manifest.validate() {
+    let snapshot: FileSnapshot = match serde_json::from_slice(&bytes) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            crate::warn(&format!(
+                "decoding reconciler output snapshot failed ({error}); omitting outputs"
+            ));
+            return None;
+        }
+    };
+    if let Err(error) = snapshot.validate() {
         crate::warn(&format!(
-            "invalid reconciler output manifest ({error}); omitting outputs"
+            "invalid reconciler output snapshot ({error}); omitting outputs"
         ));
         return None;
     }
-    Some(manifest)
+    Some(snapshot)
 }
 
 /// The report endpoint's standing refusal of this node, and when reporting may next be attempted.
 ///
 /// A `403` there is a verdict about identity, not a transient failure: the gateway admits a report
-/// only from a node whose `UpdateAgent` is an enrolled member of the repository presenting the
-/// public key that name is pinned to. It fails OPEN on every indefinite condition (an apiserver
-/// blip, a 5xx, throttling), so a refusal means the node genuinely may not write its own report and
-/// will keep not being able to until its identity itself changes.
-///
-/// An offline-provisioned `kind: manual` node is the deliberate case: it never enrolls, so it never
-/// has a pinned key, and the control plane classifies it as blind by design (see
-/// `updatec::rollout::NodeEvidence::Blind`) — it is staged on what was published to it rather than
-/// on evidence. Its reports are refused for the life of the machine. Reporting rides the update
-/// cadence, so re-PUTting a refused report every cycle is one futile request and one warning per
-/// cycle — once a second on a demo cadence — forever.
+/// only from a provisioned node whose live `UpdateAgent` pins the public key in the presented leaf.
+/// Transient control-plane failures return 5xx; a `403` is reserved for a missing, revoked, or
+/// malformed live identity and will keep failing until that identity changes.
 ///
 /// So a refusal drops reporting to the slowest cadence the agent already has, the agent-check
 /// interval, and warns once. Nothing is given up: a report that would be refused carries no
@@ -123,6 +207,79 @@ pub struct Refusal {
     /// When a report may next be attempted. `None` while the endpoint is accepting — which is also
     /// what re-arms the single warning, so a later refusal is reported again rather than silently.
     retry_after: Option<Instant>,
+}
+
+#[derive(Default)]
+pub struct OutputPublisher {
+    current: Option<CachedOutput>,
+}
+
+struct CachedOutput {
+    publication: OutputPublication,
+}
+
+impl OutputPublisher {
+    async fn publish(
+        &mut self,
+        control_client: &reqwest::Client,
+        object_client: &reqwest::Client,
+        control_base: &str,
+        node: &str,
+        state: &RunningState<'_>,
+    ) -> Option<String> {
+        if !state.healthy {
+            return None;
+        }
+        let snapshot = load_outputs(state.paths, state.manifest_sha256)?;
+        let same = self.current.as_ref().is_some_and(|current| {
+            current.publication.node == node
+                && current.publication.deployment == state.deployment
+                && current.publication.assignment_sha256 == state.assignment_sha256
+                && current.publication.archive_sha256 == state.archive_sha256
+                && current.publication.snapshot == snapshot
+        });
+        if !same {
+            self.current = Some(CachedOutput {
+                publication: OutputPublication {
+                    schema: OutputPublication::SCHEMA,
+                    node: node.to_string(),
+                    deployment: state.deployment.to_string(),
+                    assignment_sha256: state.assignment_sha256.to_string(),
+                    archive_sha256: state.archive_sha256.to_string(),
+                    snapshot,
+                },
+            });
+        }
+        let current = self
+            .current
+            .as_ref()
+            .expect("created above or already present");
+        // Re-upload before every report. A previous success proves nothing about the current object
+        // store: the repository can move buckets without changing this assignment, and an object
+        // can be deleted independently. The PUT is idempotent; skipping it would report a digest
+        // whose bytes may no longer exist, wedging every dependent until the output changed.
+        let body = match current.publication.to_bounded_body() {
+            Ok(body) => body,
+            Err(error) => {
+                crate::warn(&format!(
+                    "preparing node outputs failed ({error}); omitting them"
+                ));
+                return None;
+            }
+        };
+        let target = updated_contracts::dataflow::outputs_url(control_base);
+        let output_sha256 = updated_contracts::digest::sha256_bytes(&body);
+        if let Err(error) =
+            upload_via_capability(control_client, object_client, &target, body, "node outputs")
+                .await
+        {
+            crate::warn(&format!(
+                "publishing node outputs through {target} failed ({error}); omitting them from telemetry"
+            ));
+            return None;
+        }
+        Some(output_sha256)
+    }
 }
 
 impl Refusal {
@@ -145,21 +302,27 @@ impl Refusal {
     }
 }
 
-/// Write the node's running state to its report location. Strictly best-effort: any
-/// error (no report URL, no derivable identity, network failure, non-success status)
+/// Write the node's running state through its routing gateway. Strictly best-effort: any
+/// error (local routing, no derivable identity, network failure, non-success status)
 /// is logged and swallowed so reporting can never disrupt the update loop.
 ///
 /// `backoff` is how long a refused node stays quiet before trying again (see [`Refusal`]).
+pub struct ReportChannel<'a> {
+    pub control_client: &'a reqwest::Client,
+    pub object_client: &'a reqwest::Client,
+    pub control_base: Option<&'a str>,
+    pub node: Option<&'a str>,
+    pub signing_key: Option<&'a [u8]>,
+    pub refusal_backoff: Duration,
+}
+
 pub async fn report_running_state(
-    client: &reqwest::Client,
-    report_url: Option<&str>,
-    node: Option<&str>,
+    channel: &ReportChannel<'_>,
     state: &RunningState<'_>,
-    signing_key: Option<&[u8]>,
     refusal: &mut Refusal,
-    backoff: Duration,
+    outputs: &mut OutputPublisher,
 ) {
-    let (Some(report_url), Some(node)) = (report_url, node) else {
+    let (Some(control_base), Some(node)) = (channel.control_base, channel.node) else {
         return;
     };
     // Checked before the report is even built: a refused node pays no signing, no output read, and
@@ -172,9 +335,27 @@ pub async fn report_running_state(
     // OVERWRITE this node's last good report, so a consumer that had a fresh healthy record would be
     // left with an unverifiable one and drain the node. Staying quiet leaves the previous report to
     // age out honestly on its own freshness bound.
-    let Some(key) = signing_key else {
+    let Some(key) = channel.signing_key else {
         crate::warn("no telemetry signing key available; skipping the rollout heartbeat");
         return;
+    };
+    let reconciliation = match updated::reconciler::read_last_reconciliation(
+        &state.paths.last_reconciliation,
+    ) {
+        Ok(Some(record)) => Some(record),
+        Ok(None) if state.version.is_empty() => None,
+        Ok(None) => {
+            crate::warn(
+                "the installed release has no reconciliation evidence; skipping rollout telemetry",
+            );
+            return;
+        }
+        Err(error) => {
+            crate::warn(&format!(
+                "reading the last reconciliation record failed ({error}); skipping rollout telemetry"
+            ));
+            return;
+        }
     };
     let mut report = NodeReport::new(
         node,
@@ -182,22 +363,34 @@ pub async fn report_running_state(
         state.assignment_sha256,
         state.version,
         state.archive_sha256,
+        state.provider_set_sha256,
         state.healthy,
     );
     report.updating = state.updating;
     report.rejected = state.rejected;
-    report.fingerprint = state.fingerprint.cloned();
-    // Outputs describe what the running archive settled on, so an unsettled node has none to
-    // publish — and no reason to pay the read. One gate, at the one place that attaches them.
-    report.outputs = state
-        .healthy
-        .then(|| load_outputs(state.install_root, state.manifest_sha256))
-        .flatten();
+    report.fingerprint = if state.healthy {
+        state.fingerprint.cloned()
+    } else {
+        None
+    };
+    report.reconciliation = reconciliation;
+    // Store the private object first, then bind its exact bytes into the signed report. A failed
+    // output write cannot make an old object look current, and storage cannot substitute new bytes
+    // under the same node key.
+    report.output_sha256 = outputs
+        .publish(
+            channel.control_client,
+            channel.object_client,
+            control_base,
+            node,
+            state,
+        )
+        .await;
     // Signed with the node's per-node key so the throttle and the health proxy can verify authenticity
     // end-to-end, rather than trusting the write hop.
-    let body = match sign_report(&report, key).and_then(|envelope| {
-        serde_json::to_vec(&envelope).map_err(|e| format!("encoding rollout telemetry: {e}"))
-    }) {
+    // Encoded under the ceiling every reader decodes with, so an over-large report fails here,
+    // on the one machine that can do anything about it, rather than being dropped by the fleet.
+    let body = match sign_report(&report, key).and_then(|envelope| envelope.to_bounded_json()) {
         Ok(body) => body,
         Err(error) => {
             crate::warn(&format!(
@@ -206,33 +399,30 @@ pub async fn report_running_state(
             return;
         }
     };
-    let target = telemetry_report_url(report_url, node);
-    let result = client
-        .put(&target)
-        .timeout(Duration::from_secs(5))
-        .header("content-type", "application/json")
-        .body(body)
-        .send()
-        .await;
+    let target = updated_contracts::dataflow::report_url(control_base);
+    let result = upload_via_capability(
+        channel.control_client,
+        channel.object_client,
+        &target,
+        body,
+        "node report",
+    )
+    .await;
     match result {
-        Ok(response) if response.status().is_success() => refusal.accepted(),
-        Ok(response) if response.status() == reqwest::StatusCode::FORBIDDEN => {
-            if refusal.refused(Instant::now(), backoff) {
+        Ok(()) => refusal.accepted(),
+        Err(CapabilityWriteError::Refused) => {
+            if refusal.refused(Instant::now(), channel.refusal_backoff) {
                 crate::warn(&format!(
                     "rollout telemetry to {target} was refused (403): this node is not an enrolled \
                      member of its repository presenting its pinned key, so the control plane \
                      cannot verify anything it reports and stages it blind. Reporting backs off to \
                      one attempt every {}s and recovers on its own if the identity is completed.",
-                    backoff.as_secs()
+                    channel.refusal_backoff.as_secs()
                 ));
             }
         }
-        Ok(response) => crate::warn(&format!(
-            "rollout telemetry to {target} returned {}; continuing",
-            response.status()
-        )),
         Err(error) => crate::warn(&format!(
-            "rollout telemetry to {target} failed ({error}); continuing"
+            "publishing rollout telemetry through {target} failed ({error}); continuing"
         )),
     }
 }
@@ -244,6 +434,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn routing(assignment: &str) -> Routing {
         Routing {
@@ -266,24 +457,25 @@ mod tests {
     #[test]
     fn output_files_are_release_partitioned_bounded_and_validated() {
         let root = tempfile::tempdir().unwrap();
+        // The real layout, resolved the one way production resolves it: a test that spelled the
+        // outputs directory itself would keep passing after the layout moved under the hook.
+        let paths = updated::config::Paths::resolve(root.path(), root.path());
         let identity = "a".repeat(64);
-        let path = crate::update::reconciler_output_path(root.path(), &identity);
+        let path = paths.reconciler_output_snapshot(&identity);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let manifest = OutputManifest {
-            schema: OutputManifest::SCHEMA,
-            values: BTreeMap::from([(
+        let snapshot = FileSnapshot {
+            files: BTreeMap::from([(
                 "endpoint".into(),
-                updated_contracts::telemetry::OutputValue::String {
-                    value: "https://vault-0:8200".into(),
-                },
+                updated_contracts::dataflow::FileValue::from_bytes(b"https://vault-0:8200")
+                    .unwrap(),
             )]),
         };
-        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert_eq!(load_outputs(root.path(), &identity), Some(manifest));
-        assert_eq!(load_outputs(root.path(), &"b".repeat(64)), None);
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(load_outputs(&paths, &identity), Some(snapshot));
+        assert_eq!(load_outputs(&paths, &"b".repeat(64)), None);
 
-        std::fs::write(path, vec![b'x'; MAX_OUTPUT_MANIFEST_BYTES + 1]).unwrap();
-        assert_eq!(load_outputs(root.path(), &identity), None);
+        std::fs::write(path, vec![b'x'; MAX_DATAFLOW_BODY_BYTES + 1]).unwrap();
+        assert_eq!(load_outputs(&paths, &identity), None);
     }
 
     #[test]
@@ -328,37 +520,227 @@ mod tests {
         (base, requests)
     }
 
+    /// A real HTTPS object endpoint plus a plain loopback capability endpoint. The control client
+    /// sees only the capability document; the object client spends it on a separate TLS
+    /// connection without any client identity.
+    async fn accepting_report_endpoints(
+    ) -> (String, reqwest::Client, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType,
+        };
+        use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::default();
+        server_params
+            .subject_alt_names
+            .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server = server_params.signed_by(&server_key, &ca, &ca_key).unwrap();
+        let server_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
+            updated::tls::crypto_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![server.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let object_url = format!("https://{}/report", listener.local_addr().unwrap());
+        let object_writes = Arc::new(AtomicUsize::new(0));
+        let counted_writes = Arc::clone(&object_writes);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let counted_writes = Arc::clone(&counted_writes);
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") && headers.len() < 64 * 1024 {
+                        let mut byte = [0u8; 1];
+                        if stream.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        headers.push(byte[0]);
+                    }
+                    let text = String::from_utf8_lossy(&headers);
+                    if !text.starts_with("POST /report ") {
+                        return;
+                    }
+                    let length = text
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; length];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    counted_writes.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let capability = serde_json::to_vec(&updated_contracts::dataflow::UploadCapability {
+            schema: updated_contracts::dataflow::UploadCapability::SCHEMA,
+            url: object_url,
+            fields: updated_contracts::dataflow::testing::presigned_post_fields(
+                "routing/private/reports/node-1.json",
+            ),
+        })
+        .unwrap();
+        let control_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_base = format!("http://{}", control_listener.local_addr().unwrap());
+        let control_requests = Arc::new(AtomicUsize::new(0));
+        let counted_requests = Arc::clone(&control_requests);
+        std::thread::spawn(move || {
+            for stream in control_listener.incoming() {
+                let Ok(stream) = stream else { return };
+                counted_requests.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    capability.len()
+                );
+                let stream = reader.get_mut();
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&capability);
+            }
+        });
+        let object_client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_der(ca.der()).unwrap())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        (control_base, object_client, control_requests, object_writes)
+    }
+
     /// One report attempt against `base`, with a fresh signing key so the envelope is real.
     async fn report(base: &str, refusal: &mut Refusal, backoff: Duration) {
+        report_with_object_client(base, &reqwest::Client::new(), refusal, backoff).await;
+    }
+
+    async fn report_with_object_client(
+        base: &str,
+        object_client: &reqwest::Client,
+        refusal: &mut Refusal,
+        backoff: Duration,
+    ) {
         let key =
             updated::csr::key_pem_to_pkcs8_der(&updated::csr::generate_key().unwrap()).unwrap();
+        let control_client = reqwest::Client::new();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = updated::config::Paths::resolve(directory.path(), directory.path());
+        let digest = "a".repeat(64);
+        write_reconciliation(&paths, "1.0.0", &digest, &digest, &digest);
         report_running_state(
-            &reqwest::Client::new(),
-            Some(base),
-            Some("node-1"),
+            &ReportChannel {
+                control_client: &control_client,
+                object_client,
+                control_base: Some(base),
+                node: Some("node-1"),
+                signing_key: Some(&key),
+                refusal_backoff: backoff,
+            },
             &RunningState {
                 deployment: "deployment",
                 assignment_sha256: "assignment",
                 version: "1.0.0",
-                archive_sha256: "archive",
+                archive_sha256: &digest,
+                provider_set_sha256: &digest,
                 healthy: false,
                 updating: false,
                 rejected: false,
                 fingerprint: None,
-                install_root: std::path::Path::new("/nonexistent"),
+                paths: &paths,
                 manifest_sha256: "",
             },
-            Some(&key),
             refusal,
-            backoff,
+            &mut OutputPublisher::default(),
         )
         .await;
     }
 
+    fn write_reconciliation(
+        paths: &updated::config::Paths,
+        version: &str,
+        archive_sha256: &str,
+        provider_set_sha256: &str,
+        manifest_sha256: &str,
+    ) {
+        use updated_contracts::reconciler::{
+            HostAction, LastReconciliation, Operation, Reason, ReconciledRelease,
+            ReconcilerIdentity, ResultDocument, ResultStatus,
+        };
+        let release = ReconciledRelease {
+            version: version.into(),
+            manifest_sha256: manifest_sha256.into(),
+            archive_sha256: archive_sha256.into(),
+        };
+        let record = LastReconciliation {
+            schema: LastReconciliation::SCHEMA,
+            operation: Operation::Apply,
+            reason: Reason::Restart,
+            attempt_id: updated_contracts::reconciler::attempt::CONVERGE.into(),
+            candidate: release.clone(),
+            predecessor: release,
+            reconciler: ReconcilerIdentity {
+                provider_set_sha256: provider_set_sha256.into(),
+                product: "system".into(),
+                release: ReconciledRelease {
+                    version: "1.0.0".into(),
+                    manifest_sha256: archive_sha256.into(),
+                    archive_sha256: archive_sha256.into(),
+                },
+            },
+            result: ResultDocument {
+                schema: ResultDocument::SCHEMA,
+                status: ResultStatus::Succeeded,
+                changed: false,
+                host_action: HostAction::None,
+                retry_after_seconds: None,
+                message: None,
+            },
+            completed_at_ms: 1,
+        };
+        std::fs::create_dir_all(paths.last_reconciliation.parent().unwrap()).unwrap();
+        updated::reconciler::write_last_reconciliation(&paths.last_reconciliation, &record)
+            .unwrap();
+    }
+
     /// A 403 is a standing verdict on this node's identity: the writer must stop hammering it every
-    /// cycle. A `kind: manual` node — deliberately blind, never enrolled, never pinned — is refused
-    /// for the life of the machine, which on the demo cadence was one futile request and one warning
-    /// per second, forever.
+    /// cycle. This protects a deleted, revoked, or malformed identity from producing one futile
+    /// request and warning per second forever on a demo cadence.
     #[tokio::test]
     async fn a_refused_report_backs_off_instead_of_reporting_every_cycle() {
         let (base, requests) = report_endpoint("403 Forbidden");
@@ -389,15 +771,105 @@ mod tests {
     /// refusal is still reported.
     #[tokio::test]
     async fn an_accepted_report_leaves_the_cadence_alone() {
-        let (base, requests) = report_endpoint("200 OK");
+        let (base, object_client, requests, object_writes) = accepting_report_endpoints().await;
         let mut refusal = Refusal {
             retry_after: Some(std::time::Instant::now()),
         };
         for _ in 0..3 {
-            report(&base, &mut refusal, Duration::from_secs(3600)).await;
+            report_with_object_client(
+                &base,
+                &object_client,
+                &mut refusal,
+                Duration::from_secs(3600),
+            )
+            .await;
         }
         assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(object_writes.load(Ordering::SeqCst), 3);
         assert!(refusal.retry_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_outputs_are_reput_before_every_report() {
+        let (base, object_client, control_requests, object_writes) =
+            accepting_report_endpoints().await;
+        let directory = tempfile::tempdir().unwrap();
+        let paths = updated::config::Paths::resolve(directory.path(), directory.path());
+        let manifest = "c".repeat(64);
+        let output_path = paths.reconciler_output_snapshot(&manifest);
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        let snapshot = FileSnapshot {
+            files: BTreeMap::from([(
+                "endpoint".into(),
+                updated_contracts::dataflow::FileValue::from_bytes(b"db.internal:5432").unwrap(),
+            )]),
+        };
+        std::fs::write(output_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let key =
+            updated::csr::key_pem_to_pkcs8_der(&updated::csr::generate_key().unwrap()).unwrap();
+        let control_client = reqwest::Client::new();
+        let channel = ReportChannel {
+            control_client: &control_client,
+            object_client: &object_client,
+            control_base: Some(&base),
+            node: Some("node-1"),
+            signing_key: Some(&key),
+            refusal_backoff: Duration::from_secs(60),
+        };
+        let assignment_sha256 = "a".repeat(64);
+        let archive_sha256 = "b".repeat(64);
+        write_reconciliation(&paths, "1.0.0", &archive_sha256, &archive_sha256, &manifest);
+        let state = RunningState {
+            deployment: "database",
+            assignment_sha256: &assignment_sha256,
+            version: "1.0.0",
+            archive_sha256: &archive_sha256,
+            provider_set_sha256: &archive_sha256,
+            healthy: true,
+            updating: false,
+            rejected: false,
+            fingerprint: None,
+            paths: &paths,
+            manifest_sha256: &manifest,
+        };
+        let mut refusal = Refusal::default();
+        let mut outputs = OutputPublisher::default();
+
+        report_running_state(&channel, &state, &mut refusal, &mut outputs).await;
+        let output_sha256 = updated_contracts::digest::sha256_bytes(
+            &outputs
+                .current
+                .as_ref()
+                .unwrap()
+                .publication
+                .to_bounded_body()
+                .unwrap(),
+        );
+        report_running_state(&channel, &state, &mut refusal, &mut outputs).await;
+
+        assert_eq!(
+            updated_contracts::digest::sha256_bytes(
+                &outputs
+                    .current
+                    .as_ref()
+                    .unwrap()
+                    .publication
+                    .to_bounded_body()
+                    .unwrap()
+            ),
+            output_sha256,
+            "unchanged bytes keep one content identity"
+        );
+        assert_eq!(
+            control_requests.load(Ordering::SeqCst),
+            4,
+            "each cycle requests output and report capabilities"
+        );
+        assert_eq!(
+            object_writes.load(Ordering::SeqCst),
+            4,
+            "each cycle repairs the output object before writing its report"
+        );
     }
 
     /// Anything other than a refusal keeps the ordinary cadence: a 5xx or an unreachable gateway is

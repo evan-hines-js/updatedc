@@ -22,6 +22,9 @@ chrono.workspace = true
 futures.workspace = true
 foundation = { path = "../foundation" }
 hex.workspace = true
+# Draupnir's admission decision signature travels base64 in a header; the pinned key is hex, like
+# every other pinned key here.
+base64.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 object_store.workspace = true
@@ -55,6 +58,14 @@ serde_yaml.workspace = true
 http-body-util = "0.1"
 # Drive Axum routers directly in gateway tests via `ServiceExt::oneshot`, no socket needed.
 tower = { version = "0.5", features = ["util"] }
+# Test-only: compile the CEL regexes out of the rendered write-boundary policy and check them
+# against the names this controller actually generates. Nothing shipped depends on a regex engine
+# (see `foundation::digest`); asserting the policy's regex TEXT instead would be brittle, because
+# `0[0-9]|[1-5][0-9]` and `[0-5][0-9]` are the same rule spelled two ways.
+regex = "1"
+# The gateway's connection deadline is half an hour; `test-util`'s paused clock exercises it in
+# milliseconds, the same way the directory repository fixture tests its own.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 fips = ["updated/fips"]

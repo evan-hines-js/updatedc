@@ -94,13 +94,21 @@ pub(crate) const HAPROXY_ADMIN_PORT: u16 = 9999;
 /// The ClusterIP Service that fans traffic across the HAProxy pods — the fleet's front door. The
 /// synthetic load probe drives it across the HAProxy upgrade to prove zero dropped requests.
 pub(crate) const HAPROXY_FRONT_SERVICE: &str = "haproxy-front";
-/// Availability the HAProxy front is held to across its in-place upgrade, as a percentage. A
-/// correct SIGUSR2 re-exec drops no connection, so the probe stays pinned here; a botched upgrade
-/// that dropped the front would tank it far below.
-pub(crate) const HAPROXY_SLA_TARGET: f64 = 99.5;
 /// The two release versions the HAProxy tier demonstrates an in-place upgrade between.
 pub(crate) const HAPROXY_V1: &str = "1.0.0";
 pub(crate) const HAPROXY_V2: &str = "2.0.0";
+
+/// The one spelling for a rollout deployment identity in this harness. It is carried through
+/// signed assignments and telemetry, so construct it through the production contract rather than
+/// letting scenarios invent separators the agent will reject.
+pub(crate) fn versioned_deployment_name(group: &str, version: &str) -> String {
+    let name = format!("{group}-{version}");
+    assert!(
+        updated_contracts::identity::is_segment(&name),
+        "E2E deployment identity {name:?} violates the shared identity grammar"
+    );
+    name
+}
 /// Annotation on the `haproxy` UpdateGroup carrying the pre-published 2.0.0 target the upgrade
 /// patches in — so the bytes are signed and in the store up front and the upgrade is a pure group
 /// patch, never a live publish.
@@ -192,29 +200,21 @@ pub(crate) fn alert_url() -> String {
     format!("http://{ALERT_SINK}:{ALERT_PORT}/alerts")
 }
 
-/// Where cohort agents write their rollout telemetry — the in-cluster routing gateway. The
-/// gateway admits only fleet-CA client certs, so this is https and every node PUTs under its
-/// own mTLS identity (the same one it fetches its repository with); the gateway persists each
-/// report to the object store the operator reads. Signed into every group's deployment so the
-/// control plane can gate rollouts on real node health.
-pub(crate) const REPORT_URL: &str = "https://updatec-gateway";
-
-/// Where readers (the healthproxy) fetch persisted telemetry — the MinIO object store the
-/// gateway writes reports into, read directly as the CDN. This is the read side of the split:
-/// nodes *write* over mTLS to the gateway ([`REPORT_URL`]); readers *read* the resulting
-/// `<base>/telemetry/<node>.json` from the store. Anonymous read is enabled on the bucket.
+/// Where readers (the healthproxy) fetch the controller's fleet projection. Nodes obtain an exact
+/// write capability from their routing gateway and POST raw signed reports directly to MinIO; the
+/// controller reads those objects and publishes the stable `<base>/telemetry/fleet.json` index and
+/// bounded shard keys. Anonymous read is enabled on the bucket in this disposable test cluster.
 ///
-/// The path is `<bucket>/<repository s3.prefix>`: the gateway persists each report under the
-/// repository's own object-store prefix (`<prefix>/telemetry/<node>.json`), the same prefix the
-/// controller reads them back through. Pointing this at the bucket root instead would 404 every
-/// report and silently drain the whole fleet, so it must track the repository's spec.
-pub(crate) const HEALTH_CDN: &str = "http://minio:9000/updates/routing";
+/// The path is `<bucket>/routing/<namespace>/<repository>`: the gateway flushes the index under the
+/// controller-derived managed-repository prefix. Pointing this at the bucket root would 404 the
+/// document and silently drain the whole fleet, so the test below tracks the production constructor.
+pub(crate) const HEALTH_CDN: &str = "http://minio:9000/updates/routing/updated-system/default";
 
-/// The release repository in the in-cluster MinIO — the ONE place its location is written
-/// down. Everything that publishes into it (`updatectl` inside the release-server pod) and
-/// everything that resolves out of it (each group's signed `releaseRepository`) is built from
-/// these, so a publish cannot land somewhere the signed repository does not name.
+/// The release repository's internal publishing endpoint and TLS public read endpoint. They name
+/// the same bucket/prefix: publishers use cluster-local credentials; agents use anonymous HTTPS
+/// and never present their control-plane identity to MinIO.
 pub(crate) const RELEASE_ENDPOINT: &str = "http://minio:9000";
+pub(crate) const RELEASE_PUBLIC_ENDPOINT: &str = "https://minio-direct.updated-system.svc";
 pub(crate) const RELEASE_BUCKET: &str = "updates";
 pub(crate) const RELEASE_PREFIX: &str = "releases";
 pub(crate) const RELEASE_REGION: &str = "us-east-1";
@@ -229,7 +229,7 @@ pub(crate) fn release_repository_flags() -> String {
 
 /// The URL a group's signed `releaseRepository` resolves `namespace` (`metadata`/`targets`) from.
 pub(crate) fn release_repository_url(namespace: &str) -> String {
-    format!("{RELEASE_ENDPOINT}/{RELEASE_BUCKET}/{RELEASE_PREFIX}/{namespace}/")
+    format!("{RELEASE_PUBLIC_ENDPOINT}/{RELEASE_BUCKET}/{RELEASE_PREFIX}/{namespace}/")
 }
 
 /// Name of the per-set ClusterIP Service backing a set's pods. Distinct from the set's
@@ -265,10 +265,68 @@ pub(crate) fn fleet_rollout_width(seed: u64) -> u32 {
     FLEET_CONCURRENCY + offset as u32
 }
 
+/// An agent pod's volume mounts: the workload's own, then the two every agent gets.
+///
+/// TLS material is mounted READ-ONLY at `/etc/agent-tls` from the `agent-tls` secret, and every
+/// agent gets a writable `/tmp`. That is one fact about how an agent runs, and the two pod specs in
+/// this suite — the plain fleet and the HAProxy-fronted one — each spelled it out. The specs are
+/// otherwise genuinely different workloads, so only the shared part is shared: a drift in where an
+/// agent finds its identity, or in whether it can write over it, would otherwise reach one workload
+/// and not the other.
+pub(crate) fn agent_volume_mounts(workload: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut mounts = workload;
+    mounts.push(serde_json::json!({
+        "name": "agent-tls", "mountPath": "/etc/agent-tls", "readOnly": true
+    }));
+    mounts.push(serde_json::json!({ "name": "tmp", "mountPath": "/tmp" }));
+    mounts
+}
+
+/// The volumes [`agent_volume_mounts`] resolves against, plus the workload's own.
+pub(crate) fn agent_volumes(workload: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut volumes = workload;
+    volumes.push(serde_json::json!({ "name": "tmp", "emptyDir": {} }));
+    volumes.push(serde_json::json!({
+        "name": "agent-tls", "secret": { "secretName": "agent-tls" }
+    }));
+    volumes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared fragments must render exactly the pod spec the two workloads used to spell out.
+    /// Extracting them was meant to remove a copy, not to change where an agent finds its identity
+    /// or whether it can write over it.
+    #[test]
+    fn agent_pods_mount_their_identity_read_only_under_the_workload_s_own_volumes() {
+        assert_eq!(
+            serde_json::Value::from(agent_volume_mounts(vec![serde_json::json!(
+                { "name": "state", "mountPath": "/var/lib/updated" }
+            )])),
+            serde_json::json!([
+                { "name": "state", "mountPath": "/var/lib/updated" },
+                { "name": "agent-tls", "mountPath": "/etc/agent-tls", "readOnly": true },
+                { "name": "tmp", "mountPath": "/tmp" }
+            ])
+        );
+        assert_eq!(
+            serde_json::Value::from(agent_volumes(vec![])),
+            serde_json::json!([
+                { "name": "tmp", "emptyDir": {} },
+                { "name": "agent-tls", "secret": { "secretName": "agent-tls" } }
+            ])
+        );
+    }
     use std::collections::BTreeSet;
+
+    #[test]
+    fn versioned_deployments_use_the_signed_identity_grammar() {
+        let name = versioned_deployment_name("edge", "1.2.3-rc.1");
+        assert_eq!(name, "edge-1.2.3-rc.1");
+        assert!(updated_contracts::identity::is_segment(&name));
+    }
 
     #[test]
     fn fleet_rollout_width_stays_in_the_uptime_safe_band_and_spans_it() {
@@ -296,8 +354,8 @@ mod tests {
 
     fn spec_field(field: &str) -> String {
         let block = REPOSITORY_SPEC
-            .split_once("s3: S3Destination {")
-            .expect("repository spec declares an S3 destination")
+            .split_once("s3: RepositoryStorage {")
+            .expect("repository spec declares managed repository storage")
             .1;
         let value = block
             .split_once(&format!("{field}: "))
@@ -315,20 +373,21 @@ mod tests {
     }
 
     #[test]
-    fn health_cdn_addresses_the_prefix_the_gateway_writes_reports_under() {
-        // The gateway persists a node report at `<s3.prefix>/telemetry/<node>.json` inside the
-        // repository's bucket, and the healthproxy fetches `<health base>/telemetry/<node>.json`.
-        // If the base omits the prefix, every GET 404s, no report is ever cached, and every node
-        // is programmed `ready: false` forever — silently draining the entire external LB path.
+    fn health_cdn_addresses_the_prefix_the_gateway_flushes_the_fleet_index_under() {
+        // The controller publishes the fleet index to its canonical
+        // `routing/<namespace>/<name>/telemetry/fleet.json` key
+        // inside the repository's bucket, and the healthproxy fetches
+        // `<health base>/telemetry/fleet.json`. If the base omits the prefix, the GET 404s every
+        // cycle, no report is ever cached, and every node is programmed `ready: false` forever —
+        // silently draining the entire external LB path.
         let endpoint = spec_field("endpoint");
         let bucket = spec_field("bucket");
-        let prefix = spec_field("prefix");
+        let prefix = updatec::runtime::managed_repository_prefix("updated-system", "default");
         assert_eq!(HEALTH_CDN, format!("{endpoint}/{bucket}/{prefix}"));
 
-        let node = "fleet-node-01";
         assert_eq!(
-            format!("{HEALTH_CDN}/telemetry/{node}.json"),
-            format!("{endpoint}/{bucket}/{prefix}/telemetry/{node}.json"),
+            updated_contracts::telemetry::fleet_index_url(HEALTH_CDN),
+            format!("{endpoint}/{bucket}/{prefix}/telemetry/fleet.json"),
         );
     }
 }

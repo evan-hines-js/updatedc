@@ -12,7 +12,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+      "pattern": "^(?!(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:$|\\.))[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
     },
     "reconciler": { "$ref": "#/$defs/reconciler" }
   },

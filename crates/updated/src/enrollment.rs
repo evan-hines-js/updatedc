@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-#[cfg(test)]
-use updated_contracts::enrollment::InitialSignedConfiguration;
+use updated_contracts::dataflow::DownloadCapability;
 use updated_contracts::enrollment::{
     EnrollResponse, EnrollmentBundle, EnrollmentRequest, RenewalRequest, RenewalResponse,
-    BUNDLE_PATH, ENROLL_PATH, RENEW_PATH,
+    ENROLL_PATH, MAX_CONTROL_DOCUMENT_BYTES as CONTROL_RESPONSE_LIMIT,
+    MAX_DOCUMENT_BYTES as ENROLLMENT_BUNDLE_LIMIT, RENEW_PATH,
 };
 
-const ENROLLMENT_RESPONSE_LIMIT: usize = 1024 * 1024;
+const NODE_CONFIG_MAX_BYTES: usize = 64 * 1024;
 
 /// The total wall-clock one control-plane exchange may take: the request, the response, and every
 /// byte of its bounded body.
@@ -21,7 +21,7 @@ const ENROLLMENT_RESPONSE_LIMIT: usize = 1024 * 1024;
 /// [`crate::tls::Identity::reqwest_client`] bounds *progress* only — a connect timeout and the gap
 /// between two reads — because it is also the client that streams release artifacts, where a total
 /// deadline is a cap on artifact size × link speed. These two exchanges are the opposite case:
-/// their bodies are at most [`ENROLLMENT_RESPONSE_LIMIT`], and a peer trickling one byte before
+/// their bodies are at most [`CONTROL_RESPONSE_LIMIT`], and a peer trickling one byte before
 /// every read timeout would hold them forever — enrollment on the boot path, renewal inline in the
 /// agent's single control loop, the loop that also drives update checks and the health probes,
 /// so a hung gateway silently stops the node reporting health while it still looks alive. This is
@@ -35,20 +35,19 @@ pub struct NodeConfig {
     pub enrollment: EnrollmentBootstrap,
 }
 
-/// The agent's sole node-local input, and deliberately minimal — a name, the shared fleet
-/// enrollment certificate, a CA, and where to reach the gateway. Nothing else, and never an implicit
-/// environment variable:
+/// The agent's sole node-local input, and deliberately minimal — a name, a CA, where to reach the
+/// gateway, and an enrollment-only identity when this node still needs a leaf. Nothing else, and
+/// never an implicit environment variable:
 ///
 /// * `url` — the gateway to enroll against.
 /// * `ca` — a PEM path for the CA that signs the gateway's (self-signed) server certificate, so the
 ///   node can verify the server it talks to without trusting the public web PKI.
 /// * `name` — this node's name. Self-asserted; it becomes the minted certificate's `CN`, the
 ///   `UpdateAgent` the enrollment creates, and the node key the control plane pins.
-/// * `client_cert` / `client_key` — the shared, fleet-wide enrollment certificate (two PEM files,
-///   issued by cert-manager into a Secret). It authenticates the `/enroll` handshake by mutual TLS
-///   and nothing else; a party that holds it may enroll a node under any name. This is the single
-///   credential — there is no plaintext token and no per-group join secret. Individual attribution
-///   and revocation come from the per-node certificate minted at enrollment, not from this.
+/// * `bootstrap` — the enrollment certificate and key. It authenticates the `/enroll` handshake by
+///   mutual TLS and nothing else; a party that holds it may enroll a reserved node name. It is
+///   optional because an operator-provisioned node that already has `agent.crt` / `agent.key` must
+///   not receive fleet-wide enrollment authority it will never use.
 ///
 /// The node generates a keypair and CSR, presents `name` + its CSR at `/enroll` over that mutual
 /// TLS, and receives a per-node certificate it uses for every steady-state request thereafter.
@@ -58,24 +57,46 @@ pub struct EnrollmentBootstrap {
     pub url: String,
     pub ca: PathBuf,
     pub name: String,
+    pub bootstrap: Option<EnrollmentClientIdentity>,
+}
+
+/// The credential for the one enrollment handshake. Keeping the pair in one optional block makes
+/// the invalid half-configured states unrepresentable after TOML decoding.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentClientIdentity {
     pub client_cert: PathBuf,
     pub client_key: PathBuf,
 }
 
 impl EnrollmentBootstrap {
-    /// Reject an empty `name` and an empty path. `serde(deny_unknown_fields)` already rejects
-    /// removed enrollment fields and a missing one, but a present-but-empty value passes it and
-    /// would only fail at the first network use — the one thing eager validation exists to
-    /// prevent. The single validation site for it.
+    /// Reject a name the gateway would refuse, and an empty path. `serde(deny_unknown_fields)`
+    /// already rejects removed enrollment fields and a missing one, but a present-but-empty or
+    /// otherwise ill-formed value passes it and would only fail at the first network use — the one
+    /// thing eager validation exists to prevent. The name rule is asked of the wire contract that
+    /// `/enroll` itself enforces ([`EnrollmentRequest::name_is_wellformed`]) rather than restated
+    /// here, so a config that loads is a config the gateway will admit. The single validation site
+    /// for it.
     pub fn validate(&self) -> io::Result<()> {
-        if self.name.trim().is_empty() {
-            return Err(invalid("enrollment name must not be empty"));
+        let proposed = EnrollmentRequest {
+            name: self.name.clone(),
+            csr: String::new(),
+        };
+        if !proposed.name_is_wellformed() {
+            return Err(invalid(&format!(
+                "enrollment name {:?} is not a DNS subdomain: lowercase letters, digits, '-' and \
+                 '.'; labels are at most 63 bytes and the whole name at most 253 bytes",
+                self.name
+            )));
         }
-        for (field, path) in [
-            ("ca", &self.ca),
-            ("client_cert", &self.client_cert),
-            ("client_key", &self.client_key),
-        ] {
+        let mut paths = vec![("ca", &self.ca)];
+        if let Some(bootstrap) = &self.bootstrap {
+            paths.extend([
+                ("bootstrap.client_cert", &bootstrap.client_cert),
+                ("bootstrap.client_key", &bootstrap.client_key),
+            ]);
+        }
+        for (field, path) in paths {
             if path.as_os_str().is_empty() {
                 return Err(invalid(&format!(
                     "enrollment {field} path must not be empty"
@@ -102,9 +123,14 @@ impl EnrollmentBootstrap {
     /// used for nothing else, and steady-state traffic uses the per-node cert from
     /// [`Self::steady_identity`].
     pub fn enroll_identity(&self) -> io::Result<crate::tls::Identity> {
+        let bootstrap = self.bootstrap.as_ref().ok_or_else(|| {
+            invalid(
+                "this node has no enrollment bootstrap identity; preplace its per-node leaf or configure [enrollment.bootstrap]",
+            )
+        })?;
         Ok(crate::tls::Identity::new(
-            self.client_cert.clone(),
-            self.client_key.clone(),
+            bootstrap.client_cert.clone(),
+            bootstrap.client_key.clone(),
             self.ca.clone(),
         ))
     }
@@ -120,15 +146,22 @@ pub(crate) fn joined_key_path(state_dir: &Path) -> PathBuf {
 
 impl NodeConfig {
     pub fn load(path: &Path) -> io::Result<Self> {
-        let bytes = std::fs::read_to_string(path)?;
+        // A host installer normally writes a regular file, while a container may mount a ConfigMap
+        // key as a symlink. Both use one bounded opened-handle read; only the final symlink policy
+        // differs from node-owned durable state below.
+        let bytes = foundation::file::read_bounded_regular_string(
+            path,
+            NODE_CONFIG_MAX_BYTES,
+            foundation::file::FinalSymlink::Follow,
+        )?;
         let config: Self = toml::from_str(&bytes).map_err(|error| invalid(&error.to_string()))?;
-        let url = url::Url::parse(&config.enrollment.url)
-            .map_err(|error| invalid(&format!("invalid enrollment URL: {error}")))?;
         // The gateway is externally exposed and always TLS, so enrollment is always HTTPS: the node
         // verifies the gateway against the pinned `ca` and presents the shared fleet enrollment cert.
-        if url.scheme() != "https" {
-            return Err(invalid("enrollment URL must use HTTPS"));
-        }
+        crate::http::network_endpoint(
+            &config.enrollment.url,
+            crate::http::EndpointTransport::HttpsOnly,
+            "enrollment URL",
+        )?;
         // Validate eagerly so a misconfigured config fails at load, not at first network use.
         config.enrollment.validate()?;
         Ok(config)
@@ -172,14 +205,18 @@ pub fn load_or_enroll(
     enroll: impl FnOnce() -> io::Result<Vec<u8>>,
 ) -> io::Result<EnrollmentBundle> {
     let consumed = consumed_path(bundle_path);
-    match std::fs::read(bundle_path) {
+    match foundation::file::read_bounded_regular(
+        bundle_path,
+        ENROLLMENT_BUNDLE_LIMIT,
+        foundation::file::FinalSymlink::Refuse,
+    ) {
         Ok(bytes) => {
             let bundle = decode(&bytes)?;
             consume_if_needed(&consumed)?;
             Ok(bundle)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if consumed.exists() {
+            if consumed.try_exists()? {
                 return Err(invalid(
                     "enrollment bundle is missing after bootstrap eligibility was consumed",
                 ));
@@ -193,9 +230,10 @@ pub fn load_or_enroll(
             // marker's guarantee still holds: once both exist, deleting the bundle can never
             // re-enable enrollment.
             //
-            // The bundle is signed public metadata (routing, assignment, the initial signed
-            // configuration), not a secret, so it commits through the managed door and keeps the
-            // state directory's grant rather than an owner-only DACL no `icacls` could repair.
+            // The bundle is public bootstrap metadata (routing anchor, assignment name, and the
+            // immutable install-root pin), not a secret, so it commits through the managed door
+            // and keeps the state directory's grant rather than an owner-only DACL no `icacls`
+            // could repair.
             foundation::durable::atomic_write_managed(bundle_path, ".enrollment-", &bytes)?;
             consume_if_needed(&consumed)?;
             Ok(bundle)
@@ -204,36 +242,32 @@ pub fn load_or_enroll(
     }
 }
 
-/// Resolve the enrollment bundle and ensure the node holds its steady-state identity. The bundle
-/// (routing, assignment, and the initial signed configuration) may be **preplaced** for a
-/// network-free first start, or fetched over the network — but identity is a separate, node-owned
-/// concern. The per-node leaf (`agent.crt`) is ALWAYS minted through the `/enroll` mutual-TLS
-/// handshake the first time the gateway is reachable: the node presents the shared fleet enrollment
-/// cert, self-asserts its configured `name`, and receives a leaf it persists and uses for every
-/// steady-state request thereafter. Idempotent on retry (the durable per-node key plus the stable
-/// name yield the same agent and the same pinned leaf); the bundle remains one-way (once consumed,
-/// enrollment can never re-run).
+/// Resolve the enrollment bundle and ensure the node holds its steady-state identity. The small
+/// routing bootstrap may be **preplaced** for an operator-assisted start, or fetched from S3 through
+/// a capability minted by the enrollment endpoint — but identity is a separate, node-owned concern.
+/// The per-node leaf (`agent.crt`) is either provisioned beside the bundle by an operator or minted
+/// through the `/enroll` mutual-TLS handshake the first time the gateway is reachable. Online
+/// enrollment presents the shared fleet enrollment cert, self-asserts the configured `name`, and
+/// receives a leaf it persists and uses for every steady-state request thereafter. Idempotent on
+/// retry (the durable per-node key plus the stable name yield the same agent and the same pinned
+/// leaf); the bundle remains one-way (once consumed, enrollment can never re-run).
 pub async fn load_or_enroll_http(
     config: &NodeConfig,
     state_dir: &Path,
-    policy: &dyn BundlePolicy,
 ) -> io::Result<EnrollmentBundle> {
     let bundle_path = bundle_path(state_dir);
-    match load_existing_or_fresh(&bundle_path) {
-        // A preplaced (or already-loaded) bundle supplies routing/assignment/config, but carries no
+    match load_existing_or_fresh(&bundle_path)? {
+        // A preplaced (or already-loaded) bundle supplies the routing bootstrap, but carries no
         // identity. Mint the steady-state leaf now unless a prior boot already did — decoupling the
         // one-way bundle from the per-node cert is what lets an offline-seeded node still obtain a
         // real identity the first time it reaches the gateway.
-        Some(loaded) => {
-            let mut bundle = loaded?;
+        Some(bundle) => {
             // The leaf's identity (`CN`) comes from the configured enrollment name, so whatever
             // bundle this node runs on must name the same agent. Otherwise the node would run on one
             // agent's routing/assignment while holding another agent's steady-state certificate — a
             // split identity. Checked on EVERY boot, not only the one that mints the leaf: the
             // bundle on disk can be replaced under an already-enrolled node (a config-management
-            // step, an image refresh), and nothing further down re-checks it — `refresh_bundle`'s
-            // own identity rule is skipped when the material is not yet aging, and warned away
-            // rather than propagated when it is. Fail closed on that misconfiguration.
+            // step, an image refresh), so fail closed on that misconfiguration every boot.
             if bundle.agent_id != config.enrollment.name {
                 return Err(invalid(&format!(
                     "enrollment bundle is for agent {:?}, but this node is configured to enroll as \
@@ -246,25 +280,27 @@ pub async fn load_or_enroll_http(
             // repository) reads routing and secrets straight from disk and never makes an mTLS
             // request, so it needs no per-node identity — and forcing an `/enroll` handshake it
             // cannot reach would wedge its boot. This mirrors the split the secrets client uses.
-            if !crate::config::base_url_is_local(&bundle.routing_base_url)
-                && !joined_cert_path(state_dir).exists()
-            {
-                // The `/enroll` response carries a freshly signed bundle beside the leaf. Adopting
-                // it is what makes minting an identity for a preplaced node also REFRESH the
-                // material it was seeded with: the preplaced copy was signed whenever the image was
-                // built, and discarding this one left the node holding metadata that only ages.
-                // Rejected (a substituted root, an unverifiable chain) leaves the preplaced bundle
-                // exactly as it was — the leaf is still minted, and boot proceeds on it.
-                let minted = mint_leaf(config, state_dir).await?;
-                match adopt_bundle(&bundle_path, config, &minted, &bundle, policy).await {
-                    Ok(()) => bundle = minted,
-                    Err(error) => warn(&format!(
-                        "keeping the preplaced enrollment bundle: the one minted with this node's \
-                         certificate was refused ({error})"
-                    )),
+            if !crate::config::base_url_is_local(&bundle.routing_base_url) {
+                let identity_complete = joined_cert_path(state_dir).try_exists()?
+                    && joined_key_path(state_dir).try_exists()?;
+                if !identity_complete {
+                    // The current object must agree on every immutable routing boundary the operator
+                    // preplaced. Its root may be newer: the standard live TUF refresh walks that
+                    // rotation from the preplaced root, so there is no second bundle-adoption path.
+                    let minted = mint_leaf(config, state_dir).await?;
+                    if minted.agent_id != bundle.agent_id
+                        || minted.routing_base_url != bundle.routing_base_url
+                        || minted.assignment != bundle.assignment
+                        || minted.install_root != bundle.install_root
+                    {
+                        return Err(invalid(
+                            "the live enrollment object disagrees with the preplaced node identity, routing path, or install root",
+                        ));
+                    }
                 }
+                validate_stored_leaf(config, state_dir)?;
             }
-            Ok(refresh_bundle_or_warn(config, state_dir, bundle, policy).await)
+            Ok(bundle)
         }
         // No bundle yet: the `/enroll` handshake yields BOTH the minted leaf and the signed bundle.
         None => {
@@ -291,153 +327,12 @@ fn bundle_path(state_dir: &Path) -> PathBuf {
     state_dir.join("enrollment.json")
 }
 
-fn warn(message: &str) {
-    foundation::log::warn("updated", message);
-}
-
-/// The trust decisions about an enrollment bundle that this module cannot make, supplied by the TUF
-/// layer that owns them (`updated_tuf::EmbeddedChainPolicy`).
-///
-/// This module owns the bundle's transport and durability — which endpoint serves it, which identity
-/// fetches it, and the one-way persistence rules — and deliberately none of its meaning. Verifying a
-/// signed metadata chain, and judging when that chain is close enough to expiry to be worth
-/// replacing, both need the TUF implementation, which depends on this crate and so cannot be
-/// depended on from here. Inverting it through this trait keeps ONE verification implementation
-/// rather than a weaker second copy on the refresh path.
-#[async_trait::async_trait]
-pub trait BundlePolicy: Sync {
-    /// Whether `current`'s embedded metadata chain has expired, or is near enough to expiry that the
-    /// node should try to replace it now. Asked before any network call, so a node holding fresh
-    /// material spends nothing.
-    fn needs_refresh(&self, current: &EnrollmentBundle) -> bool;
-
-    /// Whether `candidate`, freshly issued by the gateway, may replace `current`. Must verify the
-    /// candidate's complete chain AND that its root is `current`'s pinned root or a rotation signed
-    /// by it — otherwise a gateway an attacker controls could hand every node a root of its own and
-    /// the enrollment-time pin would be worth nothing.
-    ///
-    /// Async because a rotation the node was offline for spans several root versions, and the only
-    /// way to check one is against the version before it: the implementation fetches the
-    /// intermediate versioned roots the repository publishes and walks them one verified step at a
-    /// time. That fetch is the reason this is the one policy method that may touch the network.
-    async fn accept(
-        &self,
-        candidate: &EnrollmentBundle,
-        current: &EnrollmentBundle,
-    ) -> io::Result<()>;
-}
-
-/// Replace the node's persisted enrollment bundle when its signed material is aging, and return
-/// whichever bundle the node should now run on.
-///
-/// A refresh is best-effort by construction: the bundle a node already holds still pins its root of
-/// trust and still names its `install_root` even after its chain expires, so failing to replace it
-/// is never a reason to fail a boot or a control loop. Every failure — an unreachable gateway, a
-/// refused candidate, an unwritable state directory — warns and yields the bundle unchanged.
-async fn refresh_bundle_or_warn(
-    config: &NodeConfig,
-    state_dir: &Path,
-    current: EnrollmentBundle,
-    policy: &dyn BundlePolicy,
-) -> EnrollmentBundle {
-    match refresh_bundle(config, state_dir, &current, policy).await {
-        Ok(Some(refreshed)) => {
-            foundation::log::info(
-                "updated",
-                "refreshed the enrollment bundle: its embedded metadata was at or near expiry",
-            );
-            refreshed
-        }
-        Ok(None) => current,
-        Err(error) => {
-            warn(&format!(
-                "could not refresh the aging enrollment bundle; continuing on the persisted one \
-                 (its root of trust and pinned install root do not expire): {error}"
-            ));
-            current
-        }
-    }
-}
-
-/// The refresh itself: consult the policy, and only if it says the material is aging, re-fetch and
-/// durably replace it. `Ok(None)` means nothing needed doing.
-async fn refresh_bundle(
-    config: &NodeConfig,
-    state_dir: &Path,
-    current: &EnrollmentBundle,
-    policy: &dyn BundlePolicy,
-) -> io::Result<Option<EnrollmentBundle>> {
-    if !can_reach_gateway(state_dir, current) {
-        return Ok(None);
-    }
-    if !policy.needs_refresh(current) {
-        return Ok(None);
-    }
-    let candidate = fetch_bundle(config, state_dir).await?;
-    adopt_bundle(&bundle_path(state_dir), config, &candidate, current, policy).await?;
-    Ok(Some(candidate))
-}
-
-/// Whether this node can ask the gateway for anything at all: the same split [`mint_leaf`] makes.
-/// An offline/local deployment reads routing straight from disk, so it has no gateway to ask; a node
-/// that has not yet minted its per-node certificate has nothing to ask WITH, and the shared fleet
-/// enrollment cert authenticates the `/enroll` handshake and nothing else.
-fn can_reach_gateway(state_dir: &Path, current: &EnrollmentBundle) -> bool {
-    !crate::config::base_url_is_local(&current.routing_base_url)
-        && joined_cert_path(state_dir).exists()
-}
-
-/// Fetch this node's enrollment bundle as of now, authenticated by the per-node certificate it
-/// minted at enrollment. Checks only shape and that the bundle names this node; whether it may
-/// REPLACE what the node holds is [`BundlePolicy::accept`]'s decision, made in [`adopt_bundle`].
-async fn fetch_bundle(config: &NodeConfig, state_dir: &Path) -> io::Result<EnrollmentBundle> {
-    let endpoint = format!(
-        "{}{BUNDLE_PATH}",
-        config.enrollment.url.trim_end_matches('/')
-    );
-    let bytes = control_plane_exchange(
-        &config.enrollment.steady_identity(state_dir)?,
-        &endpoint,
-        Vec::new(),
-        "enrollment bundle refresh",
-    )
-    .await?;
-    decode(&bytes)
-}
-
-/// Durably replace the persisted bundle with `candidate`, but only if it names this node and the
-/// policy accepts it over `current`.
-///
-/// The one-way enrollment contract is untouched: the consumed marker is already set and stays set,
-/// and the write is atomic, so the bundle is never absent and this can never re-enable enrollment.
-/// What changes is only WHICH signed material the node keeps.
-async fn adopt_bundle(
-    bundle_path: &Path,
-    config: &NodeConfig,
-    candidate: &EnrollmentBundle,
-    current: &EnrollmentBundle,
-    policy: &dyn BundlePolicy,
-) -> io::Result<()> {
-    // The same split-identity rule the enrollment paths apply: material issued for another agent
-    // must never become this node's, whatever else verifies.
-    if candidate.agent_id != config.enrollment.name || candidate.agent_id != current.agent_id {
-        return Err(invalid(&format!(
-            "the control plane issued a bundle for agent {:?}, but this node is agent {:?}",
-            candidate.agent_id, config.enrollment.name
-        )));
-    }
-    policy.accept(candidate, current).await?;
-    let bytes = serde_json::to_vec(candidate).map_err(io::Error::other)?;
-    foundation::durable::atomic_write_managed(bundle_path, ".enrollment-", &bytes)
-}
-
 /// Mint the node's per-node steady-state certificate through the `/enroll` mutual-TLS handshake and
-/// return the signed enrollment bundle the gateway issued alongside it. The node generates a durable
-/// per-node key and a CSR, presents its configured `name` over the shared fleet enrollment cert
-/// (which authenticates ONLY this handshake), and persists the minted leaf before returning — the
-/// key is already durable and steady state cannot run without the cert. Idempotent: the durable key
-/// and stable name mean a retry re-mints the same agent's leaf, so a crash after the leaf is written
-/// but before its caller finishes simply re-enrolls to the same identity.
+/// spend the exact S3 bundle capability issued beside it. The node generates a durable per-node key
+/// and a CSR, presents its configured `name` over the shared fleet enrollment cert (which
+/// authenticates ONLY this handshake), validates both results, then persists the leaf. Bundle bytes
+/// never transit the gateway and the object request carries no client certificate. Idempotent: the
+/// durable key and stable name mean a retry re-mints the same agent's leaf.
 async fn mint_leaf(config: &NodeConfig, state_dir: &Path) -> io::Result<EnrollmentBundle> {
     std::fs::create_dir_all(state_dir)?;
     let key_pem = durable_key_pem(state_dir)?;
@@ -459,49 +354,55 @@ async fn mint_leaf(config: &NodeConfig, state_dir: &Path) -> io::Result<Enrollme
         "enrollment",
     )
     .await?;
-    let enrolled: EnrollResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
-    validate_bundle(&enrolled.bundle)?;
+    let enrolled = EnrollResponse::from_bounded_json(&bytes)?;
     validate_leaf(
         &enrolled.leaf,
         &request.csr,
         &request.name,
         &config.enrollment.ca,
     )?;
+    let bundle = download_bundle(config, &enrolled.bundle_download).await?;
     persist_leaf(state_dir, &enrolled.leaf)?;
-    Ok(enrolled.bundle)
+    Ok(bundle)
 }
 
-/// Keep everything the node's steady state is built on current: the enrollment bundle whose signed
-/// metadata is aging, and the per-node certificate once it enters its renewal window.
+/// Spend one exact-object bearer capability without ever offering the node's certificate to the
+/// object-store host. Redirects are refused so the bearer itself cannot escape to another origin;
+/// the shared bundle ceiling is enforced over the streamed bytes before parsing.
+async fn download_bundle(
+    config: &NodeConfig,
+    capability: &DownloadCapability,
+) -> io::Result<EnrollmentBundle> {
+    capability.validate().map_err(|error| invalid(&error))?;
+    let response = crate::tls::anonymous_object_client_with_ca(&config.enrollment.ca)?
+        .get(&capability.url)
+        .timeout(CONTROL_PLANE_DEADLINE);
+    let bytes = bounded_exchange(
+        response,
+        "enrollment bundle object",
+        ENROLLMENT_BUNDLE_LIMIT,
+    )
+    .await?;
+    decode_capability_bundle(capability, &bytes)
+}
+
+fn decode_capability_bundle(
+    capability: &DownloadCapability,
+    bytes: &[u8],
+) -> io::Result<EnrollmentBundle> {
+    crate::http::authenticate_download_bytes(capability, bytes, "enrollment bundle object")?;
+    decode(bytes)
+}
+
+/// Renew the current per-node certificate when it enters its renewal window.
 ///
-/// Both decay on their own clocks and neither renews the other, which is why one entry point drives
-/// them together — a node that only ever renewed its certificate kept a bundle that eventually held
-/// nothing it could take for the repository's current state, and no periodic path existed that would
-/// have replaced it.
-///
-/// The bundle goes first, while the current certificate is still the one the gateway knows; a
-/// refresh failure is warned and never propagates, since the persisted bundle remains usable
-/// regardless. Returns `true` only after a new leaf has been durably installed — the caller restarts
-/// on that to rebuild its authenticated clients.
-pub async fn renew_node_material_if_due(
+/// Enrollment itself is one-way and its root does not expire; live TUF refresh owns metadata and
+/// root rotation. Certificate renewal is therefore the only periodic enrollment control action.
+pub async fn renew_node_certificate_if_due(
     config: &NodeConfig,
     state_dir: &Path,
-    policy: &dyn BundlePolicy,
 ) -> io::Result<bool> {
-    if let Some(current) = persisted_bundle(state_dir)? {
-        refresh_bundle_or_warn(config, state_dir, current, policy).await;
-    }
     renew_leaf_if_due(config, state_dir).await
-}
-
-/// The persisted enrollment bundle, or `None` when this node has none yet (or holds one it can no
-/// longer parse — nothing here can fix that, and the boot path reports it).
-fn persisted_bundle(state_dir: &Path) -> io::Result<Option<EnrollmentBundle>> {
-    match std::fs::read(bundle_path(state_dir)) {
-        Ok(bytes) => decode(&bytes).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 /// Renew the current per-node certificate when it enters its renewal window. The durable key is
@@ -511,7 +412,11 @@ async fn renew_leaf_if_due(config: &NodeConfig, state_dir: &Path) -> io::Result<
     const RENEW_BEFORE_SECS: i64 = 30 * 24 * 60 * 60;
 
     let cert_path = joined_cert_path(state_dir);
-    let pem = match std::fs::read(&cert_path) {
+    let pem = match foundation::file::read_bounded_regular(
+        &cert_path,
+        crate::tls::TLS_MATERIAL_MAX_BYTES,
+        foundation::file::FinalSymlink::Refuse,
+    ) {
         Ok(pem) => pem,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
@@ -530,7 +435,10 @@ async fn renew_leaf_if_due(config: &NodeConfig, state_dir: &Path) -> io::Result<
         ));
     }
 
-    let key_pem = std::fs::read_to_string(joined_key_path(state_dir))?;
+    let key_pem = crate::tls::read_private_key_pem(
+        &joined_key_path(state_dir),
+        foundation::file::FinalSymlink::Refuse,
+    )?;
     let csr = crate::csr::csr_for(&key_pem, "updated renew")
         .map_err(|error| invalid(&format!("generating renewal CSR: {error}")))?;
     let endpoint = format!(
@@ -546,7 +454,7 @@ async fn renew_leaf_if_due(config: &NodeConfig, state_dir: &Path) -> io::Result<
         "certificate renewal",
     )
     .await?;
-    let renewed: RenewalResponse = serde_json::from_slice(&bytes).map_err(invalid_error)?;
+    let renewed = RenewalResponse::from_bounded_json(&bytes)?;
     validate_leaf(
         &renewed.leaf,
         &request.csr,
@@ -591,6 +499,30 @@ fn validate_leaf(leaf_pem: &str, csr_pem: &str, expected_name: &str, ca: &Path) 
     Ok(())
 }
 
+/// Validate an operator-provisioned or previously minted steady-state identity under exactly the
+/// same name, key, CA, lifetime, and client-auth policy as a fresh `/enroll` response. This runs on
+/// every remote boot, so placing files in the state directory is not a bypass around enrollment's
+/// identity checks.
+fn validate_stored_leaf(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
+    let key_pem = crate::tls::read_private_key_pem(
+        &joined_key_path(state_dir),
+        foundation::file::FinalSymlink::Refuse,
+    )?;
+    let csr_pem = crate::csr::csr_for(&key_pem, "updated stored identity")
+        .map_err(|error| invalid(&format!("validating stored node key: {error}")))?;
+    let leaf = foundation::file::read_bounded_regular_string(
+        &joined_cert_path(state_dir),
+        crate::tls::TLS_MATERIAL_MAX_BYTES,
+        foundation::file::FinalSymlink::Refuse,
+    )?;
+    validate_leaf(
+        &leaf,
+        &csr_pem,
+        &config.enrollment.name,
+        &config.enrollment.ca,
+    )
+}
+
 fn chrono_now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -602,12 +534,15 @@ fn chrono_now_unix() -> i64 {
 /// loaded bundle (or the consumed-but-missing error) without touching the network; return `None`
 /// when a fresh network enrollment is due. Called only by [`load_or_enroll_http`], the sole
 /// bootstrap entry point, so the one-way, consumed-once contract lives on that one path.
-fn load_existing_or_fresh(bundle_path: &Path) -> Option<io::Result<EnrollmentBundle>> {
-    (bundle_path.exists() || consumed_path(bundle_path).exists()).then(|| {
+fn load_existing_or_fresh(bundle_path: &Path) -> io::Result<Option<EnrollmentBundle>> {
+    if bundle_path.try_exists()? || consumed_path(bundle_path).try_exists()? {
         load_or_enroll(bundle_path, || {
             Err(invalid("enrollment must not run for existing local state"))
         })
-    })
+        .map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// The one control-plane request shape: a JSON POST presenting `identity`, carrying
@@ -619,7 +554,7 @@ fn control_plane_request(
     body: Vec<u8>,
 ) -> io::Result<reqwest::RequestBuilder> {
     Ok(identity
-        .reqwest_client()?
+        .reqwest_control_client()?
         .post(endpoint)
         .header("content-type", "application/json")
         .body(body)
@@ -629,7 +564,7 @@ fn control_plane_request(
 }
 
 /// Perform one control-plane exchange and read its successful response, bounded by
-/// [`ENROLLMENT_RESPONSE_LIMIT`] through the one bounded-read helper every control-plane response
+/// [`CONTROL_RESPONSE_LIMIT`] through the one bounded-read helper every control-plane response
 /// uses. Shared by enrollment and certificate renewal.
 async fn control_plane_exchange(
     identity: &crate::tls::Identity,
@@ -637,11 +572,27 @@ async fn control_plane_exchange(
     body: Vec<u8>,
     what: &str,
 ) -> io::Result<Vec<u8>> {
-    let response = control_plane_request(identity, endpoint, body)?
+    bounded_exchange(
+        control_plane_request(identity, endpoint, body)?,
+        what,
+        CONTROL_RESPONSE_LIMIT,
+    )
+    .await
+}
+
+/// The one HTTP send and bounded response read used by both authenticated control documents and
+/// anonymous S3 bundle objects. Callers choose the contract limit; transport errors are always
+/// redacted because the request URL may be a bearer secret.
+async fn bounded_exchange(
+    request: reqwest::RequestBuilder,
+    what: &str,
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    let response = request
         .send()
         .await
-        .map_err(io::Error::other)?;
-    crate::http::read_bounded(response, what, ENROLLMENT_RESPONSE_LIMIT).await
+        .map_err(|error| crate::http::redacted_reqwest_error(what, &error))?;
+    crate::http::read_bounded(response, what, limit).await
 }
 
 /// The node's durable per-node key (PKCS#8 PEM): generated once, persisted owner-only, and reused
@@ -655,7 +606,7 @@ fn durable_key_pem(state_dir: &Path) -> io::Result<String> {
     // or owner changed, EIO on a failing disk, invalid UTF-8 from a single flipped byte — means a
     // key file is there, and generating over it destroys the durable identity the control plane
     // pinned: the node's telemetry stops verifying and it can never prove it is itself again.
-    match std::fs::read_to_string(&path) {
+    match crate::tls::read_private_key_pem(&path, foundation::file::FinalSymlink::Refuse) {
         Ok(existing) if !existing.trim().is_empty() => return Ok(existing),
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -690,49 +641,11 @@ fn persist_leaf(state_dir: &Path, leaf_pem: &str) -> io::Result<()> {
 }
 
 fn decode(bytes: &[u8]) -> io::Result<EnrollmentBundle> {
-    let bundle: EnrollmentBundle = serde_json::from_slice(bytes).map_err(invalid_error)?;
-    validate_bundle(&bundle)?;
-    Ok(bundle)
-}
-
-/// The single gate every enrollment bundle passes before this node will look at it, wherever it
-/// came from: the persisted copy, a preplaced one, the `/enroll` response, or a `/bundle` refresh.
-fn validate_bundle(bundle: &EnrollmentBundle) -> io::Result<()> {
-    bundle.validate_shape()?;
-    assignment_names_its_own_agent(bundle)
-}
-
-/// A bundle's `assignment` must be the routing target of the agent the bundle names.
-///
-/// `agent_id` and `assignment` are plaintext fields the gateway chooses; TUF covers only
-/// `routing_root` and `initial.*`. `verify_embedded_chain` then verifies the embedded agent
-/// document against *whatever path the bundle names*, and an [`AgentDocument`] carries no node
-/// identity of its own — so without this rule a gateway that had been taken over could hand node A
-/// a bundle with `agent_id: "a"` (which the identity checks accept) naming
-/// `assignments/agents/b.json` plus node B's genuinely published, correctly signed documents. Every
-/// signature, threshold and digest verifies, the enrollment-time root pin gives nothing, and node A
-/// permanently runs node B's product, args, secret mapping and install root. Binding the path to
-/// the identity is what closes it: the control plane publishes each agent's assignment at exactly
-/// `<prefix>/agents/<agent>.json` (`telemetry::assignment_object_key`, and the API contract), so a
-/// bundle
-/// naming another agent's path is refused whether or not that path is genuinely signed.
-///
-/// [`AgentDocument`]: updated_contracts::artifact::AgentDocument
-fn assignment_names_its_own_agent(bundle: &EnrollmentBundle) -> io::Result<()> {
-    if updated_contracts::telemetry::split_assignment_path(&bundle.assignment)
-        .is_some_and(|(_, agent)| agent == bundle.agent_id)
-    {
-        return Ok(());
-    }
-    Err(invalid(&format!(
-        "enrollment bundle for agent {:?} names the assignment {:?}, which is another agent's \
-         routing target",
-        bundle.agent_id, bundle.assignment
-    )))
+    EnrollmentBundle::from_bounded_json(bytes)
 }
 
 fn consume_if_needed(path: &Path) -> io::Result<()> {
-    if path.exists() {
+    if path.try_exists()? {
         return Ok(());
     }
     let parent = path
@@ -755,10 +668,6 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn invalid_error(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,14 +685,8 @@ mod tests {
             agent_id: "agent-a".into(),
             routing_base_url: "https://updates.example/".into(),
             assignment: "assignments/agents/agent-a.json".into(),
+            install_root: "/var/lib/app".into(),
             routing_root: "{}".into(),
-            initial: InitialSignedConfiguration {
-                timestamp: "{}".into(),
-                snapshot: "{}".into(),
-                targets: "{}".into(),
-                agent_document: "{}".into(),
-                managed_configuration: "{}".into(),
-            },
         })
         .unwrap()
     }
@@ -801,6 +704,26 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.agent_id, "agent-a");
         assert!(!called.get());
+    }
+
+    #[test]
+    fn object_store_bytes_must_match_the_mtls_authenticated_digest() {
+        let bytes = bundle();
+        let capability = DownloadCapability {
+            schema: DownloadCapability::SCHEMA,
+            url: "https://objects.example/enrollment?X-Amz-Signature=secret".into(),
+            sha256: updated_contracts::digest::sha256_bytes(&bytes),
+        };
+        assert!(decode_capability_bundle(&capability, &bytes).is_ok());
+
+        let mut substituted = bytes;
+        substituted.push(b' ');
+        assert_eq!(
+            decode_capability_bundle(&capability, &substituted)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -833,6 +756,24 @@ mod tests {
         assert!(!called.get());
     }
 
+    #[test]
+    fn oversized_preplaced_bundle_fails_without_enrolling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.enrollment.json");
+        std::fs::write(&path, vec![b' '; ENROLLMENT_BUNDLE_LIMIT + 1]).unwrap();
+        let called = Cell::new(false);
+        assert_eq!(
+            load_or_enroll(&path, || {
+                called.set(true);
+                Ok(bundle())
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!called.get());
+    }
+
     /// A bundle for `agent_id` whose `routing_root` is `marker`, so a test can tell which of two
     /// bundles a path ended up holding.
     fn bundle_for(agent_id: &str, marker: &str) -> EnrollmentBundle {
@@ -841,133 +782,21 @@ mod tests {
             agent_id: agent_id.into(),
             routing_base_url: "https://updates.example/".into(),
             assignment: format!("assignments/agents/{agent_id}.json"),
+            install_root: "/var/lib/app".into(),
             routing_root: format!("{{\"marker\":\"{marker}\"}}"),
-            initial: InitialSignedConfiguration {
-                timestamp: "{}".into(),
-                snapshot: "{}".into(),
-                targets: "{}".into(),
-                agent_document: "{}".into(),
-                managed_configuration: "{}".into(),
-            },
-        }
-    }
-
-    /// A stand-in for `updated_tuf::EmbeddedChainPolicy`: this crate owns transport and durability,
-    /// so its tests state what it does with each verdict, not how the verdict is reached.
-    struct FixedPolicy {
-        stale: bool,
-        verdict: Result<(), &'static str>,
-        /// Atomic rather than a `Cell` only because the policy is consulted through a `&dyn` that
-        /// crosses an await point and so must be `Sync`.
-        consulted: std::sync::atomic::AtomicBool,
-    }
-
-    impl FixedPolicy {
-        fn accepting() -> Self {
-            Self {
-                stale: true,
-                verdict: Ok(()),
-                consulted: std::sync::atomic::AtomicBool::new(false),
-            }
-        }
-        fn refusing() -> Self {
-            Self {
-                stale: true,
-                verdict: Err("substituted root of trust"),
-                consulted: std::sync::atomic::AtomicBool::new(false),
-            }
-        }
-        fn consulted(&self) -> bool {
-            self.consulted.load(std::sync::atomic::Ordering::Relaxed)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl BundlePolicy for FixedPolicy {
-        fn needs_refresh(&self, _current: &EnrollmentBundle) -> bool {
-            self.stale
-        }
-        async fn accept(
-            &self,
-            _candidate: &EnrollmentBundle,
-            _current: &EnrollmentBundle,
-        ) -> io::Result<()> {
-            self.consulted
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.verdict.map_err(invalid)
         }
     }
 
     fn config_for(dir: &Path, name: &str) -> NodeConfig {
         let body = format!(
-            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='{name}'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n"
+            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='{name}'\n[enrollment.bootstrap]\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n"
         );
         NodeConfig::load(&write_config(dir, &body)).unwrap()
     }
 
-    /// The bundle is written once at enrollment and its signed metadata expires, so it MUST be
-    /// replaceable — but only by material that is still this node's and that the trust policy
-    /// accepts. Every refusal leaves the persisted bundle byte-for-byte intact, because it remains
-    /// the node's root of trust and pinned install root however old it is.
-    #[test]
-    fn a_refreshed_bundle_replaces_the_persisted_one_only_when_the_policy_accepts_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = bundle_path(dir.path());
-        let config = config_for(dir.path(), "agent-a");
-        let current = bundle_for("agent-a", "pinned");
-        let write_current = || {
-            std::fs::write(&path, serde_json::to_vec(&current).unwrap()).unwrap();
-        };
-        let held = || decode(&std::fs::read(&path).unwrap()).unwrap().routing_root;
-
-        // Accepted: the node now holds the newer material.
-        write_current();
-        let candidate = bundle_for("agent-a", "rotated");
-        let policy = FixedPolicy::accepting();
-        block_on(adopt_bundle(&path, &config, &candidate, &current, &policy)).unwrap();
-        assert!(policy.consulted());
-        assert_eq!(held(), candidate.routing_root);
-
-        // Refused by the trust policy: nothing is written.
-        write_current();
-        let policy = FixedPolicy::refusing();
-        let error =
-            block_on(adopt_bundle(&path, &config, &candidate, &current, &policy)).unwrap_err();
-        assert!(error.to_string().contains("substituted root of trust"));
-        assert_eq!(held(), current.routing_root);
-
-        // Issued for another agent: refused on identity, and the trust policy is never even asked —
-        // a bundle naming someone else is not a question about roots.
-        write_current();
-        let foreign = bundle_for("agent-b", "rotated");
-        let policy = FixedPolicy::accepting();
-        let error =
-            block_on(adopt_bundle(&path, &config, &foreign, &current, &policy)).unwrap_err();
-        assert!(error.to_string().contains("agent-b"));
-        assert!(!policy.consulted());
-        assert_eq!(held(), current.routing_root);
-    }
-
-    /// Refreshing needs a gateway to ask and a per-node certificate to ask with. A node missing
-    /// either must skip it silently rather than fail: an offline deployment has no gateway at all,
-    /// and a node that has not minted its leaf yet holds only the shared fleet enrollment
-    /// certificate, which authenticates `/enroll` and nothing else.
-    #[test]
-    fn a_node_with_no_steady_state_identity_never_asks_for_a_bundle() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = bundle_for("agent-a", "pinned");
-        assert!(!can_reach_gateway(dir.path(), &remote));
-        std::fs::write(joined_cert_path(dir.path()), "leaf").unwrap();
-        assert!(can_reach_gateway(dir.path(), &remote));
-
-        let mut local = remote.clone();
-        local.routing_base_url = "file:///var/lib/updates/".into();
-        assert!(!can_reach_gateway(dir.path(), &local));
-    }
-
     /// A bundle naming another agent must be refused however long this node has been enrolled. The
     /// mint path is the obvious place it appears, but the dangerous one is a bundle swapped under a
-    /// node that already holds its leaf: minting is skipped there, and the refresh path's identity
+    /// node that already holds its leaf: minting is skipped there, so the persisted-path identity
     /// rule is both conditional on aging material and warned away rather than propagated. Boot must
     /// fail closed, before any of the foreign agent's assignment is resolved.
     #[test]
@@ -983,12 +812,10 @@ mod tests {
         // The node has already enrolled, so nothing on this boot would mint a leaf.
         std::fs::write(joined_cert_path(dir.path()), "leaf").unwrap();
 
-        let policy = FixedPolicy::accepting();
-        let error = block_on(load_or_enroll_http(&config, dir.path(), &policy)).unwrap_err();
+        let error = block_on(load_or_enroll_http(&config, dir.path())).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("agent-b"), "{error}");
         // Refused on identity alone: no gateway was asked anything.
-        assert!(!policy.consulted());
     }
 
     fn write_config(dir: &Path, body: &str) -> PathBuf {
@@ -998,9 +825,9 @@ mod tests {
     }
 
     #[test]
-    fn config_is_name_plus_shared_cert_and_mints_a_per_node_identity() {
+    fn config_separates_the_optional_bootstrap_from_the_per_node_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let base = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
+        let base = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\n[enrollment.bootstrap]\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
         let config = NodeConfig::load(&write_config(dir.path(), base)).unwrap();
         assert_eq!(config.enrollment.name, "agent-7");
         // The shared fleet cert authenticates ONLY the enrollment handshake.
@@ -1016,42 +843,132 @@ mod tests {
             steady.client_cert,
             Path::new("/var/lib/updated/state/agent.crt")
         );
+
+        let manual =
+            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='manual-7'\n";
+        let manual = NodeConfig::load(&write_config(dir.path(), manual)).unwrap();
+        assert!(manual.enrollment.enroll_identity().is_err());
+        assert_eq!(
+            manual
+                .enrollment
+                .steady_identity(Path::new("/var/lib/updated/manual"))
+                .unwrap()
+                .client_cert,
+            Path::new("/var/lib/updated/manual/agent.crt")
+        );
+    }
+
+    #[test]
+    fn a_preprovisioned_identity_is_validated_and_never_needs_bootstrap_authority() {
+        crate::tls::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let (ca_pem, ca_key) = test_ca();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+        let key = crate::csr::generate_key().unwrap();
+        let csr = crate::csr::csr_for(&key, "offline fixture").unwrap();
+        let leaf = issue_test_leaf(&ca_pem, &ca_key, &csr, "manual-7");
+        foundation::durable::atomic_write(&joined_key_path(dir.path()), ".key-", key.as_bytes())
+            .unwrap();
+        std::fs::write(joined_cert_path(dir.path()), leaf).unwrap();
+        std::fs::write(
+            bundle_path(dir.path()),
+            serde_json::to_vec(&bundle_for("manual-7", "offline")).unwrap(),
+        )
+        .unwrap();
+        let config = NodeConfig::load(&write_config(
+            dir.path(),
+            &format!(
+                "[enrollment]\nurl='https://updates.example/'\nca='{}'\nname='manual-7'\n",
+                ca_path.display()
+            ),
+        ))
+        .unwrap();
+
+        block_on(load_or_enroll_http(&config, dir.path())).unwrap();
+
+        // A partial external install does not silently count as a usable identity. With no
+        // bootstrap authority available, recovery stops before any network request.
+        std::fs::remove_file(joined_cert_path(dir.path())).unwrap();
+        let error = block_on(load_or_enroll_http(&config, dir.path())).unwrap_err();
+        assert!(
+            error.to_string().contains("no enrollment bootstrap"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn node_config_is_bounded_before_toml_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, vec![b' '; NODE_CONFIG_MAX_BYTES + 1]).unwrap();
+        assert_eq!(
+            NodeConfig::load(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
     fn config_rejects_incomplete_or_stale_input() {
         let dir = tempfile::tempdir().unwrap();
-        let ok = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
+        let ok = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\n[enrollment.bootstrap]\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
         assert!(NodeConfig::load(&write_config(dir.path(), ok)).is_ok());
-        // A missing required field (name / cert / key) is rejected.
+        // A missing required field (name or one half of a present bootstrap identity) is rejected.
         for missing in [
-            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n",
-            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\nclient_key='/id/tls.key'\n",
+            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\n[enrollment.bootstrap]\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n",
+            "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='agent-7'\n[enrollment.bootstrap]\nclient_key='/id/tls.key'\n",
         ] {
             assert!(NodeConfig::load(&write_config(dir.path(), missing)).is_err());
         }
         // An empty name is rejected by `validate()`.
-        let empty = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname=''\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
+        let empty = "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname=''\n[enrollment.bootstrap]\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n";
         assert!(NodeConfig::load(&write_config(dir.path(), empty)).is_err());
         // A removed enrollment field is rejected by `deny_unknown_fields`, so a half-migrated
         // config fails loudly instead of silently ignoring a credential.
         let stale = format!("{ok}group_id='canary'\n");
         assert!(NodeConfig::load(&write_config(dir.path(), &stale)).is_err());
+
+        // The URL is eventually concatenated with fixed enrollment and renewal paths. Reject
+        // every component that could reinterpret those paths or escape into diagnostics before
+        // the node creates any durable enrollment state.
+        for url in [
+            "http://updates.example/",
+            "https://user@updates.example/",
+            "https://updates.example/?token=secret",
+            "https://updates.example/#fragment",
+            "updates.example",
+        ] {
+            let body = format!(
+                "[enrollment]\nurl='{url}'\nca='/id/ca.crt'\nname='agent-7'\n[enrollment.bootstrap]\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n"
+            );
+            let error = NodeConfig::load(&write_config(dir.path(), &body)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "accepted {url}");
+            assert!(
+                !error.to_string().contains("secret"),
+                "URL material escaped into the validation error: {error}"
+            );
+        }
     }
 
+    /// A name the gateway will refuse must fail at config load, not after the node has minted and
+    /// persisted a durable key and built a CSR — otherwise every boot retries and the failure is
+    /// attributed to the gateway rather than to the one file the operator can fix.
     #[test]
-    fn a_node_name_must_be_a_dns_safe_label() {
-        let name = |value: &str| EnrollmentRequest {
-            name: value.into(),
-            csr: String::new(),
-        };
-        assert!(name("agent-7").name_is_wellformed());
-        assert!(name("jenkins-author-0").name_is_wellformed());
-        for bad in ["", "-agent", "agent-", "Agent", "a_b", "a/b", "a.b"] {
-            assert!(
-                !name(bad).name_is_wellformed(),
-                "{bad:?} should be rejected"
+    fn a_node_name_must_be_a_dns_safe_subdomain() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |name: &str| {
+            let body = format!(
+                "[enrollment]\nurl='https://updates.example/'\nca='/id/ca.crt'\nname='{name}'\n[enrollment.bootstrap]\nclient_cert='/id/tls.crt'\nclient_key='/id/tls.key'\n"
             );
+            NodeConfig::load(&write_config(dir.path(), &body))
+        };
+        assert!(load("agent-7").is_ok());
+        assert!(load("jenkins-author-0").is_ok());
+        assert!(load("rack-1.agent-7").is_ok());
+        for bad in [
+            "", " ", "-agent", "agent-", "Agent", "a_b", "a/b", ".agent", "agent.", "a..b",
+        ] {
+            assert!(load(bad).is_err(), "{bad:?} should be rejected at load");
         }
     }
 
@@ -1142,19 +1059,26 @@ mod tests {
             1,
             "this module must send one request shape, the one that carries the deadline"
         );
+        let bounded = body_of(source, "async fn bounded_exchange");
+        assert!(bounded.contains(".send()") && bounded.contains("read_bounded("));
         let exchange = body_of(source, "async fn control_plane_exchange");
-        assert!(exchange.contains("control_plane_request(") && exchange.contains(".send()"));
+        assert!(
+            exchange.contains("control_plane_request(") && exchange.contains("bounded_exchange(")
+        );
         // …and both entry points reach the control plane only through it.
-        for entry in [
-            "async fn mint_leaf",
-            "async fn renew_leaf_if_due",
-            "async fn fetch_bundle",
-        ] {
+        for entry in ["async fn mint_leaf", "async fn renew_leaf_if_due"] {
             assert!(
                 body_of(source, entry).contains("control_plane_exchange("),
                 "`{entry}` reaches the control plane outside the deadline-carrying request"
             );
         }
+        let download = body_of(source, "async fn download_bundle");
+        assert!(
+            download.contains("anonymous_object_client_with_ca(")
+                && download.contains("bounded_exchange(")
+                && download.contains("ENROLLMENT_BUNDLE_LIMIT"),
+            "bundle bytes must use the public-CA-only, deadline-carrying, bounded object path"
+        );
 
         crate::tls::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
@@ -1182,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn config_without_any_credential_is_rejected() {
+    fn config_without_a_node_name_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         assert!(NodeConfig::load(&write_config(
             dir.path(),

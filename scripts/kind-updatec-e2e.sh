@@ -5,11 +5,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Fail with the tool's name rather than mid-provision inside a command substitution,
 # where `set -euo pipefail` kills the run with no diagnostic. The digest tool is
 # coreutils `sha256sum` here and in every container job below — one spelling only.
-for command in kind kubectl docker curl openssl awk sha256sum cargo; do
+for command in kind kubectl helm docker curl openssl awk sha256sum cargo; do
   command -v "$command" >/dev/null || { echo "FAIL: missing required command: $command" >&2; exit 2; }
 done
+# shellcheck source=scripts/lib/publish-fuzz-plan.sh
 . "$ROOT/scripts/lib/publish-fuzz-plan.sh"
 FUZZ_ROUNDS=${UPDATEC_FUZZ_ROUNDS:-1}
+# Managed repository object keys have one controller-owned namespace/name scope. Keep the fixture's
+# direct MinIO probes on that same identity; the Rust e2e asserts this value against the production
+# prefix constructor.
+MANAGED_REPOSITORY_PREFIX="routing/updated-system/default"
 while (( $# > 0 )); do
   case "$1" in
     --fuzz-rounds)
@@ -33,7 +38,94 @@ done
   exit 2
 }
 echo "Kind E2E fleet-fuzz rounds: $FUZZ_ROUNDS"
+
+# ---------------------------- timing, decided once ----------------------------
+#
+# Every wait in this suite bounds one of three facts. Each fact gets one number here, and every
+# call site derives from it, because the alternative is what this script used to do: the same
+# deployment given 180s in one place and 120s in another, and a verifier whose own retry budget
+# (90s per agent, five agents) sat above the job deadline (120s) that killed it — so the retry
+# count past the first agent was configuration that could never run, and the failure arrived as an
+# opaque DeadlineExceeded with the pod deleted and the diagnostic gone.
+#
+# They are deliberately generous. A wait that is too short does not catch a bug; it invents a flake.
+
+# A cluster dependency (deployment, statefulset, pod, certificate) becomes ready.
+READY_TIMEOUT=${UPDATEC_READY_TIMEOUT:-240}
+# The fleet reaches an exact desired state. Spent by the in-cluster verifier itself.
+FLEET_CONVERGE_SECONDS=${UPDATEC_FLEET_CONVERGE_SECONDS:-240}
+# How far a Job's own deadline sits ABOVE the budget its script spends, and how far the outer
+# `kubectl wait` sits above that deadline. This ordering is the point: the script must be what
+# fails, because it is the only layer that can say which agent was behind and on what version.
+JOB_SLACK=60
+WAIT_SLACK=10
+
+# A node reacts to a local event: a relaunch, a workload crash, a certificate rotation, a durable
+# rejection. Four host-side loops each expressed this as a retry COUNT times a sleep interval —
+# 90x1s, 30x1s, 90x2s, 90x2s — so the bound each one actually enforced (90s, 30s, 180s, 180s) was
+# nowhere written down and no two agreed.
+NODE_SETTLE_TIMEOUT=${UPDATEC_NODE_SETTLE_TIMEOUT:-180}
+# A one-shot Job: start a pod, make a single request, exit. No retry loop to bound, so this is the
+# whole budget.
+ONESHOT_JOB_SECONDS=${UPDATEC_ONESHOT_JOB_SECONDS:-30}
+
+# Poll `$2...` once a second until it succeeds or $1 seconds pass. Non-zero on timeout; the caller
+# reports the failure, because only the caller knows what it was waiting for.
+poll_until() {
+  local budget="$1"
+  shift
+  local deadline=$(( $(date +%s) + budget ))
+  while :; do
+    if "$@"; then
+      return 0
+    fi
+    if [[ "$(date +%s)" -ge "$deadline" ]]; then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# The deadline for a Job whose script is bounded by $1 seconds.
+job_deadline() { echo $(( $1 + JOB_SLACK )); }
+
+# Await a Job whose script is bounded by $2 seconds, dumping its logs if it does not complete.
+await_job() {
+  local job="$1" budget="$2"
+  if ! kubectl -n updated-system wait --for=condition=complete "job/$job" \
+    --timeout=$(( budget + JOB_SLACK + WAIT_SLACK ))s; then
+    kubectl -n updated-system logs "job/$job" >&2 || true
+    return 1
+  fi
+}
+
 NAME="${UPDATEC_KIND_CLUSTER:-updatec-e2e}"
+# These values become destructive-operation names and literal YAML scalars below. Validate them
+# before the first `kind delete` or `rm -rf`: quoting prevents shell expansion, but it does not stop
+# `../` path traversal in `$WORK` or a newline from changing the generated Kind document.
+[[ ${#NAME} -le 63 && "$NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || {
+  echo "FAIL: UPDATEC_KIND_CLUSTER must be a lowercase DNS label, got '$NAME'" >&2
+  exit 2
+}
+# The host ports nginx is published on. Overridable so two clusters built from this script can
+# coexist on one machine (the default 80/443 pair is a host-wide singleton): a second run sets
+# UPDATEC_KIND_HTTP_PORT/UPDATEC_KIND_HTTPS_PORT (and UPDATEC_KIND_CLUSTER) and shares nothing.
+HTTP_PORT="${UPDATEC_KIND_HTTP_PORT:-80}"
+HTTPS_PORT="${UPDATEC_KIND_HTTPS_PORT:-443}"
+for port in "$HTTP_PORT" "$HTTPS_PORT"; do
+  if [[ ${#port} -gt 5 || ! "$port" =~ ^[0-9]+$ ]]; then
+    echo "FAIL: Kind host ports must be integers from 1 through 65535, got '$port'" >&2
+    exit 2
+  fi
+  if (( 10#$port < 1 || 10#$port > 65535 )); then
+    echo "FAIL: Kind host ports must be integers from 1 through 65535, got '$port'" >&2
+    exit 2
+  fi
+done
+[[ "$HTTP_PORT" != "$HTTPS_PORT" ]] || {
+  echo "FAIL: Kind HTTP and HTTPS host ports must differ" >&2
+  exit 2
+}
 KUBE_CONTEXT="kind-$NAME"
 # Never depend on kubectl's process-global current context. The fleet e2e, CI, and a
 # developer's separate Kind run may execute concurrently; pinning every operation is
@@ -45,6 +137,9 @@ finish() {
   local status=$?
   if (( status == 0 )) && [[ "${UPDATEC_KEEP_KIND_CLUSTER:-0}" != 1 ]]; then
     cleanup
+    # The work tree contains extracted fleet-CA and node private keys. Keep it with a failed or
+    # explicitly preserved cluster for diagnosis, but never retain credentials after a normal run.
+    rm -rf "$WORK"
     return
   fi
   echo >&2
@@ -76,7 +171,7 @@ cleanup
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-cat >"$WORK/kind.yaml" <<'YAML'
+cat >"$WORK/kind.yaml" <<YAML
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -85,12 +180,12 @@ nodes:
     # so the fleet e2e can front each set's pods with per-set Services.
     labels:
       ingress-ready: "true"
-    # Publish the ingress controller on the host's ports 80/443, so both the browser AND the
+    # Publish the ingress controller on the host's ports, so both the browser AND the
     # co-located out-of-cluster agent reach every endpoint through nginx — the agent resolves
     # updatec-gateway/release-default to 127.0.0.1 (nginx), no socat or LAN-IP needed.
     extraPortMappings:
-      - { containerPort: 80, hostPort: 80, protocol: TCP }
-      - { containerPort: 443, hostPort: 443, protocol: TCP }
+      - { containerPort: 80, hostPort: $HTTP_PORT, protocol: TCP }
+      - { containerPort: 443, hostPort: $HTTPS_PORT, protocol: TCP }
     kubeadmConfigPatches:
       - |
         kind: KubeletConfiguration
@@ -98,19 +193,23 @@ nodes:
         maxPods: 250
 YAML
 kind create cluster --name "$NAME" --config "$WORK/kind.yaml"
-cargo run -q -p updatec --example crdgen >"$WORK/crds.yaml"
-kubectl apply -f "$WORK/crds.yaml"
+# The CRDs the CHART ships, not a fresh generation from the Rust types. An operator installing this
+# product has no Rust toolchain, so what they apply is this file — and this is the run that proves
+# the file works. CI separately fails the build if it has drifted from the types.
+kubectl apply -f "$ROOT/deploy/charts/updatec/crds/"
 kubectl create namespace updated-system
 
 kubectl -n updated-system create deployment minio --image=minio/minio:RELEASE.2025-04-22T22-12-26Z
 kubectl -n updated-system patch deployment minio --type=json -p='[{"op":"add","path":"/spec/template/spec/containers/0/args","value":["server","/data"]}]'
 kubectl -n updated-system set env deployment/minio MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=minio123
 kubectl -n updated-system expose deployment minio --port=9000
-kubectl -n updated-system rollout status deployment/minio --timeout=120s
+kubectl -n updated-system rollout status deployment/minio --timeout=${READY_TIMEOUT}s
 kubectl -n updated-system run minio-init --restart=Never --image=minio/mc:RELEASE.2025-04-16T18-13-26Z --command -- sh -c \
-  'until mc alias set local http://minio:9000 minio minio123; do sleep 1; done; mc mb --ignore-existing local/updates; mc anonymous set download local/updates'
+  "until mc alias set local http://minio:9000 minio minio123; do sleep 1; done; mc mb --ignore-existing local/updates; mc anonymous set download local/updates/releases; mc anonymous set download local/updates/${MANAGED_REPOSITORY_PREFIX}/telemetry"
+# Deliberately one second, and deliberately not a readiness bound: this is a best-effort nudge that
+# lets the pod leave Pending before the Succeeded wait below, which is the one that actually bounds.
 kubectl -n updated-system wait pod/minio-init --for=condition=Ready=false --timeout=1s >/dev/null 2>&1 || true
-kubectl -n updated-system wait pod/minio-init --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s
+kubectl -n updated-system wait pod/minio-init --for=jsonpath='{.status.phase}'=Succeeded --timeout=${READY_TIMEOUT}s
 
 # Ingress controller: cluster infrastructure, provisioned here alongside minio so every
 # environment built from this script is ingress-capable. The fleet e2e fronts each set's
@@ -118,58 +217,57 @@ kubectl -n updated-system wait pod/minio-init --for=jsonpath='{.status.phase}'=S
 # driver's own routing — guarantees a set is only ever answered by its own pods. Scheduled
 # onto the ingress-ready control-plane node (see the kind config above).
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
-kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=180s
+kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=${READY_TIMEOUT}s
 
-# cert-manager issues the fleet mTLS material: a self-signed root CA, then the gateway's server
-# certificate and the agents' client certificate, all from that one CA. The gateway (the only
-# externally exposed listener) requires a client cert the CA signed — that mutual TLS is the
-# enrollment identity, so there is no shared secret anywhere.
+# cert-manager itself — the controller only. The fleet's mTLS material (a self-signed root CA, the
+# gateway's server certificate, and the agents' client certificate, all from that one CA) is
+# declared by the chart below, not here. The gateway, the only externally exposed listener,
+# requires a client cert that CA signed: that mutual TLS is the enrollment identity, so there is no
+# shared secret anywhere.
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.3/cert-manager.yaml
-kubectl -n cert-manager rollout status deployment/cert-manager-webhook --timeout=180s
-kubectl -n cert-manager rollout status deployment/cert-manager --timeout=180s
-kubectl -n cert-manager rollout status deployment/cert-manager-cainjector --timeout=180s
+kubectl -n cert-manager rollout status deployment/cert-manager-webhook --timeout=${READY_TIMEOUT}s
+kubectl -n cert-manager rollout status deployment/cert-manager --timeout=${READY_TIMEOUT}s
+kubectl -n cert-manager rollout status deployment/cert-manager-cainjector --timeout=${READY_TIMEOUT}s
+# Build and side-load the operator image BEFORE the chart installs, so the control plane starts on
+# the image this commit produced rather than backing off against a registry that has never heard
+# of `updatec:kind`.
+docker build -f crates/updatec/Dockerfile -t updatec:kind .
+kind load docker-image --name "$NAME" updatec:kind
+
+# The control plane goes in through the SHIPPED HELM CHART — the same one-command install an
+# operator runs — not through a hand-maintained manifest that could drift from what we publish.
+# `certManager.enabled` makes the chart issue the fleet root, the gateway's server certificate, and
+# the shared bootstrap client certificate, which is the whole mTLS identity: no shared secret.
+#
+# `publicUrl` is set here, at install, rather than patched in afterwards. The controller mints it
+# into IMMUTABLE signed enrollment bundles, so a reconcile that ran on a placeholder would wedge
+# that node's first boot in a way no later edit repairs.
+# The fixture repository uses one static S3 credential Secret, so the externally exposed gateway
+# receives the chart's exact-name read for that Secret and no namespace-wide Secret authority.
+helm upgrade --install updatec "$ROOT/deploy/charts/updatec" \
+  --kube-context "$KUBE_CONTEXT" \
+  --namespace updated-system \
+  --set image.repository=updatec \
+  --set image.tag=kind \
+  --set image.pullPolicy=Never \
+  --set healthproxy.image.repository=updatec-e2e \
+  --set healthproxy.image.tag=kind \
+  --set healthproxy.image.pullPolicy=Never \
+  --set controller.metrics.enabled=true \
+  --set 'gateway.secretResourceNames={s3-credentials}' \
+  --set publicUrl=https://updatec-gateway \
+  --set certManager.enabled=true \
+  --set certManager.agentCertificate.create=true \
+  --set 'certManager.gatewayCertificate.dnsNames={release-default,release-edge,release-batch,localhost}'
+# Deliberately no `--wait`: the gateway does not open its health listener until its
+# UpdateRepository exists, and that resource is applied further down. Readiness is asserted below,
+# after the repository is in place — waiting here would time out on a control plane that is
+# behaving exactly as designed.
+
 cat <<'YAML' | kubectl apply -f -
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata: {name: fleet-selfsigned, namespace: updated-system}
-spec: {selfSigned: {}}
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata: {name: fleet-ca, namespace: updated-system}
-spec:
-  isCA: true
-  commonName: updated-fleet-ca
-  secretName: fleet-ca
-  privateKey: {algorithm: ECDSA, size: 256}
-  issuerRef: {name: fleet-selfsigned, kind: Issuer}
----
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata: {name: fleet-ca-issuer, namespace: updated-system}
-spec: {ca: {secretName: fleet-ca}}
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata: {name: gateway-tls, namespace: updated-system}
-spec:
-  secretName: gateway-tls
-  commonName: updatec-gateway
-  dnsNames: [updatec-gateway, release-default, release-edge, release-batch, localhost]
-  usages: [server auth]
-  issuerRef: {name: fleet-ca-issuer, kind: Issuer}
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata: {name: agent-tls, namespace: updated-system}
-spec:
-  secretName: agent-tls
-  commonName: updated-agent
-  usages: [client auth]
-  issuerRef: {name: fleet-ca-issuer, kind: Issuer}
----
-# An intruder identity issued by the self-signed issuer directly (NOT the fleet CA), so the
-# gateway rejects it — proving the mTLS gate fails closed for a non-fleet client.
+# An intruder identity issued by the chart's self-signed bootstrap issuer DIRECTLY (never the fleet
+# CA), so the gateway rejects it — proving the mTLS gate fails closed for a non-fleet client. This
+# one is a test fixture, so it is the one certificate the chart has no business creating.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata: {name: intruder-tls, namespace: updated-system}
@@ -177,11 +275,60 @@ spec:
   secretName: intruder-tls
   commonName: intruder
   usages: [client auth]
-  issuerRef: {name: fleet-selfsigned, kind: Issuer}
+  issuerRef: {name: updatec-selfsigned, kind: Issuer}
 YAML
-kubectl -n updated-system wait --for=condition=Ready certificate/gateway-tls --timeout=120s
-kubectl -n updated-system wait --for=condition=Ready certificate/agent-tls --timeout=120s
-kubectl -n updated-system wait --for=condition=Ready certificate/intruder-tls --timeout=120s
+kubectl -n updated-system wait --for=condition=Ready certificate/gateway-tls --timeout=${READY_TIMEOUT}s
+kubectl -n updated-system wait --for=condition=Ready certificate/agent-tls --timeout=${READY_TIMEOUT}s
+kubectl -n updated-system wait --for=condition=Ready certificate/intruder-tls --timeout=${READY_TIMEOUT}s
+
+# Direct artifact downloads leave the mTLS gateway only after authorization, then land on this
+# TLS-terminating MinIO load balancer. The public signing name is a namespace-local ExternalName
+# for ingress-nginx: every agent resolves one stable address, nginx balances the MinIO Service,
+# and MinIO receives the original host/path/query needed to verify AWS SigV4. Its leaf chains to
+# the same CA agents already pin for the gateway, so the redirect never weakens transport security.
+cat <<'YAML' | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: minio-direct-tls, namespace: updated-system}
+spec:
+  secretName: minio-direct-tls
+  dnsNames: [minio-direct.updated-system.svc]
+  usages: [server auth]
+  issuerRef: {name: updatec-ca-issuer, kind: Issuer}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: minio-direct, namespace: updated-system}
+spec:
+  type: ExternalName
+  # ExternalName is a DNS CNAME target, not a Service reference. Keep it absolute so CoreDNS does
+  # not return a namespace-relative CNAME that libc cannot resolve from another namespace.
+  externalName: ingress-nginx-controller.ingress-nginx.svc.cluster.local
+  ports: [{name: https, port: 443, targetPort: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minio-direct
+  namespace: updated-system
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [minio-direct.updated-system.svc]
+      secretName: minio-direct-tls
+  rules:
+    - host: minio-direct.updated-system.svc
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: {name: minio, port: {number: 9000}}
+YAML
+kubectl -n updated-system wait --for=condition=Ready certificate/minio-direct-tls --timeout=${READY_TIMEOUT}s
 
 # The fleet CA's own key, used exactly where an operator's out-of-band provisioning would use it:
 # to issue a node's steady-state leaf without the gateway. One issuing function, so the offline
@@ -205,6 +352,23 @@ EOF
   openssl x509 -req -in "$out.csr" -CA "$FLEET_CA/ca.crt" -CAkey "$FLEET_CA/ca.key" \
     -CAcreateserial -days "$days" -extfile "$out.cnf" -out "$out"
 }
+
+# Every repository read uses a live, key-pinned UpdateAgent. Keep one manually provisioned inventory
+# probe for transport assertions that are not tied to a running agent: using either the shared
+# bootstrap certificate or an unregistered fleet leaf here would create a second authorization path
+# that production deliberately does not have.
+ROUTING_PROBE="$WORK/routing-probe"
+mkdir -p "$ROUTING_PROBE"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -out "$ROUTING_PROBE/tls.key" 2>/dev/null
+ROUTING_PROBE_PUBLIC_KEY="$(cargo run -q -p updatectl -- node-public-key \
+  --key "$ROUTING_PROBE/tls.key")"
+sign_node_leaf kind-routing-probe \
+  "$ROUTING_PROBE/tls.key" "$ROUTING_PROBE/tls.crt" 1
+kubectl -n updated-system create secret generic routing-probe-tls \
+  --from-file=tls.crt="$ROUTING_PROBE/tls.crt" \
+  --from-file=tls.key="$ROUTING_PROBE/tls.key" \
+  --from-file=ca.crt="$FLEET_CA/ca.crt"
 
 docker build -f crates/updatec/Dockerfile.e2e -t updatec-e2e:kind .
 kind load docker-image --name "$NAME" updatec-e2e:kind
@@ -233,8 +397,9 @@ spec:
           ports: [{name: https, containerPort: 8080}]
           volumeMounts:
             - {name: repository, mountPath: /data}
-            # The fleet server cert + CA: release-server terminates mTLS, so it needs the same
-            # gateway-tls material the gateway uses.
+            # Reuse the fleet server leaf as this fixture's HTTPS identity. The release origin is
+            # anonymous and never requests a client certificate; only the gateway uses the CA to
+            # authenticate nodes.
             - {name: gateway-tls, mountPath: /etc/gateway-tls, readOnly: true}
       volumes:
         - name: repository
@@ -270,7 +435,7 @@ spec:
   selector: {app: release-server}
   ports: [{name: https, port: 443, targetPort: https}]
 YAML
-kubectl -n updated-system rollout status deployment/release-server --timeout=180s
+kubectl -n updated-system rollout status deployment/release-server --timeout=${READY_TIMEOUT}s
 echo "waiting for the in-cluster release repository"
 for attempt in {1..60}; do
   if kubectl -n updated-system exec deployment/release-server -c release-server -- \
@@ -305,24 +470,130 @@ PROVIDER_SHA="$(kubectl -n updated-system exec deployment/release-server -c rele
   --repo /data/repository --name provider-sets/default.json)"
 
 cargo run -q -p server -- init --repo "$WORK/seed-repo" --keys "$WORK/keys"
-kubectl -n updated-system create secret generic tuf-signing-keys --from-file="$WORK/keys/root.pk8" --from-file="$WORK/keys/targets.pk8" --from-file="$WORK/keys/snapshot.pk8" --from-file="$WORK/keys/timestamp.pk8"
+kubectl -n updated-system create secret generic tuf-signing-keys \
+  --from-file="$WORK/keys/root.pk8" --from-file="$WORK/keys/root.next.pk8" \
+  --from-file="$WORK/keys/targets.pk8" --from-file="$WORK/keys/snapshot.pk8" \
+  --from-file="$WORK/keys/timestamp.pk8"
 kubectl -n updated-system create secret generic s3-credentials --from-literal=AWS_ACCESS_KEY_ID=minio --from-literal=AWS_SECRET_ACCESS_KEY=minio123
 
 cargo run -q -p updatec --example kind_resources -- \
   "$PLATFORM" "$APP_V1_SHA" "$APP_V2_SHA" "$APP_V3_SHA" "$PROVIDER_SHA" \
   "$WORK/release-root.json" >"$WORK/resources.yaml"
 kubectl apply -f "$WORK/resources.yaml"
+cat <<YAML | kubectl apply -f -
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata: {name: kind-routing-probe, namespace: updated-system}
+spec:
+  repositoryRef: {name: default}
+  identity: {kind: manual, publicKey: "$ROUTING_PROBE_PUBLIC_KEY"}
+  labels: {}
+YAML
 
-docker build -f crates/updatec/Dockerfile -t updatec:kind .
-kind load docker-image --name "$NAME" updatec:kind
-# Deploy the operator with its public URL already pointing at the in-cluster gateway. Substituting
-# it into the manifest BEFORE apply (rather than `kubectl set env` after) means the controller never
-# starts on the placeholder URL — otherwise a reconcile during the env rollout can mint an
-# *immutable* enrollment bundle that points a node at the placeholder, wedging that node's first boot.
-sed 's#https://updates.example/routing#https://updatec-gateway#g' deploy/kubernetes/updatec.yaml \
-  | kubectl apply -f -
-kubectl -n updated-system rollout status deployment/updatec-controller --timeout=180s
-kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=180s
+# The control plane was installed from the chart before cert-manager's material was minted; its
+# UpdateRepository now exists, so the gateway can finish opening its listeners and both workloads
+# become ready.
+kubectl -n updated-system rollout status deployment/updatec-controller --timeout=${READY_TIMEOUT}s
+kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=${READY_TIMEOUT}s
+
+# Exercise the gateway's field boundary at the API server, independently of the honest gateway
+# process. The service account can CREATE UpdateAgents by RBAC, so only the fail-closed validating
+# policy prevents a compromised internet-facing pod from creating held/cordoned inventory or
+# enrolling into another repository. First prove the forbidden shape is denied, then prove the one
+# intended create shape remains usable (the later five-node enrollment proves reserved UPDATE).
+GATEWAY_USER=system:serviceaccount:updated-system:updatec-gateway
+if kubectl -n updated-system --as="$GATEWAY_USER" create -f - <<'YAML'
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata: {name: forbidden-gateway-agent}
+spec:
+  repositoryRef: {name: default}
+  identity:
+    kind: enrolled
+    registrationSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    publicKey: "0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  labels: {}
+  hold: true
+  cordon: false
+YAML
+then
+  echo "FAIL: gateway service account created a held UpdateAgent through the admission boundary" >&2
+  exit 1
+fi
+if kubectl -n updated-system --as="$GATEWAY_USER" create -f - <<'YAML'
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata: {name: forbidden-gateway-label}
+spec:
+  repositoryRef: {name: default}
+  identity:
+    kind: enrolled
+    registrationSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    publicKey: "0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  labels: {updated.dev/role: edge}
+  hold: false
+  cordon: false
+YAML
+then
+  echo "FAIL: gateway service account bypassed the repository's operator-owned enrollment labels" >&2
+  exit 1
+fi
+if kubectl -n updated-system --as="$GATEWAY_USER" create -f - <<'YAML'
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata:
+  name: forbidden-gateway-metadata
+  annotations: {attacker.example/persist: "true"}
+spec:
+  repositoryRef: {name: default}
+  identity:
+    kind: enrolled
+    registrationSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    publicKey: "0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  labels: {}
+  hold: false
+  cordon: false
+YAML
+then
+  echo "FAIL: gateway service account added user-controlled metadata to an UpdateAgent" >&2
+  exit 1
+fi
+kubectl -n updated-system --as="$GATEWAY_USER" create -f - <<'YAML'
+apiVersion: updated.dev/v1alpha1
+kind: UpdateAgent
+metadata: {name: gateway-admission-probe}
+spec:
+  repositoryRef: {name: default}
+  identity:
+    kind: enrolled
+    registrationSha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    publicKey: "0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  labels: {}
+  hold: false
+  cordon: false
+YAML
+kubectl -n updated-system delete updateagent gateway-admission-probe --wait=true
+echo "gateway UpdateAgent admission denies unsafe fields and admits only the enrollment shape"
+
+# The deletion finalizer is allowed to prune only the storage scope the object was created to own.
+# Prove the generated CRD refuses physical-coordinate retargets before one can turn deletion into
+# an attacker-selected object-store delete. Prefix is not part of the managed-repository API.
+if kubectl -n updated-system patch updaterepository default --type=merge \
+  -p='{"spec":{"s3":{"bucket":"another-bucket"}}}'; then
+  echo "FAIL: UpdateRepository storage bucket was mutable" >&2
+  exit 1
+fi
+if kubectl -n updated-system patch updaterepository default --type=merge \
+  -p='{"spec":{"s3":{"endpoint":"https://another-store.example"}}}'; then
+  echo "FAIL: UpdateRepository storage endpoint was mutable" >&2
+  exit 1
+fi
+if kubectl -n updated-system patch updaterepository default --type=merge \
+  -p='{"spec":{"s3":{"credentialsSecretRef":{"name":"another-identity"}}}}'; then
+  echo "FAIL: UpdateRepository storage credential identity was mutable" >&2
+  exit 1
+fi
+echo "UpdateRepository storage coordinates are write-once at the API server"
 
 echo "waiting for updatec to publish the first complete routing generation"
 for attempt in {1..60}; do
@@ -342,43 +613,182 @@ if ! kubectl_log_contains deployment/updatec-controller 'desired state reconcile
 fi
 echo "initial routing generation published"
 
-# Exercise the offline provisioning route end to end. The controller turns a manual UpdateAgent
-# into an immutable signed enrollment Secret. A `manual` identity is deliberately never completable
-# over the shared fleet bootstrap certificate — `/enroll` refuses it — so the operator provisions
-# BOTH halves out of band: the signed bundle (routing, assignment, initial config) and the node's
-# own steady-state leaf, issued here from the fleet CA exactly as an offline PKI would. The agent
-# then performs the same repository-backed cold install every other fresh node performs.
-cat <<'YAML' | kubectl apply -f -
+# The controller log above proves a complete repository generation exists, but it is not tied to a
+# particular watch event. Bind the transport assertion to the probe's own published status so a
+# fast repository-only reconcile cannot race the immediately following UpdateAgent creation.
+routing_probe_has_assignment() {
+  [[ -n "$(kubectl -n updated-system get updateagent kind-routing-probe \
+    -o jsonpath='{.status.assignmentPath}' 2>/dev/null || true)" ]]
+}
+if ! poll_until "$READY_TIMEOUT" routing_probe_has_assignment; then
+  echo "FAIL: routing probe never received a published assignment" >&2
+  kubectl -n updated-system get updateagent kind-routing-probe -o yaml >&2 || true
+  exit 1
+fi
+
+# Prove direct download as a transport contract, not merely as a successful agent fetch. The root
+# is present in every complete generation. Require a real, live, key-pinned inventory identity to
+# receive a 307 to the MinIO TLS load balancer, require that signed URL to download, and require the
+# same object URL without its signature to be refused. This avoids a privileged bucket listing and
+# tests the same single repository-read authorization path used by metadata, assignments, configs,
+# and artifacts.
+DIRECT_PATH=metadata/root.json
+cat >"$WORK/direct-download-check.yaml" <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: direct-download-check, namespace: updated-system}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: check
+      image: updatec-e2e:kind
+      imagePullPolicy: Never
+      command: [/bin/sh, -ec]
+      args:
+        - |
+          target='https://updatec-gateway/$DIRECT_PATH'
+          status="\$(curl -sS --max-time 15 --cert /tls/tls.crt --key /tls/tls.key \
+            --cacert /tls/ca.crt -D /tmp/headers -o /dev/null -w '%{http_code}' "\$target")"
+          if [ "\$status" != 307 ]; then
+            echo "gateway repository read returned HTTP \$status, expected 307" >&2
+            exit 1
+          fi
+          location="\$(awk 'BEGIN {IGNORECASE=1} /^location:/ {sub(/\r\$/, ""); print \$2}' /tmp/headers)"
+          case "\$location" in
+            https://minio-direct.updated-system.svc/*?X-Amz-*) ;;
+            *) echo "unexpected direct-download Location shape" >&2; exit 1 ;;
+          esac
+          # Spend the bearer URL with no client identity. The agent uses two clients for this same
+          # reason: mTLS authenticates only the gateway request; S3 sees only the exact capability.
+          curl -fsS --max-time 30 --cacert /tls/ca.crt "\$location" -o /tmp/root.json
+          test -s /tmp/root.json
+          unsigned="\${location%%\?*}"
+          if curl -fsS --max-time 15 --cacert /tls/ca.crt "\$unsigned" -o /dev/null 2>/dev/null; then
+            echo "private routing target was downloadable without its signature" >&2
+            exit 1
+          fi
+          echo "signed direct download verified: \$status exact HTTPS capability"
+      volumeMounts:
+        - {name: tls, mountPath: /tls, readOnly: true}
+  volumes:
+    - {name: tls, secret: {secretName: routing-probe-tls}}
+YAML
+kubectl apply -f "$WORK/direct-download-check.yaml"
+for attempt in {1..60}; do
+  DIRECT_PHASE="$(kubectl -n updated-system get pod direct-download-check \
+    -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  [[ "$DIRECT_PHASE" == Succeeded || "$DIRECT_PHASE" == Failed ]] && break
+  sleep 1
+done
+if [[ "${DIRECT_PHASE:-}" != Succeeded ]]; then
+  echo "FAIL: signed direct download check did not succeed" >&2
+  kubectl -n updated-system logs direct-download-check >&2 || true
+  kubectl -n updated-system logs deployment/updatec-gateway --tail=100 >&2 || true
+  exit 1
+fi
+kubectl -n updated-system logs direct-download-check
+echo "private MinIO routing objects are reachable only through the gateway's signed HTTPS redirect"
+
+# `stateMaxShards` is a live CRD control, not an install-time or compiled ceiling. Start from the
+# default eight-shard projection that performed the initial publication, then change it in place.
+# Reconcile must atomically move the same durable state to exactly three shards and reclaim both the
+# old slot and every unused name; otherwise lowering the knob would not actually lower the steady
+# etcd footprint.
+ADMITTED_INDEX=updatec-admitted-default
+INITIAL_STATE_INDEX="$(kubectl -n updated-system get configmap "$ADMITTED_INDEX" \
+  -o jsonpath='{.data.index\.json}')"
+if [[ "$INITIAL_STATE_INDEX" != *'"maxShards":8'* ]]; then
+  echo "FAIL: initial durable state did not use the CRD default of eight shards: $INITIAL_STATE_INDEX" >&2
+  exit 1
+fi
+kubectl -n updated-system patch updaterepository default --type=merge \
+  -p='{"spec":{"stateMaxShards":3}}'
+echo "waiting for live durable-state rebalance from eight shards to three"
+STATE_INDEX=""
+for attempt in {1..60}; do
+  STATE_INDEX="$(kubectl -n updated-system get configmap "$ADMITTED_INDEX" \
+    -o jsonpath='{.data.index\.json}' 2>/dev/null || true)"
+  case "$STATE_INDEX" in
+    *'"maxShards":3'*'"aShards":3,"bShards":0'* | \
+    *'"maxShards":3'*'"aShards":0,"bShards":3'*) break ;;
+  esac
+  sleep 1
+done
+case "$STATE_INDEX" in
+  *'"maxShards":3'*'"aShards":3,"bShards":0'*) ACTIVE_STATE_SLOT=a ;;
+  *'"maxShards":3'*'"aShards":0,"bShards":3'*) ACTIVE_STATE_SLOT=b ;;
+  *)
+    echo "FAIL: durable-state rebalance did not settle on exactly three active shards: $STATE_INDEX" >&2
+    exit 1
+    ;;
+esac
+EXPECTED_STATE_MAPS="configmap/$ADMITTED_INDEX
+configmap/$ADMITTED_INDEX-$ACTIVE_STATE_SLOT-00
+configmap/$ADMITTED_INDEX-$ACTIVE_STATE_SLOT-01
+configmap/$ADMITTED_INDEX-$ACTIVE_STATE_SLOT-02"
+ACTUAL_STATE_MAPS="$(kubectl -n updated-system get configmaps \
+  -l app.kubernetes.io/component=controller-state -o name | sort)"
+if [[ "$ACTUAL_STATE_MAPS" != "$EXPECTED_STATE_MAPS" ]]; then
+  echo "FAIL: stateMaxShards=3 did not leave exactly the index and three active ConfigMaps" >&2
+  echo "expected:" >&2
+  echo "$EXPECTED_STATE_MAPS" >&2
+  echo "actual:" >&2
+  echo "$ACTUAL_STATE_MAPS" >&2
+  exit 1
+fi
+echo "live durable-state rebalance converged to exactly three shards"
+
+# Exercise the offline provisioning route end to end. The operator first creates the node key and
+# pins its public half in inventory. The controller then turns that manual UpdateAgent into a
+# content-addressed signed enrollment object in S3. A `manual` identity is never completable over
+# the shared fleet bootstrap certificate — `/enroll` refuses it — so the operator provisions both
+# the signed bundle and the matching leaf out of band. After bootstrap, the pin gives this node the
+# exact same key-bound capabilities and signed-telemetry path as an online-enrolled node.
+MANUAL_IDENTITY="$WORK/manual-offline-identity"
+mkdir -p "$MANUAL_IDENTITY"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -out "$MANUAL_IDENTITY/agent.key" 2>/dev/null
+MANUAL_PUBLIC_KEY="$(cargo run -q -p updatectl -- node-public-key \
+  --key "$MANUAL_IDENTITY/agent.key")"
+sign_node_leaf manual-offline "$MANUAL_IDENTITY/agent.key" "$MANUAL_IDENTITY/agent.crt" 90
+cat <<YAML | kubectl apply -f -
 apiVersion: updated.dev/v1alpha1
 kind: UpdateAgent
 metadata: {name: manual-offline, namespace: updated-system}
 spec:
   repositoryRef: {name: default}
-  identity: {kind: manual}
+  identity: {kind: manual, publicKey: "$MANUAL_PUBLIC_KEY"}
   labels: {}
 YAML
 echo "waiting for the manual agent's signed installer artifact"
 for attempt in {1..60}; do
-  MANUAL_ENROLLMENT_SECRET="$(kubectl -n updated-system get updateagent manual-offline \
-    -o jsonpath='{.status.enrollmentSecretRef.name}' 2>/dev/null || true)"
-  if [[ -n "$MANUAL_ENROLLMENT_SECRET" ]] && \
-    kubectl -n updated-system get secret "$MANUAL_ENROLLMENT_SECRET" >/dev/null 2>&1; then
-    break
-  fi
+  MANUAL_ENROLLMENT_OBJECT="$(kubectl -n updated-system get updateagent manual-offline \
+    -o jsonpath='{.status.enrollmentObjectKey}' 2>/dev/null || true)"
+  [[ -n "$MANUAL_ENROLLMENT_OBJECT" ]] && break
   sleep 2
 done
-if [[ -z "${MANUAL_ENROLLMENT_SECRET:-}" ]]; then
-  echo "FAIL: manual agent never received an enrollment Secret" >&2
+if [[ -z "${MANUAL_ENROLLMENT_OBJECT:-}" ]]; then
+  echo "FAIL: manual agent never received an enrollment object" >&2
   kubectl -n updated-system get updateagent manual-offline -o yaml >&2 || true
   exit 1
 fi
-MANUAL_IDENTITY="$WORK/manual-offline-identity"
-mkdir -p "$MANUAL_IDENTITY"
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-  -out "$MANUAL_IDENTITY/agent.key" 2>/dev/null
-sign_node_leaf manual-offline "$MANUAL_IDENTITY/agent.key" "$MANUAL_IDENTITY/agent.crt" 90
+# Model the operator's offline copy: read the exact S3 object named on status, materialize it as a
+# file, then hand that file to the machine. The temporary Secret below is only how this Kubernetes
+# test projects the copied file into its pod; updatec never writes or reads enrollment Secrets.
+kubectl -n updated-system run manual-enrollment-export --restart=Never \
+  --image=minio/mc:RELEASE.2025-04-16T18-13-26Z --command -- sh -ec \
+  "mc alias set local http://minio:9000 minio minio123 >/dev/null; mc cat local/updates/${MANAGED_REPOSITORY_PREFIX}/$MANUAL_ENROLLMENT_OBJECT"
+kubectl -n updated-system wait pod/manual-enrollment-export \
+  --for=jsonpath='{.status.phase}'=Succeeded --timeout=${READY_TIMEOUT}s
+kubectl -n updated-system logs manual-enrollment-export >"$WORK/manual-enrollment.json"
+kubectl -n updated-system create secret generic manual-offline-enrollment \
+  --from-file=enrollment.json="$WORK/manual-enrollment.json"
 kubectl -n updated-system create secret generic manual-offline-identity \
   --from-file="$MANUAL_IDENTITY/agent.crt" --from-file="$MANUAL_IDENTITY/agent.key"
+# The manually provisioned node needs the public fleet trust anchor, never the shared enrollment
+# private key. A ConfigMap makes that least-authority boundary visible in the test topology.
+kubectl -n updated-system create configmap manual-offline-trust \
+  --from-file=ca.crt="$FLEET_CA/ca.crt"
 cat >"$WORK/manual-offline.yaml" <<YAML
 apiVersion: v1
 kind: ConfigMap
@@ -388,13 +798,11 @@ data:
     [enrollment]
     # The preplaced signed bundle gives this node its routing/assignment/initial config for a
     # network-free first start, and the preplaced leaf gives it its steady-state identity, so it
-    # reaches the gateway only for the repository content its assignment names. The shared fleet
-    # certificate below authenticates nothing for this node — a manual identity never enrolls.
+    # reaches the gateway only for the repository content its assignment names. A manual identity
+    # never receives the fleet enrollment private key.
     url = "https://updatec-gateway"
     name = "manual-offline"
-    client_cert = "/etc/agent-tls/tls.crt"
-    client_key = "/etc/agent-tls/tls.key"
-    ca = "/etc/agent-tls/ca.crt"
+    ca = "/etc/fleet-trust/ca.crt"
 ---
 apiVersion: v1
 kind: Pod
@@ -437,21 +845,18 @@ spec:
       volumeMounts:
         - {name: state, mountPath: /var/lib/updated}
         - {name: launcher-config, mountPath: /launcher-config, readOnly: true}
-        # The offline agent still fronts the real gateway for routing/secrets after its
-        # network-free cold install, so it carries the same shared fleet mTLS identity every
-        # other agent does (its config.toml points its client cert/key/CA here).
-        - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
+        - {name: fleet-trust, mountPath: /etc/fleet-trust, readOnly: true}
   volumes:
     - {name: state, emptyDir: {}}
     - name: enrollment
-      secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
+      secret: {secretName: manual-offline-enrollment}
     - {name: identity, secret: {secretName: manual-offline-identity}}
     - name: launcher-config
       configMap: {name: manual-offline-config}
-    - {name: agent-tls, secret: {secretName: agent-tls}}
+    - {name: fleet-trust, configMap: {name: manual-offline-trust}}
 YAML
 kubectl apply -f "$WORK/manual-offline.yaml"
-kubectl -n updated-system wait pod/manual-offline --for=condition=Ready --timeout=120s
+kubectl -n updated-system wait pod/manual-offline --for=condition=Ready --timeout=${READY_TIMEOUT}s
 # The workload belongs to the release's own reconciler, so the proof it converged is the
 # application answering — reached with a bounded wait rather than assumed to be up the instant the
 # container reports ready.
@@ -472,7 +877,25 @@ kubectl_log_contains manual-offline \
   echo "FAIL: manual agent did not cold-install from its preplaced enrollment bundle" >&2
   exit 1
 }
-echo "manual CRD export cold-installed offline and its reconciler started 1.0.0"
+# A manual node must not be operationally blind: its pinned key authorizes the same bounded report
+# upload as online enrollment, and the controller must verify and surface that report.
+MANUAL_REPORTED_VERSION=""
+MANUAL_REPORTED_READY=""
+for attempt in {1..60}; do
+  MANUAL_REPORTED_VERSION="$(kubectl -n updated-system get updateagent manual-offline \
+    -o jsonpath='{.status.reportedVersion}' 2>/dev/null || true)"
+  MANUAL_REPORTED_READY="$(kubectl -n updated-system get updateagent manual-offline \
+    -o jsonpath='{.status.reportedReady}' 2>/dev/null || true)"
+  [[ "$MANUAL_REPORTED_VERSION" == 1.0.0 && "$MANUAL_REPORTED_READY" == true ]] && break
+  sleep 2
+done
+if [[ "$MANUAL_REPORTED_VERSION" != 1.0.0 || "$MANUAL_REPORTED_READY" != true ]]; then
+  echo "FAIL: manual agent telemetry was not accepted (version=$MANUAL_REPORTED_VERSION ready=$MANUAL_REPORTED_READY)" >&2
+  kubectl -n updated-system get updateagent manual-offline -o yaml >&2 || true
+  kubectl -n updated-system logs manual-offline -c agent --tail=100 >&2 || true
+  exit 1
+fi
+echo "manual CRD export cold-installed offline, started 1.0.0, and reported healthy"
 
 # A malformed enrollment artifact is terminal: it must never fall back to the URL/key or install
 # an application. `timeout` bounds the launcher's intentional relaunch retries so Kubernetes
@@ -509,7 +932,7 @@ spec:
   volumes:
     - {name: state, emptyDir: {}}
     - name: enrollment
-      secret: {secretName: $MANUAL_ENROLLMENT_SECRET}
+      secret: {secretName: manual-offline-enrollment}
     - name: launcher-config
       configMap: {name: manual-offline-config}
 YAML
@@ -553,9 +976,10 @@ spec:
           [enrollment]
           url = "https://updatec-gateway"
           name = "intruder"
+          ca = "/etc/agent-tls/ca.crt"
+          [enrollment.bootstrap]
           client_cert = "/etc/intruder-tls/tls.crt"
           client_key = "/etc/intruder-tls/tls.key"
-          ca = "/etc/agent-tls/ca.crt"
           EOF
           timeout 15 updated-launcher --state-dir /var/lib/updated/launcher \
             --config /tmp/config.toml --agent /usr/local/bin/updated-agent \
@@ -654,7 +1078,7 @@ spec:
       spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
 YAML
 echo "waiting for all five real agent nodes to reach their assigned versions"
-kubectl -n updated-system rollout status statefulset/agent --timeout=240s
+kubectl -n updated-system rollout status statefulset/agent --timeout=${READY_TIMEOUT}s
 # The `UpdateAgent` name pod `agent-<ordinal>` enrolls under. Read from the single definition of
 # that derivation (`resource_name`, crates/updatec-e2e/src/cluster.rs) — the same one the pods
 # themselves use through `updatec-e2e agent-name` — never re-derived here. Derived once for all
@@ -667,8 +1091,17 @@ declare -a AGENT_RESOURCES
 for ordinal in 0 1 2 3 4; do
   AGENT_RESOURCES[ordinal]="$(agent_resource_name "$ordinal")"
 done
+agent_is_enrolled() {
+  [[ "$(kubectl -n updated-system get updateagent "$1" \
+    -o jsonpath='{.spec.identity.kind}' 2>/dev/null || true)" == enrolled ]]
+}
 for ordinal in 0 1 2 3 4; do
   resource="${AGENT_RESOURCES[ordinal]}"
+  poll_until "$NODE_SETTLE_TIMEOUT" agent_is_enrolled "$resource" || {
+    echo "FAIL: agent-$ordinal did not create enrolled UpdateAgent $resource" >&2
+    kubectl -n updated-system logs "agent-$ordinal" -c agent --tail=200 >&2 || true
+    exit 1
+  }
   identity="$(kubectl -n updated-system get updateagent "$resource" -o jsonpath='{.spec.identity.kind}')"
   [[ "$identity" == enrolled ]] || {
     echo "FAIL: agent-$ordinal registered with identity '$identity', expected enrolled" >&2
@@ -692,6 +1125,41 @@ for ordinal in 0 1 2 3 4; do
   }
 done
 echo "all five empty agents enrolled online and cold-installed the network assignment"
+
+# Prove the direct WRITE boundary independently of the honest agent client. A live node asks the
+# mTLS gateway for its exact report capability, then tries to spend that capability on a payload
+# one byte past the report ceiling. The policy itself must name the ceiling and MinIO must reject
+# the POST: merely bounding controller reads would still let a compromised node consume unbounded
+# object-store capacity and ingress bandwidth.
+# shellcheck disable=SC2016 # The script is intentionally evaluated by the shell inside the pod.
+kubectl -n updated-system exec agent-0 -c agent -- sh -ec '
+  state=/var/lib/updated/launcher
+  capability=$(curl -fsS --max-time 15 \
+    --cert "$state/agent.crt" --key "$state/agent.key" --cacert /etc/agent-tls/ca.crt \
+    https://updatec-gateway/v1/node/report)
+  field() {
+    printf "%s" "$capability" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"
+  }
+  action=$(field url)
+  key=$(field key)
+  policy=$(field policy)
+  algorithm=$(field x-amz-algorithm)
+  credential=$(field x-amz-credential)
+  date=$(field x-amz-date)
+  signature=$(field x-amz-signature)
+  case "$action" in https://minio-direct.updated-system.svc/updates/) ;; *) exit 1 ;; esac
+  printf "%s" "$policy" | base64 -d >/tmp/report-policy.json
+  grep -q '\''\["content-length-range",1,65536\]'\'' /tmp/report-policy.json
+  head -c 65537 /dev/zero >/tmp/oversized-report.json
+  status=$(curl -sS --max-time 15 -o /tmp/oversized-response -w "%{http_code}" \
+    --cacert /etc/agent-tls/ca.crt \
+    -F "key=$key" -F "policy=$policy" -F "x-amz-algorithm=$algorithm" \
+    -F "x-amz-credential=$credential" -F "x-amz-date=$date" \
+    -F "x-amz-signature=$signature" -F "file=@/tmp/oversized-report.json" \
+    "$action")
+  case "$status" in 4??) ;; *) echo "oversized signed S3 POST returned HTTP $status" >&2; exit 1 ;; esac
+'
+echo "MinIO enforced the signed direct-upload report ceiling"
 
 # Exercise certificate renewal through the live gateway without restarting the pod, container, or
 # workload. Replace agent-4's leaf with a fleet-CA-signed one-day leaf for the SAME durable key and
@@ -722,6 +1190,7 @@ short_cert="$(sha256sum "$ROTATION_DIR/short.crt" | awk '{print $1}')"
 # reconciler started runs as its entrypoint, `app`.
 process_pid() {
   local process="$1"
+  # shellcheck disable=SC2016 # $path and $1 belong to the shell running inside the pod.
   kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- sh -ec '
     for path in /proc/[0-9]*; do
       [ "$(cat "$path/comm" 2>/dev/null || true)" = "$1" ] || continue
@@ -734,13 +1203,15 @@ process_pid() {
 agent_before="$(process_pid updated-agent)"
 application_before="$(process_pid app)"
 
-cat <<'YAML' | kubectl apply -f -
+# The observer samples once a second for exactly this long; both bounds below derive from it.
+ROTATION_OBSERVE_SECONDS=45
+cat <<YAML | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata: {name: observe-certificate-rotation, namespace: updated-system}
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 90
+  activeDeadlineSeconds: $(job_deadline "$ROTATION_OBSERVE_SECONDS")
   template:
     spec:
       restartPolicy: Never
@@ -748,22 +1219,26 @@ spec:
         - name: observe
           image: updatec-e2e:kind
           command: [/bin/sh, -ec]
+          env:
+            - {name: OBSERVE_SECONDS, value: "$ROTATION_OBSERVE_SECONDS"}
           args:
             - |
               failures=0
-              for attempt in $(seq 1 45); do
-                version=$(curl -fsS --max-time 1 http://agent-4.agents:8080/version || true)
-                [ "$version" = 1.0.0 ] || failures=$((failures + 1))
+              attempt=0
+              while [ "\$attempt" -lt "\$OBSERVE_SECONDS" ]; do
+                attempt=\$((attempt + 1))
+                version=\$(curl -fsS --max-time 1 http://agent-4.agents:8080/version || true)
+                [ "\$version" = 1.0.0 ] || failures=\$((failures + 1))
                 sleep 1
               done
-              [ "$failures" -eq 0 ] || {
-                echo "application was unavailable for $failures observation(s)" >&2
+              [ "\$failures" -eq 0 ] || {
+                echo "application was unavailable for \$failures observation(s)" >&2
                 exit 1
               }
               echo "application stayed available throughout certificate renewal"
 YAML
 kubectl -n updated-system wait --for=condition=ready \
-  pod -l job-name=observe-certificate-rotation --timeout=30s
+  pod -l job-name=observe-certificate-rotation --timeout=${READY_TIMEOUT}s
 
 # Install the near-expiry leaf completely before signalling the agent. Existing clients keep
 # using their in-memory identity until the launcher relaunches the agent.
@@ -772,20 +1247,15 @@ kubectl -n updated-system exec -i "$ROTATION_AGENT" -c agent -- \
 kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
   kill -TERM "$agent_before"
 
-renewed=false
-for attempt in $(seq 1 90); do
+rotation_relaunched_the_agent() {
   kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
     cat "$ROTATION_STATE/agent.crt" >"$ROTATION_DIR/renewed.crt"
   renewed_cert="$(sha256sum "$ROTATION_DIR/renewed.crt" | awk '{print $1}')"
   agent_after="$(process_pid updated-agent 2>/dev/null || true)"
-  if [[ "$renewed_cert" != "$short_cert" && -n "$agent_after" \
-      && "$agent_after" != "$agent_before" ]]; then
-    renewed=true
-    break
-  fi
-  sleep 1
-done
-[[ "$renewed" == true ]] || {
+  [[ "$renewed_cert" != "$short_cert" && -n "$agent_after" \
+    && "$agent_after" != "$agent_before" ]]
+}
+poll_until "$NODE_SETTLE_TIMEOUT" rotation_relaunched_the_agent || {
   echo "FAIL: agent-4 did not renew its short-lived certificate and relaunch its agent" >&2
   kubectl -n updated-system logs "$ROTATION_AGENT" -c agent --tail=200 >&2 || true
   exit 1
@@ -812,23 +1282,24 @@ kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
     >/dev/null
 kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
   curl -fsS --cert "$ROTATION_STATE/agent.crt" --key "$ROTATION_STATE/agent.key" \
-    --cacert /etc/agent-tls/ca.crt https://updatec-gateway/v1/node/secrets \
+    --cacert /etc/agent-tls/ca.crt https://updatec-gateway/v1/node/report \
     >/dev/null
 # The shared fleet bootstrap certificate authenticates the one /enroll handshake and NOTHING else.
 # It is signed by the same fleet CA, so it completes the mTLS handshake — but it carries no SPIFFE
 # node SAN, so every steady-state route must refuse it. Otherwise any holder of the fleet-wide
-# enrollment Secret could read a node's assigned secrets. Repository content stays readable (it is
-# not node-scoped), which the timestamp.json fetch above already proves for the same certificate.
-if kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
-  curl -fsS --cert /etc/agent-tls/tls.crt --key /etc/agent-tls/tls.key \
-    --cacert /etc/agent-tls/ca.crt https://updatec-gateway/v1/node/secrets \
-    >/dev/null 2>&1; then
-  echo "FAIL: the shared bootstrap certificate was served node secrets" >&2
-  exit 1
-fi
-echo "the shared bootstrap certificate is refused on steady-state node routes"
-kubectl -n updated-system wait --for=condition=complete \
-  job/observe-certificate-rotation --timeout=90s
+# enrollment Secret could mint either repository-read or node-object capabilities.
+for bootstrap_path in metadata/timestamp.json v1/node/report; do
+  bootstrap_status="$(kubectl -n updated-system exec "$ROTATION_AGENT" -c agent -- \
+    curl -sS --max-time 15 --cert /etc/agent-tls/tls.crt --key /etc/agent-tls/tls.key \
+      --cacert /etc/agent-tls/ca.crt -o /dev/null -w '%{http_code}' \
+      "https://updatec-gateway/$bootstrap_path")"
+  if [[ "$bootstrap_status" != 403 ]]; then
+    echo "FAIL: bootstrap access to $bootstrap_path returned HTTP $bootstrap_status, expected 403" >&2
+    exit 1
+  fi
+done
+echo "the shared bootstrap certificate is refused on every steady-state route"
+await_job observe-certificate-rotation "$ROTATION_OBSERVE_SECONDS"
 kubectl -n updated-system logs job/observe-certificate-rotation
 kubectl_log_contains deployment/updatec-gateway \
   "renewed node certificate" || {
@@ -847,13 +1318,15 @@ for ordinal in 2 3; do
 done
 echo "dynamic enrollments registered; waiting for group assignments"
 sleep 5
-cat <<'YAML' | kubectl apply -f -
+cat <<YAML | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata: {name: verify-agent-versions, namespace: updated-system}
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 120
+  # Above the verifier's own budget, so the script reports which agent is behind rather than the
+  # job controller deleting the pod and its diagnostic. See FLEET_CONVERGE_SECONDS.
+  activeDeadlineSeconds: $(job_deadline "$FLEET_CONVERGE_SECONDS")
   template:
     spec:
       restartPolicy: Never
@@ -862,21 +1335,28 @@ spec:
           image: updatec-e2e:kind
           imagePullPolicy: IfNotPresent
           command: [/bin/sh, -ec]
+          env:
+            - {name: BUDGET, value: "$FLEET_CONVERGE_SECONDS"}
           args:
             - |
+              # One wall-clock budget for the whole fleet, not a retry count per agent: these checks
+              # run in sequence, so a per-agent count bounds nothing the name claims to bound.
+              deadline=\$(( \$(date +%s) + BUDGET ))
               check() {
-                agent="$1" expected="$2" expected_artifact="$3"
-                for attempt in $(seq 1 60); do
-                  actual=$(curl -fsS "http://${agent}.agents:8080/version" || true)
-                  artifact=$(curl -fsS "http://${agent}.agents:8080/artifact" || true)
-                  if [ "$actual" = "$expected" ] && [ "$artifact" = "$expected_artifact" ]; then
-                    echo "$agent: $actual ($artifact)"
+                agent="\$1" expected="\$2" expected_artifact="\$3"
+                while :; do
+                  actual=\$(curl -fsS "http://\${agent}.agents:8080/version" || true)
+                  artifact=\$(curl -fsS "http://\${agent}.agents:8080/artifact" || true)
+                  if [ "\$actual" = "\$expected" ] && [ "\$artifact" = "\$expected_artifact" ]; then
+                    echo "\$agent: \$actual (\$artifact)"
                     return 0
+                  fi
+                  if [ "\$(date +%s)" -ge "\$deadline" ]; then
+                    echo "\$agent: expected \$expected/\$expected_artifact, got \${actual:-unreachable}/\${artifact:-unreachable}" >&2
+                    return 1
                   fi
                   sleep 1
                 done
-                echo "$agent: expected $expected, got ${actual:-unreachable}" >&2
-                return 1
               }
               check agent-0 2.0.0 stateful
               check agent-1 2.0.0 stateful
@@ -885,7 +1365,7 @@ spec:
               check agent-4 1.0.0 sampleapp
               echo "all 5 agents reached their control-plane-selected versions (2/2/1)"
 YAML
-kubectl -n updated-system wait --for=condition=complete job/verify-agent-versions --timeout=150s
+await_job verify-agent-versions "$FLEET_CONVERGE_SECONDS"
 kubectl -n updated-system logs job/verify-agent-versions
 
 # A workload crash is the release's problem, not the node stack's: the agent runs packages and
@@ -896,16 +1376,11 @@ restart_before="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.statu
 agent_before="$(process_pid updated-agent)"
 kubectl -n updated-system exec agent-4 -c agent -- \
   sh -c 'curl -fsS http://127.0.0.1:8080/crash >/dev/null || true' || true
-crashed=false
-for attempt in $(seq 1 30); do
-  if ! kubectl -n updated-system exec agent-4 -c agent -- \
-    curl -fsS --max-time 2 http://127.0.0.1:8080/version >/dev/null 2>&1; then
-    crashed=true
-    break
-  fi
-  sleep 1
-done
-[[ "$crashed" == true ]] || {
+workload_stopped_answering() {
+  ! kubectl -n updated-system exec agent-4 -c agent -- \
+    curl -fsS --max-time 2 http://127.0.0.1:8080/version >/dev/null 2>&1
+}
+poll_until "$NODE_SETTLE_TIMEOUT" workload_stopped_answering || {
   echo "FAIL: agent-4's application kept answering after it was told to crash" >&2
   exit 1
 }
@@ -922,18 +1397,18 @@ restart_after="$(kubectl -n updated-system get pod agent-4 -o jsonpath='{.status
 # reconciler — the one thing that owns this process — starts the workload again.
 kubectl -n updated-system exec agent-4 -c agent -- kill -TERM "$agent_before"
 recovered_version=""
-for attempt in $(seq 1 90); do
+workload_answered_again() {
   recovered_version="$(kubectl -n updated-system exec agent-4 -c agent -- \
     curl -fsS --max-time 2 http://127.0.0.1:8080/version 2>/dev/null || true)"
-  [[ -n "$recovered_version" ]] && break
-  sleep 2
-done
+  [[ -n "$recovered_version" ]]
+}
+poll_until "$NODE_SETTLE_TIMEOUT" workload_answered_again || true
 [[ "$recovered_version" == 1.0.0 ]] || {
   echo "FAIL: agent-4 recovered as '$recovered_version', expected committed 1.0.0" >&2
   kubectl -n updated-system logs agent-4 -c agent --tail=100 >&2 || true
   exit 1
 }
-kubectl -n updated-system wait --for=condition=ready pod/agent-4 --timeout=120s
+kubectl -n updated-system wait --for=condition=ready pod/agent-4 --timeout=${READY_TIMEOUT}s
 echo "a workload crash left the node stack untouched; the boot converge re-applied committed 1.0.0"
 
 if (( FUZZ_ROUNDS > 0 )); then
@@ -961,27 +1436,38 @@ data:
   verify.sh: |
     #!/bin/sh
     set -eu
-    echo "waiting for exact fleet convergence: $EXPECTED"
+    # ONE budget for the whole fleet, spent as wall clock rather than as a per-agent retry count.
+    #
+    # Per-agent counts cannot express the thing being bounded. These checks run sequentially, so
+    # "90 tries each" meant the fleet was allowed 90s or 450s depending on how many agents were
+    # slow — and the job deadline above killed the pod long before the later agents were even
+    # reached, so the count past the first agent or two was configuration that could never run.
+    # A deadline shared across the loop is the actual claim: this fleet converges within BUDGET.
+    echo "waiting for exact fleet convergence within ${BUDGET}s: $EXPECTED"
+    deadline=$(( $(date +%s) + BUDGET ))
     for pair in $EXPECTED; do
       agent=${pair%%=*}
       wanted=${pair#*=}
       expected=${wanted%%,*}
       expected_artifact=${wanted#*,}
-      actual=""
-      for attempt in $(seq 1 90); do
+      waited=0
+      while :; do
         actual=$(curl -fsS "http://${agent}.agents:8080/version" 2>/dev/null || true)
         artifact=$(curl -fsS "http://${agent}.agents:8080/artifact" 2>/dev/null || true)
         health=$(curl -fsS "http://${agent}.agents:8080/healthz" 2>/dev/null || true)
-        if [ "$actual" = "$expected" ] && [ "$artifact" = "$expected_artifact" ] && [ "$health" = "ok" ]; then break; fi
-        if [ $((attempt % 10)) -eq 0 ]; then
-          echo "$agent: still waiting for $expected/$expected_artifact/ok (${attempt}/90); currently ${actual:-unreachable}/${artifact:-unreachable}/${health:-unreachable}"
+        if [ "$actual" = "$expected" ] && [ "$artifact" = "$expected_artifact" ] && [ "$health" = "ok" ]; then
+          break
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+          echo "$agent: expected $expected/$expected_artifact/ok, got ${actual:-unreachable}/${artifact:-unreachable}/${health:-unreachable}" >&2
+          exit 1
+        fi
+        waited=$((waited + 1))
+        if [ $((waited % 10)) -eq 0 ]; then
+          echo "$agent: still waiting for $expected/$expected_artifact/ok (${waited}s); currently ${actual:-unreachable}/${artifact:-unreachable}/${health:-unreachable}"
         fi
         sleep 1
       done
-      if [ "$actual" != "$expected" ] || [ "$artifact" != "$expected_artifact" ] || [ "$health" != "ok" ]; then
-        echo "$agent: expected $expected/$expected_artifact/ok, got ${actual:-unreachable}/${artifact:-unreachable}/${health:-unreachable}" >&2
-        exit 1
-      fi
       echo "$agent: $actual ($artifact) healthy"
     done
     echo "fleet converged exactly"
@@ -997,7 +1483,7 @@ spec:
   completions: 5
   parallelism: 5
   backoffLimitPerIndex: 0
-  activeDeadlineSeconds: $((OBSERVER_ITERATIONS + 60))
+  activeDeadlineSeconds: $(job_deadline "$OBSERVER_ITERATIONS")
   template:
     spec:
       restartPolicy: Never
@@ -1019,7 +1505,10 @@ kind: Job
 metadata: {name: $job, namespace: updated-system}
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 120
+  # Strictly above the verifier's own budget: the script must be the thing that fails, because it
+  # is the only one that can say WHICH agent was behind and on what version. A deadline at or below
+  # the budget deletes the pod and its diagnostic, leaving an opaque DeadlineExceeded.
+  activeDeadlineSeconds: $(job_deadline "$FLEET_CONVERGE_SECONDS")
   template:
     spec:
       restartPolicy: Never
@@ -1027,14 +1516,13 @@ spec:
         - name: verify
           image: updatec-e2e:kind
           command: [/bin/sh, /scripts/verify.sh]
-          env: [{name: EXPECTED, value: "$expected"}]
+          env:
+            - {name: EXPECTED, value: "$expected"}
+            - {name: BUDGET, value: "$FLEET_CONVERGE_SECONDS"}
           volumeMounts: [{name: scripts, mountPath: /scripts, readOnly: true}]
       volumes: [{name: scripts, configMap: {name: fleet-fuzz-scripts}}]
 YAML
-  if ! kubectl -n updated-system wait --for=condition=complete "job/$job" --timeout=130s; then
-    kubectl -n updated-system logs "job/$job" >&2 || true
-    return 1
-  fi
+  await_job "$job" "$FLEET_CONVERGE_SECONDS" || return 1
   kubectl -n updated-system logs "job/$job"
 }
 
@@ -1124,26 +1612,26 @@ for ((round = 1; round <= FUZZ_ROUNDS; round++)); do
     0)
       echo "fuzz generation $round: restarting controller during convergence"
       kubectl -n updated-system rollout restart deployment/updatec-controller >/dev/null
-      kubectl -n updated-system rollout status deployment/updatec-controller --timeout=120s >/dev/null
+      kubectl -n updated-system rollout status deployment/updatec-controller --timeout=${READY_TIMEOUT}s >/dev/null
       ;;
     1)
       echo "fuzz generation $round: restarting gateway during convergence"
       kubectl -n updated-system rollout restart deployment/updatec-gateway >/dev/null
-      kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=120s >/dev/null
+      kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=${READY_TIMEOUT}s >/dev/null
       ;;
     2)
       echo "fuzz generation $round: replacing the release origin pod"
       kubectl -n updated-system scale deployment/release-server --replicas=0 >/dev/null
-      kubectl -n updated-system wait --for=delete pod -l app=release-server --timeout=60s >/dev/null
+      kubectl -n updated-system wait --for=delete pod -l app=release-server --timeout=${READY_TIMEOUT}s >/dev/null
       kubectl -n updated-system scale deployment/release-server --replicas=1 >/dev/null
-      kubectl -n updated-system rollout status deployment/release-server --timeout=120s >/dev/null
+      kubectl -n updated-system rollout status deployment/release-server --timeout=${READY_TIMEOUT}s >/dev/null
       ;;
     3)
       echo "fuzz generation $round: briefly removing the controller"
       kubectl -n updated-system scale deployment/updatec-controller --replicas=0 >/dev/null
       sleep 3
       kubectl -n updated-system scale deployment/updatec-controller --replicas=1 >/dev/null
-      kubectl -n updated-system rollout status deployment/updatec-controller --timeout=120s >/dev/null
+      kubectl -n updated-system rollout status deployment/updatec-controller --timeout=${READY_TIMEOUT}s >/dev/null
       ;;
   esac
   verify_fleet "verify-fuzz-$round" "$expected"
@@ -1200,18 +1688,17 @@ for role in edge batch default; do
   done
   [[ ${#members[@]} -gt 0 ]] || continue
   rejector=""
-  for attempt in $(seq 1 90); do
+  a_member_rejected_the_corrupt_release() {
+    local index
     for index in "${members[@]}"; do
       if rejected_corrupt "$index"; then
         rejector="$index"
-        break
+        return 0
       fi
     done
-    if [[ -n "$rejector" ]]; then
-      break
-    fi
-    sleep 2
-  done
+    return 1
+  }
+  poll_until "$NODE_SETTLE_TIMEOUT" a_member_rejected_the_corrupt_release || true
   [[ -n "$rejector" ]] || {
     echo "FAIL: no $role node recorded rejection of corrupt 18.0.0 (members: ${members[*]})" >&2
     for index in "${members[@]}"; do
@@ -1219,7 +1706,7 @@ for role in edge batch default; do
     done
     exit 1
   }
-  rejector_of[$rejector]=1
+  rejector_of[rejector]=1
   echo "$role: agent-$rejector rejected corrupt 18.0.0"
 done
 verify_fleet verify-fuzz-rollback "$expected"
@@ -1256,12 +1743,13 @@ kubectl -n updated-system delete job observe-fleet-chaos --wait=true >/dev/null
 else
   echo "fleet fuzz skipped (--fuzz-rounds 0)"
 fi
-cat <<'YAML' | kubectl apply -f -
+cat <<YAML | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata: {name: routing-digest-before-overlap, namespace: updated-system}
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: $(job_deadline "$ONESHOT_JOB_SECONDS")
   template:
     spec:
       restartPolicy: Never
@@ -1269,22 +1757,23 @@ spec:
         - name: digest
           image: updatec-e2e:kind
           command: [/bin/sh, -ec]
-          args: ['curl -fsS --cert /etc/agent-tls/tls.crt --key /etc/agent-tls/tls.key --cacert /etc/agent-tls/ca.crt https://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
-          volumeMounts: [{name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}]
-      volumes: [{name: agent-tls, secret: {secretName: agent-tls}}]
+          args: ['curl -fsS --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt https://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
+          volumeMounts: [{name: tls, mountPath: /tls, readOnly: true}]
+      volumes: [{name: tls, secret: {secretName: routing-probe-tls}}]
 YAML
-kubectl -n updated-system wait --for=condition=complete job/routing-digest-before-overlap --timeout=60s
+await_job routing-digest-before-overlap "$ONESHOT_JOB_SECONDS"
 before="$(kubectl -n updated-system logs job/routing-digest-before-overlap)"
 cargo run -q -p updatec --example kind_resources -- \
   "$PLATFORM" "$APP_V1_SHA" "$APP_V2_SHA" "$APP_V3_SHA" "$PROVIDER_SHA" \
   "$WORK/release-root.json" overlap | kubectl apply -f -
 sleep 8
-cat <<'YAML' | kubectl apply -f -
+cat <<YAML | kubectl apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata: {name: routing-digest-after-overlap, namespace: updated-system}
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: $(job_deadline "$ONESHOT_JOB_SECONDS")
   template:
     spec:
       restartPolicy: Never
@@ -1292,11 +1781,11 @@ spec:
         - name: digest
           image: updatec-e2e:kind
           command: [/bin/sh, -ec]
-          args: ['curl -fsS --cert /etc/agent-tls/tls.crt --key /etc/agent-tls/tls.key --cacert /etc/agent-tls/ca.crt https://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
-          volumeMounts: [{name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}]
-      volumes: [{name: agent-tls, secret: {secretName: agent-tls}}]
+          args: ['curl -fsS --cert /tls/tls.crt --key /tls/tls.key --cacert /tls/ca.crt https://updatec-gateway/metadata/timestamp.json | sha256sum | cut -d" " -f1']
+          volumeMounts: [{name: tls, mountPath: /tls, readOnly: true}]
+      volumes: [{name: tls, secret: {secretName: routing-probe-tls}}]
 YAML
-kubectl -n updated-system wait --for=condition=complete job/routing-digest-after-overlap --timeout=60s
+await_job routing-digest-after-overlap "$ONESHOT_JOB_SECONDS"
 after="$(kubectl -n updated-system logs job/routing-digest-after-overlap)"
 test "$before" = "$after"
 ambiguous_logged=false
@@ -1315,4 +1804,75 @@ if [[ "$ambiguous_logged" != true ]]; then
     --all-containers=true --prefix=true --tail=200 >&2 || true
   exit 1
 fi
+
+# Deletion is one repository-epoch boundary, not three eventually consistent cleanup paths. Seed
+# sentinels immediately beside and outside the repository's owned S3 prefix, then require the
+# finalizer to remove only the owned prefix, the fixed-name admitted-state projection, and the
+# controller's local TUF epoch before Kubernetes releases the CR name.
+kubectl -n updated-system run repository-delete-seed --restart=Never \
+  --image=minio/mc:RELEASE.2025-04-16T18-13-26Z --command -- sh -ec \
+  "mc alias set local http://minio:9000 minio minio123 >/dev/null
+printf owned | mc pipe local/updates/${MANAGED_REPOSITORY_PREFIX}/deletion-owned
+printf sibling | mc pipe local/updates/routing/updated-system/sibling/keep
+printf outside | mc pipe local/updates/outside/keep"
+kubectl -n updated-system wait pod/repository-delete-seed \
+  --for=jsonpath='{.status.phase}'=Succeeded --timeout=${READY_TIMEOUT}s
+
+kubectl -n updated-system delete updaterepository default --wait=false >/dev/null
+repository_deleted() {
+  ! kubectl -n updated-system get updaterepository default >/dev/null 2>&1
+}
+if ! poll_until "$READY_TIMEOUT" repository_deleted; then
+  echo "FAIL: repository finalizer did not complete its epoch cleanup" >&2
+  kubectl -n updated-system get updaterepository default -o yaml >&2 || true
+  kubectl -n updated-system logs deployment/updatec-controller --tail=200 >&2 || true
+  exit 1
+fi
+
+remaining_state="$(kubectl -n updated-system get configmaps \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+  | grep -E '^updatec-admitted-default(-[ab]-[0-9][0-9])?$' || true)"
+if [[ -n "$remaining_state" ]]; then
+  echo "FAIL: deleted repository left admitted-state ConfigMaps:" >&2
+  echo "$remaining_state" >&2
+  exit 1
+fi
+if ! kubectl -n updated-system exec deployment/updatec-controller -- sh -ec '
+  for path in repository keys published-generation.json pending-state.json; do
+    test ! -e "/var/lib/updatec/$path" || {
+      echo "repository-local state survived deletion: $path" >&2
+      exit 1
+    }
+  done
+'; then
+  echo "FAIL: deleted repository left controller-local TUF state" >&2
+  exit 1
+fi
+
+kubectl -n updated-system run repository-delete-check --restart=Never \
+  --image=minio/mc:RELEASE.2025-04-16T18-13-26Z --command -- sh -ec \
+  "mc alias set local http://minio:9000 minio minio123 >/dev/null
+remaining=\$(mc ls --recursive local/updates/${MANAGED_REPOSITORY_PREFIX} 2>/dev/null || true)
+test -z \"\$remaining\" || { echo \"owned prefix survived deletion: \$remaining\" >&2; exit 1; }
+mc stat local/updates/routing/updated-system/sibling/keep >/dev/null
+mc stat local/updates/outside/keep >/dev/null"
+if ! kubectl -n updated-system wait pod/repository-delete-check \
+  --for=jsonpath='{.status.phase}'=Succeeded --timeout=${READY_TIMEOUT}s; then
+  echo "FAIL: repository deletion crossed its exact object-storage boundary" >&2
+  kubectl -n updated-system logs repository-delete-check >&2 || true
+  exit 1
+fi
+
+# The controller intentionally remains installed after its sole repository is removed. Give it two
+# fresh one-second passes, then prove absence is a quiet waiting state rather than a synthetic 404
+# failure loop against a status endpoint that no longer exists.
+sleep 3
+post_delete_logs="$(kubectl -n updated-system logs deployment/updatec-controller \
+  --since=2s 2>/dev/null || true)"
+if grep -q 'reconciliation failed' <<<"$post_delete_logs"; then
+  echo "FAIL: ordinary repository absence is still reported as reconciliation failure" >&2
+  echo "$post_delete_logs" >&2
+  exit 1
+fi
+echo "repository deletion atomically cleared its S3, Kubernetes, local, and in-memory epoch"
 echo "updatec Kind E2E passed: five real agents updated and were verified through version endpoints"

@@ -248,12 +248,26 @@ mod tests {
         assert_eq!(channel.child_env_value(), "-1");
     }
 
+    /// `poll_readable` must answer `false` — never spin, never panic — for a descriptor that is
+    /// not open (POLLNVAL). Asked of a number provably beyond the process's descriptor table
+    /// rather than of a just-closed pair: descriptor numbers are reused lowest-first, so under the
+    /// multi-threaded test runner another test could reclaim the closed number between the close
+    /// and the poll and hand this assertion a live, readable descriptor.
     #[test]
     fn poll_reports_invalid_descriptors_closed() {
-        let [read, write] = socketpair_cloexec().unwrap();
-        close_fd(read);
-        close_fd(write);
-        assert!(!poll_readable(read, 0));
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let beyond_table = i32::try_from(limit.rlim_cur)
+            .ok()
+            .and_then(|limit| limit.checked_add(1))
+            .unwrap_or(i32::MAX);
+        assert!(!poll_readable(beyond_table, 0));
     }
 
     #[test]

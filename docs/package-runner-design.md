@@ -43,10 +43,13 @@ needs — `systemctl restart`, `sc.exe`, container runtimes, config reloads, any
 - Durable transactions: journals, crash replay, confirmation windows, rollback,
   rejection-by-content-hash (a failed candidate is never retried).
 - Hook invocation: bounded, contained (a hung hook's whole tree is killed on timeout),
-  cleared environment, argv-only, attempt-identity partitioned outputs.
-- Signed NodeReports: settlement, health (from the `healthcheck` hook), output manifests.
+  cleared environment, argv-only, and fresh per-invocation file exchange.
+- Signed NodeReports: settlement, health (from the `healthcheck` hook), and exact-byte output
+  bindings. File contents use the private object store, not telemetry.
 - Agent self-update by pointer flip, gated by the launcher (below).
-- Secret acquisition from the control plane over mTLS.
+- Assignment-selected, keyed-blinded input publications from the private object store through
+  short-lived exact-object capabilities. Their TUF-signed commitments authenticate S3 without
+  publishing a low-entropy secret digest.
 
 ## What is deleted
 
@@ -57,15 +60,14 @@ needs — `systemctl restart`, `sc.exe`, container runtimes, config reloads, any
 - The launched-secrets record and environment-digest adoption comparison.
 - `managed` runtime mode in configuration, contracts, docs, and tests.
 
-## Secrets
+## Configuration dataflow
 
-Assigned secrets are delivered to the hooks, not to a process the agent owns: each hook
-invocation receives the resolved secret values in its (otherwise cleared) environment, named
-by `SecretReference.environment` exactly as before. The entrypoint installs them wherever its
-environment wants them (systemd credentials, a vault agent, a config template — its call).
-A rotation (bundle digest change) triggers `apply --reason restart` so the entrypoint can
-re-converge with the new values. Secret values still never touch the agent's disk and never
-appear in manifests or logs.
+All application configuration, including secrets, reaches hooks as ordinary private files in a
+fresh `--input-dir`. Hooks advertise ordinary files through a fresh `--output-dir`. The agent has
+no scalar-secret, environment-variable, manifest, or proxy path. S3 is the durable data plane;
+mTLS authorizes short-lived capabilities for one exact object and method. When a producer's files
+change, dependent assignments receive a new opaque input generation and reapply their last known
+release with `--reason restart`.
 
 ## Health
 
@@ -113,5 +115,5 @@ Names must match the new shape, and nothing keeps its old name as an alias:
 ## Control plane
 
 Unchanged. NodeReports, settlement semantics, regression evidence, alerting, metrics,
-endpoint projections, and the healthproxy neither know nor care who owns workload
+backend topology projections, and the healthproxy neither know nor care who owns workload
 processes; they already operated purely on signed reports and hook-derived health.

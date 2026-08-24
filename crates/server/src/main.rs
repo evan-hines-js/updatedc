@@ -1,4 +1,4 @@
-//! Development TUF publisher and static repository server (the mock CDN).
+//! Development TUF publisher and explicit private-capability/public-object fixtures.
 //!
 //! - `init`    mint the five ed25519 role keys and an empty signed repository.
 //! - `publish-app` build and publish application bundles.
@@ -9,14 +9,17 @@
 //! - `export-enrollment` write the enrollment bundle a node boots from.
 //! - `target-sha256` print the content address of a published target.
 //! - `gen-certs` mint the development mTLS certificate hierarchy.
-//! - `serve`   serve the repository directory over HTTP for clients to refresh.
+//! - `serve-capability` serve a private repository through exact bearer capabilities.
+//! - `serve-object` serve a public release repository as an anonymous HTTPS object origin.
 //!
 //! Publishing is an offline/CI operation; a deployed client never runs it.
 
-use std::fs::{File, OpenOptions};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -27,6 +30,18 @@ use updated_tuf::repo::{self, PublishTarget};
 mod certs;
 
 type R = Result<(), Box<dyn std::error::Error>>;
+
+fn read_operator_file(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    foundation::file::read_bounded_regular(path, limit, foundation::file::FinalSymlink::Follow)
+}
+
+fn read_operator_text(path: &Path, limit: usize) -> std::io::Result<String> {
+    foundation::file::read_bounded_regular_string(
+        path,
+        limit,
+        foundation::file::FinalSymlink::Follow,
+    )
+}
 
 #[tokio::main]
 async fn main() {
@@ -43,11 +58,12 @@ async fn main() {
         "export-enrollment" => export_enrollment(rest),
         "target-sha256" => target_sha256(rest).await,
         "gen-certs" => gen_certs(rest).await,
-        "serve" => serve(rest).await,
+        "serve-capability" => serve(rest, ServeKind::Capability).await,
+        "serve-object" => serve(rest, ServeKind::Object).await,
         other => {
             eprintln!("unknown or missing subcommand: {other:?}");
             eprintln!(
-                "usage: server <init|publish-app|publish-provider-artifact|publish-agent|publish-provider-set|publish-assignment|export-enrollment|target-sha256|gen-certs|serve> [flags]"
+                "usage: server <init|publish-app|publish-provider-artifact|publish-agent|publish-provider-set|publish-assignment|export-enrollment|target-sha256|gen-certs|serve-capability|serve-object> [flags]"
             );
             exit(2);
         }
@@ -66,47 +82,54 @@ fn export_enrollment(args: &[String]) -> R {
         .ok_or("--routing-base-url <url-or-absolute-path> is required")?;
     let output = PathBuf::from(flag(args, "--output").ok_or("--output <path> is required")?);
     let metadata = repo.join("metadata");
-    let root = std::fs::read_to_string(metadata.join("root.json"))?;
-    let timestamp = std::fs::read_to_string(metadata.join("timestamp.json"))?;
+    let limit = updated_contracts::enrollment::MAX_DOCUMENT_BYTES;
+    let root = read_operator_text(&metadata.join("root.json"), limit)?;
+    let timestamp = read_operator_text(&metadata.join("timestamp.json"), limit)?;
     let timestamp_value: serde_json::Value = serde_json::from_str(&timestamp)?;
     let snapshot_version = timestamp_value
         .pointer("/signed/meta/snapshot.json/version")
         .and_then(serde_json::Value::as_u64)
         .ok_or("timestamp omits snapshot.json version")?;
-    let snapshot =
-        std::fs::read_to_string(metadata.join(format!("{snapshot_version}.snapshot.json")))?;
+    let snapshot = read_operator_text(
+        &metadata.join(format!("{snapshot_version}.snapshot.json")),
+        limit,
+    )?;
     let snapshot_value: serde_json::Value = serde_json::from_str(&snapshot)?;
     let targets_version = snapshot_value
         .pointer("/signed/meta/targets.json/version")
         .and_then(serde_json::Value::as_u64)
         .ok_or("snapshot omits targets.json version")?;
-    let targets =
-        std::fs::read_to_string(metadata.join(format!("{targets_version}.targets.json")))?;
+    let targets = read_operator_text(
+        &metadata.join(format!("{targets_version}.targets.json")),
+        limit,
+    )?;
     let targets_value: serde_json::Value = serde_json::from_str(&targets)?;
     let agent_document = repository_target_text(&repo, &targets_value, &assignment)?;
     let agent: updated_contracts::artifact::AgentDocument = serde_json::from_str(&agent_document)?;
     agent.validate()?;
     let managed_configuration = repository_target_text(&repo, &targets_value, &agent.config.path)?;
+    // Export and online enrollment share this one complete TUF-verification path. Reading files
+    // from an operator-supplied repository is not itself proof that the metadata roles, hashes,
+    // target lengths, assignment binding, or expiries form one authentic publication.
+    let managed = updated_tuf::verify_enrollment_publication(
+        root.as_bytes(),
+        timestamp.as_bytes(),
+        snapshot.as_bytes(),
+        targets.as_bytes(),
+        &assignment,
+        agent_document.as_bytes(),
+        managed_configuration.as_bytes(),
+    )?;
     let bundle = updated_contracts::enrollment::EnrollmentBundle {
         schema: 1,
         agent_id,
         routing_base_url: ensure_base_location(routing_base_url),
         assignment,
+        install_root: managed.runtime.install_root,
         routing_root: root,
-        initial: updated_contracts::enrollment::InitialSignedConfiguration {
-            timestamp,
-            snapshot,
-            targets,
-            agent_document,
-            managed_configuration,
-        },
     };
     bundle.validate_shape()?;
-    foundation::durable::atomic_write(
-        &output,
-        ".enrollment-",
-        &serde_json::to_vec_pretty(&bundle)?,
-    )?;
+    foundation::durable::atomic_write(&output, ".enrollment-", &bundle.to_bounded_json()?)?;
     println!("exported signed enrollment bundle to {}", output.display());
     Ok(())
 }
@@ -123,8 +146,9 @@ fn repository_target_text(
         ))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("targets metadata omits {logical}"))?;
-    Ok(std::fs::read_to_string(
-        repo.join("targets").join(format!("{sha}.{logical}")),
+    Ok(read_operator_text(
+        &repo.join("targets").join(format!("{sha}.{logical}")),
+        updated_contracts::enrollment::MAX_DOCUMENT_BYTES,
     )?)
 }
 
@@ -152,19 +176,23 @@ async fn publish_assignment(args: &[String]) -> R {
     let application = target_reference(args, "application")?;
     let ordered_install_fallback = args.iter().any(|arg| arg == "--ordered-install-fallback");
     let provider_set = target_reference(args, "provider-set")?;
-    // The release trust anchor belongs to the repository being assigned. Keeping it
-    // adjacent to that repository eliminates a second caller-supplied root path.
-    let release_root_path = repo_dir.join("metadata/root.json");
-    let release_root = serde_json::from_slice(&std::fs::read(release_root_path)?)?;
+    // Routing and releases are deliberately different repositories: the former is private and
+    // capability-gated, while the latter is fetched directly from the object plane. Requiring the
+    // release root makes that trust boundary explicit and prevents a fixture or operator tool from
+    // silently signing the routing repository's root as though it authenticated release bytes.
+    let release_root_path = PathBuf::from(
+        flag(args, "--release-root").ok_or("--release-root <root.json> is required")?,
+    );
+    let release_root = serde_json::from_slice(&read_operator_file(
+        &release_root_path,
+        updated_contracts::assignment::RepositoryAssignment::MAX_DOCUMENT_BYTES,
+    )?)?;
     let runtime_path = flag(args, "--runtime").ok_or("--runtime <runtime.json> is required")?;
-    let runtime = serde_json::from_slice(&std::fs::read(runtime_path)?)?;
+    let runtime = serde_json::from_slice(&read_operator_file(
+        Path::new(&runtime_path),
+        updated_contracts::assignment::RepositoryAssignment::MAX_DOCUMENT_BYTES,
+    )?)?;
     let expiry_days = flag_i64(args, "--expiry-days", 365)?;
-    // Where the node PUTs its signed running-state report. Optional, because a repository that
-    // nothing reads reports from does not need one — but without it `report_running_state` returns
-    // immediately, so every consumer of this repository (a healthproxy above all) sees a fleet that
-    // never speaks. `RepositoryAssignment::validate` below holds it to the same shape the control
-    // plane's own assignments carry.
-    let report_url = flag(args, "--report-url");
     let config_source = repo_dir.join(".config-build.json");
     let node_source = repo_dir.join(".node-build.json");
     let assignment = updated_contracts::assignment::RepositoryAssignment {
@@ -172,16 +200,13 @@ async fn publish_assignment(args: &[String]) -> R {
         deployment,
         metadata_url,
         targets_url,
-        report_url,
         application,
         ordered_install_fallback,
         provider_set,
         release_root,
         runtime,
     };
-    assignment.validate()?;
-    let config_bytes = serde_json::to_vec(&assignment)?;
-    let config_sha256 = updated::hash::sha256_bytes(&config_bytes);
+    let (config_bytes, config_sha256) = assignment.publication()?;
     let (prefix, node_id) = updated_contracts::telemetry::split_assignment_path(&name)
         .ok_or("--name must use <prefix>/agents/<agent>.json")?;
     let config_name = updated_contracts::telemetry::config_object_key(prefix, &config_sha256);
@@ -193,7 +218,7 @@ async fn publish_assignment(args: &[String]) -> R {
         },
     };
     node.validate()?;
-    let keys = repo::Keys::in_dir(&keys_dir);
+    let keys = repo::Keys::in_dir(&keys_dir)?;
     // Staging comes AFTER the lock, exactly as in `publish`: these are fixed names in the shared
     // repository directory, and `add_release` reads them back to hash and sign. Staging outside the
     // lock lets a second publisher overwrite them in that gap, so each process signs the other's
@@ -237,25 +262,21 @@ async fn publish_provider_set(args: &[String]) -> R {
             .unwrap_or_else(|| "300000".into())
             .parse()?,
     };
-    let set = updated_contracts::artifact::ProviderSet {
-        schema: updated_contracts::artifact::ProviderSet::SCHEMA,
-        id: id.clone(),
-        reconciler,
-    };
-    // Validate before anything is signed: a published target is immutable and keyed by id, so a
-    // set that every node's `set.validate()` rejects at selection time could only be repaired by
-    // republishing under a *new* id. Same gate, same reason, as the production publisher.
-    set.validate().map_err(|error| {
-        format!("refusing to publish provider set {id:?}: {error} (nothing was signed or uploaded)")
-    })?;
+    // Same gate, same wording, as the production publisher: `for_publication` is where the rule
+    // lives, so this fixture cannot drift into accepting a document `updatectl` would refuse.
+    let set = updated_contracts::artifact::ProviderSet::for_publication(id.clone(), reconciler)?;
     let source = repo_dir.join(".provider-set-build.json");
     let name = format!("provider-sets/{id}.json");
-    let keys = repo::Keys::in_dir(&keys_dir);
+    let keys = repo::Keys::in_dir(&keys_dir)?;
     // Under the lock before the staging write, for the same reason as `publish_assignment`: the
     // staging name is fixed and shared, and `add_release` signs whatever bytes it finds there.
     let _publish_lock = lock_publisher(&repo_dir)?;
     repo::verify_provider_set_reconciler(&repo_dir, &set).await?;
-    foundation::durable::atomic_write(&source, ".provider-set-", &serde_json::to_vec(&set)?)?;
+    foundation::durable::atomic_write(
+        &source,
+        ".provider-set-",
+        &set.to_bounded_json().map_err(|error| error.to_string())?,
+    )?;
     repo::add_release(
         &repo_dir,
         &keys,
@@ -280,13 +301,9 @@ fn target_reference(
         .ok_or_else(|| format!("--{prefix}-path <target> is required"))?;
     let sha256 = flag(args, &format!("--{prefix}-sha256"))
         .ok_or_else(|| format!("--{prefix}-sha256 <hex> is required"))?;
-    if !updated_contracts::is_sha256_hex(&sha256) {
-        return Err(format!("--{prefix}-sha256 must be 64 hexadecimal characters").into());
-    }
-    Ok(updated_contracts::artifact::TargetReference {
-        path,
-        sha256: sha256.to_ascii_lowercase(),
-    })
+    let sha256 = updated_contracts::digest::parse_canonical_sha256(&sha256)
+        .map_err(|error| format!("--{prefix}-sha256: {error}"))?;
+    Ok(updated_contracts::artifact::TargetReference { path, sha256 })
 }
 
 // --- init -------------------------------------------------------------------
@@ -318,7 +335,16 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
     let product = flag(args, "--product").ok_or("--product <name> is required")?;
     let channel = flag(args, "--channel").unwrap_or_else(|| "stable".into());
     let version = flag(args, "--version").ok_or("--version <semver> is required")?;
-    semver::Version::parse(&version).map_err(|e| format!("invalid --version: {e}"))?;
+    updated_contracts::identity::parse_release_version(&version)
+        .ok_or("invalid --version: expected a bounded semantic version")?;
+    for (flag, value) in [
+        ("--product", product.as_str()),
+        ("--channel", channel.as_str()),
+    ] {
+        if !updated_contracts::identity::is_segment(value) {
+            return Err(format!("{flag} is not a valid identity segment: {value:?}").into());
+        }
+    }
     let component = if application_bundle {
         product.clone()
     } else {
@@ -335,30 +361,35 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
     if raw.is_empty() {
         return Err(format!("at least one {artifact_flag} <os>-<arch>=<path> is required").into());
     }
-    let keys = repo::Keys::in_dir(&keys_dir);
+    let keys = repo::Keys::in_dir(&keys_dir)?;
     let _publish_lock = lock_publisher(&repo_dir)?;
+    let bundle_scratch = application_bundle
+        .then(|| BundleBuildScratch::create(&repo_dir))
+        .transpose()?;
 
     let mut targets = Vec::new();
-    for t in &raw {
+    for (target_index, t) in raw.iter().enumerate() {
         let (platform, source) = t
             .split_once('=')
             .ok_or_else(|| format!("{artifact_flag} must be <os>-<arch>=<path>, got {t:?}"))?;
         let (os, arch) = platform
             .split_once('-')
             .ok_or_else(|| format!("platform must be <os>-<arch>, got {platform:?}"))?;
+        for (part, value) in [("os", os), ("arch", arch)] {
+            if !updated_contracts::identity::is_segment(value) {
+                return Err(format!("platform {part} is invalid in {platform:?}").into());
+            }
+        }
         let path = if application_bundle {
-            let archive = repo_dir
-                .join(".bundle-build")
-                .join(format!("{product}-{version}-{platform}.tar.zst"));
-            let wrap_dir = repo_dir
-                .join(".bundle-build")
-                .join(format!("tree-{product}-{version}-{platform}"));
+            let scratch = bundle_scratch.as_ref().expect("created above").path();
+            let archive = scratch.join(format!("{target_index}.tar.zst"));
+            let wrap_root = scratch.join(format!("{target_index}.wrap"));
             let entrypoint =
                 flag(args, "--entrypoint").ok_or("--entrypoint <relative-path> is required")?;
             updated::bundle::create_bundle_from_source(
                 Path::new(source),
                 &archive,
-                &wrap_dir,
+                &wrap_root,
                 &product,
                 &version,
                 platform,
@@ -390,6 +421,32 @@ async fn publish(args: &[String], application_bundle: bool) -> R {
     Ok(())
 }
 
+/// One publish invocation's bundle workspace. The namespace is fixed and owned by this command,
+/// the publisher lock excludes concurrent users, and every exit removes it. No user-supplied
+/// product/platform text participates in a local path.
+struct BundleBuildScratch {
+    path: PathBuf,
+}
+
+impl BundleBuildScratch {
+    fn create(repo_dir: &Path) -> std::io::Result<Self> {
+        let path = repo_dir.join(".bundle-build");
+        foundation::durable::remove_path(&path)?;
+        fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for BundleBuildScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Test-only: damage a built bundle archive in a chosen way, keeping it signed for its (now
 /// corrupt) bytes so it passes the download sha check and fails only at extract/validate — the
 /// client's defense against a malformed-but-signed bundle. Distinct per version, so a descent
@@ -400,8 +457,9 @@ fn corrupt_archive(archive: &Path, kind: &str, version: &str) -> R {
         "garbage" => std::fs::write(archive, format!("corrupt-archive-{version}\n").repeat(64))?,
         // A truncated tar.zst: decompression / untar hits an unexpected EOF partway through.
         "truncate" => {
-            let bytes = std::fs::read(archive)?;
-            std::fs::write(archive, &bytes[..bytes.len() / 2])?;
+            let file = OpenOptions::new().write(true).open(archive)?;
+            file.set_len(file.metadata()?.len() / 2)?;
+            file.sync_all()?;
         }
         other => return Err(format!("unknown --corrupt kind {other:?}").into()),
     }
@@ -449,23 +507,81 @@ async fn gen_certs(args: &[String]) -> R {
     Ok(())
 }
 
-async fn serve(args: &[String]) -> R {
+#[derive(Clone, Copy)]
+enum ServeKind {
+    Capability,
+    Object,
+}
+
+#[derive(Clone)]
+struct CapabilityStore {
+    public_url: Arc<str>,
+    grants: Arc<Mutex<HashMap<String, CapabilityGrant>>>,
+}
+
+#[derive(Clone)]
+struct CapabilityGrant {
+    path: String,
+    expires: Instant,
+}
+
+const MAX_FIXTURE_CAPABILITIES: usize = 4096;
+
+async fn serve(args: &[String], kind: ServeKind) -> R {
     let repo_dir = PathBuf::from(flag(args, "--repo").ok_or("--repo <dir> is required")?);
     let addr = flag(args, "--addr").unwrap_or_else(|| "127.0.0.1:8080".into());
     let root = tokio::fs::canonicalize(&repo_dir).await?;
 
-    // mTLS is mandatory, exactly like the gateway: the mock CDN admits a connection only if the
-    // client presents a certificate the fleet CA signed. It terminates TLS here and hands the
-    // decrypted stream to the same stream-generic handler.
     let cert = PathBuf::from(flag(args, "--cert").ok_or("--cert <server.crt> is required")?);
     let key = PathBuf::from(flag(args, "--key").ok_or("--key <server.key> is required")?);
-    let ca = PathBuf::from(flag(args, "--ca").ok_or("--ca <ca.crt> is required")?);
-    let acceptor =
-        tokio_rustls::TlsAcceptor::from(Arc::new(updated::tls::server_config(&cert, &key, &ca)?));
+    let (tls, capabilities) = match kind {
+        ServeKind::Capability => {
+            let ca = PathBuf::from(flag(args, "--ca").ok_or("--ca <ca.crt> is required")?);
+            let public_url =
+                flag(args, "--public-url").ok_or("--public-url <https-url> is required")?;
+            let parsed = url::Url::parse(&public_url)?;
+            if parsed.scheme() != "https"
+                || parsed.cannot_be_a_base()
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || parsed.path() != "/"
+            {
+                return Err(
+                    "--public-url must be an HTTPS origin with no path, query, or fragment".into(),
+                );
+            }
+            let public_url: Arc<str> = public_url.trim_end_matches('/').into();
+            (
+                updated::tls::capability_fixture_server_config(&cert, &key, &ca)?,
+                Some(CapabilityStore {
+                    public_url,
+                    grants: Arc::new(Mutex::new(HashMap::new())),
+                }),
+            )
+        }
+        ServeKind::Object => (
+            updated::tls::object_fixture_server_config(&cert, &key)?,
+            None,
+        ),
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
 
     let listener = TcpListener::bind(&addr).await?;
+    let bound = listener.local_addr()?;
     let connections = Arc::new(Semaphore::new(128));
-    println!("serving {} on https://{addr} (mTLS)", root.display());
+    match kind {
+        ServeKind::Capability => println!(
+            "serving capability repository {} on https://{bound}",
+            root.display()
+        ),
+        ServeKind::Object => println!(
+            "serving object repository {} on https://{bound}",
+            root.display()
+        ),
+    }
     loop {
         // An accept error is recoverable and must never take the server down: ECONNABORTED (a peer
         // that reset between SYN and accept) and EMFILE/ENFILE (the fd ceiling, reachable at 128
@@ -482,15 +598,27 @@ async fn serve(args: &[String]) -> R {
         let permit = connections.clone().acquire_owned().await?;
         let root = root.clone();
         let acceptor = acceptor.clone();
+        let capabilities = capabilities.clone();
         tokio::spawn(async move {
             let _permit = permit;
             // The handshake is bounded like every other phase. Without it a client that opens a
             // connection and sends nothing holds its permit forever; 128 of those exhaust the
             // semaphore, the accept loop blocks on `acquire_owned`, and the server stops serving
             // entirely — no error, no recovery.
-            // A client that fails the mTLS handshake is dropped without ever reaching the repo.
             if let Ok(Ok(stream)) = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-                let _ = serve_conn(stream, &root).await;
+                let authenticated = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .is_some_and(|certificates| !certificates.is_empty());
+                let access = match capabilities {
+                    Some(store) => RequestAccess::Capability {
+                        authenticated,
+                        store,
+                    },
+                    None => RequestAccess::Object,
+                };
+                let _ = serve_conn(stream, &root, access).await;
             }
         });
     }
@@ -501,7 +629,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a handshaken client has to finish its one request while holding a connection permit.
 ///
-/// Every individual phase is already bounded — the header read, the telemetry body read, each
+/// Every individual phase is already bounded — the header read and each
 /// `write_all` — but per-operation bounds do not bound the connection: a client that drains one
 /// 64 KiB chunk every ~25s keeps every write inside `write_with_timeout` forever and holds its
 /// permit indefinitely. 128 such connections exhaust the semaphore, the accept loop blocks on
@@ -512,16 +640,25 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Serve the connection's one request under an overall deadline, so a permit's lifetime is bounded
 /// by `HANDSHAKE_TIMEOUT + CONNECTION_TIMEOUT` no matter how the peer behaves.
-async fn serve_conn<S>(stream: S, root: &Path) -> std::io::Result<()>
+#[derive(Clone)]
+enum RequestAccess {
+    Capability {
+        authenticated: bool,
+        store: CapabilityStore,
+    },
+    Object,
+}
+
+async fn serve_conn<S>(stream: S, root: &Path, access: RequestAccess) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    timeout(CONNECTION_TIMEOUT, serve_request(stream, root))
+    timeout(CONNECTION_TIMEOUT, serve_request(stream, root, access))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connection deadline"))?
 }
 
-async fn serve_request<S>(mut stream: S, root: &Path) -> std::io::Result<()>
+async fn serve_request<S>(mut stream: S, root: &Path, access: RequestAccess) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -573,28 +710,13 @@ where
         respond_status(&mut stream, 400, b"unsupported HTTP version").await;
         return Ok(());
     }
-    // As a "bring your own control plane" data plane, the server also accepts node
-    // rollout telemetry — the same generic contract the k8s gateway implements — writing
-    // each report beside the repository it serves.
-    if method == "PUT" {
-        return serve_telemetry_put(&mut stream, root, path, head, &buf).await;
-    }
     if method != "GET" {
         respond_status(&mut stream, 405, b"method not allowed").await;
         return Ok(());
     }
-    if path == "/v1/node/secrets" {
-        let bundle = root
-            .parent()
-            .map(|parent| parent.join("secret-bundle.json"));
-        match bundle.and_then(|path| std::fs::read(path).ok()) {
-            Some(body) => respond_secret_bundle(&mut stream, &body).await,
-            None => respond_status(&mut stream, 503, b"secret bundle unavailable").await,
-        }
-        return Ok(());
-    }
-    // A `Range` header means a client is resuming (or slicing) a download. Which values are legal
-    // is the gateway's grammar, called rather than restated.
+    // A `Range` header means a client is resuming (or slicing) a download. This fixture implements
+    // the direct object-store hop, so its one range parser lives in the shared repository-serving
+    // support module rather than being restated here.
     let header_value = head.lines().skip(1).find_map(|line| {
         let lowered = line.to_ascii_lowercase();
         lowered
@@ -613,131 +735,97 @@ where
         }
     };
 
-    match open_repository_file(root, path) {
+    let object_path = match access {
+        RequestAccess::Object => Some(path.to_owned()),
+        RequestAccess::Capability {
+            authenticated: true,
+            store,
+        } => {
+            // Do not mint a bearer for a path this origin would not serve. Besides producing a
+            // truthful 404, this keeps the grant table from becoming an authenticated arbitrary
+            // string store.
+            let Some(file) = open_repository_file(root, path) else {
+                respond_status(&mut stream, 404, b"not found").await;
+                return Ok(());
+            };
+            drop(file);
+            match store.mint(path) {
+                Ok(location) => respond_redirect(&mut stream, &location).await,
+                Err(_) => respond_status(&mut stream, 503, b"capability capacity exhausted").await,
+            }
+            return Ok(());
+        }
+        RequestAccess::Capability {
+            authenticated: false,
+            store,
+        } => store.authorize(path),
+    };
+    let Some(object_path) = object_path else {
+        // Deliberately do not distinguish malformed, expired, unknown, or wrong-object bearers.
+        respond_status(&mut stream, 403, b"invalid object capability").await;
+        return Ok(());
+    };
+
+    match open_repository_file(root, &object_path) {
         Some(file) => respond_file(&mut stream, tokio::fs::File::from_std(file), range).await,
         None => respond_status(&mut stream, 404, b"not found").await,
     }
     Ok(())
 }
 
-async fn respond_secret_bundle<S>(stream: &mut S, body: &[u8])
+impl CapabilityStore {
+    fn mint(&self, path: &str) -> std::io::Result<String> {
+        let now = Instant::now();
+        let mut grants = self
+            .grants
+            .lock()
+            .map_err(|_| std::io::Error::other("capability store poisoned"))?;
+        grants.retain(|_, grant| grant.expires > now);
+        if grants.len() >= MAX_FIXTURE_CAPABILITIES {
+            return Err(std::io::Error::other("capability capacity exhausted"));
+        }
+        let token = updated::rand::token()?;
+        grants.insert(
+            token.clone(),
+            CapabilityGrant {
+                path: path.to_owned(),
+                expires: now + updated_contracts::dataflow::OBJECT_CAPABILITY_TTL,
+            },
+        );
+        Ok(format!("{}{path}?cap={token}", self.public_url))
+    }
+
+    fn authorize(&self, request_target: &str) -> Option<String> {
+        let (path, query) = request_target.split_once('?')?;
+        let token = query.strip_prefix("cap=")?;
+        if !updated::rand::is_token(token) {
+            return None;
+        }
+        let now = Instant::now();
+        let mut grants = self.grants.lock().ok()?;
+        grants.retain(|_, grant| grant.expires > now);
+        let grant = grants.get(token)?;
+        (grant.path == path).then(|| path.to_owned())
+    }
+}
+
+async fn respond_redirect<S>(stream: &mut S, location: &str)
 where
     S: AsyncWrite + Unpin,
 {
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nPragma: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+    // `location` is assembled only from a validated HTTPS origin, a path accepted by the shared
+    // repository grammar, and a fixed-width hex token, so it cannot inject response headers.
+    let header = format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(body).await;
-    let _ = stream.shutdown().await;
+    let _ = write_with_timeout(stream, header.as_bytes()).await;
 }
 
-/// Accept a node rollout report and persist it beside the repository at
-/// `<root>/telemetry/<node>.json`. Mirrors the k8s gateway's telemetry contract: the
-/// body must be a well-formed [`updated_contracts::telemetry::NodeReport`] naming the same node as
-/// the path, so a malformed or misattributed report is rejected rather than stored.
-///
-/// Unlike the production k8s gateway (`updatec::gateway::telemetry_put`), this dev/mock CDN does
-/// NOT authorize the report against the caller's mTLS leaf identity: `gen_certs` mints a single
-/// shared fleet client certificate, so there is no per-node identity to bind the path node against
-/// — the check is not expressible here. The report signature is still what makes a report
-/// trustworthy end-to-end (the control plane and health proxy verify it against the node's pinned
-/// key), so this omission only lets a shared-cert peer overwrite another node's report with bytes
-/// that then fail verification and fail closed. Do not copy this handler as the production contract.
-async fn serve_telemetry_put<S>(
-    stream: &mut S,
-    root: &Path,
-    path: &str,
-    head: &str,
-    buf: &[u8],
-) -> std::io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let Some(node) = updated_contracts::telemetry::node_from_path(path) else {
-        respond_status(stream, 404, b"not found").await;
-        return Ok(());
-    };
-    let content_length = head.lines().skip(1).find_map(|line| {
-        let line = line.to_ascii_lowercase();
-        line.strip_prefix("content-length:")
-            .and_then(|value| value.trim().parse::<usize>().ok())
-    });
-    let Some(content_length) = content_length else {
-        respond_status(stream, 411, b"length required").await;
-        return Ok(());
-    };
-    // The same envelope bound every other hop enforces, so the dev CDN accepts exactly the reports
-    // the production gateway does — and exactly the ones a node may sign.
-    if content_length > updated_contracts::telemetry::MAX_REPORT_ENVELOPE_BYTES {
-        respond_status(stream, 413, b"payload too large").await;
-        return Ok(());
-    }
-    let start = buf
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| position + 4)
-        .unwrap_or(buf.len());
-    let mut body = buf.get(start..).unwrap_or_default().to_vec();
-    body.truncate(content_length);
-    let mut chunk = [0u8; 1024];
-    while body.len() < content_length {
-        let read = timeout(Duration::from_secs(10), stream.read(&mut chunk))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "body timeout"))??;
-        if read == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..read]);
-    }
-    if body.len() < content_length {
-        respond_status(stream, 400, b"short body").await;
-        return Ok(());
-    }
-    body.truncate(content_length);
-    // A report travels as a signed DSSE envelope, exactly as the k8s gateway stores it — that is
-    // what a consumer verifies against the node's pinned key. The acceptance rule is the gateway's
-    // own, called rather than restated, so the dev CDN accepts exactly the reports production does.
-    if updated_contracts::telemetry::accept_report_envelope(&body, node).is_none() {
-        respond_status(stream, 400, b"malformed report envelope").await;
-        return Ok(());
-    }
-    let dest = root.join(updated_contracts::telemetry::report_object_key(node));
-    if let Some(parent) = dest.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
-            respond_status(stream, 500, error.to_string().as_bytes()).await;
-            return Ok(());
-        }
-    }
-    // `atomic_write` fsyncs the file and its directory — hundreds of milliseconds on a busy disk,
-    // on a runtime worker that is also serving every other agent's metadata fetch. Hand it to the
-    // blocking pool.
-    let written = tokio::task::spawn_blocking(move || {
-        foundation::durable::atomic_write(&dest, ".telemetry-", &body)
-    })
-    .await
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
-    match written {
-        Ok(()) => respond_status(stream, 200, b"ok").await,
-        Err(error) => respond_status(stream, 500, error.to_string().as_bytes()).await,
-    }
-    Ok(())
-}
-
-/// The namespaces this server serves. The two TUF halves, plus the report namespace it also
-/// accepts writes into — a namespace this server can write but never read back would 404 every
-/// consumer's fetch while each `PUT` reported success.
-const SERVED_NAMESPACES: [&str; 4] = [
-    "metadata",
-    "targets",
-    updated_contracts::telemetry::REPORT_NAMESPACE,
-    // The control plane's endpoint projection (cordoned nodes), read by the healthproxy.
-    "endpoints",
-];
+/// The read-only namespaces this development repository serves.
+const SERVED_NAMESPACES: [&str; 2] = ["metadata", "targets"];
 
 /// Map a request path to a file inside `root`. Which request paths name a repository object is
-/// the gateway's grammar ([`updatec::served::repository_object`]), shared so this dev CDN serves
+/// the repository grammar ([`updatec::served::repository_object`]), shared so these fixtures serve
 /// exactly the requests production serves — nested target paths yes, traversal, empty and
 /// dot-leading segments, query strings and percent-escapes no. What is added here is the local
 /// half: the namespaces this server publishes, and opening the file without letting a symlink
@@ -950,10 +1038,14 @@ mod tests {
     /// Serve one request through an in-memory transport so protocol unit tests do not
     /// require permission to bind loopback sockets.
     async fn get(root: &Path, request: &str) -> String {
+        serve_one(root, request, RequestAccess::Object).await
+    }
+
+    async fn serve_one(root: &Path, request: &str, access: RequestAccess) -> String {
         let (mut client, server) = tokio::io::duplex(32 * 1024);
         let root = root.to_path_buf();
         tokio::spawn(async move {
-            let _ = serve_conn(server, &root).await;
+            let _ = serve_conn(server, &root, access).await;
         });
         client.write_all(request.as_bytes()).await.unwrap();
         client.shutdown().await.unwrap();
@@ -1019,7 +1111,7 @@ mod tests {
     /// A bounded and a suffix range are what production serves; while this server open-coded its
     /// own range parser it answered both with a 400, so no run ever exercised production's rule.
     #[tokio::test]
-    async fn bounded_and_suffix_ranges_are_served_the_way_the_gateway_serves_them() {
+    async fn bounded_and_suffix_ranges_match_direct_object_storage() {
         let (_tmp, root) = serve_root("range-shapes");
         for (header, expected_range, body) in [
             ("bytes=0-3", "bytes 0-3/10", "0123"),
@@ -1041,11 +1133,87 @@ mod tests {
         }
     }
 
+    /// The one length at which a suffix range has nothing to place. This verifies the fixture's
+    /// direct-object behavior; the production gateway does not inspect or proxy range requests.
+    #[tokio::test]
+    async fn a_suffix_range_over_an_empty_object_is_not_satisfiable() {
+        let (_tmp, root) = serve_root("empty-suffix");
+        std::fs::write(root.join("targets/empty"), b"").unwrap();
+        let response = get(
+            &root,
+            "GET /targets/empty HTTP/1.1\r\nRange: bytes=-500\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 416"), "got: {response:?}");
+        assert!(
+            response.contains("Content-Range: bytes */0"),
+            "got: {response:?}"
+        );
+    }
+
     #[tokio::test]
     async fn unsupported_methods_are_rejected() {
         let (_tmp, root) = serve_root("method");
         let response = get(&root, "POST /targets/app HTTP/1.1\r\n\r\n").await;
         assert!(response.starts_with("HTTP/1.1 405"), "got: {response:?}");
+    }
+
+    #[tokio::test]
+    async fn capability_gateway_requires_identity_then_binds_the_bearer_to_one_object() {
+        let (_tmp, root) = serve_root("capability");
+        let store = CapabilityStore {
+            public_url: "https://objects.example".into(),
+            grants: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let denied = serve_one(
+            &root,
+            "GET /targets/app HTTP/1.1\r\n\r\n",
+            RequestAccess::Capability {
+                authenticated: false,
+                store: store.clone(),
+            },
+        )
+        .await;
+        assert!(denied.starts_with("HTTP/1.1 403"), "got: {denied:?}");
+
+        let minted = serve_one(
+            &root,
+            "GET /targets/app HTTP/1.1\r\n\r\n",
+            RequestAccess::Capability {
+                authenticated: true,
+                store: store.clone(),
+            },
+        )
+        .await;
+        assert!(minted.starts_with("HTTP/1.1 307"), "got: {minted:?}");
+        let location = minted
+            .lines()
+            .find_map(|line| line.strip_prefix("Location: "))
+            .unwrap();
+        let request_target = location.strip_prefix("https://objects.example").unwrap();
+        let body = serve_one(
+            &root,
+            &format!("GET {request_target} HTTP/1.1\r\n\r\n"),
+            RequestAccess::Capability {
+                authenticated: false,
+                store: store.clone(),
+            },
+        )
+        .await;
+        assert!(body.starts_with("HTTP/1.1 200"), "got: {body:?}");
+        assert!(body.ends_with("0123456789"), "got: {body:?}");
+
+        let token = request_target.split_once('?').unwrap().1;
+        let wrong = serve_one(
+            &root,
+            &format!("GET /metadata/root.json?{token} HTTP/1.1\r\n\r\n"),
+            RequestAccess::Capability {
+                authenticated: false,
+                store,
+            },
+        )
+        .await;
+        assert!(wrong.starts_with("HTTP/1.1 403"), "got: {wrong:?}");
     }
 
     #[tokio::test]
@@ -1085,49 +1253,6 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 431"), "got: {response:?}");
     }
 
-    /// The server accepts report writes, so it must serve them back: a store that knows only the
-    /// write half answers 404 to every consumer fetch, and a health proxy pointed at it programs
-    /// an empty backend set forever while each `PUT` reports success.
-    #[tokio::test]
-    async fn a_stored_report_is_served_back_to_the_reader_that_fetches_it() {
-        use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
-        use updated_contracts::telemetry::{
-            report_is_authentic_and_fresh, report_object_key, sign_report, NodeReport,
-        };
-
-        let (_tmp, root) = serve_root("telemetry-roundtrip");
-        let rng = aws_lc_rs::rand::SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
-        let key =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref()).unwrap();
-        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let report = NodeReport::new("agent-7", "deploy-3", digest, "3.0.0", digest, true);
-        let body = serde_json::to_vec(&sign_report(&report, pkcs8.as_ref()).unwrap()).unwrap();
-
-        let key_path = report_object_key("agent-7");
-        let put = format!(
-            "PUT /{key_path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            String::from_utf8(body.clone()).unwrap()
-        );
-        let stored = get(&root, &put).await;
-        assert!(stored.starts_with("HTTP/1.1 200"), "got: {stored:?}");
-
-        let fetched = get(&root, &format!("GET /{key_path} HTTP/1.1\r\n\r\n")).await;
-        assert!(fetched.starts_with("HTTP/1.1 200"), "got: {fetched:?}");
-        let (_, served) = fetched.split_once("\r\n\r\n").unwrap();
-        assert_eq!(served.as_bytes(), body);
-        // The served bytes are still the ones the node signed, not a re-encoding.
-        let envelope = serde_json::from_slice(served.as_bytes()).unwrap();
-        assert!(report_is_authentic_and_fresh(
-            &envelope,
-            "agent-7",
-            key.public_key().as_ref(),
-            updated_contracts::telemetry::now_ms(),
-        )
-        .is_some());
-    }
-
     /// A client that keeps every individual write inside `write_with_timeout` — draining one
     /// chunk just before each 30s write deadline — would otherwise hold its connection permit for
     /// as long as it likes; 128 of those wedge the accept loop. The overall deadline ends it.
@@ -1140,7 +1265,7 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let served = tokio::spawn({
             let root = root.clone();
-            async move { serve_conn(server, &root).await }
+            async move { serve_conn(server, &root, RequestAccess::Object).await }
         });
         client
             .write_all(b"GET /targets/big HTTP/1.1\r\n\r\n")
@@ -1215,35 +1340,7 @@ mod tests {
     /// The signed runtime policy an assignment carries. Valid, because `publish-assignment`
     /// validates it before it stages anything.
     fn managed_runtime() -> updated_contracts::assignment::ManagedRuntime {
-        use updated_contracts::assignment::*;
-        ManagedRuntime {
-            product: "app".into(),
-            channel: "stable".into(),
-            install_root: "/opt/app".into(),
-            secrets: vec![],
-            inputs: Default::default(),
-            repository: ManagedRepositoryLimits {
-                metadata_limit: 1 << 20,
-                target_limit: 512 << 20,
-                transport_timeout_seconds: 30,
-            },
-            storage: ManagedStorage {
-                inactive_releases: 2,
-                inactive_providers: 2,
-                inactive_agents: 2,
-                inactive_bytes: 1 << 30,
-                inactive_repository_caches: 2,
-            },
-            timeouts: ManagedTimeouts {
-                check_interval_seconds: 15,
-                health_grace_seconds: 30,
-                health_successes: 2,
-                health_interval_seconds: 1,
-                refresh_retry_seconds: 5,
-                confirmation_window_seconds: 120,
-                agent_check_interval_seconds: 3600,
-            },
-        }
+        updated_contracts::assignment::testing::runtime()
     }
 
     /// A publish stages the documents it is about to sign under fixed names in the shared
@@ -1278,6 +1375,8 @@ mod tests {
             repo_dir.display().to_string(),
             "--keys".into(),
             keys_dir.display().to_string(),
+            "--release-root".into(),
+            repo_dir.join("metadata/root.json").display().to_string(),
             "--name".into(),
             "assignments/agents/agent-0.json".into(),
             "--metadata-url".into(),

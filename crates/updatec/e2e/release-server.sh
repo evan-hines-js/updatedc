@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+# Installed into the image at runtime; there is no source-tree path at this location for
+# ShellCheck to follow.
+# shellcheck source=/dev/null
 . /usr/local/lib/publish-fuzz-plan.sh
 
 repo=/data/repository
@@ -50,14 +53,15 @@ set -eu
 
 operation=${1:?missing reconciler operation}
 shift
-protocol= candidate= state_dir=
+protocol= candidate= state_dir= result_file=
 while [ $# -gt 0 ]; do
   case $1 in
     --protocol) protocol=$2; shift 2 ;;
     --candidate) candidate=$2; shift 2 ;;
     --state-dir) state_dir=$2; shift 2 ;;
+    --result-file) result_file=$2; shift 2 ;;
     --attempt-id|--reason|--install-root|--candidate-version|--predecessor|\
---predecessor-version|--input-file|--output-file) shift 2 ;;
+--predecessor-version|--input-dir|--output-dir) shift 2 ;;
     --) shift; break ;;
     *) echo "default-reconciler: unknown argument '$1'" >&2; exit 2 ;;
   esac
@@ -130,7 +134,12 @@ converge() {
 case "$operation" in
   # On a rollback --candidate IS the release being restored, so both directions converge the
   # same way onto the same argument.
-  apply|rollback) converge ;;
+  apply|rollback)
+    changed=true
+    if running && [ "$(cat "$releasefile" 2>/dev/null || true)" = "$candidate" ]; then changed=false; fi
+    converge
+    printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","retryAfterSeconds":null,"message":null}' "$changed" >"$result_file"
+    ;;
   healthcheck) curl -fsS -o /dev/null --max-time 3 http://127.0.0.1:8080/healthz ;;
   inspect) printf 'release=%s\n' "$(cat "$releasefile" 2>/dev/null || true)" ;;
   *) echo "default-reconciler: unknown operation '$operation'" >&2; exit 2 ;;
@@ -176,8 +185,8 @@ RECONCILER
   printf '%s\n' "$platform" >/data/platform
   touch /data/ready
 fi
-# The mock CDN terminates mTLS just like the gateway: cert-manager issues the fleet server cert
-# (gateway-tls) into /etc/gateway-tls, and only a client presenting a fleet-CA-signed cert is
-# admitted. Agents reach this over https://release-<group>/ under their agent-tls identity.
-exec server serve --repo "$repo" --addr 0.0.0.0:8080 \
-  --cert /etc/gateway-tls/tls.crt --key /etc/gateway-tls/tls.key --ca /etc/gateway-tls/ca.crt
+# Releases are the object plane: agents fetch them anonymously over HTTPS and never offer their
+# control-plane certificate. The real routing gateway is exercised separately and redirects its
+# authorized requests to signed MinIO URLs.
+exec server serve-object --repo "$repo" --addr 0.0.0.0:8080 \
+  --cert /etc/gateway-tls/tls.crt --key /etc/gateway-tls/tls.key

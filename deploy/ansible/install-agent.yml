@@ -1,27 +1,38 @@
 ---
-# Install the `updated` agent on a fleet of hosts and register each with the control plane.
-# This is the VM-fleet counterpart to the Kubernetes operator: the *same* agent (launcher +
-# agent), installed by ansible instead of a pod spec, phoning the same control plane home.
+# Bootstrap a fleet of hosts onto an `updated` control plane. The VM-fleet counterpart to the
+# Helm chart: the *same* launcher and agent the published release ships, placed by Ansible instead
+# of by a pod spec, enrolling with the same control plane.
 #
-# Required vars (see roles/updated_agent/defaults):
-#   updatedc_source         path to the updatedc workspace to build from (on the control node)
-#   updated_enrollment_url  the control plane's enrollment endpoint (HTTPS/mTLS)
+# This play performs the FIRST install only. After it, every agent version and every workload
+# arrives through the fleet's own signed TUF channel — re-running this play does not upgrade an
+# agent, and the package is deliberately not the upgrade mechanism. The one reason to run it again
+# is to move the launcher, which is installer-owned by design and never updates itself.
+#
+# Required vars (see roles/updated_agent/defaults/main.yml):
+#   updated_enrollment_url  the control plane's gateway URL (https, mutual TLS)
 #   updated_enrollment_client_cert / _client_key / _ca
-#                           base64 PEM of the fleet client cert, its key, and the fleet CA (the
-#                           mTLS identity — cert-manager issues it; no shared secret)
-#   updated_hostname        stable identity the control plane addresses this node by
-# Optional:
-#   updated_build_dir       where to build on the target (default ~/updatedc-src)
+#                           base64 PEM of this node's client certificate, its key, and the fleet
+#                           CA. Per-node certificates, ideally from your own PKI and pulled from
+#                           your secret store per host — not one certificate shared fleet-wide.
+# Common overrides:
+#   updated_release_tag        which published release to install (default: latest)
+#   updated_verify_attestation true to additionally check the build's signed provenance with
+#                              `gh attestation verify` on each target
+#   updated_release_local_dir  install from artifacts staged on the control node (air-gapped)
+#   updated_hostname           how the control plane addresses this node (default: inventory name)
+#   updated_agent_started      false to stage the fleet without starting it
 - name: Install the updated agent
   hosts: updated_agents
   become: true
   gather_facts: false
   pre_tasks:
-    # A freshly-imaged VM may lack python/rsync that ansible's modules need; install them raw.
-    - name: Bootstrap python and rsync for ansible
+    # A freshly-imaged VM may lack the python ansible's modules need; install it raw.
+    - name: Bootstrap python for ansible
       ansible.builtin.raw: >
-        (test -e /usr/bin/python3 && command -v rsync >/dev/null 2>&1) ||
-        (apt-get update && apt-get install -y python3 rsync)
+        test -e /usr/bin/python3 ||
+        (apt-get update && apt-get install -y python3) ||
+        (dnf install -y python3) ||
+        (yum install -y python3)
       changed_when: false
     - name: Gather facts
       ansible.builtin.setup:

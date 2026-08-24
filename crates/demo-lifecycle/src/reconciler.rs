@@ -16,7 +16,9 @@ use demo_lifecycle::PROVIDER_TIMEOUT_MS;
 use foundation::durable;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate; this fixture
 /// answers exactly the operations the agent invokes.
-use updated_contracts::reconciler::{attempt, Operation};
+use updated_contracts::reconciler::{
+    attempt, HostAction, Operation, Reason, ResultDocument, ResultStatus, PROTOCOL,
+};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -26,14 +28,26 @@ type Error = Box<dyn std::error::Error>;
 /// entrypoint serves ([`WORKLOAD_START_BUDGET_MS`]).
 const APPLY_FIXED_WORK_MS: u64 = 6_000 + WORKLOAD_START_BUDGET_MS;
 
-/// How long `start` waits for the candidate's workload to answer on [`WORKLOAD_ADDRESS`] before
+/// How long `start` waits for the candidate's workload to answer on [`WORKLOAD_PORT`] before
 /// failing the activation. A release whose entrypoint cannot serve fails its own apply here,
 /// rather than leaving the agent to infer it from a health observation.
 const WORKLOAD_START_BUDGET_MS: u64 = 5_000;
 
-/// The address this product's workload serves the fleet on — what the pod, its peers, and this
-/// reconciler's own health observation all reach it at.
-const WORKLOAD_ADDRESS: &str = "0.0.0.0:8080";
+/// The port this product's workload serves the fleet on — what the pod, its peers, and this
+/// reconciler's own health observation all reach it at. Both spellings below derive from it, so
+/// the workload cannot be started on one port and observed on another.
+const WORKLOAD_PORT: u16 = 8080;
+
+/// What the workload binds: every interface on [`WORKLOAD_PORT`], because the fleet reaches it
+/// from outside the pod.
+fn workload_address() -> String {
+    format!("0.0.0.0:{WORKLOAD_PORT}")
+}
+
+/// Where this reconciler observes the workload it started: the same port, over loopback.
+fn workload_version_url() -> String {
+    format!("http://127.0.0.1:{WORKLOAD_PORT}/version")
+}
 
 /// Headroom the dwell band leaves the timeout for everything wall time this fixture does not
 /// control: process spawn, artifact staging, and a demo cluster under load.
@@ -50,17 +64,39 @@ const ROLLBACK_SET: [&str; 3] = ["application.war", "content.repository", "serve
 /// timeout after the fixed work and the margin has to cover both.
 const DWELL_CEILING_MS: u64 = (PROVIDER_TIMEOUT_MS - APPLY_FIXED_WORK_MS - APPLY_MARGIN_MS) / 2;
 
+/// Where one deployment TRANSACTION's rollback backup lives — keyed by transaction, not by
+/// attempt. The agent drives the compensating direction — the predecessor's re-`apply` after a
+/// crash, and `rollback` — under the forward attempt's id with an `r` appended
+/// (`rollback_attempt_id`); attempt ids are dashless hex, so a trailing `r` can only be that
+/// marker. Keying per attempt was a poison path: the compensating apply's `prepare` ran with the
+/// crashed forward attempt's candidate bytes already live, captured THAT as "the predecessor's
+/// state", and a later rollback under the same compensating id faithfully restored the
+/// contamination — the node then failed its boot converge forever, on a state no release ever
+/// shipped. One backup per transaction means it is only ever captured by the forward `prepare` —
+/// the one moment the live files are genuinely the predecessor's — and both directions restore
+/// that same truth.
+fn transaction_backup(state: &Path, attempt: &str) -> PathBuf {
+    let transaction = attempt.strip_suffix('r').unwrap_or(attempt);
+    state.join("backups").join(transaction)
+}
+
 struct Deployment {
     phase: Operation,
     attempt: String,
     candidate: String,
     predecessor: String,
     candidate_dir: PathBuf,
-    reason: String,
+    reason: Reason,
     state: PathBuf,
     effects: PathBuf,
     live: PathBuf,
     backup: PathBuf,
+    /// Private per-invocation files supplied by the dataflow graph.
+    input_dir: PathBuf,
+    /// Empty per-invocation directory where this reconciler advertises named output files.
+    output_dir: PathBuf,
+    /// Agent-owned structured result channel for state-changing operations.
+    result_file: PathBuf,
 }
 
 impl Deployment {
@@ -78,13 +114,20 @@ impl Deployment {
             phase,
             effects: state.join("attempts").join(&attempt),
             live: state.join("legacy-java-home"),
-            backup: state.join("backups").join(&attempt),
+            backup: transaction_backup(&state, &attempt),
             state,
             attempt,
             candidate,
             predecessor: required_argument(&values, "--predecessor-version")?.to_string(),
             candidate_dir: PathBuf::from(required_argument(&values, "--candidate")?),
-            reason: required_argument(&values, "--reason")?.to_string(),
+            // Parsed by the contract that owns the vocabulary — never against literals of this
+            // fixture's own, which would compile clean through a renamed spelling and silently
+            // stop taking the per-boot path. A reason outside the grammar is refused, not treated
+            // as an update.
+            reason: required_argument(&values, "--reason")?.parse::<Reason>()?,
+            input_dir: PathBuf::from(required_argument(&values, "--input-dir")?),
+            output_dir: PathBuf::from(required_argument(&values, "--output-dir")?),
+            result_file: PathBuf::from(required_argument(&values, "--result-file")?),
         })
     }
 
@@ -96,10 +139,14 @@ impl Deployment {
         // without repeating finished work. A per-boot hook is not an attempt: the agent
         // invokes it under a constant id on every launch, so honouring a marker there would turn
         // "run this before every start" into "run this once, ever".
-        if !matches!(self.phase, Operation::Healthcheck | Operation::Inspect)
-            && !self.is_per_boot()
-            && self.completed(self.phase)
-        {
+        if self.phase.mutation().is_some() && !self.is_per_boot() && self.completed(self.phase) {
+            // Idempotence skips side effects, never declarations. Every invocation receives a
+            // fresh output directory and the agent atomically replaces the durable snapshot with
+            // what this invocation emits, so a replay must re-advertise the complete output set.
+            if self.phase.publishes_outputs() {
+                self.publish_outputs()?;
+            }
+            self.publish_result(false)?;
             return Ok(());
         }
         self.audit("started")?;
@@ -109,18 +156,46 @@ impl Deployment {
             Operation::Rollback => self.rollback()?,
             Operation::Inspect => self.fingerprint()?,
         }
-        if !matches!(self.phase, Operation::Healthcheck | Operation::Inspect) && !self.is_per_boot()
-        {
+        // Reached only on success. The contract owns which operations publish; observations get a
+        // disposable output directory but must never replace the durable snapshot.
+        if self.phase.publishes_outputs() {
+            self.publish_outputs()?;
+        }
+        if self.phase.mutation().is_some() && !self.is_per_boot() {
             self.write(
                 self.effects.join(format!("{}.done", self.phase.as_str())),
                 b"done\n",
             )?;
         }
-        self.audit("completed")
+        self.audit("completed")?;
+        if self.phase.publishes_outputs() {
+            self.publish_result(true)?;
+        }
+        Ok(())
     }
 
+    fn publish_result(&self, changed: bool) -> Result<(), Error> {
+        let result = ResultDocument {
+            schema: ResultDocument::SCHEMA,
+            status: ResultStatus::Succeeded,
+            changed,
+            host_action: HostAction::None,
+            retry_after_seconds: None,
+            message: None,
+        };
+        durable::atomic_write(
+            &self.result_file,
+            ".result-",
+            &result.to_bounded_json().map_err(std::io::Error::other)?,
+        )?;
+        Ok(())
+    }
+
+    /// Converge onto the candidate. A restart — or a transaction whose candidate and predecessor
+    /// are the same release — moves no bytes: it re-establishes the live state and brings the
+    /// workload back up rather than running the update steps against the release already live.
     fn apply(&self) -> Result<(), Error> {
-        if self.reason == "restart" || self.candidate == self.predecessor {
+        if self.reason == Reason::Restart || self.candidate == self.predecessor {
             self.pre_start()?;
             return self.start();
         }
@@ -147,9 +222,6 @@ impl Deployment {
     fn preflight(&self) -> Result<(), Error> {
         executable(&self.candidate_dir.join("bin/app"))?;
         required_file(&self.candidate_dir.join("config/release.toml"))?;
-        if self.candidate == self.predecessor {
-            return Err("candidate and predecessor versions are identical".into());
-        }
         thread::sleep(Duration::from_secs(1));
         Ok(())
     }
@@ -171,13 +243,18 @@ impl Deployment {
         Ok(())
     }
 
-    /// Copy the predecessor's live state aside, exactly once per attempt.
+    /// Copy the predecessor's live state aside, exactly once per TRANSACTION.
     ///
-    /// `apply` is replayed under the same attempt id — after a crash mid-apply, and by the
-    /// agent's recovery activation, which re-invokes the hook with candidate and predecessor
-    /// swapped. By then `activate` may already have written the candidate into `live`, so a second
-    /// copy would overwrite the predecessor bytes that this attempt's `rollback` restores. The
-    /// marker is written last, so a copy interrupted halfway is retaken rather than trusted.
+    /// `apply` is replayed — after a crash mid-apply under the same attempt id, and by the
+    /// agent's recovery activation under the transaction's compensating id (candidate and
+    /// predecessor swapped). By then `activate` may already have written the candidate into
+    /// `live`, so a later copy would overwrite the predecessor bytes that this transaction's
+    /// `rollback` restores; the shared transaction-keyed `backup` dir (see [`Deployment::load`])
+    /// plus this marker is what makes every replay and both directions skip it. The window is
+    /// closed by ordering, not luck: the `ROLLBACK_SET` files are only ever mutated by `activate`
+    /// and `finalize`, both of which require a completed `prepare` — so a missing marker proves
+    /// the live files are still the predecessor's. The marker is written last, so a copy
+    /// interrupted halfway is retaken rather than trusted.
     fn capture_rollback_backup(&self) -> Result<(), Error> {
         let marker = self.backup.join("captured");
         if marker.is_file() {
@@ -324,17 +401,6 @@ impl Deployment {
         required_file(&self.live.join("migration.plan"))
     }
 
-    /// Observe the running application, which only exists outside the activation transaction:
-    /// `periodic` runs after the agent has relaunched the process (and after agent or
-    /// pod restarts), so its evidence comes from durable live state and the live socket.
-    fn verify_running_version(&self) -> Result<(), Error> {
-        let observed = ureq::get("http://127.0.0.1:8080/version")
-            .timeout(Duration::from_secs(2))
-            .call()?
-            .into_string()?;
-        self.validate_running_version(&observed)
-    }
-
     fn validate_running_version(&self, observed: &str) -> Result<(), Error> {
         if observed.trim() != self.candidate {
             return Err(format!("expected {}, observed {observed:?}", self.candidate).into());
@@ -347,7 +413,7 @@ impl Deployment {
         // hardened agent; the provider defines the application-specific evidence. Periodic is
         // deliberately independent of rollout-attempt markers: those belong to a completed
         // transaction and are not steady-state health.
-        self.verify_running_version()?;
+        self.validate_running_version(&self.observed_version()?)?;
         // Finalization consumes the transient migration plan. Steady health proves the durable
         // post-finalize state instead of requiring transaction-temporary evidence.
         expect(
@@ -409,6 +475,33 @@ impl Deployment {
         Ok(())
     }
 
+    /// Publish this release's file-native dataflow output. The one output is its own version, under
+    /// `release.version`: deterministic, joinable by a dependent group's configuration, and the
+    /// value the dataflow e2e asserts travels producer → signed report → control plane →
+    /// consumer assignment → consumer `--input-dir`.
+    fn publish_outputs(&self) -> Result<(), Error> {
+        fs::create_dir_all(&self.output_dir)?;
+        durable::atomic_write(
+            &self.output_dir.join("release.version"),
+            ".demo-outputs",
+            self.candidate.as_bytes(),
+        )?;
+        // The fixture's dataflow scenario wires this PUBLIC release version into a consumer. Echo
+        // that one named value as an advertised output so the cluster test can prove the hook read
+        // the ephemeral input file without weakening the production rule by retaining input
+        // directories. Arbitrary configuration (and therefore arbitrary secrets) is never copied.
+        match fs::read(self.input_dir.join("upstream_release")) {
+            Ok(value) => durable::atomic_write(
+                &self.output_dir.join("observed.upstream_release"),
+                ".demo-outputs",
+                &value,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     fn require(&self, phase: &str) -> Result<(), Error> {
         if self.effects.join(format!("{phase}.done")).is_file() {
             Ok(())
@@ -420,7 +513,7 @@ impl Deployment {
     /// Whether this invocation is the agent's per-boot environment hook (`install`/`restart`
     /// reasons, run on every launch under a constant attempt id) rather than one update attempt.
     fn is_per_boot(&self) -> bool {
-        matches!(self.reason.as_str(), "install" | "restart")
+        matches!(self.reason, Reason::Install | Reason::Restart)
     }
 
     fn completed(&self, phase: Operation) -> bool {
@@ -481,21 +574,40 @@ impl Deployment {
             .ok()
     }
 
-    /// Whether the recorded workload is still serving. A detached workload is reparented to
-    /// whatever runs as pid 1, which reaps its own children and nothing else, so a crashed one
-    /// lingers as a zombie that answers `kill -0` and serves nothing: the process state, not its
-    /// mere existence, is what says the workload is still there.
-    fn workload_running(&self) -> bool {
+    /// Whether the recorded workload is still serving: `Some(true)` it is, `Some(false)` it is
+    /// observably gone, `None` when this platform cannot tell.
+    ///
+    /// A detached workload is reparented to whatever runs as pid 1, which reaps its own children
+    /// and nothing else, so a crashed one lingers as a zombie that answers `kill -0` and serves
+    /// nothing: the process state, not its mere existence, is what says the workload is still
+    /// there. That state is read from `/proc`, which the Linux nodes this demo deploys to have —
+    /// the crate is gated `cfg(unix)` so the rest of the workspace still builds and tests
+    /// elsewhere, not because owning a workload through `/proc` is portable. Everywhere else the
+    /// answer is "unknown", and each caller below says what it does with that rather than letting
+    /// it silently mean "gone": read as "gone", it let `stop_workload` skip its `SIGKILL`
+    /// escalation and return while the old workload still held the port.
+    fn workload_liveness(&self) -> Option<bool> {
         let Some(pid) = self.workload_pid() else {
-            return false;
+            return Some(false);
         };
-        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        // The comm field is parenthesized and may itself contain spaces; the process state is the
-        // first field after the closing parenthesis.
-        stat.rsplit_once(") ")
-            .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+        #[cfg(target_os = "linux")]
+        {
+            // No entry at all is a pid with no process behind it. The comm field is parenthesized
+            // and may itself contain spaces; the process state is the first field after the
+            // closing parenthesis.
+            let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return Some(false);
+            };
+            Some(
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| !rest.starts_with('Z')),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            None
+        }
     }
 
     /// Stop the running workload, whichever release's reconciler started it, and forget it.
@@ -503,12 +615,15 @@ impl Deployment {
         if let Some(pid) = self.workload_pid() {
             signal(pid, libc::SIGTERM);
             for _ in 0..5 {
-                if !self.workload_running() {
+                if self.workload_liveness() == Some(false) {
                     break;
                 }
                 thread::sleep(Duration::from_secs(1));
             }
-            if self.workload_running() {
+            // Escalate unless the process was OBSERVED to be gone. "Cannot tell" must not end the
+            // stop: the replacement is started the moment this returns, and it cannot bind a port
+            // the old workload still holds.
+            if self.workload_liveness() != Some(false) {
                 signal(pid, libc::SIGKILL);
                 thread::sleep(Duration::from_millis(200));
             }
@@ -521,10 +636,13 @@ impl Deployment {
     /// otherwise stop what is running and start the candidate's own entrypoint, detached into its
     /// own session so it belongs to the release rather than to this bounded invocation (the agent
     /// tears the hook's process tree down the moment the hook returns).
+    ///
+    /// Only a process observed to be running is left alone: "cannot tell" restarts it, which
+    /// costs a restart and never leaves the release believing in a workload nobody can see.
     fn converge_workload(&self) -> Result<(), Error> {
         let release =
             fs::read_to_string(self.workload_record("workload.release")).unwrap_or_default();
-        if self.workload_running() && release.trim() == self.candidate {
+        if self.workload_liveness() == Some(true) && release.trim() == self.candidate {
             return Ok(());
         }
         self.stop_workload()?;
@@ -533,10 +651,11 @@ impl Deployment {
             .append(true)
             .open(self.workload_record("workload.log"))?;
         let pidfile = self.workload_record("workload.pid");
+        let address = workload_address();
         let mut command = std::process::Command::new(self.candidate_dir.join("bin/app"));
         command
             .current_dir(&self.candidate_dir)
-            .args(["--addr", WORKLOAD_ADDRESS, "--await-record"])
+            .args(["--addr", &address, "--await-record"])
             .arg(&pidfile)
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone()?)
@@ -575,8 +694,14 @@ impl Deployment {
         .into())
     }
 
+    /// Ask the running application which release it is serving — the one probe of the live
+    /// socket, used both while `start` waits for the candidate to come up and by the steady-state
+    /// `periodic` observation. The running application exists only outside the activation
+    /// transaction (`periodic` runs after the agent has relaunched the process, and after agent or
+    /// pod restarts), which is why in-transaction `verify` proves the activation from durable live
+    /// state instead.
     fn observed_version(&self) -> Result<String, Error> {
-        Ok(ureq::get("http://127.0.0.1:8080/version")
+        Ok(ureq::get(&workload_version_url())
             .timeout(Duration::from_secs(2))
             .call()?
             .into_string()?)
@@ -621,7 +746,7 @@ fn named_arguments(
             .ok_or_else(|| format!("missing value for {name}"))?;
         values.insert(name, value);
     }
-    if values.get("--protocol").map(String::as_str) != Some("1") {
+    if values.get("--protocol").map(String::as_str) != Some(PROTOCOL) {
         return Err("unsupported or missing reconciler protocol".into());
     }
     Ok(values)
@@ -711,19 +836,212 @@ mod tests {
         }
     }
 
+    /// The `--reason` vocabulary is the published one, not literals of this fixture's own: the
+    /// restart short-path and the per-boot marker rule both hinge on it, and a hook spelling the
+    /// words itself would compile clean through a renamed spelling while silently running a full
+    /// update apply on every boot.
+    #[test]
+    fn every_reason_the_agent_emits_selects_this_hooks_matching_path() {
+        for reason in [Reason::Install, Reason::Restart, Reason::Update] {
+            assert_eq!(reason.as_str().parse::<Reason>().unwrap(), reason);
+        }
+        assert!(
+            "reinstall".parse::<Reason>().is_err(),
+            "a reason outside the grammar is refused, not silently treated as an update"
+        );
+
+        let mut deployment = deployment(PathBuf::from("/nonexistent"), Operation::Apply, "a1");
+        for (reason, per_boot) in [
+            (Reason::Install, true),
+            (Reason::Restart, true),
+            (Reason::Update, false),
+        ] {
+            deployment.reason = reason;
+            assert_eq!(
+                deployment.is_per_boot(),
+                per_boot,
+                "{} is the per-boot hook: {per_boot}",
+                reason.as_str()
+            );
+        }
+    }
+
+    /// The workload is started on one port and observed on the same one. Those were independent
+    /// literals, so moving the port would have left both probes talking to nothing while the
+    /// address constant claimed to be what the health observation reaches.
+    #[test]
+    fn the_workload_is_observed_on_the_port_it_is_started_on() {
+        let port = workload_address().rsplit_once(':').unwrap().1.to_string();
+        assert!(
+            workload_version_url().contains(&format!(":{port}/")),
+            "{} does not observe the workload on {port}",
+            workload_version_url()
+        );
+    }
+
+    /// "Cannot tell" is not "gone". `stop_workload` escalates to `SIGKILL` on anything but an
+    /// observed exit and `converge_workload` adopts only an observed live process, so the liveness
+    /// question must never claim a workload is running when nothing stands behind its pid, and
+    /// must never claim it exited where the platform cannot look.
+    #[test]
+    fn an_unobservable_workload_is_never_reported_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("provider");
+        fs::create_dir_all(&root).unwrap();
+        let deployment = deployment(root, Operation::Apply, "a1");
+
+        assert_eq!(
+            deployment.workload_liveness(),
+            Some(false),
+            "no workload record at all is a stopped workload"
+        );
+        fs::write(deployment.workload_record("workload.pid"), b"2147483646\n").unwrap();
+        assert_ne!(
+            deployment.workload_liveness(),
+            Some(true),
+            "a pid with no process behind it is not a running workload"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            deployment.workload_liveness(),
+            Some(false),
+            "on Linux the absent /proc entry is an observed exit"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            deployment.workload_liveness(),
+            None,
+            "without /proc the answer is unknown, never a claimed exit"
+        );
+    }
+
     fn deployment(root: PathBuf, phase: Operation, attempt: &str) -> Deployment {
+        deployment_between(root, phase, attempt, "22.0.0", "1.0.0")
+    }
+
+    fn deployment_between(
+        root: PathBuf,
+        phase: Operation,
+        attempt: &str,
+        candidate: &str,
+        predecessor: &str,
+    ) -> Deployment {
         Deployment {
             phase,
             attempt: attempt.into(),
-            candidate: "22.0.0".into(),
-            predecessor: "1.0.0".into(),
+            candidate: candidate.into(),
+            predecessor: predecessor.into(),
             candidate_dir: root.join("candidate"),
-            reason: "update".into(),
+            reason: Reason::Update,
             state: root.clone(),
             effects: root.join("attempts").join(attempt),
-            live: root.join("live"),
-            backup: root.join("backups").join(attempt),
+            live: root.join("legacy-java-home"),
+            backup: transaction_backup(&root, attempt),
+            input_dir: root.join("inputs"),
+            output_dir: root.join("outputs"),
+            result_file: root.join("result.json"),
         }
+    }
+
+    /// Both fixture halves of the dataflow contract: a producer advertises its release, and a
+    /// consumer proves it observed that public value by advertising it again. The input directory
+    /// itself remains ephemeral and is never the assertion surface.
+    #[test]
+    fn a_successful_operation_publishes_its_release_version_as_a_file_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let deployment = deployment(root.clone(), Operation::Healthcheck, "healthcheck");
+        fs::create_dir_all(&deployment.input_dir).unwrap();
+        fs::write(deployment.input_dir.join("upstream_release"), b"21.0.0").unwrap();
+        deployment.publish_outputs().unwrap();
+        assert_eq!(
+            fs::read(root.join("outputs/release.version")).unwrap(),
+            b"22.0.0"
+        );
+        assert_eq!(
+            fs::read(root.join("outputs/observed.upstream_release")).unwrap(),
+            b"21.0.0"
+        );
+    }
+
+    /// A completion marker suppresses repeated machine effects, not output declarations. The
+    /// agent gives a replay a fresh directory and replaces the prior snapshot with its contents;
+    /// returning without re-emitting used to turn a crash replay into an empty dataflow value.
+    #[test]
+    fn a_completed_replay_reemits_the_complete_output_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let deployment = deployment(root.clone(), Operation::Apply, "replayed");
+        fs::create_dir_all(&deployment.effects).unwrap();
+        fs::write(deployment.effects.join("apply.done"), b"done\n").unwrap();
+        fs::create_dir_all(&deployment.input_dir).unwrap();
+        fs::write(deployment.input_dir.join("upstream_release"), b"21.0.0").unwrap();
+
+        deployment.run().unwrap();
+
+        assert_eq!(
+            fs::read(root.join("outputs/release.version")).unwrap(),
+            b"22.0.0"
+        );
+        assert_eq!(
+            fs::read(root.join("outputs/observed.upstream_release")).unwrap(),
+            b"21.0.0"
+        );
+    }
+
+    /// The double-crash lifecycle that wedged real fleet nodes: a forward update captured the
+    /// true predecessor, crashed after `activate` had put the candidate live, and the agent then
+    /// drove the compensating direction under `<id>r`. Both compensating operations must act on
+    /// the FORWARD attempt's capture — treating `<id>r` as a fresh attempt captured the
+    /// crash-contaminated live files as "the predecessor", and a rollback under that id then
+    /// restored the very bytes it existed to remove, failing the node's boot converge forever.
+    #[test]
+    fn the_compensating_direction_restores_the_forward_captures_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Steady predecessor state, then the forward attempt's capture — the one taken while the
+        // live files are genuinely the predecessor's.
+        let forward =
+            deployment_between(root.clone(), Operation::Apply, "abc123", "23.0.0", "22.0.0");
+        fs::create_dir_all(&forward.live).unwrap();
+        for name in ROLLBACK_SET {
+            forward.write(forward.live.join(name), b"22.0.0").unwrap();
+        }
+        forward.capture_rollback_backup().unwrap();
+
+        // The crash: `activate` already published the candidate into live when the node died.
+        forward
+            .write(forward.live.join("application.war"), b"23.0.0")
+            .unwrap();
+
+        // The compensating apply's `prepare` must not recapture over the transaction's backup.
+        let compensating = deployment_between(
+            root.clone(),
+            Operation::Apply,
+            "abc123r",
+            "22.0.0",
+            "23.0.0",
+        );
+        assert_eq!(
+            compensating.backup, forward.backup,
+            "both directions of one transaction share one backup"
+        );
+        compensating.capture_rollback_backup().unwrap();
+        assert_eq!(
+            fs::read_to_string(forward.backup.join("application.war")).unwrap(),
+            "22.0.0",
+            "the capture still holds the true predecessor"
+        );
+
+        // A rollback under the compensating id restores the true predecessor, not the crash.
+        let rollback = deployment_between(root, Operation::Rollback, "abc123r", "22.0.0", "23.0.0");
+        rollback.restore_release().unwrap();
+        assert_eq!(
+            fs::read_to_string(rollback.live.join("application.war")).unwrap(),
+            "22.0.0",
+            "live state is the predecessor's again; the boot converge can succeed"
+        );
     }
 
     #[test]
@@ -787,7 +1105,7 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().to_path_buf();
         let mut deployment = deployment(root.clone(), Operation::Apply, attempt::BOOT);
-        deployment.reason = "install".into();
+        deployment.reason = Reason::Install;
         fs::create_dir_all(&deployment.live).unwrap();
 
         assert!(!deployment.effects.join("activate.done").exists());
@@ -855,7 +1173,7 @@ mod tests {
     fn steady_state_verification_does_not_require_transaction_markers() {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().to_path_buf();
-        let live = root.join("live");
+        let live = root.join("legacy-java-home");
         fs::create_dir_all(&live).unwrap();
         fs::write(
             live.join("content.repository"),

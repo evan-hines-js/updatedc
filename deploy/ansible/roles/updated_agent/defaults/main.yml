@@ -1,12 +1,56 @@
 ---
-# The control plane's enrollment endpoint — your gateway's URL.
-updated_enrollment_url: "https://updatec-gateway"
+# ── What to install ───────────────────────────────────────────────────────────
+# The published release this role bootstraps a node from. CI publishes an immutable, attested
+# build per commit to GitHub Releases: per-platform archives, .deb/.rpm packages, and SHA256SUMS.
+# Nothing is compiled on the target — a fleet of hosts is not a build farm, and the artifact a
+# node runs should be the one CI tested and attested.
+updated_release_repo: evan-hines-js/updatedc
+updated_release_tag: ""
+
+# Verify the artifact and SHA256SUMS against CI's signed provenance. Mandatory for network
+# downloads; it needs `gh` and a route to GitHub on each target. An air-gapped fleet may set this
+# false only after verifying every staged asset on the control node before populating
+# `updated_release_local_dir`.
+updated_verify_attestation: true
+
+# Air-gapped installs: a directory ON THE CONTROL NODE holding the release artifacts and their
+# SHA256SUMS. When set, the role copies from here instead of reaching GitHub from every target.
+# Fetch it once with:
+#   gh release download <tag> --repo evan-hines-js/updatedc --dir ./artifacts
+updated_release_local_dir: ""
+
+# `package` installs the .deb/.rpm, which owns the root-only directory modes, the unit,
+# and config-merge-on-upgrade. `archive` unpacks the tarball and lets this role place those things
+# — for hosts with neither dpkg nor rpm.
+updated_install_method: package
+
+# ── Node identity ─────────────────────────────────────────────────────────────
+# `updated_enrollment_url` — the control plane's enrollment endpoint, the same value the control
+# plane was installed with as `publicUrl`. REQUIRED, and deliberately left undefined here: it is
+# the address nodes resolve from OUTSIDE the cluster, so no value this role could ship would be
+# right, and a plausible-looking one (the in-cluster Service name, say) would install a whole fleet
+# that fails enrollment on every target instead of failing once on the control node. The Helm chart
+# refuses to render without the same value for the same reason; this role asserts it in tasks.
+
 # Stable identity the control plane addresses this node by; defaults to the inventory name. It is
-# written verbatim as `name` in /etc/updated/config.toml, which is the name the gateway mints
-# into the node's certificate CN and gives its UpdateAgent object.
+# written verbatim as `name` in /etc/updated/config.toml, becomes the CN of the certificate the
+# gateway mints, and names the UpdateAgent object — so it is how this machine is known forever.
 updated_hostname: "{{ inventory_hostname }}"
-# Where the source is built ON the target. `updatedc_source` (on the control node) is rsync'd here
-# first; when the two are the same path the copy is skipped and the checkout is built in place.
-updated_build_dir: "{{ ansible_env.HOME }}/updatedc-src"
-# Required (no default): updatedc_source and the mTLS identity —
-# updated_enrollment_client_cert / _client_key / _ca (base64 PEM).
+
+# The mTLS identity, base64 PEM. Required; there is no shared enrollment secret.
+#   updated_enrollment_client_cert / updated_enrollment_client_key / updated_enrollment_ca
+#
+# Per-node certificates are the right shape: with one certificate shared across the fleet, any
+# host holding it can enroll under any name it asserts. Pair per-node certs with pre-created
+# `reserved` UpdateAgent objects to close that gap entirely — see docs/agent-install.md. Pull them
+# from your secret store per host rather than committing them to group_vars, e.g.
+#   updated_enrollment_client_cert: "{{ lookup('community.hashi_vault.hashi_vault', ...) }}"
+
+# ── Service tuning ────────────────────────────────────────────────────────────
+# Written to /etc/updated/agent.env, which the unit reads. Widen the ready timeout for a fleet
+# whose first cold install pulls a large bundle over a slow link.
+updated_ready_timeout: 60
+updated_confirm_timeout: 30
+
+# Start the service once configured. Set false to stage a fleet and cut it over separately.
+updated_agent_started: true

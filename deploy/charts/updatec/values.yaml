@@ -1,0 +1,229 @@
+# updatec — the control plane's controller and enrollment gateway.
+#
+# The only value with no workable default is `publicUrl`: it is the URL nodes are told to come back
+# to, and it is minted into immutable signed enrollment bundles. A wrong value there wedges a node's
+# first boot in a way no later edit repairs, so the chart refuses to render without it.
+
+# The `updatec` image. Source-chart development defaults `tag` to appVersion; release packaging
+# replaces the empty digest with the exact attested multi-architecture manifest it built. A tag is
+# always registry-mutable even when it is spelled as a commit.
+#
+# `digest` pins an exact image (`sha256:<64 hex>`) and is mutually exclusive with `tag` — a digest
+# already names the image, so a tag beside it is redundant or contradictory. `requireDigest` makes
+# a bare tag a render-time failure, for deployments that refuse mutable references. Neither ever
+# resolves a tag to a digest: that would need a registry at render time and would break air-gapped
+# `helm template`, so resolve it yourself and pass the result.
+image:
+  repository: ghcr.io/evan-hines-js/updatec
+  tag: ""
+  digest: ""
+  requireDigest: false
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The URL agents reach the gateway at. Required. This is baked into signed enrollment bundles, so
+# set it to the address nodes resolve from OUTSIDE the cluster — not the in-cluster Service name,
+# unless your nodes really do run in this cluster.
+publicUrl: ""
+
+# The UpdateRepository this control plane serves. The chart does not create it; see the install
+# guide for the repository, group, and agent resources.
+repository: default
+
+# `RUST_LOG` for both workloads.
+logLevel: info
+
+# The controller and the gateway run as separate identities, always. The gateway is the only
+# externally exposed listener, and it needs nothing beyond agent enrollment and reading the
+# repository it serves — so it never receives the controller's namespace-wide write access.
+# Names default to <fullname>-controller and <fullname>-gateway. The chart refuses to render if the
+# two ever resolve to one name — including `create: false` with a name left empty, which would run
+# that workload as the shared namespace `default` account.
+serviceAccount:
+  create: true
+  # Required when `create` is false: name the two ServiceAccounts you created yourself.
+  controllerName: ""
+  gatewayName: ""
+  annotations: {}
+
+# Per-workload, namespace-scoped Roles and RoleBindings only. The two
+# ValidatingAdmissionPolicies that bound what the controller identity may actually
+# write are NOT part of this toggle — they render either way, because a hand-written Role carries
+# the same unconstrained grants and needs the same object-level fence.
+rbac:
+  create: true
+
+controller:
+  # Every replica acquires or renews the `updatec-publisher` lease before it reconciles, and a
+  # follower reconciles nothing — so more than one replica is SAFE, and buys failover rather than
+  # throughput. It is the volume that decides whether it is possible: with the default
+  # ReadWriteOnce claim a second replica cannot bind the same PVC, so raising this requires a
+  # ReadWriteMany `accessModes` (or an `existingClaim` that is already RWX). The chart refuses to
+  # render a combination that would deadlock.
+  replicaCount: 1
+  podAnnotations: {}
+  # Spread replicas across failure domains. Only meaningful with replicaCount > 1.
+  topologySpreadConstraints: []
+  # Only rendered when replicaCount > 1 — a PDB over a single replica blocks node drains forever.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: "1", memory: 512Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # NOT a cache. This volume holds the signed TUF repository, and the controller numbers the next
+  # generation from the metadata it finds HERE. Lose it and the controller fails closed — it
+  # refuses to re-initialize at version 1 over a store already serving version N, because every
+  # node would reject that as a rollback — so publishing stops until the volume is restored.
+  #
+  # Disable it only for a repository that has never published (an ephemeral test cluster). The
+  # `helm.sh/resource-policy: keep` annotation on the claim is deliberate for the same reason.
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+    existingClaim: ""
+    # ReadWriteMany is what makes controller.replicaCount > 1 possible, and it is required for it
+    # — replicas must SHARE this state, not each hold their own. A replica with its own stale copy
+    # numbers the next generation from what it last saw, so one that led up to version 5 and later
+    # reacquired the lease would try to publish 6 over a store serving 40. The controller detects
+    # that and fails closed, but the fleet stops publishing until an operator intervenes.
+    accessModes: [ReadWriteOnce]
+  # GET /metrics, off by default.
+  metrics:
+    enabled: false
+    port: 9090
+    service:
+      enabled: false
+      annotations: {}
+  # POST condition transitions to a webhook, off by default. `tokenSecret` names an existing Secret
+  # holding the bearer token; it is mounted and re-read per delivery, never templated into env.
+  alerting:
+    url: ""
+    tokenSecret: ""
+    tokenKey: token
+  extraEnv: []
+
+# The operator creates one isolated healthproxy workload for each UpdateBackend. This image is
+# process configuration; all backend topology and behavior belongs to the CRD, never Helm values.
+healthproxy:
+  image:
+    repository: ghcr.io/evan-hines-js/updated-healthproxy
+    tag: ""
+    digest: ""
+    requireDigest: false
+    pullPolicy: IfNotPresent
+
+gateway:
+  # Stateless and safe to scale: it holds no lease and no volume.
+  replicaCount: 1
+  topologySpreadConstraints: []
+  # Only rendered when replicaCount > 1.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  # Exact maximum active fleet-report shards. Each shard is bounded to 16 MiB, so this sets the
+  # pending and stored serialized-report ceiling in 16 MiB units. Changing it restarts the gateway;
+  # the first flush rebalances the existing fleet even if no new report arrives. Heap/RSS also
+  # includes decoded maps, I/O buffers, and allocator overhead, so size resources separately.
+  # Valid range: 1..64.
+  fleetReportMaxShards: 4
+  podAnnotations: {}
+  resources:
+    requests: {cpu: 25m, memory: 32Mi}
+    limits: {cpu: "1", memory: 256Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # The gateway terminates mutual TLS itself and its clients are agents, not browsers. Exposure is
+  # therefore an L4 concern: a LoadBalancer Service, or an ingress controller in TLS-passthrough
+  # mode. Terminating TLS at an ingress breaks enrollment — the gateway would see the proxy's
+  # identity instead of the node's client certificate.
+  service:
+    type: ClusterIP
+    port: 443
+    annotations: {}
+    # Only read when type is LoadBalancer.
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+  ingress:
+    enabled: false
+    className: nginx
+    host: ""
+    # Passthrough is not optional in practice — see the note above. The chart stamps the
+    # ingress-nginx passthrough annotation and refuses to render with `passthrough: false` unless
+    # you also set `ingress.acknowledgeTlsTermination: true`.
+    passthrough: true
+    acknowledgeTlsTermination: false
+    annotations: {}
+  # Secret holding the gateway's own server certificate (tls.crt/tls.key) and the CA agents are
+  # verified against (ca.crt). Created for you when `certManager.enabled` is set.
+  tlsSecretName: gateway-tls
+  # Secret holding the fleet CA *with its private key*, so /enroll can sign a node's CSR into a
+  # client certificate the mTLS listener accepts. This widens the gateway's blast radius; scope the
+  # CA to the fleet and nothing else.
+  issuingCaSecretName: fleet-ca
+  # The CN the shared bootstrap certificate must carry to call /enroll. Every holder has the same
+  # authority; reserved inventory limits claimable names but does not bind one holder to one name.
+  # Use a manual identity with an operator-pinned public key for that stronger binding.
+  enrollmentClientCN: updated-agent
+
+  # Pin the gateway's Secret read to the repository's `spec.s3.credentialsSecretRef`, which it
+  # uses to construct the object-store client. Applications and assignments never grant Secret
+  # reads; their bytes exist only in private S3 file snapshots.
+  #
+  #   secretResourceNames: [updatedc-store]
+  #
+  # Empty grants no Secret access at all, which is the secure default for workload identity. A
+  # repository using a credentials Secret must name it here; the gateway stays unavailable if the
+  # reference and this allow-list disagree.
+  secretResourceNames: []
+  extraEnv: []
+
+# Optional cert-manager resources for the two Secrets above. Off by default: most organizations
+# issue both from an existing PKI. Turning this on gives you a self-signed fleet root, which is
+# correct for a fleet whose only relying parties are its own agents and gateway.
+certManager:
+  enabled: false
+  # The self-signed issuer bootstrapping the fleet root. Set `create: false` and name your own
+  # issuer to root the fleet CA in an existing chain instead. `kind` describes THAT issuer, so it
+  # goes with `create: false`; the issuer this chart creates is always a namespaced Issuer, and
+  # asking for another kind beside `create: true` is refused at render time.
+  bootstrapIssuer:
+    create: true
+    name: ""
+    kind: Issuer
+  # `create: false` means the `gateway.issuingCaSecretName` Secret (CA certificate *and* key) is
+  # yours to supply. The CA Issuer that mints the certificates below is rendered either way.
+  fleetCA:
+    create: true
+    commonName: updated-fleet-ca
+    duration: 87600h
+    privateKey: {algorithm: ECDSA, size: 256}
+  gatewayCertificate:
+    create: true
+    duration: 8760h
+    # Every name a node or in-cluster client may address the gateway by. The Service name is added
+    # automatically; add the external hostname from `publicUrl` here.
+    dnsNames: []
+  # An mTLS client certificate for the shared bootstrap identity, issued from the fleet CA. Off by
+  # default because per-node certificates are the recommended production shape.
+  agentCertificate:
+    create: false
+    secretName: agent-tls
+    commonName: updated-agent
+
+podSecurityContext:
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: {drop: [ALL]}
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532

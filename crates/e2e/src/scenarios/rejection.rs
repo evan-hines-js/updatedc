@@ -43,7 +43,7 @@ pub(crate) fn persisted_rejection(ctx: &Ctx) -> R {
             ));
         }
         let persisted = wait_until(EVENT_TIMEOUT, || {
-            std::fs::metadata(dir.join("install/state/rejected"))
+            std::fs::metadata(node_paths(&dir).rejected)
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         });

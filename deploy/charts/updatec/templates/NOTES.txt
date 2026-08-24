@@ -1,0 +1,40 @@
+{{ .Chart.Name }} {{ .Chart.Version }} is installed in namespace {{ .Release.Namespace }}.
+
+Agents are told to return to:
+  {{ .Values.publicUrl }}
+
+That URL is minted into immutable signed enrollment bundles. If it is wrong, already-enrolled
+nodes cannot be repaired by editing it — reissue their bundles.
+
+Watch the control plane come up:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "updatec.controllerName" . }}
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "updatec.gatewayName" . }}
+
+{{- if not .Values.controller.persistence.enabled }}
+
+WARNING: controller.persistence is disabled, so the signed TUF repository lives in an emptyDir.
+The controller numbers each generation from that state. Once this repository has published, losing
+the pod means the controller fails closed — it will refuse to re-initialize at version 1 over a
+store already serving a later generation, and publishing stops until the state is restored.
+This setting is only safe for a repository that never needs to survive a restart.
+{{- end }}
+
+{{- if not .Values.certManager.enabled }}
+
+This release does NOT create its TLS material. The gateway stays in ImagePullBackOff-adjacent
+limbo (ContainerCreating, unmounted Secret) until both of these exist:
+  - {{ .Values.gateway.tlsSecretName }}   the gateway's server certificate (tls.crt/tls.key) and the CA agents are verified against (ca.crt)
+  - {{ .Values.gateway.issuingCaSecretName }}       the fleet CA *including its private key*, so /enroll can sign node CSRs
+Set `certManager.enabled=true` to have the chart issue both from a self-signed fleet root.
+{{- end }}
+
+{{- if eq .Values.gateway.service.type "ClusterIP" }}
+
+The gateway Service is ClusterIP, so nodes outside this cluster cannot reach it. Set
+`gateway.service.type=LoadBalancer`, or enable `gateway.ingress` on a TLS-PASSTHROUGH controller.
+The gateway terminates mutual TLS itself; a proxy that terminates TLS strips the client certificate
+that IS the node's identity.
+{{- end }}
+
+Next: create the UpdateRepository, UpdateGroup, UpdateGroupSet, and UpdateAgent objects for your
+fleet, then install agents. See docs/kubernetes-install.md and docs/agent-install.md.

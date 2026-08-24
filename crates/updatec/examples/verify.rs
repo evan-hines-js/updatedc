@@ -16,6 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metadata_limit: 1024 * 1024,
             target_limit: 1024 * 1024,
             transport_timeout: std::time::Duration::from_secs(30),
+            access: updated::config::RepositoryAccess::Direct,
             mtls: updated::tls::Identity::new("client.crt", "client.key", "ca.crt"),
         },
         &state.path().join("datastore"),
@@ -26,18 +27,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .find(|candidate| candidate.path == *target)
         .ok_or("target missing from verified TUF metadata")?;
-    repository
+    let mut downloaded = repository
         .download_target(&verified, &state.path().join("assignment.json"))
         .await?;
-    let node: updated_contracts::artifact::AgentDocument =
-        serde_json::from_slice(&std::fs::read(state.path().join("assignment.json"))?)?;
+    let node: updated_contracts::artifact::AgentDocument = serde_json::from_slice(
+        &downloaded.read_bounded(updated_contracts::artifact::AgentDocument::MAX_DOCUMENT_BYTES)?,
+    )?;
     node.validate()?;
     let config = repository.exact_target(&node.config)?;
-    repository
+    let mut downloaded = repository
         .download_target(&config, &state.path().join("config.json"))
         .await?;
     let config: updated_contracts::assignment::RepositoryAssignment =
-        serde_json::from_slice(&std::fs::read(state.path().join("config.json"))?)?;
+        serde_json::from_slice(&downloaded.read_bounded(
+            updated_contracts::assignment::RepositoryAssignment::MAX_DOCUMENT_BYTES,
+        )?)?;
     config.validate()?;
     println!("{}", config.deployment);
     Ok(())

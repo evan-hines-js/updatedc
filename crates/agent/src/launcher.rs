@@ -45,11 +45,12 @@ impl Launcher {
     }
 
     /// A connection in the shape [`Launcher::connect`] produces, over a socketpair whose other end
-    /// the test drives.
+    /// the test drives — including the endpoint's I/O deadlines, so what is exercised is the
+    /// endpoint the agent actually runs with.
     #[cfg(all(test, unix))]
     pub(crate) fn for_test(stream: std::os::unix::net::UnixStream) -> Launcher {
         Launcher {
-            conn: Conn { stream },
+            conn: Conn::adopt(stream).expect("bounding the test endpoint"),
             ready_nonce: [0u8; 16],
             ready_signalled: false,
         }
@@ -82,20 +83,26 @@ impl Launcher {
     /// way, because it records the *ordering* — that this call has happened — which is what the
     /// waits behind it depend on.
     ///
-    /// At most one `READY` reaches the launcher per launch. Boot recovery signals readiness as
-    /// soon as it starts waiting out a node-local transient (see `run`), and the boot path then
-    /// signals again at its ordinary point; a second frame on the wire would be answered — the
-    /// launcher's dispatch ignores it once the nonce is spent — but the agent would be
-    /// blocked on that exchange for no reason, so the send is made once here instead.
+    /// At most one `READY` frame reaches the launcher per launch — once one has actually got
+    /// there. Boot recovery signals readiness as soon as it starts waiting out a node-local
+    /// transient (see `run`), and the boot path then signals again at its ordinary point; a repeat
+    /// frame is harmless (the launcher's dispatch re-checks the nonce and does nothing once the
+    /// candidate's confirmation window has begun) but the agent would be blocked on that exchange
+    /// for no reason, so the send is made once here instead.
+    ///
+    /// A send that FAILED delivered nothing, so it does not count as that one send: the flag is
+    /// raised only on success, and the next call tries again. Consuming this launch's one signal on
+    /// a broken exchange would leave the candidate to time out on the launcher's readiness gate and
+    /// be rejected by content hash, permanently, for a fault that says nothing about its bytes.
     pub(crate) fn signal_ready(&mut self) -> ReadySignalled {
         if self.ready_signalled {
             return ReadySignalled(());
         }
-        self.ready_signalled = true;
-        if let Err(error) = self.expect_ok(&Request::Ready(self.ready_nonce), "READY") {
-            crate::warn(&format!(
+        match self.expect_ok(&Request::Ready(self.ready_nonce), "READY") {
+            Ok(()) => self.ready_signalled = true,
+            Err(error) => crate::warn(&format!(
                 "could not signal readiness to the launcher: {error}"
-            ));
+            )),
         }
         ReadySignalled(())
     }
@@ -109,9 +116,6 @@ impl Launcher {
             Response::Error(msg) => Err(LauncherError::Refused(format!(
                 "launcher rejected {what}: {msg}"
             ))),
-            other => Err(LauncherError::Refused(format!(
-                "unexpected reply to {what}: {other:?}"
-            ))),
         }
     }
 }
@@ -120,18 +124,10 @@ impl Launcher {
 /// [`Launcher::signal_ready`] can make one — the field is private to this module — so a wait that
 /// demands one cannot be moved back in front of the readiness signal without failing to compile.
 ///
-/// [`crate::secrets::SecretManager::acquire`] is that wait: in front of the signal, an unreachable
-/// secrets endpoint is indistinguishable from an agent binary that cannot start, and the
-/// candidate's bytes are then rejected by content hash, permanently.
+/// [`crate::runtime_data::RuntimeDataManager::acquire`] is that wait: in front of the signal, an
+/// unreachable input capability is indistinguishable from an agent binary that cannot start, and
+/// the candidate's bytes are then rejected by content hash, permanently.
 pub(crate) struct ReadySignalled(());
-
-#[cfg(test)]
-impl ReadySignalled {
-    /// Stand in for the launcher handshake, for tests of the waits that sit behind it.
-    pub(crate) fn for_test() -> ReadySignalled {
-        ReadySignalled(())
-    }
-}
 
 /// Why a launcher request failed, distinguished by fault attribution. `Refused` is a real
 /// operation failure the candidate owns (an operation this launcher build does not implement, an
@@ -166,13 +162,6 @@ impl From<LauncherError> for std::io::Error {
     }
 }
 
-/// The launcher's state directory, from the launch environment.
-pub(crate) fn state_dir() -> Option<std::path::PathBuf> {
-    std::env::var(control::STATE_DIR_ENV)
-        .ok()
-        .map(std::path::PathBuf::from)
-}
-
 /// One marker file the launcher writes for the agent: evidence about the agent launch that just
 /// ended, which the agent turns into a durable rejection.
 ///
@@ -197,8 +186,10 @@ struct Marker {
 }
 
 /// A marker instance that has been read, pinned to the exact bytes it held. Holding one is the
-/// proof of reading that [`Claim::clear`] requires; consuming one is what makes clearing happen at
-/// most once, for at most that instance.
+/// proof of reading that [`Claim::clear`] requires, and a clear only ever touches the instance
+/// whose bytes this claim pins — so clearing happens for at most that instance, however many times
+/// it is attempted. The holder ([`Evidence`]) releases the claim once the erase has committed,
+/// which is what makes a failed clear a retry rather than a silent skip.
 ///
 /// The *contents* are the instance identity, and nothing else: the launcher writes markers through
 /// `foundation::durable::atomic_write_managed`, but filesystem metadata cannot tell two writes
@@ -224,17 +215,11 @@ fn taken_path(marker: &Path) -> std::path::PathBuf {
 /// NOT consume — a newer instance, or one whose clear was interrupted. If a marker has landed on
 /// the path in the meantime it is newer evidence of the same event and wins; what must never
 /// happen is ending with no marker at all when one is owed.
-fn restore_taken(taken: &Path, marker: &Path) {
-    let restored = if marker.exists() {
+fn restore_taken(taken: &Path, marker: &Path) -> std::io::Result<()> {
+    if marker.try_exists()? {
         foundation::durable::remove_file(taken)
     } else {
         std::fs::rename(taken, marker)
-    };
-    if let Err(error) = restored {
-        crate::warn(&format!(
-            "could not restore the launcher marker {}: {error}",
-            marker.display()
-        ));
     }
 }
 
@@ -242,11 +227,12 @@ fn restore_taken(taken: &Path, marker: &Path) {
 /// beside the marker path. Restore it before reading, so that one-rename window cannot swallow a
 /// marker whose consequence had not committed. Runs on every claim, which is the only place a
 /// marker is ever read.
-fn recover_interrupted_clear(marker: &Path) {
+fn recover_interrupted_clear(marker: &Path) -> std::io::Result<()> {
     let taken = taken_path(marker);
-    if taken.exists() {
-        restore_taken(&taken, marker);
+    if taken.try_exists()? {
+        restore_taken(&taken, marker)?;
     }
+    Ok(())
 }
 
 fn warn_unusable(path: &Path, why: &str) {
@@ -285,25 +271,24 @@ impl Marker {
 
     /// Claim the marker as it is right now, without disturbing it. A genuine I/O failure (EIO, a
     /// permission problem) is propagated — the environment is broken, not the file — while
-    /// anything at the path that cannot *be* evidence is discarded and read as "no marker".
+    /// anything at the path that cannot *be* bounded evidence is discarded and read as "no
+    /// marker". The shared reader performs its no-follow open, regular-file check, and bounded
+    /// read on one handle, so a path replacement cannot turn the advisory check into a symlink or
+    /// an unbounded file before the read.
     fn claim(self) -> std::io::Result<Option<Claim>> {
-        recover_interrupted_clear(&self.path);
-        let metadata = match std::fs::symlink_metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if !metadata.file_type().is_file() {
-            return Ok(discard(&self.path, "is not a regular file"));
-        }
-        match std::fs::read_to_string(&self.path) {
+        recover_interrupted_clear(&self.path)?;
+        match foundation::file::read_bounded_regular_string(
+            &self.path,
+            control::MAX_AGENT_PATH_RECORD_BYTES,
+            foundation::file::FinalSymlink::Refuse,
+        ) {
             Ok(content) => Ok(Some(Claim {
                 path: self.path,
                 content,
             })),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                Ok(discard(&self.path, "is not valid UTF-8"))
+                Ok(discard(&self.path, "is not a bounded regular file"))
             }
             Err(e) => Err(e),
         }
@@ -323,7 +308,8 @@ impl Claim {
 
     /// Erase exactly the instance that was claimed. Call only AFTER the durable consequence
     /// derived from it — a synthesized rollback journal, a recorded rejection — has been
-    /// committed; the claim is consumed, so it cannot be cleared twice.
+    /// committed. Erasing an instance that is already gone is a no-op, so a repeated call (a
+    /// retried clear after a failure) cannot destroy anything but the pinned instance.
     ///
     /// If the bytes on disk are no longer the ones that were read, the launcher wrote a new marker
     /// while this boot was reconciling: that instance's evidence has been read by nobody, so it
@@ -333,20 +319,31 @@ impl Claim {
     /// then unlinking the *path* leaves a window between the two calls in which a marker the
     /// launcher renamed into place is unlinked with its evidence read by nobody — which is
     /// precisely how a rejected candidate gets re-staged forever.
-    fn clear(self) -> std::io::Result<()> {
+    fn clear(&self) -> std::io::Result<()> {
         let taken = taken_path(&self.path);
         match std::fs::rename(&self.path, &taken) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         }
-        let mine = match std::fs::read_to_string(&taken) {
+        let mine = match foundation::file::read_bounded_regular_string(
+            &taken,
+            control::MAX_AGENT_PATH_RECORD_BYTES,
+            foundation::file::FinalSymlink::Refuse,
+        ) {
             Ok(content) => content == self.content,
-            // Bytes that are no longer text at all are a different instance than the one read.
+            // Bytes that are no longer bounded text at all are a different instance than the one
+            // read.
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => false,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
-                restore_taken(&taken, &self.path);
+                if let Err(restore_error) = restore_taken(&taken, &self.path) {
+                    crate::warn(&format!(
+                        "could not restore the launcher marker {} after a read failure: \
+                         {restore_error}",
+                        self.path.display()
+                    ));
+                }
                 return Err(e);
             }
         };
@@ -358,8 +355,7 @@ impl Claim {
              for the next boot",
             self.path.display()
         ));
-        restore_taken(&taken, &self.path);
-        Ok(())
+        restore_taken(&taken, &self.path)
     }
 
     /// Throw away a marker whose content is not evidence, without touching a newer instance that
@@ -387,14 +383,10 @@ pub(crate) struct Evidence {
 }
 
 impl Evidence {
-    /// Read the marker. `state_dir` is `None` when this agent was not launched by a launcher, in
-    /// which case there is never any evidence.
-    pub(crate) fn read(state_dir: Option<&Path>) -> std::io::Result<Evidence> {
-        let Some(state_dir) = state_dir else {
-            return Ok(Evidence {
-                rejected_agent: None,
-            });
-        };
+    /// Read the marker out of the launcher's state directory. There is always one to read from:
+    /// an agent that was not launched by a launcher never gets this far — `parse_args` refuses
+    /// without the state directory, and `run` connects to the launcher before reading evidence.
+    pub(crate) fn read(state_dir: &Path) -> std::io::Result<Evidence> {
         let rejected_agent = match Marker::rejected_agent(state_dir).claim()? {
             Some(claim) => {
                 let candidate = claim.single_line().map(std::path::PathBuf::from);
@@ -421,11 +413,20 @@ impl Evidence {
     }
 
     /// Drop the rejected-agent evidence, now that the candidate's hash is durably rejected.
+    ///
+    /// The claim is surrendered only once the erase has COMMITTED. `execute_boot_plan` runs under
+    /// `recover_through_transients`, which re-invokes it on a node-local transient (an EIO, a
+    /// read-only remount) — and a clear that failed on one is exactly such a transient. Consuming
+    /// the claim on failure would make the retry a no-op that reports success, leaving the marker
+    /// on disk to be re-derived and re-warned on every later boot; keeping it makes the retry
+    /// finish the work the first attempt started.
     pub(crate) fn clear_rejected_agent(&mut self) -> std::io::Result<()> {
-        match self.rejected_agent.take() {
-            Some((claim, _)) => claim.clear(),
-            None => Ok(()),
-        }
+        let Some((claim, _)) = self.rejected_agent.as_ref() else {
+            return Ok(());
+        };
+        claim.clear()?;
+        self.rejected_agent = None;
+        Ok(())
     }
 }
 
@@ -451,6 +452,16 @@ fn parse_nonce(hex: &str) -> Option<Nonce> {
 }
 
 // ── the inherited channel endpoint ───────────────────────────────────────────────
+
+/// How long one control-channel read or write may stall this agent before it gives up on the
+/// frame. Deliberately far longer than the launcher's own 5s per-frame bound: the launcher serves
+/// from one thread and does the committed-agent fsync on it, so an honestly slow launcher must not
+/// be cut off mid-handoff — a lost READY would blow its readiness gate and get this agent's bytes
+/// rejected for a fault that says nothing about them. Short enough that a peer that will never
+/// answer does not silently spend the node's whole report-freshness budget
+/// (`updated_contracts::telemetry::REPORT_FRESHNESS`) blocked on it.
+#[cfg(unix)]
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(unix)]
 struct Conn {
@@ -487,6 +498,26 @@ impl Conn {
         // fd could drive the launcher directly — a handoff frame would swap the agent binary
         // out from under this node.
         set_cloexec(fd).map_err(|e| format!("securing the control channel endpoint: {e}"))?;
+        Conn::adopt(stream)
+    }
+
+    /// Take ownership of an endpoint and bound every operation on it.
+    ///
+    /// Neither end of this socketpair may block indefinitely on the other, and until now only the
+    /// launcher's end said so (`launcher::sys::Channel::create` sets `SO_RCVTIMEO`/`SO_SNDTIMEO`).
+    /// [`control::read_frame`] is written against that bound: it turns `WouldBlock`/`TimedOut`
+    /// into a "peer stalled mid-frame" error, which without a timeout is unreachable and leaves
+    /// `read_exact` blocking forever. The exchanges are boot readiness and the self-update handoff,
+    /// and the launcher answers them from its single serve thread — a thread that also does the
+    /// committed-agent fsync inline, so a stalled disk parks the responder. Bounded, that surfaces
+    /// as [`LauncherError::Channel`], which every caller already treats as a retryable transport
+    /// fault rather than a candidate defect.
+    #[cfg(unix)]
+    fn adopt(stream: std::os::unix::net::UnixStream) -> Result<Conn, String> {
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
+            .map_err(|e| format!("bounding the control channel endpoint: {e}"))?;
         Ok(Conn { stream })
     }
 
@@ -499,6 +530,13 @@ impl Conn {
     }
 }
 
+/// The Windows endpoint is a pair of anonymous pipe handles, which carry no read or write
+/// timeout: the deadline [`Conn::adopt`] sets on Unix has no counterpart here, and bounding a
+/// pipe needs the peek-poll and scratch-thread machinery the launcher's own end carries
+/// (`launcher::sys::windows`). A launcher that exits or is killed closes the pipes and this end
+/// sees a broken pipe — the ordinary case — but one that stops *answering* without closing
+/// (its single serve thread parked in a stalled fsync) blocks this exchange for as long as that
+/// lasts. Duplicating the launcher's bounding machinery here is what would close that gap.
 #[cfg(windows)]
 struct Conn {
     reader: std::fs::File,
@@ -562,17 +600,24 @@ impl Conn {
     }
 }
 
-/// Answer one request the way the launcher would, and hand it back, so the exchange under test
-/// completes and the frame it put on the wire can be asserted on.
+/// Answer requests the way the launcher would — one `responses` entry per request, in order — and
+/// hand back every frame that arrived, so the exchanges under test complete and what the agent put
+/// on the wire can be asserted on. The peer stops reading once its answers run out.
 #[cfg(all(test, unix))]
 fn answering(
     mut peer: std::os::unix::net::UnixStream,
-    response: Response,
-) -> std::thread::JoinHandle<Request> {
+    responses: Vec<Response>,
+) -> std::thread::JoinHandle<Vec<Request>> {
     std::thread::spawn(move || {
-        let request = Request::read(&mut peer).expect("one request");
-        response.write(&mut peer).expect("one response");
-        request
+        let mut requests = Vec::new();
+        for response in responses {
+            let Ok(request) = Request::read(&mut peer) else {
+                break;
+            };
+            response.write(&mut peer).expect("one response");
+            requests.push(request);
+        }
+        requests
     })
 }
 
@@ -587,7 +632,7 @@ mod channel_tests {
     #[test]
     fn a_handoff_puts_the_candidate_path_on_the_wire() {
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
-        let peer = answering(theirs, Response::Ok);
+        let peer = answering(theirs, vec![Response::Ok]);
         let mut launcher = Launcher::for_test(ours);
 
         launcher
@@ -596,7 +641,9 @@ mod channel_tests {
 
         assert_eq!(
             peer.join().expect("the stand-in launcher"),
-            Request::ReplaceAgent("/state/agents/abc/updated-agent".into())
+            vec![Request::ReplaceAgent(
+                "/state/agents/abc/updated-agent".into()
+            )]
         );
     }
 
@@ -604,19 +651,85 @@ mod channel_tests {
     fn readiness_is_signalled_at_most_once_per_launch() {
         // Boot recovery signals as soon as it starts waiting out a node-local transient, and the
         // boot path signals again at its ordinary point. A second frame would be answered — the
-        // launcher ignores a spent nonce — but this agent would block on an exchange for nothing.
+        // launcher ignores a repeat once the confirmation window has begun — but this agent would
+        // block on an exchange for nothing.
+        //
+        // The stand-in is willing to answer a second frame, so a second one would be recorded;
+        // dropping the launcher closes the channel and ends its read loop.
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
-        let peer = answering(theirs, Response::Ok);
+        let peer = answering(theirs, vec![Response::Ok, Response::Ok]);
         let mut launcher = Launcher::for_test(ours);
 
         launcher.signal_ready();
         launcher.signal_ready();
+        drop(launcher);
 
         assert_eq!(
             peer.join().expect("the stand-in launcher"),
-            Request::Ready([0u8; 16]),
+            vec![Request::Ready([0u8; 16])],
             "exactly one READY reached the launcher"
         );
+    }
+
+    #[test]
+    fn a_failed_readiness_signal_is_not_the_launchs_one_signal() {
+        // The signal that never arrived cannot be the one this launch is allowed. Forfeiting it
+        // would leave the candidate to blow the launcher's readiness gate and be rejected by
+        // content hash — permanently — over an exchange that says nothing about its bytes.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let peer = answering(
+            theirs,
+            vec![
+                Response::Error("unsupported".into()),
+                Response::Ok,
+                Response::Ok,
+            ],
+        );
+        let mut launcher = Launcher::for_test(ours);
+
+        launcher.signal_ready();
+        launcher.signal_ready();
+        launcher.signal_ready();
+        drop(launcher);
+
+        assert_eq!(
+            peer.join().expect("the stand-in launcher"),
+            vec![Request::Ready([0u8; 16]), Request::Ready([0u8; 16])],
+            "the refused send is retried, and the one that lands ends the retrying"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_bounds_every_read_and_write() {
+        // The launcher's end bounds itself so the agent can never park its single serve thread;
+        // this end must be bounded for the same reason in reverse. `control::read_frame` only
+        // reports a peer that stalled mid-frame because a timeout makes `WouldBlock`/`TimedOut`
+        // reachable — without one, `read_exact` waits for a launcher that may never answer.
+        let (ours, _theirs) = UnixStream::pair().expect("socketpair");
+        let conn = Conn::adopt(ours).expect("bounded endpoint");
+        assert_eq!(conn.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        assert_eq!(conn.stream.write_timeout().unwrap(), Some(IO_TIMEOUT));
+    }
+
+    #[test]
+    fn a_launcher_that_never_answers_is_a_transport_failure_not_a_hang() {
+        // What the bound buys: a peer holding the channel open and answering nothing ends the
+        // exchange as a retryable `Channel` fault instead of blocking the caller for ever. The
+        // deadline is shortened here so the test does not have to wait out the real one.
+        let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        let mut launcher = Launcher::for_test(ours);
+        launcher
+            .conn
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+
+        let error = launcher
+            .replace_agent(Path::new("/state/agents/abc/updated-agent"))
+            .expect_err("the launcher never answered");
+
+        assert!(matches!(error, LauncherError::Channel(_)));
+        drop(theirs);
     }
 
     #[test]
@@ -624,8 +737,10 @@ mod channel_tests {
         // The distinction the whole error type exists for: a candidate agent must never be
         // rejected by content hash because the launcher's socket died.
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
-        drop(theirs);
+        // Adopted while the peer is still there, as at boot, and killed underneath the agent: a
+        // closed endpoint no longer accepts socket options at all on some platforms.
         let mut launcher = Launcher::for_test(ours);
+        drop(theirs);
 
         let error = launcher
             .replace_agent(Path::new("/state/agents/abc/updated-agent"))
@@ -671,16 +786,13 @@ mod marker_tests {
         let (_guard, state) = dir("rejected-agent");
         write_markers(&state, "/state/agents/abc/agent");
 
-        let mut evidence = Evidence::read(Some(&state)).unwrap();
+        let mut evidence = Evidence::read(&state).unwrap();
         assert_eq!(
             evidence.rejected_agent(),
             Some(Path::new("/state/agents/abc/agent"))
         );
         assert!(
-            Evidence::read(Some(&state))
-                .unwrap()
-                .rejected_agent()
-                .is_some(),
+            Evidence::read(&state).unwrap().rejected_agent().is_some(),
             "a re-read still sees the marker"
         );
 
@@ -697,7 +809,7 @@ mod marker_tests {
         // boot's evidence, and losing it would let the same bad bytes be staged again.
         let (_guard, state) = dir("rewritten");
         write_markers(&state, "/state/agents/abc/agent");
-        let mut evidence = Evidence::read(Some(&state)).unwrap();
+        let mut evidence = Evidence::read(&state).unwrap();
 
         // The launcher writes a new marker mid-boot (a fresh file renamed into place).
         write_markers(&state, "/state/agents/def/agent");
@@ -708,9 +820,39 @@ mod marker_tests {
             "the marker written during reconciliation must survive"
         );
         assert_eq!(
-            Evidence::read(Some(&state)).unwrap().rejected_agent(),
+            Evidence::read(&state).unwrap().rejected_agent(),
             Some(Path::new("/state/agents/def/agent")),
             "the next boot sees the newer candidate, not the one already handled"
+        );
+    }
+
+    #[test]
+    fn a_failed_clear_keeps_the_claim_so_the_retried_boot_finishes_it() {
+        // `execute_boot_plan` runs under `recover_through_transients`, which re-invokes it on a
+        // node-local transient — and a clear that failed on an EIO or a read-only remount is one.
+        // If the failure consumed the claim, the retry would report success with the marker still
+        // on disk, and every later boot would re-derive the same rejection behind a warning.
+        let (_guard, state) = dir("failed-clear");
+        write_markers(&state, "/state/agents/abc/agent");
+        let marker = state.join(control::REJECTED_AGENT_FILE);
+        // Something at the path `clear` renames the instance to makes that one rename fail, which
+        // stands in for the disk faults the retry exists for.
+        let blocked = taken_path(&marker);
+        let mut evidence = Evidence::read(&state).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("stray"), b"in the way").unwrap();
+
+        assert!(evidence.clear_rejected_agent().is_err());
+        assert!(
+            exists(&state, control::REJECTED_AGENT_FILE),
+            "a failed clear leaves the evidence exactly as it found it"
+        );
+
+        std::fs::remove_dir_all(&blocked).unwrap();
+        evidence.clear_rejected_agent().unwrap();
+        assert!(
+            !exists(&state, control::REJECTED_AGENT_FILE),
+            "the retry clears the marker the first attempt could not"
         );
     }
 
@@ -726,7 +868,7 @@ mod marker_tests {
         let content = std::fs::read_to_string(&marker).unwrap();
         std::fs::rename(&marker, taken_path(&marker)).unwrap();
 
-        let evidence = Evidence::read(Some(&state)).unwrap();
+        let evidence = Evidence::read(&state).unwrap();
 
         assert!(
             evidence.rejected_agent().is_some(),
@@ -748,20 +890,10 @@ mod marker_tests {
         write_markers(&state, "/state/agents/def/agent");
         let newest = std::fs::read_to_string(&marker).unwrap();
 
-        assert!(Evidence::read(Some(&state))
-            .unwrap()
-            .rejected_agent()
-            .is_some());
+        assert!(Evidence::read(&state).unwrap().rejected_agent().is_some());
 
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), newest);
         assert!(!taken_path(&marker).exists());
-    }
-
-    #[test]
-    fn no_launcher_state_dir_means_no_evidence() {
-        let mut evidence = Evidence::read(None).unwrap();
-        assert!(evidence.rejected_agent().is_none());
-        evidence.clear_rejected_agent().unwrap();
     }
 
     #[test]
@@ -773,7 +905,7 @@ mod marker_tests {
         let (_guard, state) = dir("malformed");
         for garbage in [&b"one\ntwo\n"[..], b"", b"   \n", &[0xff, 0xfe][..]] {
             std::fs::write(state.join(control::REJECTED_AGENT_FILE), garbage).unwrap();
-            let evidence = Evidence::read(Some(&state)).unwrap();
+            let evidence = Evidence::read(&state).unwrap();
             assert!(evidence.rejected_agent().is_none());
             assert!(
                 !exists(&state, control::REJECTED_AGENT_FILE),
@@ -781,19 +913,44 @@ mod marker_tests {
             );
         }
 
+        std::fs::write(
+            state.join(control::REJECTED_AGENT_FILE),
+            vec![b'x'; control::MAX_AGENT_PATH_RECORD_BYTES + 1],
+        )
+        .unwrap();
+        assert!(Evidence::read(&state).unwrap().rejected_agent().is_none());
+        assert!(
+            !exists(&state, control::REJECTED_AGENT_FILE),
+            "an oversized marker is discarded without allocating its complete contents"
+        );
+
         // Not even a regular file: same rule, and the boot still proceeds. A non-empty directory
         // is the hard case — unlinking one fails on every platform — and it must be REMOVED, not
         // merely tolerated, or every future boot repeats the same discard warning forever.
         let marker = state.join(control::REJECTED_AGENT_FILE);
         std::fs::create_dir(&marker).unwrap();
         std::fs::write(marker.join("stray"), b"not evidence").unwrap();
-        let evidence = Evidence::read(Some(&state)).unwrap();
+        let evidence = Evidence::read(&state).unwrap();
         assert!(evidence.rejected_agent().is_none());
         assert!(
             !marker.exists(),
             "a directory at the marker path must be discarded like any other garbage, so the \
              next boot is not stuck on it"
         );
+
+        #[cfg(unix)]
+        {
+            let target = state.join("unrelated");
+            std::fs::write(&target, b"must survive").unwrap();
+            std::os::unix::fs::symlink(&target, &marker).unwrap();
+            assert!(Evidence::read(&state).unwrap().rejected_agent().is_none());
+            assert!(!marker.exists(), "the marker symlink itself is discarded");
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"must survive",
+                "discarding a marker must never follow its symlink"
+            );
+        }
     }
 
     #[test]
@@ -808,7 +965,7 @@ mod marker_tests {
         std::fs::write(&path, b"/state/agents/def/agent").unwrap();
         claim.discard_corrupt("is a test fixture");
         assert_eq!(
-            Evidence::read(Some(&state)).unwrap().rejected_agent(),
+            Evidence::read(&state).unwrap().rejected_agent(),
             Some(Path::new("/state/agents/def/agent"))
         );
     }

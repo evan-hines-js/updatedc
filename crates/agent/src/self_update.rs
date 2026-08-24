@@ -70,7 +70,9 @@ impl SelfUpdateState {
         let policy = DefaultPolicy::current("agent", su.channel.clone());
         let Some(selected) = repo.select_release(
             &policy,
-            None, // no "current version": the running agent is identified by hash
+            // The running agent is identified by its content hash, not a version, so there is no
+            // installed version to floor against or to short-circuit on.
+            updated_tuf::select::Stance::Nothing,
             |m| log(&format!("self-update: {m}")),
             |t, _| self.rejected.is_rejected(&target_sha(t)),
         ) else {
@@ -96,16 +98,20 @@ impl SelfUpdateState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Content-addressed staging: never overwrite a running agent binary, so
         // Windows executable locks do not apply: each candidate has a fresh path.
-        let dir = su.state_dir.join("agents").join(&selected.sha256);
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(agent_filename());
+        // Built by the shared rule the LAUNCHER admits binaries with, so a change to the layout
+        // cannot leave the permanent component refusing every self-update.
+        let path = control::staged_agent_binary(&su.state_dir, &selected.sha256);
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("a staged agent path has a digest directory"),
+        )?;
         let download = with_suffix(&path, ".download");
         // The download is the verification: `download_target` streams through the TUF target
         // reader, which enforces this target's declared length and sha256 byte by byte and
         // errors out rather than yield unverified data. Re-hashing the staged file here proved
         // the same digest a second time, and the application/provider path never did.
-        repo.download_target(&selected.target, &download).await?;
-        foundation::durable::install_executable(&path, &download)?;
+        let mut downloaded = repo.download_target(&selected.target, &download).await?;
+        downloaded.install_executable(&path)?;
         let _ = std::fs::remove_file(&download);
         log(&format!(
             "agent self-update {} staged at {}; handing off to the launcher",
@@ -140,7 +146,7 @@ impl SelfUpdateState {
 
 fn prune_agent_cache(opts: &Options) {
     let state_dir = &opts.agent_update.state_dir;
-    let root = state_dir.join("agents");
+    let root = control::agent_staging_root(state_dir);
     // Two entries are never candidates for collection: the running agent's own directory, and
     // the one the launcher has COMMITTED. This process may itself be an unconfirmed candidate the
     // launcher is trialling, in which case the committed entry is the rollback target — older than
@@ -183,14 +189,7 @@ fn running_agent_is(sha: &str) -> bool {
     std::env::current_exe()
         .ok()
         .and_then(|p| sha256_file(&p).ok())
-        .is_some_and(|h| h.eq_ignore_ascii_case(sha))
-}
-
-/// The agent binary's file name inside a content-addressed staging directory. The
-/// launcher validates against the same name via [`foundation::platform`], so the two
-/// cannot drift.
-fn agent_filename() -> &'static str {
-    foundation::platform::agent_binary_name()
+        .is_some_and(|hash| updated_contracts::digest::digests_match(&hash, sha))
 }
 
 #[cfg(test)]

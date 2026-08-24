@@ -19,7 +19,7 @@ protocol=
 attempt=unknown
 root=
 candidate=
-predecessor=
+result_file=
 
 while (($#)); do
   case "$1" in
@@ -33,8 +33,11 @@ while (($#)); do
     # scratch directory.
     --state-dir) shift 2 ;;
     --candidate-version) shift 2 ;;
-    --input-file | --output-file) shift 2 ;;
-    --predecessor) predecessor=$2; shift 2 ;;
+    --result-file) result_file=$2; shift 2 ;;
+    --input-dir | --output-dir) shift 2 ;;
+    # This HAProxy reconciler needs only the one direction-independent target (`--candidate`), but
+    # still consumes the protocol's compensation context so the argv grammar stays exact.
+    --predecessor) shift 2 ;;
     --predecessor-version) shift 2 ;;
     --) shift; break ;;
     *) die "unknown reconciler argument '$1'" ;;
@@ -45,17 +48,30 @@ done
 [[ -n $root ]] || die "missing --install-root"
 runtime="$root/runtime"
 
+publish_result() {
+  local changed=$1
+  [[ -n $result_file ]] || die "missing --result-file"
+  printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","retryAfterSeconds":null,"message":null}' \
+    "$changed" >"$result_file"
+}
+
 audit "$root" "$operation" "$attempt" started
 
 case "$operation" in
-  apply)
+  apply | rollback)
+    # The protocol has one direction rule for both mutation operations: --candidate is the release
+    # to converge onto. During rollback that is the restored release; --predecessor is available
+    # only to reconcilers whose compensation needs to inspect what it undoes. HAProxy does not, so
+    # apply and rollback intentionally share this entire validation-and-convergence path.
+    changed=true
+    if live_master "$runtime" && [[ $(cat "$runtime/live-release.path" 2>/dev/null || true) == "$candidate" ]]; then
+      changed=false
+    fi
     [[ -x "$candidate/bin/haproxy" ]] || die "candidate $candidate has no executable bin/haproxy"
     "$candidate/bin/haproxy" -c -f "$candidate/config/haproxy.cfg" >/dev/null \
       || die "candidate HAProxy configuration failed validation"
     converge_release "$candidate" "$root"
-    ;;
-  rollback)
-    converge_release "$predecessor" "$root"
+    publish_result "$changed"
     ;;
   healthcheck)
     # The agent owns no workload process, so a running, identified master under the runtime pid

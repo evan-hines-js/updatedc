@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for the self-updating agent (macOS). This is the ONE job definition:
+  install.sh ships this exact file inside the release archive and places it, so a
+  node bootstrapped by the installer and one set up by hand run the same daemon.
+  Installing it by hand:
+
+      sudo cp dev.updated.agent.plist /Library/LaunchDaemons/
+      sudo launchctl bootstrap system /Library/LaunchDaemons/dev.updated.agent.plist
+
+  launchd manages the lifecycle of the tiny, installer-owned LAUNCHER (launcher).
+  The launcher runs the committed agent pointer and advances it only after a
+  content-addressed candidate proves it can run; the agent deploys releases by
+  invoking each release's own reconciler hooks. The update hierarchy terminates at
+  launchd — an OS-maintained root we do not ship:
+
+    launchd =manages=> launcher =activates=> agent =invokes=> release hooks
+                            |
+                      pointer-swaps the agent (readiness-gated); never itself
+      package manager =replaces=> launcher/agent   (out-of-band alternative)
+
+  The launcher runs continuously: when the agent stages a self-update
+  and exits, the launcher activates the candidate under a readiness gate, committing
+  it or retaining the previous committed pointer. KeepAlive relaunches only the
+  launcher, on the rare event that it crashes. Workload processes belong to each
+  release's reconciler hooks, never to the launcher or the agent.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.updated.agent</string>
+
+  <!-- This is a system LaunchDaemon and deliberately runs as root. A configuration reconciler
+       must be able to manage the whole machine and honor the agent's fixed reboot action. Signed
+       provider artifacts and the pinned TUF root are the authorization boundary for that
+       privileged code. -->
+
+  <!-- The launcher is installer-owned and read-only. Its arguments name the state
+       directory, initial agent, and readiness timeout. The config is NOT named:
+       the launcher reads the canonical /etc/updated/config.toml.
+
+       The two timeouts are FIXED here, and macOS has no /etc/updated/agent.env
+       equivalent: the launcher takes them as flags, and the systemd unit's
+       UPDATED_READY_TIMEOUT works only because systemd substitutes an
+       EnvironmentFile value into ExecStart, which launchd cannot do. The values
+       below are the same defaults the Linux unit ships. A macOS fleet whose first
+       cold install needs longer than 60s must widen --ready-timeout here — which
+       means forking the one job definition, so prefer fixing the link or
+       pre-staging the bundle. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/etc/updated/updated-launcher</string>
+    <string>--state-dir</string>
+    <string>/usr/local/var/updated</string>
+    <string>--agent</string>
+    <string>/etc/updated/updated-agent</string>
+    <string>--ready-timeout</string>
+    <string>60</string>
+    <string>--confirm-timeout</string>
+    <string>30</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>

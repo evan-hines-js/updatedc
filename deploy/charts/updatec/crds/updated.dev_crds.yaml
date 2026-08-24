@@ -1,0 +1,1532 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: updateadmissionpolicies.updated.dev
+spec:
+  group: updated.dev
+  names:
+    categories: []
+    kind: UpdateAdmissionPolicy
+    plural: updateadmissionpolicies
+    shortNames:
+    - uap
+    singular: updateadmissionpolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.webhook.url
+      name: URL
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UpdateAdmissionPolicySpec via `CustomResource`
+        properties:
+          spec:
+            description: One namespaced release-admission policy. A repository either references exactly one of these or has no external admission gate; there are no environment-variable or per-group override paths.
+            properties:
+              actions:
+                properties:
+                  noInformation:
+                    description: What to do when Draupnir authoritatively says it has no information for the subject. Transport failure, a missing verdict, and `Pending` are not `NoInformation`; they always hold movement until an authoritative response arrives.
+                    enum:
+                    - Allow
+                    - Block
+                    type: string
+                  nonCompliant:
+                    description: What to do when Draupnir has information and declares the subject noncompliant.
+                    enum:
+                    - Allow
+                    - Block
+                    type: string
+                required:
+                - noInformation
+                - nonCompliant
+                type: object
+              webhook:
+                properties:
+                  decisionPublicKey:
+                    description: |-
+                      Draupnir's admission public key, pinned here the way a release-signing root is pinned: hex of an uncompressed P-256 point (65 bytes, `04`-prefixed), the same encoding [`AgentIdentity::public_key`] uses, so the fleet has exactly one public-key encoding.
+
+                      The decision is an authoritative compliance assertion that gates deployment, so it is signed ASYMMETRICALLY over the exact response body bytes and verified against this pin. A shared HMAC could not serve here: this control plane holds that key, so it could mint its own verdict, and no third party could ever verify what Draupnir decided. Because the signed document is byte-identical to the enforced one, Draupnir's retained attestation — which embeds the digest of these bytes — cannot silently disagree with what was enforced.
+
+                      There is no unsigned or symmetric fallback: a policy that cannot verify a decision has no safe reading, so this is required and a malformed pin fails closed.
+                    type: string
+                  secretRef:
+                    description: 'Secret in the same namespace whose `key` entry authenticates the exact REQUEST bytes with HMAC-SHA256 (`X-Updated-Signature: sha256=<hex>`). Caller authentication only: the response is authenticated by [`Self::decision_public_key`] instead.'
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  url:
+                    description: Absolute HTTP(S) endpoint implementing updatedc's versioned release-admission contract. At most every 30 seconds (and immediately for a previously unseen subject), the controller POSTs the complete active subject set. The idempotent request is both event notification and verdict refresh; there is no second event or admission endpoint.
+                    type: string
+                required:
+                - decisionPublicKey
+                - secretRef
+                - url
+                type: object
+            required:
+            - actions
+            - webhook
+            type: object
+        required:
+        - spec
+        title: UpdateAdmissionPolicy
+        type: object
+    served: true
+    storage: true
+    subresources: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: updatebackends.updated.dev
+spec:
+  group: updated.dev
+  names:
+    categories: []
+    kind: UpdateBackend
+    plural: updatebackends
+    shortNames:
+    - upb
+    singular: updatebackend
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.repositoryRef.name
+      name: Repository
+      type: string
+    - jsonPath: .status.matchedAgents
+      name: Agents
+      type: integer
+    - jsonPath: .status.conditions[?(@.type == 'Ready')].status
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UpdateBackendSpec via `CustomResource`
+        properties:
+          spec:
+            description: 'A dynamically managed load-balancer projection. This is the sole topology input for `updated-healthproxy`: the operator derives its inventory from matching [`UpdateAgent`]s and owns the workload and its least-privilege RBAC for the lifetime of this object.'
+            properties:
+              healthBase:
+                description: Public base URL from which healthproxy reads this repository's signed telemetry projection.
+                type: string
+              healthTimeoutSeconds:
+                default: 2
+                format: uint64
+                maximum: 30.0
+                minimum: 1.0
+                type: integer
+              intervalSeconds:
+                default: 2
+                format: uint64
+                maximum: 16.0
+                minimum: 1.0
+                type: integer
+              repositoryRef:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              selector:
+                description: Selects `UpdateAgent.spec.labels`. An empty selector is refused rather than interpreted as the whole fleet.
+                properties:
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                type: object
+              target:
+                description: 'One structurally valid Kubernetes object for both load-balancer integrations. Reconciliation enforces the discriminator strictly: fields belonging to the other kind are rejected, so there is still exactly one valid configuration shape without relying on CRD `oneOf` constructs that Kubernetes cannot make structural.'
+                properties:
+                  backend:
+                    nullable: true
+                    type: string
+                  endpoints:
+                    description: HAProxy Runtime API TCP sockets as `host:port`.
+                    items:
+                      type: string
+                    type: array
+                  kind:
+                    enum:
+                    - endpointSlice
+                    - haProxy
+                    type: string
+                  port:
+                    format: uint16
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  portName:
+                    nullable: true
+                    type: string
+                  service:
+                    description: Selectorless Service in the `UpdateBackend` namespace. Cross-namespace traffic mutation is deliberately not supported; it would require namespace-wide operator credentials.
+                    nullable: true
+                    type: string
+                required:
+                - kind
+                type: object
+            required:
+            - healthBase
+            - repositoryRef
+            - selector
+            - target
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              matchedAgents:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              workload:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: UpdateBackend
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: updategroups.updated.dev
+spec:
+  group: updated.dev
+  names:
+    categories: []
+    kind: UpdateGroup
+    plural: updategroups
+    shortNames:
+    - upg
+    singular: updategroup
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.repositoryRef.name
+      name: Repository
+      type: string
+    - jsonPath: .status.matchedAgents
+      name: Agents
+      type: integer
+    - jsonPath: .status.conditions[?(@.type == 'Ready')].status
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UpdateGroupSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              dependsOn:
+                default: []
+                description: Namespace-local prerequisite groups which must be settled before this group can roll. These are opaque ordering edges; updatedc never interprets deployment semantics.
+                items:
+                  type: string
+                type: array
+              deployment:
+                properties:
+                  application:
+                    properties:
+                      path:
+                        type: string
+                      sha256:
+                        type: string
+                    required:
+                    - path
+                    - sha256
+                    type: object
+                  name:
+                    type: string
+                  orderedInstallFallback:
+                    default: false
+                    description: Signed opt-in to first-install ordered fallback (see [`updated_contracts::assignment::RepositoryAssignment::ordered_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
+                    type: boolean
+                  providerSet:
+                    properties:
+                      path:
+                        type: string
+                      sha256:
+                        type: string
+                    required:
+                    - path
+                    - sha256
+                    type: object
+                  releaseRepository:
+                    properties:
+                      metadataUrl:
+                        type: string
+                      rootJson:
+                        description: Exact JSON bytes of the pinned TUF root. A string keeps the Kubernetes API structural while preserving TUF's intentionally extensible document.
+                        type: string
+                      targetsUrl:
+                        type: string
+                    required:
+                    - metadataUrl
+                    - rootJson
+                    - targetsUrl
+                    type: object
+                  runtime:
+                    description: |-
+                      The CRD spelling of [`updated_contracts::assignment::ManagedRuntime`].
+
+                      It is a near-twin, not a full one, and the difference is the point. This side is a Kubernetes object: deserialized from apiserver JSON, versioned by the CRD's own `v1alpha1`, and free to gain an optional field whenever an operator needs one. The contract side is the SIGNED, node-facing document, governed by [`updated_contracts::assignment::RepositoryAssignment::SCHEMA`], where any shape change — even an added optional field — strands every not-yet-upgraded node behind a parse error. Two things with genuinely different evolution rules get two types.
+
+                      What this type must never contain is a second DEFINITION of a value the node acts on. It used to: `repository`, `storage` and `timeouts` were declared here as field-for-field copies of the contract structs, and a copy drifts. Adding a field to the contract failed to compile, but adding one *here* did not — an operator could set it in YAML and it would silently never reach a node — and nothing at all caught a mis-wired mapping between two `u64` fields. Those three are now the contract's own types, carried across whole. There is one declaration of each, so there is nothing left to drift against and no field mapping to get wrong.
+
+                      What remains is genuinely this side's own: `product`, `channel`, and an `installRoot` the contract holds as a `PathBuf`. `TryFrom<DeploymentSpec> for DesiredDeployment` destructures every spec exhaustively, so a field added to either side is a compile error until both agree.
+                    properties:
+                      channel:
+                        type: string
+                      installRoot:
+                        type: string
+                      product:
+                        type: string
+                      repository:
+                        properties:
+                          metadataLimit:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          targetLimit:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          transportTimeoutSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - metadataLimit
+                        - targetLimit
+                        - transportTimeoutSeconds
+                        type: object
+                      storage:
+                        properties:
+                          inactiveAgents:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                          inactiveBytes:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          inactiveProviders:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                          inactiveReleases:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                          inactiveRepositoryCaches:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - inactiveAgents
+                        - inactiveBytes
+                        - inactiveProviders
+                        - inactiveReleases
+                        - inactiveRepositoryCaches
+                        type: object
+                      timeouts:
+                        properties:
+                          agentCheckIntervalSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          checkIntervalSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          confirmationWindowSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          healthGraceSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          healthIntervalSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          healthSuccesses:
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                          refreshRetrySeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - agentCheckIntervalSeconds
+                        - checkIntervalSeconds
+                        - confirmationWindowSeconds
+                        - healthGraceSeconds
+                        - healthIntervalSeconds
+                        - healthSuccesses
+                        - refreshRetrySeconds
+                        type: object
+                    required:
+                    - channel
+                    - installRoot
+                    - product
+                    - repository
+                    - storage
+                    - timeouts
+                    type: object
+                required:
+                - application
+                - name
+                - providerSet
+                - releaseRepository
+                - runtime
+                type: object
+              emergencyCorrection:
+                default: false
+                description: |-
+                  The operator's explicit statement that [`deployment`](Self::deployment) is an EMERGENCY CORRECTION: admit it now, without waiting for the governing [`UpdateGroupSet`]'s rollout schedule (its windows and its calendar).
+
+                  The schedule, and ONLY the schedule, is bypassed. The set's concurrency limit still applies: an emergency correction to a settled group waits for one of the set's `maxConcurrent` slots exactly as an ordinary retarget does, so declaring an emergency across many groups at once still rolls them `maxConcurrent` at a time rather than changing the whole fleet simultaneously. (A group whose rollout is already in flight holds the slot it claimed, so retargeting it needs no new one — that is true of any retarget, emergency or not.) This group's `maxUnavailable` staging, its resolved inputs, and its prerequisites all still apply too.
+
+                  Intent is STATED here rather than inferred from telemetry, and that is the whole point. The control plane cannot tell an emergency rollback from an ordinary forward change by looking at node health: a group carrying one chronically unhealthy node (a failing downstream dependency, an expired licence) would be permanently window-exempt, while the failure an operator most needs to escape a window for — a release that bricks the agent itself — emits no telemetry at all and so looks like nothing is wrong. Both cases are answered by the operator saying so.
+
+                  It stays in force until it is cleared, and it is loudly visible while it is: the governing set lists the group in `status.emergency`, and `updatectl deploy` writes this field explicitly on every publish, so the next ordinary deploy of this group clears it.
+                type: boolean
+              inputs:
+                additionalProperties:
+                  properties:
+                    group:
+                      type: string
+                    output:
+                      type: string
+                  required:
+                  - group
+                  - output
+                  type: object
+                default: {}
+                description: Named lifecycle inputs sourced from signed outputs of prerequisite groups.
+                type: object
+              maxUnavailable:
+                description: Maximum unavailable agents while this group changes deployment. This is group rollout policy, deliberately outside `deployment` so changing it does not change the signed assignment identity. Defaults to one; zero is rejected during reconciliation.
+                format: uint
+                minimum: 1.0
+                nullable: true
+                type: integer
+              repositoryRef:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              selector:
+                properties:
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                type: object
+            required:
+            - deployment
+            - repositoryRef
+            - selector
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              heldAgents:
+                description: 'How many of this group''s agents the operator is holding (`UpdateAgent.spec.hold`). A forgotten hold must be a visible condition, not a mystery, so the count is projected here on every reconcile, from the planner''s own membership ([`rollout::GroupNodes::held`]) — the group this pass''s labels select, never the group the last publication routed the node to. Serialized even when `None`: this status travels as a merge patch, and the explicit null is what deletes a stale count when a writer (quarantine, failure) cannot compute one.'
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              matchedAgents:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              publishedDigest:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: UpdateGroup
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: updategroupsets.updated.dev
+spec:
+  group: updated.dev
+  names:
+    categories: []
+    kind: UpdateGroupSet
+    plural: updategroupsets
+    shortNames:
+    - upgs
+    singular: updategroupset
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.memberCount
+      name: Members
+      type: integer
+    - jsonPath: .status.maxConcurrent
+      name: MaxConcurrent
+      type: integer
+    - jsonPath: .status.rollingCount
+      name: Rolling
+      type: integer
+    - jsonPath: .status.frozen
+      name: Frozen
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UpdateGroupSetSpec via `CustomResource`
+        properties:
+          spec:
+            description: 'A blast-radius throttle over a set of [`UpdateGroup`]s. Membership is label-based like everything else: `selector` matches `UpdateGroup` **metadata labels** (not agent labels), so a set can gather any number of member groups. The control plane rolls no more than [`Self::effective_max_concurrent`] members at once, holding the rest on their last-admitted deployment until an in-flight member settles (all its agents report the desired deployment, healthy). A member "settles" only through the node telemetry the control plane reads out of storage. Deployments require a report URL; unverifiable or missing telemetry fails closed.'
+            properties:
+              calendar:
+                default: []
+                description: 'One-off dated maintenance windows: absolute UTC dates with a time range, e.g. `{ date: "2026-08-25", start: "06:00", end: "09:00" }`. Edit the CRD to change them — the operator re-reads every reconcile. The set may roll only inside a listed window; once every entry is in the past the calendar "runs out" and stops gating (falls back to open). Combined with [`rollout_windows`](Self::rollout_windows) by intersection: when both are set, the set must satisfy both. See [`CalendarEntry`].'
+                items:
+                  description: 'One absolute, one-off dated window: a specific UTC calendar date with a time-of-day span, e.g. `{ date: "2026-08-25", start: "06:00", end: "09:00" }`. Unlike a [`RolloutWindow`] (which recurs forever), a calendar entry names a single day and therefore *expires*. Dated entries do not wrap past midnight — write two entries for that — so `end` must be after `start`.'
+                  properties:
+                    date:
+                      description: UTC calendar date, `YYYY-MM-DD`.
+                      type: string
+                    end:
+                      default: 24:00
+                      description: End of the allowed span on `date`, UTC `HH:MM`, exclusive. Default `24:00`. Must be after `start`.
+                      type: string
+                    start:
+                      default: 00:00
+                      description: Start of the allowed span on `date`, UTC `HH:MM`, inclusive. Default `00:00`.
+                      type: string
+                  required:
+                  - date
+                  type: object
+                type: array
+              maxConcurrent:
+                description: Maximum member groups allowed to roll at once. Defaults to `members - 1`, so at least one member always holds a known-good release. Clamped to `1..=members-1`.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              maxRegressions:
+                description: |-
+                  How many distinct nodes must independently prove a staged deployment bad — attempt it and roll themselves back, as their signed reports already show — before the deployment is HALTED: no further node is moved to it, anywhere in the fleet, until a deployment with a different identity is staged. Defaults to one.
+
+                  The verdict is FLEET-WIDE per deployment identity — a body proven bad must not reach a sibling set, or a group no set governs, through a second door — so the effective threshold for an identity is the TIGHTEST `maxRegressions` among all sets whose members name it (default one when none does). The halt is a planner verdict recomputed from evidence each reconcile, never stored state, and republishing the identical body cannot clear it — corrected bytes have a new digest.
+                format: uint32
+                minimum: 1.0
+                nullable: true
+                type: integer
+              onRegression:
+                default: halt
+                description: |-
+                  What happens to this set's groups, beyond the fleet-wide halt, when the regression verdict fires on a deployment they are staging. `halt` (the default) stops admission and leaves every node where it is — nodes that attempted the bad release already rolled themselves back, and nodes that settled healthy on it stay on it. `rollback` additionally rebases each affected group onto the deployment its rollout was staging away from, so the nodes that settled on the proven-bad body are staged back too (bounded by `maxUnavailable`, exactly like the forward direction).
+
+                  The rollback response is deliberately conservative in three ways. It fires only once every node whose evidence triggered the halt is OBSERVABLY RECOVERED — an authentic, fresh report that is healthy and still claims the rejection — because a node whose own rollback failed is a machine in an unknown state, not proof that reverting the rest of the fleet is safe; until then the halt alone stands. It requires a predecessor to exist (a group whose FIRST deployment regressed has nowhere to go and stays halted). And a group governed by several sets rolls back only when every one of them says `rollback` — automatic movement needs unanimous operator intent, a freeze does not.
+
+                  Rolling back consumes the very evidence the halt is recomputed from (the rejecting nodes are reassigned the predecessor, so their reports stop naming the bad assignment), so the response also records a durable VETO of the deployment identity in the admitted-state document: the proven-bad body stays refused across controller restarts, until no group names it any more. The exit is the same as for a halt — publish corrected bytes, which have a new digest.
+                enum:
+                - halt
+                - rollback
+                type: string
+              rolloutWindows:
+                default: []
+                description: UTC windows during which this set may admit new rollouts. Empty means always open. When non-empty, the set freezes (admits nothing new) whenever "now" (UTC) falls outside every window; members already rolling keep settling. See [`RolloutWindow`] for the schedule model, including weekly and every-other-week ("every other Sunday") recurrences and past-midnight time spans.
+                items:
+                  description: |-
+                    One UTC window during which rollouts may proceed. A set is open when *any* of its windows is active; the pieces of a single window are ANDed — an active window is one whose day rule matches the calendar day and whose time-of-day span contains the moment.
+
+                    Day rule (evaluated per UTC date): - Empty `weekdays`: every day (a pure daily maintenance window). `intervalWeeks`/`anchorWeek` have no weekday to phase and are rejected by [`RolloutWindow::validate`]. - Otherwise the day matches if its weekday is in `weekdays` and passes the `intervalWeeks` phase.
+
+                    One-off dated windows are not written here: they are [`CalendarEntry`], which expires.
+
+                    Time-of-day span: `[start, end)` in UTC `HH:MM`. Defaults span the whole day (`00:00`–`24:00`). If `end <= start` the span wraps past midnight into the following day (so `22:00`–`02:00` is active from 22:00 on an "on" day through 02:00 the next).
+                  properties:
+                    anchorWeek:
+                      description: UTC date (`YYYY-MM-DD`) whose ISO-week is an "on" week, anchoring the `intervalWeeks` phase. Any day within the intended on-week works. Required when `intervalWeeks > 1`, and only meaningful alongside `weekdays`.
+                      nullable: true
+                      type: string
+                    end:
+                      default: 24:00
+                      description: Daily span end, UTC `HH:MM`, exclusive. Default `24:00`. `end <= start` wraps past midnight.
+                      type: string
+                    intervalWeeks:
+                      description: 'Recur only every Nth week. With `weekdays: [sunday]` and `intervalWeeks: 2` this is "every other Sunday". Omitted or `1` means weekly. Requires `anchorWeek` and a non-empty `weekdays` when > 1.'
+                      format: uint32
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    start:
+                      default: 00:00
+                      description: Daily span start, UTC `HH:MM`, inclusive. Default `00:00`.
+                      type: string
+                    weekdays:
+                      default: []
+                      description: Weekdays (UTC) the window recurs on, e.g. `[sunday]`. Empty means every day.
+                      items:
+                        description: 'A day of the week, UTC. Named in full so the CRD reads naturally (`weekdays: [sunday]`).'
+                        enum:
+                        - monday
+                        - tuesday
+                        - wednesday
+                        - thursday
+                        - friday
+                        - saturday
+                        - sunday
+                        type: string
+                      type: array
+                  type: object
+                type: array
+              selector:
+                description: Selects member `UpdateGroup`s by their Kubernetes metadata labels.
+                properties:
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                type: object
+              stuckAfterSeconds:
+                description: How long a member group may sit in `staging` with no node newly settled before the `RolloutStuck` condition is raised on it. Defaults to 3600 seconds. Alerting policy only — it gates nothing.
+                format: uint64
+                minimum: 1.0
+                nullable: true
+                type: integer
+            required:
+            - selector
+            type: object
+          status:
+            nullable: true
+            properties:
+              calendarExhausted:
+                description: 'True when the set''s dated calendar has run out (every approved window is past): it has stopped gating and now admits at any hour. Surfaced so "silently expired" is distinguishable from "actively inside an approved window." Absent/false for a set with no calendar or one still active or pending.'
+                nullable: true
+                type: boolean
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              emergency:
+                default: []
+                description: 'Member groups whose spec declares [`emergency_correction`](UpdateGroupSpec::emergency_correction): their desired deployment is admitted without waiting for this set''s schedule. Listed for as long as the flag is set, so an emergency override is never silently permanent.'
+                items:
+                  type: string
+                type: array
+              failed:
+                default: []
+                description: 'Member groups whose rollout ENDED IN FAILURE: their nodes attempted the admitted deployment and durably rejected it (rolling back to what they were running), and nothing is still moving toward it. They hold no concurrency slot — there is nothing in flight to protect — and they are never listed as settled, so nothing gated on them opens and no progress count includes them. The exit is a deployment with a different identity: corrected bytes have a new digest.'
+                items:
+                  type: string
+                type: array
+              frozen:
+                description: 'True when the set is outside all its rollout windows: no new rollouts are being admitted (in-flight members still settle). Absent/false when open or window-less.'
+                nullable: true
+                type: boolean
+              halted:
+                default: []
+                description: 'Deployments HALTED for this set by the regression verdict: enough distinct nodes proved each one bad (attempted it and rolled themselves back). No further node is moved to a halted deployment in any member group; nodes already on it are left where they are. An array, not a map, so a JSON merge patch replaces it wholesale and a cleared halt cannot linger.'
+                items:
+                  description: One deployment the regression verdict has halted for a set, with the evidence that halted it.
+                  properties:
+                    deployment:
+                      description: The deployment's operator-facing name.
+                      type: string
+                    evidence:
+                      description: Distinct nodes whose signed reports prove they attempted this deployment and rolled back.
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    rolledBack:
+                      default: false
+                      description: 'Whether an `onRegression: rollback` response has consumed this halt: the affected groups were rebased onto their predecessors and the identity carries a durable veto, so it stays refused even though the rejecting nodes — reassigned to the predecessor — no longer state the rejection in their reports.'
+                      type: boolean
+                  required:
+                  - deployment
+                  - evidence
+                  type: object
+                type: array
+              maxConcurrent:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              memberCount:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              rolling:
+                default: []
+                description: Member groups currently admitted to roll (desired != settled).
+                items:
+                  type: string
+                type: array
+              rollingCount:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              settled:
+                default: []
+                description: 'Member groups settled on their desired deployment: every agent whose reports can be verified reports it, healthy. Agents with no pinned public key are excluded from the judgement rather than assumed healthy — a group carrying any of them is listed here only as "settled as far as anything can be observed".'
+                items:
+                  type: string
+                type: array
+              shared:
+                default: []
+                description: Member groups also claimed by another set, safely rolled up (admitted only when every governing set has a slot).
+                items:
+                  type: string
+                type: array
+              unobservable:
+                default: []
+                description: 'Member groups no evidence can ever come from: they select no agent, or EVERY agent they select has no pinned public key (offline-provisioned, never enrolled). They hold no concurrency slot and will never settle, so anything gated on them waits forever — which is why they are surfaced rather than folded into `rolling`.'
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        title: UpdateGroupSet
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: updateagents.updated.dev
+spec:
+  group: updated.dev
+  names:
+    categories: []
+    kind: UpdateAgent
+    plural: updateagents
+    shortNames:
+    - upa
+    singular: updateagent
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.repositoryRef.name
+      name: Repository
+      type: string
+    - jsonPath: .status.selectedGroup
+      name: Selected
+      type: string
+    - jsonPath: .status.conditions[?(@.type == 'Ready')].status
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UpdateAgentSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              backendAddress:
+                description: 'Host a load balancer uses to reach this agent''s managed service: one IP literal or DNS name, never a URL or `host:port`. The [`UpdateBackend`] target owns the service port, so there is one port authority rather than an ignored per-agent spelling. It is optional because not every managed machine serves traffic; an [`UpdateBackend`] selecting an uncordoned agent without a valid host and pinned key projects that identity as explicitly drained and reports the degraded inventory.'
+                nullable: true
+                type: string
+              cordon:
+                default: false
+                description: 'Take this node out of load-balancer rotation gracefully, without stopping the application. A cordoned identity is projected through every matching [`UpdateBackend`]''s trusted inventory as an explicit drain, regardless of its report. The application keeps running, the node keeps reporting, and the agent stays unaware. Rollout accounting treats it as absent (like a departed node), so a cordon neither eats the group''s availability budget nor wedges an in-flight rollout. Orthogonal to [`hold`](Self::hold): a node can be held but serving, or cordoned but updatable.'
+                type: boolean
+              hold:
+                default: false
+                description: 'Freeze this node on exactly the body its recorded assignment names — a hardware swap is scheduled, do not move it. A held node keeps its group membership for accounting but is excluded from admission: it neither advances to a staged deployment nor releases a rollout slot, and its recorded body is republished verbatim. If that body can no longer be resolved, planning fails closed for this node exactly as the quarantine carry-forward does — a hold can never silently become a move. Clearing it returns the node to normal admission on the next reconcile.'
+                type: boolean
+              identity:
+                properties:
+                  kind:
+                    enum:
+                    - manual
+                    - reserved
+                    - enrolled
+                    type: string
+                  publicKey:
+                    description: The node's pinned public key (hex uncompressed EC point) — set from the CSR at online enrollment or supplied by the operator for a manual identity. It is the same key that certifies the node's mTLS leaf. Rollout planning verifies the node's *signed* telemetry against this, so a report is attributable end-to-end (node → planner), not merely authenticated on the write hop. `None` only while a reserved identity has not enrolled.
+                    nullable: true
+                    type: string
+                  registrationSha256:
+                    description: Present only for controller-created dynamic inventory. It is the stable digest of the validated enrollment name and makes retries resolve to the same agent.
+                    nullable: true
+                    type: string
+                required:
+                - kind
+                type: object
+              labels:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: Control-plane labels for this agent. The represented agent may run anywhere and does not need to be a Kubernetes Node, Pod, or workload.
+                type: object
+              repositoryRef:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+            required:
+            - identity
+            - repositoryRef
+            type: object
+          status:
+            nullable: true
+            properties:
+              assignmentPath:
+                nullable: true
+                type: string
+              assignmentSha256:
+                description: 'SHA-256 of this node''s exact currently published signed assignment document. Informational only: the gateway independently resolves the assignment through TUF and never treats status as data-plane authority.'
+                nullable: true
+                type: string
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              cordoned:
+                description: Mirror of `spec.cordon`, written as an explicit bool for the same merge-patch reason.
+                nullable: true
+                type: boolean
+              enrollmentObjectKey:
+                description: Repository-relative S3 key of this agent's current content-addressed enrollment bundle. The gateway authorizes this exact object for live enrollment; an operator may copy the same object out of band for a manual identity. No gateway response carries its bytes.
+                nullable: true
+                type: string
+              held:
+                description: Mirror of `spec.hold`, written as an explicit bool every reconcile (a merge patch that omitted it would leave a cleared hold reading `true` forever). Surfaced so a forgotten hold is a visible condition, not a mystery.
+                nullable: true
+                type: boolean
+              lastReconciliation:
+                description: The latest successful state-changing reconciler invocation, durably bound and signed by the node. This exposes change, immutable release identities, and any requested host action without trusting script logs.
+                nullable: true
+                properties:
+                  attemptId:
+                    type: string
+                  candidate:
+                    properties:
+                      archiveSha256:
+                        type: string
+                      manifestSha256:
+                        type: string
+                      version:
+                        type: string
+                    required:
+                    - archiveSha256
+                    - manifestSha256
+                    - version
+                    type: object
+                  changed:
+                    type: boolean
+                  completedAtMs:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  hostAction:
+                    type: string
+                  message:
+                    nullable: true
+                    type: string
+                  operation:
+                    type: string
+                  predecessor:
+                    properties:
+                      archiveSha256:
+                        type: string
+                      manifestSha256:
+                        type: string
+                      version:
+                        type: string
+                    required:
+                    - archiveSha256
+                    - manifestSha256
+                    - version
+                    type: object
+                  reason:
+                    type: string
+                  reconciler:
+                    properties:
+                      product:
+                        type: string
+                      providerSetSha256:
+                        type: string
+                      release:
+                        properties:
+                          archiveSha256:
+                            type: string
+                          manifestSha256:
+                            type: string
+                          version:
+                            type: string
+                        required:
+                        - archiveSha256
+                        - manifestSha256
+                        - version
+                        type: object
+                    required:
+                    - product
+                    - providerSetSha256
+                    - release
+                    type: object
+                required:
+                - attemptId
+                - candidate
+                - changed
+                - completedAtMs
+                - hostAction
+                - operation
+                - predecessor
+                - reason
+                - reconciler
+                type: object
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              publishedDigest:
+                nullable: true
+                type: string
+              reportedReady:
+                description: Whether the node last reported itself settled and healthy on its assignment.
+                nullable: true
+                type: boolean
+              reportedVersion:
+                description: The version the node last reported it is actually running, from its rollout telemetry. This is the control plane's authoritative view of a node's running version — no consumer probes the managed app, so it works for any app kind (a Rust service, a real Jenkins, anything). `None` until the node has reported at least once.
+                nullable: true
+                type: string
+              selectedGroup:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: UpdateAgent
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: updaterepositories.updated.dev
+spec:
+  group: updated.dev
+  names:
+    categories: []
+    kind: UpdateRepository
+    plural: updaterepositories
+    shortNames:
+    - upr
+    singular: updaterepository
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.agentCount
+      name: Agents
+      type: integer
+    - jsonPath: .status.conditions[?(@.type == 'Ready')].status
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UpdateRepositorySpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              admissionPolicyRef:
+                description: Optional namespace-local release-admission policy. Presence enables the one Draupnir integration path; absence disables external admission. Policy behavior lives only in the referenced CRD, never in environment variables or group-level overrides.
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              assignmentPrefix:
+                default: assignments
+                description: Prefix below the TUF targets namespace at which assignments are published.
+                type: string
+              defaultDeployment:
+                description: Deployment selected when no named group matches an agent.
+                properties:
+                  application:
+                    properties:
+                      path:
+                        type: string
+                      sha256:
+                        type: string
+                    required:
+                    - path
+                    - sha256
+                    type: object
+                  name:
+                    type: string
+                  orderedInstallFallback:
+                    default: false
+                    description: Signed opt-in to first-install ordered fallback (see [`updated_contracts::assignment::RepositoryAssignment::ordered_install_fallback`]). Defaults off so a group only descends versions when the publisher explicitly allows it.
+                    type: boolean
+                  providerSet:
+                    properties:
+                      path:
+                        type: string
+                      sha256:
+                        type: string
+                    required:
+                    - path
+                    - sha256
+                    type: object
+                  releaseRepository:
+                    properties:
+                      metadataUrl:
+                        type: string
+                      rootJson:
+                        description: Exact JSON bytes of the pinned TUF root. A string keeps the Kubernetes API structural while preserving TUF's intentionally extensible document.
+                        type: string
+                      targetsUrl:
+                        type: string
+                    required:
+                    - metadataUrl
+                    - rootJson
+                    - targetsUrl
+                    type: object
+                  runtime:
+                    description: |-
+                      The CRD spelling of [`updated_contracts::assignment::ManagedRuntime`].
+
+                      It is a near-twin, not a full one, and the difference is the point. This side is a Kubernetes object: deserialized from apiserver JSON, versioned by the CRD's own `v1alpha1`, and free to gain an optional field whenever an operator needs one. The contract side is the SIGNED, node-facing document, governed by [`updated_contracts::assignment::RepositoryAssignment::SCHEMA`], where any shape change — even an added optional field — strands every not-yet-upgraded node behind a parse error. Two things with genuinely different evolution rules get two types.
+
+                      What this type must never contain is a second DEFINITION of a value the node acts on. It used to: `repository`, `storage` and `timeouts` were declared here as field-for-field copies of the contract structs, and a copy drifts. Adding a field to the contract failed to compile, but adding one *here* did not — an operator could set it in YAML and it would silently never reach a node — and nothing at all caught a mis-wired mapping between two `u64` fields. Those three are now the contract's own types, carried across whole. There is one declaration of each, so there is nothing left to drift against and no field mapping to get wrong.
+
+                      What remains is genuinely this side's own: `product`, `channel`, and an `installRoot` the contract holds as a `PathBuf`. `TryFrom<DeploymentSpec> for DesiredDeployment` destructures every spec exhaustively, so a field added to either side is a compile error until both agree.
+                    properties:
+                      channel:
+                        type: string
+                      installRoot:
+                        type: string
+                      product:
+                        type: string
+                      repository:
+                        properties:
+                          metadataLimit:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          targetLimit:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          transportTimeoutSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - metadataLimit
+                        - targetLimit
+                        - transportTimeoutSeconds
+                        type: object
+                      storage:
+                        properties:
+                          inactiveAgents:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                          inactiveBytes:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          inactiveProviders:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                          inactiveReleases:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                          inactiveRepositoryCaches:
+                            format: uint
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - inactiveAgents
+                        - inactiveBytes
+                        - inactiveProviders
+                        - inactiveReleases
+                        - inactiveRepositoryCaches
+                        type: object
+                      timeouts:
+                        properties:
+                          agentCheckIntervalSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          checkIntervalSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          confirmationWindowSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          healthGraceSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          healthIntervalSeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                          healthSuccesses:
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                          refreshRetrySeconds:
+                            format: uint64
+                            minimum: 0.0
+                            type: integer
+                        required:
+                        - agentCheckIntervalSeconds
+                        - checkIntervalSeconds
+                        - confirmationWindowSeconds
+                        - healthGraceSeconds
+                        - healthIntervalSeconds
+                        - healthSuccesses
+                        - refreshRetrySeconds
+                        type: object
+                    required:
+                    - channel
+                    - installRoot
+                    - product
+                    - repository
+                    - storage
+                    - timeouts
+                    type: object
+                required:
+                - application
+                - name
+                - providerSet
+                - releaseRepository
+                - runtime
+                type: object
+              enrollment:
+                description: Trusted labels applied to dynamic registrations. Enrollment is authenticated by mutual TLS at the gateway (a cert-manager-issued server cert + fleet client CA, mounted), so there is no shared secret here.
+                properties:
+                  labels:
+                    additionalProperties:
+                      type: string
+                    default: {}
+                    type: object
+                type: object
+              s3:
+                description: Object store that holds this managed repository. The controller derives the repository's key prefix from its Kubernetes namespace and name; operators cannot select or retarget it.
+                properties:
+                  bucket:
+                    minLength: 1
+                    type: string
+                  credentialsSecretRef:
+                    description: Optional Secret containing standard AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY entries. When absent, workload identity is used.
+                    nullable: true
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  endpoint:
+                    minLength: 1
+                    nullable: true
+                    type: string
+                  publicEndpoint:
+                    description: 'Public HTTPS S3-compatible endpoint placed in short-lived object capabilities. Omit for AWS S3 or when `endpoint` is already public HTTPS. An internal HTTP endpoint must provide this: payload proxying is not a fallback.'
+                    minLength: 1
+                    nullable: true
+                    type: string
+                  region:
+                    minLength: 1
+                    type: string
+                required:
+                - bucket
+                - region
+                type: object
+                x-kubernetes-validations:
+                - message: spec.s3 bucket, region, endpoint, and credentialsSecretRef are immutable because the deletion finalizer owns that storage destination
+                  rule: self.bucket == oldSelf.bucket && self.region == oldSelf.region && has(self.endpoint) == has(oldSelf.endpoint) && (!has(self.endpoint) || self.endpoint == oldSelf.endpoint) && has(self.credentialsSecretRef) == has(oldSelf.credentialsSecretRef) && (!has(self.credentialsSecretRef) || self.credentialsSecretRef.name == oldSelf.credentialsSecretRef.name)
+              signingSecretRef:
+                description: Secret in the same namespace containing active and standby root keys (`root.pk8` and `root.next.pk8`) plus targets, snapshot, and timestamp private keys. The controller never stores private keys in CRD status.
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              stateMaxShards:
+                default: 8
+                description: Exact maximum number of bounded ConfigMaps used for the durable rollout-state document. The controller atomically rebalances the entire document when this changes. Two slots are used so a process death can never expose a partially rewritten state; a live rebalance may transiently hold the old width plus the new width, and reclaims the old slot afterwards.
+                format: uint8
+                maximum: 64.0
+                minimum: 1.0
+                type: integer
+            required:
+            - defaultDeployment
+            - enrollment
+            - s3
+            - signingSecretRef
+            type: object
+          status:
+            description: 'This status is always written as a JSON MERGE PATCH, where an explicit `null` DELETES the field instead of leaving it alone. A writer that has nothing to say about a field must therefore OMIT it, which is what `skip_serializing_if` is doing on every optional field a later reader depends on: the failure path knows neither the agent count nor the published digest, and serializing its `None` erased the count `gateway::at_enrollment_capacity` reads — uncapping `/enroll` from the first failed reconcile until the next successful one.'
+            nullable: true
+            properties:
+              agentCount:
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              publishedDigest:
+                nullable: true
+                type: string
+              routingRootSha256:
+                description: |-
+                  SHA-256 of the `root.json` this control plane publishes — the fleet's trust anchor, recorded in etcd where only the control plane can write it.
+
+                  The object store is a distribution channel, not a trust boundary: anyone able to write its prefix can replace `root.json`. Enrollment therefore pins the root it hands a node against THIS value before verifying anything else. `None` until the first publish, and enrollment refuses to serve a bundle until then.
+                nullable: true
+                type: string
+              storageOwnership:
+                description: Storage coordinates this controller bound before it added the external-artifact finalizer or published the first object. The status subresource is controller-owned, so deletion uses this record rather than reconstructing an irreversible target from mutable access settings.
+                nullable: true
+                properties:
+                  bucket:
+                    type: string
+                  credentialsSecretRef:
+                    nullable: true
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  endpoint:
+                    nullable: true
+                    type: string
+                  prefix:
+                    type: string
+                  region:
+                    type: string
+                required:
+                - bucket
+                - prefix
+                - region
+                type: object
+            type: object
+        required:
+        - spec
+        title: UpdateRepository
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: updatesubscriptions.updated.dev
+spec:
+  group: updated.dev
+  names:
+    categories: []
+    kind: UpdateSubscription
+    plural: updatesubscriptions
+    shortNames:
+    - usub
+    singular: updatesubscription
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.webhook.url
+      name: URL
+      type: string
+    - jsonPath: .status.conditions[?(@.type == 'Ready')].status
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for UpdateSubscriptionSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              A generic webhook that is notified when a repository publishes a new generation. This is how external change-tracking systems (compliance engines, audit stores, chat notifiers) subscribe to updates without polling S3 or depending on bucket event notifications: the publisher pushes.
+
+              Delivery is at-least-once and rides the controller's single-writer reconcile. Each subscription carries a per-repository high-water mark in its status; every reconcile the controller delivers one event per generation from that mark up to the currently published version, advancing the mark on each success. A subscriber that was down is caught up on the next tick; nothing is skipped and, because the mark only moves forward on a delivered POST, nothing is lost.
+            properties:
+              repositoryRef:
+                description: Restrict this subscription to one repository. Omit to be notified for every `UpdateRepository` in the namespace (each tracked independently in status).
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              webhook:
+                description: Where update events are delivered.
+                properties:
+                  secretRef:
+                    description: 'Secret in the same namespace whose `key` entry is the HMAC-SHA256 secret used to sign the request body. The signature rides `X-Updated-Signature: sha256=<hex>` so the subscriber can authenticate the event and reject a forged one. Omit for an unsigned POST over TLS.'
+                    nullable: true
+                    properties:
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  url:
+                    description: Absolute `http(s)` URL the controller `POST`s each update event to as JSON.
+                    type: string
+                required:
+                - url
+                type: object
+            required:
+            - webhook
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  properties:
+                    lastTransitionTime:
+                      type: string
+                    message:
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
+                    reason:
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              deliveredVersions:
+                additionalProperties:
+                  format: uint64
+                  minimum: 0.0
+                  type: integer
+                default: {}
+                description: Highest generation successfully delivered, per repository (repository name → version). One entry per repository this subscription covers; the controller delivers versions above each mark. Per-repository because each repository has its own independent generation counter.
+                type: object
+              lastAttemptTime:
+                description: 'RFC 3339 time this subscription was last ATTEMPTED — success or failure alike, and never stamped by a deferral. It is the delivery cursor: each pass serves the least recently attempted subscriptions first, so a slow subscriber early in name order can no longer consume the whole budget every pass and starve the ones behind it. Persisted here rather than in the controller so it survives a leader change.'
+                nullable: true
+                type: string
+              lastDeliveryTime:
+                description: RFC 3339 time of the most recent successful delivery, for operator visibility.
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: UpdateSubscription
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

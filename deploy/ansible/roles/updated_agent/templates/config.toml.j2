@@ -1,13 +1,22 @@
+# Managed by the updated_agent Ansible role. The launcher reads this canonical path; it holds only
+# paths and a name — no secret. Enrollment happens once: after enrollment.json exists in launcher
+# state it is never retried, so editing this file does not re-enroll an established node.
+#
+# The annotated reference copy of this document — same keys, same mTLS paths, placeholder values —
+# is packaging/etc/config.toml, the conffile the .deb/.rpm ship. It cannot be templated directly
+# (a conffile cannot carry Jinja), so keep the key set here in step with it. Drift is loud, not
+# silent: the launcher refuses to parse an unknown or missing enrollment key at first boot.
 [enrollment]
-url = "{{ updated_enrollment_url }}"
+url = {{ updated_enrollment_url | to_json }}
 # This node's self-asserted enrollment name — the gateway mints it as the leaf certificate's CN and
 # creates the UpdateAgent object under exactly this string. It is the one knob that decides how the
 # control plane addresses this node, so `updated_hostname` — the variable the README documents and
 # the role defaults to the inventory name — is the single variable that reaches it.
-name = "{{ updated_hostname }}"
-# Identity is mutual TLS: this node presents the shared fleet enrollment certificate the fleet CA
-# signed. The config file holds only a name and paths — the certificate material is written by this
-# role.
+name = {{ updated_hostname | to_json }}
+# The CA is also the steady-state server trust anchor. The bootstrap identity below is consumed
+# only when the node still needs its per-node leaf.
+ca = "/etc/updated/agent-tls/ca.crt"
+
+[enrollment.bootstrap]
 client_cert = "/etc/updated/agent-tls/tls.crt"
 client_key = "/etc/updated/agent-tls/tls.key"
-ca = "/etc/updated/agent-tls/ca.crt"

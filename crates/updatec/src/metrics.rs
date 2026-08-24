@@ -34,12 +34,6 @@ pub struct FleetSnapshot {
     pub reports_stale: usize,
     /// Size of the quarantine set this pass.
     pub quarantined_groups: usize,
-    /// Nodes reporting under each report schema, from the verifications the pass already performed.
-    /// The compatibility window admits older reports with newer fields at their fail-safe default,
-    /// so the population below the current schema is exactly the population whose evidence is
-    /// degraded — and the only in-system answer to "does any supported fleet still run the older
-    /// agent", which is the precondition for raising the floor.
-    pub report_schemas: BTreeMap<u32, usize>,
 }
 
 /// The state the metrics listener reads: the latest snapshot, plus the failure counter that must
@@ -53,14 +47,21 @@ pub struct MetricsState {
 
 pub type SharedMetrics = Arc<std::sync::RwLock<MetricsState>>;
 
-/// The one-hot label set, spelled once: the renderer emits exactly these states and
-/// `progress_label` maps into them, so the two cannot drift into a label the other never uses.
-const PROGRESS_STATES: [&str; 5] = ["staging", "held", "settled", "failed", "unobservable"];
+/// The one-hot columns, taken from the planner's own list of verdicts rather than restated here.
+///
+/// [`GroupProgress::ALL`] is generated from the same list that declares the variants, so a verdict
+/// cannot exist without a column here. This used to be a local array whose own comment conceded
+/// that "what the compiler does not catch is a variant left out of this array": its groups rendered
+/// all zeros and no hot column, which a dashboard reads as "no groups in any state".
+const PROGRESS_STATES: [GroupProgress; GroupProgress::COUNT] = GroupProgress::ALL;
 
 fn progress_label(progress: GroupProgress) -> &'static str {
     match progress {
         GroupProgress::Held => "held",
         GroupProgress::Rolling => "staging",
+        // Frozen by a halt or a compliance block. Its own column: an operator watching "staging"
+        // climb has no way to see that none of it can finish.
+        GroupProgress::Blocked => "blocked",
         GroupProgress::Settled => "settled",
         // Its own state, never folded into "settled" or "staging": a group whose rollout ended in
         // durable rejection is neither done nor in flight, and counting it as either is what makes
@@ -78,46 +79,69 @@ fn escape(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// Declare one series: its `# HELP` and `# TYPE`, written whether or not a sample follows.
+fn declare(out: &mut String, name: &str, kind: &str, help: &str) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
 /// Render the exposition document. Pure — a function of reconciler state — so it is unit-tested as
 /// text against constructed state, the same way status projection is tested.
+///
+/// Every series is DECLARED unconditionally and only its samples depend on state: before the first
+/// successful pass the document is nothing but `# HELP`/`# TYPE` pairs and the failure counter, and
+/// `updatec_generation` is declared with no samples until something is published. That is the
+/// invariant docs/observability-design.md's testing section rests on — a name check passes against
+/// an exposition that projected nothing, which is why the e2e reads sample VALUES. Skipping the
+/// declarations instead would make a name check look like a real assertion on every scrape but the
+/// pre-first-pass one, which is precisely the scrape the assertion exists to catch.
 pub fn render(state: &MetricsState) -> String {
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "# HELP updatec_reconcile_failures_total Reconcile passes that failed since this process started."
+    let snapshot = state.last.as_ref();
+    declare(
+        &mut out,
+        "updatec_reconcile_failures_total",
+        "counter",
+        "Reconcile passes that failed since this process started.",
     );
-    let _ = writeln!(out, "# TYPE updatec_reconcile_failures_total counter");
     let _ = writeln!(
         out,
         "updatec_reconcile_failures_total {}",
         state.reconcile_failures_total
     );
-    let Some(snapshot) = &state.last else {
-        return out;
-    };
-    let _ = writeln!(out, "# HELP updatec_reconcile_timestamp_seconds When the last successful reconcile finished (unix seconds).");
-    let _ = writeln!(out, "# TYPE updatec_reconcile_timestamp_seconds gauge");
-    let _ = writeln!(
-        out,
-        "updatec_reconcile_timestamp_seconds {}",
-        snapshot.reconcile_timestamp_seconds
+    declare(
+        &mut out,
+        "updatec_reconcile_timestamp_seconds",
+        "gauge",
+        "When the last successful reconcile finished (unix seconds).",
     );
-    let _ = writeln!(
-        out,
-        "# HELP updatec_reconcile_duration_seconds How long the last successful reconcile took."
-    );
-    let _ = writeln!(out, "# TYPE updatec_reconcile_duration_seconds gauge");
-    let _ = writeln!(
-        out,
-        "updatec_reconcile_duration_seconds {:.6}",
-        snapshot.reconcile_duration_seconds
-    );
-    if let Some(generation) = snapshot.generation {
+    if let Some(snapshot) = snapshot {
         let _ = writeln!(
             out,
-            "# HELP updatec_generation The published generation, labeled per deployment name."
+            "updatec_reconcile_timestamp_seconds {}",
+            snapshot.reconcile_timestamp_seconds
         );
-        let _ = writeln!(out, "# TYPE updatec_generation gauge");
+    }
+    declare(
+        &mut out,
+        "updatec_reconcile_duration_seconds",
+        "gauge",
+        "How long the last successful reconcile took.",
+    );
+    if let Some(snapshot) = snapshot {
+        let _ = writeln!(
+            out,
+            "updatec_reconcile_duration_seconds {:.6}",
+            snapshot.reconcile_duration_seconds
+        );
+    }
+    declare(
+        &mut out,
+        "updatec_generation",
+        "gauge",
+        "The published generation, labeled per deployment name.",
+    );
+    if let Some((snapshot, generation)) = snapshot.and_then(|s| Some((s, s.generation?))) {
         for deployment in &snapshot.deployments {
             let _ = writeln!(
                 out,
@@ -126,24 +150,31 @@ pub fn render(state: &MetricsState) -> String {
             );
         }
     }
-    let _ = writeln!(
-        out,
-        "# HELP updatec_group_progress One-hot projection of the planner verdict per group."
+    let groups = snapshot.into_iter().flat_map(|snapshot| &snapshot.groups);
+    declare(
+        &mut out,
+        "updatec_group_progress",
+        "gauge",
+        "One-hot projection of the planner verdict per group.",
     );
-    let _ = writeln!(out, "# TYPE updatec_group_progress gauge");
-    for (group, (progress, _)) in &snapshot.groups {
+    for (group, (progress, _)) in groups.clone() {
         for state in PROGRESS_STATES {
-            let value = u8::from(progress_label(*progress) == state);
+            let value = u8::from(*progress == state);
             let _ = writeln!(
                 out,
-                "updatec_group_progress{{group=\"{}\",state=\"{state}\"}} {value}",
-                escape(group)
+                "updatec_group_progress{{group=\"{}\",state=\"{}\"}} {value}",
+                escape(group),
+                progress_label(state)
             );
         }
     }
-    let _ = writeln!(out, "# HELP updatec_group_nodes Nodes each group selects.");
-    let _ = writeln!(out, "# TYPE updatec_group_nodes gauge");
-    for (group, (_, nodes)) in &snapshot.groups {
+    declare(
+        &mut out,
+        "updatec_group_nodes",
+        "gauge",
+        "Nodes each group selects.",
+    );
+    for (group, (_, nodes)) in groups.clone() {
         let _ = writeln!(
             out,
             "updatec_group_nodes{{group=\"{}\"}} {}",
@@ -151,9 +182,13 @@ pub fn render(state: &MetricsState) -> String {
             nodes.total
         );
     }
-    let _ = writeln!(out, "# HELP updatec_group_nodes_on_target Nodes already handed the group's admitted deployment, as admission counts it.");
-    let _ = writeln!(out, "# TYPE updatec_group_nodes_on_target gauge");
-    for (group, (_, nodes)) in &snapshot.groups {
+    declare(
+        &mut out,
+        "updatec_group_nodes_on_target",
+        "gauge",
+        "Nodes already handed the group's admitted deployment, as admission counts it.",
+    );
+    for (group, (_, nodes)) in groups {
         let _ = writeln!(
             out,
             "updatec_group_nodes_on_target{{group=\"{}\"}} {}",
@@ -161,27 +196,37 @@ pub fn render(state: &MetricsState) -> String {
             nodes.on_target
         );
     }
-    let _ = writeln!(out, "# HELP updatec_reports_fresh Node reports inside REPORT_FRESHNESS, as the admission gate counts them.");
-    let _ = writeln!(out, "# TYPE updatec_reports_fresh gauge");
-    let _ = writeln!(out, "updatec_reports_fresh {}", snapshot.reports_fresh);
-    let _ = writeln!(out, "# HELP updatec_reports_stale Nodes that have reported before but have no fresh authentic report.");
-    let _ = writeln!(out, "# TYPE updatec_reports_stale gauge");
-    let _ = writeln!(out, "updatec_reports_stale {}", snapshot.reports_stale);
-    let _ = writeln!(out, "# HELP updatec_report_schema Nodes with a fresh authentic report, by the report schema they wrote.");
-    let _ = writeln!(out, "# TYPE updatec_report_schema gauge");
-    for (schema, nodes) in &snapshot.report_schemas {
-        let _ = writeln!(out, "updatec_report_schema{{schema=\"{schema}\"}} {nodes}");
+    declare(
+        &mut out,
+        "updatec_reports_fresh",
+        "gauge",
+        "Node reports inside REPORT_FRESHNESS, as the admission gate counts them.",
+    );
+    if let Some(snapshot) = snapshot {
+        let _ = writeln!(out, "updatec_reports_fresh {}", snapshot.reports_fresh);
     }
-    let _ = writeln!(
-        out,
-        "# HELP updatec_quarantined_groups Size of the quarantine set."
+    declare(
+        &mut out,
+        "updatec_reports_stale",
+        "gauge",
+        "Nodes that have reported before but have no fresh authentic report.",
     );
-    let _ = writeln!(out, "# TYPE updatec_quarantined_groups gauge");
-    let _ = writeln!(
-        out,
-        "updatec_quarantined_groups {}",
-        snapshot.quarantined_groups
+    if let Some(snapshot) = snapshot {
+        let _ = writeln!(out, "updatec_reports_stale {}", snapshot.reports_stale);
+    }
+    declare(
+        &mut out,
+        "updatec_quarantined_groups",
+        "gauge",
+        "Size of the quarantine set.",
     );
+    if let Some(snapshot) = snapshot {
+        let _ = writeln!(
+            out,
+            "updatec_quarantined_groups {}",
+            snapshot.quarantined_groups
+        );
+    }
     out
 }
 
@@ -261,7 +306,6 @@ mod tests {
                 reports_fresh: 7,
                 reports_stale: 1,
                 quarantined_groups: 1,
-                report_schemas: BTreeMap::from([(5, 2), (6, 5)]),
             }),
         };
         let text = render(&state);
@@ -279,26 +323,134 @@ mod tests {
             "updatec_group_nodes_on_target{group=\"core\"} 2",
             "updatec_reports_fresh 7",
             "updatec_reports_stale 1",
-            // The population still writing an older report schema, which is the population whose
-            // rollbacks mint no regression evidence — invisible in every other series.
-            "updatec_report_schema{schema=\"5\"} 2",
-            "updatec_report_schema{schema=\"6\"} 5",
             "updatec_quarantined_groups 1",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }
     }
 
+    /// Every planner verdict must light exactly one column. A verdict missing from
+    /// `PROGRESS_STATES` renders five zeros instead of erroring or vanishing, and an all-zero
+    /// one-hot reads on a dashboard as "no groups in any state" — the fleet looks empty rather than
+    /// unknown, which is the one wrong answer this series can give.
+    #[test]
+    fn every_group_progress_renders_exactly_one_hot_column() {
+        // Over the planner's own list, which is complete by construction, so a new variant arrives
+        // here without anyone remembering to add it.
+        for progress in GroupProgress::ALL {
+            let text = render(&MetricsState {
+                reconcile_failures_total: 0,
+                last: Some(FleetSnapshot {
+                    reconcile_timestamp_seconds: 1_770_000_000,
+                    reconcile_duration_seconds: 0.1,
+                    generation: None,
+                    deployments: Vec::new(),
+                    groups: BTreeMap::from([(
+                        "edge".to_string(),
+                        (
+                            progress,
+                            GroupNodes {
+                                total: 1,
+                                on_target: 1,
+                                fresh: 1,
+                                observable: 1,
+                                held: 0,
+                                target: Some("id".into()),
+                            },
+                        ),
+                    )]),
+                    reports_fresh: 1,
+                    reports_stale: 0,
+                    quarantined_groups: 0,
+                }),
+            });
+            let hot: Vec<&str> = text
+                .lines()
+                .filter(|line| line.starts_with("updatec_group_progress{"))
+                .collect();
+            assert_eq!(hot.len(), PROGRESS_STATES.len(), "{text}");
+            assert_eq!(
+                hot.iter().filter(|line| line.ends_with(" 1")).count(),
+                1,
+                "{progress:?} lights no column or more than one:\n{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "updatec_group_progress{{group=\"edge\",state=\"{}\"}} 1",
+                    progress_label(progress)
+                )),
+                "{text}"
+            );
+        }
+    }
+
     /// Before the first successful pass there is nothing to project but the failure counter — the
     /// scrape must still answer, or "is the loop alive" is unanswerable exactly when it matters.
+    /// Every other series is still DECLARED and carries no sample, which is the invariant
+    /// docs/observability-design.md's testing section rests on: a search for a series NAME passes
+    /// against a document that projected nothing, so an assertion must read values. A conditional
+    /// declaration would make a name check pass on every scrape except this one.
     #[test]
-    fn an_empty_state_still_exposes_the_failure_counter() {
+    fn an_empty_state_declares_every_series_and_samples_only_the_failure_counter() {
         let text = render(&MetricsState {
             last: None,
             reconcile_failures_total: 3,
         });
         assert!(text.contains("updatec_reconcile_failures_total 3"));
-        assert!(!text.contains("updatec_reconcile_timestamp_seconds"));
+        for series in [
+            "updatec_reconcile_timestamp_seconds",
+            "updatec_reconcile_duration_seconds",
+            "updatec_generation",
+            "updatec_group_progress",
+            "updatec_group_nodes",
+            "updatec_group_nodes_on_target",
+            "updatec_reports_fresh",
+            "updatec_reports_stale",
+            "updatec_quarantined_groups",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {series} gauge")),
+                "{series} is not declared in:\n{text}"
+            );
+        }
+        // Declared, but nothing was projected: no line of this document is a sample except the
+        // failure counter's.
+        let samples: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        assert_eq!(
+            samples,
+            vec!["updatec_reconcile_failures_total 3"],
+            "{text}"
+        );
+    }
+
+    /// A published generation is the only thing `updatec_generation` samples: a pass that
+    /// published nothing declares the series and emits no line, so an alert reading its value sees
+    /// no series at all rather than a zero it would treat as a real generation.
+    #[test]
+    fn a_pass_that_published_nothing_declares_the_generation_series_with_no_sample() {
+        let text = render(&MetricsState {
+            reconcile_failures_total: 0,
+            last: Some(FleetSnapshot {
+                reconcile_timestamp_seconds: 1_770_000_000,
+                reconcile_duration_seconds: 0.1,
+                generation: None,
+                deployments: vec!["app-v2".into()],
+                groups: BTreeMap::new(),
+                reports_fresh: 0,
+                reports_stale: 0,
+                quarantined_groups: 0,
+            }),
+        });
+        assert!(text.contains("# TYPE updatec_generation gauge"), "{text}");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("updatec_generation{")),
+            "{text}"
+        );
     }
 
     /// Label values travel inside double quotes, so the three escapes the exposition format

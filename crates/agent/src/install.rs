@@ -197,24 +197,46 @@ async fn apply_install(
     // head and re-selects, so ordered fallback monotonically descends to the newest *installable*
     // release; the loop terminates when one installs or nothing selectable remains.
     let (prepared, providers) = loop {
-        match crate::acquire::prepare_assigned_application(
-            crate::acquire::ApplicationRequest {
-                repository: &repo,
-                application: &opts.application,
-                paths: &opts.paths,
-                current_version: None,
-            },
-            |sha256| store.is_rejected(&lineage, sha256),
-        )
-        .await
-        {
-            Ok(Some(prepared)) => {
+        let request = crate::acquire::ApplicationRequest {
+            repository: &repo,
+            application: &opts.application,
+            paths: &opts.paths,
+            // A cold install: nothing is on this node, so there is no floor and a signed
+            // `orderedInstallFallback` may descend. The one stance that permits a descent.
+            stance: updated_tuf::select::Stance::Nothing,
+        };
+        let selected = match crate::acquire::select_assigned_application(&request, |sha256| {
+            store.is_rejected(&lineage, sha256)
+        }) {
+            Ok(Some(selected)) => selected,
+            Ok(None) => {
+                // Enumerate exactly what the repository offered and why nothing was selectable, so
+                // an empty ordered-fallback descent is diagnosable from the log, not opaque. The
+                // caller decides whether an empty descent is fatal or survivable.
+                let policy = updated_tuf::DefaultPolicy::current(
+                    &opts.application.product,
+                    &opts.application.channel,
+                );
+                return Ok(ColdInstall::NothingSelectable(repo.selection_diagnostics(
+                    &policy,
+                    updated_tuf::select::Stance::Nothing,
+                    |sha| store.is_rejected(&lineage, sha),
+                )));
+            }
+            // A failure to read the signed metadata at all says nothing about any release, so
+            // nothing is rejected: the boot retries the whole cold install later.
+            Err(error) => return Err(format!("preparing the first application: {error}").into()),
+        };
+        // The set signed into the version just selected, decided once with it.
+        let version_provider_set = selected.provider_set.clone();
+        match crate::acquire::prepare_assigned_application(&request, selected).await {
+            Ok(prepared) => {
                 // Stage the operator's providers *for this app version* — its own signed provider
                 // set governs (app + providers are one signed rollback unit, see `stage_providers`).
                 // A corrupt or previously-rejected provider set makes this whole version
                 // uninstallable: reject the app version so ordered fallback descends to one whose
                 // provider set is good, rather than crash-looping on a version we can never bring up.
-                match stage_providers(opts, &repo, store, None).await {
+                match stage_providers(opts, &repo, store, version_provider_set.as_ref()).await {
                     Ok(providers) => break (prepared, providers),
                     Err(crate::selection::ProviderStagingError::Unusable {
                         message,
@@ -255,20 +277,6 @@ async fn apply_install(
                         .into());
                     }
                 }
-            }
-            Ok(None) => {
-                // Enumerate exactly what the repository offered and why nothing was selectable, so
-                // an empty ordered-fallback descent is diagnosable from the log, not opaque. The
-                // caller decides whether an empty descent is fatal or survivable.
-                let policy = updated_tuf::DefaultPolicy::current(
-                    &opts.application.product,
-                    &opts.application.channel,
-                );
-                return Ok(ColdInstall::NothingSelectable(repo.selection_diagnostics(
-                    &policy,
-                    None,
-                    |sha| store.is_rejected(&lineage, sha),
-                )));
             }
             Err(error) => {
                 // A malformed bundle carries a rejectable archive hash; reject it and descend. A

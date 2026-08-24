@@ -1,19 +1,18 @@
 {
   "schema": 3,
   "deployment": "production-web-2026-07-18.1",
-  "metadata_url": "https://cdn.example.com/tuf/metadata/",
-  "targets_url": "https://cdn.example.com/tuf/targets/",
-  "report_url": "https://reports.example.com/nodes/",
+  "metadataUrl": "https://cdn.example.com/tuf/metadata/",
+  "targetsUrl": "https://cdn.example.com/tuf/targets/",
   "application": {
     "path": "products/web/stable/2.7.1/linux-x86_64/app",
     "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
   },
-  "ordered_install_fallback": false,
-  "provider_set": {
+  "orderedInstallFallback": false,
+  "providerSet": {
     "path": "provider-sets/web-linux-v4.json",
     "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
   },
-  "release_root": {
+  "releaseRoot": {
     "signed": {
       "_type": "root",
       "spec_version": "1.0.31",
@@ -28,40 +27,32 @@
   "runtime": {
     "product": "web",
     "channel": "stable",
-    "install_root": "/opt/web",
-    "secrets": [
-      {
-        "environment": "DATABASE_PASSWORD",
-        "secret": "production-database",
-        "key": "password"
-      }
-    ],
+    "installRoot": "/opt/web",
     "inputs": {
-      "database_host": {
-        "type": "string",
-        "value": "db.production.internal"
-      }
+      "generation": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "object_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "files": ["database_host"]
     },
     "repository": {
-      "metadata_limit": 1048576,
-      "target_limit": 536870912,
-      "transport_timeout_seconds": 30
+      "metadataLimit": 1048576,
+      "targetLimit": 536870912,
+      "transportTimeoutSeconds": 30
     },
     "storage": {
-      "inactive_releases": 2,
-      "inactive_providers": 2,
-      "inactive_agents": 2,
-      "inactive_bytes": 1073741824,
-      "inactive_repository_caches": 2
+      "inactiveReleases": 2,
+      "inactiveProviders": 2,
+      "inactiveAgents": 2,
+      "inactiveBytes": 1073741824,
+      "inactiveRepositoryCaches": 2
     },
     "timeouts": {
-      "check_interval_seconds": 15,
-      "health_grace_seconds": 30,
-      "health_successes": 2,
-      "health_interval_seconds": 1,
-      "refresh_retry_seconds": 5,
-      "confirmation_window_seconds": 120,
-      "agent_check_interval_seconds": 3600
+      "checkIntervalSeconds": 15,
+      "healthGraceSeconds": 30,
+      "healthSuccesses": 2,
+      "healthIntervalSeconds": 1,
+      "refreshRetrySeconds": 5,
+      "confirmationWindowSeconds": 120,
+      "agentCheckIntervalSeconds": 3600
     }
   }
 }

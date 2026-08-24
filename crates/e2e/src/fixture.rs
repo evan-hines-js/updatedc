@@ -26,7 +26,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use updated_contracts::reconciler::Operation;
+use updated_contracts::reconciler::{Operation, Reason};
 
 /// The provider argument that selects this fixture, followed by its state root and its mode.
 pub const FLAG: &str = "--lifecycle-fixture";
@@ -43,6 +43,30 @@ pub fn is_invocation(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>
     args.into_iter().any(|arg| arg.as_ref() == FLAG)
 }
 
+/// Run the reconciler fixture if this process was invoked as one, reporting whether it did.
+///
+/// Every binary that signs ITSELF in as a release's reconciler — the e2e driver, killfuzz — must
+/// call this before anything else: the agent invokes the executable as the hook that owns the
+/// workload, so a binary that fell through to its own `main` would recursively start a whole nested
+/// suite on every hook call, which the agent then times out. That is one rule about how these
+/// executables behave, so it is written once; a second binary copying the preamble is a binary that
+/// can copy it slightly wrong, and the symptom is a timeout nobody reads as recursion.
+///
+/// Returns `true` when it handled the invocation, and the caller must then return from `main`
+/// rather than exiting here: a fixture mode answers the agent on stdout and some modes deliberately
+/// hang, so normal shutdown — flushes and destructors included — has to stay the caller's.
+#[must_use = "when this returns true the process was a reconciler invocation and main must return"]
+pub fn dispatch_if_invoked() -> bool {
+    if !is_invocation(std::env::args_os()) {
+        return false;
+    }
+    if let Err(error) = run() {
+        eprintln!("node reconciler fixture: {error}");
+        std::process::exit(1);
+    }
+    true
+}
+
 /// The fixture's state root for a scenario directory. One location, so a scenario and the provider
 /// command it publishes can never disagree about where the recorded history lives.
 pub fn root(dir: &Path) -> PathBuf {
@@ -50,19 +74,15 @@ pub fn root(dir: &Path) -> PathBuf {
 }
 
 /// One recorded reconciler invocation, parsed back out of `operations.log`.
+///
+/// The operation and the reason are the published vocabulary, not strings: `Reason`'s own doc names
+/// "a conformance harness, a test fixture" as the second speller it exists to prevent, and a
+/// scenario comparing against its own literals would go on passing — or start failing for the wrong
+/// reason — through a renamed spelling.
 pub struct Invocation {
-    pub operation: String,
+    pub operation: Operation,
     pub id: String,
-    pub reason: String,
-    /// The NAMES present in the invocation's environment. Values are never recorded — a secret
-    /// that reached a hook must be provable without ever being written down.
-    pub environment: Vec<String>,
-}
-
-impl Invocation {
-    pub fn has_environment(&self, name: &str) -> bool {
-        self.environment.iter().any(|present| present == name)
-    }
+    pub reason: Reason,
 }
 
 /// Every invocation the fixture under `root` has observed, oldest first.
@@ -72,32 +92,23 @@ pub fn operations(root: &Path) -> Vec<Invocation> {
         .lines()
         .filter_map(|line| {
             let mut fields = line.split('\t');
-            let operation = fields.next()?.to_string();
+            let operation: Operation = fields.next()?.parse().ok()?;
             let id = fields.next()?.to_string();
-            let reason = fields.next()?.to_string();
-            // The recorded candidate version: written for a human reading a failed run's log,
-            // asserted on by nothing. Consumed positionally so the environment column stays put,
-            // and with `?` so a line of fewer than four columns is still not an invocation.
+            let reason: Reason = fields.next()?.parse().ok()?;
+            // The recorded candidate version is for a human reading a failed run's log and is not
+            // part of the assertion shape. Requiring it still rejects truncated records.
             fields.next()?;
-            let environment = fields
-                .next()
-                .unwrap_or_default()
-                .split(' ')
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
             Some(Invocation {
                 operation,
                 id,
                 reason,
-                environment,
             })
         })
         .collect()
 }
 
 /// The deployment operations recorded under transaction identities, as `(operation, attempt id)`
-/// pairs. The reserved `boot`/`periodic`/fingerprint observations never appear here.
+/// pairs. Operations carrying a reserved non-transaction attempt identity never appear here.
 pub fn attempts(root: &Path) -> Vec<(String, String)> {
     std::fs::read_to_string(root.join("attempts.log"))
         .unwrap_or_default()
@@ -122,17 +133,16 @@ pub fn transactions(attempts: &[(String, String)]) -> std::collections::BTreeSet
 }
 
 /// The invocations recorded after `since` that no agent-only event may ever produce: any deployment
-/// operation (a non-reserved attempt id) and any `rollback`. A re-converging agent legitimately runs
-/// `apply`/`healthcheck` under the reserved `boot` identity and the steady-state
-/// `periodic`/`fingerprint` observations; a deployment or a rollback means it reached for the
-/// workload.
+/// operation (a non-reserved attempt id) and any `rollback`. An agent legitimately runs
+/// `apply`/`healthcheck` under `boot`, another pair under `converge`, and steady observations under
+/// `periodic`/`fingerprint`; a deployment or a rollback means it reached for the workload.
 pub fn disturbances(root: &Path, since: usize) -> Vec<String> {
     operations(root)
         .into_iter()
         .skip(since)
         .filter(|invocation| {
             !updated_contracts::reconciler::attempt::is_reserved(&invocation.id)
-                || invocation.operation == "rollback"
+                || invocation.operation == Operation::Rollback
         })
         .map(|invocation| {
             format!(
@@ -286,6 +296,7 @@ pub fn run() -> R {
     let reason = value("--reason")?;
     let candidate = PathBuf::from(value("--candidate")?);
     let candidate_version = value("--candidate-version")?;
+    let result_file = PathBuf::from(value("--result-file")?);
     let provider_args = &args[separator + 1..];
     let at = provider_args
         .iter()
@@ -326,30 +337,48 @@ pub fn run() -> R {
         migration_gate(&root, &candidate_version)?;
     }
 
-    let Some(address) = mode.workload.as_deref() else {
-        return Ok(());
-    };
-    match operation {
+    let outcome = match mode.workload.as_deref() {
+        None => Ok(()),
         // `--candidate` is the release to converge ONTO in both directions: on a rollback the agent
         // passes the release being restored as the candidate and the failed one as the predecessor,
         // so a hook that converges toward `--candidate` needs no direction-specific branch at all.
-        Operation::Apply | Operation::Rollback => converge(&root, &candidate, address, &mode),
-        Operation::Healthcheck => {
+        Some(address) if operation.mutation().is_some() => {
+            converge(&root, &candidate, address, &mode)
+        }
+        Some(address) if operation == Operation::Healthcheck => {
             probe(address)?;
             // A healthy observation is also the answer to "is this node fit to serve": a workload
             // that came up after its `apply` stopped waiting rejoins rotation here.
             restore_rotation(&root, address, &mode)
         }
-        Operation::Inspect => Ok(()),
+        Some(_) => Ok(()),
+    };
+    outcome?;
+    if operation.mutation().is_some() {
+        let result = updated_contracts::reconciler::ResultDocument {
+            schema: updated_contracts::reconciler::ResultDocument::SCHEMA,
+            status: updated_contracts::reconciler::ResultStatus::Succeeded,
+            changed: true,
+            host_action: updated_contracts::reconciler::HostAction::None,
+            retry_after_seconds: None,
+            message: None,
+        };
+        foundation::durable::atomic_write(
+            &result_file,
+            ".result-",
+            &result.to_bounded_json().map_err(str_err)?,
+        )
+        .map_err(str_err)?;
     }
+    Ok(())
 }
 
 /// Record one invocation. This is the fixture's only writer of observation history.
 ///
-/// `operations.log` holds *every* invocation, including the reserved identities, with the full
-/// argument shape a scenario may need to assert on — including which environment variable NAMES were
-/// present, never their values. `attempts.log` holds only deployment operations, so it is the
-/// transaction history alone.
+/// `operations.log` holds every invocation, including the reserved identities, with its stable
+/// operation identity. `attempts.log` holds only deployment operations, so it is the transaction
+/// history alone. The cleared process environment is deliberately absent: configuration has only
+/// the file-native input path, and recording another representation would revive the old model.
 fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &str) -> R {
     let append = |path: PathBuf, line: &str| -> R {
         std::fs::create_dir_all(root).map_err(str_err)?;
@@ -360,18 +389,9 @@ fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &s
             .map_err(str_err)?;
         writeln!(log, "{line}").map_err(str_err)
     };
-    let mut environment: Vec<String> = std::env::vars()
-        .map(|(name, _)| name)
-        .filter(|name| !name.contains(char::is_whitespace))
-        .collect();
-    environment.sort();
     append(
         root.join("operations.log"),
-        &format!(
-            "{}\t{id}\t{reason}\t{version}\t{}",
-            operation.as_str(),
-            environment.join(" ")
-        ),
+        &format!("{}\t{id}\t{reason}\t{version}", operation.as_str()),
     )?;
     if updated_contracts::reconciler::attempt::is_reserved(id) {
         return Ok(());
@@ -385,17 +405,14 @@ fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &s
 
 // ---------------------------------- the workload ----------------------------------
 
-/// The workload's recorded identity: which release it runs and under which environment. `apply`
-/// compares against it so an already-correct workload is left strictly alone — the difference
-/// between a reconciler that converges and one that restarts a healthy service on every boot.
-///
-/// The environment is a digest, never the values: a rotated secret must be provably acted on
-/// without any part of it reaching disk.
+/// The workload's recorded identity. `apply` compares the running release so an already-correct
+/// workload is left strictly alone — the difference between convergence and restarting a healthy
+/// service on every boot. Configuration identity is not duplicated here: a real reconciler
+/// compares its managed files/state, while the fixture's workload consumes no assigned inputs.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WorkloadRecord {
     pid: u32,
     release: String,
-    environment: String,
 }
 
 fn record_path(root: &Path) -> PathBuf {
@@ -406,27 +423,13 @@ fn read_workload(root: &Path) -> Option<WorkloadRecord> {
     serde_json::from_slice(&std::fs::read(record_path(root)).ok()?).ok()
 }
 
-/// A digest over the whole invocation environment. Secret values arrive only here, so this is the
-/// one thing that can tell a rotation from an ordinary `apply --reason restart`.
-fn environment_digest() -> String {
-    let mut entries: Vec<String> = std::env::vars()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect();
-    entries.sort();
-    updated::hash::sha256_bytes(entries.join("\n").as_bytes())
-}
-
 /// Converge the workload onto `release`: leave it alone if it already runs these bytes under this
-/// environment, otherwise withdraw it from traffic, stop it, and start the release's entrypoint.
+/// fixture-managed state, otherwise withdraw it from traffic, stop it, and start the release's
+/// entrypoint.
 fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
     let release_id = release.display().to_string();
-    let environment = environment_digest();
     let replacing = match read_workload(root) {
-        Some(current)
-            if current.release == release_id
-                && current.environment == environment
-                && pid_alive(current.pid) =>
-        {
+        Some(current) if current.release == release_id && pid_alive(current.pid) => {
             // Already converged. Rotation is still derived rather than assumed: a workload that
             // came up after a previous `apply` gave up waiting is put back in rotation here.
             return restore_rotation(root, address, mode);
@@ -477,7 +480,6 @@ fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
     let workload = WorkloadRecord {
         pid: child.id(),
         release: release_id,
-        environment,
     };
     // Renamed into place, never truncate-then-write: a kill mid-write would otherwise leave an
     // unparseable record and the same unreapable orphan.

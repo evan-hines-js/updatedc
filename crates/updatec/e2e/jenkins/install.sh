@@ -23,15 +23,16 @@ PROTOCOL=
 PREDECESSOR_VERSION=
 CANDIDATE_VERSION=
 CANDIDATE=
-PREDECESSOR=
+RESULT_FILE=
 while (($#)); do
   case "$1" in
     --protocol) PROTOCOL=$2; shift 2 ;;
     --predecessor-version) PREDECESSOR_VERSION=$2; shift 2 ;;
     --candidate-version) CANDIDATE_VERSION=$2; shift 2 ;;
     --candidate) CANDIDATE=$2; shift 2 ;;
-    --predecessor) PREDECESSOR=$2; shift 2 ;;
-    --attempt-id | --reason | --install-root | --state-dir | --input-file | --output-file)
+    --result-file) RESULT_FILE=$2; shift 2 ;;
+    --predecessor) shift 2 ;;
+    --attempt-id | --reason | --install-root | --state-dir | --input-dir | --output-dir)
       shift 2
       ;;
     --) shift; break ;;
@@ -41,6 +42,14 @@ done
 [[ $PROTOCOL == 1 ]] || { echo "jenkins-install: unsupported protocol" >&2; exit 2; }
 DATA="${JENKINS_DATA:-/var/lib/jenkins}"
 BACKUPS="${JENKINS_BACKUPS:-/var/lib/jenkins-backups}"
+[[ "$DATA" == /* && "$DATA" != / ]] || {
+  echo "jenkins-install: JENKINS_DATA must be a non-root absolute path" >&2
+  exit 2
+}
+[[ "$BACKUPS" == /* && "$BACKUPS" != / ]] || {
+  echo "jenkins-install: JENKINS_BACKUPS must be a non-root absolute path" >&2
+  exit 2
+}
 JENKINS_VERSION="${JENKINS_VERSION:-2.462.3}"
 # Ceiling on waiting for running builds to finish before a restart. A ceiling, not a floor:
 # an idle controller restarts immediately. Builds still running when it expires are lost —
@@ -154,6 +163,7 @@ case "$PHASE" in
     echo "jenkins-install: converging to ${CANDIDATE_VERSION:-?}, reusing JENKINS_HOME at $DATA/home" >&2
     printf '%s\n' "${CANDIDATE_VERSION:-?}" > "$DATA/installed-version"
     start_controller "$CANDIDATE"
+    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}' >"$RESULT_FILE"
     ;;
 
   healthcheck)
@@ -171,13 +181,14 @@ case "$PHASE" in
     latest="$(cat "$BACKUPS/latest" 2>/dev/null || true)"
     if [ -n "$latest" ] && [ -f "$BACKUPS/$latest" ]; then
       echo "jenkins-install: restoring JENKINS_HOME from $BACKUPS/$latest" >&2
-      rm -rf "$DATA/home"
+      rm -rf "${DATA:?}/home"
       tar xzf "$BACKUPS/$latest" -C "$DATA"
     else
       echo "jenkins-install: no JENKINS_HOME backup to restore (nothing was upgraded yet)" >&2
     fi
     printf '%s\n' "${CANDIDATE_VERSION:-?}" > "$DATA/installed-version"
     start_controller "$CANDIDATE"
+    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}' >"$RESULT_FILE"
     ;;
 
   *)

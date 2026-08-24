@@ -1,38 +1,45 @@
-# updatedc — a signed, transactional deployment channel for fleets of machines
+# updatedc — signed, transactional configuration management for fleets of machines
 
 [![CI](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml/badge.svg)](https://github.com/evan-hines-js/updatedc/actions/workflows/ci.yml)
-[![License: PolyForm Small Business 1.0.0](https://img.shields.io/badge/License-PolyForm%20Small%20Business%201.0.0-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 
 <p align="center">
   <img src="assets/fleet-cube.svg" width="700"
-       alt="updatedc: the updatec control plane distributes signed releases to a fleet of updated node agents." />
+       alt="updatedc: the updatec control plane distributes signed releases to a fleet of updated-agent nodes." />
 </p>
 
-**updatedc** delivers arbitrary content to arbitrary machines under one signed, transactional
-contract. You publish a directory of files — binaries, configuration, certificates, scripts,
-assets, a whole application tree — together with one executable that knows how to put it into
-service. A fleet of machines pulls it, verifies every byte against signed metadata, activates it
-transactionally, gates the result on health, and rolls back to the exact predecessor when health
-does not arrive. Publishing a second bundle of the same shape is an update; the mechanism does not
-distinguish the two.
+**updatedc** is a pull-based configuration-management and software-delivery system for arbitrary
+machines. You publish a directory of files — configuration, packages, certificates, scripts,
+binaries, assets, or a whole application tree — together with one executable that converges the
+host onto that desired state. A fleet pulls it, verifies every byte against signed metadata,
+applies it transactionally, gates the result on health, and rolls back to the exact predecessor
+when health does not arrive. Publishing a second bundle of the same shape is an update; wrapping an
+existing installer or operations script makes it a reconciler.
 
 The executable is the whole learning curve, and it is a Bash script, a PowerShell script, or any
 other program. It answers four operations — `apply`, `healthcheck`, `rollback`, `inspect` — in
 whatever terms the environment already uses: `systemctl restart`, `sc.exe`, a container runtime, a
-config reload, a firmware tool, an existing installer. Everything hard around it belongs to the
-agent: delivery, signature and digest verification, durable transactions, health gating, rollback,
-rejection-by-hash so proven-bad bytes are never retried, and signed fleet reporting.
+config reload, a package manager, a firmware tool, or an existing installer. Everything that must
+always happen belongs to the agent: delivery, signature and digest verification, single-writer
+locking, bounded retries and deadlines, process containment, durable transactions and crash
+recovery, health gating, rollback, reboot orchestration, rejection-by-hash so proven-bad bytes are
+never retried, continuous desired-state convergence, drift measurement, and signed reconciliation
+reporting.
 
-Two cooperating halves:
+The system is split into deliberately narrow components:
 
-- **`updated`** — the per-node agent, on Linux, macOS, and Windows. It authenticates bundles
-  through TUF, materializes them as immutable content-addressed releases, drives the transaction,
-  survives interruption at every durable boundary, and can replace its own binary without
-  disturbing the workload.
-- **`updatec`** — the reference Kubernetes control plane. It groups nodes into fleets, publishes
-  each group's desired deployment as signed TUF metadata to object storage or a CDN, throttles how
-  fast a change ripples through a group, gates completion on the nodes' own signed health reports,
-  and drives load-balancer membership from that same health.
+- **`updated-agent`** runs on Linux, macOS, and Windows. It authenticates bundles through TUF,
+  materializes immutable content-addressed releases, drives the transaction, survives interruption
+  at every durable boundary, and reports signed health and output evidence.
+- **`updated-launcher`** supervises only the agent. It readiness-gates agent self-updates and
+  reverts a bad candidate without owning or disturbing the deployed workload.
+- **`updatec`** is the reference Kubernetes control plane and mTLS gateway. It resolves fleet
+  policy, signs and publishes per-node assignments, enrolls nodes, brokers bounded object
+  capabilities, accepts signed reports, and reconciles rollout state.
+- **`updated-healthproxy`** turns the control plane's pinned inventory and signed node health into
+  EndpointSlice or HAProxy membership; it is not in the application data path.
+- **`updatectl`** is the operator CLI for key management, publication, deployment, and reconciler
+  conformance checks.
 
 The control plane can never connect to a node. Everything flows through signed artifacts in shared
 storage: `updatec` publishes what each group *should* run, and each `updated` agent pulls,
@@ -52,14 +59,20 @@ A deployment names two immutable, signed, manifested bundles:
 
 The agent supplies delivery, verification of bytes, durable ordering, retries, deadlines,
 containment, cancellation, rollback journaling, scheduling, and telemetry. The reconciler supplies
-every application-specific decision. Hooks are invoked with argv only — never shell text — under a
+every application-specific desired-state decision. The installed system service has machine
+authority so a reconciler can manage users, packages, services, mounts, networking, and boot state;
+signed provider artifacts are the authorization boundary, and a reconciler may drop privileges for
+the workload it starts. Hooks are invoked with argv only — never shell text — under a
 cleared environment, a null stdin, and a contained process tree the agent reaps when the hook
-returns. Assigned secret values reach the hooks through that environment and never touch the
-agent's disk, manifests, or logs.
+returns. Assigned configuration, including secrets, reaches hooks only as ordinary files in the
+fresh private `--input-dir`; it never enters argv, the environment, manifests, telemetry, or logs.
 
 `healthcheck` is the one readiness gate. It makes a single observation and exits zero only when the
 observed release is acceptable; the agent retries it to the signed success threshold within the
-signed grace window, and runs it on the signed cadence for steady state. `inspect` is the bounded
+signed grace window, and runs it on the signed cadence for steady state. At every release-check
+cycle the agent also re-runs the installed release's idempotent `apply`, even when no new bundle is
+available, then requires the same bounded readiness gate. That platform-owned loop repairs drift;
+the script only has to describe how to converge its domain correctly. `inspect` is the bounded
 steady-state measurement: it runs after each deploy or rollback once the periodic `healthcheck`
 reports healthy, then hourly with stable per-node ±10% jitter — agent policy rather than deployment
 configuration, so expensive collection cannot drift into every health check. On exit zero the agent
@@ -70,10 +83,17 @@ five-minute agent ceiling, or output beyond 64 KiB omits the fingerprint rather 
 incomplete state.
 
 Every invocation carries `--attempt-id`: a transaction's own token when it gates that transaction's
-candidate, or one of the reserved `boot`/`periodic`/`fingerprint` identities for an operation
+candidate, or one of the reserved `boot`/`converge`/`periodic`/`fingerprint` identities for an operation
 belonging to no transaction. A transaction's compensating direction carries that token with `r`
 appended. Because intent is journaled before every invocation, every operation is invoked *at least
 once* and must tolerate replay.
+
+Successful `apply` and `rollback` operations publish a small structured result declaring whether
+state changed, whether the same attempt should be retried, and whether the host must reboot. The
+agent validates and durably records that result, owns the retry ceiling and delay, performs reboot
+through a fixed OS command, and includes the latest reconciliation evidence in the node's signed
+report. Health after a requested reboot is judged only after the next boot, with the predecessor
+retained until confirmation.
 
 The argv contract, the output-manifest document, and a copyable Bash template are in the
 [node reconciler protocol](docs/node-reconciler-protocol.md). Before publishing, run the
@@ -84,8 +104,8 @@ updatectl reconciler-check ./reconciler
 ```
 
 It builds a scratch install root, drives the hook through the same argv grammar the agent emits,
-and replays every operation the way crash recovery does — checking replay tolerance, observation
-purity, fingerprint stability, output-manifest bounds, and the refusals for an unknown operation
+and replays every operation the way crash recovery does — checking structured results, replay
+tolerance, observation purity, fingerprint stability, output-snapshot bounds, and the refusals for an unknown operation
 and an unimplemented protocol. It needs no repository, keys, or Kubernetes access.
 
 ## Architecture
@@ -94,9 +114,9 @@ Every node runs two small processes; workloads belong to the releases themselves
 plane lives outside the node entirely.
 
 ```text
-                    updatec (Kubernetes operator + gateway + healthproxy)
+                    updatec (Kubernetes controller + mTLS gateway)
                       │  signs & publishes desired deployments per group
-                      │  never connects into a node
+                      │  manages updated-healthproxy; never connects into a node
         ┌─────────────┴───────── signed TUF metadata + bundles ──────────────┐
         ▼  (object storage / CDN)                                            ▲
   per node:                                                       signed health reports
@@ -122,22 +142,26 @@ authenticate the archive through TUF
   → write the transaction journal
   → atomically switch active-release
   → the release's reconciler `apply` brings the candidate into service
-  → require health
-  → commit, or reactivate and reject the predecessor
+  → honor a requested host reboot, otherwise require health immediately
+  → after reboot, reapply and require health before confirmation
+  → commit, or reactivate the predecessor and reject the candidate
 ```
 
 ## Fleet management with `updatec`
 
 `updatec` maps nodes' control-plane labels to signed, opaque bundle references published through
-TUF; agents never learn *why* their assignment changed. Four custom resources (`updated.dev`)
+TUF; agents never learn *why* their assignment changed. Seven custom resources (`updated.dev`)
 describe a fleet:
 
 | Resource | Role |
 | --- | --- |
 | `UpdateRepository` | The object-store/CDN destination, signing keys, and enrollment policy for one fleet. |
+| `UpdateAgent` | One enrolled or manually provisioned node, including identity, labels, assignment, and observed status. |
 | `UpdateGroup` | A set of nodes (by label selector) and the exact deployment they should run. |
 | `UpdateGroupSet` | A throttle + schedule spanning several groups: `maxConcurrent`, rollout windows, and dated maintenance calendars. |
-| `UpdateAgent` | One enrolled node: its identity, resolved group, assignment path, and last self-reported running version/health. |
+| `UpdateBackend` | A label-selected, health-driven EndpointSlice or HAProxy projection with operator-owned runtime and RBAC. |
+| `UpdateAdmissionPolicy` | A repository-scoped external admission gate that can allow or block release movement. |
+| `UpdateSubscription` | At-least-once webhook delivery of repository publication generations with durable cursors. |
 
 Publication is a single consistent generation. The operator resolves every group's selector against
 the enrolled agents, builds one plan, signs it, and uploads it with `timestamp.json` last — the TUF
@@ -155,24 +179,27 @@ identity.
 **Throttled rollouts.** An `UpdateGroupSet` never advances more than `maxConcurrent` members at
 once (default `members − 1`), holding the rest until the in-flight ones settle. Settlement is
 proven by the node itself: each agent writes a small signed `NodeReport` to shared storage stating
-the version it is *actually* running, the digest of the archive that version was installed from,
-and whether it is healthy. The control plane reads those back — it never probes the app — so a
-rollout completes only on real, node-attested health, and a missing or stale report fails closed
-(keeps the slot). Rollout windows and dated calendars gate *when* a set may admit new rollouts;
-members already rolling always finish.
+the exact assignment it acted on, the application archive and provider set it is *actually*
+running, its latest platform-owned reconciliation record, and whether that running release is
+healthy. The control plane reads those back — it never probes the app — and settles a node only
+when all desired identities match and no rejection stands. Health remains independent: a restored
+predecessor can rejoin service while its rejected assignment remains visibly unconverged. A forged,
+missing, stale, or mismatched report fails closed and keeps the slot. Rollout windows and dated
+calendars gate *when* a set may admit new rollouts; members already rolling always finish.
 
-**Health-driven load balancing** (`updated-healthproxy`). The same signed `NodeReport`s drive
-backend membership. `updated-healthproxy` reads each node's report and programs a Kubernetes
-EndpointSlice (kube-proxy forwards; it adds no data-path hop of its own), so a node drops out of
-rotation the instant its report goes unhealthy or stale and rejoins when it recovers. It fails
-closed — only a fresh, healthy, correctly-attributed report keeps a backend in service — and the
-backend is pluggable (EndpointSlices today, DNS or HAProxy later) behind one health→membership
-core.
+**Health-driven load balancing** (`UpdateBackend`). The same signed `NodeReport`s drive backend
+membership. The operator derives a pinned inventory from matching `UpdateAgent`s and owns an
+`updated-healthproxy` workload for that projection. The proxy programs either a Kubernetes
+EndpointSlice (kube-proxy forwards; it adds no data-path hop of its own) or HAProxy runtime members.
+A node leaves rotation when its report becomes unhealthy or stale and rejoins when it recovers.
+Only a fresh, healthy, correctly attributed report keeps a backend in service. Adding or removing
+agent labels changes membership; deleting the CR drains members before generated RBAC is removed.
 
 Control-plane authors targeting a different orchestrator should start with the normative
-[JSON Schemas](schemas) — the wire contract integrators write against. Installation manifests live
-under [deploy/kubernetes](deploy/kubernetes); the CRDs, namespace, and Secrets they presuppose are
-in the [Kubernetes install guide](docs/kubernetes-install.md).
+[JSON Schemas](schemas) — the wire contract integrators write against. The control plane and its
+operator-owned backend workloads install from the single [`updatec` Helm chart](deploy/charts/updatec); see the
+[Kubernetes install guide](docs/kubernetes-install.md). Nodes are bootstrapped by a package,
+`install.sh`, or Ansible — see the [agent install guide](docs/agent-install.md).
 
 ## Guarantees
 
@@ -182,6 +209,8 @@ in the [Kubernetes install guide](docs/kubernetes-install.md).
   directories are never rewritten in place.
 - Startup reconciles interrupted transactions before selection or launch.
 - Failed activation or health reactivates the predecessor and rejects the candidate archive.
+- Reconciler-requested retries and host reboots are bounded, journaled, and executed by the agent.
+- Every accepted state-changing reconciliation is durably recorded and signed into node telemetry.
 - A post-commit crash inside the confirmation window also reverts the release.
 - Agent crashes and agent self-update do not disturb the reconciler-owned workload.
 - An unavailable repository does not prevent a verified installed bundle from starting.
@@ -206,6 +235,8 @@ name:
 url = "https://updates.example.com"
 ca  = "/etc/updated/fleet-ca.crt"
 name = "node-001"
+
+[enrollment.bootstrap]
 client_cert = "/etc/updated/enrollment/tls.crt"
 client_key  = "/etc/updated/enrollment/tls.key"
 ```
@@ -219,20 +250,29 @@ bundle; a bundle alone still requires `/enroll` to establish the per-node identi
 preinstalled files are never trusted — every artifact is admitted only through signature and digest
 verification.
 
-An offline-provisioned agent (`identity.kind: manual`) is the exception, and deliberately so: it
-never talks to `/enroll`, so no public key is ever pinned to its name, and the control plane can
-never verify anything it reports. It is staged **blind** — on what was published to it rather than
-on evidence — so its group stays throttled and stays updatable without any unverifiable report
-being believed. The gateway consequently refuses that node's report writes (`403`), and the node's
-agent treats the refusal as the standing verdict it is: it warns once and drops reporting to the
-agent-check cadence rather than re-PUTting a report no reader could accept on every cycle.
-Reporting resumes at full cadence by itself if the identity is ever completed. An operator who
-wants a node observed enrolls it (`kind: reserved` reserves the name for a specific machine to
-claim); manual provisioning trades visibility for needing no inbound enrollment at all.
+For an offline-provisioned agent (`identity.kind: manual`), the operator generates the node key
+first and places its canonical public half in the `UpdateAgent`. The node never calls `/enroll` and
+never receives the shared bootstrap private key; the operator copies both the signed enrollment
+object and a fleet-CA-signed leaf for that exact key to the machine. Once running, manual and online
+nodes use the same key-pinned authorization, certificate renewal, direct S3 capabilities, and
+end-to-end signed telemetry. Only the bootstrap delivery path differs. A reserved identity instead
+allows any holder of the shared bootstrap certificate to claim that pre-approved name first; it is
+inventory approval, not per-node bootstrap authority.
 
-The same signed deployment accepts HTTP(S), `file:` URLs, or absolute local repository directories,
-so an operator can repair a deployment fully offline. Raw edits inside an immutable installed
-release remain untrusted and are rejected. See [deploy/config.toml](deploy/config.toml).
+The controller publishes every node's small, immutable, content-addressed enrollment bootstrap in
+the repository's private S3 prefix and records its repository-relative key in
+`UpdateAgent.status.enrollmentObjectKey`. Live enrollment receives only a short-lived exact-object
+capability and the expected SHA-256 over mTLS, then downloads and verifies those bytes anonymously
+from S3. An offline provisioning tool reads the same object with operator S3 credentials and copies
+it to the machine as `enrollment.json`; Kubernetes Secrets and gateway response bodies are never a
+second bootstrap transport. The object changes only when its actual inputs change (desired
+configuration, pinned root, or public repository location), not during routine TUF timestamp
+renewal.
+
+The same signed deployment accepts HTTPS release origins, `file:` URLs, or absolute local
+repository directories, so an operator can repair a deployment fully offline without permitting a
+plaintext network transport. Raw edits inside an immutable installed release remain untrusted and
+are rejected. See [packaging/etc/config.toml](packaging/etc/config.toml).
 
 Run the launcher — not the agent — under the chosen lifecycle owner:
 
@@ -266,6 +306,8 @@ install_root/
     versions/<version-manifest-id>/
     staging/
     work/<version-manifest-id>/
+    state/<product>/          # the reconciler's --state-dir, preserved across replays and boots
+    outputs/<archive-id>.json # internal snapshot of the last successful output directory
   state/
     installed.json
     transaction.json
@@ -305,26 +347,35 @@ should be removed after the controlled retry. Application keys are
 
 ## Try it
 
-Run the cross-platform end-to-end system:
+Run every CI check supported by the current host through the same entrypoint GitHub Actions uses:
 
 ```sh
-cargo run -p e2e
+./scripts/ci.sh
 ```
 
-Run the Kubernetes operator suites against a disposable Kind cluster (Docker, Kind, kubectl, and
-curl required; each builds its own cluster and tears it down):
+To test the exact current working tree on this Mac and the Linux test machine concurrently, use:
 
 ```sh
-./scripts/kind-updatec-e2e.sh     # operator, enrollment, throttled rollout, rollback
-cargo run -p updatec-e2e          # the full fleet: lifecycle transaction, rollback, HAProxy
+./scripts/ci-mac-linux.sh
 ```
 
-Run the complete workspace suite:
+The coordinator rsyncs source and untracked working-tree changes, but never `.git`, `target`,
+`dist`, or ignored files. It preserves the remote `target` cache, locks the dedicated mirror
+against concurrent runs, prefixes both output streams, and fails if either host fails. Its defaults
+are `root@10.0.0.206` and `/var/tmp/updatedc-ci`; `UPDATEDC_CI_LINUX_HOST` and
+`UPDATEDC_CI_LINUX_DIR` override them.
+
+For a focused rerun, both entrypoints accept the same suite name:
 
 ```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets --no-deps -- -D warnings
+./scripts/ci.sh rust
+./scripts/ci-mac-linux.sh charts
 ```
+
+Available suites are `rust`, `charts`, `semgrep`, `trivy`, `haproxy`, `kind`, and `fleet`.
+The default `all` suite fails during preflight when a supported check is missing a dependency;
+it never silently reduces coverage. The Kind suites require Docker, Kind, kubectl, Helm,
+OpenSSL, and GNU `sha256sum`.
 
 The E2E harness creates a real signed repository and disposable node installations under
 `target/e2e-work/`. It covers deploy and rollback, a tampered trust root, offline launch, rejection
@@ -341,7 +392,7 @@ CI additionally runs:
 - the E2E system on Linux, Intel/ARM macOS, and Windows;
 - the full Kind operator E2E (`updatec` publishing across groups, enrollment, throttled rollout, and
   rollback);
-- the Kind fleet E2E (`cargo run -p updatec-e2e`): a 32-node fleet in eight sets, a Jenkins tier, an
+- the Kind fleet E2E (`./scripts/ci.sh fleet`): a 32-node fleet in eight sets, a Jenkins tier, an
   out-of-cluster slice fronted by the real `updated-healthproxy`, and an `updated`-managed HAProxy
   pair — asserting the ordered red-to-green lifecycle transaction, per-set isolation,
   reconciler-programmed endpoints, a zero-downtime HAProxy upgrade, and a seeded chaos generation
@@ -353,22 +404,29 @@ CI additionally runs:
 
 ## Development publisher
 
-The `server` crate creates a real signed TUF repository for development. Production deployments
-should publish immutable targets and signed metadata to object storage or a CDN and keep role keys
-offline or in controlled CI/KMS infrastructure.
+The `server` crate creates real signed TUF repositories for development. Routing and releases are
+separate trust domains: routing is private behind the mTLS capability gateway, while release bytes
+are fetched directly from an HTTPS object origin. Production keeps the same boundary with private
+S3 routing objects, short-lived signed reads, and direct release downloads.
 
 ```sh
 cargo build --release -p server -p launcher -p agent
 
-target/release/server init --repo ./repo --keys ./keys
+target/release/server init --repo ./release-repo --keys ./release-keys
+target/release/server init --repo ./routing-repo --keys ./routing-keys
+target/release/server gen-certs --dir ./certs --san 127.0.0.1 --san localhost
 
-target/release/server publish-app --repo ./repo --keys ./keys \
+target/release/server publish-app --repo ./release-repo --keys ./release-keys \
   --product app --channel stable --version 1.0.0 \
   --entrypoint bin/app \
   --bundle linux-x86_64=./release-linux-x86_64 \
   --bundle macos-aarch64=./release-macos-aarch64
 
-target/release/server serve --repo ./repo --addr 127.0.0.1:8080
+target/release/server serve-object --repo ./release-repo --addr 127.0.0.1:8081 \
+  --cert ./certs/server.crt --key ./certs/server.key
+target/release/server serve-capability --repo ./routing-repo --addr 127.0.0.1:8080 \
+  --public-url https://127.0.0.1:8080 \
+  --cert ./certs/server.crt --key ./certs/server.key --ca ./certs/ca.crt
 ```
 
 Publish immutable payload and reconciler artifacts first, then a provider set, and finally the
@@ -377,6 +435,7 @@ CDN lag can delay a deployment but cannot mix generations:
 
 ```sh
 target/release/server publish-assignment --repo ./routing-repo --keys ./routing-keys \
+  --release-root ./release-repo/metadata/root.json \
   --name assignments/agents/agent-123.json \
   --deployment deploy-42 \
   --metadata-url https://cdn.example.com/groups/canary/metadata/ \
@@ -397,8 +456,8 @@ development and for control planes built on other orchestrators.
   enrollment artifact.
 - Local state is not hardware-backed monotonic storage; a local administrator is inside the host
   trust boundary and can reseed an installation.
-- The reference deployment runs the agent and the workload under one restricted OS identity.
-  Containing a hostile workload requires a separate account or sandbox.
+- Node service templates run the agent with machine authority so signed reconcilers can manage the
+  whole host. A reconciler should launch an untrusted workload under a separate account or sandbox.
 - Activation requires a cooperative lifecycle the reconciler can drive (a master/worker reload, a
   systemd unit, an external launcher). Windows uses stop/activate/start.
 - The included publisher and HTTP server are development components, not production signing or
@@ -410,21 +469,26 @@ development and for control planes built on other orchestrators.
 ## Documentation
 
 - [JSON Schemas](schemas) — the normative wire contract
-- [Node reconciler protocol](docs/node-reconciler-protocol.md) — the argv and output-manifest
+- [Node reconciler protocol](docs/node-reconciler-protocol.md) — the argv, structured-result, and output-snapshot
   contract a release's own reconciler is written against
 - [Package-runner design](docs/package-runner-design.md) — why the agent owns no workload process
-- [Kubernetes install guide](docs/kubernetes-install.md) — CRDs, namespace, and Secrets
-- [Reference node config](deploy/config.toml)
+- [Kubernetes install guide](docs/kubernetes-install.md) — the Helm chart, CRDs, and Secrets
+- [Agent install guide](docs/agent-install.md) — packages, `install.sh`, Ansible, and the
+  bootstrap-then-self-update boundary
+- [Reference node config](packaging/etc/config.toml) — the file the package installs
 - Design notes for the shipped controls: [observability](docs/observability-design.md),
   [regression response](docs/regression-response-design.md),
   [alerting](docs/alerting-design.md),
   [node controls](docs/node-controls-design.md),
-  [wire compatibility](docs/wire-compatibility-design.md)
-- Node decommission: delete the node's `UpdateAgent` object. The gateway checks enrolled membership
-  on every request, so a deleted or re-homed agent stops being served bundles, secrets, and routing
-  immediately — even while its unexpired leaf certificate still authenticates. There is no
-  tombstone artifact.
+- Node decommission: delete the node's `UpdateAgent` object. There is no tombstone artifact, and
+  revocation has two explicit bounds. Enrollment, renewal, and bundle authorization stop on their
+  next live membership check. Input/output/report capabilities may be minted from a successful
+  authorization memo for up to 30 seconds, and an already minted exact-object capability remains
+  usable for at most another 60 seconds. Repository metadata and release-target reads are still
+  authorized by the mTLS leaf itself and remain readable until that leaf expires; assignment
+  removal is published on the next controller generation. Treat repository bytes reachable by a
+  compromised leaf as disclosed until certificate expiry.
 
 ## License
 
-PolyForm Small Business License 1.0.0. See [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 only (`AGPL-3.0-only`). See [LICENSE](LICENSE).

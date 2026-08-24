@@ -23,9 +23,11 @@ pub mod gc;
 pub mod hash;
 pub mod http;
 pub mod install;
+pub mod journal;
 pub mod lock;
 pub mod provider;
 pub mod rand;
+pub mod reconciler;
 pub mod reject;
 pub mod state;
 #[cfg(test)]

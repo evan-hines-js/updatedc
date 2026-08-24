@@ -2,12 +2,12 @@ use std::io;
 
 use updated::bundle::{read_active, write_active, ReleaseId};
 use updated::config::Paths;
-use updated::install::{self, InstallTransaction};
+use updated::install::InstallTransaction;
 use updated::reject::Rejections;
 use updated::state::{
     read_installed, write_installed, Installed, InstalledState, RepositoryLineage,
 };
-use updated::transaction::{self, Transaction};
+use updated::transaction::Transaction;
 
 pub(crate) trait Store {
     fn installed(&self) -> Installed;
@@ -25,8 +25,12 @@ pub(crate) trait Store {
     /// [`Store::clear_journal`] — call that instead: it is the one place the discard rule is
     /// enforced, and a direct `remove_journal` bypasses the machine's compensation guarantee.
     fn remove_journal(&mut self) -> io::Result<()>;
-    fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()>;
-    fn clear_install_journal(&mut self) -> io::Result<()>;
+    /// Write first-install journal bytes unconditionally. The implementation detail behind
+    /// [`Store::write_install_journal`].
+    fn record_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()>;
+    /// Remove first-install journal bytes unconditionally. The implementation detail behind
+    /// [`Store::clear_install_journal`].
+    fn remove_install_journal(&mut self) -> io::Result<()>;
     fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()>;
     /// Delete a rejection record, unconditionally. The implementation detail behind
     /// [`Store::clear_rejection`] — call that instead: a rejection is never-retry evidence, and
@@ -54,7 +58,7 @@ pub(crate) trait Store {
     /// terminal phase — and reaching `RolledBack` is what runs, or durably abandons, the
     /// compensating `rollback` hook); and [`classify_recovery`]'s `Committed` answers from the
     /// machine — a crash between the durable commit and the journal's own terminal write leaves
-    /// the phase at `CommitStarted` while active and installed state prove the commit landed.
+    /// the phase at `Committing` while active and installed state prove the commit landed.
     /// Every other case is displaced state with an obligation on record, and discarding the
     /// record would silently skip the compensation — so the refusal lives here, on the destroy
     /// operation itself, where no future call site can forget it.
@@ -85,10 +89,10 @@ pub(crate) trait Store {
         }
         self.remove_journal()
     }
-    /// Persist a transaction — but never over a DIFFERENT transaction that still owes the
-    /// machine anything. Replays and phase advances of the same transaction (same id) pass
-    /// freely; burying another unsettled journal is the same evidence destruction as
-    /// [`Store::clear_journal`] refuses, through a different door.
+    /// Persist a transaction without rewriting its identity or its durable history. Until a
+    /// transaction settles, a same-id record must be one exact successor; a different id may
+    /// replace it only while nothing has been displaced. Burying unsettled evidence is the same
+    /// destruction [`Store::clear_journal`] refuses, through a different door.
     fn write_journal(&mut self, tx: &Transaction) -> io::Result<()> {
         if let Some(existing) = self.journal()? {
             if existing.id != tx.id && !existing.may_discard() {
@@ -102,8 +106,68 @@ pub(crate) trait Store {
                     ),
                 ));
             }
+            if existing.id == tx.id && !existing.permits_replacement(tx) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing an invalid rewrite of transaction {} from {:?} to {:?}",
+                        existing.id, existing.phase, tx.phase
+                    ),
+                ));
+            }
         }
         self.record_journal(tx)
+    }
+    /// Persist first-install intent without ever burying a different interrupted install. An
+    /// install has no abort path: every non-committed record is resumed, and a committed record is
+    /// cleared before a later install can begin. Replays and phase advances of the same attempt are
+    /// the only legitimate replacement.
+    fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
+        if let Some(existing) = self.install_journal()? {
+            if existing.id != tx.id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to bury first-install transaction {} at {:?} under transaction {}",
+                        existing.id, existing.phase, tx.id
+                    ),
+                ));
+            }
+            if !existing.permits_replacement(tx) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing an invalid rewrite of first-install transaction {} from {:?} to {:?}",
+                        existing.id, existing.phase, tx.phase
+                    ),
+                ));
+            }
+        }
+        self.record_install_journal(tx)
+    }
+    /// Destroy first-install intent only after the authoritative installed record proves the exact
+    /// release committed. Phase alone is insufficient: preserving the journal when installed
+    /// state is missing or corrupt is what keeps an interrupted enrollment recoverable.
+    fn clear_install_journal(&mut self) -> io::Result<()> {
+        if let Some(tx) = self.install_journal()? {
+            let installed = match self.installed() {
+                Installed::Present(state) => Some(state.release.clone()),
+                Installed::Missing | Installed::Invalid => None,
+            };
+            if !matches!(
+                updated::install::classify_install_recovery(&tx, installed.as_ref()),
+                updated::install::InstallRecovery::Committed
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to discard first-install transaction {} at {:?}: its release is not committed",
+                        tx.id, tx.phase
+                    ),
+                ));
+            }
+        }
+        self.remove_install_journal()
     }
     /// Erase a rejection — but only with proof of settlement: the exact rejected bytes are the
     /// currently committed head, so the machine itself has demonstrated they work. A rejection is
@@ -146,10 +210,10 @@ impl Store for FileStore {
         read_installed(&self.paths.installed)
     }
     fn journal(&self) -> io::Result<Option<Transaction>> {
-        transaction::read(&self.paths.journal)
+        updated::journal::read(&self.paths.journal)
     }
     fn install_journal(&self) -> io::Result<Option<InstallTransaction>> {
-        install::read(&self.paths.install_journal)
+        updated::journal::read(&self.paths.install_journal)
     }
     fn active_release(&self) -> io::Result<Option<ReleaseId>> {
         read_active(&self.paths.active_release)
@@ -161,16 +225,16 @@ impl Store for FileStore {
         write_installed(&self.paths.installed, state)
     }
     fn record_journal(&mut self, tx: &Transaction) -> io::Result<()> {
-        transaction::write(&self.paths.journal, tx)
+        updated::journal::write(&self.paths.journal, tx)
     }
     fn remove_journal(&mut self) -> io::Result<()> {
-        transaction::clear(&self.paths.journal)
+        updated::journal::clear(&self.paths.journal)
     }
-    fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
-        install::write(&self.paths.install_journal, tx)
+    fn record_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
+        updated::journal::write(&self.paths.install_journal, tx)
     }
-    fn clear_install_journal(&mut self) -> io::Result<()> {
-        install::clear(&self.paths.install_journal)
+    fn remove_install_journal(&mut self) -> io::Result<()> {
+        updated::journal::clear(&self.paths.install_journal)
     }
     fn reject(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
         self.rejected.reject(&lineage.rejection_key(digest))
@@ -234,11 +298,11 @@ impl Store for MemStore {
         self.journal = None;
         Ok(())
     }
-    fn write_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
+    fn record_install_journal(&mut self, tx: &InstallTransaction) -> io::Result<()> {
         self.install_journal = Some(tx.clone());
         Ok(())
     }
-    fn clear_install_journal(&mut self) -> io::Result<()> {
+    fn remove_install_journal(&mut self) -> io::Result<()> {
         self.install_journal = None;
         Ok(())
     }
@@ -259,5 +323,116 @@ impl Store for MemStore {
     fn point_active(&mut self, release: &ReleaseId) -> io::Result<()> {
         self.active = Some(release.clone());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use updated::install::InstallPhase;
+    use updated::state::ProviderRelease;
+
+    fn install_transaction(id_byte: char, phase: InstallPhase) -> InstallTransaction {
+        let release = ReleaseId {
+            version: "1.0.0".into(),
+            manifest_sha256: "a".repeat(64),
+        };
+        InstallTransaction {
+            id: id_byte.to_string().repeat(64),
+            release: release.clone(),
+            archive_sha256: "b".repeat(64),
+            repository_lineage: RepositoryLineage::from_metadata_url(
+                "https://repo.example/metadata/",
+            ),
+            lifecycle: Box::new(ProviderRelease {
+                provider_set_sha256: "c".repeat(64),
+                product: "reconciler".into(),
+                release,
+                archive_sha256: "d".repeat(64),
+                args: Vec::new(),
+                timeout_millis: 1_000,
+            }),
+            phase,
+        }
+    }
+
+    fn update_transaction() -> Transaction {
+        let candidate = install_transaction('3', InstallPhase::Started);
+        Transaction {
+            id: "4".repeat(64),
+            previous_release: ReleaseId {
+                version: "0.9.0".into(),
+                manifest_sha256: "e".repeat(64),
+            },
+            previous_archive_sha256: "f".repeat(64),
+            previous_repository_lineage: candidate.repository_lineage.clone(),
+            candidate_release: candidate.release,
+            candidate_archive_sha256: candidate.archive_sha256,
+            candidate_rejection_sha256: "a".repeat(64),
+            candidate_repository_lineage: candidate.repository_lineage,
+            candidate_rejection_required: false,
+            lifecycle: candidate.lifecycle,
+            rollback_health_failures: 0,
+            phase: updated::transaction::Phase::Prepared,
+        }
+    }
+
+    #[test]
+    fn first_install_intent_can_only_advance_or_clear_after_its_release_commits() {
+        let mut store = MemStore::default();
+        let started = install_transaction('1', InstallPhase::Started);
+        store.write_install_journal(&started).unwrap();
+
+        let mut prepared = started.clone();
+        prepared.advance(InstallPhase::Prepared).unwrap();
+        store
+            .write_install_journal(&prepared)
+            .expect("the same install attempt may advance");
+        assert!(
+            store.write_install_journal(&started).is_err(),
+            "the same id cannot move durable install history backward"
+        );
+        let mut mutated = prepared.clone();
+        mutated.archive_sha256 = "e".repeat(64);
+        assert!(
+            store.write_install_journal(&mutated).is_err(),
+            "the same id cannot replace the release identity"
+        );
+        assert!(
+            store
+                .write_install_journal(&install_transaction('2', InstallPhase::Started))
+                .is_err(),
+            "a second attempt cannot bury interrupted first-install recovery"
+        );
+        assert!(
+            store.clear_install_journal().is_err(),
+            "intent survives until installed state proves the commit"
+        );
+
+        store.installed = Some(InstalledState::confirmed(
+            prepared.repository_lineage.clone(),
+            prepared.release.clone(),
+            prepared.archive_sha256.clone(),
+            prepared.lifecycle.clone(),
+        ));
+        store
+            .clear_install_journal()
+            .expect("the exact committed release discharges first-install intent");
+        assert!(store.install_journal.is_none());
+    }
+
+    #[test]
+    fn update_intent_cannot_be_rewritten_while_it_is_still_discardable() {
+        let mut store = MemStore::default();
+        let started = update_transaction();
+        store.write_journal(&started).unwrap();
+
+        let mut mutated = started.clone();
+        mutated.candidate_archive_sha256 = "e".repeat(64);
+        assert!(
+            store.write_journal(&mutated).is_err(),
+            "a pre-activation journal is discardable, but its identity is not mutable under the same id"
+        );
+        assert_eq!(store.journal().unwrap(), Some(started));
     }
 }

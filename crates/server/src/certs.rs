@@ -5,7 +5,7 @@
 //! Written as five PEM files into `dir`:
 //!   ca.crt        — the fleet CA (agents trust it for the gateway; the gateway trusts it for clients)
 //!   server.crt/.key — the gateway's server identity
-//!   client.crt/.key — the agent's client identity
+//!   client.crt/.key — the fixture node's preprovisioned identity
 //!
 //! This is the local/e2e issuer. In the kind e2e cert-manager issues the same three roles.
 
@@ -52,12 +52,13 @@ pub async fn generate(dir: &Path, server_sans: &[String]) -> R {
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
 
-    // The agent's client identity — fleet membership, verified by the gateway against the CA.
+    // The fixture node's identity — verified by the gateway against the CA and named exactly as
+    // the one agent every standalone integration scenario provisions.
     let client_key = KeyPair::generate()?;
     let mut client_params = CertificateParams::new(Vec::<String>::new())?;
     client_params
         .distinguished_name
-        .push(DnType::CommonName, "updated-agent");
+        .push(DnType::CommonName, "agent");
     client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key)?;

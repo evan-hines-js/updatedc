@@ -21,13 +21,14 @@ pub struct ProxyMetrics {
     pub reports_stale_total: u64,
     /// When the last reconcile finished, seconds since the Unix epoch. Zero until the first.
     pub reconcile_timestamp_seconds: u64,
-    /// When a USABLE endpoint projection from the control plane was last observed, seconds since
-    /// the Unix epoch — a document that arrived but does not decode is not an observation, or this
-    /// series would read "current" while every cordon was being released. Zero until the first. The projection fails open — once it falls further behind than
-    /// `LastKnownGood::STALENESS`, every cordon has been released and health alone governs — so
-    /// this is what makes a silently lost cordon alertable, the mirror of what
-    /// `reports_stale_total` does for a silently aged-out report.
-    pub endpoints_timestamp_seconds: u64,
+    /// When a USABLE fleet report generation was last observed — the index AND at least one of the
+    /// shards it names, because readiness is read from the shards and a readable index over
+    /// unreadable shards drains the fleet exactly as a missing index does. Seconds since the Unix
+    /// epoch, zero until the first. While these documents are unreadable every node
+    /// resolves through its cached report, and once those age out the whole inventory drains.
+    /// `reports_stale_total` counts those drains one node at a time and reads identically to a
+    /// fleet that genuinely stopped heartbeating — this is what tells the two apart.
+    pub reports_timestamp_seconds: u64,
 }
 
 pub type Shared = Arc<Mutex<ProxyMetrics>>;
@@ -67,12 +68,12 @@ pub fn render(metrics: &ProxyMetrics) -> String {
         "healthproxy_reconcile_timestamp_seconds {}",
         metrics.reconcile_timestamp_seconds
     );
-    let _ = writeln!(out, "# HELP healthproxy_endpoints_timestamp_seconds When the control plane's endpoint projection was last observed (unix seconds).");
-    let _ = writeln!(out, "# TYPE healthproxy_endpoints_timestamp_seconds gauge");
+    let _ = writeln!(out, "# HELP healthproxy_reports_timestamp_seconds When a usable fleet report generation (index and shards) was last observed (unix seconds).");
+    let _ = writeln!(out, "# TYPE healthproxy_reports_timestamp_seconds gauge");
     let _ = writeln!(
         out,
-        "healthproxy_endpoints_timestamp_seconds {}",
-        metrics.endpoints_timestamp_seconds
+        "healthproxy_reports_timestamp_seconds {}",
+        metrics.reports_timestamp_seconds
     );
     out
 }
@@ -81,14 +82,30 @@ pub fn render(metrics: &ProxyMetrics) -> String {
 /// headers. Anything longer is not a scrape.
 const REQUEST_BYTES_LIMIT: usize = 4096;
 
+/// Max scrapes served at once. This listener is unauthenticated plaintext, and its file descriptors
+/// are the same process-wide pool the reconcile loop's own fetches draw from — so an unbounded
+/// accept loop lets anything in the cluster hold connections until the reads that decide membership
+/// start failing and the fleet drains. The gateway bounds its plaintext health listener for exactly
+/// this reason (`gateway::HEALTH_CONNECTIONS`); a scrape target needs no more than a handful of
+/// simultaneous scrapers, and each connection is already bounded by the read deadline below, so
+/// past this the excess simply waits.
+const SCRAPE_CONNECTIONS: usize = 64;
+
 /// Serve `GET /metrics` forever on `address`. Any other request — and any request that does not
 /// finish arriving within a short deadline — is answered 404 (or dropped) and the connection
-/// closed; the listener holds no state and serves nothing else.
+/// closed; the listener holds no state and serves nothing else. At most
+/// [`SCRAPE_CONNECTIONS`] connections are in flight at a time.
 pub async fn serve(address: std::net::SocketAddr, metrics: Shared) -> Result<(), std::io::Error> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind(address).await?;
+    let budget = Arc::new(tokio::sync::Semaphore::new(SCRAPE_CONNECTIONS));
     eprintln!("healthproxy: metrics listener serving /metrics on {address}");
     loop {
+        // Held for the connection's whole life, so the cap counts sockets this process still owns
+        // rather than accepts it has made.
+        let Ok(permit) = budget.clone().acquire_owned().await else {
+            return Ok(());
+        };
         let (mut socket, _) = match listener.accept().await {
             Ok(accepted) => accepted,
             // A persistent accept error (fd exhaustion, a torn-down interface) must cost a paced
@@ -101,6 +118,7 @@ pub async fn serve(address: std::net::SocketAddr, metrics: Shared) -> Result<(),
         };
         let metrics = metrics.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let mut buffer = vec![0u8; REQUEST_BYTES_LIMIT];
                 let mut read = 0usize;
@@ -154,7 +172,7 @@ mod tests {
             backends_drained: 2,
             reports_stale_total: 7,
             reconcile_timestamp_seconds: 1_770_000_000,
-            endpoints_timestamp_seconds: 1_769_999_940,
+            reports_timestamp_seconds: 1_769_999_950,
         });
         for expected in [
             "healthproxy_backends{state=\"up\"} 4",
@@ -162,8 +180,8 @@ mod tests {
             "# TYPE healthproxy_reports_stale_total counter",
             "healthproxy_reports_stale_total 7",
             "healthproxy_reconcile_timestamp_seconds 1770000000",
-            "# TYPE healthproxy_endpoints_timestamp_seconds gauge",
-            "healthproxy_endpoints_timestamp_seconds 1769999940",
+            "# TYPE healthproxy_reports_timestamp_seconds gauge",
+            "healthproxy_reports_timestamp_seconds 1769999950",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
         }

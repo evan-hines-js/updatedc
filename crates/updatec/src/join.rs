@@ -10,6 +10,8 @@
 
 use std::io;
 
+use updated_contracts::key::P256PublicKey;
+
 use chrono::Datelike;
 use rcgen::{
     CertificateParams, CertificateSigningRequestParams, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -74,24 +76,23 @@ impl NodeSpiffeId {
 /// moment the key is read, not merely later at signing time: a caller that pins first and signs
 /// afterwards would otherwise durably pin an attacker-chosen key onto a node name from a CSR whose
 /// self-signature is garbage — the enrollment fails, but the pin (and the object) survives.
-/// The key SHAPE is enforced here, at the one place a pin is produced, not left to the verifier.
+/// The key is admitted here, at the one place a pin is produced, through the one gate that admits
+/// one — it is returned as a [`P256PublicKey`], so nothing downstream holds an unchecked pin.
 /// CSR parsing accepts Ed25519, P-384 and RSA keys just as happily as P-256, and every one of them
-/// would be pinned and certified — after which `report_is_authentic_and_fresh` rejects every report
-/// the node ever sends on its `is_uncompressed_p256_point` gate. The node then looks permanently
-/// `Silent`: it holds a `maxUnavailable` slot in its group and a concurrency slot in its set, for a
-/// reason nothing surfaces. Refusing the CSR turns that into a 400 at the moment of the mistake.
-pub fn csr_public_key(csr_pem: &str) -> io::Result<Vec<u8>> {
+/// would otherwise be pinned and certified — after which `report_is_authentic_and_fresh` could
+/// never verify a report the node sends. The node would then look permanently `Silent`: holding a
+/// `maxUnavailable` slot in its group and a concurrency slot in its set, for a reason nothing
+/// surfaces. Refusing the CSR turns that into a 400 at the moment of the mistake.
+pub fn csr_public_key(csr_pem: &str) -> io::Result<P256PublicKey> {
     use rcgen::PublicKeyData;
     let csr = CertificateSigningRequestParams::from_pem(csr_pem)
         .map_err(|error| io::Error::other(format!("parsing CSR: {error}")))?;
-    let key = csr.public_key.der_bytes().to_vec();
-    if !updated_contracts::telemetry::is_uncompressed_p256_point(&key) {
-        return Err(io::Error::other(
-            "CSR public key is not an uncompressed P-256 point; nodes must enroll with an \
-             ECDSA P-256 key so their signed telemetry can be verified",
-        ));
-    }
-    Ok(key)
+    P256PublicKey::from_point(csr.public_key.der_bytes()).map_err(|error| {
+        io::Error::other(format!(
+            "CSR public key {error}; nodes must enroll with an ECDSA P-256 key so their signed \
+             telemetry can be verified"
+        ))
+    })
 }
 
 /// The fleet CA that signs per-node client certificates at `/enroll`. Loaded from the same
@@ -158,6 +159,9 @@ impl IssuingCa {
 }
 
 #[cfg(test)]
+// These tests assert the end-to-end claim that a key pinned at enrollment is the key that later
+// verifies that node's telemetry, which cannot be shown through the controller's report cache.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -167,6 +171,61 @@ mod tests {
     use rcgen::PublicKeyData;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, UnixTime};
+
+    /// A CSR whose self-signature does not verify is refused, so no key is ever pinned without
+    /// proof the requester holds it.
+    ///
+    /// Proof-of-possession is the reason `/enroll` can bind a node name to a key at all, and this
+    /// crate gets it from `rcgen`'s parser rather than from code of its own — three doc comments
+    /// say so, and nothing checked it. A dependency bump that stopped verifying, or a swap to a
+    /// hand-rolled DER read, would have taken the property away silently and left the prose behind:
+    /// an attacker who could reach `/enroll` would pin a public key they do not hold onto a node
+    /// name, and that pin is what every later report is judged against.
+    #[test]
+    fn a_csr_whose_self_signature_is_broken_pins_nothing() {
+        use base64::Engine as _;
+
+        let key_pem = updated::csr::generate_key().unwrap();
+        let csr_pem = updated::csr::csr_for(&key_pem, "updated enroll").unwrap();
+        csr_public_key(&csr_pem).expect("the genuine CSR is admitted");
+
+        // Flip a bit in the trailing signature. The last DER byte is inside the signature BIT
+        // STRING, so every length in the structure stays valid and the CSR still parses — only the
+        // signature stops verifying, which is exactly the case prose alone was covering.
+        let body: String = csr_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let mut der = base64::engine::general_purpose::STANDARD
+            .decode(body.trim())
+            .expect("a PEM CSR is base64");
+        *der.last_mut().expect("a non-empty CSR") ^= 0x01;
+        let reencoded = base64::engine::general_purpose::STANDARD.encode(&der);
+        let forged = format!(
+            "-----BEGIN CERTIFICATE REQUEST-----\n{}\n-----END CERTIFICATE REQUEST-----\n",
+            reencoded
+                .as_bytes()
+                .chunks(64)
+                .map(|chunk| std::str::from_utf8(chunk).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        let error = csr_public_key(&forged)
+            .expect_err("a CSR that proves nothing pins nothing")
+            .to_string();
+        // Specifically the signature check, not merely "the parse failed". `rcgen` maps a failed
+        // `verify_signature` to its ring error, so this distinguishes the property under test from
+        // a structurally broken CSR — which a byte flip in a length field would also produce, and
+        // which would let this test keep passing for entirely the wrong reason. If a future `rcgen`
+        // rewords this, confirm the new text still names a signature failure rather than relaxing
+        // the assertion.
+        assert!(
+            error.contains("parsing CSR") && error.contains("ring error"),
+            "the refusal must come from verifying the self-signature, not from malformed DER: \
+             {error}"
+        );
+    }
 
     #[test]
     fn pinned_csr_public_key_verifies_the_node_s_signed_telemetry() {
@@ -178,10 +237,10 @@ mod tests {
         let pinned = csr_public_key(&csr_pem).unwrap();
 
         let pkcs8_der = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
-        let report = updated_contracts::telemetry::NodeReport::new(
-            "agent-9", "deploy-2", DIGEST, "2.0.0", DIGEST, true,
+        let mut report = updated_contracts::telemetry::NodeReport::new(
+            "agent-9", "deploy-2", DIGEST, "2.0.0", DIGEST, DIGEST, true,
         );
-        let envelope = updated_contracts::telemetry::sign_report(&report, &pkcs8_der).unwrap();
+        let envelope = crate::test_support::sign_report(&mut report, &pkcs8_der);
         let now_ms = updated_contracts::telemetry::now_ms();
 
         // The whole point of pinning the CSR's key at enrollment: it is the key that later verifies
@@ -385,7 +444,7 @@ mod tests {
         // The one accepted shape still is.
         let key_pem = updated::csr::generate_key().unwrap();
         let csr = updated::csr::csr_for(&key_pem, "updated enroll").unwrap();
-        assert_eq!(csr_public_key(&csr).unwrap().len(), 65);
+        assert_eq!(csr_public_key(&csr).unwrap().as_bytes().len(), 65);
     }
 
     /// A tiny deterministic xorshift PRNG. Seeded from a constant so a fuzz failure reproduces

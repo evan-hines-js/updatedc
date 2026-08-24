@@ -1,0 +1,34 @@
+{{/*
+A PDB over a single replica is a trap: `minAvailable: 1` on one pod makes every node drain block
+forever, which turns routine cluster maintenance into an outage of its own. So each of these is
+rendered only when its workload actually has replicas to spare.
+*/}}
+{{- if and .Values.controller.podDisruptionBudget.enabled (gt (int .Values.controller.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "updatec.controllerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  minAvailable: {{ .Values.controller.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: {{ include "updatec.controllerName" . }}
+{{- end }}
+{{- if and .Values.gateway.podDisruptionBudget.enabled (gt (int .Values.gateway.replicaCount) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "updatec.gatewayName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  minAvailable: {{ .Values.gateway.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app: {{ include "updatec.gatewayName" . }}
+{{- end }}

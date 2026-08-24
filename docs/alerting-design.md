@@ -41,6 +41,8 @@ operator who wants nothing but `kubectl wait` gets full fidelity without configu
 One sink. `updatec` takes `UPDATED_ALERT_URL` (plus a bearer token read from the mounted secret file `UPDATED_ALERT_TOKEN_FILE` names);
 unset means conditions-only. On a condition transition (False→True or True→False) it POSTs one
 JSON document: resource, condition, state, reason, evidence, generation, timestamp.
+An authenticated sink must use HTTPS so the bearer token is never sent in cleartext; unauthenticated
+in-cluster sinks may use HTTP.
 
 Delivery rules, in line with every other external operation in the core:
 

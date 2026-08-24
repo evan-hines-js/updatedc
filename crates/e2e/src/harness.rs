@@ -225,7 +225,7 @@ impl Ctx {
     /// which are compiled out of every ordinary build.
     pub fn build(&self) -> R {
         // `E2E_FIPS=1` runs the suite on FIPS-validated crypto: the binaries that do crypto (the
-        // mock CDN and agent — mTLS, the TUF transport, hashing,
+        // repository fixtures and agent — mTLS, the TUF transport, hashing,
         // signing) are built `--features fips`, which links the validated aws-lc-rs. The launcher
         // and sample apps do no crypto, so they build unchanged. A FIPS build that cannot validate
         // its provider fails closed at startup.
@@ -354,17 +354,20 @@ impl Ctx {
         Ok(list)
     }
 
-    /// Initialize a TUF repository and its role keys under `dir` (`dir/repo`,
-    /// `dir/keys`).
+    /// Initialize independent routing and release TUF repositories. Routing is private and read
+    /// through exact capabilities; release objects are fetched directly without a node identity.
     pub fn init_repo(&self, dir: &Path) -> R {
-        run(Command::new(&self.server)
-            .arg("init")
-            .arg("--repo")
-            .arg(dir.join("repo"))
-            .arg("--keys")
-            .arg(dir.join("keys")))?;
-        // Mint the fleet mTLS material alongside the TUF keys, so the mock CDN can require client
-        // certs and each agent can present one. Loopback SANs cover `https://127.0.0.1:port`.
+        for name in ["routing", "release"] {
+            run(Command::new(&self.server)
+                .arg("init")
+                .arg("--repo")
+                .arg(dir.join(format!("{name}-repo")))
+                .arg("--keys")
+                .arg(dir.join(format!("{name}-keys"))))?;
+        }
+        // Mint the fleet TLS material alongside the TUF keys. The private capability fixture
+        // validates agent certificates; the public object fixture only presents its server
+        // certificate. Loopback SANs cover `https://127.0.0.1:port`.
         run(Command::new(&self.server)
             .arg("gen-certs")
             .arg("--dir")
@@ -407,9 +410,9 @@ impl Ctx {
                 "publish-agent"
             })
             .arg("--repo")
-            .arg(dir.join("repo"))
+            .arg(dir.join("release-repo"))
             .arg("--keys")
-            .arg(dir.join("keys"))
+            .arg(dir.join("release-keys"))
             .args(["--product", product, "--version", version])
             .arg(if application { "--bundle" } else { "--target" })
             .arg(format!("{}={}", self.platkey, source.display()));
@@ -434,18 +437,48 @@ impl Ctx {
         Ok(())
     }
 
-    /// Serve the TUF repository at `dir/repo`; the returned handle keeps it alive.
+    /// Serve the private routing repository through a capability gateway and the release
+    /// repository through a distinct anonymous object origin. The returned handle owns both
+    /// processes, preserving the existing one-lifetime-per-fixture contract.
     pub fn serve(&self, dir: &Path, addr: &str) -> R<Proc> {
         std::fs::write(dir.join("assignment-addr"), addr).map_err(str_err)?;
         let certs = dir.join("certs");
-        let mut server = Proc::spawn(
-            "server",
+        let mut object = Proc::spawn(
+            "object-server",
             Command::new(&self.server)
-                .arg("serve")
+                .arg("serve-object")
                 .arg("--repo")
-                .arg(dir.join("repo"))
+                .arg(dir.join("release-repo"))
+                .args(["--addr", "127.0.0.1:0"])
+                .arg("--cert")
+                .arg(certs.join("server.crt"))
+                .arg("--key")
+                .arg(certs.join("server.key")),
+        )?;
+        if !object.wait_for_log("serving object repository ", EVENT_TIMEOUT) {
+            let exited = object.has_exited();
+            let output = object.captured_log();
+            return fail(format!(
+                "object repository did not become ready (exited={exited}):\n{output}"
+            ));
+        }
+        let object_log = object.captured_log();
+        let object_url = object_log
+            .lines()
+            .find_map(|line| line.rsplit_once(" on ").map(|(_, url)| url.trim()))
+            .filter(|url| url.starts_with("https://"))
+            .ok_or("object repository did not report its bound HTTPS origin")?;
+        let release_base_url = format!("{}/", object_url.trim_end_matches('/'));
+        std::fs::write(dir.join("release-base-url"), &release_base_url).map_err(str_err)?;
+
+        let mut gateway = Proc::spawn(
+            "capability-gateway",
+            Command::new(&self.server)
+                .arg("serve-capability")
+                .arg("--repo")
+                .arg(dir.join("routing-repo"))
                 .args(["--addr", addr])
-                // Terminate mTLS: present the fleet server cert, require a client cert.
+                .args(["--public-url", &format!("https://{addr}")])
                 .arg("--cert")
                 .arg(certs.join("server.crt"))
                 .arg("--key")
@@ -453,34 +486,36 @@ impl Ctx {
                 .arg("--ca")
                 .arg(certs.join("ca.crt")),
         )?;
-        if !server.wait_for_log("serving ", EVENT_TIMEOUT) {
-            let exited = server.has_exited();
-            let output = server.captured_log();
+        if !gateway.wait_for_log("serving capability repository ", EVENT_TIMEOUT) {
+            let exited = gateway.has_exited();
+            let output = gateway.captured_log();
             return fail(format!(
-                "repository server did not become ready at {addr} (exited={exited}):\n{output}"
+                "capability gateway did not become ready at {addr} (exited={exited}):\n{output}"
             ));
         }
-        Ok(server)
+        gateway.companions.push(object);
+        Ok(gateway)
     }
 
-    fn publish_current_assignment(&self, dir: &Path, addr: &str, deployment: &str) -> R {
+    fn publish_current_assignment(&self, dir: &Path, _addr: &str, deployment: &str) -> R {
         // Only publish once the runtime fixture exists; the assignment builder itself is shared with
         // the `Sup` republish path in `fixtures`, so the format lives in one place.
         if !dir.join("assignment-runtime.json").exists() {
             return Ok(());
         }
+        let release = self.release_base_url(dir)?;
         crate::fixtures::publish_assignment(
             &self.server,
             dir,
-            &self.meta_url(addr),
-            &self.targets_url(addr),
+            &format!("{release}metadata/"),
+            &format!("{release}targets/"),
             deployment,
         )
     }
 
     /// The installer-pinned root a client trusts for the repo under `dir`.
     pub fn root(&self, dir: &Path) -> PathBuf {
-        dir.join("repo/metadata/root.json")
+        dir.join("release-repo/metadata/root.json")
     }
 
     pub fn target_sha256(&self, dir: &Path, name: &str) -> R<String> {
@@ -488,17 +523,14 @@ impl Ctx {
         // only supplies the server binary the `Ctx` already holds.
         crate::fixtures::target_sha256(&self.server, dir, name)
     }
-    pub fn meta_url(&self, srv: &str) -> String {
-        format!("https://{srv}/metadata/")
-    }
-    pub fn targets_url(&self, srv: &str) -> String {
-        format!("https://{srv}/targets/")
+    fn release_base_url(&self, dir: &Path) -> R<String> {
+        std::fs::read_to_string(dir.join("release-base-url")).map_err(str_err)
     }
     /// A key file path under `dir/keys` (e.g. `root.pk8`). Only the Unix-only
     /// key-permissions scenario needs it.
     #[cfg(unix)]
     pub fn key(&self, dir: &Path, role: &str) -> PathBuf {
-        dir.join(format!("keys/{role}.pk8"))
+        dir.join(format!("release-keys/{role}.pk8"))
     }
 }
 
@@ -553,6 +585,48 @@ pub fn stays_true(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// How long a node may take to reach and commit its target state — a cold install, a descent past
+/// heads it cannot run, a reconverge after a kill.
+///
+/// One constant, because it is one fact. It began as three function-local copies that had already
+/// disagreed (120 in one scenario, 90 in two others), plus eight bare `120` literals in killfuzz
+/// and one more in the application scenarios, with nothing saying why converging should be faster
+/// in one place than another. A too-short bound here does not catch a bug, it invents a flake, so
+/// the copies were not trading anything for the disagreement.
+pub const CONVERGE_TIMEOUT: u64 = 120;
+
+/// How long the node stack may take to disappear after it is killed — the service port released,
+/// the version endpoint silent. Distinct from [`CONVERGE_TIMEOUT`] and much shorter: this bounds a
+/// teardown that has already been commanded, not a convergence that has to do work.
+pub const STOP_TIMEOUT: u64 = 20;
+
+/// The canonical durable layout of the node rooted at `dir`.
+///
+/// [`updated::config::Paths::resolve`] is the single definition of that layout, and a scenario
+/// asserting on `dir.join("install/state/installed.json")` is a second copy of it — one that keeps
+/// passing after the real layout moves, because the file it looks for is simply never there and
+/// "not settled" reads the same as "settled somewhere else". Every scenario derives its paths here
+/// instead.
+pub fn node_paths(dir: &std::path::Path) -> updated::config::Paths {
+    updated::config::Paths::resolve(&dir.join("install"), &crate::fixtures::state_dir(dir))
+}
+
+/// Poll until the committed install record under `install_root` names `version`.
+///
+/// Serving a version and having *committed* it are different facts: a node can answer `/version`
+/// from a running process whose install record never settled, and a restart then climbs back onto
+/// the head it was supposed to have left. Every descent scenario asserts both, so the second half
+/// is written once here rather than open-coded beside each first half.
+pub fn wait_for_installed_version(dir: &std::path::Path, version: &str, secs: u64) -> bool {
+    let state_path = node_paths(dir).installed;
+    wait_until(secs, || {
+        matches!(
+            updated::state::read_installed(&state_path),
+            updated::state::Installed::Present(ref state) if state.release.version == version
+        )
+    })
+}
+
 pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -572,6 +646,7 @@ pub struct Proc {
     grouped: Grouped,
     log: LogBuf,
     readers: Vec<LogReader>,
+    companions: Vec<Proc>,
 }
 
 /// One log-query API for directly spawned processes and init-model services.
@@ -620,6 +695,7 @@ impl Proc {
             grouped,
             log,
             readers,
+            companions: Vec::new(),
         })
     }
 

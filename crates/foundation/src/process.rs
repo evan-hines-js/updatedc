@@ -361,12 +361,6 @@ mod unix {
     }
 }
 
-/// Shared kill-on-close job-object setup: the launcher's suspended-spawn adapter
-/// (`launcher::sys::windows`) assigns to the job differently than this crate's
-/// `Command`-based containment but needs the identical creation, so it lives here once.
-#[cfg(windows)]
-pub use windows::create_kill_on_close_job;
-
 #[cfg(windows)]
 mod windows {
     use std::io;
@@ -631,7 +625,13 @@ mod windows_tests {
     /// reconciler cannot start a workload on Windows at all.
     #[test]
     fn the_contained_tree_is_killable_as_a_unit_and_escapable_on_request() {
-        let job = super::create_kill_on_close_job().unwrap();
+        // Through its own module: the function is private to `windows`, and a child of `process`
+        // may reach it there. It carried a `pub use` re-export for years so this line could say
+        // `super::`, which made an internal helper part of `foundation`'s public API for the sake
+        // of one test. The re-export's doc claimed the launcher's Windows adapter needed it; that
+        // adapter has no job-object code at all — it contains its agent through `ContainedChild`,
+        // which assigns the job itself.
+        let job = super::windows::create_kill_on_close_job().unwrap();
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
         let mut returned = 0u32;
         let ok = unsafe {

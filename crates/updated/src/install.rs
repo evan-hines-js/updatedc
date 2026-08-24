@@ -3,8 +3,10 @@
 //! Cold install is a first-class operation with a *different meaning* than an update: there
 //! is no predecessor to roll back to. It is `prepare -> place -> commit`,
 //! and a failure fails closed (nothing to restore — the node simply retries the install on
-//! the next boot). This module owns that journal in the same shape and spirit as the update
-//! [`crate::transaction`], but without any predecessor or rollback machinery.
+//! the next boot). This module owns that record and its phases — the same shape and spirit as the
+//! update [`crate::transaction`], but without any predecessor or rollback machinery. Persisting it
+//! is [`crate::journal`]: the record differs, "write the intent before acting and read it back
+//! after a crash" does not.
 //!
 //! The journal is written before any durable install step, so a crash mid-install always
 //! leaves evidence the next boot can complete idempotently — closing the window where an
@@ -12,7 +14,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::Path;
 
 use crate::bundle::ReleaseId;
 use crate::state::{ProviderRelease, RepositoryLineage};
@@ -53,19 +54,26 @@ pub enum InstallPhase {
 
 impl InstallTransaction {
     pub fn validate(&self) -> io::Result<()> {
-        if self.id.is_empty() {
+        if !crate::rand::is_token(&self.id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "install transaction id must not be empty",
+                "install transaction id is invalid",
             ));
         }
-        if !updated_contracts::is_sha256_hex(self.repository_lineage.as_str()) {
+        self.release.validate()?;
+        if !updated_contracts::is_canonical_sha256(&self.archive_sha256) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "install transaction archive identity is invalid",
+            ));
+        }
+        if !updated_contracts::is_canonical_sha256(self.repository_lineage.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "install transaction repository lineage is invalid",
             ));
         }
-        if self.lifecycle.product.is_empty() || self.lifecycle.timeout_millis == 0 {
+        if !self.lifecycle.is_valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "install transaction provider identity is invalid",
@@ -90,6 +98,20 @@ impl InstallTransaction {
         self.phase = next;
         Ok(())
     }
+
+    /// Whether `next` is a legitimate durable rewrite of this same install attempt.
+    ///
+    /// A journal may be replayed byte-for-byte or advance exactly one state-machine edge. Using
+    /// whole-record equality after [`InstallTransaction::advance`] makes every other field
+    /// immutable by default: adding a field to the transaction cannot accidentally make it
+    /// mutable unless this rule is deliberately changed too.
+    pub fn permits_replacement(&self, next: &Self) -> bool {
+        if self == next {
+            return true;
+        }
+        let mut advanced = self.clone();
+        advanced.advance(next.phase).is_ok() && advanced == *next
+    }
 }
 
 /// The recovery action implied by an install journal and the committed installed record.
@@ -112,49 +134,21 @@ pub fn classify_install_recovery(
     }
 }
 
-pub fn read(path: &Path) -> io::Result<Option<InstallTransaction>> {
-    match std::fs::read(path) {
-        Ok(raw) => {
-            let transaction: InstallTransaction = serde_json::from_slice(&raw)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            transaction.validate()?;
-            Ok(Some(transaction))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+/// Persisted through [`crate::journal`], which owns the read/write/clear the update transaction
+/// needs in exactly the same shape.
+impl crate::journal::Journaled for InstallTransaction {
+    const STAGING_PREFIX: &'static str = ".install-";
+
+    fn validate(&self) -> io::Result<()> {
+        InstallTransaction::validate(self)
     }
-}
-
-pub fn write(path: &Path, tx: &InstallTransaction) -> io::Result<()> {
-    tx.validate()?;
-    foundation::durable::atomic_write_managed(
-        path,
-        ".install-",
-        &serde_json::to_vec(tx).map_err(io::Error::other)?,
-    )
-}
-
-pub fn clear(path: &Path) -> io::Result<()> {
-    foundation::durable::remove_file(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{provider, release};
-
-    fn tx() -> InstallTransaction {
-        InstallTransaction {
-            id: "install-id".into(),
-            release: release("1.0.0", "new"),
-            archive_sha256: "archive".into(),
-            repository_lineage: crate::state::RepositoryLineage::from_metadata_url(
-                "https://repo/metadata/",
-            ),
-            lifecycle: provider(),
-            phase: InstallPhase::Started,
-        }
-    }
+    use crate::testing::install_transaction as tx;
+    use crate::testing::release;
 
     #[test]
     fn advance_is_forward_only() {
@@ -164,6 +158,24 @@ mod tests {
         t.advance(InstallPhase::Committed).unwrap();
         assert!(t.advance(InstallPhase::Started).is_err());
         assert!(tx().advance(InstallPhase::Placed).is_err());
+    }
+
+    #[test]
+    fn journal_replacement_is_replay_or_one_exact_forward_step() {
+        let started = tx();
+        assert!(started.permits_replacement(&started));
+
+        let mut prepared = started.clone();
+        prepared.advance(InstallPhase::Prepared).unwrap();
+        assert!(started.permits_replacement(&prepared));
+        assert!(!prepared.permits_replacement(&started));
+
+        let mut mutated = prepared.clone();
+        mutated.archive_sha256 = "f".repeat(64);
+        assert!(
+            !started.permits_replacement(&mutated),
+            "an id cannot make different install evidence the same attempt"
+        );
     }
 
     #[test]
@@ -180,38 +192,45 @@ mod tests {
         );
     }
 
-    fn tmp(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path().join(name);
-        std::fs::create_dir_all(&d).unwrap();
-        let path = d.join("install.json");
-        (dir, path)
-    }
-
     #[test]
-    fn journal_round_trips_and_absent_is_none() {
-        let (_dir, path) = tmp("journal");
-        assert_eq!(read(&path).unwrap(), None, "absent journal reads as None");
-        write(&path, &tx()).unwrap();
-        assert_eq!(
-            read(&path).unwrap(),
-            Some(tx()),
-            "written journal reads back"
-        );
-        clear(&path).unwrap();
-        assert_eq!(read(&path).unwrap(), None, "cleared journal reads as None");
+    fn durable_install_identity_is_fully_validated() {
+        let valid = tx();
+        valid.validate().unwrap();
+        for invalid in [
+            {
+                let mut value = valid.clone();
+                value.id = "attempt".into();
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.release.manifest_sha256 = "bad".into();
+                value
+            },
+            {
+                let mut value = valid;
+                value.archive_sha256 = "bad".into();
+                value
+            },
+        ] {
+            assert_eq!(
+                invalid.validate().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]
     fn unknown_journal_shapes_are_rejected() {
-        let (_dir, path) = tmp("strict-schema");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("install.json");
         std::fs::write(
             &path,
             br#"{"id":"x","release":{"version":"1","manifest_sha256":"a"},"legacy":true}"#,
         )
         .unwrap();
         assert!(
-            read(&path).is_err(),
+            crate::journal::read::<InstallTransaction>(&path).is_err(),
             "unknown fields are not a second schema"
         );
     }

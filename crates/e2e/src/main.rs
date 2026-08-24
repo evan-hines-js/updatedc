@@ -26,13 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 fn main() {
-    // The agent invokes this executable as the release's signed reconciler. Dispatch before
-    // anything else, or every hook invocation re-enters a whole nested suite.
-    if fixture::is_invocation(std::env::args_os()) {
-        if let Err(error) = fixture::run() {
-            eprintln!("node reconciler fixture: {error}");
-            std::process::exit(1);
-        }
+    if fixture::dispatch_if_invoked() {
         return;
     }
     if let Err(e) = run_suite() {
@@ -83,14 +77,6 @@ fn scenarios() -> Vec<Scenario> {
         (
             "two nodes receive one group release; only the failing node rolls back",
             group_peer_failure_is_node_local,
-        ),
-        (
-            "assigned secrets reach every hook's environment, rotate by apply --reason restart, and are never persisted",
-            assigned_secret_lifecycle,
-        ),
-        (
-            "an incomplete secret bundle blocks the converge before any hook runs",
-            missing_assigned_secret_blocks_the_converge,
         ),
         (
             "a tampered enrollment trust root fails closed before any hook runs",

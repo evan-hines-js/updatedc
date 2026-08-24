@@ -83,6 +83,8 @@ impl Backoff {
     /// transient crashes. Beyond this the backoff stops resetting, whatever the run durations
     /// were, and escalates to the cap.
     const BURST: u32 = 10;
+    /// Environment override for [`BASE`](Self::BASE), honoured only when it lengthens the delay.
+    const BASE_MS_ENV: &'static str = "UPDATED_LAUNCHER_BACKOFF_BASE_MS";
 
     fn new() -> Self {
         Backoff {
@@ -103,15 +105,36 @@ impl Backoff {
         }
     }
 
-    /// The crash-loop base delay. Tunable via `UPDATED_LAUNCHER_BACKOFF_BASE_MS` so a test can
+    /// The crash-loop base delay. Tunable via [`BASE_MS_ENV`](Self::BASE_MS_ENV) so a test can
     /// widen the backoff window enough that a shutdown deterministically lands inside the sleep
     /// (never in the brief serve window) — no wall-clock margin to flake. Defaults to [`BASE`].
+    ///
+    /// WIDENING ONLY. The override is clamped up to [`BASE`], because narrowing it disables the
+    /// only bound the launcher has on relaunch rate — and this is the permanent component, the one
+    /// that can never be updated to take the bound back. A zero base makes
+    /// `exponential_backoff` return zero at every step, cap included, so an agent that cannot
+    /// start would be re-forked as fast as the kernel allows, forever. The only real caller widens
+    /// it (`tests/cli.rs` sets ten minutes); nothing has ever wanted it shorter, and the shape of
+    /// the value that would be catastrophic is exactly the shape a typo produces.
     fn base() -> Duration {
-        std::env::var("UPDATED_LAUNCHER_BACKOFF_BASE_MS")
+        let Some(configured) = std::env::var(Self::BASE_MS_ENV)
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_millis)
-            .unwrap_or(Self::BASE)
+        else {
+            return Self::BASE;
+        };
+        if configured < Self::BASE {
+            warn(&format!(
+                "{} is {}ms, under the {}ms crash-loop floor; using the floor. This knob may only \
+                 lengthen the relaunch delay.",
+                Self::BASE_MS_ENV,
+                configured.as_millis(),
+                Self::BASE.as_millis(),
+            ));
+            return Self::BASE;
+        }
+        configured
     }
 
     /// The delay before the next relaunch, given how long the last agent ran. A run that
@@ -307,17 +330,7 @@ fn serve_service<L: Link>(
                         return conclude(cfg, &mut activation, "could not be written to");
                     }
                 }
-                // Forward compatibility, not a fault: a newer agent may send a tag this
-                // launcher has never heard of. Answer `Unsupported` and keep serving — but a
-                // failed write here leaves the same half-written frame the dispatch arm above
-                // refuses to serve past, so it ends the channel the same way.
-                Err(control::Error::UnknownTag(_)) => {
-                    if sup.send_response(&Response::Unsupported).is_err() {
-                        sup.stop();
-                        return conclude(cfg, &mut activation, "could not be written to");
-                    }
-                }
-                // Any other read failure ends this agent's usefulness, so it ends its
+                // Any read failure ends this agent's usefulness, so it ends its
                 // lifetime — through the same `conclude` every other ending goes through.
                 //
                 // The common cause is the ordinary one: the agent EXITED, and on Unix its
@@ -568,26 +581,18 @@ fn validate_agent_path(cfg: &Config, path: &Path, candidate: bool) -> Result<(),
     }
     let canonical = std::fs::canonicalize(path)
         .map_err(|e| format!("canonicalizing agent {}: {e}", path.display()))?;
-    let root = std::fs::canonicalize(cfg.state_dir.join("agents"))
+    let root = std::fs::canonicalize(control::agent_staging_root(&cfg.state_dir))
         .map_err(|e| format!("canonicalizing agent staging directory: {e}"))?;
-    let relative = canonical.strip_prefix(&root).map_err(|_| {
-        format!(
-            "agent {} is outside the managed staging directory",
-            path.display()
-        )
-    })?;
-    let parts: Vec<_> = relative.components().collect();
-    let expected_name = foundation::platform::agent_binary_name();
-    if parts.len() != 2
-        || parts[0]
-            .as_os_str()
-            .to_str()
-            .is_none_or(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
-        || parts[1].as_os_str() != expected_name
-    {
+    // The layout rule lives in `control`, with the agent that CONSTRUCTS these paths, not here
+    // alongside the check that refuses them. Spelled out separately in each, a change to the
+    // agent's staging layout would be refused by every launcher in the fleet — and the launcher
+    // is the half that can never be updated to agree again.
+    if control::staged_agent_digest(&root, &canonical).is_none() {
         return Err(format!(
-            "agent {} must be agents/<64-hex-sha256>/{expected_name}",
-            path.display()
+            "agent {} must be {}/<64-hex-sha256>/{}",
+            path.display(),
+            control::AGENT_STAGING_DIR,
+            foundation::platform::agent_binary_name(),
         ));
     }
     Ok(())
@@ -724,6 +729,56 @@ mod tests {
         );
     }
 
+    /// The backoff override may only lengthen the delay, never shorten it.
+    ///
+    /// It exists so a cross-process test can widen the sleep; the launcher is a binary, so an
+    /// in-process `with_base` cannot reach it. That makes it the one safety constant in the
+    /// permanent component that outside input can move, and moving it DOWN is what would matter:
+    /// `exponential_backoff` scales the base, so a zero base is zero at every step and at the cap
+    /// too — an agent that cannot start would be re-forked as fast as the kernel allows, forever,
+    /// in the component that can never be updated to stop it.
+    #[test]
+    fn the_relaunch_floor_cannot_be_lowered_from_the_environment() {
+        // Serialized against other tests in this binary that read the same variable: the process
+        // environment is global, and `set_var`/`remove_var` are inherently racy otherwise.
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let restore = std::env::var(Backoff::BASE_MS_ENV).ok();
+        // SAFETY: single-threaded within this test, which holds the guard above.
+        let set = |value: Option<&str>| unsafe {
+            match value {
+                Some(value) => std::env::set_var(Backoff::BASE_MS_ENV, value),
+                None => std::env::remove_var(Backoff::BASE_MS_ENV),
+            }
+        };
+
+        set(None);
+        assert_eq!(Backoff::base(), Backoff::BASE, "unset means the default");
+
+        // Every shape of "shorter" — including the one a typo produces — is refused.
+        for shorter in ["0", "1", "999"] {
+            set(Some(shorter));
+            assert_eq!(
+                Backoff::base(),
+                Backoff::BASE,
+                "{shorter}ms is under the floor and must be clamped up to it"
+            );
+        }
+
+        // Unparseable input falls back to the default rather than to zero.
+        set(Some("not-a-number"));
+        assert_eq!(Backoff::base(), Backoff::BASE);
+
+        // Widening, the only thing this knob is for, is honoured exactly.
+        set(Some("600000"));
+        assert_eq!(Backoff::base(), Duration::from_secs(600));
+
+        set(restore.as_deref());
+    }
+
     #[test]
     fn the_backoff_cap_is_five_minutes() {
         // Pin the concrete cap, not just "== Backoff::CAP" (which a mutated CAP satisfies).
@@ -834,11 +889,13 @@ mod tests {
         std::fs::read_to_string(c.state_dir.join(control::REJECTED_AGENT_FILE)).ok()
     }
 
+    /// A staged candidate at the path the AGENT would really write it to — built by the shared
+    /// layout rule, not by a hand-spelled copy of it, so these fixtures cannot keep passing
+    /// against a layout the agent no longer produces.
     fn staged_candidate(c: &Config, byte: u8) -> PathBuf {
         let digest = format!("{byte:02x}").repeat(32);
-        let dir = c.state_dir.join("agents").join(digest);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(foundation::platform::agent_binary_name());
+        let path = control::staged_agent_binary(&c.state_dir, &digest);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"candidate").unwrap();
         path
     }
@@ -1256,6 +1313,19 @@ mod tests {
         seed_desired_agent(&no_flag).expect("committed seed must validate without the flag");
         validate_agent_path(&no_flag, &initial, false)
             .expect("the seeded path must validate flag-free");
+    }
+
+    #[test]
+    fn staged_agent_directory_requires_the_canonical_digest_spelling() {
+        let (_tmp, state_dir) = temp_dir("canonical-agent-digest");
+        let c = cfg(state_dir, None);
+        // Hand-built on purpose: `staged_agent_binary` cannot produce this, which is the point.
+        let directory = control::agent_staging_root(&c.state_dir).join("A".repeat(64));
+        std::fs::create_dir_all(&directory).unwrap();
+        let candidate = directory.join(foundation::platform::agent_binary_name());
+        std::fs::write(&candidate, b"candidate").unwrap();
+
+        assert!(validate_agent_path(&c, &candidate, true).is_err());
     }
 
     #[test]

@@ -6,19 +6,20 @@
 //!
 //! Configuration is entirely `HEALTHPROXY_*` environment variables:
 //!
-//! - `HEALTHPROXY_HEALTH_BASE`         (required) CDN base; a node's report is at
-//!   `<base>/telemetry/<node>.json`.
-//! - `HEALTHPROXY_HAPROXY_ENDPOINTS`   comma-separated HAProxy admin sockets (`host:port` or a
-//!   unix path). Non-empty ⇒ program that cluster over the Runtime API; absent ⇒ program
+//! - `HEALTHPROXY_HEALTH_BASE`         (required) CDN base; the fleet report document is at
+//!   `<base>/telemetry/fleet.json`.
+//! - `HEALTHPROXY_HAPROXY_ENDPOINTS`   comma-separated HAProxy TCP admin sockets (`host:port`).
+//!   Non-empty ⇒ program that cluster over the Runtime API; absent ⇒ program
 //!   Kubernetes EndpointSlices. This one variable selects the whole backend.
 //! - `HEALTHPROXY_HAPROXY_BACKEND`     HAProxy backend name to program (default `fleet`); read
 //!   only on the HAProxy path.
 //! - `HEALTHPROXY_SERVICE`             selectorless Service to program — required on the
 //!   EndpointSlice path, unused on the HAProxy path, which touches no Service.
-//! - `HEALTHPROXY_MEMBERS`             (required) `node=address=pubkeyhex,…` fleet inventory; the
-//!   pinned public key (the node's enrollment EC point in hex — 65 bytes, `04`-prefixed) is what
-//!   its health report is verified against, so a report the node did not sign can never place it
-//!   in rotation. A key of any other shape is refused at startup rather than draining that node.
+//! - `HEALTHPROXY_INVENTORY_DIR`       (required) operator-projected, revisioned inventory shards;
+//!   active members carry node/address/pinned report key, while cordoned members carry only the
+//!   identity to drain. The key is the node's enrollment EC point in hex (65 bytes,
+//!   `04`-prefixed), so a report the node did not sign can never place it in rotation.
+//!   The projection has one protocol-defined width of eight shards; there is no reader-side knob.
 //! - `HEALTHPROXY_NAMESPACE`           Service namespace (default `default`).
 //! - `HEALTHPROXY_PORT` / `_PORT_NAME` endpoint port and name (default `8080` / `http`).
 //! - `HEALTHPROXY_INTERVAL_SECS`       reconcile cadence (default `2`).
@@ -46,7 +47,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // the system uses. Idempotent, so a double install is not fatal.
     updated::tls::install_crypto_provider();
 
-    let config = Config::from_env()?;
+    let config = Config::from_env().await?;
     // The health→membership core is identical; only the backend differs. A HAProxy target programs a
     // cluster of HAProxy admin sockets over the Runtime API; otherwise we program a Kubernetes
     // EndpointSlice. The HAProxy backend needs no kube client, so only build one for the slice path.
@@ -85,11 +86,32 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             config.health_base
         );
     }
-    // The per-fetch budget is owned by the poll plan (`tokio::time::timeout` around each fetch),
-    // which is what the fan-out arithmetic reasons about; the client does not bound it a second
-    // time at the same value.
-    let http = reqwest::Client::builder().build()?;
+    // The per-fetch budget is owned by the poll plan (`tokio::time::timeout` around each request
+    // AND its bounded body read), which is what the fan-out arithmetic reasons about. Redirect
+    // refusal still comes from the one outbound-client policy every operator endpoint uses.
+    let http = updated::http::outbound_client(updated::http::OutboundDeadline::ExternallyEnforced)?;
 
-    run(http, config, load_balancer).await;
+    run(http, config, load_balancer, shutdown_signal()).await;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    eprintln!("healthproxy: failed to listen for an interrupt: {error}");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("healthproxy: failed to listen for an interrupt: {error}");
+    }
 }

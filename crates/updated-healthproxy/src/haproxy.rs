@@ -47,13 +47,47 @@ fn exchange_timeout(instances: usize) -> Duration {
 pub struct HAProxyLb {
     endpoints: Vec<String>,
     backend: String,
+    /// The servers this process currently owns: the node set of the last non-empty reconcile, kept
+    /// because the shutdown drain runs after there is any membership left to read it from (see
+    /// [`HAProxyLb::desired_members`]).
+    managed_servers: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl HAProxyLb {
     /// `endpoints`: one admin stats socket (`host:port`) per HAProxy instance. `backend`: the name
     /// of the HAProxy `backend` section whose servers are the fleet.
     pub fn new(endpoints: Vec<String>, backend: String) -> Self {
-        Self { endpoints, backend }
+        Self {
+            endpoints,
+            backend,
+            managed_servers: std::sync::Mutex::default(),
+        }
+    }
+
+    /// What to program this cycle, and the record of what this process currently owns.
+    ///
+    /// An empty `observed` is the shutdown drain (see [`crate::run`]): there is no membership to
+    /// program, so the answer is "drain everything this process owned". That record tracks *current*
+    /// membership, not history — a node that left the inventory is no longer declared in the
+    /// HAProxy `backend` section, and `set server <backend>/<gone> state drain` makes the instance
+    /// answer `No such server.`, which [`response_error`] turns into a failed reconcile. Accumulating
+    /// departed nodes would therefore fail the drain — the one log line that is supposed to mean the
+    /// handover was unsafe — on every deployment that followed an inventory shrink, and grow the set
+    /// for the process lifetime besides.
+    fn desired_members(&self, observed: &[Member]) -> Vec<Member> {
+        let mut managed = self.managed_servers.lock().expect("managed server lock");
+        if observed.is_empty() {
+            return managed
+                .iter()
+                .map(|node| Member {
+                    node: node.clone(),
+                    address: String::new(),
+                    ready: false,
+                })
+                .collect();
+        }
+        *managed = observed.iter().map(|member| member.node.clone()).collect();
+        observed.to_vec()
     }
 }
 
@@ -99,8 +133,8 @@ fn line_bytes(batch: usize) -> usize {
 /// BOTH operator-supplied names on this line — `backend` and the member's node identity — are
 /// interpolated into a `;`-joined batch on a `level admin` socket, so either one carrying `;` or
 /// whitespace would be a second command rather than a name. That is the configuration's business,
-/// not this function's: [`crate::is_balancer_safe`] refuses such a name at startup — for the
-/// identity in `parse_inventory`, for the backend in `Config::build` — where an operator typo is a
+/// not this function's: [`updated_contracts::backend::is_balancer_safe`] refuses such a name at startup — for the
+/// identity in `parse_member`, for the backend in `Config::build` — where an operator typo is a
 /// configuration error instead of a fleet that is never programmed again.
 fn state_batches(backend: &str, members: &[Member]) -> Vec<String> {
     const SEPARATOR: &str = "; ";
@@ -148,7 +182,8 @@ fn response_error(response: &str) -> Option<String> {
 /// whatever it streams for the whole exchange budget, [`crate::FANOUT_CONCURRENCY`] connections at a
 /// time, until this component — the only writer of load-balancer membership — is OOM-killed and the
 /// fleet freezes at the last programmed set. Same rule as every other network read in the tree (see
-/// [`crate::REPORT_BYTES_LIMIT`]): the running total is what caps the read.
+/// [`updated_contracts::telemetry::MAX_FLEET_REPORT_SHARD_BYTES`]): the running total is what caps
+/// the read.
 const RUNTIME_API_RESPONSE_LIMIT: usize = 8 * 1024;
 
 /// Read one admin-socket response to EOF, failing rather than growing past
@@ -208,7 +243,8 @@ async fn run_commands(
 #[async_trait::async_trait]
 impl LoadBalancer for HAProxyLb {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String> {
-        let batches = state_batches(&self.backend, members);
+        let desired = self.desired_members(members);
+        let batches = state_batches(&self.backend, &desired);
         if batches.is_empty() {
             return Ok(());
         }
@@ -250,6 +286,12 @@ impl LoadBalancer for HAProxyLb {
             .filter_map(|(_, failure)| failure)
             .collect();
         if failures.is_empty() {
+            if members.is_empty() {
+                self.managed_servers
+                    .lock()
+                    .expect("managed server lock")
+                    .clear();
+            }
             Ok(())
         } else {
             Err(failures.join(" | "))
@@ -282,6 +324,35 @@ mod tests {
         assert!(state_batches("fleet", &[]).is_empty());
     }
 
+    #[test]
+    fn an_empty_shutdown_reconcile_drains_every_server_this_process_managed() {
+        let load_balancer = HAProxyLb::new(Vec::new(), "fleet".into());
+        load_balancer.desired_members(&[member("agent-1", true), member("agent-0", false)]);
+        let draining = load_balancer.desired_members(&[]);
+        assert_eq!(
+            state_batches("fleet", &draining),
+            vec!["set server fleet/agent-0 state drain; set server fleet/agent-1 state drain"]
+        );
+    }
+
+    /// The drain must name what this process owns *now*. A node removed from the inventory is
+    /// usually removed from the HAProxy `backend` section too, and HAProxy answers `No such server.`
+    /// for it — which fails the whole reconcile. Remembering departed nodes would therefore break
+    /// the shutdown handover on every deployment that followed an inventory shrink, behind the one
+    /// log line that is supposed to mean the handover was unsafe, and grow the set forever besides.
+    #[test]
+    fn a_departed_node_is_forgotten_rather_than_drained_after_it_left_the_inventory() {
+        let load_balancer = HAProxyLb::new(Vec::new(), "fleet".into());
+        load_balancer.desired_members(&[member("agent-0", true), member("agent-1", true)]);
+        // agent-1 leaves the inventory; the next cycle is the one that redefines ownership.
+        load_balancer.desired_members(&[member("agent-0", true)]);
+        let draining = load_balancer.desired_members(&[]);
+        assert_eq!(
+            state_batches("fleet", &draining),
+            vec!["set server fleet/agent-0 state drain"]
+        );
+    }
+
     /// Every name that reaches this batch builder came through the inventory gate, so a name that
     /// could end the command it is written into never exists at this layer — the batch for a member
     /// is exactly one command, whatever the member set. (The gate itself is asserted in
@@ -296,7 +367,7 @@ mod tests {
         assert_eq!(batches[0].matches("set server").count(), 2);
         for injected in ["agent-0; shutdown frontend public", "agent-0 state maint"] {
             assert!(
-                !crate::is_balancer_safe(injected),
+                !updated_contracts::backend::is_balancer_safe(injected),
                 "{injected:?} must be refused before it can be programmed"
             );
         }

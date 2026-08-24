@@ -1,101 +1,85 @@
-//! Content-identity of bytes: the streaming and in-memory SHA-256 the whole tower
-//! digests with, and the one case-insensitive digest comparison it comes to verdicts
-//! with — a single implementation each, so the trust boundary cannot drift.
+//! Content-identity of *files*: the streaming SHA-256 that hashes bytes off a disk handle.
+//!
+//! The digest primitive itself is not here. It lives in [`updated_contracts::digest`], at the
+//! bottom of the stack where the protocol types that carry digests can reach it, so there is one
+//! SHA-256 implementation and one canonical spelling for every consumer. This module adds only
+//! what needs a filesystem — which is exactly why it cannot live down there — and it streams
+//! through the same hasher, so a file digest and an in-memory digest of the same bytes are the same
+//! identity by construction.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use std::path::Path;
 
-use aws_lc_rs::digest::{Context, SHA256};
+use updated_contracts::digest::Sha256Hasher;
 
-/// Streaming SHA-256 of the file at `path`, lowercase hex.
+/// Streaming SHA-256 of the file at `path`, canonical lowercase hex.
 pub fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut ctx = Context::new(&SHA256);
+    let mut file = foundation::file::open_regular(path, foundation::file::FinalSymlink::Refuse)?;
+    sha256_file_handle(&mut file).map(|(digest, _)| digest)
+}
+
+/// Hash one already-open regular file and leave it rewound for the operation that consumes the
+/// authenticated bytes. The returned length and digest are derived from the same handle, closing
+/// the verify-then-reopen race at every downloaded-target boundary.
+pub fn sha256_file_handle(file: &mut std::fs::File) -> io::Result<(String, u64)> {
+    file.rewind()?;
+    let mut hasher = Sha256Hasher::new();
     let mut buf = [0u8; 64 * 1024];
+    let mut length = 0u64;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        ctx.update(&buf[..n]);
+        hasher.update(&buf[..n]);
+        length = length
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file length overflow"))?;
     }
-    Ok(hex::encode(ctx.finish().as_ref()))
-}
-
-/// SHA-256 of in-memory `bytes`, lowercase hex. Bundle manifests and release ids
-/// digest small buffers; keeping this beside [`sha256_file`] means every digest the
-/// tower trusts is produced in one place, so the trust boundary cannot drift.
-pub fn sha256_bytes(bytes: &[u8]) -> String {
-    use aws_lc_rs::digest::{digest, SHA256};
-    hex::encode(digest(&SHA256, bytes).as_ref())
-}
-
-/// An incremental SHA-256, for the digests computed over several fields rather than one buffer
-/// (a publication plan, a secret bundle). Wraps the same `aws-lc-rs` backend as [`sha256_bytes`]
-/// and [`sha256_file`], so every digest the system produces — one-shot or streamed — still comes
-/// from the one crypto library, with no second implementation to drift against.
-pub struct Sha256Hasher(Context);
-
-impl Sha256Hasher {
-    pub fn new() -> Self {
-        Self(Context::new(&SHA256))
-    }
-
-    pub fn update(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    /// Consume the hasher and return the lowercase-hex digest.
-    pub fn finish_hex(self) -> String {
-        hex::encode(self.0.finish().as_ref())
-    }
-}
-
-impl Default for Sha256Hasher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Whether two hex digests name the same content.
-///
-/// The two sides never come from the same producer: one is `hex::encode`, which is always
-/// lowercase, and the other is a digest out of a signed document, which the contract
-/// (`updated_contracts::is_sha256_hex`) admits in any case. A bare `==` therefore fails closed on a
-/// perfectly valid uppercase digest — on the paths that boot, install, or execute, where that is
-/// non-retryable. Every digest comparison this crate makes on that path goes through here — the
-/// release-identity check, each extracted bundle member against its manifest, and the on-disk
-/// re-verification — so no one of them can diverge back to `==` on its own.
-pub fn digests_match(got: &str, expected: &str) -> bool {
-    got.eq_ignore_ascii_case(expected)
+    file.rewind()?;
+    Ok((hasher.finish_hex(), length))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    #[test]
+    fn a_file_and_its_bytes_have_one_content_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join(name);
-        (dir, p)
+        let path = dir.path().join("known");
+        std::fs::write(&path, b"the exact bytes").unwrap();
+
+        // Pin the actual digest: a hasher returning a constant, or one that stopped reading the
+        // file body, would not produce this exact hex.
+        let digest = sha256_file(&path).unwrap();
+        assert_eq!(
+            digest,
+            "70c940552e567905b6e8321e87284124ba5753614a7c8f16dc56538a00173c36"
+        );
+        assert_eq!(
+            digest,
+            updated_contracts::digest::sha256_bytes(b"the exact bytes")
+        );
     }
 
     #[test]
-    fn file_and_byte_hashing_agree_on_known_bytes() {
-        let (_dir, f) = tmp("known");
-        std::fs::write(&f, b"the exact bytes").unwrap();
-        // Pin the actual digest: a hasher returning a constant, or one that stopped
-        // reading the file body, would not produce this exact hex.
-        let want = sha256_file(&f).unwrap();
-        assert_eq!(
-            want,
-            "70c940552e567905b6e8321e87284124ba5753614a7c8f16dc56538a00173c36"
-        );
+    fn hashing_a_handle_reports_its_length_and_rewinds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sized");
+        std::fs::write(&path, b"the exact bytes").unwrap();
 
-        // Streaming-file and in-memory hashing are the same content-identity.
-        assert_eq!(sha256_bytes(b"the exact bytes"), want);
-        assert!(digests_match(&want, &want.to_uppercase()));
-        assert!(!digests_match(&want, &"0".repeat(64)));
-        let _ = std::fs::remove_file(&f);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).unwrap();
+
+        // Already at EOF: the digest must still cover the whole file, and the handle must come
+        // back positioned for the consumer of the authenticated bytes.
+        let (digest, length) = sha256_file_handle(&mut file).unwrap();
+        assert_eq!(length, 15);
+        assert_eq!(digest, sha256_file(&path).unwrap());
+        let mut rest = Vec::new();
+        file.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"the exact bytes");
     }
 }

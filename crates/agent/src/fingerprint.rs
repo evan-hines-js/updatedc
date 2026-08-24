@@ -20,8 +20,9 @@ struct Worker {
 }
 
 /// Sole owner of fingerprint scheduling, execution, cancellation, and the publishable result.
-/// A fingerprint hook never overlaps a deployment hook: the deployment path calls `restart_after`
-/// and waits for this worker's contained process tree to die before beginning its transaction.
+/// A fingerprint hook never overlaps a mutation hook: deployment paths call `restart_after`, and
+/// steady convergence calls `pause_for_mutation`; both wait for this worker's contained process
+/// tree to die before `apply` begins.
 pub(crate) struct Tracker {
     current: Option<Fingerprint>,
     due: Instant,
@@ -53,26 +54,41 @@ impl Tracker {
         });
     }
 
-    /// Cancel and reap any observation of the old deployment. The next healthy probe starts a
-    /// fresh measurement of the deployment that won the transaction (including rollback).
-    pub(crate) fn restart_after_deployment(&mut self, now: Instant) {
+    fn cancel_worker(&mut self) {
         if let Some(worker) = self.worker.take() {
             worker.cancelled.store(true, Ordering::Release);
             let _ = worker.handle.join();
         }
+    }
+
+    /// Stop an observation before an `apply` can touch the state it reads. A successful no-change
+    /// result may keep the last completed value and its hourly cadence; a changed result follows
+    /// this with [`restart_after_deployment`](Self::restart_after_deployment).
+    pub(crate) fn pause_for_mutation(&mut self) {
+        self.cancel_worker();
+    }
+
+    /// Cancel and reap any observation of the old deployment. The next healthy probe starts a
+    /// fresh measurement of the deployment that won the transaction (including rollback).
+    pub(crate) fn restart_after_deployment(&mut self, now: Instant) {
+        self.cancel_worker();
         self.current = None;
         self.due = now;
     }
 
     /// Reap a completed observation and, when due, start at most one new worker. Preparation is
     /// kept on the agent thread so invalid signed/provider state fails before spawning.
+    ///
+    /// Returns the failure of this poll, if any; a measurement that succeeded is published through
+    /// [`current`](Self::current) and needs nothing from the caller. Whether a worker was reaped at
+    /// all is not the caller's business, so it is not reported.
     pub(crate) fn poll(
         &mut self,
         now: Instant,
         healthy: bool,
         node: &str,
         prepare: impl FnOnce() -> io::Result<FingerprintJob>,
-    ) -> Option<io::Result<()>> {
+    ) -> Option<io::Error> {
         let mut completed = None;
         if self
             .worker
@@ -86,14 +102,19 @@ impl Tracker {
                 .unwrap_or_else(|_| Err(io::Error::other("fingerprint worker panicked")));
             self.current = result.as_ref().ok().cloned();
             self.due = now + crate::schedule::jitter_for_key(INTERVAL, JITTER_PERCENT, node);
-            completed = Some(result.map(|_| ()))
+            completed = result.err();
+        }
+
+        // A measurement that spans an unhealthy interval is not evidence of one stable state.
+        // Cancel it immediately and require a fresh observation after readiness returns.
+        if !healthy {
+            self.cancel_worker();
+            self.current = None;
+            self.due = now;
+            return completed;
         }
 
         if self.worker.is_none() && now >= self.due {
-            if !healthy {
-                self.current = None;
-                return completed;
-            }
             match prepare() {
                 Ok(job) => {
                     self.start_worker(move |cancelled| job.run(cancelled));
@@ -102,7 +123,7 @@ impl Tracker {
                     self.current = None;
                     self.due =
                         now + crate::schedule::jitter_for_key(INTERVAL, JITTER_PERCENT, node);
-                    return Some(Err(error));
+                    return Some(error);
                 }
             }
         }
@@ -124,7 +145,7 @@ mod tests {
     fn value(byte: char) -> Fingerprint {
         Fingerprint {
             definition_sha256: byte.to_string().repeat(64),
-            output_sha256: byte.to_ascii_uppercase().to_string().repeat(64),
+            output_sha256: byte.to_string().repeat(64),
         }
     }
 
@@ -154,6 +175,54 @@ mod tests {
     }
 
     #[test]
+    fn a_no_change_mutation_pauses_observation_without_destroying_prior_evidence() {
+        let start = Instant::now();
+        let due = start + INTERVAL;
+        let mut tracker = Tracker::new(start);
+        tracker.current = Some(value('a'));
+        tracker.due = due;
+        let (started_tx, started_rx) = mpsc::channel();
+        tracker.start_worker(move |cancelled| {
+            started_tx.send(()).unwrap();
+            while !cancelled.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        tracker.pause_for_mutation();
+
+        assert!(tracker.worker.is_none());
+        assert_eq!(tracker.current(), Some(&value('a')));
+        assert_eq!(tracker.due, due);
+    }
+
+    #[test]
+    fn unhealthy_state_cancels_in_flight_measurement_and_requires_a_fresh_one() {
+        let start = Instant::now();
+        let mut tracker = Tracker::new(start);
+        tracker.current = Some(value('a'));
+        let (started_tx, started_rx) = mpsc::channel();
+        tracker.start_worker(move |cancelled| {
+            started_tx.send(()).unwrap();
+            while !cancelled.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let unhealthy_at = start + Duration::from_secs(1);
+
+        assert!(tracker
+            .poll(unhealthy_at, false, "node-a", || panic!("unhealthy"))
+            .is_none());
+        assert!(tracker.worker.is_none());
+        assert!(tracker.current().is_none());
+        assert_eq!(tracker.due, unhealthy_at);
+    }
+
+    #[test]
     fn completed_measurement_is_published_and_scheduled_about_an_hour_out() {
         let start = Instant::now();
         let mut tracker = Tracker::new(start);
@@ -165,8 +234,15 @@ mod tests {
         let result = tracker.poll(now, true, "node-a", || {
             panic!("a completed worker must advance the cadence before starting another")
         });
-        assert!(result.unwrap().is_ok());
-        assert_eq!(tracker.current(), Some(&value('b')));
+        assert!(
+            result.is_none(),
+            "a measurement that succeeded reports no error"
+        );
+        assert_eq!(
+            tracker.current(),
+            Some(&value('b')),
+            "the worker was reaped and its measurement published"
+        );
         assert!(tracker.due >= now + Duration::from_secs(54 * 60));
         assert!(tracker.due <= now + Duration::from_secs(66 * 60));
     }

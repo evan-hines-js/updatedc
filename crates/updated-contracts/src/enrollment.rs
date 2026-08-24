@@ -1,23 +1,21 @@
 //! Enrollment and certificate-renewal wire contracts.
 
 use std::io;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::dataflow::DownloadCapability;
 
 /// The one enrollment endpoint.
 pub const ENROLL_PATH: &str = "/enroll";
 /// The per-node certificate-renewal endpoint.
 pub const RENEW_PATH: &str = "/renew";
-/// Where an already-enrolled node re-fetches its enrollment bundle, authenticated by the per-node
-/// certificate it minted at [`ENROLL_PATH`].
-///
-/// The bundle carries signed TUF metadata, and signed metadata expires. Written once at enrollment
-/// and never replaced, it eventually holds nothing a node can take for the repository's current
-/// state — so this endpoint exists to replace it, and only that: it mints nothing, registers
-/// nothing, and returns the same bundle `/enroll` would issue for a node that enrolled today. The
-/// node keeps its enrollment-time root of trust across the swap by requiring the returned
-/// `routingRoot` to be the pinned root or a rotation signed by it.
-pub const BUNDLE_PATH: &str = "/bundle";
+/// Whole-document ceiling shared by persisted bundles and their content-addressed S3 objects. A
+/// producer that cannot fit this contract must fail before publishing bytes every node will refuse.
+pub const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Control responses carry only a certificate or an exact-object capability, never bundle bytes.
+pub const MAX_CONTROL_DOCUMENT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -27,15 +25,13 @@ pub struct EnrollmentRequest {
 }
 
 impl EnrollmentRequest {
+    /// Whether the name a node self-asserts at enrollment is one the fleet can actually own.
+    ///
+    /// This is exactly the shared Kubernetes DNS-subdomain identity grammar
+    /// ([`crate::telemetry::is_valid_node`]), so self-enrollment, report maps, backend projections,
+    /// and `UpdateAgent` objects cannot disagree about node identity.
     pub fn name_is_wellformed(&self) -> bool {
-        !self.name.is_empty()
-            && self.name.len() <= 253
-            && self
-                .name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !self.name.starts_with('-')
-            && !self.name.ends_with('-')
+        crate::telemetry::is_valid_node(&self.name)
     }
 }
 
@@ -43,7 +39,7 @@ impl EnrollmentRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollResponse {
     pub leaf: String,
-    pub bundle: EnrollmentBundle,
+    pub bundle_download: DownloadCapability,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -65,54 +61,240 @@ pub struct EnrollmentBundle {
     pub agent_id: String,
     pub routing_base_url: String,
     pub assignment: String,
+    /// Immutable node-local boundary authenticated at enrollment. Live signed assignments may
+    /// change every other runtime field but may never relocate durable install state.
+    pub install_root: PathBuf,
     /// Exact UTF-8 bytes of signed metadata; TUF authenticates the serialized bytes.
     pub routing_root: String,
-    pub initial: InitialSignedConfiguration,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InitialSignedConfiguration {
-    pub timestamp: String,
-    pub snapshot: String,
-    pub targets: String,
-    pub agent_document: String,
-    pub managed_configuration: String,
 }
 
 impl EnrollmentBundle {
     pub fn validate_shape(&self) -> io::Result<()> {
-        if self.schema != 1 || self.agent_id.is_empty() {
+        if self.schema != 1 || !crate::telemetry::is_valid_node(&self.agent_id) {
             return Err(invalid(
-                "unsupported enrollment bundle or empty agent identity",
+                "unsupported enrollment bundle or invalid agent identity",
             ));
         }
-        if !self.routing_base_url.ends_with('/') || self.assignment.starts_with('/') {
+        if !crate::assignment::valid_repository_base(&self.routing_base_url)
+            || self.assignment.starts_with('/')
+            || !self.install_root.is_absolute()
+        {
             return Err(invalid("invalid enrollment routing location"));
         }
         if !crate::path::is_confined_relative(&self.assignment) {
             return Err(invalid("invalid enrollment assignment path"));
         }
-        for (name, value) in [
-            ("routingRoot", &self.routing_root),
-            ("timestamp", &self.initial.timestamp),
-            ("snapshot", &self.initial.snapshot),
-            ("targets", &self.initial.targets),
-            ("agentDocument", &self.initial.agent_document),
-            ("managedConfiguration", &self.initial.managed_configuration),
-        ] {
-            let value: serde_json::Value = serde_json::from_str(value)
-                .map_err(|error| invalid(&format!("enrollment {name} is invalid JSON: {error}")))?;
-            if !value.is_object() {
-                return Err(invalid(&format!(
-                    "enrollment {name} must encode a JSON object"
-                )));
-            }
+        if crate::telemetry::split_assignment_path(&self.assignment)
+            .is_none_or(|(_, agent)| agent != self.agent_id)
+        {
+            return Err(invalid(
+                "enrollment assignment does not name the bundle's agent identity",
+            ));
+        }
+        let root: serde_json::Value =
+            serde_json::from_str(&self.routing_root).map_err(|error| {
+                invalid(&format!("enrollment routingRoot is invalid JSON: {error}"))
+            })?;
+        if !root.is_object() {
+            return Err(invalid("enrollment routingRoot must encode a JSON object"));
         }
         Ok(())
     }
+
+    pub fn to_bounded_json(&self) -> io::Result<Vec<u8>> {
+        self.validate_shape()?;
+        encode_bounded(self, MAX_DOCUMENT_BYTES)
+    }
+
+    pub fn from_bounded_json(bytes: &[u8]) -> io::Result<Self> {
+        let bundle: Self = decode_bounded(bytes, MAX_DOCUMENT_BYTES)?;
+        bundle.validate_shape()?;
+        Ok(bundle)
+    }
+}
+
+impl EnrollResponse {
+    pub fn to_bounded_json(&self) -> io::Result<Vec<u8>> {
+        self.bundle_download
+            .validate()
+            .map_err(|error| invalid(&error))?;
+        encode_bounded(self, MAX_CONTROL_DOCUMENT_BYTES)
+    }
+
+    pub fn from_bounded_json(bytes: &[u8]) -> io::Result<Self> {
+        let response: Self = decode_bounded(bytes, MAX_CONTROL_DOCUMENT_BYTES)?;
+        response
+            .bundle_download
+            .validate()
+            .map_err(|error| invalid(&error))?;
+        Ok(response)
+    }
+}
+
+impl RenewalResponse {
+    pub fn to_bounded_json(&self) -> io::Result<Vec<u8>> {
+        encode_bounded(self, MAX_CONTROL_DOCUMENT_BYTES)
+    }
+
+    pub fn from_bounded_json(bytes: &[u8]) -> io::Result<Self> {
+        decode_bounded(bytes, MAX_CONTROL_DOCUMENT_BYTES)
+    }
+}
+
+/// This module's `io::Result` spelling of the one bounded codec.
+///
+/// The bound itself is not restated here — [`crate::bounded`] owns it, as it does for every other
+/// contract document. These two only carry the result into the `io::Error` shape the enrollment
+/// boot path is written in.
+fn encode_bounded<T: Serialize>(value: &T, limit: usize) -> io::Result<Vec<u8>> {
+    crate::bounded::encode(value, "enrollment document", limit).map_err(|error| invalid(&error))
+}
+
+fn decode_bounded<T: serde::de::DeserializeOwned>(bytes: &[u8], limit: usize) -> io::Result<T> {
+    crate::bounded::decode(bytes, "enrollment document", limit).map_err(|error| invalid(&error))
 }
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(name: &str) -> EnrollmentRequest {
+        EnrollmentRequest {
+            name: name.into(),
+            csr: String::new(),
+        }
+    }
+
+    fn bundle(base: &str) -> EnrollmentBundle {
+        EnrollmentBundle {
+            schema: 1,
+            agent_id: "agent-7".into(),
+            routing_base_url: base.into(),
+            assignment: "assignments/agents/agent-7.json".into(),
+            install_root: "/var/lib/app".into(),
+            routing_root: "{}".into(),
+        }
+    }
+
+    fn download() -> DownloadCapability {
+        DownloadCapability {
+            schema: DownloadCapability::SCHEMA,
+            url: "https://objects.example/enrollments/bundle.json?X-Amz-Signature=secret".into(),
+            sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn enrollment_routing_uses_the_shared_repository_base_grammar() {
+        assert!(bundle("https://updates.example/routing/")
+            .validate_shape()
+            .is_ok());
+        assert!(bundle("file:///var/lib/updated/routing/")
+            .validate_shape()
+            .is_ok());
+        for invalid in [
+            "http://updates.example/routing/",
+            "https://user:secret@updates.example/routing/",
+            "https://updates.example/routing/?token=bearer",
+            "https://updates.example/routing/#fragment",
+            "https://updates.example/routing",
+            "relative/routing/",
+        ] {
+            assert!(
+                bundle(invalid).validate_shape().is_err(),
+                "{invalid:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn enrollment_documents_have_one_producer_and_consumer_ceiling() {
+        let valid = bundle("https://updates.example/routing/");
+        let bytes = valid.to_bounded_json().unwrap();
+        assert_eq!(
+            EnrollmentBundle::from_bounded_json(&bytes)
+                .unwrap()
+                .agent_id,
+            "agent-7"
+        );
+
+        let mut oversized = valid;
+        oversized.routing_root = format!("{{\"padding\":\"{}\"}}", "x".repeat(MAX_DOCUMENT_BYTES));
+        assert_eq!(
+            oversized.to_bounded_json().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            EnrollmentBundle::from_bounded_json(&vec![b' '; MAX_DOCUMENT_BYTES + 1])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn enrollment_identity_and_assignment_have_one_shared_binding_gate() {
+        let mut mismatched = bundle("https://updates.example/routing/");
+        mismatched.assignment = "assignments/agents/another-agent.json".into();
+        assert!(mismatched.validate_shape().is_err());
+        assert!(mismatched.to_bounded_json().is_err());
+
+        let mut invalid_identity = bundle("https://updates.example/routing/");
+        invalid_identity.agent_id = "Agent-7".into();
+        invalid_identity.assignment = "assignments/agents/Agent-7.json".into();
+        assert!(invalid_identity.validate_shape().is_err());
+    }
+
+    #[test]
+    fn control_responses_carry_only_a_strict_bounded_download_capability() {
+        let response = EnrollResponse {
+            leaf: "certificate".into(),
+            bundle_download: download(),
+        };
+        let bytes = response.to_bounded_json().unwrap();
+        assert_eq!(
+            EnrollResponse::from_bounded_json(&bytes)
+                .unwrap()
+                .bundle_download,
+            download()
+        );
+
+        let mut invalid = download();
+        invalid.url = "http://objects.example/bundle?X-Amz-Signature=secret".into();
+        assert!(invalid.to_bounded_json().is_err());
+        let mut invalid = download();
+        invalid.sha256 = "A".repeat(64);
+        assert!(invalid.to_bounded_json().is_err());
+        assert!(
+            DownloadCapability::from_bounded_json(&vec![b' '; MAX_CONTROL_DOCUMENT_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    /// Enrollment is the gate that decides which names ever exist, so it must not admit one the
+    /// storage and inventory readers refuse: such a node runs, heartbeats, and is invisible to
+    /// every consumer forever. Anything the shared grammar rejects — the reserved fleet-index
+    /// basename above all — must be rejected here too, without enrollment restating the rule.
+    #[test]
+    fn an_enrollment_name_is_refused_wherever_the_shared_identity_grammar_refuses_it() {
+        assert!(request("agent-7").name_is_wellformed());
+        assert!(request("jenkins-author-0").name_is_wellformed());
+        // Raw report keys are hashed, so ordinary DNS names no longer collide with controller
+        // projection objects or need a second, storage-specific reserved-word grammar.
+        assert!(request("fleet").name_is_wellformed());
+        assert!(request("rack-1.agent-7").name_is_wellformed());
+        assert!(!request(&"a".repeat(crate::telemetry::MAX_NODE_BYTES + 1)).name_is_wellformed());
+        for bad in [
+            "", "-agent", "agent-", "Agent", "a_b", "a/b", ".agent", "agent.", "a..b",
+        ] {
+            assert!(
+                !request(bad).name_is_wellformed(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
 }

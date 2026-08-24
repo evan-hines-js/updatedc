@@ -9,14 +9,17 @@ use std::io;
 use updated::bundle::{ExpectedBundle, InstallError, ReleaseId};
 use updated::config::{Application, Paths};
 use updated::provider::BundleStore;
-use updated_tuf::select::target_sha;
+use updated_tuf::select::{target_sha, SelectedRelease, Stance};
 use updated_tuf::{DefaultPolicy, TrustedRepository, VerifiedTarget};
 
 pub(crate) struct ApplicationRequest<'a> {
     pub(crate) repository: &'a TrustedRepository,
     pub(crate) application: &'a Application,
     pub(crate) paths: &'a Paths,
-    pub(crate) current_version: Option<&'a str>,
+    /// What this node already has, in the selector's own vocabulary. Not an `Option<&str>`: the
+    /// floor and the "already have it" short-circuit are separate facts, and a repair needs to
+    /// lift the second without lifting the first (see [`Stance`]).
+    pub(crate) stance: Stance<'a>,
 }
 
 #[derive(Debug)]
@@ -113,31 +116,43 @@ impl std::error::Error for PrepareError {
     }
 }
 
-/// Prepare the exact application assigned by the verified control plane.
+/// Decide which application this node should be running, against the verified control plane.
 ///
 /// `Ok(None)` means the current version is already desired or these exact bytes were
 /// previously rejected. Activation and rejection persistence remain front-end policy.
-pub(crate) async fn prepare_assigned_application(
-    request: ApplicationRequest<'_>,
+///
+/// The decision is deterministic and side-effect free, and it answers two questions at once: which
+/// release to acquire, and — when ordered fallback descended below the assigned head — which signed
+/// provider set governs it (app and providers are one signed unit). Every caller needs both, so the
+/// decision is made HERE, once, and its result is handed to [`prepare_assigned_application`] and to
+/// `selection::stage_providers`; asking the repository twice would be one decision with two
+/// evaluation sites.
+pub(crate) fn select_assigned_application(
+    request: &ApplicationRequest<'_>,
     mut is_rejected: impl FnMut(&str) -> bool,
-) -> Result<Option<PreparedApplication>, PrepareError> {
+) -> Result<Option<SelectedRelease>, PrepareError> {
     let policy = DefaultPolicy::current(&request.application.product, &request.application.channel);
     // Rejection filtering now happens inside selection: exact-pin returns None when
     // the assigned bytes are rejected (hold predecessor), and ordered fallback skips
     // rejected targets as it descends. Diagnostics are dropped here; the agent's
     // own selection path logs skips.
-    let Some(selected) = request
+    request
         .repository
         .assigned_application(
             &policy,
-            request.current_version,
+            request.stance,
             |_message| {},
             |target, _version| is_rejected(&target_sha(target)),
         )
-        .map_err(PrepareError::Repository)?
-    else {
-        return Ok(None);
-    };
+        .map_err(PrepareError::Repository)
+}
+
+/// Download and stage the application [`select_assigned_application`] chose: everything before
+/// activation, and nothing that decides anything.
+pub(crate) async fn prepare_assigned_application(
+    request: &ApplicationRequest<'_>,
+    selected: SelectedRelease,
+) -> Result<PreparedApplication, PrepareError> {
     let platform = foundation::platform::platform_key();
     let store =
         BundleStore::for_app(request.paths).with_target_limit(request.repository.target_limit());
@@ -165,11 +180,11 @@ pub(crate) async fn prepare_assigned_application(
             source,
         },
     })?;
-    Ok(Some(PreparedApplication {
+    Ok(PreparedApplication {
         release: id,
         version: selected.version,
         archive_sha256: selected.sha256,
-    }))
+    })
 }
 
 /// Download and install one metadata-authenticated bundle through the canonical
@@ -185,12 +200,12 @@ pub(crate) async fn acquire_verified_bundle(
     store: &BundleStore,
     expected: &ExpectedBundle<'_>,
 ) -> Result<ReleaseId, AcquireBundleError> {
-    repository
+    let mut downloaded = repository
         .download_target(target, destination)
         .await
         .map_err(AcquireBundleError::Repository)?;
-    store
-        .install(destination, expected)
+    downloaded
+        .install_bundle(store, expected)
         .map_err(|error| match error {
             InstallError::Archive(source) => AcquireBundleError::Invalid {
                 archive_sha256: target_sha(target),

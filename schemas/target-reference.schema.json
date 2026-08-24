@@ -11,7 +11,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 1024,
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\:])[A-Za-z0-9._/-]+$"
+      "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f]+(?:/[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f]+)*$",
+      "description": "A confined relative target name: one or more non-empty `/`-separated components, none of them `.` or `..`, and none containing a backslash, a drive/scheme colon, or a control character. Joined onto any root it can never escape it."
     },
     "sha256": {
       "type": "string",

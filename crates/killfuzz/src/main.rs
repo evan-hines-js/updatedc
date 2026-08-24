@@ -1,5 +1,5 @@
-//! Arbitrary-`SIGKILL` fuzzer for the cold-install / broken-rollout / roll-forward crash-safety
-//! paths.
+//! Arbitrary-`SIGKILL` fuzzer for the cold-install / broken-rollout / roll-forward / interleave
+//! crash-safety paths.
 //!
 //! The deterministic `install_chaos_recovery` / `stateless_install_chaos` scenarios crash at every
 //! *named* state-machine boundary — that's the exhaustive proof *under the atomicity invariant*
@@ -8,9 +8,10 @@
 //! whole stack at truly arbitrary instants, which is the one thing that catches a durable write we
 //! forgot to make atomic (or a boundary we forgot to place), and it models real pod-kill timing.
 //!
-//! It runs three sequential rounds, each a full burst of arbitrary kills, so the fuzz spans the
-//! whole fleet lifecycle — the story is: 1.0.0 installs, a broken 2.0.0 begins rolling out, and a
-//! healthy 3.0.0 supersedes the failing 2.0.0 mid-rollout; the node must end up on 3.0.0.
+//! It runs four sequential rounds, each a full burst of arbitrary kills, so the fuzz spans the
+//! whole fleet lifecycle — the story is: 1.0.0 installs, a broken 2.0.0 begins rolling out, a
+//! healthy 3.0.0 supersedes the failing 2.0.0 mid-rollout (the node must end up on 3.0.0), and then
+//! the same supersession is replayed against a broken transaction still in-flight on disk.
 //!
 //! - `install` — a cold node must reconverge to a live, committed 1.0.0. Only this round wipes the
 //!   disk (emptyDir restart churn); an upgrade never does.
@@ -50,15 +51,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // `Node::new` signs THIS executable in as the release's reconciler, so the agent invokes it as
-    // the hook that owns the workload. Dispatch to the shared fixture implementation before
-    // anything else: without it every hook invocation would recursively start another complete
-    // killfuzz run, which the agent then times out.
-    if fixture::is_invocation(std::env::args_os()) {
-        if let Err(error) = fixture::run() {
-            eprintln!("node reconciler fixture: {error}");
-            std::process::exit(1);
-        }
+    if fixture::dispatch_if_invoked() {
         return;
     }
 
@@ -113,89 +106,112 @@ fn env_u64(key: &str, default: u64) -> u64 {
 /// `wipe_disk` is set (the cold-install round only), half the iterations wipe the install first
 /// (stateless emptyDir → fresh cold-install), half leave state to recover; an upgrade round never
 /// wipes — deleting the disk would turn it into a fresh install, not an upgrade.
-#[allow(clippy::too_many_arguments)]
-fn fuzz_phase(
-    label: &str,
-    expect: &str,
+struct FuzzPhase<'a> {
+    label: &'a str,
+    expect: &'a str,
     wipe_disk: bool,
     rounds: usize,
-    seed: u64,
-    rng: &mut Lcg,
-    cmd: &Command,
-    dir: &Path,
-    install: &Path,
-    state_path: &Path,
-    svc: &str,
-    ver_url: &str,
-) -> R {
-    println!("killfuzz [{label}]: {rounds} rounds of arbitrary SIGKILL → expect a live, committed {expect}");
-    for round in 0..rounds {
-        // On the install round, half the iterations are stateless (emptyDir wipe → fresh
-        // cold-install), half stateful (state survives → journal recovery). Upgrade rounds keep
-        // the disk on every iteration so the roll-forward-from-committed-state path is exercised.
-        let stateless = wipe_disk && rng.bit();
-        if stateless {
-            let _ = std::fs::remove_dir_all(install);
-        }
-        let stack = Service::spawn("killfuzz", cmd);
-        // Kill at a random instant spanning the install/upgrade/reject/confirm/steady window.
-        let kill_ms = rng.range(150, 3500);
-        std::thread::sleep(std::time::Duration::from_millis(kill_ms));
+}
 
-        // A brick is never acceptable at any kill timing: a healthy floor (1.0.0, later 2.0.0)
-        // always exists at or below the assigned head, so recovery can never run out of targets.
-        if stack.log_contains("no installable application") {
-            let log = stack.captured_log();
-            drop(stack);
-            reap(dir);
-            return fail(format!(
+/// The one node installation a sequence of fuzz phases kills and recovers. Keeping its command,
+/// durable paths, service endpoint and seed together prevents a phase from observing a different
+/// node than the one it killed.
+struct FuzzHarness<'a> {
+    seed: u64,
+    cmd: &'a Command,
+    dir: &'a Path,
+    install: &'a Path,
+    state_path: &'a Path,
+    svc: &'a str,
+    ver_url: &'a str,
+}
+
+impl FuzzHarness<'_> {
+    fn run_phase(&self, phase: FuzzPhase<'_>, rng: &mut Lcg) -> R {
+        let FuzzPhase {
+            label,
+            expect,
+            wipe_disk,
+            rounds,
+        } = phase;
+        let Self {
+            seed,
+            cmd,
+            dir,
+            install,
+            state_path,
+            svc,
+            ver_url,
+        } = *self;
+        println!("killfuzz [{label}]: {rounds} rounds of arbitrary SIGKILL → expect a live, committed {expect}");
+        for round in 0..rounds {
+            // On the install round, half the iterations are stateless (emptyDir wipe → fresh
+            // cold-install), half stateful (state survives → journal recovery). Upgrade rounds keep
+            // the disk on every iteration so the roll-forward-from-committed-state path is exercised.
+            let stateless = wipe_disk && rng.bit();
+            if stateless {
+                let _ = std::fs::remove_dir_all(install);
+            }
+            let stack = Service::spawn("killfuzz", cmd);
+            // Kill at a random instant spanning the install/upgrade/reject/confirm/steady window.
+            let kill_ms = rng.range(150, 3500);
+            std::thread::sleep(std::time::Duration::from_millis(kill_ms));
+
+            // A brick is never acceptable at any kill timing: a healthy floor (1.0.0, later 2.0.0)
+            // always exists at or below the assigned head, so recovery can never run out of targets.
+            if stack.log_contains("no installable application") {
+                let log = stack.captured_log();
+                drop(stack);
+                reap(dir);
+                return fail(format!(
                 "phase {label} round {round} ({}, killed at {kill_ms}ms, seed {seed:#x}): stranded on \
                  'no installable application' — a kill must never brick a node with a healthy floor:\n{log}",
                 if stateless { "stateless" } else { "stateful" }
             ));
-        }
+            }
 
-        // SIGKILL the WHOLE tree, then reap synchronously: `Service::drop` kills the launcher's
-        // process group (taking the agent with it) and joins its monitor; `reap` ends the
-        // hook-managed workload while leaving the mock-CDN server up.
-        drop(stack);
-        reap(dir);
-        // Do not start the next round until the tree is actually gone (service port released).
-        if !wait_until(20, || http_text(ver_url).is_none()) {
-            return fail(format!(
+            // SIGKILL the WHOLE tree, then reap synchronously: `Service::drop` kills the launcher's
+            // process group (taking the agent with it) and joins its monitor; `reap` ends the
+            // hook-managed workload while leaving the mock-CDN server up.
+            drop(stack);
+            reap(dir);
+            // Do not start the next round until the tree is actually gone (service port released).
+            if !wait_until(STOP_TIMEOUT, || http_text(ver_url).is_none()) {
+                return fail(format!(
                 "phase {label} round {round}: the node stack was not fully reaped (service port still held) after the kill"
             ));
+            }
         }
-    }
 
-    // An untouched boot must reconverge to this phase's expected live, committed version — proving
-    // no round's kill left durable state that bricks recovery or strands the wrong release.
-    let stack = Service::spawn("killfuzz", cmd);
-    let live = wait_for_version(svc, expect, 120);
-    let want = expect.to_string();
-    let settled = wait_until(120, || {
-        matches!(
-            updated::state::read_installed(state_path),
-            updated::state::Installed::Present(ref s) if s.release.version == want
-        )
-    });
-    let log = stack.captured_log();
-    drop(stack);
-    reap(dir);
-    if !live || !settled {
-        return fail(format!(
-            "phase {label}: after {rounds} arbitrary SIGKILLs (seed {seed:#x}) the node never \
+        // An untouched boot must reconverge to this phase's expected live, committed version — proving
+        // no round's kill left durable state that bricks recovery or strands the wrong release.
+        let stack = Service::spawn("killfuzz", cmd);
+        let live = wait_for_version(svc, expect, CONVERGE_TIMEOUT);
+        let want = expect.to_string();
+        let settled = wait_until(CONVERGE_TIMEOUT, || {
+            matches!(
+                updated::state::read_installed(state_path),
+                updated::state::Installed::Present(ref s) if s.release.version == want
+            )
+        });
+        let log = stack.captured_log();
+        drop(stack);
+        reap(dir);
+        if !live || !settled {
+            return fail(format!(
+                "phase {label}: after {rounds} arbitrary SIGKILLs (seed {seed:#x}) the node never \
              reconverged to a live, committed {expect} (live={live}, settled={settled}):\n{log}"
-        ));
-    }
-    // Release the port before the next phase respawns the stack.
-    if !wait_until(20, || http_text(ver_url).is_none()) {
-        return fail(format!(
+            ));
+        }
+        // Release the port before the next phase respawns the stack.
+        if !wait_until(STOP_TIMEOUT, || http_text(ver_url).is_none()) {
+            return fail(format!(
             "phase {label}: the settle boot's tree was not fully reaped (service port still held)"
         ));
+        }
+        println!("killfuzz [{label}]: reconverged to a live, committed {expect}");
+        Ok(())
     }
-    println!("killfuzz [{label}]: reconverged to a live, committed {expect}");
-    Ok(())
 }
 
 fn run() -> R {
@@ -236,34 +252,42 @@ fn run() -> R {
         .confirmation_window("3s")
         .launcher()?;
 
-    let install = dir.join("install");
-    let state_path = install.join("state/installed.json");
+    // The canonical layout, never a second copy of it: a hand-written state path keeps passing
+    // after the real layout moves, because the file it watches is simply never written.
+    let paths = e2e::harness::node_paths(&dir);
+    let install = paths.install_root.clone();
+    let state_path = paths.installed.clone();
     let ver_url = format!("http://{svc}/version");
     let rounds = env_u64("KILLFUZZ_ROUNDS", 12) as usize;
     let seed = env_u64("KILLFUZZ_SEED", 0x00C0_FFEE_D00D);
     let mut rng = Lcg(seed);
+    let fuzz = FuzzHarness {
+        seed,
+        cmd: &cmd,
+        dir: &dir,
+        install: &install,
+        state_path: &state_path,
+        svc,
+        ver_url: &ver_url,
+    };
 
     println!(
-        "killfuzz: 3 rounds (install→1.0.0, broken 2.0.0 rollout→rolls back to 1.0.0, healthy 3.0.0 \
-         supersedes→3.0.0), {rounds} kill rounds each (seed {seed:#x})"
+        "killfuzz: 4 rounds — install→1.0.0, broken 2.0.0 rollout→rolls back to 1.0.0, healthy \
+         3.0.0 supersedes→3.0.0 ({rounds} kill rounds each), then interleave \
+         ({INTERLEAVE_TRIALS} trials, one kill each, climbing 3→5→7→9) (seed {seed:#x})"
     );
 
     // Round 1 — cold install. Assignment head is 1.0.0; a kill at any instant of
     // cold-install/confirm/steady must reconverge to a live, committed 1.0.0. This is the only round
     // that wipes the disk (emptyDir restart churn).
-    fuzz_phase(
-        "install",
-        "1.0.0",
-        true,
-        rounds,
-        seed,
+    fuzz.run_phase(
+        FuzzPhase {
+            label: "install",
+            expect: "1.0.0",
+            wipe_disk: true,
+            rounds,
+        },
         &mut rng,
-        &cmd,
-        &dir,
-        &install,
-        &state_path,
-        svc,
-        &ver_url,
     )?;
 
     // Round 2 — a broken 2.0.0 begins rolling out. Its bundle stages and verifies (a valid, signed
@@ -282,13 +306,15 @@ fn run() -> R {
     // rollback — the whole point of the round.
     {
         let stack = Service::spawn("killfuzz", &cmd);
-        let started = wait_until(120, || stack.log_contains("applying update 1.0.0 -> 2.0.0"));
+        let started = wait_until(CONVERGE_TIMEOUT, || {
+            stack.log_contains("applying update 1.0.0 -> 2.0.0")
+        });
         let log = stack.captured_log();
         drop(stack);
         // The next phase rebinds the same port, so the wait for the old listener to disappear is a
         // precondition, not a diagnostic: discarding its result meant the phase could start against
         // a port the previous stack still held and fail for an unrelated reason.
-        if !wait_until(20, || http_text(&ver_url).is_none()) {
+        if !wait_until(STOP_TIMEOUT, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(
                 "round 2: the previous stack never released its listener, so the next phase would \
@@ -307,19 +333,14 @@ fn run() -> R {
     }
     println!("killfuzz [broken-rollout]: node began the 2.0.0 rollout — 3.0.0 will not be published until now");
 
-    fuzz_phase(
-        "broken-rollout",
-        "1.0.0",
-        false,
-        rounds,
-        seed,
+    fuzz.run_phase(
+        FuzzPhase {
+            label: "broken-rollout",
+            expect: "1.0.0",
+            wipe_disk: false,
+            rounds,
+        },
         &mut rng,
-        &cmd,
-        &dir,
-        &install,
-        &state_path,
-        svc,
-        &ver_url,
     )?;
 
     // Round 3 — a healthy 3.0.0 supersedes the failing 2.0.0 head. Only now — after the node has
@@ -327,19 +348,14 @@ fn run() -> R {
     // broken 2.0.0; the node must abandon 2.0.0 and roll forward to a live, committed 3.0.0.
     // Persistent disk — no wipes.
     ctx.publish(&dir, "app", "3.0.0", &app_v(&ctx, "1.0.0"))?;
-    fuzz_phase(
-        "roll-forward",
-        "3.0.0",
-        false,
-        rounds,
-        seed,
+    fuzz.run_phase(
+        FuzzPhase {
+            label: "roll-forward",
+            expect: "3.0.0",
+            wipe_disk: false,
+            rounds,
+        },
         &mut rng,
-        &cmd,
-        &dir,
-        &install,
-        &state_path,
-        svc,
-        &ver_url,
     )?;
 
     // Round 4 — TRUE INTERLEAVE: a broken head is superseded by a healthy one *while the broken
@@ -351,7 +367,7 @@ fn run() -> R {
     //
     // Each trial uses a fresh broken head with unique bytes and an ascending version, so no stale
     // rejection or version floor carries between trials (the node climbs 3→5→7→9).
-    let journal_path = install.join("state/transaction.json");
+    let journal_path = paths.journal.clone();
     const INTERLEAVE_TRIALS: usize = 3;
     for trial in 0..INTERLEAVE_TRIALS {
         let broken_v = format!("{}.0.0", 4 + 2 * trial);
@@ -377,8 +393,10 @@ fn run() -> R {
         // gate stack has already cleared the stale journal and confirmed the predecessor, so the
         // journal we then catch belongs to {broken_v}.
         let stack = Service::spawn("killfuzz", &cmd);
-        let began = wait_until(120, || stack.log_contains(&format!("-> {broken_v}")));
-        // Tight-poll for the fresh journal (written at ActivateStarted, before the entrypoint even
+        let began = wait_until(CONVERGE_TIMEOUT, || {
+            stack.log_contains(&format!("-> {broken_v}"))
+        });
+        // Tight-poll for the fresh journal (written at Activating, before the entrypoint even
         // execs) and SIGKILL the instant it lands — before the failed activation can roll up and a
         // Service restart's recovery can clear it, freezing a genuine in-flight transaction on disk.
         let in_flight = began && {
@@ -410,7 +428,7 @@ fn run() -> R {
         // drain is a race, not a test.
         drop(stack);
         reap(&dir);
-        if !wait_until(20, || http_text(&ver_url).is_none()) {
+        if !wait_until(STOP_TIMEOUT, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(format!(
                 "round 4 trial {trial}: stack tree not reaped after the mid-flight kill"
@@ -431,9 +449,9 @@ fn run() -> R {
         // Boot into recovery. Journal-driven, it must finalize the broken transaction (reject/restore
         // the predecessor) and then roll forward to a live, committed healthy_v.
         let stack = Service::spawn("killfuzz", &cmd);
-        let live = wait_for_version(svc, &healthy_v, 120);
+        let live = wait_for_version(svc, &healthy_v, CONVERGE_TIMEOUT);
         let want = healthy_v.clone();
-        let settled = wait_until(120, || {
+        let settled = wait_until(CONVERGE_TIMEOUT, || {
             matches!(
                 updated::state::read_installed(&state_path),
                 updated::state::Installed::Present(ref s) if s.release.version == want
@@ -469,7 +487,7 @@ fn run() -> R {
                  not exercised (its coverage is the whole point of this round):\n{log}"
             ));
         }
-        if !wait_until(20, || http_text(&ver_url).is_none()) {
+        if !wait_until(STOP_TIMEOUT, || http_text(&ver_url).is_none()) {
             drop(server);
             return fail(format!(
                 "round 4 trial {trial}: settle stack not reaped (service port still held)"

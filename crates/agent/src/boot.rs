@@ -117,14 +117,18 @@ fn complete_pending_rollback(plan: &mut Plan, state: &InstalledState) {
 /// Whether a journal can still *drive* a rollback, asked of the phase machine itself rather than of
 /// a list of phases: the recovery driver's own two steps, replayed on a throwaway copy.
 ///
-/// A journal off the rollback path is first moved onto it (`advance` to `RollbackStarted`), which
+/// A journal off the rollback path is first moved onto it (`advance` to `RollbackActivating`), which
 /// the phase machine refuses from a terminal phase; a journal already on the path has work left
 /// exactly while a resume gate is open, which is what `recovery_pending` up to the final phase
 /// answers. Deriving it this way means a change to the phase machine moves this with it — the
 /// enumerate-one-phase version of this test is precisely what let `RolledBack` through.
-fn drives_rollback(tx: &Transaction) -> bool {
+///
+/// Its negation is the single definition of a SPENT journal — one whose transaction reached its end
+/// state, so nothing is left to reconcile — which is why [`crate::update::apply_update`] asks this
+/// too before deleting one rather than naming the terminal phases a second time.
+pub(crate) fn drives_rollback(tx: &Transaction) -> bool {
     let mut probe = tx.clone();
-    if !probe.is_rollback() && probe.advance(TransactionPhase::RollbackStarted).is_err() {
+    if !probe.is_rollback() && probe.advance(TransactionPhase::RollbackActivating).is_err() {
         return false;
     }
     probe.recovery_pending(TransactionPhase::RolledBack)
@@ -169,7 +173,7 @@ fn reconcile_transaction(
     if tx.candidate_rejection_required {
         plan.reject_app.push((
             tx.candidate_repository_lineage.clone(),
-            tx.candidate_archive_sha256.clone(),
+            tx.candidate_rejection_sha256.clone(),
         ));
         plan.warn(format!(
             "recovery: rejected {} after failed activation",
@@ -256,29 +260,9 @@ fn confirm_if_window_passed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{lineage, provider, release};
     use std::time::Duration;
     use updated::bundle::ReleaseId;
-
-    fn release(version: &str, digest: &str) -> ReleaseId {
-        ReleaseId {
-            version: version.into(),
-            manifest_sha256: digest.into(),
-        }
-    }
-
-    fn lineage() -> updated::state::RepositoryLineage {
-        updated::state::RepositoryLineage::from_metadata_url("https://repo/metadata/")
-    }
-
-    fn provider() -> Box<updated::state::ProviderRelease> {
-        Box::new(updated::state::ProviderRelease {
-            product: "reconciler".into(),
-            release: release("1.0.0", "reconciler-manifest"),
-            archive_sha256: "reconciler-archive".into(),
-            args: Vec::new(),
-            timeout_millis: 1_000,
-        })
-    }
 
     fn steady() -> Situation {
         let current = release("1.0.0", "one");
@@ -316,15 +300,16 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: provider(),
             rollback_health_failures: 0,
-            phase: TransactionPhase::CandidateActivated,
+            phase: TransactionPhase::Activating,
         });
         let plan = plan_boot(&situation);
         assert_eq!(plan.release, ReleaseFix::Activate(release("1.0.0", "one")));
-        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
+        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
         assert!(plan
             .notes
             .iter()
@@ -343,11 +328,12 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: provider(),
             rollback_health_failures: 0,
-            phase: TransactionPhase::CandidateActivated,
+            phase: TransactionPhase::Activating,
         });
         let plan = plan_boot(&situation);
         assert!(plan.reject_app.is_empty());
@@ -374,16 +360,17 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: provider(),
             rollback_health_failures: 0,
-            phase: TransactionPhase::RollbackStarted,
+            phase: TransactionPhase::RollbackActivating,
         });
 
         let plan = plan_boot(&situation);
 
-        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
+        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
     }
 
     #[test]
@@ -398,17 +385,18 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: provider(),
             rollback_health_failures: 0,
-            phase: TransactionPhase::PreflightStarted,
+            phase: TransactionPhase::Prepared,
         });
 
         let plan = plan_boot(&situation);
 
         assert_eq!(plan.release, ReleaseFix::None);
-        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
+        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
         assert!(plan.clear_journal);
     }
 
@@ -422,6 +410,7 @@ mod tests {
             lifecycle: provider(),
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
+                candidate_rejection_sha256: "f".repeat(64),
                 previous_release: predecessor.clone(),
                 previous_archive_sha256: "archive-one".into(),
                 previous_repository_lineage: lineage(),
@@ -444,6 +433,7 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: false,
             lifecycle: provider(),
@@ -456,58 +446,6 @@ mod tests {
         spent_journal(predecessor, candidate, TransactionPhase::Committed)
     }
 
-    /// Every phase of the transaction machine. The `match` is the guard: a phase added to
-    /// `updated::transaction::Phase` makes it non-exhaustive and fails the build, so this list —
-    /// and the spent-journal property below — cannot fall behind the machine it describes.
-    fn all_phases() -> [TransactionPhase; 19] {
-        use TransactionPhase::*;
-        let every = [
-            PreflightStarted,
-            PreflightCompleted,
-            PrepareStarted,
-            Prepared,
-            ActivateStarted,
-            CandidateActivated,
-            HealthStarted,
-            CandidateHealthy,
-            FinalizeStarted,
-            Finalized,
-            CommitStarted,
-            Committed,
-            RollbackStarted,
-            RollbackActivateStarted,
-            PredecessorActivated,
-            RollbackHealthStarted,
-            PredecessorHealthy,
-            RollbackFinalizeStarted,
-            RolledBack,
-        ];
-        for phase in every {
-            match phase {
-                PreflightStarted
-                | PreflightCompleted
-                | PrepareStarted
-                | Prepared
-                | ActivateStarted
-                | CandidateActivated
-                | HealthStarted
-                | CandidateHealthy
-                | FinalizeStarted
-                | Finalized
-                | CommitStarted
-                | Committed
-                | RollbackStarted
-                | RollbackActivateStarted
-                | PredecessorActivated
-                | RollbackHealthStarted
-                | PredecessorHealthy
-                | RollbackFinalizeStarted
-                | RolledBack => {}
-            }
-        }
-        every
-    }
-
     #[test]
     fn every_terminal_journal_phase_is_spent_and_no_other_phase_is() {
         // The property the neutralisation rests on, asked of the phase machine rather than of a
@@ -516,7 +454,7 @@ mod tests {
         // execute, so assert the whole phase space instead.
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        for phase in all_phases() {
+        for phase in TransactionPhase::ALL {
             let tx = spent_journal(predecessor.clone(), candidate.clone(), phase);
             let spent = !drives_rollback(&tx);
             assert_eq!(
@@ -656,6 +594,7 @@ mod tests {
             lifecycle: provider(),
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
+                candidate_rejection_sha256: "f".repeat(64),
                 previous_release: release("1.0.0", "one"),
                 previous_archive_sha256: "archive-one".into(),
                 previous_repository_lineage: lineage(),
@@ -749,16 +688,17 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: candidate,
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: provider(),
             rollback_health_failures: 0,
-            phase: TransactionPhase::RollbackStarted,
+            phase: TransactionPhase::RollbackActivating,
         });
 
         let plan = plan_boot(&situation);
 
-        assert_eq!(plan.reject_app, vec![(lineage(), "archive-two".into())]);
+        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
     }
 
     #[test]
@@ -774,6 +714,7 @@ mod tests {
             lifecycle: provider(),
             pending: Some(Pending {
                 lifecycle_attempt_id: "attempt".into(),
+                candidate_rejection_sha256: "f".repeat(64),
                 previous_release: predecessor.clone(),
                 previous_archive_sha256: "archive-one".into(),
                 previous_repository_lineage: lineage(),

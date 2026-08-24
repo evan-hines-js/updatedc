@@ -15,8 +15,6 @@
 
 use crate::*;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Execution ceiling signed into the `haproxy-lifecycle` provider set. The agent bounds the
@@ -43,7 +41,7 @@ fn backend_servers() -> Vec<BackendServer> {
         .map(|index| {
             let ordinal = external_ordinal(index);
             BackendServer {
-                node: agent_resource_name(ordinal as u8),
+                node: agent_resource_name(ordinal),
                 address: format!("agent-{ordinal}.agents:8080"),
             }
         })
@@ -128,16 +126,11 @@ pub(crate) fn haproxy_statefulset() -> serde_json::Value {
                         "readinessProbe": { "tcpSocket": { "port": "http" }, "periodSeconds": 1, "failureThreshold": 180 },
                         "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] }, "runAsNonRoot": true, "runAsUser": 65532 },
                         "resources": { "requests": { "cpu": "50m", "memory": "64Mi" }, "limits": { "memory": "256Mi" } },
-                        "volumeMounts": [
-                            { "name": "state", "mountPath": "/var/lib/updated" },
-                            { "name": "agent-tls", "mountPath": "/etc/agent-tls", "readOnly": true },
-                            { "name": "tmp", "mountPath": "/tmp" }
-                        ]
+                        "volumeMounts": agent_volume_mounts(vec![
+                            serde_json::json!({ "name": "state", "mountPath": "/var/lib/updated" })
+                        ])
                     }],
-                    "volumes": [
-                        { "name": "tmp", "emptyDir": {} },
-                        { "name": "agent-tls", "secret": { "secretName": "agent-tls" } }
-                    ]
+                    "volumes": agent_volumes(vec![])
                 }
             },
             // Persistent, like every enrolling node: the per-node minted key/cert and the install
@@ -285,22 +278,13 @@ fn publish_haproxy_app(
 }
 
 /// Run `sh -c "<command>"` in the release-server pod with `stdin` piped to it — the escaping-free
-/// way to land arbitrary bytes (a generated config) inside the pod.
+/// way to land arbitrary bytes (a generated config) inside the pod. Built from
+/// [`RELEASE_SERVER_EXEC`] with `-i` added, so the pod and container this addresses stay stated in
+/// exactly one place.
 fn pipe_into_release_server(command: &str, stdin: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut child = kubectl()
-        .args([
-            "-n",
-            NAMESPACE,
-            "exec",
-            "-i",
-            "deployment/release-server",
-            "-c",
-            "release-server",
-            "--",
-            "sh",
-            "-c",
-            command,
-        ])
+        .args(RELEASE_SERVER_EXEC)
+        .args(["-i", "--", "sh", "-c", command])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()?;
@@ -332,13 +316,12 @@ fn haproxy_group_deployment(
     release: &HaproxyRelease,
 ) -> serde_json::Value {
     let mut deployment = edge["spec"]["deployment"].clone();
-    deployment["name"] = format!("{HAPROXY_GROUP}@{HAPROXY_V1}").into();
+    deployment["name"] = versioned_deployment_name(HAPROXY_GROUP, HAPROXY_V1).into();
     deployment["application"] =
         serde_json::json!({"path": release.v1_path, "sha256": release.v1_sha});
     deployment["providerSet"] =
         serde_json::json!({"path": release.provider_path, "sha256": release.provider_sha});
     deployment["releaseRepository"] = minio_release_repository(release_root);
-    deployment["reportUrl"] = REPORT_URL.into();
     deployment["orderedInstallFallback"] = serde_json::json!(false);
     deployment["runtime"]["product"] = "haproxy".into();
     // No install-root override: a node's install root is pinned at enrollment and the agent fails
@@ -363,8 +346,6 @@ fn haproxy_group_deployment(
 /// membership, and the front Service. Idempotent enough to re-run: applies are declarative.
 pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("[e2e] deploying the updated-managed HAProxy tier ({HAPROXY_REPLICAS} HAProxies fronting the external slice)");
-    // Start the pods enrolling now; they install HAProxy while we publish the bundles below.
-    apply_json(&haproxy_statefulset())?;
     // Clone the fully-valid `edge` deployment as the template for every HAProxy deployment spec, so
     // no CRD-required field is ever missing. The MinIO root is what the HAProxy bundles are pinned to.
     let edge: serde_json::Value = serde_json::from_str(&output(kubectl().args([
@@ -404,9 +385,36 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
             "maxUnavailable": 1
         }
     }))?;
-    label_haproxy_agents()?;
+    // Reserve each HAProxy node's identity, WITH its cohort labels, before any pod exists to
+    // enroll — and only after the group above is applied, so the very first assignment such a
+    // node ever resolves is its own group's. The previous shape (enroll first, label the
+    // registered agent afterwards) left a window in which the node was an unmatched member of
+    // the fleet: it was routed to the DEFAULT deployment, installed the sample application, and
+    // — that deployment's version colliding with the HAProxy tier's `1.0.0` — held those foreign
+    // bytes by the same-version rule. The stowaway workload kept `:8080` bound, so the tier's
+    // first real upgrade failed activation on that node, was durably rejected, and halted the
+    // deployment fleet-wide. Reserving first closes the window structurally instead of narrowing
+    // it: there is no instant at which the node is enrolled but unlabeled.
+    for ordinal in 0..HAPROXY_REPLICAS {
+        let node = format!("haproxy-{ordinal}");
+        apply_json(&serde_json::json!({
+            "apiVersion": "updated.dev/v1alpha1",
+            "kind": "UpdateAgent",
+            "metadata": {"name": resource_name(&node), "namespace": NAMESPACE},
+            "spec": {
+                "repositoryRef": {"name": "default"},
+                "identity": {"kind": "reserved"},
+                "labels": {
+                    NODE_LABEL: node,
+                    COHORT_LABEL: HAPROXY_COHORT,
+                    KIND_LABEL: "haproxy"
+                }
+            }
+        }))?;
+    }
+    apply_json(&haproxy_statefulset())?;
     apply_haproxy_front_service()?;
-    deploy_haproxy_healthproxy()?;
+    deploy_haproxy_healthproxy().await?;
     println!("[e2e] waiting for the HAProxy tier to install and become ready");
     run(kubectl().args([
         "-n",
@@ -416,23 +424,6 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
         "statefulset/haproxy",
         "--timeout=300s",
     ]))?;
-    Ok(())
-}
-
-/// Label each HAProxy pod's enrolled `UpdateAgent` into the `haproxy` cohort the group selects.
-/// Retries until the agent has registered (`patch_agent_labels` waits).
-pub(crate) fn label_haproxy_agents() -> Result<(), Box<dyn std::error::Error>> {
-    for ordinal in 0..HAPROXY_REPLICAS {
-        let node = format!("haproxy-{ordinal}");
-        patch_agent_labels(
-            &resource_name(&node),
-            serde_json::json!({
-                NODE_LABEL: node,
-                COHORT_LABEL: HAPROXY_COHORT,
-                KIND_LABEL: "haproxy"
-            }),
-        )?;
-    }
     Ok(())
 }
 
@@ -451,60 +442,29 @@ pub(crate) fn apply_haproxy_front_service() -> Result<(), Box<dyn std::error::Er
     }))
 }
 
-/// Deploy a HAProxy-mode `updated-healthproxy`: it reads the backend nodes' signed CDN health and
-/// programs each HAProxy's `fleet` backend membership over the admin runtime API
-/// (`set server fleet/<node> state ready|drain`). Setting `HEALTHPROXY_HAPROXY_ENDPOINTS` is what
-/// flips the binary from the EndpointSlice backend to the HAProxy backend; it needs no kube client,
-/// hence no RBAC (unlike the EndpointSlice reconciler).
-pub(crate) fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::error::Error>> {
-    let members = backend_servers()
-        .into_iter()
-        .map(|server| {
-            // Append each node's pinned public key so the healthproxy verifies the signed report,
-            // not merely its shape — the same key the control-plane throttle pins.
-            let key = agent_pinned_public_key(&server.node)?;
-            Ok(format!("{}={}={key}", server.node, server.address))
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
-        .join(",");
-    let endpoints = (0..HAPROXY_REPLICAS)
+/// Declare the HAProxy Runtime API backend. The same external-agent selector used by the
+/// EndpointSlice backend drives this independent projection; the operator resolves addresses and
+/// pinned identities and creates a tokenless workload identity with no Role.
+pub(crate) async fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoints: Vec<String> = (0..HAPROXY_REPLICAS)
         .map(|ordinal| format!("haproxy-{ordinal}.agents:{}", HAPROXY_ADMIN_PORT))
-        .collect::<Vec<_>>()
-        .join(",");
+        .collect();
     apply_json(&serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {"name": "haproxy-healthproxy", "namespace": NAMESPACE},
+        "apiVersion": "updated.dev/v1alpha1",
+        "kind": "UpdateBackend",
+        "metadata": {"name": "haproxy", "namespace": NAMESPACE},
         "spec": {
-            "replicas": 1,
-            "selector": {"matchLabels": {"app": "haproxy-healthproxy"}},
-            "template": {
-                "metadata": {"labels": {"app": "haproxy-healthproxy"}},
-                "spec": {
-                    "containers": [{
-                        "name": "healthproxy",
-                        "image": "updatec-e2e:kind",
-                        "imagePullPolicy": "Never",
-                        "command": ["/usr/local/bin/updated-healthproxy"],
-                        "env": [
-                            {"name": "HEALTHPROXY_HEALTH_BASE", "value": HEALTH_CDN},
-                            {"name": "HEALTHPROXY_MEMBERS", "value": members},
-                            {"name": "HEALTHPROXY_HAPROXY_ENDPOINTS", "value": endpoints},
-                            {"name": "HEALTHPROXY_HAPROXY_BACKEND", "value": HAPROXY_BACKEND}
-                        ]
-                    }]
-                }
+            "repositoryRef": {"name": "default"},
+            "selector": {"matchLabels": {COHORT_LABEL: EXTERNAL_COHORT}},
+            "healthBase": HEALTH_CDN,
+            "target": {
+                "kind": "haProxy",
+                "endpoints": endpoints,
+                "backend": HAPROXY_BACKEND
             }
         }
     }))?;
-    run(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "rollout",
-        "status",
-        "deployment/haproxy-healthproxy",
-        "--timeout=120s",
-    ]))
+    await_operator_deployment("updated-backend-haproxy", 120).await
 }
 
 /// Drive the HAProxy tier through a 1.0.0 → 2.0.0 in-place upgrade while a synthetic client hits
@@ -515,59 +475,81 @@ pub(crate) fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::error::Err
 /// The upgrade is a pure group patch to the pre-published 2.0.0 target (read from the annotation
 /// `prepare_haproxy_tier` stamped), so it is signed-store-driven, never a live publish. Convergence
 /// is gated on the durable control-plane `reportedVersion`, never on transient probing.
+/// The in-cluster load-probe pod behind the zero-lost-requests assertion, and the shape of the
+/// claim it enforces. The pod runs `updatec-e2e load-probe` (see `crate::probe`) against the
+/// front Service from INSIDE the cluster, so the measurement rides the exact path production
+/// traffic does and carries none of the `kubectl port-forward` reconnect noise the previous
+/// probe's availability tolerance existed to absorb. With that noise gone the tolerance goes
+/// with it: a correct SIGUSR2 re-exec keeps the listeners bound and `-sf` drains the old worker,
+/// so across the whole upgrade NOTHING on this path may fail — the assertion is `failed == 0`,
+/// with a bounded blackout window (`max_gap_ms`) so a stall that merely queues requests cannot
+/// hide behind requests that eventually succeeded.
+const LOAD_PROBE_POD: &str = "haproxy-load-probe";
+/// Pacing between sequential probe requests: ~40 req/s of steady load.
+const LOAD_PROBE_INTERVAL_MS: u64 = 25;
+/// The fewest observations a verdict may rest on, counted from the instant the group is patched —
+/// a DELTA, never the cumulative total. At 25ms pacing 400 samples is ~10s, but the window the
+/// verdict certifies runs to the convergence deadline, so a cumulative floor was cleared by a
+/// probe that watched the first ten seconds and then died (evicted, OOM-killed; `restartPolicy:
+/// Never` leaves the pod's last cumulative line readable by `kubectl logs` forever). The delta,
+/// together with the pod still being `Running` when the verdict is read, is what makes "the probe
+/// was alive across the re-exec" a checked fact rather than an assumption.
+const LOAD_PROBE_MIN_SAMPLES: u64 = 400;
+/// The longest the front may go without a successful response. Two seconds is far above any
+/// healthy in-cluster round trip and far below what a dropped listener costs.
+const LOAD_PROBE_MAX_GAP_MS: u64 = 2000;
+
 pub(crate) async fn assert_haproxy_zero_downtime_upgrade() -> Result<(), Box<dyn std::error::Error>>
 {
     println!("[e2e] verifying the updated-managed HAProxy tier and its zero-downtime upgrade");
     // Both HAProxies must already be serving 1.0.0 before we start.
     wait_for_haproxy_version(HAPROXY_V1, 240).await?;
+    // And the front must proxy real backend traffic before anything is measured or touched.
+    wait_for_front(120, "a backend /version response", |body| {
+        !body.trim().is_empty()
+    })
+    .await?;
 
-    // Port-forward the front Service and confirm traffic proxies THROUGH HAProxy to a backend
-    // service (a non-empty /version body) before we touch anything.
-    let port = std::env::var("UPDATEC_HAPROXY_PORT").unwrap_or_else(|_| "8099".into());
-    let mut forward = kubectl()
+    apply_json(&serde_json::json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": LOAD_PROBE_POD, "namespace": NAMESPACE},
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "probe",
+                "image": "updatec-e2e:kind",
+                "imagePullPolicy": "Never",
+                "command": [
+                    "/usr/local/bin/updatec-e2e", "load-probe",
+                    format!("http://{HAPROXY_FRONT_SERVICE}/version"),
+                    LOAD_PROBE_INTERVAL_MS.to_string(),
+                ],
+            }],
+        }
+    }))?;
+    let result = drive_haproxy_upgrade().await;
+    // The probe has no stop of its own; the pod's deletion is the stop, on every exit path.
+    let _ = kubectl()
         .args([
             "-n",
             NAMESPACE,
-            "port-forward",
-            &format!("service/{HAPROXY_FRONT_SERVICE}"),
-            &format!("{port}:80"),
+            "delete",
+            "pod",
+            LOAD_PROBE_POD,
+            "--ignore-not-found",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let result = drive_haproxy_upgrade(&port).await;
-    let _ = forward.kill();
+        .status();
     result
 }
 
-async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let front = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(800))
-        .build()?;
-    wait_for_front_serving(&client, &front).await?;
-    println!("[e2e] HAProxy front is serving backend traffic; starting the load probe and upgrade");
-
-    // A continuous readiness-respecting probe against the front, exactly like the fleet's synthetic
-    // load test: it records every outcome while the upgrade runs.
-    let stop = Arc::new(AtomicBool::new(false));
-    let total = Arc::new(AtomicU64::new(0));
-    let failed = Arc::new(AtomicU64::new(0));
-    let probe = {
-        let (stop, total, failed) = (stop.clone(), total.clone(), failed.clone());
-        let client = client.clone();
-        let url = format!("{front}/version");
-        tokio::spawn(async move {
-            while !stop.load(Ordering::Relaxed) {
-                let ok = matches!(client.get(&url).send().await, Ok(r) if r.status().is_success());
-                total.fetch_add(1, Ordering::Relaxed);
-                if !ok {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-    };
+async fn drive_haproxy_upgrade() -> Result<(), Box<dyn std::error::Error>> {
+    // The probe must be observing BEFORE the upgrade starts, or the re-exec happens off camera.
+    await_for(120, "the load probe to start observing the front", || {
+        Ok(probe_summary().is_some_and(|summary| summary.total > 0))
+    })
+    .await?;
+    println!("[e2e] in-cluster load probe is observing the front; starting the upgrade");
 
     // Upgrade the self-protecting group to the pre-published 2.0.0 target. Intra-group admission
     // publishes it to the two HAProxies one at a time. Bracket notation for the annotation key — and
@@ -589,10 +571,12 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
     let next_path = next_path.trim();
     let next_sha = next_sha.trim();
     if next_path.is_empty() || next_sha.is_empty() {
-        stop.store(true, Ordering::Relaxed);
-        let _ = probe.await;
         return Err("HAProxy group carries no pre-published 2.0.0 target annotation".into());
     }
+    // The probe's counters are cumulative, so the samples that certify the upgrade are the ones
+    // taken after this line. Everything before it belongs to the pre-flight, and counting it would
+    // let a probe that died early clear the coverage floor on requests nobody was upgrading during.
+    let before_patch = probe_summary().map_or(0, |summary| summary.total);
     run(kubectl().args([
         "-n",
         NAMESPACE,
@@ -602,131 +586,138 @@ async fn drive_haproxy_upgrade(port: &str) -> Result<(), Box<dyn std::error::Err
         "--type=merge",
         "-p",
         &serde_json::to_string(&serde_json::json!({"spec": {"deployment": {
-            "name": format!("{HAPROXY_GROUP}@{HAPROXY_V2}"),
+            "name": versioned_deployment_name(HAPROXY_GROUP, HAPROXY_V2),
             "application": {"path": next_path, "sha256": next_sha}
         }}}))?,
     ]))?;
 
     // Gate convergence on the durable control-plane reportedVersion — never on the probe.
-    let converged = wait_for_haproxy_version(HAPROXY_V2, 240).await;
-    // And confirm the running config actually re-execed (the front now reports 2.0.0).
-    let reexeced = converged.is_ok()
-        && wait_for_front_version(&client, &front, HAPROXY_V2)
-            .await
-            .is_ok();
+    wait_for_haproxy_version(HAPROXY_V2, 240).await?;
+    // Both instances really re-execed: the Service balances across the pair, so only a run of
+    // consecutive 2.0.0 answers proves no old worker is still answering behind it.
+    let want = format!("haproxy {HAPROXY_V2}");
+    let mut consecutive = 0usize;
+    wait_for_front_path(
+        60,
+        "/haproxy-version",
+        "every instance re-execed to 2.0.0",
+        |body| {
+            if body.trim() == want {
+                consecutive += 1;
+            } else {
+                consecutive = 0;
+            }
+            consecutive >= 10
+        },
+    )
+    .await?;
 
-    // Let the probe run past convergence and collect a window large enough to measure the stated
-    // SLA. At 99.5%, fewer than 200 observations cannot tolerate even one transient failure, which
-    // turns an otherwise identical upgrade into a pass or failure based only on how quickly it
-    // converged. Keep the wall-clock bound so a wedged probe still fails promptly below.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let sample_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while total.load(Ordering::Relaxed) < 200 && tokio::time::Instant::now() < sample_deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    stop.store(true, Ordering::Relaxed);
-    let _ = probe.await;
-    converged?;
-    if !reexeced {
-        return Err(
-            "HAProxy converged to 2.0.0 but the front never reported the re-execed version".into(),
-        );
-    }
-
-    let total = total.load(Ordering::Relaxed);
-    let failed = failed.load(Ordering::Relaxed);
-    let availability = if total == 0 {
-        0.0
-    } else {
-        (total - failed) as f64 / total as f64 * 100.0
-    };
-    // The availability line this tier is held to. A correct SIGUSR2 re-exec (and rolling the two
-    // HAProxies one at a time) drops no connection, so availability stays pinned here; a botched
-    // upgrade that dropped the front would tank it far below. A tiny tolerance absorbs port-forward
-    // reconnect blips (the probe crosses the host↔cluster boundary), not a real outage.
-    if total < 200 {
+    // Keep observing past convergence, then read the probe's cumulative verdict. The lines are
+    // cumulative, so the last one covers the whole run.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The probe must still be ALIVE to have watched the window it certifies. A pod with
+    // `restartPolicy: Never` that was evicted or OOM-killed keeps serving its last cumulative line
+    // to `kubectl logs`, so reading a summary proves nothing about when it was written.
+    let phase = kubectl_value("pod", LOAD_PROBE_POD, "{.status.phase}")?;
+    if phase.trim() != "Running" {
         return Err(format!(
-            "HAProxy load probe recorded too few samples ({total}) to judge availability"
+            "the load probe pod is {} and not Running, so its summary does not cover the re-exec \
+             it would certify",
+            phase.trim()
         )
         .into());
     }
-    if availability < HAPROXY_SLA_TARGET {
+    let summary =
+        probe_summary().ok_or("the load probe emitted no summary to judge the upgrade by")?;
+    let during_upgrade = summary.total.saturating_sub(before_patch);
+    if during_upgrade < LOAD_PROBE_MIN_SAMPLES {
         return Err(format!(
-            "HAProxy upgrade dropped traffic: {failed}/{total} requests failed ({availability:.2}% available, SLA {HAPROXY_SLA_TARGET}%)"
+            "the load probe recorded too few samples ({during_upgrade} of {}) after the group was \
+             patched to judge the upgrade",
+            summary.total
+        )
+        .into());
+    }
+    if summary.failed != 0 {
+        return Err(format!(
+            "HAProxy upgrade dropped traffic: {}/{} requests failed (first: {})",
+            summary.failed, summary.total, summary.first_failure
+        )
+        .into());
+    }
+    if summary.max_gap_ms > LOAD_PROBE_MAX_GAP_MS {
+        return Err(format!(
+            "HAProxy upgrade stalled the front for {}ms (bound {LOAD_PROBE_MAX_GAP_MS}ms) even \
+             though no request failed outright",
+            summary.max_gap_ms
         )
         .into());
     }
     println!(
-        "HAPROXY PASS: {HAPROXY_REPLICAS} updated-managed HAProxies upgraded {HAPROXY_V1}\u{2192}{HAPROXY_V2} in place with {availability:.2}% front availability ({failed}/{total} failed) across the SIGUSR2 re-exec"
+        "HAPROXY PASS: {HAPROXY_REPLICAS} updated-managed HAProxies upgraded {HAPROXY_V1} -> {HAPROXY_V2} in place with 0/{} requests lost ({during_upgrade} of them after the patch, from a probe still running at the verdict) and a worst gap of {}ms across the SIGUSR2 re-exec",
+        summary.total, summary.max_gap_ms
     );
     Ok(())
+}
+
+/// The probe pod's latest cumulative summary, or `None` while it has not emitted one (or the read
+/// itself failed — every caller polls or has already bounded the run with the sample floor).
+fn probe_summary() -> Option<crate::probe::Summary> {
+    let logs =
+        output(kubectl().args(["-n", NAMESPACE, "logs", LOAD_PROBE_POD, "--tail=5"])).ok()?;
+    crate::probe::Summary::from_logs(&logs)
+}
+
+/// Wait until the front Service, reached from INSIDE the cluster (a curl from the release-server
+/// pod — the same trust boundary production clients sit in), answers `path` with a body `accept`
+/// approves. The single front-read primitive: pre-flight serving checks and the re-exec proof both
+/// go through it, so there is no second, differently-flaky way to ask the front a question.
+async fn wait_for_front_path(
+    seconds: usize,
+    path: &str,
+    what: &str,
+    mut accept: impl FnMut(&str) -> bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("http://{HAPROXY_FRONT_SERVICE}{path}");
+    let deadline = Instant::now() + Duration::from_secs(seconds as u64);
+    while Instant::now() < deadline {
+        if let Ok(body) = cluster_curl(&url) {
+            if accept(&body) {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Err(format!("HAProxy front never satisfied: {what}").into())
+}
+
+async fn wait_for_front(
+    seconds: usize,
+    what: &str,
+    accept: impl FnMut(&str) -> bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_front_path(seconds, "/version", what, accept).await
 }
 
 /// Wait until every HAProxy node's `UpdateAgent` durably reports `version`.
 async fn wait_for_haproxy_version(
     version: &str,
-    attempts: usize,
+    seconds: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let nodes: Vec<String> = (0..HAPROXY_REPLICAS)
         .map(|ordinal| resource_name(&format!("haproxy-{ordinal}")))
         .collect();
-    for _ in 0..attempts {
-        let converged = nodes.iter().all(|node| {
-            kubectl_value("updateagent", node, "{.status.reportedVersion}")
-                .map(|v| v.trim() == version)
-                .unwrap_or(false)
-        });
-        if converged {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    Err(format!("HAProxy tier never converged to {version}").into())
-}
-
-/// Wait until the front Service proxies a non-empty `/version` body from a backend service.
-async fn wait_for_front_serving(
-    client: &reqwest::Client,
-    front: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{front}/version");
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
-        if let Ok(response) = client.get(&url).send().await {
-            if response.status().is_success() {
-                if let Ok(body) = response.text().await {
-                    if !body.trim().is_empty() {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    Err("HAProxy front never proxied a backend /version response".into())
-}
-
-/// Wait until the front's `/haproxy-version` reports `version` — proof the in-place re-exec swapped
-/// the running configuration, not just the control-plane record.
-async fn wait_for_front_version(
-    client: &reqwest::Client,
-    front: &str,
-    version: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("{front}/haproxy-version");
-    let want = format!("haproxy {version}");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        if let Ok(response) = client.get(&url).send().await {
-            if let Ok(body) = response.text().await {
-                if body.trim() == want {
-                    return Ok(());
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    Err(format!("HAProxy front never reported the re-execed version {version}").into())
+    await_for(
+        seconds,
+        &format!("the HAProxy tier to report {version}"),
+        || {
+            Ok(nodes.iter().all(|node| {
+                kubectl_value("updateagent", node, "{.status.reportedVersion}")
+                    .is_ok_and(|reported| reported.trim() == version)
+            }))
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -735,7 +726,7 @@ mod tests {
 
     fn edge_group() -> serde_json::Value {
         let deployment = updatec::DeploymentSpec {
-            name: "edge@1.0.0".into(),
+            name: versioned_deployment_name("edge", "1.0.0"),
             release_repository: updatec::ReleaseRepositorySpec {
                 metadata_url: "https://release/metadata/".into(),
                 targets_url: "https://release/targets/".into(),
@@ -754,20 +745,19 @@ mod tests {
                 product: "sampleapp".into(),
                 channel: "stable".into(),
                 install_root: "/var/lib/updated/app".into(),
-                secrets: Vec::new(),
-                repository: updatec::RepositoryLimitsSpec {
+                repository: updated_contracts::assignment::ManagedRepositoryLimits {
                     metadata_limit: 1 << 20,
                     target_limit: 512 << 20,
                     transport_timeout_seconds: 30,
                 },
-                storage: updatec::StorageSpec {
+                storage: updated_contracts::assignment::ManagedStorage {
                     inactive_releases: 2,
                     inactive_providers: 2,
                     inactive_agents: 2,
                     inactive_bytes: 1 << 30,
                     inactive_repository_caches: 2,
                 },
-                timeouts: updatec::TimeoutsSpec {
+                timeouts: updated_contracts::assignment::ManagedTimeouts {
                     check_interval_seconds: 15,
                     health_grace_seconds: 30,
                     health_successes: 1,
@@ -777,7 +767,6 @@ mod tests {
                     agent_check_interval_seconds: 3600,
                 },
             },
-            report_url: "https://gateway/v1/node/report".into(),
         };
         serde_json::json!({
             "spec": { "deployment": serde_json::to_value(deployment).unwrap() }

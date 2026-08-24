@@ -143,11 +143,25 @@ impl Chaos {
         let mut settled_broken: HashSet<String> = HashSet::new();
         let mut settled_valid: HashSet<String> = HashSet::new();
         let mut last_logged_secs = 0u64;
+        let mut last_error = String::new();
         // Generous ceiling: the whole fleet pipelines a few groups at a time, and controller chaos
         // (recovering only after lease expiry) can stretch a rollout well past its uncontested
         // duration — it must still finish, just slower.
         for _ in 0..FLEET_ROLLOUT_TIMEOUT_SECS {
-            let fleet = self.fleet.nodes().await?;
+            // This loop polls the apiserver once a second for the whole rollout while the chaos
+            // injector is deleting controller pods, so a transient list failure is not a verdict:
+            // it is retried like an unsettled pass and reported only if the wait runs out.
+            let fleet = match self.fleet.nodes().await {
+                Ok(fleet) => {
+                    last_error.clear();
+                    fleet
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             let mut by_group: BTreeMap<&str, Vec<&FleetNode>> = BTreeMap::new();
             for node in fleet.iter().filter(|node| is_cohort_member(node)) {
                 if let Some(group) = node.selected_group.as_deref() {
@@ -252,10 +266,15 @@ impl Chaos {
         Err(format!(
             "generation did not settle within {FLEET_ROLLOUT_TIMEOUT_SECS} seconds: {} of {} \
              cohorts settled; {} of the cohorts queued behind a rejecting sibling never advanced \
-             {wedged:?} — a rejecting group is holding its set's slot",
+             {wedged:?} — a rejecting group is holding its set's slot{}{last_error}",
             settled_broken.len() + settled_valid.len(),
             exercised.len(),
             wedged.len(),
+            if last_error.is_empty() {
+                ""
+            } else {
+                "; last error: "
+            }
         )
         .into())
     }
@@ -272,6 +291,12 @@ impl Chaos {
     /// durable fact and the webhook is one delivery of its transition, and a system that publishes
     /// the first while silently dropping the second is exactly the "contained but silent" failure
     /// the alerting exists to end.
+    ///
+    /// All three are asserted PER COHORT, and the delivery is bound to the halt beside it by the
+    /// resource it names and the canonical versioned deployment identity in its evidence. Any weaker filter —
+    /// "some DeploymentHalted document arrived" — is satisfied by a single delivery, so a sink
+    /// that delivered one halt and dropped the other fifteen would still pass, which is precisely
+    /// the silence the pairing is here to detect.
     async fn assert_halt_and_alert(
         &self,
         broken_cohorts: &[usize],
@@ -283,68 +308,83 @@ impl Chaos {
         let mut last = String::new();
         for _ in 0..120 {
             let mut pending = Vec::new();
+            let delivered = delivered_alerts();
+            let mut matched: Vec<&serde_json::Value> = Vec::new();
             for cohort in broken_cohorts {
                 let group = cohort_group(*cohort);
                 let set = set_name(cohort_set_index(*cohort));
                 // The deployment identity the group was rolled to, spelled exactly as `deploy`
                 // patched it — so this cannot pass on a halt of some other body.
-                let deployment = format!("{group}@{bad_version}");
+                let deployment = versioned_deployment_name(&group, bad_version);
                 if !halted_deployments(&set).contains(&deployment) {
                     pending.push(format!("{set}.status.halted lacks {deployment}"));
                     continue;
                 }
-                if condition_status(&group, "DeploymentHalted").as_deref() != Some("True") {
+                if condition_field(&group, "DeploymentHalted", "status").as_deref() != Some("True")
+                {
                     pending.push(format!("{group}/DeploymentHalted is not True"));
                 }
+                // The delivery is required PER COHORT and bound to this cohort's identity: the
+                // sink coalesces on `(resource, condition)`, so the halts of N broken cohorts are
+                // N distinct pending documents. A filter on the condition name alone was satisfied
+                // by any one of them — a drain that delivered the first and then stopped passed
+                // while every other halt was silently dropped, which is the exact failure this
+                // assertion is paired with the condition check to catch. The condition message
+                // names the halted body (`deployment <group>-<version> is halted: …`), so the
+                // evidence field is what ties a document to the halt just asserted.
+                let by_set = format!("UpdateGroupSet/{set}");
+                let by_group = format!("UpdateGroup/{group}");
+                let found = delivered.iter().find(|alert| {
+                    alert["condition"] == "DeploymentHalted"
+                        && alert["state"] == "True"
+                        && alert["resource"]
+                            .as_str()
+                            .is_some_and(|name| name == by_set || name == by_group)
+                        && alert["evidence"]
+                            .as_str()
+                            .is_some_and(|evidence| evidence.contains(&deployment))
+                });
+                match found {
+                    Some(alert) => matched.push(alert),
+                    None => pending.push(format!(
+                        "no DeploymentHalted document naming {by_set} or {by_group} with \
+                         {deployment} in its evidence reached the webhook receiver"
+                    )),
+                }
             }
-            let delivered = delivered_alerts();
-            let alerted: Vec<&serde_json::Value> = delivered
-                .iter()
-                .filter(|alert| {
-                    alert["condition"] == "DeploymentHalted" && alert["state"] == "True"
-                })
-                .collect();
-            if pending.is_empty() && !alerted.is_empty() {
+            if pending.is_empty() {
                 // The payload is the generic document `alerting-design.md` specifies — every field
                 // present, naming the resource whose condition flipped and carrying the evidence
                 // behind the verdict. A delivery that arrived shaped differently would satisfy a
                 // "did anything arrive" check and be useless to a receiver.
-                let alert = alerted[0];
-                for field in [
-                    "resource",
-                    "condition",
-                    "state",
-                    "reason",
-                    "evidence",
-                    "timestamp",
-                ] {
-                    if !alert[field].is_string() {
-                        return Err(
-                            format!("the delivered alert is missing {field}: {alert}").into()
-                        );
+                for alert in &matched {
+                    for field in [
+                        "resource",
+                        "condition",
+                        "state",
+                        "reason",
+                        "evidence",
+                        "timestamp",
+                    ] {
+                        if !alert[field].is_string() {
+                            return Err(
+                                format!("the delivered alert is missing {field}: {alert}").into()
+                            );
+                        }
                     }
                 }
-                let resource = alert["resource"].as_str().unwrap_or_default();
-                if !resource.starts_with("UpdateGroupSet/") && !resource.starts_with("UpdateGroup/")
-                {
-                    return Err(
-                        format!("the delivered alert names no known resource: {alert}").into(),
-                    );
-                }
+                let example = matched.first().copied().unwrap_or(&serde_json::Value::Null);
                 println!(
                     "[e2e] regression halt on {bad_version} is published on every affected set and \
-                     group, and {} DeploymentHalted alert(s) were delivered to the webhook (e.g. \
-                     {resource}: {})",
-                    alerted.len(),
-                    alert["evidence"].as_str().unwrap_or_default()
+                     group, and each of the {} halted cohort(s) has its own DeploymentHalted \
+                     document at the webhook (e.g. {}: {})",
+                    broken_cohorts.len(),
+                    example["resource"].as_str().unwrap_or_default(),
+                    example["evidence"].as_str().unwrap_or_default()
                 );
                 return Ok(());
             }
-            last = if pending.is_empty() {
-                "no DeploymentHalted alert has been delivered to the webhook receiver".to_string()
-            } else {
-                pending.join("; ")
-            };
+            last = pending.join("; ");
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         Err(format!("the regression halt never reached its records or its webhook: {last}").into())
@@ -364,15 +404,38 @@ impl Chaos {
         // set admits no new rollout, so its time cannot count against convergence, and a freeze
         // being added or lifted resets the clock so the fleet always gets a full window once the
         // gate reopens.
+        //
+        // A second, ABSOLUTE ceiling bounds that pause. A set frozen for ever (a planner bug that
+        // leaves a window closed) resets the admitting clock on every pass, so the budget alone can
+        // never run out — the run would hang until CI's own timeout killed it with no diagnostic at
+        // all. The ceiling turns that control-plane defect back into the failure below, naming the
+        // sets that were still frozen.
+        let hard_deadline =
+            Instant::now() + Duration::from_secs(3 * FLEET_ROLLOUT_TIMEOUT_SECS as u64);
         let mut attempt = 0usize;
         let mut was_frozen = false;
-        while attempt < FLEET_ROLLOUT_TIMEOUT_SECS {
-            let frozen = self.any_set_frozen().await;
+        let mut last_error = String::new();
+        while attempt < FLEET_ROLLOUT_TIMEOUT_SECS && Instant::now() < hard_deadline {
+            let frozen_sets = self.frozen_sets().await;
+            let frozen = !frozen_sets.is_empty();
             if frozen || frozen != was_frozen {
                 attempt = 0;
             }
             was_frozen = frozen;
-            let fleet = self.fleet.nodes().await?;
+            // A transient list failure is not a verdict here either: retried like an unconverged
+            // pass, reported only if the wait runs out.
+            let fleet = match self.fleet.nodes().await {
+                Ok(fleet) => {
+                    last_error.clear();
+                    fleet
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    attempt += 1;
+                    continue;
+                }
+            };
             let cohort: Vec<&FleetNode> =
                 fleet.iter().filter(|node| is_cohort_member(node)).collect();
             let on_target = cohort
@@ -396,26 +459,51 @@ impl Chaos {
             tokio::time::sleep(Duration::from_secs(1)).await;
             attempt += 1;
         }
+        let still_frozen = self.frozen_sets().await;
         Err(format!(
-            "fleet did not converge onto {converge_version} within {FLEET_ROLLOUT_TIMEOUT_SECS} seconds"
+            "fleet did not converge onto {converge_version} within {FLEET_ROLLOUT_TIMEOUT_SECS} \
+             seconds of admitting time{}{}{}{last_error}",
+            if still_frozen.is_empty() {
+                String::new()
+            } else {
+                format!("; these sets are still frozen and admit nothing: {still_frozen:?}")
+            },
+            if Instant::now() >= hard_deadline {
+                " (the absolute ceiling was reached, so the clock was being paused by a freeze)"
+            } else {
+                ""
+            },
+            if last_error.is_empty() {
+                ""
+            } else {
+                "; last error: "
+            }
         )
         .into())
     }
 
-    /// Whether the operator currently has any throttle set frozen (a set outside its rollout
-    /// window/calendar). While frozen no new rollout is admitted, so the convergence wait must
-    /// not count that time against its budget. Best-effort: an API hiccup reads as not-frozen so
-    /// a transient error can never wedge the loop.
-    async fn any_set_frozen(&self) -> bool {
+    /// The throttle sets the operator currently reports frozen (outside their rollout
+    /// window/calendar), by name. While frozen no new rollout is admitted, so the convergence wait
+    /// must not count that time against its budget — and when the wait fails, these are the sets
+    /// that explain why. Best-effort: an API hiccup reads as nothing frozen, so a transient error
+    /// can never wedge the loop.
+    async fn frozen_sets(&self) -> Vec<String> {
         self.fleet
             .sets()
             .list(&Default::default())
             .await
             .map(|sets| {
                 sets.into_iter()
-                    .any(|set| set.status.and_then(|status| status.frozen).unwrap_or(false))
+                    .filter(|set| {
+                        set.status
+                            .as_ref()
+                            .and_then(|status| status.frozen)
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|set| set.metadata.name)
+                    .collect()
             })
-            .unwrap_or(false)
+            .unwrap_or_default()
     }
 
     /// The one chaos mechanism, fired a random 0-5s into the rollout. It abruptly SIGKILLs pods —

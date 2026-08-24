@@ -7,17 +7,18 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::Ed25519KeyPair;
 use tough::editor::signed::{SignedRepository, SignedRole};
 use tough::editor::RepositoryEditor;
-use tough::key_source::{KeySource, LocalKeySource};
+use tough::key_source::KeySource;
 use tough::schema::decoded::{Decoded, Hex};
 use tough::schema::key::Key;
 use tough::schema::{KeyHolder, RoleKeys, RoleType, Root, Signed, Target};
 use tough::sign::{parse_keypair, Sign};
-use tough::{FilesystemTransport, RepositoryLoader, TargetName};
+use tough::{FilesystemTransport, Repository, RepositoryLoader, TargetName};
 use url::Url;
 
 /// An authoring error.
@@ -32,6 +33,95 @@ impl std::fmt::Display for RepoError {
 impl std::error::Error for RepoError {}
 
 type Result<T> = std::result::Result<T, RepoError>;
+
+/// The complete private-key set for a rotatable repository. Provisioning and controller
+/// materialization both iterate this constant, so a newly minted standby root cannot be dropped
+/// between the key generator and the signer.
+pub const KEY_FILE_NAMES: [&str; 5] = [
+    "root.pk8",
+    "root.next.pk8",
+    "targets.pk8",
+    "snapshot.pk8",
+    "timestamp.pk8",
+];
+
+/// Authoring metadata has the same fleet-scale ceiling as the routing client. This is deliberately
+/// independent of artifact size: release archives stream and may be large, while every role file
+/// is a bounded JSON trust document.
+const AUTHORING_METADATA_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SIGNING_KEY_MAX_BYTES: usize = 1024 * 1024;
+
+/// Read the current authoring root through the one bounded, no-follow trust-material path.
+pub async fn root_bytes(repo_dir: &Path) -> Result<Vec<u8>> {
+    crate::read_local_trust_material(
+        &repo_dir.join("metadata/root.json"),
+        AUTHORING_METADATA_MAX_BYTES as u64,
+    )
+    .await
+    .map_err(|e| err("reading root.json", e))
+}
+
+/// One immutable, bounded snapshot of a local signing key.
+///
+/// `tough::LocalKeySource` reopens its path when signing. Reading once here makes the public key
+/// placed in metadata and the private key that signs it the same bytes, closes the check/use race,
+/// and keeps the no-follow/size policy in this crate rather than delegating it to an unbounded
+/// convenience read.
+#[derive(Clone)]
+struct BoundedKeySource {
+    bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for BoundedKeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedKeySource").finish_non_exhaustive()
+    }
+}
+
+impl BoundedKeySource {
+    fn load(path: &Path) -> Result<Self> {
+        let bytes = foundation::file::read_bounded_private_regular(path, SIGNING_KEY_MAX_BYTES)
+            .map_err(|e| err("reading key", e))?;
+        // Validate eagerly so a malformed key fails at the named path boundary, before an editor
+        // is mutated. `as_sign` parses the same immutable bytes again for tough's owned signer.
+        parse_keypair(&bytes).map_err(|e| err("parsing key", e))?;
+        Ok(Self {
+            bytes: Arc::from(bytes),
+        })
+    }
+
+    fn tuf_key(&self) -> Result<Key> {
+        Ok(parse_keypair(&self.bytes)
+            .map_err(|e| err("parsing key", e))?
+            .tuf_key())
+    }
+
+    fn boxed(&self) -> Box<dyn KeySource> {
+        Box::new(self.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl KeySource for BoundedKeySource {
+    async fn as_sign(
+        &self,
+    ) -> std::result::Result<Box<dyn Sign>, Box<dyn std::error::Error + Send + Sync + 'static>>
+    {
+        Ok(Box::new(parse_keypair(&self.bytes)?))
+    }
+
+    async fn write(
+        &self,
+        _value: &str,
+        _key_id_hex: &str,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bounded signing-key snapshots are read-only",
+        )
+        .into())
+    }
+}
 
 fn err(context: &str, e: impl std::fmt::Display) -> RepoError {
     RepoError(format!("{context}: {e}"))
@@ -53,18 +143,21 @@ impl Keys {
     /// The standard key file layout under `dir`: `root.pk8` (active) and, when present,
     /// `root.next.pk8` (the side-by-side successor). A repository minted single-key (e.g.
     /// the operator's assignment repo) simply has no `root.next.pk8`.
-    pub fn in_dir(dir: &Path) -> Self {
+    pub fn in_dir(dir: &Path) -> Result<Self> {
         let mut roots = vec![dir.join("root.pk8")];
         let successor = dir.join("root.next.pk8");
-        if successor.exists() {
+        if successor
+            .try_exists()
+            .map_err(|error| err("checking for the standby root key", error))?
+        {
             roots.push(successor);
         }
-        Keys {
+        Ok(Keys {
             roots,
             targets: dir.join("targets.pk8"),
             snapshot: dir.join("snapshot.pk8"),
             timestamp: dir.join("timestamp.pk8"),
-        }
+        })
     }
 
     /// The single-key online roles (targets, snapshot, timestamp).
@@ -131,11 +224,11 @@ impl PublishTarget {
 /// Where every byte destined for the published repository is staged: `<repo>/.publish/`.
 ///
 /// Deliberately NOT inside `metadata/` or `targets/`. Those two directories *are* the published
-/// repository: a mirror walks them whole and uploads every file below them verbatim (see
-/// `updatec::publisher::upload_order`), with no notion of which names are internal. A staging
-/// temp orphaned there by a crash would therefore be uploaded as a repository object and stay
-/// one forever. Staging one level up, in a directory no mirror walks, makes that unrepresentable
-/// rather than something a filter has to keep catching.
+/// repository: publication resolves its active closure below them (see
+/// `updatec::publisher::publication_plan`), with no notion of which names are staging internals. A
+/// staging temp orphaned there could therefore become a repository object. Staging one level up,
+/// in a directory publication never considers, makes that unrepresentable rather than something a
+/// filter has to keep catching.
 ///
 /// `.publish/` and the published directories share a filesystem, so committing a staged file is
 /// still a rename, never a copy.
@@ -276,18 +369,12 @@ pub async fn generate_keys(keys_dir: &Path) -> Result<Keys> {
         .map_err(|e| err("creating key dir", e))?;
     let rng = SystemRandom::new();
     // Two root keys side-by-side (active + successor) so the root is rotatable from day one.
-    for name in [
-        "root.pk8",
-        "root.next.pk8",
-        "targets.pk8",
-        "snapshot.pk8",
-        "timestamp.pk8",
-    ] {
+    for name in KEY_FILE_NAMES {
         let pkcs8 =
             Ed25519KeyPair::generate_pkcs8(&rng).map_err(|e| err("generating ed25519 key", e))?;
         create_key_file(&keys_dir.join(name), pkcs8.as_ref())?;
     }
-    Ok(Keys::in_dir(keys_dir))
+    Keys::in_dir(keys_dir)
 }
 
 /// Mint a single fresh ed25519 root key at `path` (mode 0600). Used to provision the new
@@ -319,44 +406,7 @@ fn create_key_file(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(path);
         return Err(err("durably writing signing key", e));
     }
-    validate_key_file(path)
-}
-
-fn validate_key_file(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|e| err("inspecting signing key", e))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(RepoError(format!(
-            "signing key {} must be a regular, non-symlink file",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            return Err(RepoError(format!(
-                "signing key {} must have mode 0600, found {mode:04o}",
-                path.display()
-            )));
-        }
-    }
-    // Off Unix there is no mode to read back. A key this process minted is still owner-only —
-    // [`create_key_file`] hands the protected descriptor to the file at creation — but a key that
-    // was already on disk was created by something else, and its ACL is not inspected here. Say so
-    // rather than let a reused key look as checked as a freshly minted one.
-    #[cfg(not(unix))]
-    {
-        foundation::log::warn(
-            "updated-tuf",
-            &format!(
-                "cannot verify the permissions of the existing signing key {} on this platform; \
-                 keys minted here are owner-only at creation, one created elsewhere may not be",
-                path.display()
-            ),
-        );
-    }
-    Ok(())
+    BoundedKeySource::load(path).map(|_| ())
 }
 
 /// Initialize an empty TUF repository under `repo_dir`: mint and sign `root.json`,
@@ -398,11 +448,14 @@ pub async fn init_from_version(
     let mut root_keys: HashMap<Decoded<Hex>, Key> = HashMap::new();
     let mut roles: HashMap<RoleType, RoleKeys> = HashMap::new();
     let mut root_keyids = Vec::new();
+    let mut root_sources = Vec::new();
     for path in &keys.roots {
-        let key = load_signer(path)?.tuf_key();
+        let source = BoundedKeySource::load(path)?;
+        let key = source.tuf_key()?;
         let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
         root_keys.insert(keyid.clone(), key);
         root_keyids.push(keyid);
+        root_sources.push(source.boxed());
     }
     roles.insert(
         RoleType::Root,
@@ -412,8 +465,10 @@ pub async fn init_from_version(
             _extra: HashMap::new(),
         },
     );
+    let mut online_sources = Vec::new();
     for (role, path) in keys.online() {
-        let key = load_signer(path)?.tuf_key();
+        let source = BoundedKeySource::load(path)?;
+        let key = source.tuf_key()?;
         let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
         root_keys.insert(keyid.clone(), key);
         roles.insert(
@@ -424,6 +479,7 @@ pub async fn init_from_version(
                 _extra: HashMap::new(),
             },
         );
+        online_sources.push(source.boxed());
     }
     let root = Root {
         spec_version: "1.0.0".to_string(),
@@ -438,7 +494,6 @@ pub async fn init_from_version(
         _extra: HashMap::new(),
     };
     let rng = SystemRandom::new();
-    let root_sources: Vec<Box<dyn KeySource>> = keys.roots.iter().map(|p| local(p)).collect();
     let signed_root = SignedRole::new(root.clone(), &KeyHolder::Root(root), &root_sources, &rng)
         .await
         .map_err(|e| err("signing root", e))?;
@@ -471,15 +526,72 @@ pub async fn init_from_version(
         .timestamp_version(start)
         .timestamp_expires(expires);
     let signed = editor
-        .sign(&[
-            local(&keys.targets),
-            local(&keys.snapshot),
-            local(&keys.timestamp),
-        ])
+        .sign(&online_sources)
         .await
         .map_err(|e| err("signing initial metadata", e))?;
     publish_metadata(&scratch, &signed, &metadata_dir).await?;
     Ok(())
+}
+
+/// Republish the root role: read the current root, build its successor at the next version with a
+/// fresh expiry, sign it, and commit the versioned document before the unversioned anchor.
+///
+/// A renewal is a rotation with an unchanged key set and role map, so this is the whole of both
+/// ceremonies except the one thing they genuinely differ in: `plan` receives the current root and
+/// its root role, and answers with the key set, the role map, and the keys that sign. Everything
+/// else — the version bump, carrying `spec_version` / `consistent_snapshot` / `_extra` forward, the
+/// expiry, and the commit order — lives here once, so a change to any of it moves both ceremonies
+/// together instead of drifting between two copies (which is how one of them came to drop the
+/// root's `_extra` while the other kept it).
+async fn republish_root(
+    repo_dir: &Path,
+    expiry_days: i64,
+    plan: impl FnOnce(
+        &Root,
+        &RoleKeys,
+    ) -> Result<(
+        HashMap<Decoded<Hex>, Key>,
+        HashMap<RoleType, RoleKeys>,
+        Vec<Box<dyn KeySource>>,
+    )>,
+) -> Result<()> {
+    let metadata_dir = repo_dir.join("metadata");
+    let root_path = metadata_dir.join("root.json");
+    let scratch = Scratch::open(repo_dir).await?;
+    let bytes = root_bytes(repo_dir).await?;
+    let current: Signed<Root> =
+        serde_json::from_slice(&bytes).map_err(|e| err("parsing root.json", e))?;
+    let old = &current.signed;
+    let old_root_role = old
+        .roles
+        .get(&RoleType::Root)
+        .ok_or_else(|| RepoError("current root omits the root role".into()))?;
+    let (keys, roles, sources) = plan(old, old_root_role)?;
+
+    let next_version = nz(old.version.get() + 1);
+    let next = Root {
+        spec_version: old.spec_version.clone(),
+        consistent_snapshot: old.consistent_snapshot,
+        version: next_version,
+        expires: expiry(expiry_days)?,
+        keys,
+        roles,
+        _extra: old._extra.clone(),
+    };
+    let rng = SystemRandom::new();
+    let signed_root = SignedRole::new(next.clone(), &KeyHolder::Root(next), &sources, &rng)
+        .await
+        .map_err(|e| err("signing republished root", e))?;
+    // The versioned root is what clients fetch to walk the rotation chain; the unversioned
+    // pointer is the anchor for new enrollments, so it is committed second — a crash between
+    // the two leaves the anchor on a root whose successor is already durable.
+    publish_file(
+        &scratch,
+        &metadata_dir.join(format!("{next_version}.root.json")),
+        signed_root.buffer().to_vec(),
+    )
+    .await?;
+    publish_file(&scratch, &root_path, signed_root.buffer().to_vec()).await
 }
 
 /// Rotate the root role: publish a new root version whose key set is the `retained` keys
@@ -503,102 +615,69 @@ pub async fn rotate_root(
             "root rotation needs at least one retained key for continuity".into(),
         ));
     }
-    let metadata_dir = repo_dir.join("metadata");
-    let root_path = metadata_dir.join("root.json");
-    let scratch = Scratch::open(repo_dir).await?;
-    let bytes = tokio::fs::read(&root_path)
-        .await
-        .map_err(|e| err("reading root.json", e))?;
-    let current: Signed<Root> =
-        serde_json::from_slice(&bytes).map_err(|e| err("parsing root.json", e))?;
-    let old = &current.signed;
-    let old_root_role = old
-        .roles
-        .get(&RoleType::Root)
-        .ok_or_else(|| RepoError("current root omits the root role".into()))?;
-
-    // Carry the online roles forward from the current root, unchanged.
-    let mut keys: HashMap<Decoded<Hex>, Key> = HashMap::new();
-    let mut roles: HashMap<RoleType, RoleKeys> = HashMap::new();
-    for role in [RoleType::Targets, RoleType::Snapshot, RoleType::Timestamp] {
-        let role_keys = old
-            .roles
-            .get(&role)
-            .ok_or_else(|| RepoError(format!("current root omits the {role:?} role")))?
-            .clone();
-        for keyid in &role_keys.keyids {
-            let key = old
-                .keys
-                .get(keyid)
-                .ok_or_else(|| RepoError(format!("current root omits a {role:?} key")))?
+    republish_root(repo_dir, expiry_days, |old, old_root_role| {
+        // Carry the online roles forward from the current root, unchanged.
+        let mut keys: HashMap<Decoded<Hex>, Key> = HashMap::new();
+        let mut roles: HashMap<RoleType, RoleKeys> = HashMap::new();
+        for role in [RoleType::Targets, RoleType::Snapshot, RoleType::Timestamp] {
+            let role_keys = old
+                .roles
+                .get(&role)
+                .ok_or_else(|| RepoError(format!("current root omits the {role:?} role")))?
                 .clone();
+            for keyid in &role_keys.keyids {
+                let key = old
+                    .keys
+                    .get(keyid)
+                    .ok_or_else(|| RepoError(format!("current root omits a {role:?} key")))?
+                    .clone();
+                keys.insert(keyid.clone(), key);
+            }
+            roles.insert(role, role_keys);
+        }
+
+        // New root role = retained continuity keys + the fresh successor.
+        let mut root_keyids = Vec::new();
+        let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
+        for path in retained {
+            let source = BoundedKeySource::load(path)?;
+            let key = source.tuf_key()?;
+            let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
+            if !old_root_role.keyids.contains(&keyid) {
+                return Err(RepoError(format!(
+                    "retained key {} is not in the current root, so it cannot authorize a rotation",
+                    path.display()
+                )));
+            }
             keys.insert(keyid.clone(), key);
+            root_keyids.push(keyid);
+            sources.push(source.boxed());
         }
-        roles.insert(role, role_keys);
-    }
-
-    // New root role = retained continuity keys + the fresh successor.
-    let mut root_keyids = Vec::new();
-    let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
-    for path in retained {
-        let key = load_signer(path)?.tuf_key();
-        let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
-        if !old_root_role.keyids.contains(&keyid) {
-            return Err(RepoError(format!(
-                "retained key {} is not in the current root, so it cannot authorize a rotation",
-                path.display()
-            )));
+        let new_source = BoundedKeySource::load(new_root_key)?;
+        let new_key = new_source.tuf_key()?;
+        let new_keyid = new_key.key_id().map_err(|e| err("computing key id", e))?;
+        if old_root_role.keyids.contains(&new_keyid) {
+            return Err(RepoError(
+                "the new root key already belongs to the current root; provide a fresh key".into(),
+            ));
         }
-        keys.insert(keyid.clone(), key);
-        root_keyids.push(keyid);
-        sources.push(local(path));
-    }
-    let new_key = load_signer(new_root_key)?.tuf_key();
-    let new_keyid = new_key.key_id().map_err(|e| err("computing key id", e))?;
-    if old_root_role.keyids.contains(&new_keyid) {
-        return Err(RepoError(
-            "the new root key already belongs to the current root; provide a fresh key".into(),
-        ));
-    }
-    keys.insert(new_keyid.clone(), new_key);
-    root_keyids.push(new_keyid);
-    sources.push(local(new_root_key));
-    // The root role's threshold is repository state, not a constant: a root minted for
-    // multi-party signing must not be silently downgraded to a single signature by a rotation,
-    // which every node would accept because the new root is validly co-signed under the old one.
-    roles.insert(
-        RoleType::Root,
-        RoleKeys {
-            keyids: root_keyids,
-            threshold: old_root_role.threshold,
-            _extra: old_root_role._extra.clone(),
-        },
-    );
-
-    let next_version = nz(old.version.get() + 1);
-    let new_root = Root {
-        spec_version: old.spec_version.clone(),
-        consistent_snapshot: old.consistent_snapshot,
-        version: next_version,
-        expires: expiry(expiry_days)?,
-        keys,
-        roles,
-        _extra: HashMap::new(),
-    };
-    let rng = SystemRandom::new();
-    let signed_root = SignedRole::new(new_root.clone(), &KeyHolder::Root(new_root), &sources, &rng)
-        .await
-        .map_err(|e| err("signing rotated root", e))?;
-    // The versioned root is what clients fetch to walk the rotation chain; the unversioned
-    // pointer is the anchor for new enrollments, so it is committed second — a crash between
-    // the two leaves the anchor on a root whose successor is already durable.
-    publish_file(
-        &scratch,
-        &metadata_dir.join(format!("{next_version}.root.json")),
-        signed_root.buffer().to_vec(),
-    )
-    .await?;
-    publish_file(&scratch, &root_path, signed_root.buffer().to_vec()).await
+        keys.insert(new_keyid.clone(), new_key);
+        root_keyids.push(new_keyid);
+        sources.push(new_source.boxed());
+        // The root role's threshold is repository state, not a constant: a root minted for
+        // multi-party signing must not be silently downgraded to a single signature by a rotation,
+        // which every node would accept because the new root is validly co-signed under the old one.
+        roles.insert(
+            RoleType::Root,
+            RoleKeys {
+                keyids: root_keyids,
+                threshold: old_root_role.threshold,
+                _extra: old_root_role._extra.clone(),
+            },
+        );
+        Ok((keys, roles, sources))
+    })
+    .await
 }
 
 /// Renew the root role: publish the CURRENT key set again, at the next version and a fresh
@@ -615,66 +694,34 @@ pub async fn rotate_root(
 /// are written; the online roles are carried forward untouched and their signed metadata stays
 /// valid.
 pub async fn renew_root(repo_dir: &Path, root_keys: &[PathBuf], expiry_days: i64) -> Result<()> {
-    let metadata_dir = repo_dir.join("metadata");
-    let root_path = metadata_dir.join("root.json");
-    let scratch = Scratch::open(repo_dir).await?;
-    let bytes = tokio::fs::read(&root_path)
-        .await
-        .map_err(|e| err("reading root.json", e))?;
-    let current: Signed<Root> =
-        serde_json::from_slice(&bytes).map_err(|e| err("parsing root.json", e))?;
-    let old = &current.signed;
-    let old_root_role = old
-        .roles
-        .get(&RoleType::Root)
-        .ok_or_else(|| RepoError("current root omits the root role".into()))?;
-
-    // Sign with whatever of the supplied set the current root actually lists, and let the role's
-    // own threshold decide whether that is enough. Key-set drift is normal — a rotation retires a
-    // key the operator's directory still holds, and the caller hands the whole directory over — and
-    // refusing the renewal outright for one stray key made every reconcile a hard failure at
-    // exactly the moment the root is closest to expiring.
-    let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
-    for path in root_keys {
-        let key = load_signer(path)?.tuf_key();
-        let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
-        if old_root_role.keyids.contains(&keyid) {
-            sources.push(local(path));
+    republish_root(repo_dir, expiry_days, |old, old_root_role| {
+        // Sign with whatever of the supplied set the current root actually lists, and let the
+        // role's own threshold decide whether that is enough. Key-set drift is normal — a rotation
+        // retires a key the operator's directory still holds, and the caller hands the whole
+        // directory over — and refusing the renewal outright for one stray key made every reconcile
+        // a hard failure at exactly the moment the root is closest to expiring.
+        let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
+        for path in root_keys {
+            let source = BoundedKeySource::load(path)?;
+            let key = source.tuf_key()?;
+            let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
+            if old_root_role.keyids.contains(&keyid) {
+                sources.push(source.boxed());
+            }
         }
-    }
-    if (sources.len() as u64) < old_root_role.threshold.get() {
-        return Err(RepoError(format!(
-            "root renewal needs {} of the current root's keys, but only {} of the {} supplied are \
-             in it",
-            old_root_role.threshold,
-            sources.len(),
-            root_keys.len()
-        )));
-    }
-
-    let next_version = nz(old.version.get() + 1);
-    let renewed = Root {
-        spec_version: old.spec_version.clone(),
-        consistent_snapshot: old.consistent_snapshot,
-        version: next_version,
-        expires: expiry(expiry_days)?,
-        keys: old.keys.clone(),
-        roles: old.roles.clone(),
-        _extra: old._extra.clone(),
-    };
-    let rng = SystemRandom::new();
-    let signed_root = SignedRole::new(renewed.clone(), &KeyHolder::Root(renewed), &sources, &rng)
-        .await
-        .map_err(|e| err("signing renewed root", e))?;
-    // Same commit order as a rotation: the versioned document first, so a crash between the two
-    // leaves the anchor pointing at a root whose successor is already durable.
-    publish_file(
-        &scratch,
-        &metadata_dir.join(format!("{next_version}.root.json")),
-        signed_root.buffer().to_vec(),
-    )
-    .await?;
-    publish_file(&scratch, &root_path, signed_root.buffer().to_vec()).await
+        if (sources.len() as u64) < old_root_role.threshold.get() {
+            return Err(RepoError(format!(
+                "root renewal needs {} of the current root's keys, but only {} of the {} supplied \
+                 are in it",
+                old_root_role.threshold,
+                sources.len(),
+                root_keys.len()
+            )));
+        }
+        // Nothing about the trust changes: the same keys under the same roles, at a later expiry.
+        Ok((old.keys.clone(), old.roles.clone(), sources))
+    })
+    .await
 }
 
 /// Publish a release: register `targets`, bump targets/snapshot/timestamp, and
@@ -727,9 +774,15 @@ async fn publish_release(
         // object: it is committed by rename, never re-created at its final path.
         let (file, path) = stage_published(&scratch)?;
         let mut dst = tokio::fs::File::from_std(file);
-        let mut src = tokio::fs::File::open(&pt.source)
-            .await
-            .map_err(|e| err("opening target artifact", e))?;
+        let source = pt.source.clone();
+        let source_display = source.display().to_string();
+        let opened = tokio::task::spawn_blocking(move || {
+            foundation::file::open_regular(&source, foundation::file::FinalSymlink::Refuse)
+        })
+        .await
+        .map_err(|e| err("opening target artifact task", e))?
+        .map_err(|e| err(&format!("opening target artifact {source_display}"), e))?;
+        let mut src = tokio::fs::File::from_std(opened);
         tokio::io::copy(&mut src, &mut dst)
             .await
             .map_err(|e| err("staging target artifact", e))?;
@@ -741,15 +794,7 @@ async fn publish_release(
     }
 
     // Load the current repository to learn its metadata versions (bump = +1).
-    let root = tokio::fs::read(&root_path)
-        .await
-        .map_err(|e| err("reading root.json", e))?;
-    let repo = RepositoryLoader::new(&root, dir_url(&metadata_dir)?, dir_url(&targets_dir)?)
-        .transport(FilesystemTransport)
-        .expiration_enforcement(tough::ExpirationEnforcement::Unsafe)
-        .load()
-        .await
-        .map_err(|e| err("loading repository to edit", e))?;
+    let repo = load_local(repo_dir, "loading repository to edit").await?;
     let next_targets = nz(repo.targets().signed.version.get() + 1);
     let next_snapshot = nz(repo.snapshot().signed.version.get() + 1);
     let next_timestamp = nz(repo.timestamp().signed.version.get() + 1);
@@ -791,12 +836,13 @@ async fn publish_release(
             .map_err(|e| err("adding target", e))?;
     }
 
+    let online_sources = [
+        BoundedKeySource::load(&keys.targets)?.boxed(),
+        BoundedKeySource::load(&keys.snapshot)?.boxed(),
+        BoundedKeySource::load(&keys.timestamp)?.boxed(),
+    ];
     let signed = editor
-        .sign(&[
-            local(&keys.targets),
-            local(&keys.snapshot),
-            local(&keys.timestamp),
-        ])
+        .sign(&online_sources)
         .await
         .map_err(|e| err("signing release", e))?;
 
@@ -862,7 +908,18 @@ async fn publish_metadata(
     tokio::fs::create_dir(&stage)
         .await
         .map_err(|e| err("creating metadata staging", e))?;
+    // Directory mtime cannot distinguish a stalled writer from an orphan: writes to children do
+    // not refresh it. Hold an OS lock until every staged role has been published, so a concurrent
+    // Scratch::open can reclaim crash leftovers without ever deleting this live generation.
+    let stage_lease = match foundation::durable::lease_temp_directory(&stage) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&stage).await;
+            return Err(err("leasing metadata staging", error));
+        }
+    };
     if let Err(error) = signed.write(&stage).await {
+        drop(stage_lease);
         let _ = tokio::fs::remove_dir_all(&stage).await;
         return Err(err("staging signed metadata", error));
     }
@@ -875,13 +932,18 @@ async fn publish_metadata(
             .map_err(|e| err("reading metadata staging", e))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| err("reading staged metadata entry", e))?;
+        files.retain(|entry| entry.file_name() != foundation::durable::TEMP_DIRECTORY_LEASE_FILE);
         files.sort_by_key(|entry| entry.file_name());
         // The signer wrote these staged files with neither the access a published object needs
         // nor a flush, so each is re-staged and committed through `publish_file_blocking` —
         // `timestamp.json` last, as the sole visibility commit for the generation.
         let publish = |entry: &std::fs::DirEntry| -> Result<()> {
-            let bytes =
-                std::fs::read(entry.path()).map_err(|e| err("reading staged metadata role", e))?;
+            let bytes = foundation::file::read_bounded_regular(
+                &entry.path(),
+                AUTHORING_METADATA_MAX_BYTES,
+                foundation::file::FinalSymlink::Refuse,
+            )
+            .map_err(|e| err("reading staged metadata role", e))?;
             publish_file_blocking(&scratch, &metadata_dir.join(entry.file_name()), &bytes)
         };
         for entry in files
@@ -897,6 +959,7 @@ async fn publish_metadata(
         publish(timestamp)
     })
     .await;
+    drop(stage_lease);
     let _ = tokio::fs::remove_dir_all(&stage).await;
     result
 }
@@ -906,17 +969,7 @@ async fn publish_metadata(
 /// their consistent-snapshot digest-prefixed paths.
 pub async fn target_sha256(repo_dir: &Path, name: &str) -> Result<String> {
     validate_target_name(name)?;
-    let metadata_dir = repo_dir.join("metadata");
-    let targets_dir = repo_dir.join("targets");
-    let root = tokio::fs::read(metadata_dir.join("root.json"))
-        .await
-        .map_err(|e| err("reading root.json", e))?;
-    let repo = RepositoryLoader::new(&root, dir_url(&metadata_dir)?, dir_url(&targets_dir)?)
-        .transport(FilesystemTransport)
-        .expiration_enforcement(tough::ExpirationEnforcement::Unsafe)
-        .load()
-        .await
-        .map_err(|e| err("loading repository", e))?;
+    let repo = load_local(repo_dir, "loading repository").await?;
     let name = TargetName::new(name).map_err(|e| err("parsing target name", e))?;
     let target = repo
         .targets()
@@ -946,21 +999,49 @@ pub async fn verify_provider_set_reconciler(
     set: &updated_contracts::artifact::ProviderSet,
 ) -> Result<()> {
     let reference = &set.reconciler.artifact;
-    let signed = target_sha256(repo_dir, &reference.path)
-        .await
-        .map_err(|error| {
-            RepoError(format!(
-                "--provider-path {:?} does not resolve in this repository's signed metadata: \
-                 {error}. Publish the reconciler with `publish-provider-artifact` against this \
-                 same repository first, and pass the path and digest it prints. Nothing was signed.",
-                reference.path
-            ))
-        })?;
-    if signed != reference.sha256 {
+    verify_target_reference(
+        repo_dir,
+        &reference.path,
+        &reference.sha256,
+        "--provider-path",
+        "--provider-sha256",
+        "reconciler builds",
+        "Publish the reconciler with `publish-provider-artifact` against this same repository \
+         first, and pass the path and digest it prints. Nothing was signed.",
+    )
+    .await
+}
+
+/// Resolve one signed target reference — a `path` + `sha256` flag pair — against this
+/// repository's checked-out signed metadata, refusing at publish time what a node could only
+/// discover mid-rollout: a reference every syntactic check accepts but that resolves to nothing,
+/// or to different bytes than its digest names. The ONE implementation for every publisher-side
+/// reference (the provider-set reconciler above, `updatectl deploy`'s provider set), so the
+/// resolve-and-compare contract cannot drift between tools. `path_flag`/`sha_flag` name the
+/// operator's actual arguments and `names_differ`/`remedy` carry the call-site-specific operator
+/// text. Digests are compared as given, which is safe because there is only one spelling to
+/// compare: operator input is parsed through `digest::parse_canonical_sha256` at the flag, and
+/// every other digest reaching here was produced by `hex::encode`. This used to say that callers
+/// lowercase operator input first, and no caller did.
+pub async fn verify_target_reference(
+    repo_dir: &Path,
+    path: &str,
+    sha256: &str,
+    path_flag: &str,
+    sha_flag: &str,
+    names_differ: &str,
+    remedy: &str,
+) -> Result<()> {
+    let signed = target_sha256(repo_dir, path).await.map_err(|error| {
+        RepoError(format!(
+            "{path_flag} {path:?} does not resolve in this repository's signed metadata: \
+             {error}. {remedy}"
+        ))
+    })?;
+    if signed != sha256 {
         return Err(RepoError(format!(
-            "--provider-sha256 {} does not match the signed digest of --provider-path {:?}, which \
-             is {signed}: the two flags name different reconciler builds. Nothing was signed.",
-            reference.sha256, reference.path
+            "{sha_flag} {sha256} does not match the signed digest of {path_flag} {path:?}, which \
+             is {signed}: the two flags name different {names_differ}. {remedy}"
         )));
     }
     Ok(())
@@ -970,18 +1051,139 @@ pub async fn verify_provider_set_reconciler(
 /// once per [`replace_release`]. It is the monotonic id of "what the fleet is pointed at right now",
 /// the value change-tracking subscribers watermark against.
 pub async fn current_version(repo_dir: &Path) -> Result<u64> {
+    let repo = load_local(repo_dir, "loading repository to read version").await?;
+    Ok(repo.timestamp().signed.version.get())
+}
+
+/// The repository's current publication delta.
+///
+/// `uploads` are local files in commit order. `retained_targets` are content-addressed targets
+/// still named by the new metadata but absent from this checkout; each carries its signed length so
+/// the publisher can prove the object already exists intact enough to be the same target before
+/// committing metadata. This is what lets a metadata-only remote checkout add one release without
+/// downloading and re-uploading every older artifact.
+/// The root rotation chain is always uploaded so an older pinned client can walk forward, and
+/// `timestamp.json` is always last because it is the sole visibility commit.
+pub struct PublicationPlan {
+    pub uploads: Vec<PathBuf>,
+    pub retained_targets: Vec<RetainedTarget>,
+}
+
+/// One immutable target body retained at the publication destination rather than present in a
+/// metadata-only checkout.
+pub struct RetainedTarget {
+    pub path: PathBuf,
+    pub length: u64,
+}
+
+pub async fn current_publication_plan(repo_dir: &Path) -> Result<PublicationPlan> {
+    const MAX_ROOT_CHAIN_FILES: usize = 1025; // root.json + tough's 1024-update client ceiling.
+
+    let repository = load_local(repo_dir, "resolving current publication closure").await?;
     let metadata_dir = repo_dir.join("metadata");
     let targets_dir = repo_dir.join("targets");
-    let root = tokio::fs::read(metadata_dir.join("root.json"))
-        .await
-        .map_err(|e| err("reading root.json", e))?;
-    let repo = RepositoryLoader::new(&root, dir_url(&metadata_dir)?, dir_url(&targets_dir)?)
-        .transport(FilesystemTransport)
-        .expiration_enforcement(tough::ExpirationEnforcement::Unsafe)
-        .load()
-        .await
-        .map_err(|e| err("loading repository to read version", e))?;
-    Ok(repo.timestamp().signed.version.get())
+
+    let mut targets = Vec::with_capacity(repository.targets().signed.targets.len());
+    let mut retained_targets = Vec::new();
+    for (name, target) in &repository.targets().signed.targets {
+        validate_target_name(name.raw())?;
+        let digest = hex::encode(&target.hashes.sha256);
+        let path = targets_dir.join(format!("{digest}.{}", name.resolved()));
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                targets.push(path)
+            }
+            Ok(_) => {
+                return Err(RepoError(format!(
+                    "publication path {} is not a regular, non-symlink file",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                retained_targets.push(RetainedTarget {
+                    path,
+                    length: target.length,
+                })
+            }
+            Err(error) => {
+                return Err(err(
+                    &format!("inspecting publication file {}", path.display()),
+                    error,
+                ));
+            }
+        }
+    }
+    targets.sort();
+    retained_targets.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let roots_dir = metadata_dir.clone();
+    let mut roots = blocking(move || {
+        let mut roots = Vec::new();
+        for entry in
+            std::fs::read_dir(&roots_dir).map_err(|e| err("reading metadata directory", e))?
+        {
+            let entry = entry.map_err(|e| err("reading metadata entry", e))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let is_root = name == "root.json"
+                || name
+                    .strip_suffix(".root.json")
+                    .and_then(|version| version.parse::<u64>().ok())
+                    .is_some_and(|version| version > 0);
+            if is_root {
+                roots.push(require_publication_file(entry.path())?);
+                if roots.len() > MAX_ROOT_CHAIN_FILES {
+                    return Err(RepoError(format!(
+                        "root chain contains more than {} files",
+                        MAX_ROOT_CHAIN_FILES - 1
+                    )));
+                }
+            }
+        }
+        roots.sort();
+        Ok(roots)
+    })
+    .await?;
+    if !roots.iter().any(|path| path.ends_with("root.json")) {
+        return Err(RepoError("current publication has no root.json".into()));
+    }
+
+    let current_targets = require_publication_file(metadata_dir.join(format!(
+        "{}.targets.json",
+        repository.targets().signed.version
+    )))?;
+    let current_snapshot = require_publication_file(metadata_dir.join(format!(
+        "{}.snapshot.json",
+        repository.snapshot().signed.version
+    )))?;
+    let timestamp = require_publication_file(metadata_dir.join("timestamp.json"))?;
+
+    targets.append(&mut roots);
+    targets.push(current_targets);
+    targets.push(current_snapshot);
+    targets.push(timestamp);
+    Ok(PublicationPlan {
+        uploads: targets,
+        retained_targets,
+    })
+}
+
+fn require_publication_file(path: PathBuf) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(&path).map_err(|e| {
+        err(
+            &format!("inspecting publication file {}", path.display()),
+            e,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RepoError(format!(
+            "publication path {} is not a regular, non-symlink file",
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 #[derive(Default)]
@@ -1000,17 +1202,6 @@ impl Drop for StagedArtifacts {
             }
         }
     }
-}
-
-fn load_signer(path: &Path) -> Result<impl Sign> {
-    let bytes = std::fs::read(path).map_err(|e| err("reading key", e))?;
-    parse_keypair(&bytes).map_err(|e| err("parsing key", e))
-}
-
-fn local(path: &Path) -> Box<dyn KeySource> {
-    Box::new(LocalKeySource {
-        path: path.to_path_buf(),
-    })
 }
 
 fn nz(n: u64) -> NonZeroU64 {
@@ -1050,6 +1241,25 @@ fn expiry(days: i64) -> Result<jiff::Timestamp> {
     jiff::Timestamp::now()
         .checked_add(span)
         .map_err(|e| err("expiry is outside the supported timestamp range", e))
+}
+
+/// Load the repository sitting in `repo_dir` for authoring — the single home of what that means.
+///
+/// `context` names the operation, so a failure still reads as "loading repository to edit" or "to
+/// read version". Expiration is deliberately unenforced: these are the publisher's own queries
+/// against its own metadata, and a repository whose timestamp has lapsed is exactly the one an
+/// operator is running a tool against to fix. That is a trust-relevant choice, so it is made here
+/// once rather than restated at every authoring query.
+async fn load_local(repo_dir: &Path, context: &str) -> Result<Repository> {
+    let metadata_dir = repo_dir.join("metadata");
+    let targets_dir = repo_dir.join("targets");
+    let root = root_bytes(repo_dir).await?;
+    RepositoryLoader::new(&root, dir_url(&metadata_dir)?, dir_url(&targets_dir)?)
+        .transport(FilesystemTransport)
+        .expiration_enforcement(tough::ExpirationEnforcement::Unsafe)
+        .load()
+        .await
+        .map_err(|e| err(context, e))
 }
 
 fn dir_url(dir: &Path) -> Result<Url> {
@@ -1336,19 +1546,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn key_discovery_never_treats_an_uninspectable_successor_as_absent() {
+        let guard = tempfile::tempdir().unwrap();
+        let successor = guard.path().join("root.next.pk8");
+        std::os::unix::fs::symlink("root.next.pk8", &successor).unwrap();
+        assert!(
+            Keys::in_dir(guard.path()).is_err(),
+            "a symlink loop must be an error, not a silent single-root downgrade"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn signing_keys_must_be_owner_only_regular_files() {
         use std::os::unix::fs::PermissionsExt;
         let guard = tempfile::tempdir().unwrap();
         let dir = guard.path().to_path_buf();
         let key = dir.join("root.pk8");
-        std::fs::write(&key, b"key").unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        std::fs::write(&key, pkcs8.as_ref()).unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(validate_key_file(&key).is_err());
+        assert!(BoundedKeySource::load(&key).is_err());
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(validate_key_file(&key).is_ok());
+        assert!(BoundedKeySource::load(&key).is_ok());
         let link = dir.join("link.pk8");
         std::os::unix::fs::symlink(&key, &link).unwrap();
-        assert!(validate_key_file(&link).is_err());
+        assert!(BoundedKeySource::load(&link).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

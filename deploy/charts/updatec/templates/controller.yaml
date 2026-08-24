@@ -1,0 +1,185 @@
+{{/*
+Single-writer safety comes from the `updatec-publisher` lease, which every replica must hold before
+it reconciles — not from the volume. What the volume decides is whether a second replica can start
+at all: two pods cannot bind one ReadWriteOnce claim, so a rolling update over an RWO volume
+deadlocks (the new pod waits for a volume the old pod will not release until the new one is ready).
+Hence: shared volume => RollingUpdate and any replica count; exclusive volume => Recreate and
+exactly one replica, enforced here rather than discovered as a stuck rollout.
+*/}}
+{{/*
+`accessModes` is read as the operator's declaration of what this volume IS, whether or not the
+chart creates the claim. With `existingClaim` the chart cannot inspect the real access mode, so
+exempting that case would only mean the declaration is checked exactly when it can't be verified —
+and a release that declares a single-writer volume while asking for three writers is a
+misconfiguration either way. One rule, no special case.
+*/}}
+{{- $persist := .Values.controller.persistence }}
+{{- $exclusive := and $persist.enabled (not (has "ReadWriteMany" $persist.accessModes)) }}
+{{- if and $exclusive (gt (int .Values.controller.replicaCount) 1) }}
+{{- fail (printf "controller.replicaCount is %d but controller.persistence.accessModes is %v: a second replica cannot bind a ReadWriteOnce claim, so the extra pods would sit Pending forever. Set controller.persistence.accessModes to include ReadWriteMany (leader election already makes multiple replicas safe, and the chart then rolls rather than recreates), or leave replicaCount at 1. Set it even when supplying controller.persistence.existingClaim — the chart cannot read an existing claim's access mode, so this value is how it learns the volume is shared." (int .Values.controller.replicaCount) $persist.accessModes) }}
+{{- end }}
+{{/*
+Replicas over per-replica state is the dangerous combination, and the one worth refusing outright.
+Each replica would keep its OWN copy of the signed repository, and the controller numbers the next
+generation from whatever local metadata it finds: a replica that led up to version 5, lost the
+lease while another advanced the store to 40, and later reacquired it would try to publish 6 over
+40. The controller catches that and fails closed rather than corrupting the repository — but the
+fleet stops publishing until an operator restores the right volume. Shared state (ReadWriteMany) is
+the only correct way to run more than one replica.
+*/}}
+{{- if and (not $persist.enabled) (gt (int .Values.controller.replicaCount) 1) }}
+{{- fail (printf "controller.replicaCount is %d with controller.persistence.enabled=false: each replica would hold its own emptyDir copy of the signed TUF repository, and whichever one acquires the publisher lease with empty or stale state fails closed rather than publishing a generation every node would reject as a rollback — so the fleet stops receiving updates. Enable persistence with ReadWriteMany accessModes for a multi-replica controller." (int .Values.controller.replicaCount)) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "updatec.controllerName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "updatec.controllerName" . }}
+  strategy:
+    type: {{ if $exclusive }}Recreate{{ else }}RollingUpdate{{ end }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "updatec.controllerName" . }}
+        {{- include "updatec.labels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+      {{- with .Values.controller.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "updatec.controllerServiceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- include "updatec.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: updatec
+          image: {{ include "updatec.imageRef" (dict "ctx" . "image" .Values.image "label" "image") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [controller]
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          resources: {{- toYaml .Values.controller.resources | nindent 12 }}
+          {{- if .Values.controller.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.controller.metrics.port }}
+          {{- end }}
+          env:
+            {{- include "updatec.commonEnv" . | nindent 12 }}
+            # The immutable executable the operator runs for UpdateBackend workloads, under the
+            # same digest/tag policy as the images this chart runs itself.
+            - name: UPDATED_HEALTHPROXY_IMAGE
+              value: {{ include "updatec.imageRef" (dict "ctx" . "image" .Values.healthproxy.image "label" "healthproxy.image") | quote }}
+            - name: UPDATED_HEALTHPROXY_PULL_POLICY
+              value: {{ .Values.healthproxy.image.pullPolicy | quote }}
+            {{- if .Values.controller.metrics.enabled }}
+            - name: UPDATED_METRICS_ADDRESS
+              value: "0.0.0.0:{{ .Values.controller.metrics.port }}"
+            {{- end }}
+            {{- if .Values.controller.alerting.url }}
+            - name: UPDATED_ALERT_URL
+              value: {{ .Values.controller.alerting.url | quote }}
+            {{- if .Values.controller.alerting.tokenSecret }}
+            # A file, not an env value: the sink re-reads it per delivery, so rotating the Secret
+            # rotates the token without restarting the controller.
+            - name: UPDATED_ALERT_TOKEN_FILE
+              value: /etc/alert-token/{{ .Values.controller.alerting.tokenKey }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.controller.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/updatec
+            - name: tmp
+              mountPath: /tmp
+            {{- if and .Values.controller.alerting.url .Values.controller.alerting.tokenSecret }}
+            - name: alert-token
+              mountPath: /etc/alert-token
+              readOnly: true
+            {{- end }}
+      volumes:
+        # The signed TUF repository and its materialized signing keys. The controller numbers the
+        # next generation from the metadata found HERE, so this is durable state, not a cache: an
+        # empty or stale copy makes it fail closed rather than publish a generation every node
+        # would reject as a rollback. Rollout-admission state is separate — a ConfigMap in etcd —
+        # so losing this volume never re-baselines the throttle; it halts publishing instead.
+        - name: state
+          {{- if .Values.controller.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.controller.persistence.existingClaim | default (printf "%s-state" (include "updatec.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        {{- if and .Values.controller.alerting.url .Values.controller.alerting.tokenSecret }}
+        - name: alert-token
+          secret:
+            secretName: {{ .Values.controller.alerting.tokenSecret }}
+            defaultMode: 0440
+        {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if and .Values.controller.persistence.enabled (not .Values.controller.persistence.existingClaim) }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "updatec.fullname" . }}-state
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+  annotations:
+    # Helm deletes what it created; a volume holding TUF version monotonicity state should outlive
+    # an uninstall, because a repository that restarts its version counter is a repository clients
+    # reject.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: {{ toYaml .Values.controller.persistence.accessModes | nindent 4 }}
+  {{- if .Values.controller.persistence.storageClass }}
+  storageClassName: {{ .Values.controller.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.controller.persistence.size }}
+{{- end }}
+{{- if and .Values.controller.metrics.enabled .Values.controller.metrics.service.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "updatec.controllerName" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+  {{- with .Values.controller.metrics.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    app: {{ include "updatec.controllerName" . }}
+  ports:
+    - name: metrics
+      port: {{ .Values.controller.metrics.port }}
+      targetPort: metrics
+{{- end }}

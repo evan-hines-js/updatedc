@@ -13,7 +13,9 @@
 //! still belong in dedicated versioned crates such as `control`, where that transition
 //! can be negotiated explicitly.
 
+pub mod digest;
 pub mod durable;
+pub mod file;
 pub mod log;
 pub mod manifest;
 pub mod platform;

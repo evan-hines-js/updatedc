@@ -10,10 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+# The conformance harness must invoke a hook the way the agent does — as a contained,
+# killable process tree — so it shares the agent's containment mechanism rather than
+# approximating it with a bare `Command`.
+foundation = { path = "../foundation" }
 futures.workspace = true
 kube.workspace = true
 object_store.workspace = true
-semver.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

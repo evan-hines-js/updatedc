@@ -23,7 +23,8 @@ fn lit(s: &str) -> String {
 /// reconciler's job, and [`Node::workload`] is how a scenario asks for one.
 #[derive(Clone)]
 pub struct Node {
-    repository_base_url: String,
+    routing_base_url: String,
+    release_base_url: Option<String>,
     agent_bin: PathBuf,
     server_bin: PathBuf,
     platform: String,
@@ -49,7 +50,6 @@ pub struct Node {
     /// Sign `ordered_install_fallback` into the assignment: a cold node whose exact assigned
     /// bytes prove unusable may descend to the newest healthy target at or below it.
     ordered_install_fallback: bool,
-    secrets: Vec<updated_contracts::assignment::SecretReference>,
 }
 
 /// The mode the reconciler starts in: record the invocation and succeed. There is one reconciler
@@ -57,14 +57,26 @@ pub struct Node {
 /// the agent does not speak.
 const INERT: &str = "inert";
 
+/// The launcher state directory — every boot-time input: node config, enrollment bundle, private
+/// key, persisted assignment — for a scenario rooted at `dir`.
+///
+/// A free function because [`crate::harness::node_paths`] needs the same fact without a `Node` in
+/// hand, and two spellings of one directory is how a scenario comes to assert on a file nothing
+/// writes.
+pub fn state_dir(dir: &std::path::Path) -> PathBuf {
+    dir.join("launcher-state")
+}
+
 impl Node {
     /// A node stack for `product`, fed by the repo under `dir` served at `srv`.
     pub fn new(ctx: &Ctx, dir: &Path, srv: &str, product: &str) -> Self {
         // Every seeded predecessor is the version-agnostic sample release at 1.0.0; its identity
         // comes from the bundle config the publisher writes, never from the bytes.
         let seed_binary = app_v(ctx, "1.0.0");
+        let release_base_url = std::fs::read_to_string(dir.join("release-base-url")).ok();
         Node {
-            repository_base_url: format!("https://{srv}/"),
+            routing_base_url: format!("https://{srv}/"),
+            release_base_url,
             agent_bin: ctx.agent.clone(),
             server_bin: ctx.server.clone(),
             platform: ctx.platkey.clone(),
@@ -84,17 +96,7 @@ impl Node {
             seed_application: true,
             agent_override: None,
             ordered_install_fallback: false,
-            secrets: vec![],
         }
-    }
-    pub fn secret(mut self, environment: &str, secret: &str, key: &str) -> Self {
-        self.secrets
-            .push(updated_contracts::assignment::SecretReference {
-                environment: environment.into(),
-                secret: secret.into(),
-                key: key.into(),
-            });
-        self
     }
     /// Sign ordered-install fallback into the assignment (see the struct field).
     pub fn ordered_install_fallback(mut self) -> Self {
@@ -117,7 +119,8 @@ impl Node {
         self.mode(&format!("workload={address},drain={drain_millis}"))
     }
     pub fn local_repository(mut self) -> Self {
-        self.repository_base_url = format!("{}/", self.dir.join("repo").display());
+        self.routing_base_url = format!("{}/", self.dir.join("routing-repo").display());
+        self.release_base_url = Some(format!("{}/", self.dir.join("release-repo").display()));
         self
     }
     pub fn check_interval(mut self, s: &str) -> Self {
@@ -171,7 +174,7 @@ impl Node {
 
     /// The launcher's state directory for this scenario.
     pub fn state_dir(&self) -> PathBuf {
-        self.dir.join("launcher-state")
+        state_dir(&self.dir)
     }
 
     /// The reconciler command this node publishes and runs: this driver's own executable in the
@@ -294,6 +297,11 @@ impl Node {
             )
             .map_err(str_err)?;
         Ok(updated::state::ProviderRelease {
+            provider_set_sha256: target_sha256(
+                &self.server_bin,
+                &self.dir,
+                "provider-sets/default.json",
+            )?,
             product,
             release: staged,
             archive_sha256: crate::harness::sha256_hex(&download)?,
@@ -312,9 +320,9 @@ impl Node {
             Command::new(&self.server_bin)
                 .arg("publish-provider-artifact")
                 .arg("--repo")
-                .arg(self.dir.join("repo"))
+                .arg(self.dir.join("release-repo"))
                 .arg("--keys")
-                .arg(self.dir.join("keys"))
+                .arg(self.dir.join("release-keys"))
                 .args(["--product", &provider_product, "--version", "1.0.0"])
                 .arg("--bundle")
                 .arg(format!("{}={}", self.platform, published_source.display()))
@@ -332,17 +340,14 @@ impl Node {
     }
 
     fn write_config(&self) -> R<PathBuf> {
-        if self.seed_application {
-            self.seed_install()?;
-        }
         {
             let mut provider_set = Command::new(&self.server_bin);
             provider_set
                 .arg("publish-provider-set")
                 .arg("--repo")
-                .arg(self.dir.join("repo"))
+                .arg(self.dir.join("release-repo"))
                 .arg("--keys")
-                .arg(self.dir.join("keys"))
+                .arg(self.dir.join("release-keys"))
                 .args(["--id", "default"]);
             let (path, sha, signed_args) =
                 self.publish_provider("lifecycle", &self.lifecycle_command())?;
@@ -354,6 +359,12 @@ impl Node {
                 provider_set.args(["--provider-arg", arg]);
             }
             crate::harness::run(&mut provider_set)?;
+        }
+        // Seed only after the provider-set target exists: the installed predecessor records the
+        // exact signed set digest, the same identity a cold install would commit and telemetry
+        // later compares with the assignment.
+        if self.seed_application {
+            self.seed_install()?;
         }
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let seconds = |value: Option<&String>, default: u64| -> R<u64> {
@@ -370,8 +381,7 @@ impl Node {
             product: self.product.clone(),
             channel: "stable".into(),
             install_root: self.install_root.clone(),
-            secrets: self.secrets.clone(),
-            inputs: std::collections::BTreeMap::new(),
+            inputs: updated_contracts::dataflow::InputSelection::default(),
             repository: updated_contracts::assignment::ManagedRepositoryLimits {
                 metadata_limit: 1 << 20,
                 target_limit: 512 << 20,
@@ -411,19 +421,17 @@ impl Node {
             Command::new(&self.server_bin)
                 .arg("export-enrollment")
                 .arg("--repo")
-                .arg(self.dir.join("repo"))
+                .arg(self.dir.join("routing-repo"))
                 .args(["--assignment", "assignments/agents/agent.json"])
                 .args(["--agent-id", "agent"])
-                .args(["--routing-base-url", &self.repository_base_url])
+                .args(["--routing-base-url", &self.routing_base_url])
                 .arg("--output")
                 .arg(state_dir.join("enrollment.json")),
         )?;
         let certs = self.dir.join("certs");
         // Steady-state identity is the per-node cert a node mints at enrollment. In this offline,
-        // pre-placed scenario the installer supplies it directly (enrollment.json is pre-placed, so
-        // the node never reaches the network `/enroll`), so copy the fleet cert in as that identity —
-        // the release-server verifies it against the same CA. A live enrollment would mint a distinct
-        // per-node leaf; the e2e needs no per-node attribution.
+        // pre-placed scenario the installer supplies the fixture's client leaf directly because the
+        // node never reaches `/enroll`.
         std::fs::copy(certs.join("client.crt"), state_dir.join("agent.crt")).map_err(str_err)?;
         std::fs::copy(certs.join("client.key"), state_dir.join("agent.key")).map_err(str_err)?;
         let config = self.dir.join(format!(
@@ -433,16 +441,14 @@ impl Node {
         std::fs::write(
             &config,
             format!(
-                "[enrollment]\nurl = {}\nname = \"agent\"\nclient_cert = {}\nclient_key = {}\nca = {}\n",
-                lit(if self.repository_base_url.starts_with("https://") {
-                    self.repository_base_url.trim_end_matches('/')
+                "[enrollment]\nurl = {}\nname = \"agent\"\nca = {}\n",
+                lit(if self.routing_base_url.starts_with("https://") {
+                    self.routing_base_url.trim_end_matches('/')
                 } else {
                     // Offline/file scenarios never reach the network; the URL is unused but must
                     // still be a valid HTTPS string for the secretless mTLS config to load.
                     "https://preplaced.invalid"
                 }),
-                lit(&certs.join("client.crt").display().to_string()),
-                lit(&certs.join("client.key").display().to_string()),
                 lit(&certs.join("ca.crt").display().to_string()),
             ),
         )
@@ -493,7 +499,7 @@ impl Node {
         updated::bundle::write_active(&paths.active_release, &staged).map_err(str_err)?;
         let lineage = updated::state::RepositoryLineage::from_metadata_url(&format!(
             "{}metadata/",
-            self.repository_base_url
+            self.release_base_url()?
         ));
         updated::state::enroll(&paths.installed).map_err(str_err)?;
         // Carry the same signed provider set the published assignment references, so the seeded
@@ -534,12 +540,19 @@ impl Node {
             .arg("1");
         Ok(c)
     }
+
+    fn release_base_url(&self) -> R<&str> {
+        self.release_base_url.as_deref().ok_or_else(|| {
+            "release object origin is unavailable; start the repository fixture or select the explicit local repository"
+                .into()
+        })
+    }
 }
 pub fn target_sha256(server: &Path, dir: &Path, name: &str) -> R<String> {
     let output = Command::new(server)
         .arg("target-sha256")
         .arg("--repo")
-        .arg(dir.join("repo"))
+        .arg(dir.join("release-repo"))
         .arg("--name")
         .arg(name)
         .output()
@@ -595,9 +608,11 @@ pub fn publish_assignment(
     command
         .arg("publish-assignment")
         .arg("--repo")
-        .arg(dir.join("repo"))
+        .arg(dir.join("routing-repo"))
         .arg("--keys")
-        .arg(dir.join("keys"))
+        .arg(dir.join("routing-keys"))
+        .arg("--release-root")
+        .arg(dir.join("release-repo/metadata/root.json"))
         .args(["--name", "assignments/agents/agent.json"])
         .args(["--metadata-url", metadata_url])
         .args(["--targets-url", targets_url])
@@ -618,11 +633,12 @@ pub fn publish_assignment(
 }
 
 pub fn republish_assignment(node: &Node, deployment: &str) -> R {
+    let release = node.release_base_url()?;
     publish_assignment(
         &node.server_bin,
         &node.dir,
-        &format!("{}metadata/", node.repository_base_url),
-        &format!("{}targets/", node.repository_base_url),
+        &format!("{release}metadata/"),
+        &format!("{release}targets/"),
         deployment,
     )
 }

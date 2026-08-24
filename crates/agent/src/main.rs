@@ -10,35 +10,50 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use updated::config::{with_suffix, Application, Paths, Routing, Storage, Timeouts};
+use updated::config::{with_suffix, Application, Paths, Routing, Timeouts};
 /// The reconciler protocol vocabulary is defined once, in the contracts crate, and shared with
 /// every reconciler implementation in this workspace.
-use updated_contracts::reconciler::{attempt, Operation, Reason};
+use updated_contracts::reconciler::{
+    attempt, HostAction, MutationOperation, ObservationOperation, Operation, Reason,
+};
 use updated_contracts::telemetry::REPORT_CADENCE_JITTER_PERCENT;
 mod acquire;
 mod boot;
 mod domain;
 mod fingerprint;
+mod gc;
+mod heartbeat;
+mod host;
 mod install;
 mod launcher;
 mod options;
+mod recovery;
+mod repair;
+mod runtime_data;
 mod schedule;
-mod secrets;
 mod selection;
 mod self_update;
 mod store;
 mod telemetry;
+#[cfg(test)]
+mod test_support;
+mod transient;
 mod update;
 
 use boot::{plan_boot, GateFailure};
 use domain::*;
+use gc::*;
+use heartbeat::*;
 use install::ensure_installed;
 use launcher::Launcher;
 use options::*;
+use recovery::*;
+use repair::*;
 use schedule::*;
 use selection::*;
 use self_update::*;
 use store::*;
+use transient::*;
 use update::*;
 
 use updated::hash::sha256_file;
@@ -51,14 +66,20 @@ const SELF_VERSION: &str = env!("AGENT_VERSION");
 
 struct Options {
     deployment: String,
+    assignment_sha256: String,
     routing: Routing,
     application: Application,
+    /// Sensitive input bytes resolved from `application.input_selection`; never persisted in the
+    /// signed boot config or copied into telemetry.
+    inputs: updated_contracts::dataflow::FileSnapshot,
     timeouts: BoundedTimeouts,
-    storage: Storage,
+    storage: updated_contracts::assignment::ManagedStorage,
     /// Canonical bundle installation layout.
     paths: Paths,
     agent_update: AgentUpdate,
-    secrets: secrets::SecretManager,
+    runtime_data: runtime_data::RuntimeDataManager,
+    /// Latched until the currently resolved inputs survive a successful reconciler apply.
+    runtime_converge_pending: bool,
     identity_renewal: IdentityRenewal,
 }
 
@@ -69,25 +90,30 @@ struct IdentityRenewal {
 
 impl Options {
     /// Reconcile the managed runtime against the live assignment resolved this cycle. The
-    /// runtime (health checks, cadence, retention, secrets, inputs) is signed into the SAME
-    /// assignment that carries the version and provider set, so a control-plane reassignment
-    /// can change it with no version bump. The version/provider are reconciled by
-    /// `check_application`; this reconciles everything else onto the one live source.
+    /// runtime (product/channel identity, repository limits, cadence, retention, and inputs) is
+    /// signed into the SAME assignment that carries the version and provider set, so a
+    /// control-plane reassignment can change it with no version bump. The version/provider are
+    /// reconciled by `check_application`; this reconciles everything else onto the one live source.
     ///
-    /// Returns whether the machine is stale on the new runtime — changed secrets or resolved
-    /// `inputs` reach the release only through a reconciler invocation (its environment and its
-    /// `--input-file`), so the caller answers this by running the environment converge
+    /// Returns whether the machine is stale on the new runtime — changed resolved inputs reach the
+    /// release only through a reconciler invocation, so the caller answers this by running the
+    /// environment converge
     /// (`converge_environment`), which is the one thing that can act on them.
-    fn apply_runtime(&mut self, runtime: &updated_contracts::assignment::ManagedRuntime) -> bool {
-        let converge = self.application.secrets != runtime.secrets
-            || self.application.inputs != runtime.inputs;
+    fn apply_runtime(
+        &mut self,
+        runtime: &updated_contracts::assignment::ManagedRuntime,
+        inputs: updated_contracts::dataflow::FileSnapshot,
+    ) -> bool {
+        self.runtime_converge_pending |=
+            self.application.input_selection != runtime.inputs || self.inputs != inputs;
         // `install_root` needs no reconciliation: `TrustedRepository::assigned` fails closed on
         // any assignment whose root is not exactly the one this process resolved its paths from
         // (`usable_as_boot_config`), so an assignment that reaches here can only carry the boot
         // root. Moving a node's install root is a migration, done by restarting on a new config.
         self.application = Application::from_runtime(runtime);
+        self.inputs = inputs;
         self.timeouts = BoundedTimeouts::new(Timeouts::from_runtime(runtime));
-        self.storage = Storage::from_runtime(runtime);
+        self.storage = runtime.storage.clone();
         // The agent's OWN update rides the same assignment: its channel and cadence are the
         // application's, seeded once at `parse_args` from the boot-time config. Reconcile them here
         // too, or a node the control plane moves from `stable` to `canary` keeps selecting the
@@ -95,7 +121,21 @@ impl Options {
         // as the process lives, since nothing else ever rewrites these two fields.
         self.agent_update.channel = self.application.channel.clone();
         self.agent_update.check_interval = self.timeouts.agent_check_interval;
-        converge
+        self.runtime_converge_pending
+    }
+
+    fn runtime_converged(&mut self) {
+        self.runtime_converge_pending = false;
+    }
+
+    /// Whether the release has successfully observed the input selection in this assignment.
+    /// Heartbeats ask this directly, so a failure before [`Self::apply_runtime`] (notably an S3
+    /// fetch failure) cannot report the new assignment healthy on the old files.
+    fn runtime_is_converged(
+        &self,
+        runtime: &updated_contracts::assignment::ManagedRuntime,
+    ) -> bool {
+        !self.runtime_converge_pending && self.application.input_selection == runtime.inputs
     }
 }
 
@@ -137,14 +177,15 @@ impl LoopState {
 /// Every converge outside the loop proves the release healthy before returning: boot and the
 /// update transaction both gate on [`update::became_healthy`], which polls for the configured
 /// `health_grace`. A converge the loop performs itself has no such gate, so this type is where that
-/// grace is applied instead: [`HealthWatch::reconverged`] is the single way the loop restarts the
-/// tracking, and it is what keeps a freshly re-applied release from being reported unready while
-/// the reconciler is still bringing it up.
+/// grace is applied instead: [`HealthWatch::reconverging`] is the single pre-mutation boundary
+/// that restarts tracking. Entering it before the reconciler runs also prevents a failed partial
+/// apply from reporting the previous release's readiness under a new assignment.
 struct HealthWatch {
     next_probe: Instant,
     /// Latest readiness observation, so a report reflects whether the deployed release is
-    /// actually serving. `None` until first sampled, or until a converge discards it.
-    last_ready: Option<bool>,
+    /// actually serving. False until an observation says otherwise — an unsampled release and one
+    /// sampled unready are both reported unsettled, so they are the same state here.
+    last_ready: bool,
 }
 
 /// Everything the 12-hourly identity tick may spend on the control loop, end to end.
@@ -165,28 +206,71 @@ impl HealthWatch {
     fn after_boot_gate(timeouts: &Timeouts, ready: bool) -> Self {
         HealthWatch {
             next_probe: Instant::now() + timeouts.health_interval,
-            last_ready: Some(ready),
+            last_ready: ready,
         }
     }
 
-    /// Re-arm after the loop ran a converge of its own (a runtime reassignment, a secret rotation,
-    /// repaired bytes). Nothing has proven the re-applied release healthy, so give the reconciler
-    /// the same configured `health_grace` every gated converge gets through `became_healthy`
-    /// before a probe is recorded against it.
+    /// Re-arm immediately before the loop converges a runtime reassignment, repaired bytes, or a
+    /// release update. Nothing has proven the about-to-be-applied state healthy, so reporting turns
+    /// unready before any partial side effect can occur and the next probe receives the configured
+    /// `health_grace`.
     ///
     /// Without the grace, a release that is merely still starting is reported unready — fleet-wide
     /// and simultaneously, on a benign reassignment — and the healthproxy drains every node that
     /// obeyed the assignment.
-    fn reconverged(&mut self, timeouts: &Timeouts) {
+    fn reconverging(&mut self, timeouts: &Timeouts) {
         self.next_probe = Instant::now() + timeouts.health_grace;
-        self.last_ready = None;
+        self.last_ready = false;
     }
 
     /// Record one periodic observation and schedule the next probe.
     fn observed(&mut self, now: Instant, healthy: bool, timeouts: &Timeouts) {
         self.next_probe = now + timeouts.health_interval;
-        self.last_ready = Some(healthy);
+        self.last_ready = healthy;
     }
+}
+
+/// The loop's one non-transactional reapply path. Readiness turns false before `apply` can make a
+/// partial side effect; a caller therefore cannot publish old readiness or outputs under the
+/// changed assignment when convergence fails.
+async fn reconverge_environment(
+    opts: &Options,
+    store: &dyn Store,
+    health: &mut HealthWatch,
+) -> io::Result<updated_contracts::reconciler::ResultDocument> {
+    health.reconverging(&opts.timeouts);
+    let result = converge_environment(opts, store, Reason::Restart, attempt::CONVERGE)?;
+    if result.host_action == HostAction::Reboot {
+        return Ok(result);
+    }
+
+    let installed = match store.installed() {
+        Installed::Present(installed) => installed,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a verified installed release is required after convergence",
+            ))
+        }
+    };
+    let target = ReleaseTarget {
+        release: &installed.release,
+        archive_sha256: &installed.archive_sha256,
+    };
+    let mut reconciler =
+        ReleaseReconciler::new(opts, installed.lifecycle.as_ref(), Reason::Restart);
+    let gate = update::became_healthy(&mut reconciler, attempt::CONVERGE, target, target).await;
+    if let update::Health::Inconclusive(error) = &gate {
+        warn(&format!(
+            "the post-convergence health gate could not reach the reconciler ({error})"
+        ));
+    }
+    health.observed(
+        Instant::now(),
+        matches!(gate, update::Health::Ready),
+        &opts.timeouts,
+    );
+    Ok(result)
 }
 
 fn main() {
@@ -242,6 +326,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let _lock = updated::lock::InstanceLock::acquire(&with_suffix(&opts.paths.installed, ".lock"))
         .map_err(|e| format!("another agent already owns this install: {e}"))?;
 
+    // Reconciler exchanges contain plaintext assigned inputs. `InvocationData::drop` removes the
+    // ordinary case; this is the crash-recovery half of the same ownership rule. Run it only after
+    // taking the instance lock, so no live invocation can be mistaken for a stale one.
+    update::clear_stale_invocation_data(&opts.paths)?;
+
     // Watch for a stop/restart signal; when it fires the agent exits. It touches no workload:
     // whatever the release's reconciler started keeps running, under whatever owns it.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -266,7 +355,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let first_install = ensure_installed(&opts, &mut store).await?;
 
     // Claim the launcher's marker once, up front.
-    let mut evidence = launcher::Evidence::read(launcher::state_dir().as_deref())?;
+    let mut evidence = launcher::Evidence::read(&opts.agent_update.state_dir)?;
 
     // Whether this boot repaired a damaged committed tree. A permanent, hash-keyed rejection may
     // never be charged to bytes this boot re-downloaded and re-verified, so it is the one input
@@ -325,7 +414,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         error(reason);
         return Err(reason.clone().into());
     }
-    let mut current = plan.current.clone();
+    let current = plan.current.clone();
 
     let mut self_update = SelfUpdateState::load(&opts)?;
 
@@ -353,7 +442,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         // `RolledBack` file left behind by a tolerated `clear_journal` failure), and the
         // `pending`-derived rollbacks are synthesized already on the path.
         if !tx.is_rollback() {
-            advance_transaction(&mut store, tx, TransactionPhase::RollbackStarted)?;
+            advance_transaction(&mut store, tx, TransactionPhase::RollbackActivating)?;
         }
     }
 
@@ -363,12 +452,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // `exit_for_relaunch`), so the launcher relaunches this agent and boot recovery re-derives
     // the identical, idempotent reconciliation from that durable evidence — unless the cause is a
     // node-local transient, which `recover_through_transients` waits out instead (see there).
-    let mut pending = recover_through_transients(
-        "boot/update recovery",
-        &TransientRetry::BOOT,
-        &mut launcher,
-        &shutdown,
-        || {
+    let mut pending =
+        recover_through_transients("boot/update recovery", &mut launcher, &shutdown, || {
             execute_boot_plan(
                 &plan,
                 &mut store,
@@ -377,20 +462,22 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 recovery_transaction.as_mut(),
                 &mut evidence,
             )
-        },
-    )
-    .await?;
+        })
+        .await?;
     // Restore the predecessor's machine state (rollback recovery): the predecessor's own `apply`,
     // replayed under the transaction's identity — `complete_recovery_activation` resolves whether
     // this boot still owes it.
-    recover_through_transients(
+    let recovery_action = recover_through_transients(
         "predecessor activation recovery",
-        &TransientRetry::BOOT,
         &mut launcher,
         &shutdown,
         || complete_recovery_activation(&opts, &mut store, recovery_transaction.as_mut()),
     )
     .await?;
+    if recovery_action == HostAction::Reboot {
+        request_host_reboot(&shutdown).await?;
+        return Ok(());
+    }
     if pending.is_some() {
         if let Some(v) = current.as_deref() {
             log(&format!(
@@ -409,15 +496,15 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // Signal *agent* readiness to the launcher now that this boot has reconciled its durable
-    // state — BEFORE fetching secrets or gating the release's health. For a committed agent this is
+    // state — BEFORE fetching assigned inputs or gating the release's health. For a committed agent this is
     // a no-op; for a candidate it begins the launcher's confirmation window. Signalling here
     // decouples "the agent process started successfully" from everything downstream that depends on
-    // the control plane or on the release: neither a slow reconciler nor an unreachable secrets
-    // endpoint can blow the launcher's ready_timeout and get a perfectly good agent rejected — and
+    // the control plane or on the release: neither a slow reconciler nor an unreachable input
+    // capability can blow the launcher's ready_timeout and get a perfectly good agent rejected — and
     // that rejection is by content hash and never expires.
     //
     // The price is real and deliberate: from here the confirmation window runs on its own clock, so
-    // a candidate that spends it waiting for secrets is committed WITHOUT having converged the
+    // a candidate that spends it waiting for inputs is committed WITHOUT having converged the
     // release, and the boot converge and health gate below both run inside the window rather than
     // in front of it. That is the trade this ordering buys — commitment attests these agent bytes
     // started and stayed up, not that the control plane was reachable or that the release is
@@ -429,24 +516,25 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(137);
     }
 
-    // Acquire the assigned secrets, waiting out a control-plane outage: every reconciler
-    // invocation carries them in its environment, so no hook may run without them. `ready` is the
+    // Acquire the assigned sensitive runtime data, waiting out a control-plane outage: every
+    // reconciler invocation consumes it, so no hook may run without it. `ready` is the
     // proof that this wait sits behind the readiness signal — in front of it, an unreachable
-    // secrets endpoint is indistinguishable from an agent binary that cannot start, and gets the
+    // input capability is indistinguishable from an agent binary that cannot start, and gets the
     // candidate's bytes rejected for good.
     if !opts
-        .secrets
+        .runtime_data
         .acquire(
-            &opts.deployment,
-            &opts.application.secrets,
+            &opts.assignment_sha256,
+            &opts.application.input_selection,
             &shutdown,
             ready,
         )
         .await
     {
-        log("shutdown requested while waiting for the assigned secrets; exiting");
+        log("shutdown requested while waiting for assigned runtime data; exiting");
         return Ok(());
     }
+    opts.inputs = opts.runtime_data.inputs().clone();
 
     // One reason for this whole boot, so the converge below and the gate after it can never
     // disagree about what kind of boot the reconciler is being asked to serve.
@@ -461,13 +549,12 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // deferred would converge the machine onto the very release the rollback is undoing. A rollback
     // recovery instead re-runs the predecessor's own `apply` on every boot until the rollback
     // completes — see [`complete_recovery_activation`].
-    if recovery_transaction.is_none() {
-        converge_environment(&opts, &store, boot_reason)?;
-    }
-    if let Some(tx) = recovery_transaction.as_mut() {
-        if tx.recovery_pending(TransactionPhase::RollbackHealthStarted) {
-            advance_transaction(&mut store, tx, TransactionPhase::RollbackHealthStarted)?;
-        }
+    if recovery_transaction.is_none()
+        && converge_environment(&opts, &store, boot_reason, attempt::BOOT)?.host_action
+            == HostAction::Reboot
+    {
+        request_host_reboot(&shutdown).await?;
+        return Ok(());
     }
     // Gate readiness: the release's own `healthcheck` must pass before this boot is trusted. It is
     // the only health source — the agent owns no workload process to observe — and readiness was
@@ -491,8 +578,14 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let gate = update::became_healthy(
         &mut reconciler,
         &target.attempt,
-        &target.candidate,
-        &target.predecessor,
+        ReleaseTarget {
+            release: &target.candidate,
+            archive_sha256: &target.candidate_archive_sha256,
+        },
+        ReleaseTarget {
+            release: &target.predecessor,
+            archive_sha256: &target.predecessor_archive_sha256,
+        },
     )
     .await;
     if let update::Health::Inconclusive(cause) = &gate {
@@ -520,17 +613,24 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             let predecessor = tx.previous_release.version.clone();
             let opts = &opts;
             match bound_unhealthy_rollback(&mut store, tx, &mut |tx: &Transaction| {
-                run_lifecycle_command(
+                run_lifecycle_mutation(
                     tx.lifecycle.as_ref(),
                     opts,
+                    MutationOperation::Rollback,
                     LifecycleInvocation {
-                        phase: Operation::Rollback,
                         reason: Reason::Update,
                         id: &tx.rollback_attempt_id(),
-                        candidate: &tx.previous_release,
-                        predecessor: &tx.candidate_release,
+                        candidate: ReleaseTarget {
+                            release: &tx.previous_release,
+                            archive_sha256: &tx.previous_archive_sha256,
+                        },
+                        predecessor: ReleaseTarget {
+                            release: &tx.candidate_release,
+                            archive_sha256: &tx.candidate_archive_sha256,
+                        },
                     },
                 )
+                .map(drop)
             }) {
                 Ok(RollbackHealthOutcome::Descend) => error(&format!(
                     "rollback target {predecessor} is unhealthy after {MAX_ROLLBACK_HEALTH_ATTEMPTS} \
@@ -601,11 +701,11 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     if recovery_transaction
         .as_ref()
-        .is_some_and(|tx| tx.recovery_pending(TransactionPhase::PredecessorHealthy))
+        .is_some_and(|tx| tx.recovery_pending(TransactionPhase::RollbackVerified))
     {
         Chaos::from_env().crossing(update::boundary::PREDECESSOR_HEALTH_APPLIED);
         let tx = recovery_transaction.as_mut().expect("checked above");
-        advance_transaction(&mut store, tx, TransactionPhase::PredecessorHealthy)?;
+        advance_transaction(&mut store, tx, TransactionPhase::RollbackVerified)?;
     }
 
     // A crash may have interrupted the rollback between its journal barriers. Once the
@@ -615,29 +715,35 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .is_some_and(|tx| tx.recovery_pending(TransactionPhase::RolledBack));
     if rollback_incomplete {
-        if let Some(tx) = recovery_transaction.as_mut() {
-            if tx.recovery_pending(TransactionPhase::RollbackFinalizeStarted) {
-                advance_transaction(&mut store, tx, TransactionPhase::RollbackFinalizeStarted)?;
-            }
-        }
         if let (Some(tx), Some(lifecycle)) = (
             recovery_transaction.as_ref(),
             recovery_transaction
                 .as_ref()
                 .map(|tx| tx.lifecycle.as_ref()),
         ) {
-            if let Err(error) = run_lifecycle_command(
+            let rollback_result = match run_lifecycle_mutation(
                 lifecycle,
                 &opts,
+                MutationOperation::Rollback,
                 LifecycleInvocation {
-                    phase: Operation::Rollback,
                     reason: Reason::Update,
                     id: &tx.rollback_attempt_id(),
-                    candidate: &tx.previous_release,
-                    predecessor: &tx.candidate_release,
+                    candidate: ReleaseTarget {
+                        release: &tx.previous_release,
+                        archive_sha256: &tx.previous_archive_sha256,
+                    },
+                    predecessor: ReleaseTarget {
+                        release: &tx.candidate_release,
+                        archive_sha256: &tx.candidate_archive_sha256,
+                    },
                 },
             ) {
-                return Err(exit_for_relaunch("rollback recovery hook", &error));
+                Ok(result) => result,
+                Err(error) => return Err(exit_for_relaunch("rollback recovery hook", &error)),
+            };
+            if rollback_result.host_action == HostAction::Reboot {
+                request_host_reboot(&shutdown).await?;
+                return Ok(());
             }
             Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
         }
@@ -660,36 +766,76 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     }
     garbage_collect(&opts, &store);
 
+    run_steady_state(SteadyState {
+        opts,
+        shutdown,
+        launcher,
+        store,
+        pending,
+        current,
+        self_update,
+        boot_gate_passed: gate_passed,
+    })
+    .await
+}
+
+struct SteadyState {
+    opts: Options,
+    shutdown: Arc<AtomicBool>,
+    launcher: Launcher,
+    store: FileStore,
+    pending: Option<updated::state::Pending>,
+    current: Option<String>,
+    self_update: SelfUpdateState,
+    boot_gate_passed: bool,
+}
+
+async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::Error>> {
+    let SteadyState {
+        mut opts,
+        shutdown,
+        mut launcher,
+        mut store,
+        mut pending,
+        mut current,
+        mut self_update,
+        boot_gate_passed,
+    } = state;
+
     let mut loop_state = LoopState::new(opts.timeouts.check_interval);
     // The boot gate is this boot's first observation, whichever way it went: steady-state probing
     // starts one interval from here, and the node's first report carries what the gate saw rather
     // than claiming nothing is known. Pool membership follows from that report — the healthproxy is
     // the only path into rotation, and this agent never touches it directly.
-    let mut health = HealthWatch::after_boot_gate(&opts.timeouts, gate_passed);
-    // Rollout telemetry: this node's identity and a client for best-effort reports. Both
-    // are inert unless the current assignment carries a report URL; a node without a
-    // derivable identity or a failing client simply never reports and updates as usual.
-    //
-    // The report endpoint is the fleet gateway, which admits only fleet-CA client certs — the
-    // same mTLS the node already uses to fetch its repository — so the telemetry client presents
-    // the node's identity. If that identity can't build (an offline/non-mTLS deployment with no
-    // CA on disk), fall back to a plain client: telemetry is best-effort, and a plain-HTTP report
-    // target is served as usual.
+    let mut health = HealthWatch::after_boot_gate(&opts.timeouts, boot_gate_passed);
+    // Remote telemetry has exactly two clients: mTLS for capability acquisition and anonymous TLS
+    // for spending that capability. A broken remote identity is a configuration error, never an
+    // excuse to silently downgrade. Local file repositories have no telemetry endpoint, so they
+    // use one inert anonymous client without requiring node credentials.
+    let (telemetry_control_client, telemetry_object_client) = if opts.routing.is_local() {
+        let client = updated::tls::anonymous_object_client()?;
+        (client.clone(), client)
+    } else {
+        (
+            opts.routing.mtls.reqwest_control_client()?,
+            opts.routing.mtls.reqwest_capability_client()?,
+        )
+    };
+    let signing_key = load_report_signing_key(
+        (!opts.routing.is_local()).then_some(opts.routing.mtls.client_key.as_path()),
+    )?;
     let mut heartbeat = Heartbeat {
-        client: opts
-            .routing
-            .mtls
-            .reqwest_client()
-            .unwrap_or_else(|_| reqwest::Client::new()),
+        control_client: telemetry_control_client,
+        object_client: telemetry_object_client,
         node: telemetry::node_identity(&opts.routing),
         // The node signs each report with the SAME per-node key that certifies its mTLS leaf, so
         // the control plane verifies authenticity end-to-end (not just on the write hop). Loaded
-        // once as PKCS#8 DER; absent only for a mis-provisioned node, whose unsigned reports then
-        // fail closed at the throttle (treated as not-yet-settled) rather than being trusted.
-        signing_key: std::fs::read_to_string(&opts.routing.mtls.client_key)
-            .ok()
-            .and_then(|pem| updated::csr::key_pem_to_pkcs8_der(&pem).ok()),
+        // once as PKCS#8 DER. A remote node cannot run without it: silently omitting authenticated
+        // reports would stall rollout settlement and every output dependency while the workload
+        // kept changing. Only an explicitly local repository has no report channel or key.
+        signing_key,
         refusal: telemetry::Refusal::default(),
+        outputs: telemetry::OutputPublisher::default(),
     };
     let mut fingerprints = fingerprint::Tracker::new(Instant::now());
     // The last repository this node resolved. Kept across cycles so the heartbeat has something to
@@ -754,44 +900,25 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             loop_state.next_identity_check = now + IDENTITY_CHECK_INTERVAL;
             match updated::enrollment::NodeConfig::load(&opts.identity_renewal.config) {
                 Ok(config) => {
-                    // The refresh policy reads the repository's published versioned roots to walk a
-                    // rotation the node was offline for, so it presents the same steady-state
-                    // identity every other metadata fetch does.
-                    let renewal = match config
-                        .enrollment
-                        .steady_identity(&opts.identity_renewal.state_dir)
+                    // This tick now owns exactly one control operation: certificate renewal.
+                    // Metadata and root rotation ride the ordinary live TUF/S3 refresh path.
+                    let renewal = match tokio::time::timeout(
+                        IDENTITY_TICK_DEADLINE,
+                        updated::enrollment::renew_node_certificate_if_due(
+                            &config,
+                            &opts.identity_renewal.state_dir,
+                        ),
+                    )
+                    .await
                     {
-                        Ok(mtls) => {
-                            // ONE deadline over the whole tick, not per network leg. The tick runs
-                            // inline on this loop — the same loop that emits the heartbeat below —
-                            // and the healthproxy drains a node whose report is older than
-                            // REPORT_FRESHNESS (60s). Its three exchanges are each bounded
-                            // independently (60s + 30s + 60s), which sums to two and a half missed
-                            // heartbeats against a gateway that accepts connections and then
-                            // trickles: the walk would cause exactly the drain its own deadline
-                            // was sized to prevent. Timing out costs nothing — the whole check is
-                            // retried in 12h — so it is bounded well inside that window instead.
-                            match tokio::time::timeout(
-                                IDENTITY_TICK_DEADLINE,
-                                updated::enrollment::renew_node_material_if_due(
-                                    &config,
-                                    &opts.identity_renewal.state_dir,
-                                    &updated_tuf::EmbeddedChainPolicy::new(mtls),
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(renewal) => renewal,
-                                Err(_) => Err(io::Error::new(
-                                    io::ErrorKind::TimedOut,
-                                    format!(
-                                        "node material renewal exceeded {}s on this control loop",
-                                        IDENTITY_TICK_DEADLINE.as_secs()
-                                    ),
-                                )),
-                            }
-                        }
-                        Err(error) => Err(error),
+                        Ok(renewal) => renewal,
+                        Err(_) => Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "node certificate renewal exceeded {}s on this control loop",
+                                IDENTITY_TICK_DEADLINE.as_secs()
+                            ),
+                        )),
                     };
                     match renewal {
                         Ok(true) => {
@@ -815,20 +942,24 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             // which is why this tick's target exists only inside the call. It is reported, never
             // acted on: past the confirmation window the reconciler owns the workload, and the
             // control plane owns what to do about an unhealthy one.
-            let healthy = probe_steady_target(&store, |installed, lifecycle| {
-                let healthy = run_lifecycle_command(
+            let healthy = probe_steady_target(&store, |installed, archive_sha256, lifecycle| {
+                let target = ReleaseTarget {
+                    release: installed,
+                    archive_sha256,
+                };
+                let healthy = run_lifecycle_observation(
                     lifecycle,
                     &opts,
+                    ObservationOperation::Healthcheck,
                     LifecycleInvocation {
-                        phase: Operation::Healthcheck,
                         reason: Reason::Restart,
                         id: attempt::PERIODIC,
-                        candidate: installed,
-                        predecessor: installed,
+                        candidate: target,
+                        predecessor: target,
                     },
                 )
                 .is_ok();
-                if let Some(Err(error)) = fingerprints.poll(
+                if let Some(error) = fingerprints.poll(
                     now,
                     healthy,
                     heartbeat.node.as_deref().unwrap_or("unidentified-node"),
@@ -837,11 +968,10 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                             lifecycle,
                             &opts,
                             LifecycleInvocation {
-                                phase: Operation::Inspect,
                                 reason: Reason::Restart,
                                 id: attempt::FINGERPRINT,
-                                candidate: installed,
-                                predecessor: installed,
+                                candidate: target,
+                                predecessor: target,
                             },
                         )
                     },
@@ -914,17 +1044,21 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // running and the next probe would report it ready. NOT best effort: a converge
                     // that fails would leave the old image serving, so it propagates and this agent
                     // exits, leaving boot recovery to converge the repaired release.
-                    converge_environment(&opts, &store, Reason::Restart).map_err(|error| {
-                        format!("converging the environment onto the repaired bundle: {error}")
-                    })?;
-                    health.reconverged(&opts.timeouts);
+                    let result = reconverge_environment(&opts, &store, &mut health)
+                        .await
+                        .map_err(|error| {
+                            format!("converging the environment onto the repaired bundle: {error}")
+                        })?;
+                    if result.host_action == HostAction::Reboot {
+                        return Ok(TickFlow::Reboot);
+                    }
                     // Take the repaired bundle through a LATER tick rather than falling through to the
                     // update check on this one: the check is legitimately due against the repaired
                     // release, but reaching it here would drive a whole update transaction over a
                     // release the reconciler has only just been asked to converge onto.
                     //
                     // On the normal cadence, and deferring the self-update check with it, for the same
-                    // reason the secrets arm below does: `check` is the only thing that advances the
+                    // reason the input-data arm below does: `check` is the only thing that advances the
                     // self-update clock and this early exit skips it, so scheduling the next cycle
                     // immediately would leave `self_due` true forever and collapse `wait` to its 100 ms
                     // floor. Drift that survives a repair (a reconciler `apply` writing into the
@@ -937,7 +1071,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                     // the node's only word about itself, and this arm is one of the paths that ends a
                     // cycle early — under drift that survives the repair (the arm's own stated case) a
                     // silent cycle would drain the node one `REPORT_FRESHNESS` later for a reason no
-                    // reader can see. It reports not-settled, which is simply what `reconverged`
+                    // reader can see. It reports not-settled, which is simply what `reconverging`
                     // just made true.
                     last_repo = Some(repaired_from);
                     return Ok(TickFlow::Next);
@@ -987,49 +1121,58 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
 
             // Reconcile the managed runtime onto the one live source before acting on version or
             // provider changes. `check_application` reconciles the version and provider set; the
-            // rest of the runtime — launch args, health URLs, cadence, retention — is signed into
-            // the same assignment and can change on a control-plane reassignment with no version
-            // bump. Applying it here keeps every launch on the current launch spec.
-            if let Some(assignment) = repo.assignment() {
-                let secrets_changed = match opts
-                    .secrets
-                    .reconcile(&assignment.deployment, &assignment.runtime.secrets)
+            // rest of the runtime — repository bounds, cadence, retention, and resolved inputs —
+            // is signed into the same assignment and can change on a control-plane reassignment
+            // with no version bump. Applying it here keeps every converge on the current contract.
+            if let Some((assignment, assignment_sha256)) =
+                repo.assignment().zip(repo.assignment_sha256())
+            {
+                match opts
+                    .runtime_data
+                    .reconcile(assignment_sha256, &assignment.runtime.inputs)
                     .await
                 {
-                    Ok(changed) => changed,
+                    Ok(()) => {}
                     Err(error) => {
                         warn(&format!(
-                            "assigned secrets could not be reconciled; keeping the running application and retrying: {error}"
+                            "assigned runtime data could not be reconciled; keeping the running application and retrying: {error}"
                         ));
                         let retry = jitter(opts.timeouts.refresh_retry, REPORT_CADENCE_JITTER_PERCENT);
                         loop_state.next_app_check = Instant::now() + retry;
                         // Defer the self-update check too. It is due right after boot and is only
                         // advanced by `check` below — which this early exit skips — so leaving it alone
-                        // collapses `wait` to its 100 ms floor and turns a failing secrets endpoint into
-                        // every node in the fleet re-running a TUF refresh and a secrets fetch ten times
+                        // collapses `wait` to its 100 ms floor and turns a failing input capability into
+                        // every node in the fleet re-running a TUF refresh and an input fetch ten times
                         // a second, against the control plane that is already unwell.
                         self_update.defer(Instant::now() + retry);
                         return Ok(TickFlow::Next);
                     }
                 };
                 opts.deployment = assignment.deployment.clone();
-                if opts.apply_runtime(&assignment.runtime) || secrets_changed {
+                opts.assignment_sha256 = assignment_sha256.to_owned();
+                let inputs = opts.runtime_data.inputs().clone();
+                if opts.apply_runtime(&assignment.runtime, inputs) {
                     // The runtime changed under the deployed release. Resolved `inputs` reach the
-                    // reconciler only as `--input-file`, and rotated secret values only in its
-                    // environment, so `apply --reason restart` is the one thing that can act on
-                    // either — the agent has no process of its own to reconfigure.
+                    // reconciler only through its input directory, so `apply --reason restart` is
+                    // the one thing that can act on the change — the agent has no process of its
+                    // own to reconfigure.
                     log("assignment runtime changed; converging the environment onto it");
                     fingerprints.restart_after_deployment(Instant::now());
                     // The SAME converge the boot path runs, through the same function. Readiness
-                    // comes back only through the ordinary observed-healthy path once `reconverged`
+                    // comes back only through the ordinary observed-healthy path once `reconverging`
                     // re-arms probing, so a converge that fails leaves this node reporting unready.
-                    converge_environment(&opts, &store, Reason::Restart).map_err(|error| {
-                        format!("converging the environment onto the new runtime: {error}")
-                    })?;
+                    let result = reconverge_environment(&opts, &store, &mut health)
+                        .await
+                        .map_err(|error| {
+                            format!("converging the environment onto the new runtime: {error}")
+                        })?;
+                    opts.runtime_converged();
+                    if result.host_action == HostAction::Reboot {
+                        return Ok(TickFlow::Reboot);
+                    }
                     // Re-gate readiness from scratch — under the configured start grace, since
                     // nothing has proven the re-applied release yet — and let the next tick drive
                     // the version/provider reconciliation against it.
-                    health.reconverged(&opts.timeouts);
                     loop_state.next_app_check = Instant::now();
                     return Ok(TickFlow::Next);
                 }
@@ -1045,23 +1188,46 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             if cycle.updates {
                 match check_application(&opts, repo, &mut store, || {
                     fingerprints.restart_after_deployment(Instant::now());
+                    health.reconverging(&opts.timeouts);
                 })
                 .await
                 {
-                    AppOutcome::Upgraded { version } => {
+                    AppOutcome::Upgraded {
+                        version,
+                        host_action,
+                    } => {
                         current = Some(version);
                         // The commit recorded the update as unconfirmed; pick it up so its
                         // window is watched and a crash is caught on the next boot.
                         pending = installed_pending(&store);
                         garbage_collect(&opts, &store);
+                        if host_action == HostAction::Reboot {
+                            return Ok(TickFlow::Reboot);
+                        }
                         // The transaction converged the machine onto a new release. What this
                         // watch holds — the last observation, the probe deadline set earlier in
                         // this same tick — describes the release it replaced, so re-arm as at
                         // every other converge rather than judging a fresh release on its
                         // predecessor's record.
-                        health.reconverged(&opts.timeouts);
                     }
-                    AppOutcome::Unchanged => {}
+                    AppOutcome::Unchanged => {
+                        // Configuration management is continuous, not an install-only side effect:
+                        // every verified steady-state cycle asks the committed reconciler to
+                        // enforce its desired state even when release selection has nothing new.
+                        // Scripts own idempotence; the platform owns making convergence recur.
+                        fingerprints.pause_for_mutation();
+                        let result = reconverge_environment(&opts, &store, &mut health)
+                            .await
+                            .map_err(|error| {
+                                format!("periodically converging the desired state: {error}")
+                            })?;
+                        if result.changed {
+                            fingerprints.restart_after_deployment(Instant::now());
+                        }
+                        if result.host_action == HostAction::Reboot {
+                            return Ok(TickFlow::Reboot);
+                        }
+                    }
                     AppOutcome::RestartForRecovery => {
                         // A post-activation failure left a durable rollback journal. Terminate this
                         // disposable agent cleanly; the launcher relaunches it and boot recovery
@@ -1097,7 +1263,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 &store,
                 current.as_deref(),
                 Settlement {
-                    settled: pending.is_none() && health.last_ready.unwrap_or(false),
+                    settled: pending.is_none() && health.last_ready,
                     updating: pending.is_some(),
                 },
                 fingerprints.current(),
@@ -1106,8 +1272,35 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         match flow? {
             TickFlow::Next => {}
             TickFlow::Exit => return Ok(()),
+            TickFlow::Reboot => {
+                request_host_reboot(&shutdown).await?;
+                return Ok(());
+            }
         }
     }
+}
+
+/// Request a reboot and remain alive until the operating system begins shutdown.
+///
+/// Remaining alive is deliberate: the launcher must not mistake this planned host transition for
+/// an agent exit and immediately relaunch another copy before the machine goes down. If the OS
+/// accepted the request but never starts shutdown, fail after a bound so service supervision can
+/// retry the still-required, idempotent convergence instead of leaving the node wedged forever.
+async fn request_host_reboot(shutdown: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
+    host::request_reboot()?;
+    log("host reboot requested; waiting for the operating system to stop the agent");
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the operating system accepted a reboot request but did not begin shutdown within 10 minutes",
+    )
+    .into())
 }
 
 /// How one cycle of the control loop ended.
@@ -1116,908 +1309,8 @@ enum TickFlow {
     Next,
     /// Leave this agent process; the launcher relaunches it.
     Exit,
-}
-
-/// The rollout heartbeat's per-process inputs.
-///
-/// There is exactly one report writer in the agent and exactly one call to it — at the end of
-/// every cycle, outside the block that does the cycle's work, so no early exit can reach the top of
-/// the loop without it. That report is the only thing keeping this node inside `REPORT_FRESHNESS`
-/// at the health proxy: a cycle that ends in silence spends the node's freshness budget, and a
-/// fault that recurs every cycle (drift that survives a repair, an unconfirmed update) spends it to
-/// zero and the node is drained for a reason no reader can see.
-struct Heartbeat {
-    client: reqwest::Client,
-    /// The node identity reports are keyed by; absent on a node with no derivable identity, which
-    /// simply never reports.
-    node: Option<String>,
-    /// The per-node key each report is signed with (PKCS#8 DER).
-    signing_key: Option<Vec<u8>>,
-    /// Whether the report endpoint is currently refusing this node, and when to try again. A
-    /// refusal is a standing verdict about identity (see [`telemetry::Refusal`]), so it paces the
-    /// writer down to the agent-check cadence instead of spending a request and a warning per cycle
-    /// on a report no reader could ever accept.
-    refusal: telemetry::Refusal,
-}
-
-/// What this node can say about its own settlement on the assignment it is acting on: the two
-/// independent facts a report carries, gathered where both are known.
-#[derive(Clone, Copy)]
-struct Settlement {
-    /// The running app is ready AND no update is still unconfirmed.
-    settled: bool,
-    /// An update transaction is committed and its confirmation window is still open.
-    updating: bool,
-}
-
-/// Whether this node has durably rejected the release `assignment` names — its own rejection
-/// record, keyed by the repository lineage and the archive digest exactly as every acquisition path
-/// keys it. A node that has is finished with those bytes for good: it never retries them, so no
-/// later report of it will ever name that release as running, and the control plane has to be told
-/// or it waits for a convergence that cannot happen.
-fn rejects_assigned_release(
-    store: &dyn Store,
-    assignment: &updated_contracts::assignment::RepositoryAssignment,
-) -> bool {
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
-    store.is_rejected(&lineage, &assignment.application.sha256)
-}
-
-impl Heartbeat {
-    /// Write one best-effort report of what this node is running.
-    ///
-    /// `state.settled` is true only when the running app is ready AND no update is still
-    /// unconfirmed — so a node that has merely *fetched* a new assignment, or is mid-rollout, or
-    /// was just relaunched onto repaired bytes, is never reported as settled on it. That is what
-    /// lets the control plane hold a pair's second member until the first has genuinely completed.
-    /// Keyed off the current assignment's report URL, so adding or removing telemetry just starts
-    /// or stops the heartbeat.
-    ///
-    /// `state.updating` is the other half of an unsettled report: an update transaction is
-    /// committed and its confirmation window is still open. It is reported rather than inferred
-    /// from `settled`, which is also false for a plain readiness failure.
-    ///
-    /// `repo` is the last repository this node resolved — `None` only before the first successful
-    /// resolution, when there is no assignment and so no report target yet.
-    async fn emit(
-        &mut self,
-        opts: &Options,
-        repo: Option<&TrustedRepository>,
-        store: &dyn Store,
-        version: Option<&str>,
-        state: Settlement,
-        fingerprint: Option<&updated_contracts::telemetry::Fingerprint>,
-    ) {
-        let Some(assignment) = repo.and_then(|repo| repo.assignment()) else {
-            return;
-        };
-        let repo = repo.expect("an assignment came from a repository");
-        let archive_sha256 = installed_archive_sha256(store);
-        let manifest_sha256 = installed_manifest_sha256(store);
-        let rejected = rejects_assigned_release(store, assignment);
-        telemetry::report_running_state(
-            &self.client,
-            assignment.report_url.as_deref(),
-            self.node.as_deref(),
-            &telemetry::RunningState {
-                deployment: &assignment.deployment,
-                assignment_sha256: repo.assignment_sha256().unwrap_or_default(),
-                version: version.unwrap_or_default(),
-                archive_sha256: &archive_sha256,
-                healthy: state.settled,
-                updating: state.updating,
-                rejected,
-                fingerprint,
-                install_root: &opts.paths.install_root,
-                manifest_sha256: &manifest_sha256,
-            },
-            self.signing_key.as_deref(),
-            &mut self.refusal,
-            // The slowest cadence the agent already has, read fresh each cycle so an assignment
-            // that changes it moves the backoff with it.
-            opts.timeouts.agent_check_interval,
-        )
-        .await;
-    }
-}
-
-/// Repair a committed release whose bytes no longer verify on disk (bit rot, a truncated file, a
-/// partially restored backup), so local corruption is recoverable instead of a permanent boot
-/// crash-loop with the application stopped.
-///
-/// Two ordered attempts, both driven from signed evidence:
-///
-///  1. Re-acquire the assigned application from the same signed deployment contract normal updates
-///     use. The bundle store republishes a drifted release directory over the verified tree it just
-///     expanded, so this restores the ASSIGNED release — the outcome an operator wants — and it is
-///     tried first for that reason. For a `file:`/absolute routing repository it makes no network
-///     request at all; for every other node it is one repository access, which is exactly what the
-///     caller's local verification deliberately runs *in front of*.
-///  2. Failing that — an unreachable control plane, an assignment with nothing installable — fall
-///     back to the predecessor the committed record already holds for exactly this purpose
-///     (`pending.previous_release`, which [`garbage_collect`] keeps on disk). This needs no
-///     network at all. Its bytes are verified first, so a second corrupt tree is not converged onto
-///     either, and then the revert is *journaled* rather than performed: boot recovery is the one
-///     rollback implementation, and it is what moves the pointer, runs the predecessor's `apply`,
-///     gates it, and replays the candidate's compensating `rollback`. The update loop converges the
-///     node forward again from there.
-///
-/// The corrupt archive is never *rejected*: a rejection is durable and never expires, and damage to
-/// this disk is evidence about this node, not about the release — rejecting it would permanently
-/// exclude a perfectly good version from this node and walk its ordered fallback downward.
-/// Returns the trusted repository the repair ran off, when it came from the assignment — the caller
-/// reports against it without a second refresh. The predecessor fallback runs precisely when no
-/// repository could be loaded, so it has none to give.
-enum Repair {
-    /// The assigned release was re-acquired and re-committed off this repository.
-    FromAssignment(Box<TrustedRepository>),
-    /// No signed repair was applicable, so the revert to the local predecessor is journaled and
-    /// boot recovery drives it. Nothing has moved yet: the committed record still names the
-    /// candidate.
-    RollbackJournaled,
-}
-
-async fn repair_committed_bundle(
-    opts: &Options,
-    store: &mut FileStore,
-) -> Result<Repair, Box<dyn std::error::Error>> {
-    let assignment_error = match repair_from_assignment(opts, store).await {
-        Ok(repo) => return Ok(Repair::FromAssignment(Box::new(repo))),
-        Err(error) => error,
-    };
-    let Installed::Present(installed) = store.installed() else {
-        return Err(assignment_error);
-    };
-    let Some(pending) = &installed.pending else {
-        return Err(assignment_error);
-    };
-    warn(&format!(
-        "re-acquiring the assigned application failed ({assignment_error}); falling back to the \
-         local predecessor {}",
-        pending.previous_release.version
-    ));
-    // Commit to the direction only once the predecessor's own bytes verify, so an unusable
-    // predecessor surfaces the original assignment error instead of journaling a revert onto a
-    // second corrupt tree.
-    updated::bundle::verify_release(&opts.paths.versions, &pending.previous_release).map_err(
-        |error| {
-            format!(
-                "the local predecessor {} is not intact either: {error}",
-                pending.previous_release.version
-            )
-        },
-    )?;
-    journal_predecessor_fallback(store, &installed, pending)?;
-    log(&format!(
-        "journaled a revert to the intact local predecessor {}; boot recovery drives it",
-        pending.previous_release.version
-    ));
-    Ok(Repair::RollbackJournaled)
-}
-
-/// Record the revert the committed record already owes, in the one shape every other revert
-/// produces, so a revert decided here and driven by boot recovery cannot describe two different
-/// things. The candidate is not rejected: the same reasoning that forbids rejecting the corrupt
-/// archive applies to the release whose tree this disk damaged.
-fn journal_predecessor_fallback(
-    store: &mut dyn Store,
-    installed: &updated::state::InstalledState,
-    pending: &Pending,
-) -> io::Result<()> {
-    persist_transaction(store, &rollback_of_unconfirmed(installed, pending, false))
-}
-
-/// Re-acquire and re-commit the assigned application from the signed deployment contract. This is
-/// the ordinary update machinery's `prepare` step run for repair: the release is re-downloaded and
-/// re-materialized, which republishes the drifted tree.
-async fn repair_from_assignment(
-    opts: &Options,
-    store: &mut FileStore,
-) -> Result<TrustedRepository, Box<dyn std::error::Error>> {
-    let repo = TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
-        .await
-        .map_err(|error| format!("loading the signed repair assignment: {error}"))?;
-    let assignment = repo
-        .assignment()
-        .ok_or("the signed repository has no desired deployment")?;
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
-    let prepared = crate::acquire::prepare_assigned_application(
-        crate::acquire::ApplicationRequest {
-            repository: &repo,
-            application: &opts.application,
-            paths: &opts.paths,
-            current_version: None,
-        },
-        |sha256| store.is_rejected(&lineage, sha256),
-    )
-    .await
-    .map_err(|error| format!("preparing the signed repair: {error}"))?
-    .ok_or("the signed assignment contains no installable application")?;
-    let providers = selection::stage_providers(opts, &repo, store, None)
-        .await
-        .map_err(|error| format!("staging the providers for the repair: {error}"))?;
-    // A repair replaces drifted BYTES; it does not decide an in-flight update. When it lands back
-    // on the release the record already names, the record's rollback intent and its provisional
-    // flag are carried through unchanged: erasing them would silently confirm an unconfirmed head —
-    // nothing left for `plan_boot` to revert on the next crash, and `garbage_collect` free to prune
-    // the very predecessor this function's own fallback depends on. A repair that lands on a
-    // different head (the assignment moved on) is a head this node has never launched, let alone
-    // health-gated, so it is committed provisional exactly as a cold install commits one — ordered
-    // fallback has to be able to descend past it if it turns out to be broken.
-    let (pending, confirmed) = match store.installed() {
-        Installed::Present(state) if state.release == prepared.release => {
-            (state.pending, state.confirmed)
-        }
-        _ => (None, false),
-    };
-    // Verify-then-point, and only then commit — the same order, and for the same reason, as the
-    // predecessor fallback in `repair_committed_bundle`: a failed `activate` (ENOSPC, a read-only
-    // remount) must leave the committed record exactly as it found it, so the fallback still has
-    // the `pending` it reads to recover.
-    store.activate(&prepared.release)?;
-    store.commit_installed(&updated::state::InstalledState {
-        repository_lineage: lineage,
-        release: prepared.release.clone(),
-        archive_sha256: prepared.archive_sha256,
-        lifecycle: Box::new(providers),
-        pending,
-        confirmed,
-    })?;
-    // Wording held stable: the e2e's offline-repair scenario asserts on this exact line, and the
-    // scenario it covers — a `file:` routing repository, no network — is the one it names.
-    log(&format!(
-        "repaired the committed application from signed local deployment {}",
-        prepared.version
-    ));
-    Ok(repo)
-}
-
-/// End this agent because it cannot make progress, leaving every piece of durable evidence
-/// (the transaction journal, the unspent marker claims, the rejection records) exactly as it is.
-///
-/// This is the ONLY response to an unrecoverable boot or update step, and it is deliberately an
-/// exit rather than a wait: the agent is disposable — it holds no workload — and the launcher
-/// relaunches it, so the next boot re-derives the identical, idempotent recovery from the same
-/// evidence. Holding the process alive instead means a single failed durable write pins the node
-/// down forever: no exit, so no relaunch, so no next boot, so the recovery that was supposed to
-/// happen "next boot" never did. Replaying an operator hook in
-/// a tight loop is not the alternative hazard it looks like either: the launcher throttles every
-/// relaunch through one exponential backoff capped at five minutes, and that backoff is rate-
-/// limited precisely so THIS path cannot escape it. An exit from here typically comes after a long
-/// boot — situation gathering, activation, an operator hook with an operator-chosen timeout — so
-/// the launcher's "it ran a while, this was a transient crash" reset would otherwise
-/// fire on every cycle; it stops resetting past a bounded number of relaunches per hour, and the
-/// loop settles at one replay per five minutes.
-fn exit_for_relaunch(what: &str, cause: &dyn std::fmt::Display) -> Box<dyn std::error::Error> {
-    let reason = format!(
-        "{what} failed: {cause}; exiting with the recovery journal intact so the launcher \
-         relaunches boot recovery"
-    );
-    error(&reason);
-    reason.into()
-}
-
-/// How long a boot-recovery step is retried when what failed it is a node-local transient, and
-/// how long it waits between attempts.
-struct TransientRetry {
-    budget: Duration,
-    interval: Duration,
-}
-
-impl TransientRetry {
-    /// The budget boot recovery runs with. It must outlast the launcher's readiness gate plus its
-    /// confirmation window (45s + 30s with the shipped defaults), because that is the whole point:
-    /// a candidate that spends the transient behind its readiness signal gets COMMITTED, so if the
-    /// fault outlives the budget the exit that follows is an ordinary relaunch instead of a
-    /// permanent, by-content-hash rejection.
-    const BOOT: TransientRetry = TransientRetry {
-        budget: Duration::from_secs(120),
-        interval: Duration::from_secs(3),
-    };
-}
-
-/// Run one fallible boot-recovery step, waiting out node-local transients from behind the
-/// readiness signal, and turning anything else into [`exit_for_relaunch`].
-///
-/// Boot recovery runs in front of the readiness signal because commitment is meant to attest that
-/// these agent bytes reconciled their durable state. But for a CANDIDATE agent, exiting
-/// before that signal is not the relaunch `exit_for_relaunch` describes — the launcher records the
-/// candidate rejected, the predecessor comes back and blacklists the candidate's SHA-256 in
-/// `agent-rejected`, a record that never expires. A full state volume, a read-only remount, an
-/// EIO, or a CDN blip during staging would therefore strand this node an agent release behind
-/// the fleet, permanently, over a fault that says nothing about the release — the same fault
-/// attribution `update.rs` already makes for a pointer write and `self_update.rs` for a failed
-/// handoff.
-///
-/// So a transient cause is retried instead, and readiness is signalled before the first retry:
-/// with the signal sent, the confirmation window runs on its own clock and the candidate is
-/// committed on the strength of what it is — bytes that started and stayed up — rather than on
-/// whether this node's disk was writable at that moment. Retrying is safe because the step is
-/// exactly what the next boot would re-derive: every phase is guarded by `recovery_pending`, so a
-/// re-run resumes where the failure landed.
-///
-/// The retry is BOUNDED. An agent that never exits is the failure mode `exit_for_relaunch`
-/// exists to prevent, so once the budget is spent this ends the process like any other
-/// unrecoverable step — by then the candidate is committed, and the relaunch is throttled by the
-/// launcher's backoff.
-async fn recover_through_transients<T>(
-    what: &str,
-    retry: &TransientRetry,
-    launcher: &mut Launcher,
-    shutdown: &AtomicBool,
-    mut step: impl FnMut() -> io::Result<T>,
-) -> Result<T, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + retry.budget;
-    loop {
-        let error = match step() {
-            Ok(value) => return Ok(value),
-            Err(error) => error,
-        };
-        if !retry_after_transient(&error, Instant::now(), deadline, shutdown) {
-            return Err(exit_for_relaunch(what, &error));
-        }
-        warn(&format!(
-            "{what} hit a node-local fault ({error}); signalling readiness and retrying in {}ms so \
-             a transient cannot get these agent bytes rejected by content hash",
-            retry.interval.as_millis()
-        ));
-        // Idempotent: the ordinary signal below this in `run` still happens, and only one READY
-        // frame reaches the launcher.
-        launcher.signal_ready();
-        if sleep_interruptible(retry.interval, shutdown).await {
-            return Err(exit_for_relaunch(what, &error));
-        }
-    }
-}
-
-/// Whether a failed recovery step earns another attempt from behind the readiness signal: only a
-/// node-local transient, only while the budget lasts, and never once a stop was requested. Anything
-/// else is the release's own fault (or out of time) and takes the [`exit_for_relaunch`] path.
-fn retry_after_transient(
-    error: &io::Error,
-    now: Instant,
-    deadline: Instant,
-    shutdown: &AtomicBool,
-) -> bool {
-    is_node_local_transient(error) && now < deadline && !shutdown.load(Ordering::SeqCst)
-}
-
-/// Whether an I/O failure is a fault of the NODE — its disk, its filesystem, its network — rather
-/// than of the release or the state being reconciled. These are the causes that clear on their own
-/// and say nothing about the bytes that hit them; every other kind (corrupt data, a bad path, an
-/// invalid transition) is owned by whatever produced it.
-fn is_node_local_transient(error: &io::Error) -> bool {
-    if matches!(
-        error.kind(),
-        io::ErrorKind::StorageFull
-            | io::ErrorKind::QuotaExceeded
-            | io::ErrorKind::ReadOnlyFilesystem
-            | io::ErrorKind::ResourceBusy
-            | io::ErrorKind::Interrupted
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::HostUnreachable
-            | io::ErrorKind::NetworkUnreachable
-            | io::ErrorKind::NetworkDown
-    ) {
-        return true;
-    }
-    // A hardware/transport read or write error has no `ErrorKind` of its own — it arrives
-    // `Uncategorized`, which is not matchable — so it is recognised by its raw code. A post-commit
-    // fsync failure arrives wrapped by `foundation::durable` ("the change landed but is not proved
-    // durable"), and an `io::Error` carrying that payload cannot ALSO carry a raw code — `Os` and
-    // `Custom` are alternative representations — so for those the code lives one `source` hop down,
-    // which `foundation::durable` documents and pins with a regression test.
-    #[cfg(unix)]
-    {
-        if error.raw_os_error() == Some(libc::EIO) {
-            return true;
-        }
-        let mut source = std::error::Error::source(error);
-        while let Some(current) = source {
-            if current
-                .downcast_ref::<io::Error>()
-                .is_some_and(|cause| cause.raw_os_error() == Some(libc::EIO))
-            {
-                return true;
-            }
-            source = current.source();
-        }
-        false
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
-}
-
-fn garbage_collect(opts: &Options, store: &dyn Store) {
-    let Installed::Present(installed) = store.installed() else {
-        return;
-    };
-    let mut releases = vec![installed.release.clone()];
-    let mut providers = Vec::new();
-    // Protect the installed release's own providers — they run on every boot (pre-start,
-    // verification) — and the pending predecessor's, which a rollback would replay.
-    providers.push(installed.lifecycle.release);
-    if let Some(pending) = installed.pending {
-        releases.push(pending.previous_release);
-        providers.push(pending.lifecycle.release);
-    }
-    match updated::gc::prune_releases(
-        &opts.paths.versions,
-        &releases,
-        opts.storage.inactive_releases,
-        opts.storage.inactive_bytes,
-    ) {
-        Ok(removed) if removed != 0 => {
-            log(&format!("removed {removed} inactive application releases"))
-        }
-        Ok(_) => {}
-        Err(error) => warn(&format!(
-            "garbage collecting application releases failed: {error}"
-        )),
-    }
-    match updated::gc::prune_releases(
-        &opts.paths.provider_versions,
-        &providers,
-        opts.storage.inactive_providers,
-        opts.storage.inactive_bytes,
-    ) {
-        Ok(removed) if removed != 0 => {
-            log(&format!("removed {removed} inactive lifecycle providers"))
-        }
-        Ok(_) => {}
-        Err(error) => warn(&format!(
-            "garbage collecting lifecycle providers failed: {error}"
-        )),
-    }
-    // A release's writable working directory lives outside its content-addressed tree — the tree is
-    // re-hashed on every check, so an application writing to its own `cwd` would condemn it — which
-    // means pruning the tree does not take the scratch with it. Reap here, in the same pass, rather
-    // than leaving it to whenever the node next resolves a release for launch.
-    updated::gc::reap_orphaned_workspaces(&opts.paths.work, &opts.paths.versions);
-    updated::gc::reap_orphaned_workspaces(&opts.paths.provider_work, &opts.paths.provider_versions);
-}
-
-/// Reject the bytes of a *provisional* (never-health-proven) cold-installed head so the next
-/// boot's cold install descends via ordered fallback past it.
-///
-/// Called only for a head [`boot::plan_gate_failure`] has already classified provisional: a head
-/// with a predecessor to revert to takes the revert path instead, and a confirmed head is never
-/// rejected for ill health at all.
-fn reject_provisional_head(
-    store: &mut FileStore,
-    state: &updated::state::InstalledState,
-) -> std::io::Result<()> {
-    store.reject(&state.repository_lineage, &state.archive_sha256)?;
-    warn(&format!(
-        "provisional head {} never passed a health gate; rejected its bytes so the next cold \
-         install descends via ordered fallback",
-        state.release.version
-    ));
-    Ok(())
-}
-
-/// How many consecutive boots may fail to health-gate a crash-recovered rollback's predecessor
-/// before the agent stops retrying it and descends via ordered fallback. More than one so a
-/// merely slow-to-start predecessor is not abandoned on its first miss; small so a genuinely broken
-/// predecessor cannot keep the node down for long.
-const MAX_ROLLBACK_HEALTH_ATTEMPTS: u32 = 3;
-
-/// What a boot does after a crash-recovered rollback's predecessor fails its health gate.
-#[derive(Debug, PartialEq, Eq)]
-enum RollbackHealthOutcome {
-    /// Still under the bound: the incremented counter is persisted and the same predecessor is
-    /// retried on the next boot. Carries the attempt number for the log.
-    Retry(u32),
-    /// The bound was reached: the failed candidate's `rollback` compensation is run first, then the
-    /// predecessor's bytes are rejected, it is recorded as a provisional (now-rejected) head, and
-    /// the rollback journal is cleared, so the next boot's [`ensure_installed`] descends via ordered
-    /// fallback past it exactly as a cold install does.
-    Descend,
-}
-
-/// Bound rollback-target health failures so a predecessor whose bytes can no longer pass the gate
-/// cannot crash-loop the node forever. The failure count rides the journal (the very thing that
-/// re-derives the rollback on each boot, so it survives the launcher relaunch). Once it reaches
-/// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], this compensates the failed candidate through the release's
-/// own `rollback` — the agent promises reconciler authors that every `apply` it drives is
-/// compensated, and abandoning the transaction here would break that promise with the journal
-/// destroyed — and then rejects the predecessor, records it provisional, and drops the journal, so
-/// the next boot descends via the cold-install ordered-fallback path instead of relaunching the
-/// same broken predecessor.
-///
-/// The compensation is journaled before it is attempted, and the failure tally is the durable
-/// marker that makes it one shot rather than a relaunch loop: the boot that reaches the bound
-/// persists the count at exactly [`MAX_ROLLBACK_HEALTH_ATTEMPTS`] before invoking the hook, so a
-/// boot that finds the count already past the bound knows the previous attempt did not complete and
-/// descends uncompensated instead of relaunching into it forever. Worst case, two boots.
-///
-/// The phase is deliberately not advanced across this: the predecessor never became healthy, and
-/// [`Transaction::advance`] admits only the true rollback edges.
-fn bound_unhealthy_rollback(
-    store: &mut dyn Store,
-    tx: &mut Transaction,
-    compensate: &mut dyn FnMut(&Transaction) -> io::Result<()>,
-) -> io::Result<RollbackHealthOutcome> {
-    tx.rollback_health_failures = tx.rollback_health_failures.saturating_add(1);
-    if tx.rollback_health_failures >= MAX_ROLLBACK_HEALTH_ATTEMPTS {
-        if tx.rollback_health_failures == MAX_ROLLBACK_HEALTH_ATTEMPTS {
-            // Journal the intent first, so a compensation that dies mid-flight is not re-attempted
-            // forever by the boots that follow.
-            persist_transaction(store, tx)?;
-            compensate(tx)?;
-            Chaos::from_env().crossing(update::boundary::ROLLBACK_ADAPTER_APPLIED);
-        } else {
-            warn(
-                "the failed candidate's rollback compensation was already attempted and did not \
-                 complete; descending uncompensated rather than relaunching into it forever",
-            );
-        }
-        // Conclude the rollback through its own terminal edges before touching durable state:
-        // the store refuses to discard a journal that is not settled, and `RolledBack` is the
-        // phase that records this machine's obligation as discharged — by the compensation above,
-        // or by its one durably-recorded attempt. Guarded per edge so a boot that died between
-        // these writes resumes instead of tripping the phase machine.
-        if tx.recovery_pending(TransactionPhase::RollbackFinalizeStarted) {
-            update::advance_transaction(store, tx, TransactionPhase::RollbackFinalizeStarted)?;
-        }
-        if tx.recovery_pending(TransactionPhase::RolledBack) {
-            update::advance_transaction(store, tx, TransactionPhase::RolledBack)?;
-        }
-        store.reject(&tx.previous_repository_lineage, &tx.previous_archive_sha256)?;
-        store.commit_installed(&updated::state::InstalledState::provisional(
-            tx.previous_repository_lineage.clone(),
-            tx.previous_release.clone(),
-            tx.previous_archive_sha256.clone(),
-            tx.lifecycle.clone(),
-        ))?;
-        store.clear_journal()?;
-        Ok(RollbackHealthOutcome::Descend)
-    } else {
-        // Persist the incremented count (phase unchanged) so the next boot resumes the tally.
-        persist_transaction(store, tx)?;
-        Ok(RollbackHealthOutcome::Retry(tx.rollback_health_failures))
-    }
-}
-
-fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
-    if let Some(tx) = &situation.journal {
-        let committed = match &situation.installed {
-            Installed::Present(state) => Some(&state.release),
-            Installed::Missing | Installed::Invalid => None,
-        };
-        return match boot::journal_recovery(tx, situation.active.as_ref(), committed) {
-            // The predecessor must actually be restored: this journal IS the recovery, and it is
-            // resumed from its own recorded phase.
-            updated::transaction::Recovery::RestorePredecessor => Some(tx.clone()),
-            // The update's commit landed, so this journal has nothing left to undo — it is merely
-            // spent (a tolerated `clear_journal` failure, or a crash between the commit and the
-            // journal's terminal write) — including when the active pointer has since moved off the
-            // candidate, which [`boot::journal_recovery`] resolves rather than mistaking a spent
-            // journal for a rollback it can never drive. What matters now is the same thing with no
-            // journal at all: the boot plan treats the committed record's `pending` as
-            // authoritative, so this boot may still be a confirmation-window revert. Derive that
-            // rollback from `pending` exactly as the journal-less path does — the candidate's
-            // machine-state changes are owed a compensating `rollback` either way, and a spent
-            // file on disk must not be what decides whether they are undone.
-            updated::transaction::Recovery::Committed => confirmation_window_rollback(situation),
-            // Nothing was ever displaced (a pre-activation crash), or the rollback already ran to
-            // completion. `reconcile_transaction` clears the journal and, for a finished rollback,
-            // commits the predecessor with zero lifecycle calls; synthesizing anything here would
-            // re-run an already-completed rollback machine and double-invoke every hook.
-            updated::transaction::Recovery::NeverSwapped => None,
-        };
-    }
-    confirmation_window_rollback(situation)
-}
-
-/// The rollback owed by the committed record itself, when a previous boot already moved the active
-/// pointer back to `pending.previous_release` but died before the compensating `rollback` and the
-/// final commit. It is the revert [`boot::plan_boot`] completes off `pending`, and it must replay
-/// the operator's `rollback` for the candidate's machine-state changes.
-///
-/// The rejection is NOT re-derived here: the boot that judged the candidate recorded it durably
-/// (see [`revert_unconfirmed_head`]) before the pointer ever moved.
-fn confirmation_window_rollback(situation: &Situation) -> Option<Transaction> {
-    let Installed::Present(installed) = &situation.installed else {
-        return None;
-    };
-    let pending = installed.pending.as_ref()?;
-    if situation.active.as_ref() != Some(&pending.previous_release) {
-        return None;
-    }
-    Some(rollback_of_unconfirmed(installed, pending, false))
-}
-
-/// The rollback transaction that reverts `installed` to the predecessor its `pending` names — the
-/// one shape both the boot gate's revert and the resumption of an interrupted one produce, so a
-/// revert that is decided in one boot and driven by the next cannot describe two different things.
-fn rollback_of_unconfirmed(
-    installed: &updated::state::InstalledState,
-    pending: &Pending,
-    reject_candidate: bool,
-) -> Transaction {
-    Transaction {
-        id: pending.lifecycle_attempt_id.clone(),
-        previous_release: pending.previous_release.clone(),
-        previous_archive_sha256: pending.previous_archive_sha256.clone(),
-        previous_repository_lineage: pending.previous_repository_lineage.clone(),
-        candidate_release: installed.release.clone(),
-        candidate_archive_sha256: installed.archive_sha256.clone(),
-        candidate_repository_lineage: installed.repository_lineage.clone(),
-        candidate_rejection_required: reject_candidate,
-        lifecycle: pending.lifecycle.clone(),
-        rollback_health_failures: 0,
-        phase: TransactionPhase::RollbackStarted,
-    }
-}
-
-/// Record the revert an unconfirmed release earned by failing its boot health gate: a durable
-/// rollback journal, and the candidate's rejection.
-///
-/// Only the intent is written here — the rollback itself is boot recovery's, the single
-/// implementation — so this agent exits and the next boot restores the predecessor's pointer, runs
-/// its `apply`, gates it, and replays the compensating `rollback` from exactly this journal.
-///
-/// `bytes_repaired` is the one thing that withholds the rejection. It is permanent and keyed by
-/// archive hash, so it may never be charged to bytes this same boot re-downloaded and re-verified:
-/// the gate then failed on a tree that no longer exists. The revert is owed either way — it is
-/// reversible — and a release that fails the gate again on the next boot, which finds the tree
-/// intact, is charged for it, so the descent still terminates.
-fn revert_unconfirmed_head(
-    store: &mut dyn Store,
-    installed: &updated::state::InstalledState,
-    bytes_repaired: bool,
-) -> io::Result<()> {
-    let pending = installed
-        .pending
-        .as_ref()
-        .expect("an unconfirmed head has a pending record");
-    let tx = rollback_of_unconfirmed(installed, pending, !bytes_repaired);
-    warn(&format!(
-        "release {} failed its boot health gate inside its confirmation window; reverting to {}",
-        installed.release.version, pending.previous_release.version
-    ));
-    persist_transaction(store, &tx)?;
-    if tx.candidate_rejection_required {
-        store.reject(&installed.repository_lineage, &installed.archive_sha256)?;
-    }
-    Ok(())
-}
-
-/// Converge the machine onto the restored predecessor during a rollback recovery.
-///
-/// The boot converge is the committed release's `apply` and never runs during recovery, so this is
-/// the only thing that starts the predecessor's workload. An incomplete rollback owes a converged
-/// predecessor until it reaches `RolledBack` — not merely one historical `apply` — because a machine
-/// reboot (rather than an agent kill) at any later rollback phase leaves the predecessor's workload
-/// stopped and the boot gate would then fail a perfectly healthy release. The `apply` is idempotent
-/// by the Execution contract, so replaying it on every resume boot is exactly the right semantics.
-///
-/// It runs under the transaction's compensating attempt identity, never the forward one: the
-/// forward switchover already invoked `apply` under `tx.id` with the *candidate* as `--candidate`,
-/// and a reconciler that keys completion on the attempt id would otherwise skip this one.
-fn complete_recovery_activation(
-    opts: &Options,
-    store: &mut dyn Store,
-    recovery: Option<&mut Transaction>,
-) -> io::Result<()> {
-    let Some(tx) = recovery else {
-        return Ok(());
-    };
-    if !tx.recovery_pending(TransactionPhase::RolledBack) {
-        return Ok(());
-    }
-    // Restore the predecessor's machine state through the same reconciler operation used for the
-    // candidate — the predecessor's own `apply`, which is what re-converges whatever it owns.
-    run_lifecycle_command(
-        tx.lifecycle.as_ref(),
-        opts,
-        LifecycleInvocation {
-            phase: Operation::Apply,
-            reason: Reason::Update,
-            id: &tx.rollback_attempt_id(),
-            candidate: &tx.previous_release,
-            predecessor: &tx.candidate_release,
-        },
-    )?;
-    Chaos::from_env().crossing(update::boundary::PREDECESSOR_LIFECYCLE_APPLIED);
-    // Only the first resume boot records the phase; the later ones replay the apply under a phase
-    // the machine no longer admits an edge into.
-    if tx.recovery_pending(TransactionPhase::PredecessorActivated) {
-        advance_transaction(store, tx, TransactionPhase::PredecessorActivated)?;
-    }
-    Ok(())
-}
-
-// ============================== boot: gather + execute ==============================
-
-/// Read the whole world the boot planner needs — durable state via the [`Store`] and the
-/// launcher's rejection marker, already claimed into [`launcher::Evidence`] — into one
-/// [`Situation`]. The shell's single point of input gathering. Reading evidence leaves it on disk;
-/// the boot path clears the claim only once the intent it implies is durable.
-fn gather_situation(
-    opts: &Options,
-    store: &dyn Store,
-    evidence: &launcher::Evidence,
-) -> io::Result<Situation> {
-    let active = store.active_release()?;
-    let installed = store.installed();
-    let journal = store.journal()?;
-    Ok(Situation {
-        installed,
-        active,
-        journal,
-        bad_agent: evidence.rejected_agent().map(PathBuf::from),
-        confirm_window: opts.timeouts.confirmation_window,
-        now: now_unix(),
-    })
-}
-
-/// Perform a boot [`Plan`]'s durable reconciliation and return the still-unconfirmed
-/// update (if any) for the loop to watch.
-fn execute_boot_plan(
-    plan: &Plan,
-    store: &mut dyn Store,
-    self_update: &mut SelfUpdateState,
-    defer_commit: bool,
-    mut recovery: Option<&mut Transaction>,
-    evidence: &mut launcher::Evidence,
-) -> io::Result<Option<Pending>> {
-    if let Some(tx) = recovery.as_mut() {
-        if tx.recovery_pending(TransactionPhase::RollbackActivateStarted) {
-            advance_transaction(store, tx, TransactionPhase::RollbackActivateStarted)?;
-        }
-    }
-    let activate_release = recovery
-        .as_ref()
-        .is_none_or(|tx| tx.recovery_pending(TransactionPhase::PredecessorActivated));
-    apply_store_plan(plan, store, defer_commit, activate_release)?;
-    if activate_release && !matches!(plan.release, ReleaseFix::None) {
-        Chaos::from_env().crossing(update::boundary::PREDECESSOR_POINTER_APPLIED);
-    }
-    if let Some(path) = &plan.reject_agent {
-        // Fallible on purpose, and cleared only here: a rejection that failed to reach disk must
-        // not be mistaken for a durable one. If the write fails this boot fails with the marker
-        // intact, so the next boot rejects the same candidate instead of re-staging it forever.
-        //
-        // With one exception, which is the marker module's own stated invariant: bytes that are not
-        // a content-addressed `agents/<hash>/<binary>` path — a stray write, a truncated or
-        // partially restored file — name no hash to suppress and are not evidence about any
-        // candidate. Failing the boot on them would fail identically on every subsequent boot (the
-        // marker is only ever cleared here), leaving the node permanently unbootable, so they are
-        // discarded with a warning and the marker is cleared.
-        //
-        // The shape is decided HERE, before the write is attempted, and `reject_candidate` takes
-        // the extracted hash rather than re-deriving it: a failing write reports `InvalidInput`
-        // for a bad key too, so classifying the error afterwards would make "malformed marker"
-        // and "the rejection did not reach disk" the same test.
-        if let Some(hash) = rejected_agent_hash(path) {
-            self_update.reject_candidate(hash)?;
-        } else {
-            warn(&format!(
-                "discarding an unusable rejected-agent marker: {} is not a content-addressed \
-                 agents/<hash>/<binary> path and names no candidate to suppress",
-                path.display()
-            ));
-        }
-        evidence.clear_rejected_agent()?;
-    }
-    Ok(installed_pending(store))
-}
-
-/// Apply the durable half of a boot [`Plan`] to the [`Store`].
-fn apply_store_plan(
-    plan: &Plan,
-    store: &mut dyn Store,
-    defer_commit: bool,
-    activate_release: bool,
-) -> io::Result<()> {
-    // Commit the intended state before activation; immutable predecessor releases remain
-    // available if a crash interrupts pointer reconciliation.
-    if !defer_commit {
-        if let Some(state) = &plan.commit {
-            store.commit_installed(state)?;
-        }
-    }
-    if activate_release {
-        match &plan.release {
-            ReleaseFix::None => {}
-            ReleaseFix::Activate(release) => store.activate(release)?,
-        }
-    }
-    for (lineage, hash) in &plan.reject_app {
-        store.reject(lineage, hash)?;
-    }
-    Ok(())
-}
-
-/// The candidate hash a rejected-agent marker names, or `None` when the marker's bytes are
-/// not a content-addressed `agents/<hash>/<binary>` path.
-///
-/// The one place that extraction happens; the hash it yields is what `reject_candidate` records.
-/// It applies the very predicate `Rejections::reject` validates with — [`updated::reject::is_rejection_key`],
-/// called rather than restated — so this accepts exactly the markers that path would accept
-/// however that grammar moves. Every marker it turns down would have failed there with no hash
-/// recorded anyway.
-fn rejected_agent_hash(path: &std::path::Path) -> Option<&str> {
-    let hash = path.parent()?.file_name()?.to_str()?;
-    updated::reject::is_rejection_key(hash).then_some(hash)
-}
-
-/// The unconfirmed update recorded in the installed state, if any.
-fn installed_pending(store: &dyn Store) -> Option<Pending> {
-    match store.installed() {
-        Installed::Present(s) => s.pending,
-        _ => None,
-    }
-}
-
-/// The SHA-256 of the archive the committed head was installed from, for the rollout heartbeat.
-/// Read from the store at report time rather than tracked alongside the running version: the
-/// version is a local carried across four separate commit paths, and a digest that drifted out of
-/// step with it would name bytes that are not running — worse than naming none. Empty when nothing
-/// is committed (no install yet, or an unreadable record), reported as "running no known bytes".
-fn installed_archive_sha256(store: &dyn Store) -> String {
-    match store.installed() {
-        Installed::Present(state) => state.archive_sha256,
-        _ => String::new(),
-    }
-}
-
-fn installed_manifest_sha256(store: &dyn Store) -> String {
-    match store.installed() {
-        Installed::Present(state) => state.release.manifest_sha256,
-        _ => String::new(),
-    }
-}
-
-/// Run one steady-state probe against the committed release and the lifecycle provider that must
-/// invoke it, read together from the one installed record.
-///
-/// The record is read here, inside the call, and `probe` only ever *borrows* what it names — so a
-/// caller cannot hold a target across ticks without deliberately cloning one, and the shape the
-/// loop used to have (resolve once at boot, reuse forever) does not compile. That matters because
-/// `garbage_collect` protects exactly the provider release this record names, so any second copy of
-/// it is a release the collector is free to prune: an in-loop repair commits a different provider
-/// (its own `stage_providers` result), the boot-time copy then named a provider bundle that was
-/// about to disappear, and every periodic probe after it failed to resolve — so a node whose
-/// release was serving perfectly well reported itself unready and was drained out of rotation.
-fn probe_steady_target<T>(
-    store: &dyn Store,
-    probe: impl FnOnce(&updated::bundle::ReleaseId, &updated::state::ProviderRelease) -> T,
-) -> io::Result<T> {
-    match store.installed() {
-        Installed::Present(state) => Ok(probe(&state.release, &state.lifecycle)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "a verified installed release is required",
-        )),
-    }
-}
-
-/// Confirm the current update by clearing its pending record.
-/// Returns `true` only once the confirmation is durable, so callers must keep their
-/// in-memory pending intent (and continue suppressing updates) after a write failure.
-fn confirm_update(store: &mut dyn Store) -> bool {
-    if let Installed::Present(mut st) = store.installed() {
-        st.pending = None;
-        if let Err(e) = store.commit_installed(&st) {
-            // Could not durably clear the pending intent; retry on the next tick or boot.
-            warn(&format!(
-                "could not durably confirm the update ({e}); will retry"
-            ));
-            return false;
-        }
-    }
-    true
+    /// The reconciler requested a host reboot. The cycle has already reported the node unsettled.
+    Reboot,
 }
 
 // ============================ application updates ============================
@@ -2029,15 +1322,15 @@ fn confirm_update(store: &mut dyn Store) -> bool {
 /// of load-balancer rotation immediately after every successful update — read as stale rather than
 /// as "acted, not yet settled", which is the distinction `settled` exists to publish.
 #[derive(Debug, PartialEq, Eq)]
-struct Cycle {
+pub(crate) struct Cycle {
     /// The cycle clock fired: refresh the repository, reconcile the assignment, and report.
-    due: bool,
+    pub(crate) due: bool,
     /// This cycle may also start a new application update. False while an update is unconfirmed:
     /// one rollout step at a time.
-    updates: bool,
+    pub(crate) updates: bool,
 }
 
-fn cycle_due(pending: bool, now: Instant, next_check: Instant) -> Cycle {
+pub(crate) fn cycle_due(pending: bool, now: Instant, next_check: Instant) -> Cycle {
     let due = now >= next_check;
     Cycle {
         due,
@@ -2045,13 +1338,15 @@ fn cycle_due(pending: bool, now: Instant, next_check: Instant) -> Cycle {
     }
 }
 
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     foundation::log::info("agent", msg);
 }
-fn warn(msg: &str) {
+
+pub(crate) fn warn(msg: &str) {
     foundation::log::warn("agent", msg);
 }
-fn error(msg: &str) {
+
+pub(crate) fn error(msg: &str) {
     foundation::log::error("agent", msg);
 }
 
@@ -2059,33 +1354,48 @@ fn error(msg: &str) {
 mod tests {
     use super::*;
     use crate::store::MemStore;
+    use crate::test_support::{provider, release};
     use updated::bundle::ReleaseId;
     use updated::state::{Installed, InstalledState, RepositoryLineage};
     use updated::transaction::Phase;
 
-    fn release(version: &str, digest: &str) -> ReleaseId {
-        ReleaseId {
-            version: version.into(),
-            manifest_sha256: digest.into(),
-        }
-    }
-
     /// One loop tick's steady-state probe, recording exactly what it was lent.
     fn tick(store: &dyn Store) -> (ReleaseId, Box<updated::state::ProviderRelease>) {
-        probe_steady_target(store, |installed, lifecycle| {
+        probe_steady_target(store, |installed, _, lifecycle| {
             (installed.clone(), Box::new(lifecycle.clone()))
         })
         .expect("an installed record")
     }
 
-    fn provider() -> Box<updated::state::ProviderRelease> {
-        Box::new(updated::state::ProviderRelease {
-            product: "reconciler".into(),
-            release: release("1.0.0", "reconciler-manifest"),
-            archive_sha256: "reconciler-archive".into(),
-            args: Vec::new(),
-            timeout_millis: 1_000,
-        })
+    #[test]
+    fn remote_reporting_requires_one_valid_owner_only_signing_key() {
+        assert!(load_report_signing_key(None).unwrap().is_none());
+
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("agent.key");
+        let pem = updated::csr::generate_key().unwrap();
+        foundation::durable::atomic_write(&key, ".report-key-", pem.as_bytes()).unwrap();
+        assert!(load_report_signing_key(Some(&key)).unwrap().is_some());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).unwrap();
+            assert_eq!(
+                load_report_signing_key(Some(&key)).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+
+        let malformed = directory.path().join("malformed.key");
+        foundation::durable::atomic_write(&malformed, ".report-key-", b"not a private key")
+            .unwrap();
+        assert_eq!(
+            load_report_signing_key(Some(&malformed))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -2165,19 +1475,11 @@ mod tests {
     /// only those) may go.
     #[test]
     fn a_journal_that_owes_compensation_cannot_be_discarded() {
-        for (phase, discardable) in [
-            (Phase::PreflightStarted, true),
-            (Phase::Prepared, true),
-            (Phase::ActivateStarted, false),
-            (Phase::CandidateActivated, false),
-            (Phase::HealthStarted, false),
-            (Phase::CommitStarted, false),
-            (Phase::RollbackStarted, false),
-            (Phase::RollbackHealthStarted, false),
-            (Phase::RollbackFinalizeStarted, false),
-            (Phase::Committed, true),
-            (Phase::RolledBack, true),
-        ] {
+        for phase in Phase::ALL {
+            let discardable = matches!(
+                phase,
+                Phase::Prepared | Phase::Committed | Phase::RolledBack
+            );
             let situation = interrupted_revert(Some(phase));
             let mut store = MemStore {
                 journal: situation.journal,
@@ -2202,12 +1504,12 @@ mod tests {
     }
 
     /// The one non-terminal phase whose journal can still be spent: a crash between the durable
-    /// commit and the journal's own terminal write leaves `CommitStarted` on disk while active
+    /// commit and the journal's own terminal write leaves `Committing` on disk while active
     /// and installed state prove the commit landed. The store admits exactly that evidence — and
     /// still refuses the same phase when the machine does NOT corroborate it.
     #[test]
     fn a_commit_that_landed_makes_its_journal_discardable() {
-        let situation = interrupted_revert(Some(Phase::CommitStarted));
+        let situation = interrupted_revert(Some(Phase::Committing));
         let tx = situation.journal.unwrap();
         let candidate = tx.candidate_release.clone();
 
@@ -2238,11 +1540,11 @@ mod tests {
     }
 
     /// The other door into evidence destruction: persisting transaction B over transaction A's
-    /// unsettled journal buries A's compensation obligation just as surely as deleting it. Same
-    /// id passes freely (that is every replay and phase advance); a different id needs A settled.
+    /// unsettled journal buries A's compensation obligation just as surely as deleting it. The
+    /// same id admits only exact state-machine successors; a different id needs A settled.
     #[test]
     fn an_unsettled_journal_cannot_be_buried_by_another_transaction() {
-        let situation = interrupted_revert(Some(Phase::RollbackHealthStarted));
+        let situation = interrupted_revert(Some(Phase::RollbackApplied));
         let unsettled = situation.journal.unwrap();
         let mut store = MemStore {
             journal: Some(unsettled.clone()),
@@ -2262,7 +1564,7 @@ mod tests {
 
         // ...until the first is settled.
         let mut settled = same;
-        settled.advance(Phase::RollbackFinalizeStarted).unwrap();
+        store.write_journal(&settled).unwrap();
         settled.advance(Phase::RolledBack).unwrap();
         store.write_journal(&settled).unwrap();
         assert!(store.write_journal(&other).is_ok());
@@ -2311,6 +1613,7 @@ mod tests {
             lifecycle: provider(),
             pending: Some(updated::state::Pending {
                 lifecycle_attempt_id: "attempt".into(),
+                candidate_rejection_sha256: "f".repeat(64),
                 previous_release: predecessor.clone(),
                 previous_archive_sha256: "archive-one".into(),
                 previous_repository_lineage: lineage.clone(),
@@ -2329,6 +1632,7 @@ mod tests {
                 previous_repository_lineage: lineage.clone(),
                 candidate_release: candidate,
                 candidate_archive_sha256: "archive-two".into(),
+                candidate_rejection_sha256: "f".repeat(64),
                 candidate_repository_lineage: lineage,
                 candidate_rejection_required: false,
                 lifecycle: provider(),
@@ -2385,11 +1689,17 @@ mod tests {
         // cycle body being an expression whose early exits leave the block, not the tick, with the
         // single emit after it — so this asserts the structure, which is the invariant.
         let source = include_str!("main.rs");
+        // The writer itself lives with `Heartbeat`; the cycle below is its only caller.
         let emitter = concat!("telemetry::report_", "running_state(");
         assert_eq!(
-            source.matches(emitter).count(),
+            include_str!("heartbeat.rs").matches(emitter).count(),
             1,
             "reports must have exactly one writer"
+        );
+        assert_eq!(
+            source.matches(emitter).count(),
+            0,
+            "and the cycle reaches it only through `Heartbeat::emit`"
         );
         assert_eq!(
             source.matches("heartbeat\n            .emit(").count(),
@@ -2418,6 +1728,7 @@ mod tests {
             lifecycle: provider(),
             pending: Some(updated::state::Pending {
                 lifecycle_attempt_id: "attempt".into(),
+                candidate_rejection_sha256: "f".repeat(64),
                 previous_release: release("1.0.0", "one"),
                 previous_archive_sha256: "archive-one".into(),
                 previous_repository_lineage: lineage,
@@ -2426,6 +1737,25 @@ mod tests {
             }),
             confirmed: true,
         }
+    }
+
+    #[test]
+    fn output_retention_uses_the_same_manifest_identity_as_its_writer_and_reader() {
+        let head = unconfirmed_head();
+        assert_ne!(head.release.manifest_sha256, head.archive_sha256);
+        assert_ne!(
+            head.pending
+                .as_ref()
+                .unwrap()
+                .previous_release
+                .manifest_sha256,
+            head.pending.as_ref().unwrap().previous_archive_sha256
+        );
+        assert_eq!(
+            protected_output_snapshot_manifests(&head),
+            vec!["two".to_string(), "one".to_string()],
+            "GC must protect the exact paths lifecycle output writes and telemetry reads"
+        );
     }
 
     fn store_holding(installed: &InstalledState) -> MemStore {
@@ -2452,9 +1782,9 @@ mod tests {
         assert!(journal.is_rollback());
         assert_eq!(journal.previous_release, release("1.0.0", "one"));
         assert!(journal.candidate_rejection_required);
-        assert!(journal.recovery_pending(Phase::PredecessorActivated));
+        assert!(journal.recovery_pending(Phase::RollbackApplied));
         assert!(journal.recovery_pending(Phase::RolledBack));
-        assert!(store.is_rejected(&head.repository_lineage, "archive-two"));
+        assert!(store.is_rejected(&head.repository_lineage, &"f".repeat(64)));
     }
 
     #[test]
@@ -2497,35 +1827,29 @@ mod tests {
         // Whichever way the gate went, it is this boot's first observation and the node's first
         // report carries it.
         let timeouts = Timeouts::default();
-        assert_eq!(
-            HealthWatch::after_boot_gate(&timeouts, false).last_ready,
-            Some(false)
-        );
-        assert_eq!(
-            HealthWatch::after_boot_gate(&timeouts, true).last_ready,
-            Some(true)
-        );
+        assert!(!HealthWatch::after_boot_gate(&timeouts, false).last_ready);
+        assert!(HealthWatch::after_boot_gate(&timeouts, true).last_ready);
     }
 
     #[test]
     fn a_spent_journal_still_derives_a_drivable_revert() {
         // Regression: `switch_over` tolerates a failed `clear_journal`, and an agent can die
         // between `commit_installed` and the journal's terminal write — either way a spent
-        // CommitStarted/Committed journal survives. A later boot then finds the pointer already
+        // Committing/Committed journal survives. A later boot then finds the pointer already
         // back on the predecessor (the revert a failed gate began). `classify_recovery` reads
         // `RestorePredecessor`, but the phase machine refuses to BEGIN a rollback from a terminal
         // `Committed`, so returning that journal verbatim produced a "recovery" with no rollback
         // rank: every resume gate closed, the plan's reconciliation was silently discarded, and
         // the candidate's machine-state changes were never compensated.
-        for phase in [Phase::CommitStarted, Phase::Committed] {
+        for phase in [Phase::Committing, Phase::Committed] {
             let mut tx = recovery_transaction(&interrupted_revert(Some(phase)))
                 .unwrap_or_else(|| panic!("a spent {phase:?} journal still owes the revert"));
             if !tx.is_rollback() {
-                tx.advance(Phase::RollbackStarted)
+                tx.advance(Phase::RollbackActivating)
                     .expect("a non-terminal journal is moved onto the rollback path");
             }
             assert_eq!(tx.previous_release, release("1.0.0", "one"));
-            assert!(tx.recovery_pending(Phase::PredecessorActivated));
+            assert!(tx.recovery_pending(Phase::RollbackApplied));
             assert!(tx.recovery_pending(Phase::RolledBack));
         }
     }
@@ -2550,11 +1874,15 @@ mod tests {
             previous_repository_lineage: lineage.clone(),
             candidate_release: candidate.clone(),
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage.clone(),
             candidate_rejection_required: true,
             lifecycle: provider(),
             rollback_health_failures: 0,
-            phase: Phase::RollbackHealthStarted,
+            // Reproduce a later resume boot: a prior process recorded a healthy predecessor, then
+            // a machine reboot lost the workload before this boot's authoritative gate. The
+            // durable failure tally must remain writable at this phase too.
+            phase: Phase::RollbackVerified,
         };
         let mut store = MemStore {
             installed: Some(InstalledState::confirmed(
@@ -2651,12 +1979,13 @@ mod tests {
                 previous_repository_lineage: lineage.clone(),
                 candidate_release: candidate,
                 candidate_archive_sha256: "archive-two".into(),
+                candidate_rejection_sha256: "f".repeat(64),
                 candidate_repository_lineage: lineage.clone(),
                 candidate_rejection_required: true,
                 lifecycle: provider(),
                 // Two boots have already failed the gate; this is the boot that reaches the bound.
                 rollback_health_failures: MAX_ROLLBACK_HEALTH_ATTEMPTS - 1,
-                phase: Phase::RollbackHealthStarted,
+                phase: Phase::RollbackApplied,
             }),
             ..MemStore::default()
         };
@@ -2715,12 +2044,9 @@ mod tests {
             false,
         );
         for phase in [
-            Phase::RollbackStarted,
-            Phase::RollbackActivateStarted,
-            Phase::PredecessorActivated,
-            Phase::RollbackHealthStarted,
-            Phase::PredecessorHealthy,
-            Phase::RollbackFinalizeStarted,
+            Phase::RollbackActivating,
+            Phase::RollbackApplied,
+            Phase::RollbackVerified,
         ] {
             tx.phase = phase;
             assert!(
@@ -2733,9 +2059,9 @@ mod tests {
 
         // Which is why recording the phase stays guarded: the machine admits only the true forward
         // edges, so a second resume boot must replay the apply without re-advancing.
-        tx.phase = Phase::PredecessorActivated;
+        tx.phase = Phase::RollbackApplied;
         assert!(
-            tx.advance(Phase::PredecessorActivated).is_err(),
+            tx.advance(Phase::RollbackApplied).is_err(),
             "re-advancing into a phase already reached is rejected, so the advance stays guarded"
         );
     }
@@ -2816,14 +2142,14 @@ mod tests {
         // The control plane publishes a reassignment that changes only the runtime; the loop runs
         // `apply --reason restart` and the reconciler brings the workload back up on its own time.
         let converged_at = Instant::now();
-        health.reconverged(&timeouts);
+        health.reconverging(&timeouts);
         assert!(
             health.next_probe >= converged_at + timeouts.health_grace,
             "nothing has proven the re-applied release, so no probe may be recorded against it \
              until the configured grace has passed"
         );
-        assert_eq!(
-            health.last_ready, None,
+        assert!(
+            !health.last_ready,
             "the previous release's readiness is not the re-applied release's readiness"
         );
     }
@@ -2838,13 +2164,12 @@ mod tests {
         let mut now = Instant::now();
         for _ in 0..10 {
             health.observed(now, false, &timeouts);
-            assert_eq!(health.last_ready, Some(false));
+            assert!(!health.last_ready);
             now += timeouts.health_interval;
         }
         health.observed(now, true, &timeouts);
-        assert_eq!(
+        assert!(
             health.last_ready,
-            Some(true),
             "a release the hook brings back reports ready again with no agent intervention"
         );
         assert_eq!(health.next_probe, now + timeouts.health_interval);
@@ -2853,7 +2178,7 @@ mod tests {
     /// Options in the shape [`crate::options::parse_args`] produces, against a local routing
     /// repository so nothing here reaches the network.
     fn options() -> Options {
-        use updated::config::{Paths, Routing, Storage};
+        use updated::config::{Paths, Routing};
         let root = PathBuf::from("/nonexistent/updated-agent-tests");
         let routing = Routing {
             root: root.join("enrollment/routing"),
@@ -2868,18 +2193,24 @@ mod tests {
         };
         Options {
             deployment: "test".into(),
-            secrets: crate::secrets::SecretManager::new(&routing, &[]).expect("a local repository"),
+            assignment_sha256: "a".repeat(64),
+            runtime_data: crate::runtime_data::RuntimeDataManager::new(
+                &routing,
+                &updated_contracts::dataflow::InputSelection::default(),
+            )
+            .expect("a local repository"),
+            runtime_converge_pending: false,
             paths: Paths::resolve(&root, &root.join("enrollment")),
             application: Application {
                 product: "app".into(),
                 channel: "stable".into(),
                 install_root: root.clone(),
-                secrets: Vec::new(),
-                inputs: std::collections::BTreeMap::new(),
+                input_selection: updated_contracts::dataflow::InputSelection::default(),
             },
+            inputs: updated_contracts::dataflow::FileSnapshot::default(),
             routing,
             timeouts: BoundedTimeouts::new(Timeouts::default()),
-            storage: Storage::default(),
+            storage: runtime().storage,
             agent_update: AgentUpdate {
                 channel: "stable".into(),
                 state_dir: root.join("state"),
@@ -2893,36 +2224,12 @@ mod tests {
     }
 
     fn runtime() -> updated_contracts::assignment::ManagedRuntime {
-        use updated_contracts::assignment::{
-            ManagedRepositoryLimits, ManagedRuntime, ManagedStorage, ManagedTimeouts,
-        };
-        ManagedRuntime {
-            product: "app".into(),
-            channel: "stable".into(),
+        // The shared fixture, with the one field these tests care about: an install root that
+        // must not exist, so a path that escaped into a real filesystem operation would fail
+        // loudly rather than write somewhere.
+        updated_contracts::assignment::ManagedRuntime {
             install_root: PathBuf::from("/nonexistent/updated-agent-tests"),
-            secrets: Vec::new(),
-            inputs: std::collections::BTreeMap::new(),
-            repository: ManagedRepositoryLimits {
-                metadata_limit: 1 << 20,
-                target_limit: 512 << 20,
-                transport_timeout_seconds: 30,
-            },
-            storage: ManagedStorage {
-                inactive_releases: 2,
-                inactive_providers: 2,
-                inactive_agents: 2,
-                inactive_bytes: 1 << 30,
-                inactive_repository_caches: 2,
-            },
-            timeouts: ManagedTimeouts {
-                check_interval_seconds: 15,
-                health_grace_seconds: 30,
-                health_successes: 2,
-                health_interval_seconds: 1,
-                refresh_retry_seconds: 5,
-                confirmation_window_seconds: 120,
-                agent_check_interval_seconds: 3600,
-            },
+            ..updated_contracts::assignment::testing::runtime()
         }
     }
 
@@ -2942,7 +2249,6 @@ mod tests {
             deployment: "deployment".into(),
             metadata_url: "https://repo/metadata/".into(),
             targets_url: "https://repo/targets/".into(),
-            report_url: Some("https://control/telemetry".into()),
             application: TargetReference {
                 path: "releases/app/2/app.bundle".into(),
                 sha256: "a".repeat(64),
@@ -2983,38 +2289,58 @@ mod tests {
 
     #[test]
     fn a_reassignment_converges_exactly_when_the_release_could_observe_the_change() {
-        // The agent owns no process to reconfigure, so the ONLY way a changed secret reference or
-        // a re-resolved input reaches the release is another reconciler invocation — its
-        // environment and its `--input-file`. Answering "no change" on one of those leaves the
-        // node running on values the assignment has replaced; answering "changed" on a cadence
-        // tweak re-applies the whole fleet for nothing.
+        // The agent owns no process to reconfigure, so the ONLY way a changed input reaches the
+        // release is another reconciler invocation. Answering "no change" leaves the node running
+        // on values the assignment has replaced; answering "changed" on a cadence tweak re-applies
+        // the whole fleet for nothing.
         let mut opts = options();
+        let mut reinput = runtime();
+        reinput.inputs = updated_contracts::dataflow::InputSelection {
+            generation: "a".repeat(64),
+            object_sha256: "b".repeat(64),
+            files: ["endpoint".to_string()].into_iter().collect(),
+        };
         assert!(
-            !opts.apply_runtime(&runtime()),
+            !opts.runtime_is_converged(&reinput),
+            "a newly resolved selection is unsettled even before its S3 fetch succeeds"
+        );
+        assert!(
+            !opts.apply_runtime(
+                &runtime(),
+                updated_contracts::dataflow::FileSnapshot::default()
+            ),
             "the runtime the options already hold converges nothing"
         );
 
-        let mut rotated = runtime();
-        rotated.secrets = vec![updated_contracts::assignment::SecretReference {
-            environment: "API_TOKEN".into(),
-            secret: "service".into(),
-            key: "token".into(),
-        }];
-        assert!(opts.apply_runtime(&rotated), "a new secret reference");
-
-        let mut reinput = rotated.clone();
-        reinput.inputs = std::collections::BTreeMap::from([(
-            "endpoint".to_string(),
-            updated_contracts::telemetry::OutputValue::String {
-                value: "https://service.internal:8200".into(),
-            },
-        )]);
-        assert!(opts.apply_runtime(&reinput), "a re-resolved input");
+        let snapshot = updated_contracts::dataflow::FileSnapshot {
+            files: std::collections::BTreeMap::from([(
+                "endpoint".to_string(),
+                updated_contracts::dataflow::FileValue::from_bytes(
+                    b"https://service.internal:8200",
+                )
+                .unwrap(),
+            )]),
+        };
+        assert!(
+            opts.apply_runtime(&reinput, snapshot.clone()),
+            "a re-resolved input"
+        );
+        assert!(!opts.runtime_is_converged(&reinput));
+        assert!(
+            opts.apply_runtime(&reinput, snapshot.clone()),
+            "a failed converge remains due when the desired snapshot is unchanged"
+        );
+        opts.runtime_converged();
+        assert!(opts.runtime_is_converged(&reinput));
+        assert!(
+            !opts.apply_runtime(&reinput, snapshot.clone()),
+            "only a successful converge clears the dirty state"
+        );
 
         let mut cadence = reinput.clone();
         cadence.timeouts.check_interval_seconds = 60;
         assert!(
-            !opts.apply_runtime(&cadence),
+            !opts.apply_runtime(&cadence, snapshot),
             "a cadence change is picked up without touching the release"
         );
         assert_eq!(opts.timeouts.check_interval, Duration::from_secs(60));
@@ -3022,22 +2348,19 @@ mod tests {
 
     #[test]
     fn every_converge_the_loop_runs_is_apply_reason_restart() {
-        // A rotation, a re-resolved input, and a repaired bundle all reach the release the same
-        // way: `apply --reason restart`, which is the reconciler's cue to re-converge whatever it
-        // owns onto the current values. `install` is the first boot's alone.
+        // A changed input, repaired bundle, and ordinary steady-state cycle all reach the release
+        // the same way: `apply --reason restart`, which is the reconciler's cue to re-converge
+        // whatever it owns onto the current values. `install` is the first boot's alone.
         let source = include_str!("main.rs");
         let loop_body = &source[source
             .find("let flow: Result<TickFlow")
             .expect("the cycle body is one expression")..];
         // Spelled in halves so this assertion does not count itself.
-        let call = concat!("converge_", "environment(&opts, &store,");
-        let restart = concat!("converge_", "environment(&opts, &store, Reason::Restart)");
+        let call = concat!("reconverge_", "environment(&opts, &store, &mut health)");
         let converges = loop_body.matches(call).count();
-        assert_eq!(converges, 2, "the repair arm and the runtime arm");
         assert_eq!(
-            loop_body.matches(restart).count(),
-            converges,
-            "every in-loop converge is a restart-reason apply"
+            converges, 3,
+            "the repair, runtime reassignment, and continuous-convergence arms"
         );
     }
 
@@ -3078,7 +2401,7 @@ mod tests {
     fn only_a_node_local_transient_inside_the_budget_is_retried() {
         let shutdown = AtomicBool::new(false);
         let now = Instant::now();
-        let deadline = now + TransientRetry::BOOT.budget;
+        let deadline = now + TRANSIENT_RETRY_BUDGET;
 
         // The exact states a candidate agent's boot recovery hits on a full state volume, a
         // read-only remount, a bad disk, and a CDN blip. None of them says anything about these
@@ -3127,11 +2450,11 @@ mod tests {
         // by-content-hash rejection.
         let launcher_windows = Duration::from_secs(45) + Duration::from_secs(30);
         assert!(
-            TransientRetry::BOOT.budget > launcher_windows,
-            "a boot-recovery retry budget of {:?} does not outlast the launcher's {launcher_windows:?}",
-            TransientRetry::BOOT.budget
+            TRANSIENT_RETRY_BUDGET > launcher_windows,
+            "a boot-recovery retry budget of {TRANSIENT_RETRY_BUDGET:?} does not outlast the \
+             launcher's {launcher_windows:?}"
         );
-        assert!(TransientRetry::BOOT.interval < TransientRetry::BOOT.budget);
+        assert!(TRANSIENT_RETRY_INTERVAL < TRANSIENT_RETRY_BUDGET);
     }
 
     #[test]

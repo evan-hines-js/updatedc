@@ -23,25 +23,41 @@ async fn author(tmp: &std::path::Path) -> (std::path::PathBuf, repo::Keys, Strin
     (repo_dir, keys, path)
 }
 
-fn client_config(repo_dir: &std::path::Path) -> RepositorySource {
-    let url = |sub: &str| {
-        url::Url::from_directory_path(std::fs::canonicalize(repo_dir.join(sub)).unwrap())
-            .unwrap()
-            .to_string()
-    };
-    RepositorySource {
-        metadata_url: url("metadata"),
-        targets_url: url("targets"),
-        root: repo_dir.join("metadata/root.json"),
-        metadata_limit: 1024 * 1024,
-        target_limit: 100 * 1024 * 1024,
-        transport_timeout: std::time::Duration::from_secs(5),
-        mtls: updated::tls::Identity::new(
-            repo_dir.join("client.crt"),
-            repo_dir.join("client.key"),
-            repo_dir.join("ca.crt"),
-        ),
+/// The small-limits runtime both fixtures in this file use: a 1 MiB target ceiling and five-second
+/// cadences, so an offline repository exercises the bounds without waiting out production defaults.
+/// Written once — the two copies agreed on all fourteen values and differed only in these two.
+fn small_runtime(
+    product: &str,
+    install_root: std::path::PathBuf,
+) -> updated_contracts::assignment::ManagedRuntime {
+    let nominal = updated_contracts::assignment::testing::runtime();
+    updated_contracts::assignment::ManagedRuntime {
+        product: product.into(),
+        install_root,
+        repository: updated_contracts::assignment::ManagedRepositoryLimits {
+            metadata_limit: 1024 * 1024,
+            target_limit: 1024 * 1024,
+            transport_timeout_seconds: 5,
+        },
+        storage: updated_contracts::assignment::ManagedStorage {
+            inactive_bytes: 1024 * 1024,
+            ..nominal.storage
+        },
+        timeouts: updated_contracts::assignment::ManagedTimeouts {
+            check_interval_seconds: 5,
+            health_grace_seconds: 5,
+            health_successes: 1,
+            health_interval_seconds: 1,
+            refresh_retry_seconds: 5,
+            confirmation_window_seconds: 5,
+            agent_check_interval_seconds: 5,
+        },
+        ..nominal
     }
+}
+
+fn client_config(repo_dir: &std::path::Path) -> RepositorySource {
+    updated_tuf::testing::offline_source(repo_dir)
 }
 
 fn policy() -> DefaultPolicy {
@@ -54,7 +70,7 @@ fn policy() -> DefaultPolicy {
 }
 
 #[tokio::test]
-async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
+async fn preplaced_enrollment_resolves_offline_through_the_live_repository() {
     let scratch = tempfile::tempdir().unwrap();
     let tmp = scratch.path().to_path_buf();
     let repo_dir = tmp.join("routing");
@@ -65,40 +81,12 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
 
     let root_text = std::fs::read_to_string(repo_dir.join("metadata/root.json")).unwrap();
     let root: serde_json::Value = serde_json::from_str(&root_text).unwrap();
-    let runtime = updated_contracts::assignment::ManagedRuntime {
-        product: "offline-app".into(),
-        channel: "stable".into(),
-        install_root: tmp.join("install"),
-        secrets: vec![],
-        inputs: std::collections::BTreeMap::new(),
-        repository: updated_contracts::assignment::ManagedRepositoryLimits {
-            metadata_limit: 1024 * 1024,
-            target_limit: 1024 * 1024,
-            transport_timeout_seconds: 5,
-        },
-        storage: updated_contracts::assignment::ManagedStorage {
-            inactive_releases: 2,
-            inactive_providers: 2,
-            inactive_agents: 2,
-            inactive_bytes: 1024 * 1024,
-            inactive_repository_caches: 2,
-        },
-        timeouts: updated_contracts::assignment::ManagedTimeouts {
-            check_interval_seconds: 5,
-            health_grace_seconds: 5,
-            health_successes: 1,
-            health_interval_seconds: 1,
-            refresh_retry_seconds: 5,
-            confirmation_window_seconds: 5,
-            agent_check_interval_seconds: 5,
-        },
-    };
+    let runtime = small_runtime("offline-app", tmp.join("install"));
     let assignment = updated_contracts::assignment::RepositoryAssignment {
         schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
         deployment: "offline".into(),
-        metadata_url: "http://127.0.0.1:9/release/metadata/".into(),
-        targets_url: "http://127.0.0.1:9/release/targets/".into(),
-        report_url: None,
+        metadata_url: "https://127.0.0.1:9/release/metadata/".into(),
+        targets_url: "https://127.0.0.1:9/release/targets/".into(),
         application: updated_contracts::artifact::TargetReference {
             path: "products/offline-app/stable/1/linux-x86_64/app".into(),
             sha256: "a".repeat(64),
@@ -112,7 +100,7 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         runtime,
     };
     let config_bytes = serde_json::to_vec(&assignment).unwrap();
-    let config_sha = updated::hash::sha256_bytes(&config_bytes);
+    let config_sha = updated_contracts::digest::sha256_bytes(&config_bytes);
     let config_path = format!("assignments/configs/{config_sha}.json");
     let agent = updated_contracts::artifact::AgentDocument {
         schema: 1,
@@ -122,25 +110,11 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         },
     };
     let agent_bytes = serde_json::to_vec(&agent).unwrap();
-    // The same document with the digest published in upper case. The wire contract admits a hex
-    // digest in any case, so this is a document a publisher may legitimately sign; the network path
-    // accepts it, and the enrollment/offline path must not reject it.
-    let uppercase_agent = updated_contracts::artifact::AgentDocument {
-        schema: agent.schema,
-        config: updated_contracts::artifact::TargetReference {
-            path: agent.config.path.clone(),
-            sha256: agent.config.sha256.to_uppercase(),
-        },
-    };
-    let uppercase_agent_bytes = serde_json::to_vec(&uppercase_agent).unwrap();
     let config_source = tmp.join("managed.json");
     let agent_source = tmp.join("agent.json");
-    let uppercase_agent_source = tmp.join("agent-uppercase.json");
     std::fs::write(&config_source, &config_bytes).unwrap();
     std::fs::write(&agent_source, &agent_bytes).unwrap();
-    std::fs::write(&uppercase_agent_source, &uppercase_agent_bytes).unwrap();
     let agent_path = "assignments/agents/offline.json";
-    let uppercase_agent_path = "assignments/agents/offline-uppercase.json";
     repo::add_release(
         &repo_dir,
         &keys,
@@ -155,59 +129,32 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
                 source: agent_source,
                 custom: Default::default(),
             },
-            repo::PublishTarget {
-                name: uppercase_agent_path.into(),
-                source: uppercase_agent_source,
-                custom: Default::default(),
-            },
         ],
         365,
     )
     .await
     .unwrap();
-    let timestamp = std::fs::read_to_string(repo_dir.join("metadata/timestamp.json")).unwrap();
-    let timestamp_value: serde_json::Value = serde_json::from_str(&timestamp).unwrap();
-    let snapshot_version = timestamp_value["signed"]["meta"]["snapshot.json"]["version"]
-        .as_u64()
-        .unwrap();
-    let snapshot = std::fs::read_to_string(
-        repo_dir.join(format!("metadata/{snapshot_version}.snapshot.json")),
-    )
-    .unwrap();
-    let snapshot_value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-    let targets_version = snapshot_value["signed"]["meta"]["targets.json"]["version"]
-        .as_u64()
-        .unwrap();
-    let targets =
-        std::fs::read_to_string(repo_dir.join(format!("metadata/{targets_version}.targets.json")))
-            .unwrap();
+    let routing_base_url = url::Url::from_directory_path(std::fs::canonicalize(&repo_dir).unwrap())
+        .unwrap()
+        .to_string();
     let bundle = updated_contracts::enrollment::EnrollmentBundle {
         schema: 1,
         agent_id: "offline".into(),
-        routing_base_url: "http://127.0.0.1:9/routing/".into(),
+        routing_base_url,
         assignment: agent_path.into(),
+        install_root: assignment.runtime.install_root.clone(),
         routing_root: root_text,
-        initial: updated_contracts::enrollment::InitialSignedConfiguration {
-            timestamp,
-            snapshot,
-            targets,
-            agent_document: String::from_utf8(agent_bytes).unwrap(),
-            managed_configuration: String::from_utf8(config_bytes).unwrap(),
-        },
     };
     let config_path = tmp.join("config.toml");
     std::fs::write(
         &config_path,
-        "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
+        "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline'\nca='unused-offline-ca.crt'\n",
     )
     .unwrap();
     let enrollment_state = tmp.join("enrollment-state");
     std::fs::create_dir_all(&enrollment_state).unwrap();
-    // A network-free first boot against a remote gateway must preplace both halves of
-    // steady state: the signed enrollment bundle and the node's already-minted identity.
-    // The transport does not parse these fixtures until a request is made.
-    std::fs::write(enrollment_state.join("agent.crt"), "preplaced leaf").unwrap();
-    std::fs::write(enrollment_state.join("agent.key"), "preplaced key").unwrap();
+    // A local routing repository is the offline path: the small preplaced object pins its root and
+    // the first boot resolves the live assignment through the same TUF path every later poll uses.
     std::fs::write(
         enrollment_state.join("enrollment.json"),
         serde_json::to_vec(&bundle).unwrap(),
@@ -217,101 +164,6 @@ async fn preplaced_enrollment_resolves_offline_and_rejects_tampering() {
         .await
         .unwrap();
     assert_eq!(config.application.product, "offline-app");
-    assert!(config.application.secrets.is_empty());
-
-    // A signed agent document may carry its configuration digest in any case — the contract admits
-    // it and the network path accepts it — so the enrollment path must resolve the same node on the
-    // same bytes. Rejecting it here would brick exactly the nodes whose publisher upper-cased it.
-    let uppercase_state = tmp.join("uppercase-state");
-    std::fs::create_dir_all(&uppercase_state).unwrap();
-    std::fs::write(uppercase_state.join("agent.crt"), "preplaced leaf").unwrap();
-    std::fs::write(uppercase_state.join("agent.key"), "preplaced key").unwrap();
-    let mut uppercase_bundle = bundle.clone();
-    // A bundle's assignment must be its own agent's routing target, so this fixture is a second
-    // agent whose published document happens to carry the upper-cased digest.
-    uppercase_bundle.agent_id = "offline-uppercase".into();
-    uppercase_bundle.assignment = uppercase_agent_path.into();
-    uppercase_bundle.initial.agent_document = String::from_utf8(uppercase_agent_bytes).unwrap();
-    std::fs::write(
-        uppercase_state.join("enrollment.json"),
-        serde_json::to_vec(&uppercase_bundle).unwrap(),
-    )
-    .unwrap();
-    // A node boots only on a bundle issued for the agent it is configured to enroll as, so this
-    // second agent needs its own config — reusing `offline`'s would be the split identity the
-    // enrollment path fails closed on, and would never reach the digest-casing behavior under test.
-    let uppercase_config_path = tmp.join("config-uppercase.toml");
-    std::fs::write(
-        &uppercase_config_path,
-        "[enrollment]\nurl='https://127.0.0.1:9'\nname='offline-uppercase'\nclient_cert='unused-offline.crt'\nclient_key='unused-offline.key'\nca='unused-offline-ca.crt'\n",
-    )
-    .unwrap();
-    let uppercase_config =
-        updated_tuf::resolve_managed_config(&uppercase_config_path, &uppercase_state)
-            .await
-            .unwrap();
-    assert_eq!(uppercase_config.application.product, "offline-app");
-
-    // Boot configuration — which secret populates which environment variable when the release's
-    // reconciler runs — is read before any network fetch and cannot be verified at that moment,
-    // so it comes only from the enrollment directory. A document planted under `install_root`
-    // (recoverable state the agent churns through) must have no say in what the reconciler is
-    // handed.
-    let planted = config.application.install_root.join("state");
-    std::fs::create_dir_all(&planted).unwrap();
-    let mut hostile: serde_json::Value =
-        serde_json::from_str(&bundle.initial.managed_configuration).unwrap();
-    hostile["runtime"]["secrets"] = serde_json::json!([
-        {"environment": "EXFILTRATED", "secret": "production-database", "key": "password"}
-    ]);
-    std::fs::write(
-        planted.join("repository-assignment.json"),
-        serde_json::to_vec(&hostile).unwrap(),
-    )
-    .unwrap();
-    let config = updated_tuf::resolve_managed_config(&config_path, &enrollment_state)
-        .await
-        .unwrap();
-    assert!(
-        config.application.secrets.is_empty(),
-        "install_root state must not choose which secrets reach the reconciler"
-    );
-
-    // The same document in the enrollment directory — where the update loop persists it, beside
-    // the bundle and the node's key — is the node's live configuration and is honoured.
-    std::fs::write(
-        updated::config::persisted_assignment_path(&enrollment_state),
-        serde_json::to_vec(&hostile).unwrap(),
-    )
-    .unwrap();
-    let config = updated_tuf::resolve_managed_config(&config_path, &enrollment_state)
-        .await
-        .unwrap();
-    assert_eq!(config.application.secrets.len(), 1);
-    assert_eq!(config.application.secrets[0].environment, "EXFILTRATED");
-    std::fs::remove_file(updated::config::persisted_assignment_path(
-        &enrollment_state,
-    ))
-    .unwrap();
-
-    let mut tampered = bundle;
-    let mut tampered_config: serde_json::Value =
-        serde_json::from_str(&tampered.initial.managed_configuration).unwrap();
-    tampered_config["deployment"] = serde_json::json!("attacker");
-    tampered.initial.managed_configuration = serde_json::to_string(&tampered_config).unwrap();
-    let tampered_state = tmp.join("tampered-state");
-    std::fs::create_dir_all(&tampered_state).unwrap();
-    std::fs::write(tampered_state.join("agent.crt"), "preplaced leaf").unwrap();
-    std::fs::write(tampered_state.join("agent.key"), "preplaced key").unwrap();
-    std::fs::write(
-        tampered_state.join("enrollment.json"),
-        serde_json::to_vec(&tampered).unwrap(),
-    )
-    .unwrap();
-    let error = updated_tuf::resolve_managed_config(&config_path, &tampered_state)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("digest mismatch"), "{error}");
 }
 
 /// The file `resolve_assignment` writes IS this node's live boot config: the next boot launches the
@@ -343,8 +195,7 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
             schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
             deployment: "commit".into(),
             metadata_url: metadata_url.into(),
-            targets_url: "http://127.0.0.1:9/release/targets/".into(),
-            report_url: None,
+            targets_url: "https://127.0.0.1:9/release/targets/".into(),
             application: updated_contracts::artifact::TargetReference {
                 path: "products/app/stable/1/linux-x86_64/app".into(),
                 sha256: "a".repeat(64),
@@ -355,34 +206,7 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
                 sha256: "b".repeat(64),
             },
             release_root: root.clone(),
-            runtime: updated_contracts::assignment::ManagedRuntime {
-                product: "app".into(),
-                channel: "stable".into(),
-                install_root: install.to_path_buf(),
-                secrets: vec![],
-                inputs: std::collections::BTreeMap::new(),
-                repository: updated_contracts::assignment::ManagedRepositoryLimits {
-                    metadata_limit: 1024 * 1024,
-                    target_limit: 1024 * 1024,
-                    transport_timeout_seconds: 5,
-                },
-                storage: updated_contracts::assignment::ManagedStorage {
-                    inactive_releases: 2,
-                    inactive_providers: 2,
-                    inactive_agents: 2,
-                    inactive_bytes: 1024 * 1024,
-                    inactive_repository_caches: 2,
-                },
-                timeouts: updated_contracts::assignment::ManagedTimeouts {
-                    check_interval_seconds: 5,
-                    health_grace_seconds: 5,
-                    health_successes: 1,
-                    health_interval_seconds: 1,
-                    refresh_retry_seconds: 5,
-                    confirmation_window_seconds: 5,
-                    agent_check_interval_seconds: 5,
-                },
-            },
+            runtime: small_runtime("app", install.to_path_buf()),
         }
     };
 
@@ -390,7 +214,7 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
     let mut publish =
         |name: &str, assignment: &updated_contracts::assignment::RepositoryAssignment| -> String {
             let config_bytes = serde_json::to_vec(assignment).unwrap();
-            let config_sha = updated::hash::sha256_bytes(&config_bytes);
+            let config_sha = updated_contracts::digest::sha256_bytes(&config_bytes);
             let config_path = format!("assignments/configs/{config_sha}.json");
             let config_source = tmp.join(format!("{name}-config.json"));
             std::fs::write(&config_source, &config_bytes).unwrap();
@@ -418,16 +242,16 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
         };
     let good = publish(
         "good",
-        &assignment("http://127.0.0.1:9/release/metadata/", &install_root),
+        &assignment("https://127.0.0.1:9/release/metadata/", &install_root),
     );
     // A metadata_url without its trailing slash is not a base directory this build can fetch from.
     let unfetchable = publish(
         "unfetchable",
-        &assignment("http://127.0.0.1:9/release/metadata", &install_root),
+        &assignment("https://127.0.0.1:9/release/metadata", &install_root),
     );
     let relocating = publish(
         "relocating",
-        &assignment("http://127.0.0.1:9/release/metadata/", &tmp.join("moved")),
+        &assignment("https://127.0.0.1:9/release/metadata/", &tmp.join("moved")),
     );
     repo::add_release(&repo_dir, &keys, targets, 365)
         .await
@@ -453,10 +277,7 @@ async fn a_resolved_assignment_is_validated_before_it_becomes_the_live_boot_conf
         .expect("a usable document is committed as the live boot config");
     let committed = std::fs::read(&paths.assignment).unwrap();
 
-    for (agent_path, expected) in [
-        (&unfetchable, "metadata_url"),
-        (&relocating, "install_root"),
-    ] {
+    for (agent_path, expected) in [(&unfetchable, "metadataUrl"), (&relocating, "installRoot")] {
         let Err(error) = TrustedRepository::resolve_assignment(&routing(agent_path), &paths).await
         else {
             panic!("an unusable document must never be committed");
@@ -550,19 +371,25 @@ async fn publish_then_verify_and_download() {
     // Selection picks the sole eligible release, and staging downloads exactly its
     // verified bytes to the destination.
     let selected = repo
-        .select_release(&policy, None, |_| {}, |_, _| false)
+        .select_release(
+            &policy,
+            updated_tuf::select::Stance::Nothing,
+            |_| {},
+            |_, _| false,
+        )
         .expect("selects the sole release");
     assert_eq!(selected.version, "1.0.0");
 
     let staged_path = tmp.join("staged");
-    repo.download_target(&selected.target, &staged_path)
+    let mut staged = repo
+        .download_target(&selected.target, &staged_path)
         .await
         .unwrap();
-    assert_eq!(std::fs::read(&staged_path).unwrap(), b"hello-app-1.0.0");
+    assert_eq!(staged.read_bounded(1024).unwrap(), b"hello-app-1.0.0");
 
     let out = tmp.join("downloaded");
-    repo.download_target(&found, &out).await.unwrap();
-    assert_eq!(std::fs::read(&out).unwrap(), b"hello-app-1.0.0");
+    let mut downloaded = repo.download_target(&found, &out).await.unwrap();
+    assert_eq!(downloaded.read_bounded(1024).unwrap(), b"hello-app-1.0.0");
 
     // A pre-planted destination symlink is replaced as a directory entry; its target is
     // never opened or truncated by the privileged download path.
@@ -572,13 +399,20 @@ async fn publish_then_verify_and_download() {
         let redirected = tmp.join("redirected-download");
         std::fs::write(&victim, b"do-not-touch").unwrap();
         std::os::unix::fs::symlink(&victim, &redirected).unwrap();
-        repo.download_target(&found, &redirected).await.unwrap();
+        let mut downloaded = repo.download_target(&found, &redirected).await.unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
-        assert_eq!(std::fs::read(&redirected).unwrap(), b"hello-app-1.0.0");
+        assert_eq!(downloaded.read_bounded(1024).unwrap(), b"hello-app-1.0.0");
         assert!(!std::fs::symlink_metadata(&redirected)
             .unwrap()
             .file_type()
             .is_symlink());
+
+        // Replacing the directory entry after download does not replace the authenticated handle
+        // consumers use. This is the verify/use race the handle API exists to close.
+        let replacement = tmp.join("replacement");
+        std::fs::write(&replacement, b"unsigned replacement").unwrap();
+        std::fs::rename(&replacement, &redirected).unwrap();
+        assert_eq!(downloaded.read_bounded(1024).unwrap(), b"hello-app-1.0.0");
     }
 
     // The target byte cap fails closed when exceeded, and is inclusive at exactly the
@@ -609,7 +443,7 @@ async fn publish_then_verify_and_download() {
         .into_iter()
         .find(|t| t.path == target_path)
         .unwrap();
-    repo_exact
+    let _downloaded = repo_exact
         .download_target(&found_e, &tmp.join("exact"))
         .await
         .unwrap();
@@ -684,9 +518,9 @@ async fn publish_then_verify_and_download() {
     .unwrap();
 
     let old_out = tmp.join("old-assignment");
-    old.download_target(&old_target, &old_out).await.unwrap();
+    let mut old_download = old.download_target(&old_target, &old_out).await.unwrap();
     assert_eq!(
-        std::fs::read(old_out).unwrap(),
+        old_download.read_bounded(1024).unwrap(),
         b"assignment generation one"
     );
     let new = TrustedRepository::load(&client_config(&repo_dir), &tmp.join("ds-new-assignment"))
@@ -698,9 +532,9 @@ async fn publish_then_verify_and_download() {
         .find(|target| target.path == assignment_name)
         .unwrap();
     let new_out = tmp.join("new-assignment");
-    new.download_target(&new_target, &new_out).await.unwrap();
+    let mut new_download = new.download_target(&new_target, &new_out).await.unwrap();
     assert_eq!(
-        std::fs::read(new_out).unwrap(),
+        new_download.read_bounded(1024).unwrap(),
         b"assignment generation two"
     );
     assert!(!repo_dir.join("targets").join(assignment_name).exists());
@@ -767,14 +601,12 @@ async fn downloading_reclaims_staging_temps_orphaned_by_an_earlier_interrupted_d
     let unrelated = staging.join("stage-abcdef");
     std::fs::create_dir_all(&unrelated).unwrap();
 
-    repo.download_target(&found, &staging.join("app"))
+    let mut downloaded = repo
+        .download_target(&found, &staging.join("app"))
         .await
         .unwrap();
 
-    assert_eq!(
-        std::fs::read(staging.join("app")).unwrap(),
-        b"hello-app-1.0.0"
-    );
+    assert_eq!(downloaded.read_bounded(1024).unwrap(), b"hello-app-1.0.0");
     assert!(
         !orphan.exists(),
         "the orphaned staging temp must be reclaimed by the next download"

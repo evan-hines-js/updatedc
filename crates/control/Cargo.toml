@@ -5,14 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 # The frozen launcher⇄agent control protocol: the one wire contract shared by the
-# permanent launcher (`launcher`) and the disposable `agent`. It is deliberately
-# std-only and dependency-free — it must not drag any churn into the launcher, which is
-# why the launcher may depend on it even though the launcher depends on nothing else in
-# the workspace. It changes only when the protocol itself changes, which both sides must
-# track regardless. Runtime compatibility across versions is the negotiation handshake's
-# job, not this crate's build-time sharing.
+# permanent launcher (`launcher`) and the disposable `agent`. It depends only on the
+# dependency-isolated `foundation` mechanisms already shared across that process boundary; it
+# must not drag policy-tower churn into the launcher. It changes only when the protocol itself
+# changes, which both sides must track together. There is one mandatory operation set and one
+# version gate; no feature negotiation or compatibility response exists inside it.
 [lib]
 name = "control"
 path = "src/lib.rs"
 
 [dependencies]
+foundation = { path = "../foundation" }

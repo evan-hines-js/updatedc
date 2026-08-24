@@ -8,47 +8,44 @@
   "required": [
     "schema",
     "deployment",
-    "metadata_url",
-    "targets_url",
+    "metadataUrl",
+    "targetsUrl",
     "application",
-    "ordered_install_fallback",
-    "provider_set",
-    "release_root",
+    "orderedInstallFallback",
+    "providerSet",
+    "releaseRoot",
     "runtime"
   ],
   "properties": {
     "schema": { "const": 3 },
     "deployment": {
-      "description": "Opaque correlation identifier. Validation requires only that it is non-empty.",
+      "description": "Bounded deployment identity copied into status and telemetry: 1-128 characters of lowercase ASCII letters, digits, dot, underscore, or dash, beginning and ending with a letter or digit. Uppercase is refused so one identity cannot become two on a case-folding filesystem, and reserved Windows device stems (con, prn, aux, nul, com1-9, lpt1-9), alone or with an extension, are excluded.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:$|\\.))[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
+    },
+    "metadataUrl": {
+      "description": "HTTPS base URL of the release repository's TUF metadata, ending in `/`; a `file://` URL or absolute local path is accepted only for offline repositories. Userinfo, query, and fragment are forbidden.",
       "type": "string",
       "minLength": 1
     },
-    "metadata_url": {
-      "description": "Base URL of the release repository's TUF metadata. Usually an https:// URL ending in `/`; a `file://` URL or an absolute local path is accepted for offline repositories.",
+    "targetsUrl": {
+      "description": "Base URL of the release repository's TUF targets under the same HTTPS/offline rules as `metadataUrl`.",
       "type": "string",
       "minLength": 1
-    },
-    "targets_url": {
-      "description": "Base URL of the release repository's TUF targets, under the same transport rules as `metadata_url`.",
-      "type": "string",
-      "minLength": 1
-    },
-    "report_url": {
-      "description": "Optional base URL the node PUTs its signed report to. Must be an absolute http(s) URL with a host and without credentials, query, or fragment.",
-      "type": "string",
-      "pattern": "^https?://[^\\s/?#@]+(/[^\\s?#]*)?$"
     },
     "application": {
       "$ref": "https://updated.dev/schemas/target-reference.schema.json"
     },
-    "ordered_install_fallback": {
+    "orderedInstallFallback": {
       "description": "On a first install, allow the node to fall back to an ordered-lower release when the exact assigned target cannot be resolved.",
       "type": "boolean"
     },
-    "provider_set": {
+    "providerSet": {
       "$ref": "https://updated.dev/schemas/target-reference.schema.json"
     },
-    "release_root": {
+    "releaseRoot": {
       "description": "The pinned TUF root metadata of the release repository, embedded verbatim as a signed `{signed, signatures}` envelope. Validation requires a JSON object.",
       "type": "object"
     },
@@ -58,97 +55,82 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "product",
-        "channel",
-        "install_root",
-        "repository",
-        "storage",
-        "timeouts"
-      ],
+      "required": ["product", "channel", "installRoot", "repository", "storage", "timeouts"],
       "properties": {
         "product": {
-          "description": "One safe path component: non-empty, not `.` or `..`, and containing no `/`, `\\`, `:`, or control character.",
+          "description": "The bounded product identity used as a target-layout and directory segment: 1-128 characters of lowercase ASCII letters, digits, dot, underscore, or dash, beginning and ending with a letter or digit. Uppercase and reserved Windows device stems are excluded, because this value becomes a directory name.",
           "type": "string",
           "minLength": 1,
-          "pattern": "^[^/\\\\:\\u0000-\\u001f\\u007f]+$"
+          "maxLength": 128,
+          "pattern": "^(?!(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:$|\\.))[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
         },
-        "channel": { "type": "string", "minLength": 1 },
-        "install_root": {
+        "channel": {
+          "description": "The bounded TUF target-layout segment selecting a release channel.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:$|\\.))[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
+        },
+        "installRoot": {
           "description": "Absolute install root on the node.",
           "type": "string",
           "pattern": "^(/|[A-Za-z]:[\\\\/])"
         },
-        "secrets": {
-          "description": "Omitted means none. Environment names must be unique across the array.",
-          "type": "array",
-          "maxItems": 64,
-          "items": { "$ref": "#/$defs/secret_reference" }
-        },
         "inputs": {
-          "description": "Omitted means none. Typed values resolved from prerequisite group outputs; secret values stay references.",
-          "type": "object",
-          "maxProperties": 64,
-          "propertyNames": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[^/\\\\:\\u0000-\\u001f\\u007f]+$"
-          },
-          "additionalProperties": { "$ref": "#/$defs/output_value" }
+          "$ref": "#/$defs/input_selection"
         },
         "repository": { "$ref": "#/$defs/repository_limits" },
         "storage": { "$ref": "#/$defs/storage" },
         "timeouts": { "$ref": "#/$defs/timeouts" }
       }
     },
-    "secret_reference": {
+    "input_selection": {
+      "description": "A non-secret descriptor for the atomic input snapshot the node fetches over its authenticated dataflow connection.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["environment", "secret", "key"],
+      "required": ["generation", "object_sha256", "files"],
       "properties": {
-        "environment": {
-          "description": "Target environment variable. Names that let a loader or interpreter execute attacker-chosen code (`PATH`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `PYTHONPATH`, `BASH_ENV`, `IFS`, and similar) are rejected.",
+        "generation": {
+          "description": "Controller-keyed opaque snapshot generation; never a raw content digest.",
           "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Z_][A-Z0-9_]*$"
+          "pattern": "^[0-9a-f]{64}$"
         },
-        "secret": { "type": "string", "minLength": 1, "maxLength": 253 },
-        "key": { "type": "string", "minLength": 1, "maxLength": 253 }
-      }
-    },
-    "output_value": {
-      "oneOf": [
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "value"],
-          "properties": {
-            "type": { "const": "string" },
-            "value": { "type": "string", "maxLength": 4096 }
-          }
+        "object_sha256": {
+          "description": "SHA-256 of the exact private, keyed-blinded input publication.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "secret", "key"],
-          "properties": {
-            "type": { "const": "secret_ref" },
-            "secret": { "type": "string", "minLength": 1, "maxLength": 253 },
-            "key": { "type": "string", "minLength": 1, "maxLength": 253 }
+        "files": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^(?!\\.{1,2}$)[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f]+$"
           }
         }
-      ]
+      }
     },
     "repository_limits": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["metadata_limit", "target_limit", "transport_timeout_seconds"],
+      "required": ["metadataLimit", "targetLimit", "transportTimeoutSeconds"],
       "properties": {
-        "metadata_limit": { "type": "integer", "minimum": 1 },
-        "target_limit": { "type": "integer", "minimum": 1 },
-        "transport_timeout_seconds": {
+        "metadataLimit": {
+          "description": "Maximum bytes buffered for any one TUF metadata document.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        },
+        "targetLimit": {
+          "description": "Maximum bytes streamed for any one release target.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483648
+        },
+        "transportTimeoutSeconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000
@@ -159,18 +141,33 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "inactive_releases",
-        "inactive_providers",
-        "inactive_agents",
-        "inactive_bytes",
-        "inactive_repository_caches"
+        "inactiveReleases",
+        "inactiveProviders",
+        "inactiveAgents",
+        "inactiveBytes",
+        "inactiveRepositoryCaches"
       ],
       "properties": {
-        "inactive_releases": { "type": "integer", "minimum": 0 },
-        "inactive_providers": { "type": "integer", "minimum": 0 },
-        "inactive_agents": { "type": "integer", "minimum": 0 },
-        "inactive_bytes": { "type": "integer", "minimum": 1 },
-        "inactive_repository_caches": { "type": "integer", "minimum": 0 }
+        "inactiveReleases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inactiveProviders": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inactiveAgents": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "inactiveBytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "inactiveRepositoryCaches": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "timeouts": {
@@ -178,45 +175,48 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "check_interval_seconds",
-        "health_grace_seconds",
-        "health_successes",
-        "health_interval_seconds",
-        "refresh_retry_seconds",
-        "confirmation_window_seconds",
-        "agent_check_interval_seconds"
+        "checkIntervalSeconds",
+        "healthGraceSeconds",
+        "healthSuccesses",
+        "healthIntervalSeconds",
+        "refreshRetrySeconds",
+        "confirmationWindowSeconds",
+        "agentCheckIntervalSeconds"
       ],
       "properties": {
-        "check_interval_seconds": {
+        "checkIntervalSeconds": {
           "description": "Steady-state check cadence. The node heartbeats at the bottom of this loop, so it is capped by the report freshness window rather than the generic ceiling.",
           "type": "integer",
           "minimum": 1,
           "maximum": 16
         },
-        "refresh_retry_seconds": {
-          "description": "Check cadence after a retryable repository failure; same freshness-derived cap as `check_interval_seconds`.",
+        "refreshRetrySeconds": {
+          "description": "Check cadence after a retryable repository failure; same freshness-derived cap as `checkIntervalSeconds`.",
           "type": "integer",
           "minimum": 1,
           "maximum": 16
         },
-        "health_grace_seconds": {
-          "description": "Must be >= (health_successes - 1) * health_interval_seconds, otherwise the health streak can never complete inside the grace window.",
+        "healthGraceSeconds": {
+          "description": "Must be >= (healthSuccesses - 1) * healthIntervalSeconds, otherwise the health streak can never complete inside the grace window.",
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000
         },
-        "health_successes": { "type": "integer", "minimum": 1 },
-        "health_interval_seconds": {
+        "healthSuccesses": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "healthIntervalSeconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000
         },
-        "confirmation_window_seconds": {
+        "confirmationWindowSeconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000
         },
-        "agent_check_interval_seconds": {
+        "agentCheckIntervalSeconds": {
           "type": "integer",
           "minimum": 1,
           "maximum": 2592000

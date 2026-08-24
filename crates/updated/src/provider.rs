@@ -94,6 +94,23 @@ impl BundleStore {
         )
     }
 
+    /// Materialize a bundle from an already-open, metadata-authenticated archive handle.
+    /// Production TUF acquisition uses this method; the path wrapper above exists for local bundle
+    /// construction and tests but delegates to the same ingest implementation.
+    pub fn install_file(
+        &self,
+        archive: &mut std::fs::File,
+        expected: &ExpectedBundle<'_>,
+    ) -> Result<ReleaseId, InstallError> {
+        bundle::stage_bundle_file(
+            archive,
+            &self.staging,
+            &self.versions,
+            expected,
+            &self.limits,
+        )
+    }
+
     /// Resolve how to launch a materialized release after re-verifying every file, and prepare
     /// the writable working directory the process is launched in.
     /// Providers are executable policy and may sit unused between deployments, so
@@ -143,7 +160,13 @@ impl BundleStore {
         manifest: &BundleManifest,
     ) -> io::Result<PathBuf> {
         let workspace = self.workspace(release);
-        std::fs::create_dir_all(&workspace)?;
+        // `create_dir_all(workspace)` follows a pre-existing symlink at the workspace itself. The
+        // application owns this directory after launch and may replace it, so accepting that link
+        // on a later resolve would run the release with an attacker-chosen cwd and materialize its
+        // bundled files outside the store. The store root is agent-owned; create it first, then
+        // require the application-owned child itself to be a real directory.
+        std::fs::create_dir_all(&self.work)?;
+        create_real_directory(&workspace)?;
         self.materialize_bundle_files(release, manifest, &workspace)?;
         crate::gc::reap_orphaned_workspaces(&self.work, &self.versions);
         Ok(workspace)
@@ -170,6 +193,10 @@ impl BundleStore {
     /// application deliberately wrote there, and scratch surviving restarts is the point of the
     /// directory. Each copy lands by temp-then-rename, so an interrupted one never becomes a
     /// truncated file the next launch would keep forever.
+    ///
+    /// "Left untouched" includes not being resolved *through*: the intermediate directories are
+    /// created by [`create_real_directories`], which refuses a component the application replaced
+    /// with a symlink instead of following it out of the store.
     fn materialize_bundle_files(
         &self,
         release: &ReleaseId,
@@ -182,18 +209,74 @@ impl BundleStore {
             if std::fs::symlink_metadata(&destination).is_ok() {
                 continue;
             }
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(parent) = Path::new(&file.path).parent() {
+                create_real_directories(workspace, parent)?;
             }
             let staged = staging_name(&destination)?;
             std::fs::copy(tree.join(&file.path), &staged)?;
             grant_workspace_ownership(&staged, file.executable)?;
-            if let Err(error) = std::fs::rename(&staged, &destination) {
+            // The workspace is the one directory the application itself writes into, so the file
+            // being replaced may well be open right now — the case `durable::replace` retries and a
+            // bare rename fails outright.
+            if let Err(error) = foundation::durable::replace(&staged, &destination) {
                 let _ = std::fs::remove_file(&staged);
                 return Err(error);
             }
         }
         Ok(())
+    }
+}
+
+/// Create every component of `relative` under `root`, refusing one that is not a real directory.
+///
+/// `create_dir_all` would resolve a symlink instead of refusing it, and the workspace is the one
+/// part of this store the store does NOT own: the application writes into it freely, which is the
+/// whole reason it is not the release tree ([`BundleStore::workspace`]). So a `config` replaced by a
+/// link to somewhere else would make the copy-and-rename below publish release bytes outside the
+/// store, at a path the application chose. Every sibling path in this crate already refuses a link
+/// rather than following it — [`crate::bundle::extract`] opens members with `create_new`, `discard`
+/// unlinks through `symlink_metadata`, `collect_release_files` rejects a symlink in a release tree
+/// — and this is the same rule on the one path that still resolved through untrusted components.
+///
+/// Idempotent, like the materialization it serves: an existing real directory is kept, since the
+/// workspace deliberately survives restarts.
+fn create_real_directories(root: &Path, relative: &Path) -> io::Result<()> {
+    let mut at = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "workspace directory {} is not a relative normal path",
+                    relative.display()
+                ),
+            ));
+        };
+        at.push(component);
+        create_real_directory(&at)?;
+    }
+    Ok(())
+}
+
+/// Create `path` if absent, or require the existing entry to be a directory rather than a link.
+fn create_real_directory(path: &Path) -> io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(path)?.is_dir() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "workspace path {} is not a real directory; refusing to materialize \
+                         release files through it",
+                        path.display()
+                    ),
+                ))
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -533,6 +616,86 @@ mod tests {
         assert_eq!(
             fs::read_to_string(relaunch.cwd.join("config/release.toml")).unwrap(),
             "version = \"rewritten\"\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The workspace is the one directory in the store the application owns, so it is also the one
+    /// set of path components the store must not resolve through. Planting a link where a bundled
+    /// subdirectory goes used to make the next `resolve()` create it and rename the release's own
+    /// `config/release.toml` into whatever it pointed at — release bytes written outside the store,
+    /// to a path the application chose. Every other path in this crate already refuses a link here;
+    /// this one followed it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_where_a_bundled_directory_goes_is_refused_not_followed() {
+        let (_dir, root) = scratch("workspace-planted-symlink");
+        let platform = foundation::platform::platform_key();
+        let archive = archive(&root, "demo", "1.2.3", &platform);
+        let provider = store(&root);
+        let staged = provider
+            .install(
+                &archive,
+                &ExpectedBundle {
+                    product: "demo",
+                    version: "1.2.3",
+                    platform: &platform,
+                },
+            )
+            .unwrap();
+
+        // Everything the application can reach: its own workspace, before the first materialization.
+        let workspace = provider.workspace(&staged);
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, workspace.join("config")).unwrap();
+
+        let Err(error) = provider.resolve(&staged) else {
+            panic!("a workspace component that is not a real directory must be refused");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert!(
+            !elsewhere.join("release.toml").exists(),
+            "no release byte may be written through the link"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The workspace entry itself is application-owned too. Checking only its descendants leaves
+    /// a simpler escape: replace `work/<release>` with a link before the next resolve, and
+    /// `create_dir_all` follows it before any descendant check runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_where_the_workspace_goes_is_refused_not_followed() {
+        let (_dir, root) = scratch("workspace-root-symlink");
+        let platform = foundation::platform::platform_key();
+        let archive = archive(&root, "demo", "1.2.3", &platform);
+        let provider = store(&root);
+        let staged = provider
+            .install(
+                &archive,
+                &ExpectedBundle {
+                    product: "demo",
+                    version: "1.2.3",
+                    platform: &platform,
+                },
+            )
+            .unwrap();
+
+        let workspace = provider.workspace(&staged);
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &workspace).unwrap();
+
+        let Err(error) = provider.resolve(&staged) else {
+            panic!("a workspace root that is not a real directory must be refused");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert!(
+            !elsewhere.join("config/release.toml").exists(),
+            "no release byte may be written through the workspace-root link"
         );
         let _ = fs::remove_dir_all(root);
     }

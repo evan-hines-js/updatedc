@@ -1,0 +1,32 @@
+apiVersion: v2
+name: updatec
+description: The updated control plane — the reconciling controller and the mTLS enrollment gateway.
+type: application
+# ValidatingAdmissionPolicy is stable in Kubernetes 1.30 and supplies the object-level boundary
+# RBAC cannot express for dynamically named ConfigMaps.
+kubeVersion: ">=1.30.0-0"
+# The chart version tracks the workspace version. appVersion is the default tag for BOTH images
+# (`updatec` and `updated-healthproxy`), and it reads 0.1.0 only in this source tree: the release
+# job packages with `helm package --app-version "$GITHUB_SHA"`, the commit whose images it just
+# pushed to ghcr.io, so the published tarball defaults to images that exist. A packaged chart
+# carrying 0.1.0 would install as ImagePullBackOff — no such tag is ever pushed. That step
+# (.github/workflows/ci.yml, "Package the charts and the CRDs for release") is the single place the
+# shipped image identity is decided; it renders its own package and greps the two image references
+# out of the result, so this line and that step cannot silently disagree.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/evan-hines-js/updatedc
+sources:
+  - https://github.com/evan-hines-js/updatedc
+keywords:
+  - updates
+  - tuf
+  - fleet
+  - rollout
+maintainers:
+  - name: updatedc
+    url: https://github.com/evan-hines-js/updatedc
+annotations:
+  # cert-manager is an optional dependency: the chart renders the fleet CA and the gateway's server
+  # certificate only when `certManager.enabled` is set. Without it you supply the two Secrets.
+  artifacthub.io/prerelease: "true"

@@ -1,0 +1,26 @@
+# The only node-local configuration, and the one file you must edit before the agent can enroll.
+# The launcher reads it from this canonical path. It holds paths and a name — no secret.
+#
+# Once enrollment.json exists in launcher state, enrollment is never retried: this file is read at
+# first boot and is not a live control surface afterwards.
+
+[enrollment]
+# Your gateway's URL — the same value the control plane was installed with as `publicUrl`.
+url = "https://updates.example.com"
+
+# This node's self-asserted enrollment name. It becomes the minted certificate's CN and the name of
+# the UpdateAgent object the control plane creates, so it is how the fleet addresses this machine
+# forever. Set it per node; the installer and the Ansible role both default it to the hostname.
+#
+# Self-asserted is the weak form. If you pre-create a `reserved` UpdateAgent for this name and
+# issue this node its own client certificate, `/enroll` completes that reserved object in place and
+# no other machine can claim the name. See docs/agent-install.md.
+name = "node-1"
+
+# The public fleet CA remains the steady-state trust anchor. The optional bootstrap block is needed
+# only until this node has minted its durable per-node identity.
+ca = "/etc/updated/agent-tls/ca.crt"
+
+[enrollment.bootstrap]
+client_cert = "/etc/updated/agent-tls/tls.crt"
+client_key = "/etc/updated/agent-tls/tls.key"

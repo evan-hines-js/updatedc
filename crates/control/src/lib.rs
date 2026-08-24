@@ -1,5 +1,5 @@
 //! Versioned launcher⇄agent control protocol. The std-only crate is shared by
-//! both processes so framing and compatibility rules cannot drift.
+//! both processes so framing and protocol rules cannot drift.
 //!
 //! ## Framing (the hard-to-change layer)
 //!
@@ -7,13 +7,13 @@
 //! `[u32 length BE][u8 tag][body]`, with `length` capped at [`MAX_FRAME`] and every
 //! string length-prefixed and bounded.
 //!
-//! ## Negotiation (the extensible layer)
+//! ## Version gate
 //!
 //! The launcher sends [`Hello`]; the agent requires a shared protocol major and
 //! fails closed without one. That is the whole of it — every operation in a given major
 //! is mandatory, so there is no second, per-feature negotiation to disagree with it.
-//! Skew *inside* a major is additive only: a request tag the peer has never heard of is
-//! answered [`Response::Unsupported`] rather than negotiated away in advance.
+//! An unknown request or response tag is a fatal protocol error: the launcher and agent are
+//! shipped as one pair, so there is no supported skew inside a major.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -64,8 +64,59 @@ pub const REJECTED_AGENT_FILE: &str = "rejected-agent";
 /// the launcher's rollback target, or it can delete the binary the launcher is about to need).
 pub const DESIRED_AGENT_FILE: &str = "desired-agent";
 
+/// The staging layout an agent self-update lands in: `<state_dir>/agents/<sha256>/<binary>`.
+///
+/// Shared durable layout, exactly like the pointer files above, and for a sharper reason than any
+/// of them. The AGENT constructs this path when it stages a downloaded release; the LAUNCHER
+/// refuses to execute anything that is not this shape. The launcher is the permanent component —
+/// it is never updated — so if the two ever disagreed about the layout, every self-update would be
+/// refused at the readiness gate on every node, and the half that could be corrected is the half
+/// that no longer runs. The rule therefore lives here, in the crate both link, rather than being
+/// written once in each.
+///
+/// The digest is a NAME, not a proof: the launcher deliberately links no crypto (see
+/// `foundation::digest`), so it checks only that the component is a canonical SHA-256 spelling.
+/// What those bytes are is settled upstream, by the TUF verification the agent performs before it
+/// stages them.
+pub const AGENT_STAGING_DIR: &str = "agents";
+
+/// The staging root, `<state_dir>/agents`: what the agent's cache GC walks and what the launcher
+/// admits binaries from.
+pub fn agent_staging_root(state_dir: &Path) -> PathBuf {
+    state_dir.join(AGENT_STAGING_DIR)
+}
+
+/// Where one staged agent release lives: `<state_dir>/agents/<digest>/<platform binary name>`.
+///
+/// Content-addressed so a candidate never overwrites the running binary — which also keeps Windows
+/// executable locks out of the picture, since each candidate has a fresh path.
+pub fn staged_agent_binary(state_dir: &Path, digest: &str) -> PathBuf {
+    agent_staging_root(state_dir)
+        .join(digest)
+        .join(foundation::platform::agent_binary_name())
+}
+
+/// The digest a staged agent path names, or `None` if it is not the staging layout.
+///
+/// The launcher's admission rule, expressed once. `candidate` must already be canonicalized
+/// against `staging_root` — resolving symlinks is the caller's job, because only the caller knows
+/// whether it may touch the filesystem.
+pub fn staged_agent_digest<'a>(staging_root: &Path, candidate: &'a Path) -> Option<&'a str> {
+    let relative = candidate.strip_prefix(staging_root).ok()?;
+    let parts: Vec<_> = relative.components().collect();
+    if parts.len() != 2 || parts[1].as_os_str() != foundation::platform::agent_binary_name() {
+        return None;
+    }
+    let digest = parts[0].as_os_str().to_str()?;
+    foundation::digest::is_canonical_sha256(digest).then_some(digest)
+}
+
 /// First line of an agent pointer file, naming the frozen format of the rest.
 const AGENT_POINTER_HEADER: &str = "agent-v1";
+/// Maximum encoded size of a launcher-owned record containing an agent path. This is intentionally
+/// generous enough for extended Windows paths while still making a corrupt pointer or rejection
+/// marker harmless at boot.
+pub const MAX_AGENT_PATH_RECORD_BYTES: usize = 64 * 1024;
 
 /// Encode an agent pointer file's contents. The path must be valid UTF-8 (state-dir paths are
 /// checked for that at startup), so the record stays plain text.
@@ -95,7 +146,11 @@ fn decode_agent_pointer(text: &str) -> io::Result<PathBuf> {
 
 /// Read an agent pointer file, or `None` when it does not exist yet.
 pub fn read_agent_pointer(path: &Path) -> io::Result<Option<PathBuf>> {
-    match std::fs::read_to_string(path) {
+    match foundation::file::read_bounded_regular_string(
+        path,
+        MAX_AGENT_PATH_RECORD_BYTES,
+        foundation::file::FinalSymlink::Refuse,
+    ) {
         Ok(text) => decode_agent_pointer(&text).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -119,7 +174,6 @@ const TAG_READY: u8 = 0x04;
 
 const TAG_OK: u8 = 0x81;
 const TAG_ERROR: u8 = 0x82;
-const TAG_UNSUPPORTED: u8 = 0x84;
 
 /// The launcher's opening message: the protocol major it speaks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,7 +222,7 @@ impl Hello {
     /// fail-closed: there is exactly one protocol major, every operation in it is mandatory, and
     /// the launcher and the agent are shipped and updated as one pair — a build that meets a
     /// different major refuses to proceed rather than guessing which half of the protocol it
-    /// shares. This is the ONE compatibility decision in the protocol.
+    /// shares. This is the protocol's one version gate, not a negotiation path.
     pub fn compatible(&self) -> bool {
         self.major == PROTOCOL_MAJOR
     }
@@ -192,8 +246,6 @@ pub enum Response {
     Ok,
     /// The request failed; the string is a human-readable reason (diagnostics only).
     Error(String),
-    /// The launcher does not implement the requested operation.
-    Unsupported,
 }
 
 /// A framing/format fault. Never a reason to change the protocol.
@@ -204,8 +256,8 @@ pub enum Error {
     Closed,
     /// The frame violated the format (oversized length, truncated body, bad discriminant).
     Malformed(&'static str),
-    /// A message tag this build does not know. Surfaced (not fatal) so a request
-    /// reader can answer [`Response::Unsupported`].
+    /// A message tag this build does not know. Fatal because a protocol major has one mandatory
+    /// operation set and the launcher and agent are shipped together.
     UnknownTag(u8),
     /// The channel's framing or protocol major is not one this build can speak.
     Incompatible(&'static str),
@@ -428,8 +480,7 @@ impl Request {
         write_frame(w, &self.encode()?)
     }
 
-    /// Read one request frame (launcher side). `Err(UnknownTag)` on an operation this
-    /// build does not know — the launcher answers [`Response::Unsupported`].
+    /// Read one request frame (launcher side). An unknown operation is a fatal protocol error.
     pub fn read(r: &mut impl Read) -> Result<Request> {
         Request::decode(&read_frame(r)?)
     }
@@ -444,7 +495,6 @@ impl Response {
                 out.push(TAG_ERROR);
                 put_str(&mut out, msg)?;
             }
-            Response::Unsupported => out.push(TAG_UNSUPPORTED),
         }
         Ok(out)
     }
@@ -455,7 +505,6 @@ impl Response {
         let resp = match tag {
             TAG_OK => Response::Ok,
             TAG_ERROR => Response::Error(get_str(body, &mut at)?),
-            TAG_UNSUPPORTED => Response::Unsupported,
             other => return Err(Error::UnknownTag(other)),
         };
         end_of_frame(body, at)?;
@@ -524,6 +573,74 @@ fn os_from_units(bytes: &[u8]) -> Result<OsString> {
 }
 
 #[cfg(test)]
+mod agent_staging_tests {
+    use super::*;
+
+    /// What the agent STAGES is exactly what the launcher ADMITS.
+    ///
+    /// The round trip is the whole point of putting this layout in one place. These two halves run
+    /// in different processes with different lifetimes: the agent is replaced by every self-update,
+    /// the launcher is never replaced at all. A layout change that only one half learned would
+    /// strand the fleet — every candidate refused at the readiness gate, by the component that
+    /// cannot be updated to accept it.
+    #[test]
+    fn a_staged_agent_path_is_one_the_launcher_admits() {
+        let state = Path::new("/var/lib/updated");
+        let root = agent_staging_root(state);
+        let digest = "a".repeat(64);
+
+        let staged = staged_agent_binary(state, &digest);
+        assert_eq!(
+            staged_agent_digest(&root, &staged),
+            Some(digest.as_str()),
+            "the launcher must admit exactly what the agent stages"
+        );
+    }
+
+    /// Everything that is not that layout is refused.
+    ///
+    /// The digest is checked as a canonical SHA-256 spelling through the one lexical rule, so an
+    /// uppercase alias — a second name for one release — is not a staging directory either.
+    #[test]
+    fn near_misses_are_not_the_staging_layout() {
+        let state = Path::new("/var/lib/updated");
+        let root = agent_staging_root(state);
+        let binary = foundation::platform::agent_binary_name();
+        let digest = "a".repeat(64);
+
+        for (label, path) in [
+            (
+                "outside the staging root",
+                PathBuf::from("/tmp/evil").join(binary),
+            ),
+            ("no digest directory", root.join(binary)),
+            (
+                "a nested extra directory",
+                root.join(&digest).join("x").join(binary),
+            ),
+            (
+                "the wrong file name",
+                root.join(&digest).join("not-the-agent"),
+            ),
+            ("a non-digest directory", root.join("latest").join(binary)),
+            ("a short digest", root.join("a".repeat(63)).join(binary)),
+            (
+                "an uppercase digest alias",
+                root.join("A".repeat(64)).join(binary),
+            ),
+            ("the digest directory itself", root.join(&digest)),
+        ] {
+            assert_eq!(
+                staged_agent_digest(&root, &path),
+                None,
+                "{label} must not be admitted: {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -560,7 +677,6 @@ mod tests {
     fn responses_round_trip() {
         round_trip_response(Response::Ok);
         round_trip_response(Response::Error("could not stage: ENOENT".into()));
-        round_trip_response(Response::Unsupported);
     }
 
     #[test]
@@ -595,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tag_surfaces_so_the_launcher_can_answer_unsupported() {
+    fn unknown_request_tag_is_a_fatal_protocol_error() {
         let mut framed = 1u32.to_be_bytes().to_vec();
         framed.push(0x77);
         assert!(matches!(

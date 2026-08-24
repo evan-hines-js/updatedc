@@ -20,6 +20,7 @@ use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::ResourceExt;
 use serde::Serialize;
 
+use crate::webhook::{hmac_key, signature, SIGNATURE_HEADER};
 use crate::{ResourceCondition, UpdateSubscription};
 
 /// One update event delivered to a subscriber. The immutable, content-addressed history lives in S3;
@@ -49,6 +50,37 @@ const MAX_EVENTS_PER_PASS: usize = 64;
 /// catch-up must not.
 const DELIVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The one immutable publication identity every delivery in a pass announces.
+///
+/// Keeping these fields together prevents the list, event encoder, and status writer from being
+/// handed subtly different spellings of a repository generation. The delivery machinery may vary
+/// the subscriber and high-water mark; this value is the authority for everything else.
+#[derive(Clone, Copy)]
+pub struct DeliveryContext<'a> {
+    pub repository: &'a str,
+    pub namespace: &'a str,
+    pub prefix: &'a str,
+    pub public_url: &'a str,
+    pub version: u64,
+    pub now: &'a str,
+}
+
+/// The one delivery client for the process. A `reqwest::Client` IS its connection pool, so building
+/// one per call — this runs on every reconcile pass, once a second per repository — rebuilt the TLS
+/// config and resolver each time and threw away keep-alive, making every webhook `POST` pay a fresh
+/// TCP+TLS handshake. Held the way [`crate::alerts::AlertSink`] holds its client, and built lazily
+/// so a namespace with no subscriptions never builds one at all.
+///
+/// Webhook URLs are operator-supplied (inside the CRD trust boundary), but redirects are refused so
+/// a webhook cannot bounce the signed event body to an internal-only endpoint (cloud metadata,
+/// in-cluster services) that the configured host would not otherwise reach.
+static DELIVERY_CLIENT: std::sync::LazyLock<std::io::Result<reqwest::Client>> =
+    std::sync::LazyLock::new(|| {
+        updated::http::outbound_client(updated::http::OutboundDeadline::Total(
+            std::time::Duration::from_secs(10),
+        ))
+    });
+
 /// Whether a subscription with the given optional `repositoryRef` covers `repository`. `None` means
 /// every repository in the namespace; `Some(name)` means only that one.
 fn covers(repository_ref: Option<&str>, repository: &str) -> bool {
@@ -69,61 +101,27 @@ fn pending(mark: u64, version: u64) -> impl Iterator<Item = u64> {
         .flatten()
 }
 
-/// HMAC-SHA256 of `body` under `key`, lowercase hex — the value placed in `X-Updated-Signature`
-/// (prefixed `sha256=`). The one crypto library, same backend as the gateway's mTLS.
-fn sign_body(key: &[u8], body: &[u8]) -> String {
-    use aws_lc_rs::hmac;
-    let key = hmac::Key::new(hmac::HMAC_SHA256, key);
-    hex::encode(hmac::sign(&key, body).as_ref())
-}
-
-/// The HMAC signing key from a webhook's `secretRef` — the Secret's `key` entry.
-async fn hmac_key(
-    secrets: &Api<Secret>,
-    name: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let secret = secrets.get(name).await?;
-    let bytes = secret
-        .data
-        .as_ref()
-        .and_then(|data| data.get("key"))
-        .ok_or_else(|| format!("webhook Secret {name} is missing entry 'key'"))?;
-    Ok(bytes.0.clone())
-}
-
 /// Deliver pending update events to every subscription that covers `repository`, advancing each
 /// subscription's per-repository high-water mark to `version` on success. Only apiserver failures
 /// (listing subscriptions) are returned; a failed webhook `POST` is recorded in that subscription's
 /// status and left for the next reconcile, so one broken subscriber never blocks the others or the
 /// publish.
-#[allow(clippy::too_many_arguments)]
 pub async fn deliver_updates(
     subscriptions: &Api<UpdateSubscription>,
     secrets: &Api<Secret>,
-    repository: &str,
-    namespace: &str,
-    prefix: &str,
-    public_url: &str,
-    version: u64,
-    now: &str,
+    context: DeliveryContext<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Webhook URLs are operator-supplied (inside the CRD trust boundary), but refuse to follow
-    // redirects so a webhook cannot bounce the signed event body to an internal-only endpoint
-    // (cloud metadata, in-cluster services) that the configured host would not otherwise reach.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let http = match &*DELIVERY_CLIENT {
+        Ok(http) => http,
+        Err(error) => {
+            return Err(format!("building the subscription delivery client: {error}").into())
+        }
+    };
     deliver_pass(
         subscriptions,
         secrets,
-        &http,
-        repository,
-        namespace,
-        prefix,
-        public_url,
-        version,
-        now,
+        http,
+        context,
         std::time::Instant::now() + DELIVERY_BUDGET,
     )
     .await
@@ -132,17 +130,11 @@ pub async fn deliver_updates(
 /// One delivery pass, against an explicit `deadline` so the budget rule is testable: every
 /// subscription owed an event either gets a delivery attempt or gets told it was deferred, and
 /// nothing falls between the two.
-#[allow(clippy::too_many_arguments)]
 async fn deliver_pass(
     subscriptions: &Api<UpdateSubscription>,
     secrets: &Api<Secret>,
     http: &reqwest::Client,
-    repository: &str,
-    namespace: &str,
-    prefix: &str,
-    public_url: &str,
-    version: u64,
-    now: &str,
+    context: DeliveryContext<'_>,
     deadline: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut owed: Vec<(UpdateSubscription, u64)> = subscriptions
@@ -152,14 +144,14 @@ async fn deliver_pass(
         .filter(|sub| {
             covers(
                 sub.spec.repository_ref.as_ref().map(|r| r.name.as_str()),
-                repository,
+                context.repository,
             )
         })
         .map(|sub| {
-            let mark = delivered_mark(&sub, repository);
+            let mark = delivered_mark(&sub, context.repository);
             (sub, mark)
         })
-        .filter(|(_, mark)| pending(*mark, version).next().is_some())
+        .filter(|(_, mark)| pending(*mark, context.version).next().is_some())
         .collect();
     owed.sort_by(|(left, _), (right, _)| delivery_order(left).cmp(&delivery_order(right)));
 
@@ -171,49 +163,50 @@ async fn deliver_pass(
     while reached < owed.len() && std::time::Instant::now() < deadline {
         let (sub, mark) = &owed[reached];
         reached += 1;
-        deliver_one(
-            subscriptions,
-            secrets,
-            http,
-            sub,
-            repository,
-            namespace,
-            prefix,
-            public_url,
-            *mark,
-            version,
-            now,
-            deadline,
-        )
-        .await;
+        deliver_one(subscriptions, secrets, http, sub, *mark, context, deadline).await;
     }
     // Whatever the budget did not reach is DEFERRED, not skipped: it keeps its (older) attempt
-    // stamp, so the next pass serves it first, and it says so on its own CR. Both the log line and
-    // the status write are on the TRANSITION only — this pass runs once a second, so a subscriber
-    // that stays behind for an hour would otherwise be an hour of status writes and 3600 identical
-    // warnings per starved subscriber.
+    // stamp, so the next pass serves it first, and it says so on its own CR.
     for (sub, mark) in &owed[reached..] {
-        if deferral_says_nothing_new(sub) {
-            continue;
-        }
-        let name = sub.name_any();
-        tracing::warn!(
-            repository,
-            subscription = %name,
-            "subscription delivery budget spent before reaching this subscriber; it is first in \
-             line next reconcile"
-        );
-        record(
-            subscriptions,
-            &name,
-            repository,
-            *mark,
-            now,
-            Outcome::Deferred,
-        )
-        .await;
+        defer(subscriptions, sub, context.repository, *mark, context.now).await;
     }
     Ok(())
+}
+
+/// Tell one subscription the budget never got to it — the whole rule, in one place, for both the
+/// subscriptions [`deliver_pass`] never reached and the one it entered but could not attempt.
+///
+/// The log line and the status write are on the TRANSITION only: this pass runs once a second, so a
+/// subscriber that stays behind for an hour would otherwise be an hour of status writes and 3600
+/// identical warnings. And a deferral never overwrites a real delivery failure, whose detail (the
+/// HTTP status, the connection error) an operator needs more than "the budget ran out" — see
+/// [`deferral_says_nothing_new`].
+async fn defer(
+    subscriptions: &Api<UpdateSubscription>,
+    sub: &UpdateSubscription,
+    repository: &str,
+    mark: u64,
+    now: &str,
+) {
+    if deferral_says_nothing_new(sub) {
+        return;
+    }
+    let name = sub.name_any();
+    tracing::warn!(
+        repository,
+        subscription = %name,
+        "subscription delivery budget spent before this subscriber was attempted; it is first in \
+         line next reconcile"
+    );
+    record(
+        subscriptions,
+        &name,
+        repository,
+        mark,
+        now,
+        Outcome::Deferred,
+    )
+    .await;
 }
 
 /// This subscription's high-water mark for `repository` — the last generation it acknowledged.
@@ -263,22 +256,36 @@ fn deferral_says_nothing_new(sub: &UpdateSubscription) -> bool {
 /// and at [`MAX_EVENTS_PER_PASS`] or `deadline`, whichever comes first. The high-water mark and
 /// status condition are written from whatever was actually acknowledged, so a bounded pass is
 /// simply progress: the remainder resumes next reconcile.
-#[allow(clippy::too_many_arguments)]
 async fn deliver_one(
     subscriptions: &Api<UpdateSubscription>,
     secrets: &Api<Secret>,
     http: &reqwest::Client,
     sub: &UpdateSubscription,
-    repository: &str,
-    namespace: &str,
-    prefix: &str,
-    public_url: &str,
     mark: u64,
-    version: u64,
-    now: &str,
+    context: DeliveryContext<'_>,
     deadline: std::time::Instant,
 ) {
     let name = sub.name_any();
+
+    let webhook_url = match updated::http::network_endpoint(
+        &sub.spec.webhook.url,
+        updated::http::EndpointTransport::HttpOrHttps,
+        "subscription webhook URL",
+    ) {
+        Ok(url) => url,
+        Err(error) => {
+            record(
+                subscriptions,
+                &name,
+                context.repository,
+                mark,
+                context.now,
+                Outcome::Failed(&error.to_string()),
+            )
+            .await;
+            return;
+        }
+    };
 
     // Resolve the signing key once (if any) for the whole catch-up run.
     let key = match &sub.spec.webhook.secret_ref {
@@ -288,9 +295,9 @@ async fn deliver_one(
                 record(
                     subscriptions,
                     &name,
-                    repository,
+                    context.repository,
                     mark,
-                    now,
+                    context.now,
                     Outcome::Failed(&format!("resolving webhook secret: {error}")),
                 )
                 .await;
@@ -308,18 +315,18 @@ async fn deliver_one(
     // queue. That is the starvation the cursor exists to end, so zero attempts is recorded as the
     // deferral it is.
     let mut attempted = false;
-    for target in pending(mark, version).take(MAX_EVENTS_PER_PASS) {
+    for target in pending(mark, context.version).take(MAX_EVENTS_PER_PASS) {
         if std::time::Instant::now() >= deadline {
             break;
         }
         attempted = true;
         let event = UpdateEvent {
-            repository: repository.to_string(),
-            namespace: namespace.to_string(),
-            prefix: prefix.to_string(),
-            public_url: public_url.to_string(),
+            repository: context.repository.to_string(),
+            namespace: context.namespace.to_string(),
+            prefix: context.prefix.to_string(),
+            public_url: context.public_url.to_string(),
             version: target,
-            delivered_at: now.to_string(),
+            delivered_at: context.now.to_string(),
         };
         let body = match serde_json::to_vec(&event) {
             Ok(body) => body,
@@ -327,9 +334,9 @@ async fn deliver_one(
                 record(
                     subscriptions,
                     &name,
-                    repository,
+                    context.repository,
                     delivered,
-                    now,
+                    context.now,
                     Outcome::Failed(&format!("encoding event: {error}")),
                 )
                 .await;
@@ -337,13 +344,10 @@ async fn deliver_one(
             }
         };
         let mut request = http
-            .post(&sub.spec.webhook.url)
+            .post(webhook_url.clone())
             .header("content-type", "application/json");
         if let Some(key) = &key {
-            request = request.header(
-                "x-updated-signature",
-                format!("sha256={}", sign_body(key, &body)),
-            );
+            request = request.header(SIGNATURE_HEADER, signature(key, &body));
         }
         match request.body(body).send().await {
             Ok(response) if response.status().is_success() => {
@@ -353,22 +357,26 @@ async fn deliver_one(
                 record(
                     subscriptions,
                     &name,
-                    repository,
+                    context.repository,
                     delivered,
-                    now,
+                    context.now,
                     Outcome::Failed(&format!("webhook returned HTTP {}", response.status())),
                 )
                 .await;
                 return;
             }
             Err(error) => {
+                let error = updated::http::redacted_reqwest_error(
+                    "posting to subscription webhook",
+                    &error,
+                );
                 record(
                     subscriptions,
                     &name,
-                    repository,
+                    context.repository,
                     delivered,
-                    now,
-                    Outcome::Failed(&format!("posting to webhook: {error}")),
+                    context.now,
+                    Outcome::Failed(&error.to_string()),
                 )
                 .await;
                 return;
@@ -376,35 +384,17 @@ async fn deliver_one(
         }
     }
     if !attempted {
-        // Same rule as the subscriptions `deliver_pass` never reached: the deferral is recorded on
-        // the TRANSITION only, and never over a real delivery failure, whose detail an operator
-        // needs more than "the budget ran out".
-        if deferral_says_nothing_new(sub) {
-            return;
-        }
-        tracing::warn!(
-            repository,
-            subscription = %name,
-            "subscription delivery budget spent before this subscriber's first attempt; it is \
-             first in line next reconcile"
-        );
-        record(
-            subscriptions,
-            &name,
-            repository,
-            mark,
-            now,
-            Outcome::Deferred,
-        )
-        .await;
+        // The same deferral the subscriptions `deliver_pass` never reached get, through the same
+        // writer: this one was entered but never contacted, which is the same claim.
+        defer(subscriptions, sub, context.repository, mark, context.now).await;
         return;
     }
     record(
         subscriptions,
         &name,
-        repository,
+        context.repository,
         delivered,
-        now,
+        context.now,
         Outcome::Delivered,
     )
     .await;
@@ -545,28 +535,6 @@ mod tests {
             0,
             "a saturated mark owes nothing instead of overflowing the reconcile loop"
         );
-    }
-
-    #[test]
-    fn hmac_signature_is_stable_and_key_sensitive() {
-        let body = br#"{"repository":"fleet","version":42}"#;
-        let a = sign_body(b"secret-key", body);
-        assert_eq!(
-            a,
-            sign_body(b"secret-key", body),
-            "deterministic for a key+body"
-        );
-        assert_ne!(
-            a,
-            sign_body(b"other-key", body),
-            "a different key changes the tag"
-        );
-        assert_ne!(
-            a,
-            sign_body(b"secret-key", b"tampered"),
-            "a different body changes the tag"
-        );
-        assert_eq!(a.len(), 64, "SHA-256 tag is 32 bytes of hex");
     }
 
     /// A subscription carrying only what the delivery cursor reads: when it was last attempted and
@@ -714,12 +682,14 @@ mod tests {
             &Api::namespaced(client.clone(), "prod"),
             &Api::namespaced(client, "prod"),
             &reqwest::Client::new(),
-            "fleet",
-            "prod",
-            "tenant/routing",
-            "https://cdn.example/",
-            5,
-            "2026-08-03T14:00:00Z",
+            DeliveryContext {
+                repository: "fleet",
+                namespace: "prod",
+                prefix: "tenant/routing",
+                public_url: "https://cdn.example/",
+                version: 5,
+                now: "2026-08-03T14:00:00Z",
+            },
             std::time::Instant::now(),
         )
         .await
@@ -763,13 +733,15 @@ mod tests {
             // The URL is unroutable on purpose: a pass that never attempts must not touch it.
             &reqwest::Client::new(),
             &subscription("s", None, ""),
-            "fleet",
-            "prod",
-            "tenant/routing",
-            "https://cdn.example/",
             3,
-            9,
-            "2026-08-03T14:00:00Z",
+            DeliveryContext {
+                repository: "fleet",
+                namespace: "prod",
+                prefix: "tenant/routing",
+                public_url: "https://cdn.example/",
+                version: 9,
+                now: "2026-08-03T14:00:00Z",
+            },
             std::time::Instant::now(),
         )
         .await;
@@ -785,6 +757,53 @@ mod tests {
             status.get("lastAttemptTime").is_none(),
             "a subscriber that got no attempt keeps its place in the fairness queue"
         );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_subscription_url_fails_closed_without_leaking_it_to_status() {
+        use axum::http::{Method, StatusCode};
+        let recorded: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let client = crate::tests::apiserver({
+            let recorded = recorded.clone();
+            move |_: &Method, _: &str, body: Vec<u8>| {
+                let patch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                recorded.lock().unwrap().push(patch["status"].clone());
+                (
+                    StatusCode::OK,
+                    serde_json::to_value(subscription("s", None, "")).unwrap(),
+                )
+            }
+        });
+        let mut sub = subscription("s", None, "");
+        sub.spec.webhook.url = "https://subscriber/hook?token=secret".into();
+
+        deliver_one(
+            &Api::namespaced(client.clone(), "prod"),
+            &Api::namespaced(client, "prod"),
+            &reqwest::Client::new(),
+            &sub,
+            0,
+            DeliveryContext {
+                repository: "fleet",
+                namespace: "prod",
+                prefix: "tenant/routing",
+                public_url: "https://cdn.example/",
+                version: 1,
+                now: "2026-08-03T14:00:00Z",
+            },
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        let recorded = recorded.lock().unwrap();
+        let [status] = recorded.as_slice() else {
+            panic!("exactly one failure status, got {recorded:?}");
+        };
+        assert_eq!(status["conditions"][0]["reason"], FAILED_REASON);
+        let message = status["conditions"][0]["message"].as_str().unwrap();
+        assert!(message.contains("subscription webhook URL"), "{message}");
+        assert!(!message.contains("secret"), "URL leaked in {message}");
+        assert_eq!(status["deliveredVersions"]["fleet"], 0);
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! Entry point of the signed lifecycle-provider fixture for the operator demo.
 //!
 //! The fixture itself lives in [`reconciler`]. It owns the release's workload process — it
-//! `setsid`s the workload out of the hook's contained tree, reads the process state back out of
-//! `/proc`, and signals it on the next release — so it exists only for the unix nodes the demo
-//! deploys to. That is a property of the *fixture*, not of the tower: keeping the unix
+//! `setsid`s the workload out of the hook's contained tree, signals it on the next release, and
+//! reads the process state back out of `/proc` on the Linux nodes the demo deploys to — so it
+//! exists only for unix. That is a property of the *fixture*, not of the tower: keeping the unix
 //! implementation behind `cfg(unix)` is what lets `cargo test --workspace --all-targets` compile
 //! this workspace member on Windows too, instead of failing the whole build on a demo artifact no
-//! Windows node ever runs.
+//! Windows node ever runs. `/proc` is narrower than unix, so where it is absent the fixture's
+//! liveness question answers "cannot tell" rather than "gone" and every caller treats that as
+//! still-running; nothing here mistakes an unobservable workload for a stopped one.
 
 #[cfg(unix)]
 mod reconciler;

@@ -92,14 +92,29 @@ impl Fleet {
     }
 
     /// Wait until every cohort member is healthy on `version`.
+    ///
+    /// This is the first fleet wait after cluster bring-up, when the apiserver is still settling,
+    /// so an unreadable list is retried like an unconverged pass and reported only if the wait as
+    /// a whole runs out — the same rule [`await_for`] and the status readers below keep.
     pub(crate) async fn wait_for_convergence(
         &self,
         version: &str,
         timeout_seconds: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut last = Vec::new();
+        let mut last_error = String::new();
         for second in 0..timeout_seconds {
-            last = self.nodes().await?;
+            match self.nodes().await {
+                Ok(nodes) => {
+                    last = nodes;
+                    last_error.clear();
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
             let cohort: Vec<&FleetNode> =
                 last.iter().filter(|node| is_cohort_member(node)).collect();
             if cohort.len() == NODE_COUNT && cohort.iter().all(|node| node_converged(node, version))
@@ -133,8 +148,13 @@ impl Fleet {
             .collect::<Vec<_>>()
             .join(", ");
         Err(format!(
-            "fleet did not converge at {version}: observed {} nodes; lagging [{lagging}]",
-            last.len()
+            "fleet did not converge at {version}: observed {} nodes; lagging [{lagging}]{}{last_error}",
+            last.len(),
+            if last_error.is_empty() {
+                ""
+            } else {
+                "; last error: "
+            }
         )
         .into())
     }
@@ -146,18 +166,7 @@ impl Fleet {
 /// a rollback assertion evidence rather than a guess: a cohort that merely never received the
 /// broken release carries no such record.
 pub(crate) fn rejected_release(node: &str, artifact_sha256: &str) -> bool {
-    output(kubectl().args([
-        "-n",
-        NAMESPACE,
-        "exec",
-        node,
-        "-c",
-        "agent",
-        "--",
-        "cat",
-        "/var/lib/updated/state/rejected",
-    ]))
-    .is_ok_and(|record| {
+    output(agent_exec(node).args(["cat", "/var/lib/updated/state/rejected"])).is_ok_and(|record| {
         // Each line is `repository-lineage-sha256:artifact-sha256`.
         record
             .lines()
@@ -188,6 +197,52 @@ pub(crate) const KIND_LABEL: &str = "e2e.updated.dev/kind";
 /// Label carrying a Jenkins node's instance role (`ci`, `release`).
 pub(crate) const ROLE_LABEL: &str = "e2e.updated.dev/role";
 
+/// One in-cluster HTTP read: curl from the release-server pod — the same trust boundary
+/// production clients sit in — so no host↔cluster hop can flake an assertion. The single way any
+/// scenario asks an in-cluster HTTP endpoint a question.
+pub(crate) fn cluster_curl(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    output(
+        kubectl()
+            .args(RELEASE_SERVER_EXEC)
+            .args(["--", "curl", "-sf", "--max-time", "3", url]),
+    )
+}
+
+/// The pod IP behind `app=<label>` — how a scenario reaches a cluster-internal listener (a
+/// metrics exposition) that deliberately has no Service.
+pub(crate) fn pod_ip_by_app(label: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let ip = output(kubectl().args([
+        "-n",
+        NAMESPACE,
+        "get",
+        "pod",
+        "-l",
+        &format!("app={label}"),
+        "-o",
+        "jsonpath={.items[0].status.podIP}",
+    ]))?
+    .trim()
+    .to_string();
+    if ip.is_empty() {
+        return Err(format!("no running pod carries app={label}").into());
+    }
+    Ok(ip)
+}
+
+/// One field of one condition on an `UpdateGroup` (`status`, `reason`), or `None` while the
+/// condition has not been published. The single condition reader: every scenario projects the
+/// field it needs out of it rather than spelling the jsonpath again.
+pub(crate) fn condition_field(group: &str, condition: &str, field: &str) -> Option<String> {
+    kubectl_value(
+        "updategroup",
+        group,
+        &format!("{{.status.conditions[?(@.type==\"{condition}\")].{field}}}"),
+    )
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
 /// The deployments an `UpdateGroupSet` currently reports HALTED by the regression verdict, by name.
 /// An unreadable status is an empty list, never an error: every caller polls, and a transient API
 /// failure must not be mistaken for a verdict.
@@ -202,15 +257,14 @@ pub(crate) fn halted_deployments(set: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The `status` of one condition on an `UpdateGroup` (`True`/`False`), or `None` when the condition
-/// has not been published yet.
-pub(crate) fn condition_status(group: &str, condition: &str) -> Option<String> {
-    let status = kubectl_value(
-        "updategroup",
-        group,
-        &format!("{{.status.conditions[?(@.type=='{condition}')].status}}"),
+/// Whether the set's halt record for `deployment` says an `onRegression: rollback` response
+/// consumed it — the `rolledBack` flag on the same `status.halted` entry [`halted_deployments`]
+/// reads. Unreadable is `false`, never an error, for the same polling reason.
+pub(crate) fn halt_rolled_back(set: &str, deployment: &str) -> bool {
+    kubectl_value(
+        "updategroupset",
+        set,
+        &format!("{{.status.halted[?(@.deployment==\"{deployment}\")].rolledBack}}"),
     )
-    .ok()?;
-    let status = status.trim().to_string();
-    (!status.is_empty()).then_some(status)
+    .is_ok_and(|value| value.trim() == "true")
 }

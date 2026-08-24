@@ -20,7 +20,9 @@ pub struct RepositoryLineage(String);
 
 impl RepositoryLineage {
     pub fn from_metadata_url(metadata_url: &str) -> Self {
-        Self(crate::hash::sha256_bytes(metadata_url.as_bytes()))
+        Self(updated_contracts::digest::sha256_bytes(
+            metadata_url.as_bytes(),
+        ))
     }
 
     pub fn as_str(&self) -> &str {
@@ -32,7 +34,7 @@ impl RepositoryLineage {
     }
 
     fn validate(&self) -> bool {
-        updated_contracts::is_sha256_hex(&self.0)
+        updated_contracts::is_canonical_sha256(&self.0)
     }
 }
 
@@ -42,12 +44,51 @@ impl RepositoryLineage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderRelease {
+    /// SHA-256 of the signed provider-set document this reconciler was resolved from. This is the
+    /// provider half of the deployed release identity: telemetry and the update loop compare it
+    /// with the live assignment so a provider-only revision cannot be mistaken for convergence.
+    pub provider_set_sha256: String,
     pub product: String,
     pub release: ReleaseId,
     pub archive_sha256: String,
     pub args: Vec<String>,
     pub timeout_millis: u64,
 }
+
+impl ProviderRelease {
+    /// Upper bound for the serialized provider identity carried inside durable state. The
+    /// provider-set contract already accounts for the worst-case JSON expansion of its bounded
+    /// arguments; this shape adds only fixed-width digests and a bounded release identity.
+    pub(crate) const MAX_SERIALIZED_BYTES: usize =
+        updated_contracts::artifact::ProviderSet::MAX_DOCUMENT_BYTES;
+
+    /// Re-check on the way in everything the signed provider contract enforced on the way out.
+    ///
+    /// The installed record is plain JSON with no integrity check, so a value that reached disk
+    /// some other way must not become the reconciler identity this node invokes on every boot,
+    /// probe and fingerprint. A zero timeout is the sharp case: every hook would be past its
+    /// deadline before its first poll and be killed as "exceeded its 0s timeout", so the node
+    /// crash-loops blaming the operator's hook instead of failing closed on a corrupt record.
+    ///
+    /// The one home for that rule: the installed record, the update transaction and the install
+    /// transaction all persist the same identity and all re-check it here.
+    pub(crate) fn is_valid(&self) -> bool {
+        use updated_contracts::artifact::ProviderSet;
+        updated_contracts::is_canonical_sha256(&self.provider_set_sha256)
+            && updated_contracts::identity::is_segment(&self.product)
+            && self.release.validate().is_ok()
+            && updated_contracts::is_canonical_sha256(&self.archive_sha256)
+            && self.args.len() <= ProviderSet::MAX_ARGS
+            && self
+                .args
+                .iter()
+                .all(|arg| arg.len() <= ProviderSet::MAX_ARG_BYTES)
+            && (ProviderSet::MIN_TIMEOUT_MILLIS..=ProviderSet::MAX_TIMEOUT_MILLIS)
+                .contains(&self.timeout_millis)
+    }
+}
+
+const INSTALLED_RECORD_MAX_BYTES: usize = 2 * ProviderRelease::MAX_SERIALIZED_BYTES + 8 * 1024;
 
 /// Version + the sha256 (hex) of the bytes that version was installed from, plus an
 /// optional [`Pending`] record while a just-committed update is still proving itself.
@@ -89,6 +130,8 @@ pub struct InstalledState {
 #[serde(deny_unknown_fields)]
 pub struct Pending {
     pub lifecycle_attempt_id: String,
+    /// Candidate identity to reject if this confirmation window later fails.
+    pub candidate_rejection_sha256: String,
     pub previous_release: ReleaseId,
     pub previous_archive_sha256: String,
     pub previous_repository_lineage: RepositoryLineage,
@@ -104,6 +147,21 @@ impl InstalledState {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid repository lineage",
+            ));
+        }
+        if !self.lifecycle.is_valid() {
+            // The head reconciler is the one actually invoked, so it gets the check the pending
+            // predecessor already got. See [`ProviderRelease::is_valid`].
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed provider identity is invalid",
+            ));
+        }
+        self.release.validate()?;
+        if !updated_contracts::is_canonical_sha256(&self.archive_sha256) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed archive identity is invalid",
             ));
         }
         if !self.confirmed && self.pending.is_some() {
@@ -122,10 +180,16 @@ impl InstalledState {
                     "invalid pending predecessor repository lineage",
                 ));
             }
-            if pending.lifecycle_attempt_id.is_empty() {
+            if !crate::rand::is_token(&pending.lifecycle_attempt_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending lifecycle id must not be empty",
+                    "pending lifecycle id is invalid",
+                ));
+            }
+            if !updated_contracts::is_canonical_sha256(&pending.candidate_rejection_sha256) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending rejection identity is invalid",
                 ));
             }
             if pending.previous_release == self.release && pending.lifecycle == self.lifecycle {
@@ -134,10 +198,17 @@ impl InstalledState {
                     "pending predecessor must differ by application or node reconciler",
                 ));
             }
-            if pending.lifecycle.product.is_empty() || pending.lifecycle.timeout_millis == 0 {
+            if !pending.lifecycle.is_valid() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "pending provider identity is invalid",
+                ));
+            }
+            pending.previous_release.validate()?;
+            if !updated_contracts::is_canonical_sha256(&pending.previous_archive_sha256) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending predecessor archive identity is invalid",
                 ));
             }
         }
@@ -257,7 +328,11 @@ pub fn enroll(installed_path: &Path) -> io::Result<()> {
 }
 
 pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
-    match std::fs::read(enrollment_path(installed_path)) {
+    match foundation::file::read_bounded_regular(
+        &enrollment_path(installed_path),
+        ENROLLMENT_MARKER.len(),
+        foundation::file::FinalSymlink::Refuse,
+    ) {
         Ok(raw) if raw == ENROLLMENT_MARKER => EnrollmentState::Present,
         Ok(_) => EnrollmentState::Invalid,
         Err(error) if error.kind() == io::ErrorKind::NotFound => EnrollmentState::Missing,
@@ -267,7 +342,11 @@ pub fn read_enrollment(installed_path: &Path) -> EnrollmentState {
 
 /// Read the committed record at `path`, distinguishing absent from corrupt.
 pub fn read_installed(path: &Path) -> Installed {
-    match std::fs::read(path) {
+    match foundation::file::read_bounded_regular(
+        path,
+        INSTALLED_RECORD_MAX_BYTES,
+        foundation::file::FinalSymlink::Refuse,
+    ) {
         Ok(raw) => match serde_json::from_slice::<InstalledState>(&raw) {
             Ok(s) if s.validate().is_ok() => Installed::Present(Box::new(s)),
             Ok(_) | Err(_) => Installed::Invalid,
@@ -280,11 +359,14 @@ pub fn read_installed(path: &Path) -> Installed {
 /// Atomically and durably write the committed record.
 pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
     state.validate()?;
-    foundation::durable::atomic_write_managed(
-        path,
-        ".state-",
-        &serde_json::to_vec(state).map_err(io::Error::other)?,
-    )
+    let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
+    if bytes.len() > INSTALLED_RECORD_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "installed state exceeds its byte limit",
+        ));
+    }
+    foundation::durable::atomic_write_managed(path, ".state-", &bytes)
 }
 
 #[cfg(test)]
@@ -300,6 +382,10 @@ mod tests {
         (dir, path)
     }
 
+    fn digest(byte: char) -> String {
+        std::iter::repeat_n(byte, 64).collect()
+    }
+
     #[test]
     fn round_trips() {
         let (_dir, path) = tmp("ok");
@@ -309,17 +395,18 @@ mod tests {
                 repository_lineage: RepositoryLineage::from_metadata_url("https://repo/metadata/"),
                 release: ReleaseId {
                     version: "2.3.4".into(),
-                    manifest_sha256: "manifest".into(),
+                    manifest_sha256: digest('a'),
                 },
-                archive_sha256: "abcd".into(),
+                archive_sha256: digest('b'),
                 lifecycle: provider(),
                 pending: Some(Pending {
-                    lifecycle_attempt_id: "lifecycle".into(),
+                    lifecycle_attempt_id: digest('c'),
+                    candidate_rejection_sha256: "f".repeat(64),
                     previous_release: ReleaseId {
                         version: "2.3.3".into(),
-                        manifest_sha256: "old-manifest".into(),
+                        manifest_sha256: digest('d'),
                     },
-                    previous_archive_sha256: "beef".into(),
+                    previous_archive_sha256: digest('e'),
                     previous_repository_lineage: RepositoryLineage::from_metadata_url(
                         "https://old/metadata/",
                     ),
@@ -333,7 +420,7 @@ mod tests {
         match read_installed(&path) {
             Installed::Present(s) => {
                 assert_eq!(s.release.version, "2.3.4");
-                assert_eq!(s.archive_sha256, "abcd");
+                assert_eq!(s.archive_sha256, digest('b'));
                 assert_eq!(s.pending.unwrap().previous_release.version, "2.3.3");
             }
             _ => panic!("expected Present"),
@@ -356,6 +443,119 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(read_installed(&path), Installed::Invalid));
+    }
+
+    #[test]
+    fn a_head_reconciler_identity_the_contract_would_refuse_is_a_corrupt_record() {
+        // The head reconciler is the one this node invokes on every boot, probe and fingerprint,
+        // so it gets the check the pending predecessor already gets. A zero timeout is the sharp
+        // case: `lifecycle_timeout` would hand every hook a deadline already in the past and kill
+        // it as "exceeded its 0s timeout", crash-looping the node with a message blaming the
+        // operator's hook — where refusing the record fails closed on the real cause.
+        let head = |mutate: fn(&mut ProviderRelease)| {
+            let mut lifecycle = provider();
+            mutate(&mut lifecycle);
+            InstalledState::confirmed(
+                RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+                ReleaseId {
+                    version: "2.3.4".into(),
+                    manifest_sha256: digest('a'),
+                },
+                digest('b'),
+                lifecycle,
+            )
+        };
+        for (name, state) in [
+            ("zero-timeout", head(|p| p.timeout_millis = 0)),
+            (
+                "over-timeout",
+                head(|p| {
+                    p.timeout_millis =
+                        updated_contracts::artifact::ProviderSet::MAX_TIMEOUT_MILLIS + 1
+                }),
+            ),
+            // `product` becomes a directory name under the install root; staging refuses anything
+            // that could escape it, and so must the record that outlives staging.
+            (
+                "traversal-product",
+                head(|p| p.product = "../escape".into()),
+            ),
+            ("empty-product", head(|p| p.product = String::new())),
+            (
+                "leading-dash-product",
+                head(|p| p.product = "-unsafe".into()),
+            ),
+            (
+                "overlong-product",
+                head(|p| {
+                    p.product = "a".repeat(updated_contracts::identity::MAX_SEGMENT_BYTES + 1)
+                }),
+            ),
+            (
+                "bad-provider-archive",
+                head(|p| p.archive_sha256 = "bad".into()),
+            ),
+            (
+                "bad-provider-release",
+                head(|p| p.release.manifest_sha256 = "bad".into()),
+            ),
+            (
+                "too-many-provider-args",
+                head(|p| {
+                    p.args =
+                        vec![String::new(); updated_contracts::artifact::ProviderSet::MAX_ARGS + 1]
+                }),
+            ),
+            (
+                "overlong-provider-arg",
+                head(|p| {
+                    p.args = vec![
+                        "x".repeat(updated_contracts::artifact::ProviderSet::MAX_ARG_BYTES + 1)
+                    ]
+                }),
+            ),
+        ] {
+            let (_dir, path) = tmp(name);
+            assert_eq!(
+                write_installed(&path, &state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{name} must never be written"
+            );
+            // Present on disk some other way (a hand-edited or truncated-then-rewritten record):
+            // it must read as corrupt, not as a usable head.
+            std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            assert!(
+                matches!(read_installed(&path), Installed::Invalid),
+                "{name} must read as corrupt"
+            );
+        }
+    }
+
+    #[test]
+    fn the_installed_artifact_identity_is_revalidated_as_one_unit() {
+        let valid = InstalledState::confirmed(
+            RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+            ReleaseId {
+                version: "2.3.4".into(),
+                manifest_sha256: digest('a'),
+            },
+            digest('b'),
+            provider(),
+        );
+        let mut malformed_release = valid.clone();
+        malformed_release.release.manifest_sha256 = "bad".into();
+        let mut malformed_archive = valid;
+        malformed_archive.archive_sha256 = "bad".into();
+
+        for state in [malformed_release, malformed_archive] {
+            let (_dir, path) = tmp("malformed-artifact");
+            assert_eq!(
+                write_installed(&path, &state).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            assert!(matches!(read_installed(&path), Installed::Invalid));
+        }
     }
 
     #[test]
@@ -396,35 +596,36 @@ mod tests {
         let new = RepositoryLineage::from_metadata_url("https://batch/metadata/");
         let release = ReleaseId {
             version: "8.0.0".into(),
-            manifest_sha256: "manifest".into(),
+            manifest_sha256: digest('a'),
         };
         let reconciler = ProviderRelease {
+            provider_set_sha256: "f".repeat(64),
             product: "reconciler".into(),
             release: ReleaseId {
                 version: "1.0.0".into(),
-                manifest_sha256: "reconciler-manifest".into(),
+                manifest_sha256: digest('b'),
             },
-            archive_sha256: "reconciler-archive".into(),
+            archive_sha256: digest('c'),
             args: Vec::new(),
             timeout_millis: 1_000,
         };
         let installed = InstalledState::confirmed(
             old.clone(),
             release.clone(),
-            "archive".into(),
+            digest('d'),
             Box::new(reconciler.clone()),
         );
         assert_eq!(installed.version_floor_for(&old), Some("8.0.0"));
         assert_eq!(installed.version_floor_for(&new), None);
         assert_eq!(
             installed
-                .rebind_if_same_artifact(new.clone(), &release, "archive", &reconciler)
+                .rebind_if_same_artifact(new.clone(), &release, &digest('d'), &reconciler)
                 .unwrap()
                 .repository_lineage,
             new
         );
         assert!(installed
-            .rebind_if_same_artifact(new, &release, "different", &reconciler)
+            .rebind_if_same_artifact(new, &release, &digest('e'), &reconciler)
             .is_none());
     }
 

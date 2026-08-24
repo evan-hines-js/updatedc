@@ -3,6 +3,7 @@ use super::*;
 pub(crate) enum AppOutcome {
     Upgraded {
         version: String,
+        host_action: updated_contracts::reconciler::HostAction,
     },
     Unchanged,
     /// The update cannot proceed and cannot be recovered from in this process. The agent exits
@@ -22,6 +23,25 @@ fn is_self_version(installed: &updated::state::Installed, candidate: &str) -> bo
         installed,
         updated::state::Installed::Present(state) if state.release.version == candidate
     )
+}
+
+/// Reuse the committed application as the candidate for a provider-only revision. The provider
+/// still changes through the normal transaction; this helper only proves that the application
+/// half is already the exact archive the assignment names.
+fn provider_only_candidate(
+    installed: &updated::state::Installed,
+    assigned_application_sha256: &str,
+    reconciler: &updated::state::ProviderRelease,
+) -> Option<crate::acquire::PreparedApplication> {
+    let updated::state::Installed::Present(state) = installed else {
+        return None;
+    };
+    (state.archive_sha256 == assigned_application_sha256 && state.lifecycle.as_ref() != reconciler)
+        .then(|| crate::acquire::PreparedApplication {
+            release: state.release.clone(),
+            version: state.release.version.clone(),
+            archive_sha256: state.archive_sha256.clone(),
+        })
 }
 
 /// Why staging a version's lifecycle providers failed.
@@ -60,7 +80,7 @@ pub(crate) async fn stage_providers(
     opts: &Options,
     repo: &TrustedRepository,
     store: &mut dyn Store,
-    ordered_current: Option<&str>,
+    version_provider_set: Option<&updated_contracts::artifact::TargetReference>,
 ) -> Result<updated::state::ProviderRelease, ProviderStagingError> {
     use ProviderStagingError::Transient;
     // Until the provider set's origin is known, no failure can be blamed on an application version.
@@ -77,33 +97,19 @@ pub(crate) async fn stage_providers(
             "creating lifecycle provider staging directory failed: {e}"
         ))
     })?;
-    // Resolve the provider set against the app version that will actually be selected. When
+    // The set staged here is the one that governs the app version the caller already selected
+    // (`acquire::select_assigned_application`, which is where that single decision is made). When
     // ordered fallback descends below the assigned head (the head bytes are unusable), the
     // descended app version's own signed provider set governs — app and providers roll back as
     // one signed unit rather than pairing an old app with the head's newer providers. At the
-    // assigned head, `provider_set` is `None` and the assignment's own pointer governs, keeping
-    // providers independently revisable there. Selection is deterministic and side-effect free.
-    let policy =
-        updated_tuf::DefaultPolicy::current(&opts.application.product, &opts.application.channel);
-    let selected_provider_ref = repo
-        .assigned_application(
-            &policy,
-            ordered_current,
-            |_message| {},
-            |target, _version| store.is_rejected(&lineage, &target_sha(target)),
-        )
-        .map_err(|e| {
-            unusable(format!(
-                "selecting application to resolve its provider set failed: {e}"
-            ))
-        })?
-        .and_then(|selected| selected.provider_set);
-    let provider_ref = selected_provider_ref
-        .clone()
+    // assigned head that set is `None` and the assignment's own pointer governs, keeping providers
+    // independently revisable there.
+    let provider_ref = version_provider_set
+        .cloned()
         .unwrap_or_else(|| assignment.provider_set.clone());
     // From here the set's origin is known: a version's own signed metadata (descending can help)
     // or the assignment (it cannot).
-    let version_bound = selected_provider_ref.is_some();
+    let version_bound = version_provider_set.is_some();
     let unusable = |message: String| ProviderStagingError::Unusable {
         message,
         version_bound,
@@ -111,15 +117,27 @@ pub(crate) async fn stage_providers(
     let set_target = repo
         .exact_target(&provider_ref)
         .map_err(|e| unusable(format!("resolving desired provider set failed: {e}")))?;
+    if set_target.length > updated_contracts::artifact::ProviderSet::MAX_DOCUMENT_BYTES as u64 {
+        return Err(unusable(format!(
+            "desired provider set is {} bytes, past the {}-byte contract limit",
+            set_target.length,
+            updated_contracts::artifact::ProviderSet::MAX_DOCUMENT_BYTES
+        )));
+    }
+    if store.is_rejected(&lineage, &provider_ref.sha256) {
+        return Err(unusable(
+            "desired provider set was previously rejected".into(),
+        ));
+    }
     // A failed fetch or read is about the link and the disk, never about the release.
-    repo.download_target(&set_target, &opts.paths.provider_download)
+    let mut downloaded_set = repo
+        .download_target(&set_target, &opts.paths.provider_download)
         .await
         .map_err(|e| Transient(format!("acquiring desired provider set failed: {e}")))?;
-    let bytes = std::fs::read(&opts.paths.provider_download)
+    let bytes = downloaded_set
+        .read_bounded(updated_contracts::artifact::ProviderSet::MAX_DOCUMENT_BYTES)
         .map_err(|e| Transient(format!("reading desired provider set failed: {e}")))?;
-    let set: updated_contracts::artifact::ProviderSet = serde_json::from_slice(&bytes)
-        .map_err(|e| unusable(format!("desired provider set is invalid: {e}")))?;
-    set.validate()
+    let set = updated_contracts::artifact::ProviderSet::from_bounded_json(&bytes)
         .map_err(|error| unusable(format!("desired provider set is invalid: {error}")))?;
     let provider = set.reconciler;
     let target = repo
@@ -136,12 +154,12 @@ pub(crate) async fn stage_providers(
         .get("product")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| unusable("node reconciler metadata has no product".into()))?;
-    // The reconciler product becomes a directory name under the install root (per-product state),
-    // so it is confined by the same shared traversal guard as every other joined path component —
-    // a signed-but-hostile `../…` product must not escape.
-    if !updated_contracts::path::is_safe_component(product) {
+    // The reconciler product becomes both a signed identity and a directory name under the install
+    // root. Use the one identity grammar: mere traversal confinement would still admit Windows
+    // aliases (`app`/`APP`, `con`) that map distinct signed products onto one state directory.
+    if !updated_contracts::identity::is_segment(product) {
         return Err(unusable(
-            "node reconciler metadata product is not a safe path component".into(),
+            "node reconciler metadata product is not a canonical portable identity".into(),
         ));
     }
     let version = target
@@ -175,6 +193,7 @@ pub(crate) async fn stage_providers(
             Transient(format!("acquiring node reconciler failed: {error}"))
         })?;
     let release = updated::state::ProviderRelease {
+        provider_set_sha256: provider_ref.sha256,
         product: product.to_string(),
         release: staged_bundle,
         archive_sha256: sha,
@@ -207,46 +226,75 @@ pub(crate) async fn check_application(
     // A persisted rejection applies to the failed bytes only (keyed by hash), so it
     // pins the installation neither below a healthy intermediate release nor against
     // a corrected republish of the same version.
-    // Provider-only deployment revisions reconcile here as well. Staging is
-    // content-addressed and side-effect free; no lifecycle phase runs until an app
-    // transaction consumes this exact resolved provider.
-    let reconciler = match stage_providers(opts, repo, store, ordered_current).await {
+    let request = crate::acquire::ApplicationRequest {
+        repository: repo,
+        application: &opts.application,
+        paths: &opts.paths,
+        stance: ordered_current.map_or(updated_tuf::select::Stance::Nothing, |version| {
+            updated_tuf::select::Stance::Installed(version)
+        }),
+    };
+    let selected = match crate::acquire::select_assigned_application(&request, |sha256| {
+        store.is_rejected(&lineage, sha256)
+    }) {
+        Ok(selected) => selected,
+        Err(error) => {
+            warn(&format!(
+                "selecting the assigned application failed: {error}"
+            ));
+            return AppOutcome::Unchanged;
+        }
+    };
+    // Provider-only deployment revisions reconcile here as well — which is why the set is staged
+    // even when nothing was selected. Application bytes and their provider set are one release
+    // unit and use the same durable transaction; the transaction can safely name identical app
+    // bytes on both sides because the provider identity is the part that differs.
+    let reconciler = match stage_providers(
+        opts,
+        repo,
+        store,
+        selected.as_ref().and_then(|s| s.provider_set.as_ref()),
+    )
+    .await
+    {
         Ok(staged) => staged,
         Err(error) => {
             warn(&error.to_string());
             return AppOutcome::Unchanged;
         }
     };
-    // Stage and validate the provider set above, but only an application release transition may
-    // commit it. A provider-only change cannot safely use the application transaction: it would
-    // manufacture the running release as its own rollback predecessor. Keeping that invariant
-    // here leaves one lifecycle transaction path, with distinct predecessor and candidate
-    // releases, and the provider revision is naturally picked up by the next application release.
-    // Every provider is now present before downloading the application. Nothing
-    // below this point writes transaction intent or touches the live deployment.
-    let prepared = match crate::acquire::prepare_assigned_application(
-        crate::acquire::ApplicationRequest {
-            repository: repo,
-            application: &opts.application,
-            paths: &opts.paths,
-            current_version: ordered_current,
-        },
-        |sha256| store.is_rejected(&lineage, sha256),
-    )
-    .await
-    {
-        Ok(Some(prepared)) => prepared,
-        Ok(None) => return AppOutcome::Unchanged,
-        Err(error) => {
-            if let Some((version, archive_sha256)) = error.rejected_archive() {
-                if let Err(reject_error) = store.reject(&lineage, archive_sha256) {
-                    return AppOutcome::Fatal(format!(
-                        "rejecting malformed application bundle {version}: {reject_error}"
-                    ));
-                }
+    // Every provider is now present before downloading the application. Nothing below this point
+    // writes transaction intent or touches the live deployment.
+    let (prepared, rejection_sha256, provider_only) = match selected {
+        Some(selected) => {
+            let prepared =
+                match crate::acquire::prepare_assigned_application(&request, selected).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        if let Some((version, archive_sha256)) = error.rejected_archive() {
+                            if let Err(reject_error) = store.reject(&lineage, archive_sha256) {
+                                return AppOutcome::Fatal(format!(
+                                "rejecting malformed application bundle {version}: {reject_error}"
+                            ));
+                            }
+                        }
+                        warn(&error.to_string());
+                        return AppOutcome::Unchanged;
+                    }
+                };
+            let rejection = prepared.archive_sha256.clone();
+            (prepared, rejection, false)
+        }
+        None => {
+            let Some(prepared) =
+                provider_only_candidate(&installed, &assignment.application.sha256, &reconciler)
+            else {
+                return AppOutcome::Unchanged;
+            };
+            if store.is_rejected(&lineage, &reconciler.provider_set_sha256) {
+                return AppOutcome::Unchanged;
             }
-            warn(&error.to_string());
-            return AppOutcome::Unchanged;
+            (prepared, reconciler.provider_set_sha256.clone(), true)
         }
     };
 
@@ -255,35 +303,37 @@ pub(crate) async fn check_application(
     // state rebind, not an executable replacement: a full transaction would manufacture
     // a release as its own rollback predecessor. Commit the authenticated lineage while
     // leaving the active pointer and process untouched.
-    if let updated::state::Installed::Present(installed_state) = &installed {
-        if let Some(rebound) = installed_state.rebind_if_same_artifact(
-            lineage.clone(),
-            &prepared.release,
-            &prepared.archive_sha256,
-            &reconciler,
-        ) {
-            if let Err(error) = store.commit_installed(&rebound) {
-                return AppOutcome::Fatal(format!(
-                    "committing repository lineage for the running release: {error}"
+    if !provider_only {
+        if let updated::state::Installed::Present(installed_state) = &installed {
+            if let Some(rebound) = installed_state.rebind_if_same_artifact(
+                lineage.clone(),
+                &prepared.release,
+                &prepared.archive_sha256,
+                &reconciler,
+            ) {
+                if let Err(error) = store.commit_installed(&rebound) {
+                    return AppOutcome::Fatal(format!(
+                        "committing repository lineage for the running release: {error}"
+                    ));
+                }
+                log(&format!(
+                    "adopted repository lineage for already-running {}",
+                    installed_state.release.version
                 ));
+                return AppOutcome::Unchanged;
             }
-            log(&format!(
-                "adopted repository lineage for already-running {}",
-                installed_state.release.version
-            ));
-            return AppOutcome::Unchanged;
-        }
-        // A version is an immutable release identity. Across a repository-lineage change the
-        // selector has no old-lineage version floor, so it may encounter differently packed bytes
-        // carrying the running version. Those bytes are neither an upgrade nor a valid rollback
-        // predecessor. Hold the running release rather than entering a self-update transaction.
-        if is_self_version(&installed, &prepared.version) {
-            warn(&format!(
-                "ignoring application target {}: the installed version already has different \
-                 release bytes or lifecycle state",
-                prepared.version
-            ));
-            return AppOutcome::Unchanged;
+            // A version is an immutable release identity. Across a repository-lineage change the
+            // selector has no old-lineage version floor, so it may encounter differently packed bytes
+            // carrying the running version. Those bytes are neither an upgrade nor a valid rollback
+            // predecessor. Hold the running release rather than entering a self-update transaction.
+            if is_self_version(&installed, &prepared.version) {
+                warn(&format!(
+                    "ignoring application target {}: the installed version already has different \
+                     release bytes or lifecycle state",
+                    prepared.version
+                ));
+                return AppOutcome::Unchanged;
+            }
         }
     }
 
@@ -294,28 +344,39 @@ pub(crate) async fn check_application(
     // This is the single boundary between side-effect-free staging and deployment mutation.
     // Stop background observers before any lifecycle transaction hook can run.
     before_deployment();
-    log(&format!("applying update {from} -> {}", prepared.version));
+    if provider_only {
+        log(&format!(
+            "applying lifecycle provider update for {}",
+            prepared.version
+        ));
+    } else {
+        log(&format!("applying update {from} -> {}", prepared.version));
+    }
     let mut port = ReleaseReconciler::new(opts, &reconciler, Reason::Update);
     let outcome = apply_update(
         &mut port,
         store,
         &prepared.release,
         &prepared.archive_sha256,
+        &rejection_sha256,
         lineage.clone(),
         reconciler.clone(),
     )
     .await;
     match outcome {
-        Ok(Outcome::Committed) => {
-            if let Err(e) = store.clear_rejection(&lineage, &prepared.archive_sha256) {
-                warn(&format!(
-                    "upgraded to {}, but clearing its stale rejection failed: {e}",
-                    prepared.version
-                ));
+        Ok(Outcome::Committed { host_action }) => {
+            if !provider_only {
+                if let Err(e) = store.clear_rejection(&lineage, &prepared.archive_sha256) {
+                    warn(&format!(
+                        "upgraded to {}, but clearing its stale rejection failed: {e}",
+                        prepared.version
+                    ));
+                }
             }
             log(&format!("upgraded to {}", prepared.version));
             AppOutcome::Upgraded {
                 version: prepared.version,
+                host_action,
             }
         }
         Ok(Outcome::RollbackPending) => {
@@ -348,6 +409,7 @@ mod tests {
             },
             "2".repeat(64),
             Box::new(updated::state::ProviderRelease {
+                provider_set_sha256: "5".repeat(64),
                 product: "lifecycle".into(),
                 release: updated::bundle::ReleaseId {
                     version: "1.0.0".into(),
@@ -365,5 +427,29 @@ mod tests {
         let installed = installed("1.0.0");
         assert!(is_self_version(&installed, "1.0.0"));
         assert!(!is_self_version(&installed, "2.0.0"));
+    }
+
+    #[test]
+    fn a_provider_only_revision_reuses_the_exact_running_application_as_one_transaction() {
+        let installed = installed("1.0.0");
+        let updated::state::Installed::Present(state) = &installed else {
+            unreachable!()
+        };
+        let assigned_application_sha256 = state.archive_sha256.clone();
+        let mut revised = state.lifecycle.as_ref().clone();
+        revised.provider_set_sha256 = "6".repeat(64);
+
+        let candidate = provider_only_candidate(&installed, &assigned_application_sha256, &revised)
+            .expect("changed providers over identical app bytes are a real candidate");
+        assert_eq!(candidate.release, state.release);
+        assert_eq!(candidate.archive_sha256, state.archive_sha256);
+
+        assert!(provider_only_candidate(
+            &installed,
+            &assigned_application_sha256,
+            state.lifecycle.as_ref()
+        )
+        .is_none());
+        assert!(provider_only_candidate(&installed, &"7".repeat(64), &revised).is_none());
     }
 }

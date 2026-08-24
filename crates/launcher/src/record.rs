@@ -44,10 +44,9 @@ fn read_pointer(path: &Path) -> std::io::Result<Option<PathBuf>> {
     control::read_agent_pointer(path)
 }
 
-/// Every file here is *managed* state, not a secret: the launcher may run as SYSTEM while the
-/// agent runs as the service account, and the installer grants that account access to the
-/// state directory by inheritance alone. A privately-ACLed write would commit a pointer or
-/// marker the agent could neither read nor replace, with no `icacls` grant able to repair it.
+/// Every file here is *managed* state, not a secret. A privately-ACLed write would discard the
+/// state directory's intended inherited access and make launcher state inconsistent with the
+/// rest of the runtime state.
 fn write_pointer(path: &Path, target: &Path) -> std::io::Result<()> {
     let body = control::encode_agent_pointer(target)?;
     foundation::durable::atomic_write_managed(path, ".launcher-", body.as_bytes())
@@ -96,6 +95,20 @@ mod tests {
     fn corrupt_pointer_is_an_error_not_first_boot() {
         let (_tmp, d) = dir("corrupt-desired");
         std::fs::write(d.join(DESIRED_FILE), b"not-a-pointer\n").unwrap();
+        assert_eq!(
+            desired_agent(&d).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn oversized_pointer_is_bounded_before_it_can_reach_the_launcher() {
+        let (_tmp, d) = dir("oversized-desired");
+        std::fs::write(
+            d.join(DESIRED_FILE),
+            vec![b'x'; control::MAX_AGENT_PATH_RECORD_BYTES + 1],
+        )
+        .unwrap();
         assert_eq!(
             desired_agent(&d).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData

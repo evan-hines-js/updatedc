@@ -1,0 +1,85 @@
+# nfpm builds the .deb and the .rpm from this one description, so the two packages cannot
+# describe the node differently. Build with packaging/build.sh, which compiles the binaries and
+# then runs `nfpm package -p deb` and `-p rpm` over this file.
+#
+# What this package is FOR: bootstrapping a node once. It places the launcher, the first agent,
+# the unit, and the config skeleton — and then gets out of the way. Every later agent version
+# arrives through the fleet's own signed TUF channel, verified against the pinned root, exactly
+# like every workload does. Do NOT wire this package into an unattended-upgrades or `yum update`
+# path expecting it to be the upgrade mechanism: two updaters racing for the same binary is the
+# one failure mode the whole design exists to avoid. Upgrade the package only to move the
+# LAUNCHER, which is installer-owned by design and deliberately never self-updates.
+
+name: updated-agent
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: admin
+priority: optional
+maintainer: updatedc <https://github.com/evan-hines-js/updatedc>
+description: |
+  Self-updating release agent (launcher + agent).
+  Bootstraps a node onto an `updated` fleet: the installer-owned launcher supervises a
+  content-addressed agent, and every later agent version and workload arrives through the
+  fleet's signed TUF channel rather than through this package.
+vendor: updatedc
+homepage: https://github.com/evan-hines-js/updatedc
+license: AGPL-3.0-only
+
+contents:
+  # The two installer-owned binaries. They live outside the writable state directory precisely
+  # because they are the anchors the self-update machinery is measured against.
+  - src: ${PKG_BINDIR}/updated-launcher
+    dst: /usr/lib/updated/updated-launcher
+    expand: true
+    file_info: {mode: 0755}
+  - src: ${PKG_BINDIR}/updated-agent
+    dst: /usr/lib/updated/updated-agent
+    expand: true
+    file_info: {mode: 0755}
+
+  - src: ../deploy/systemd/updated-agent.service
+    dst: /usr/lib/systemd/system/updated-agent.service
+    file_info: {mode: 0644}
+
+  # Config, never overwritten on upgrade: an upgrade that rewrote a node's enrollment identity
+  # would re-enroll it under a new name and orphan its rollout history.
+  - src: ./etc/config.toml
+    dst: /etc/updated/config.toml
+    type: config|noreplace
+    file_info: {mode: 0600, owner: root, group: root}
+  - src: ./etc/agent.env
+    dst: /etc/updated/agent.env
+    type: config|noreplace
+    file_info: {mode: 0644}
+
+  # Directories the package owns so their ownership and modes are declared once, here, rather
+  # than being whatever the first process to touch them happened to create.
+  - dst: /etc/updated/agent-tls
+    type: dir
+    file_info: {mode: 0700, owner: root, group: root}
+  - dst: /var/lib/updated
+    type: dir
+    file_info: {mode: 0700, owner: root, group: root}
+
+  - src: ../LICENSE
+    dst: /usr/share/doc/updated-agent/LICENSE
+    file_info: {mode: 0644}
+
+scripts:
+  postinstall: ./scripts/postinstall.sh
+  preremove: ./scripts/preremove.sh
+  postremove: ./scripts/postremove.sh
+
+overrides:
+  deb:
+    depends:
+      - ca-certificates
+    recommends:
+      - systemd
+  rpm:
+    depends:
+      - ca-certificates
+
+rpm:
+  group: System Environment/Daemons

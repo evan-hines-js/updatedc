@@ -48,17 +48,27 @@ impl EndpointSliceLb {
         }
     }
 
-    /// The single slice we manage for the Service. One slice suffices well past any fleet
-    /// this fronts (EndpointSlices hold up to 1000 endpoints).
-    fn slice_name(&self) -> String {
-        format!("{}-updated", self.service)
+    /// One immutable name per IP family. Kubernetes does not allow an EndpointSlice's
+    /// `addressType` to change, so a stable family-specific name removes the destructive
+    /// delete-and-recreate path entirely.
+    fn slice_name(&self, family: AddressType) -> String {
+        format!("{}-updated-{}", self.service, family.suffix())
     }
 }
 
 #[async_trait::async_trait]
 impl LoadBalancer for EndpointSliceLb {
     async fn reconcile(&self, members: &[Member]) -> Result<(), String> {
-        let name = self.slice_name();
+        // A cordoned inventory entry carries no route: HAProxy needs its identity to issue an
+        // explicit drain for a predeclared server, but an EndpointSlice expresses the same state by
+        // omitting the endpoint. Filter that one shared sentinel before address-family reasoning so
+        // it can never become a DNS lookup or a placeholder address.
+        let routable: Vec<Member> = members
+            .iter()
+            .filter(|member| !member.address.is_empty())
+            .cloned()
+            .collect();
+        let members = routable.as_slice();
         // ONE family rule for the whole reconcile: the majority of the members that HAVE a family.
         //
         // Configured literals answer it, and they answer it for both halves — names are resolved
@@ -82,6 +92,14 @@ impl LoadBalancer for EndpointSliceLb {
         let family = configured
             .or_else(|| family_majority(&members))
             .unwrap_or(AddressType::Ipv4);
+        let inactive_family = match family {
+            AddressType::Ipv4 => AddressType::Ipv6,
+            AddressType::Ipv6 => AddressType::Ipv4,
+            AddressType::Fqdn => {
+                return Err("resolved EndpointSlice family cannot be FQDN".to_string());
+            }
+        };
+        let name = self.slice_name(family);
         let slice = build_slice(
             &self.service,
             &name,
@@ -101,96 +119,28 @@ impl LoadBalancer for EndpointSliceLb {
                 members.len() - kept
             );
         }
-        let error = match self.apply(&name, &slice).await {
-            Ok(()) => return Ok(()),
-            Err(error) => error,
-        };
-        // `addressType` is immutable, and `force()` resolves field-manager conflicts, not
-        // validation: once the inventory's family flips (IPv4 → IPv6), every future apply is
-        // rejected with a 422 that no retry can clear, and membership silently freezes at whatever
-        // was last programmed. Replacing the slice is the only way through. It is ours (we own the
-        // name and the field manager), so deleting it costs one reconcile interval of the endpoints
-        // it held.
-        //
-        // Only for a genuine family flip, though — 422 is the apiserver's generic Invalid, and the
-        // destructive recovery must not run for a rejection it cannot fix (crossing the
-        // 1000-endpoint ceiling, an over-long service-name label). Those delete the slice and then
-        // fail the re-apply identically, leaving the Service with ZERO endpoints where the ordinary
-        // error path keeps the last good membership programmed. So the observed slice's address
-        // type is what decides, not the status code alone.
-        //
-        // The status code is checked FIRST because reading the slice costs an apiserver round trip
-        // out of the same reconcile deadline the failed apply already spent from. A 409, a 403, or a
-        // transport failure cannot be a family flip whatever the read returns, so paying for that
-        // read on every failure only doubles the request rate against an apiserver that is already
-        // unwell.
-        if !is_invalid_rejection(&error) {
-            return Err(error.to_string());
-        }
-        let observed = match self.api.get_opt(&name).await {
-            Ok(observed) => observed,
-            // Without the slice as the apiserver holds it there is no positive evidence of a flip,
-            // so this falls back to the ordinary error path — which for a real flip is the
-            // permanently-frozen membership this recovery exists to break. Say so: silence here
-            // reads exactly like an ordinary rejection while the Service quietly stops converging.
-            Err(read_error) => {
-                eprintln!(
-                    "healthproxy: {} slice apply was refused as invalid and the slice could not be read back ({read_error}); not replacing it",
-                    self.service
-                );
-                return Err(error.to_string());
-            }
-        };
-        if !is_address_type_flip(observed.as_ref(), &slice.address_type) {
-            return Err(error.to_string());
-        }
-        eprintln!(
-            "healthproxy: {} slice must change address type to {}; replacing it",
-            self.service, slice.address_type
+        // Keep both immutable family slices present. Empty the inactive family first so a family
+        // transition never leaves old-family nodes in rotation; then apply the desired family.
+        // Server-side apply uses PATCH for both first creation and every later update, which lets
+        // RBAC restrict this controller to exactly these two named resources and this one verb.
+        let inactive_name = self.slice_name(inactive_family);
+        let inactive = build_slice(
+            &self.service,
+            &inactive_name,
+            &self.port_name,
+            self.port,
+            &[],
+            inactive_family,
         );
-        if let Err(delete_error) = self.api.delete(&name, &Default::default()).await {
-            return Err(format!(
-                "replacing the {} slice for a new address type: {delete_error}",
-                self.service
-            ));
+        let params = PatchParams::apply(MANAGED_BY).force();
+        for (slice_name, desired) in [(&inactive_name, &inactive), (&name, &slice)] {
+            self.api
+                .patch(slice_name, &params, &Patch::Apply(desired))
+                .await
+                .map_err(|error| error.to_string())?;
         }
-        self.apply(&name, &slice)
-            .await
-            .map_err(|error| error.to_string())
+        Ok(())
     }
-}
-
-impl EndpointSliceLb {
-    async fn apply(&self, name: &str, slice: &EndpointSlice) -> Result<(), kube::Error> {
-        self.api
-            .patch(
-                name,
-                &PatchParams::apply(MANAGED_BY).force(),
-                &Patch::Apply(slice),
-            )
-            .await
-            .map(|_| ())
-    }
-}
-
-/// Whether a failed apply is the apiserver's generic Invalid. Necessary but nowhere near sufficient
-/// for a family flip; it is the cheap half, and it gates the expensive half — a conflict, a
-/// permission error, or a transport failure is answered without spending a second round trip on the
-/// apiserver that just refused the first.
-fn is_invalid_rejection(error: &kube::Error) -> bool {
-    matches!(error, kube::Error::Api(response) if response.code == 422)
-}
-
-/// Whether the slice the apiserver already holds is typed for another address family — the one
-/// rejection replacing the slice actually resolves, given a 422 the caller has already matched.
-///
-/// The status code alone is not evidence: 422 is the generic Invalid, and every other cause of one
-/// survives the delete, so acting on the code alone destroys the programmed membership and re-fails.
-/// `observed` is the slice as the apiserver holds it (`None` when it does not exist); without
-/// positive evidence of a family flip the ordinary error path retries against the existing object
-/// instead of deleting it.
-fn is_address_type_flip(observed: Option<&EndpointSlice>, desired: &str) -> bool {
-    observed.is_some_and(|slice| slice.address_type != desired)
 }
 
 /// Everything the hostname resolve pass carries across cycles: the last address each name resolved
@@ -209,7 +159,7 @@ pub(crate) struct NameResolver {
     /// pass did not attempt, so every name is eventually attempted however little of the pass's
     /// share or of the pool the leading names leave behind.
     cursor: usize,
-    /// The reserved half of the blocking pool ([`crate::NAME_LOOKUP_CONCURRENCY`]), one permit per
+    /// The reserved share of the blocking pool ([`crate::NAME_LOOKUP_CONCURRENCY`]), one permit per
     /// thread a `getaddrinfo` may occupy.
     ///
     /// A permit is released by the lookup task itself, when the blocking call really returns — not
@@ -350,6 +300,17 @@ impl NameResolver {
                 ),
             }
         }
+        // Drop names that left the inventory, the same discipline `run` applies to the caches it
+        // owns. [`LastKnownGood`] ages a key out only when that key is looked up again — and a
+        // hostname removed from the projected inventory is never passed to `resolve` again, so
+        // without this its entry outlives the member forever and ordinary VM recycling grows this
+        // map for the life of the process (see [`LastKnownGood::retain`]).
+        let present: std::collections::HashSet<&str> = members
+            .iter()
+            .filter(|member| AddressType::of(&member.address) == AddressType::Fqdn)
+            .map(|member| member.address.as_str())
+            .collect();
+        self.known.retain(|address| present.contains(address));
         resolved
     }
 }
@@ -413,10 +374,10 @@ async fn lookup_one(
     if budget.is_zero() {
         return Lookup::NotAttempted("the pass spent its share of the reconcile deadline");
     }
-    // No permit means the reserved half of the pool is still occupied by lookups earlier cycles
+    // No permit means the reserved share of the pool is still occupied by lookups earlier cycles
     // abandoned. Starting anyway would queue behind them — a "lookup" that spends its whole budget
-    // waiting for a thread and never runs — and push the pool past the share the report poll's own
-    // resolutions need.
+    // waiting for a thread and never runs — and push the pool past the reserve the per-cycle
+    // document fetches resolve through.
     let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
         return Lookup::NotAttempted(
             "every reserved blocking thread is still held by a lookup an earlier cycle abandoned",
@@ -545,7 +506,7 @@ const RESOLVE_SHARE: u32 = 2;
 /// `deadline` leaves less than that, and zero once it has passed.
 ///
 /// This is what bounds the pass, at any inventory size and whatever the pool can run at once. The
-/// budget is never pre-divided by a wave count — that is the failure the report poll documents too:
+/// budget is never pre-divided by a wave count:
 /// a per-lookup timeout under a real `getaddrinfo` round trip (1000 names at width 32 would be
 /// 156ms, less than a resolver walking a multi-entry `search` path takes) times out *every* lookup
 /// in the pass, drops every hostname member to its last known address, and one
@@ -658,6 +619,14 @@ impl AddressType {
             Self::Fqdn => "FQDN",
         }
     }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+            Self::Fqdn => "fqdn",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -713,39 +682,10 @@ mod tests {
         assert_eq!(ports[0].name.as_deref(), Some("http"));
     }
 
-    /// Deleting the slice is only ever right for the immutable-`addressType` case. 422 is the
-    /// apiserver's generic Invalid — crossing the 1000-endpoint ceiling or carrying an over-long
-    /// service-name label produces one too — and for those the delete destroys the programmed
-    /// membership and the re-apply fails identically, leaving the Service with zero endpoints where
-    /// the ordinary error path would have kept the last good membership.
     #[test]
-    fn only_a_genuine_address_family_flip_replaces_the_slice() {
-        let rejection = |code: u16| {
-            kube::Error::Api(kube::core::ErrorResponse {
-                status: "Failure".to_string(),
-                message: "EndpointSlice is invalid".to_string(),
-                reason: "Invalid".to_string(),
-                code,
-            })
-        };
-        let typed = |address_type: &str| EndpointSlice {
-            address_type: address_type.to_string(),
-            ..Default::default()
-        };
-
-        // A conflict or a permission error is answered by the cheap half alone — no slice read, and
-        // therefore no second request against an apiserver that just refused the first.
-        assert!(!is_invalid_rejection(&rejection(409)));
-        assert!(!is_invalid_rejection(&rejection(403)));
-        assert!(is_invalid_rejection(&rejection(422)));
-
-        // The family genuinely flipped: no retry can clear it, so the slice is replaced.
-        assert!(is_address_type_flip(Some(&typed("IPv4")), "IPv6"));
-        // A 422 with any other cause: the existing slice is already the desired family, so
-        // destroying it fixes nothing.
-        assert!(!is_address_type_flip(Some(&typed("IPv4")), "IPv4"));
-        // No slice is no evidence of a flip.
-        assert!(!is_address_type_flip(None, "IPv6"));
+    fn address_families_have_stable_distinct_suffixes() {
+        assert_eq!(AddressType::Ipv4.suffix(), "ipv4");
+        assert_eq!(AddressType::Ipv6.suffix(), "ipv6");
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -805,6 +745,40 @@ mod tests {
         assert_eq!(slice.endpoints.len(), 1);
     }
 
+    /// The fallback above is what makes this cache necessary, and what makes it a leak if it is
+    /// never pruned: an entry ages out only when its own name is looked up again, and a name the
+    /// projected inventory dropped is never looked up again. Left alone, the map keeps every
+    /// address the fleet ever had for the life of the process — a bounded live fleet growing it
+    /// forever through ordinary VM recycling, in the one process that writes balancer membership.
+    #[test]
+    fn a_name_that_leaves_the_inventory_is_forgotten_rather_than_kept_forever() {
+        let mut resolver = NameResolver::new();
+        assert_eq!(
+            resolver.known.resolve(
+                "vm-db.invalid.example",
+                Some("10.0.0.7".into()),
+                Instant::now()
+            ),
+            Some("10.0.0.7".to_string())
+        );
+
+        // A cycle whose inventory no longer lists that name. Nothing looks it up, so only the
+        // prune can forget it.
+        let current = [member("web", "10.0.0.1", true)];
+        assert_eq!(
+            block_on(resolver.resolve(&current, AddressType::Ipv4)),
+            current.to_vec()
+        );
+
+        // Should the name come back, it is a name with no known address — not one still carrying an
+        // address remembered from before it left.
+        let returned = [member("db", "vm-db.invalid.example", true)];
+        assert!(
+            block_on(resolver.resolve(&returned, AddressType::Ipv4)).is_empty(),
+            "a departed name must not keep its last known address in the cache"
+        );
+    }
+
     /// A resolver that hangs instead of answering must cost one member's fallback, not the whole
     /// reconcile: the resolve pass has to leave the apply that programs the slice enough of the
     /// deadline to run, at EVERY inventory size, or membership freezes at the last programmed set
@@ -833,12 +807,12 @@ mod tests {
                 crate::NAME_LOOKUP_CONCURRENCY
             );
         }
-        // And the ceiling is a width the pool can really run, with room left for the HTTP client's
-        // own resolutions on the same pool — which is the report poll's cap, so the two halves of
-        // the pool are a partition and not two claims on the whole of it.
+        // And the ceiling is a width the pool can really run, with room left for the HTTP
+        // client's own resolutions on the same pool — the two per-cycle document fetches — so the
+        // reservation and that reserve are a partition, not two claims on the whole of it.
         const {
             assert!(
-                crate::NAME_LOOKUP_CONCURRENCY + crate::REPORT_POLL_CONCURRENCY
+                crate::NAME_LOOKUP_CONCURRENCY + crate::FANOUT_CONCURRENCY
                     <= crate::BLOCKING_POOL_THREADS
             )
         };

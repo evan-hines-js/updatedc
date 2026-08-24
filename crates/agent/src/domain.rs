@@ -92,14 +92,16 @@ pub(crate) struct GateTarget {
     /// when the gate is that transaction's health step, and the reserved boot identity otherwise.
     pub attempt: String,
     pub candidate: ReleaseId,
+    pub candidate_archive_sha256: String,
     pub predecessor: ReleaseId,
+    pub predecessor_archive_sha256: String,
     pub lifecycle: Box<updated::state::ProviderRelease>,
 }
 
 /// Resolve the boot gate's whole invocation identity from one source.
 ///
 /// A crash-recovered rollback's boot gate IS that transaction's health step — its verdict advances
-/// `RollbackHealthStarted` -> `PredecessorHealthy` and bounds the rollback — so it carries the same
+/// `RollbackApplied` -> `RollbackVerified` and bounds the rollback — so it carries the same
 /// compensating attempt identity as the transaction's predecessor `apply` and its `rollback`, and
 /// names the failed candidate as the predecessor. Every other boot gate belongs to no transaction
 /// and is a reserved-identity observation of the installed release.
@@ -111,13 +113,17 @@ pub(crate) fn boot_gate_target(
         Some(tx) if tx.is_rollback() => GateTarget {
             attempt: tx.rollback_attempt_id(),
             candidate: tx.previous_release.clone(),
+            candidate_archive_sha256: tx.previous_archive_sha256.clone(),
             predecessor: tx.candidate_release.clone(),
+            predecessor_archive_sha256: tx.candidate_archive_sha256.clone(),
             lifecycle: tx.lifecycle.clone(),
         },
         _ => GateTarget {
             attempt: updated_contracts::reconciler::attempt::BOOT.to_string(),
             candidate: installed.release.clone(),
+            candidate_archive_sha256: installed.archive_sha256.clone(),
             predecessor: installed.release.clone(),
+            predecessor_archive_sha256: installed.archive_sha256.clone(),
             lifecycle: installed.lifecycle.clone(),
         },
     }
@@ -205,6 +211,7 @@ mod tests {
 
     fn provider() -> Box<updated::state::ProviderRelease> {
         Box::new(updated::state::ProviderRelease {
+            provider_set_sha256: "f".repeat(64),
             product: "reconciler".into(),
             release: updated::bundle::ReleaseId {
                 version: "1.0.0".into(),
@@ -219,6 +226,7 @@ mod tests {
     fn pending() -> Pending {
         Pending {
             lifecycle_attempt_id: "attempt".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             previous_release: updated::bundle::ReleaseId {
                 version: "1.0.0".into(),
                 manifest_sha256: "aa".into(),
@@ -291,11 +299,12 @@ mod tests {
             previous_repository_lineage: lineage(),
             candidate_release: release("2.0.0"),
             candidate_archive_sha256: "archive-two".into(),
+            candidate_rejection_sha256: "f".repeat(64),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
             lifecycle: predecessor_provider,
             rollback_health_failures: 0,
-            phase: TransactionPhase::RollbackStarted,
+            phase: TransactionPhase::RollbackActivating,
         }
     }
 
@@ -318,7 +327,7 @@ mod tests {
         assert_eq!(target.predecessor, tx.candidate_release);
         assert!(
             !updated_contracts::reconciler::attempt::is_reserved(&target.attempt),
-            "a transaction's gate never borrows a reserved observation identity"
+            "a transaction's gate never borrows a reserved non-transaction identity"
         );
 
         // An ordinary boot has no rollback, so the committed record is the running release and the
@@ -332,7 +341,7 @@ mod tests {
         // A forward transaction is not a rollback: nothing was restored, the record still governs
         // and the gate is still a reserved-identity observation.
         let mut forward = rollback_of(release("1.0.0"));
-        forward.phase = TransactionPhase::CandidateActivated;
+        forward.phase = TransactionPhase::Activating;
         let target = boot_gate_target(Some(&forward), &record);
         assert_eq!(target.candidate, record.release);
         assert_eq!(target.predecessor, record.release);

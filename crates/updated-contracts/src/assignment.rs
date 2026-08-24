@@ -1,21 +1,28 @@
 //! Signed desired-state contract delivered through the routing repository.
+//!
+//! The three policy structs below — [`ManagedRepositoryLimits`], [`ManagedStorage`],
+//! [`ManagedTimeouts`] — are embedded verbatim in the control plane's `UpdateRepository` CRD as
+//! well as in this signed document. They derive `JsonSchema` for exactly that reason: the CRD used
+//! to declare its own field-for-field twins of all three, which is a second copy of a policy the
+//! node acts on, and a second copy drifts. There is one declaration, so there is nothing to drift
+//! against.
+//!
+//! Every name in this document is camelCase, matching the CRD the operator writes and the fields
+//! the node reads. A value that crosses that boundary must not change spelling on the way.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use url::{Host, Url};
 
 use crate::artifact::TargetReference;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RepositoryAssignment {
     pub schema: u32,
     pub deployment: String,
     pub metadata_url: String,
     pub targets_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub report_url: Option<String>,
     pub application: TargetReference,
     pub ordered_install_fallback: bool,
     pub provider_set: TargetReference,
@@ -24,39 +31,33 @@ pub struct RepositoryAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedRuntime {
     pub product: String,
     pub channel: String,
     pub install_root: PathBuf,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<SecretReference>,
-    /// Typed values resolved from prerequisite group outputs. Secret values remain references.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub inputs: BTreeMap<String, crate::telemetry::OutputValue>,
+    /// Opaque descriptor of the atomic file snapshot this node may fetch through an exact,
+    /// short-lived S3 capability minted over mTLS.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::dataflow::InputSelection::is_empty"
+    )]
+    pub inputs: crate::dataflow::InputSelection,
     pub repository: ManagedRepositoryLimits,
     pub storage: ManagedStorage,
     pub timeouts: ManagedTimeouts,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SecretReference {
-    pub environment: String,
-    pub secret: String,
-    pub key: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedRepositoryLimits {
     pub metadata_limit: u64,
     pub target_limit: u64,
     pub transport_timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedStorage {
     pub inactive_releases: usize,
     pub inactive_providers: usize,
@@ -65,8 +66,8 @@ pub struct ManagedStorage {
     pub inactive_repository_caches: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagedTimeouts {
     pub check_interval_seconds: u64,
     pub health_grace_seconds: u64,
@@ -78,23 +79,12 @@ pub struct ManagedTimeouts {
 }
 
 impl RepositoryAssignment {
-    /// Desired-state contracts evolve under the OPPOSITE rule from report contracts (see
-    /// `docs/wire-compatibility-design.md`). The readers here are the nodes themselves, and a
-    /// node receives its new agent THROUGH this very document — so a reader window cannot
-    /// exist (an old node cannot be taught to read a schema it predates), and bumping this number
-    /// strands every not-yet-upgraded node unable to parse the assignment that would have
-    /// delivered its upgrade: a fleet-wide deadlock with no in-band cure. The WRITER carries the
-    /// obligation instead: the control plane must not publish a new schema until every supported
-    /// node in the fleet runs an agent that reads it.
-    ///
-    /// There is no cheaper additive escape here, and reaching for one is the trap: this document
-    /// and every struct nested in it are `deny_unknown_fields` (asserted below, and mirrored by
-    /// the closed `schemas/desired-deployment.schema.json`), so the first generation that EMITS a
-    /// new optional field is refused by every not-yet-upgraded node at `serde_json::from_slice`,
-    /// before `validate` can even name a schema — the same deadlock as a bump, with a worse
-    /// diagnostic. Any change to the SHAPE of this document, numbered or not, is therefore a
-    /// deliberate act behind a verified fleet floor.
+    /// The one assignment shape this build reads and writes. Every nested struct denies unknown
+    /// fields, and validation requires exact schema equality; no compatibility or alias path exists.
     pub const SCHEMA: u32 = 3;
+    /// Whole signed configuration ceiling. The bounded input selection is at most one dataflow
+    /// document; the additional MiB covers the pinned TUF root and fixed runtime fields.
+    pub const MAX_DOCUMENT_BYTES: usize = crate::dataflow::MAX_DATAFLOW_BODY_BYTES + 1024 * 1024;
 
     /// Validate the complete signed contract before a publisher signs it or a node acts on it.
     pub fn validate(&self) -> Result<(), String> {
@@ -104,24 +94,97 @@ impl RepositoryAssignment {
                 self.schema
             ));
         }
-        if self.deployment.is_empty() {
-            return Err("repository assignment deployment must not be empty".into());
+        if !crate::identity::is_segment(&self.deployment) {
+            return Err("repository assignment deployment identity is invalid".into());
+        }
+        for (name, location) in [
+            ("metadataUrl", self.metadata_url.as_str()),
+            ("targetsUrl", self.targets_url.as_str()),
+        ] {
+            if !valid_repository_base(location) {
+                return Err(format!(
+                    "repository assignment {name} must be an HTTPS or absolute offline directory ending in /"
+                ));
+            }
         }
         for (name, reference) in [
             ("application", &self.application),
-            ("provider_set", &self.provider_set),
+            ("providerSet", &self.provider_set),
         ] {
             if !reference.is_valid() {
                 return Err(format!("repository assignment {name} reference is invalid"));
             }
         }
         if !self.release_root.is_object() {
-            return Err("repository assignment release_root must be a JSON object".into());
+            return Err("repository assignment releaseRoot must be a JSON object".into());
         }
-        if let Some(report_url) = &self.report_url {
-            validate_report_url(report_url)?;
+        self.runtime.validate()?;
+        let root_bytes = serde_json::to_vec(&self.release_root)
+            .map_err(|error| format!("encoding repository assignment release_root: {error}"))?;
+        if root_bytes.len() as u64 > self.runtime.repository.metadata_limit {
+            return Err(format!(
+                "repository metadata_limit ({}) is smaller than the {}-byte pinned release root",
+                self.runtime.repository.metadata_limit,
+                root_bytes.len()
+            ));
         }
-        self.runtime.validate()
+        Ok(())
+    }
+
+    pub fn to_bounded_json(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        crate::bounded::encode(self, "repository assignment", Self::MAX_DOCUMENT_BYTES)
+    }
+
+    /// The bytes to publish and the identity they are known by, together.
+    ///
+    /// A deployment's identity IS the digest of its published bytes, so producing one without the
+    /// other is never correct: the control plane admits, halts and counts nodes by this string,
+    /// the object is stored under it, and the node reports back the digest of whatever bytes it
+    /// actually verified. If a publisher ever canonicalized differently from whatever derived the
+    /// identity, every node would report an identity the planner does not recognise and every
+    /// rollout would sit at `Rolling` forever, with the bytes on disk perfectly correct.
+    ///
+    /// One function because it was previously three steps written out at each publisher — the
+    /// Kubernetes control plane and the standalone `server` — and nothing tied the two spellings
+    /// together. Validation is inherited from [`Self::to_bounded_json`]: an invalid assignment has
+    /// no identity, because it is never published.
+    pub fn publication(&self) -> Result<(Vec<u8>, String), String> {
+        let bytes = self.to_bounded_json()?;
+        let identity = crate::digest::sha256_bytes(&bytes);
+        Ok((bytes, identity))
+    }
+
+    pub fn from_bounded_json(bytes: &[u8]) -> Result<Self, String> {
+        let assignment: Self =
+            crate::bounded::decode(bytes, "repository assignment", Self::MAX_DOCUMENT_BYTES)?;
+        assignment.validate()?;
+        Ok(assignment)
+    }
+}
+
+/// One grammar for any TUF repository base carried across the wire: authenticated HTTPS or an
+/// explicit absolute offline location, always directory-shaped and never carrying credentials or
+/// bearer query material.
+pub fn valid_repository_base(value: &str) -> bool {
+    if PathBuf::from(value).is_absolute() {
+        return value.ends_with(std::path::MAIN_SEPARATOR);
+    }
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !url.path().ends_with('/')
+    {
+        return false;
+    }
+    match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "file" => url.host_str().is_none() && url.to_file_path().is_ok(),
+        _ => false,
     }
 }
 
@@ -141,11 +204,21 @@ impl RepositoryAssignment {
 /// derived `Duration` twin for a consumer to pick instead.
 pub const MAX_INTERVAL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
+/// Hard resource ceilings for the release repository selected by a signed assignment.
+///
+/// Metadata is buffered by the TUF client, so an unbounded limit is a fleet-wide memory-exhaustion
+/// primitive. Targets stream to disk, but still need a finite contract ceiling so one mistaken or
+/// compromised publisher cannot turn every node into an unlimited download sink. The target cap
+/// is intentionally above the bundle format's 1 GiB expanded-content ceiling, leaving room for
+/// archive framing and non-bundle targets while retaining an actual bound.
+pub const MAX_REPOSITORY_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_REPOSITORY_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 impl ManagedRuntime {
     /// Validate signed runtime policy without consulting node-local state.
     pub fn validate(&self) -> Result<(), String> {
-        if !crate::path::is_safe_component(&self.product)
-            || self.channel.is_empty()
+        if !crate::identity::is_segment(&self.product)
+            || !crate::identity::is_segment(&self.channel)
             || !self.install_root.is_absolute()
         {
             return Err("managed runtime product/channel/install_root is invalid".into());
@@ -163,6 +236,13 @@ impl ManagedRuntime {
             || self.timeouts.agent_check_interval_seconds == 0
         {
             return Err("managed runtime limits and timeouts must be non-zero".into());
+        }
+        if self.repository.metadata_limit > MAX_REPOSITORY_METADATA_BYTES
+            || self.repository.target_limit > MAX_REPOSITORY_TARGET_BYTES
+        {
+            return Err(format!(
+                "managed repository limits exceed the {MAX_REPOSITORY_METADATA_BYTES}-byte metadata or {MAX_REPOSITORY_TARGET_BYTES}-byte target ceiling"
+            ));
         }
         for (field, seconds) in [
             (
@@ -223,39 +303,9 @@ impl ManagedRuntime {
                 ));
             }
         }
-        if self.secrets.len() > 64 {
-            return Err("managed runtime may declare at most 64 secret references".into());
-        }
-        crate::telemetry::OutputManifest {
-            schema: crate::telemetry::OutputManifest::SCHEMA,
-            values: self.inputs.clone(),
-        }
-        .validate()
-        .map_err(|error| format!("managed runtime inputs: {error}"))?;
-        let mut environments = std::collections::BTreeSet::new();
-        for reference in &self.secrets {
-            let valid_environment = !reference.environment.is_empty()
-                && reference.environment.len() <= 128
-                && reference
-                    .environment
-                    .bytes()
-                    .enumerate()
-                    .all(|(index, byte)| {
-                        byte == b'_'
-                            || byte.is_ascii_uppercase()
-                            || (index > 0 && byte.is_ascii_digit())
-                    })
-                && !is_code_injection_variable(&reference.environment);
-            if !valid_environment
-                || reference.secret.is_empty()
-                || reference.secret.len() > 253
-                || reference.key.is_empty()
-                || reference.key.len() > 253
-                || !environments.insert(&reference.environment)
-            {
-                return Err("managed runtime secret references are invalid or duplicated".into());
-            }
-        }
+        self.inputs
+            .validate()
+            .map_err(|error| format!("managed runtime inputs: {error}"))?;
         let min_grace = u64::from(self.timeouts.health_successes.saturating_sub(1))
             .saturating_mul(self.timeouts.health_interval_seconds);
         if self.timeouts.health_grace_seconds < min_grace {
@@ -268,91 +318,56 @@ impl ManagedRuntime {
     }
 }
 
-fn validate_report_url(raw: &str) -> Result<(), String> {
-    let url =
-        Url::parse(raw).map_err(|error| format!("repository assignment report_url: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.cannot_be_a_base()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(
-            "repository assignment report_url must be an absolute HTTP(S) URL without credentials, a query, or a fragment"
-                .into(),
-        );
+/// Runtime fixtures, for this crate's tests and every downstream crate's.
+///
+/// [`ManagedRuntime`] is twenty fields of pure policy, and six test modules across four crates each
+/// wrote out their own copy of the same nominal value. A field added here then had to be added in
+/// six places, and a default changed in one was a default that disagreed with five. Like
+/// [`crate::key::testing`], this is deliberately not `#[cfg(test)]`: a `test`-gated item is
+/// invisible to other crates, which is what forced the copies in the first place.
+pub mod testing {
+    use super::{ManagedRepositoryLimits, ManagedRuntime, ManagedStorage, ManagedTimeouts};
+
+    /// Every bound at its floor — the smallest runtime `validate` accepts.
+    ///
+    /// Distinct from [`runtime`] and used for a distinct purpose: proving the validator admits the
+    /// boundary, and giving a planner test cadences it does not have to wait out. Two crates each
+    /// wrote their own copy of this, agreeing on all fourteen floors and differing only in an
+    /// install root and one limit, which is a copy rather than a variant.
+    pub fn minimal_runtime() -> ManagedRuntime {
+        ManagedRuntime {
+            repository: ManagedRepositoryLimits {
+                transport_timeout_seconds: 1,
+                ..runtime().repository
+            },
+            storage: ManagedStorage {
+                inactive_releases: 1,
+                inactive_providers: 1,
+                inactive_agents: 1,
+                inactive_bytes: 1,
+                inactive_repository_caches: 1,
+            },
+            timeouts: ManagedTimeouts {
+                check_interval_seconds: 1,
+                health_grace_seconds: 1,
+                health_successes: 1,
+                health_interval_seconds: 1,
+                refresh_retry_seconds: 1,
+                confirmation_window_seconds: 1,
+                agent_check_interval_seconds: 1,
+            },
+            ..runtime()
+        }
     }
-    match url.host() {
-        Some(Host::Domain(domain)) if !domain.is_empty() => Ok(()),
-        Some(Host::Ipv4(_)) | Some(Host::Ipv6(_)) => Ok(()),
-        _ => Err("repository assignment report_url must have a host".into()),
-    }
-}
 
-/// The environment names the agent itself sets on every reconciler invocation. Naming a secret
-/// after one of these would shadow it, because secret values are deliberately applied last so a
-/// deployment's own value always wins over an ambient one — so they are unshadowable by
-/// construction: [`is_code_injection_variable`] rejects the whole set. The agent-side chokepoint
-/// asserts it sets exactly these and nothing else.
-pub const RECONCILER_AMBIENT_ENVIRONMENT: &[&str] =
-    &["PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"];
-
-/// Whether a control-plane principal naming this environment variable would be redirecting code
-/// resolution rather than passing a value. Platform-independent on purpose: an assignment is
-/// validated once, centrally, and may be scheduled onto a node of any platform. Windows environment
-/// lookup is case-insensitive, so the Windows names are matched by their uppercase spelling exactly
-/// as the (already uppercase-only) environment-name rule requires.
-fn is_code_injection_variable(name: &str) -> bool {
-    const EXACT: &[&str] = &[
-        // Unix loader, interpreter, and shell resolution.
-        "GLIBC_TUNABLES",
-        "NODE_OPTIONS",
-        "PYTHONPATH",
-        "PYTHONSTARTUP",
-        "RUBYOPT",
-        "RUBYLIB",
-        "PERL5LIB",
-        "PERL5OPT",
-        "JAVA_TOOL_OPTIONS",
-        "_JAVA_OPTIONS",
-        "CLASSPATH",
-        "PATH",
-        "SHELL",
-        "BASH_ENV",
-        "ENV",
-        "IFS",
-        // Windows loader, interpreter, and module resolution.
-        "SYSTEMROOT",
-        "WINDIR",
-        "SYSTEMDRIVE",
-        "COMSPEC",
-        "PATHEXT",
-        "PSMODULEPATH",
-        "PSEXECUTIONPOLICYPREFERENCE",
-        "TEMP",
-        "TMP",
-        "DOTNET_STARTUP_HOOKS",
-        "DOTNET_ROOT",
-    ];
-    name.starts_with("LD_")
-        || name.starts_with("DYLD_")
-        || EXACT.contains(&name)
-        || RECONCILER_AMBIENT_ENVIRONMENT.contains(&name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::artifact::TargetReference;
-
-    fn runtime() -> ManagedRuntime {
+    /// The nominal managed runtime every fixture starts from. Callers that care about one field
+    /// mutate it; callers that do not are guaranteed to agree with everyone else.
+    pub fn runtime() -> ManagedRuntime {
         ManagedRuntime {
             product: "app".into(),
             channel: "stable".into(),
             install_root: "/app".into(),
-            secrets: vec![],
-            inputs: BTreeMap::new(),
+            inputs: crate::dataflow::InputSelection::default(),
             repository: ManagedRepositoryLimits {
                 metadata_limit: 1 << 20,
                 target_limit: 512 << 20,
@@ -376,6 +391,14 @@ mod tests {
             },
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact::TargetReference;
+
+    use testing::runtime;
 
     fn assignment() -> RepositoryAssignment {
         RepositoryAssignment {
@@ -383,7 +406,6 @@ mod tests {
             deployment: "d1".into(),
             metadata_url: "https://cdn/m/".into(),
             targets_url: "https://cdn/t/".into(),
-            report_url: None,
             application: TargetReference {
                 path: "app".into(),
                 sha256: "a".repeat(64),
@@ -396,6 +418,114 @@ mod tests {
             release_root: serde_json::json!({"signed": {}, "signatures": []}),
             runtime: runtime(),
         }
+    }
+
+    #[test]
+    fn network_repository_locations_are_https_bases_without_embedded_credentials() {
+        let mut value = assignment();
+        for invalid in [
+            "http://objects.example/metadata/",
+            "https://user:secret@objects.example/metadata/",
+            "https://objects.example/metadata/?token=bearer",
+            "https://objects.example/metadata/#fragment",
+            "https://objects.example/metadata",
+        ] {
+            value.metadata_url = invalid.into();
+            assert!(value.validate().is_err(), "{invalid:?} must be refused");
+        }
+        value.metadata_url = "/opt/updated/repository/metadata/".into();
+        value.targets_url = "file:///opt/updated/repository/targets/".into();
+        assert!(
+            value.validate().is_ok(),
+            "absolute offline repositories remain supported"
+        );
+    }
+
+    #[test]
+    fn assignment_publishers_and_readers_share_one_document_ceiling() {
+        let valid = assignment();
+        let bytes = valid.to_bounded_json().unwrap();
+        RepositoryAssignment::from_bounded_json(&bytes).unwrap();
+
+        let mut oversized = valid;
+        oversized.release_root =
+            serde_json::json!({"padding": "x".repeat(RepositoryAssignment::MAX_DOCUMENT_BYTES)});
+        assert!(oversized.to_bounded_json().is_err());
+        assert!(RepositoryAssignment::from_bounded_json(&vec![
+            b' ';
+            RepositoryAssignment::MAX_DOCUMENT_BYTES
+                + 1
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn every_assignment_identity_uses_the_shared_bounded_segment_grammar() {
+        for invalid in [
+            "-leading-punctuation".to_string(),
+            "nested/channel".to_string(),
+            "log\ninjection".to_string(),
+            "a".repeat(crate::identity::MAX_SEGMENT_BYTES + 1),
+        ] {
+            let mut value = assignment();
+            value.deployment = invalid.clone();
+            assert!(value.validate().is_err(), "deployment {invalid:?}");
+
+            let mut value = assignment();
+            value.runtime.product = invalid.clone();
+            assert!(value.validate().is_err(), "product {invalid:?}");
+
+            let mut value = assignment();
+            value.runtime.channel = invalid.clone();
+            assert!(value.validate().is_err(), "channel {invalid:?}");
+        }
+    }
+
+    /// The identity the control plane admits by, and the digest a node derives from the bytes it
+    /// verified, are the same string — and stay the same across a parse.
+    ///
+    /// This is the whole reason identity and bytes are produced together. The control plane counts,
+    /// halts and settles rollouts by this value; the node independently hashes whatever TUF handed
+    /// it and reports that. If canonicalization were not a fixed point, every node would report an
+    /// identity the planner had never heard of and every rollout would sit at `Rolling` forever
+    /// with perfectly correct bytes on disk.
+    #[test]
+    fn an_assignments_identity_is_the_digest_of_the_bytes_a_node_will_verify() {
+        let (bytes, identity) = assignment()
+            .publication()
+            .expect("a valid assignment publishes");
+        assert_eq!(
+            identity,
+            crate::digest::sha256_bytes(&bytes),
+            "the identity must be the digest of exactly the published bytes, which is what the \
+             node hashes on the other side"
+        );
+
+        // A node parses the bytes; anything re-deriving the identity from the parsed value must
+        // land on the same string, or the two sides of the fleet disagree about what is deployed.
+        let parsed = RepositoryAssignment::from_bounded_json(&bytes)
+            .expect("published bytes are readable by the node");
+        let (again, same_identity) = parsed.publication().expect("a parsed assignment publishes");
+        assert_eq!(again, bytes, "canonicalization is a fixed point");
+        assert_eq!(same_identity, identity);
+    }
+
+    #[test]
+    fn repository_resource_limits_are_finite_and_can_hold_the_pinned_root() {
+        let mut value = assignment();
+        value.runtime.repository.metadata_limit = MAX_REPOSITORY_METADATA_BYTES + 1;
+        assert!(value.validate().is_err());
+
+        let mut value = assignment();
+        value.runtime.repository.target_limit = MAX_REPOSITORY_TARGET_BYTES + 1;
+        assert!(value.validate().is_err());
+
+        let mut value = assignment();
+        let root_bytes = serde_json::to_vec(&value.release_root).unwrap().len() as u64;
+        value.runtime.repository.metadata_limit = root_bytes - 1;
+        assert!(value.validate().is_err());
+        value.runtime.repository.metadata_limit = root_bytes;
+        assert!(value.validate().is_ok());
     }
 
     /// Every `*_seconds` field becomes a `Duration` that a consumer adds to an `Instant` or sleeps
@@ -516,82 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_references_are_strict_and_never_carry_values() {
-        let mut value = runtime();
-        value.secrets.push(SecretReference {
-            environment: "DATABASE_PASSWORD".into(),
-            secret: "production-database".into(),
-            key: "password".into(),
-        });
-        value.validate().unwrap();
-        let json = serde_json::to_string(&value).unwrap();
-        assert!(json.contains("production-database"));
-        assert!(!json.contains("secretValue"));
-
-        value.secrets.push(SecretReference {
-            environment: "DATABASE_PASSWORD".into(),
-            secret: "other".into(),
-            key: "password".into(),
-        });
-        assert!(value.validate().is_err());
-        value.secrets[1].environment = "lowercase".into();
-        assert!(value.validate().is_err());
-    }
-
-    #[test]
-    fn every_code_injection_environment_is_rejected() {
-        for hostile in [
-            "LD_PRELOAD",
-            "LD_LIBRARY_PATH",
-            "DYLD_INSERT_LIBRARIES",
-            "GLIBC_TUNABLES",
-            "NODE_OPTIONS",
-            "PYTHONPATH",
-            "PYTHONSTARTUP",
-            "RUBYOPT",
-            "PERL5OPT",
-            "JAVA_TOOL_OPTIONS",
-            "_JAVA_OPTIONS",
-            "CLASSPATH",
-            "PATH",
-            "BASH_ENV",
-            "IFS",
-            "SYSTEMROOT",
-            "WINDIR",
-            "SYSTEMDRIVE",
-            "COMSPEC",
-            "PATHEXT",
-            "PSMODULEPATH",
-            "PSEXECUTIONPOLICYPREFERENCE",
-            "TEMP",
-            "TMP",
-            "DOTNET_STARTUP_HOOKS",
-            "DOTNET_ROOT",
-        ] {
-            let mut value = runtime();
-            value.secrets.push(SecretReference {
-                environment: hostile.into(),
-                secret: "attacker".into(),
-                key: "payload".into(),
-            });
-            assert!(value.validate().is_err(), "{hostile}");
-        }
-        let mut value = runtime();
-        value.secrets.push(SecretReference {
-            environment: "PATH_TO_LICENSE".into(),
-            secret: "licensing".into(),
-            key: "path".into(),
-        });
-        value.secrets.push(SecretReference {
-            environment: "TEMP_BUCKET_TOKEN".into(),
-            secret: "storage".into(),
-            key: "token".into(),
-        });
-        value.validate().unwrap();
-    }
-
-    #[test]
-    fn assignment_is_strict_and_validates_report_endpoints() {
+    fn assignment_is_strict_and_allows_offline_release_repositories() {
         let value = assignment();
         value.validate().unwrap();
 
@@ -600,148 +655,71 @@ mod tests {
         offline.targets_url = "file:///opt/update/targets/".into();
         offline.validate().unwrap();
 
-        for invalid in [
-            "",
-            "not-a-url",
-            "/relative/only",
-            "ftp://cdn/m/",
-            "https://",
-            "https://user:pass@cdn/report",
-        ] {
-            let mut candidate = value.clone();
-            candidate.report_url = Some(invalid.into());
-            assert!(candidate.validate().is_err(), "{invalid:?}");
-        }
-
-        assert!(serde_json::from_str::<RepositoryAssignment>(
-            r#"{"schema":3,"deployment":"d1","unexpected":true}"#
-        )
-        .is_err());
         let mut obsolete = value;
         obsolete.schema -= 1;
         assert!(obsolete.validate().is_err());
     }
 
+    /// [`RepositoryAssignment::SCHEMA`]'s doc rests the whole writer-restraint policy on this
+    /// document being closed all the way down: the first generation that emits a new optional field
+    /// is refused by every not-yet-upgraded node, so nobody may reach for one.
+    ///
+    /// The probe this replaces was `{"schema":3,"deployment":"d1","unexpected":true}` — a document
+    /// missing eight required fields, which serde rejects for the missing fields whether or not the
+    /// struct is closed. Removing `deny_unknown_fields` from any of these structs left it green.
+    /// Each probe below is a COMPLETE, valid document with exactly one unknown key inserted, so
+    /// the only thing it can fail for is the closedness it claims to check.
     #[test]
-    fn code_injection_environment_names_are_centrally_rejected() {
-        for name in [
-            "LD_PRELOAD",
-            "DYLD_INSERT_LIBRARIES",
-            "PATH",
-            "NODE_OPTIONS",
-            "PSMODULEPATH",
-            "PATHEXT",
-            "SYSTEMROOT",
-            "COMSPEC",
+    fn the_assignment_and_every_struct_nested_in_it_refuse_an_unknown_field() {
+        let value = assignment();
+        let document = serde_json::to_value(&value).unwrap();
+        serde_json::from_value::<RepositoryAssignment>(document.clone())
+            .expect("the probe document parses before anything unknown is added to it");
+
+        // `release_root` and `runtime.inputs` are deliberately open — the signed root is an opaque
+        // JSON object and an input is a caller-named value — so neither is probed; every struct
+        // this crate declares is.
+        for path in [
+            "",
+            "runtime",
+            "runtime/repository",
+            "runtime/storage",
+            "runtime/timeouts",
         ] {
-            assert!(is_code_injection_variable(name), "{name}");
-        }
-        assert!(!is_code_injection_variable("DATABASE_PASSWORD"));
-        assert!(!is_code_injection_variable("TEMP_BUCKET_TOKEN"));
-        // Every name the agent's own chokepoint sets is unshadowable by construction.
-        for ambient in RECONCILER_AMBIENT_ENVIRONMENT {
-            assert!(is_code_injection_variable(ambient), "{ambient}");
+            let mut probe = document.clone();
+            let mut target = &mut probe;
+            for key in path.split('/').filter(|key| !key.is_empty()) {
+                target = match key.parse::<usize>() {
+                    Ok(index) => &mut target[index],
+                    Err(_) => &mut target[key],
+                };
+            }
+            target["unexpected"] = serde_json::json!(true);
+            assert!(
+                serde_json::from_value::<RepositoryAssignment>(probe).is_err(),
+                "an unknown field under {path:?} was accepted"
+            );
         }
     }
 
-    #[test]
-    fn report_urls_are_bounded_absolute_network_locations() {
-        assert!(validate_report_url("https://reports.example.test/base").is_ok());
-        for invalid in [
-            "file:///tmp/reports",
-            "https://user@example.test/",
-            "https://example.test/?query",
-            "relative/path",
-        ] {
-            assert!(validate_report_url(invalid).is_err(), "{invalid}");
-        }
-    }
-
-    /// `schemas/desired-deployment.schema.json` is the normative wire contract, with
-    /// `schemas/examples` as its reference documents; integrators write
-    /// control planes against those files rather than against this crate, and nothing else in the
-    /// workspace reads them. Without these checks the two drift into mutually unparseable shapes —
-    /// a document the published schema blesses that every agent rejects at
-    /// `serde_json::from_slice`, discovered only when a fleet-wide rollout stalls. This is the same
-    /// guard `artifact.rs`'s `published_schemas` module applies to the sibling contracts.
+    /// The deployment contract's half of the published-schema conformance check, with
+    /// `schemas/examples` as its reference documents. The harness itself — and the rule it enforces
+    /// — is [`crate::published_schema`]; this module only names which schema each type must match
+    /// and which of its fields serde may omit.
     mod published_schema {
         use super::*;
+        use crate::published_schema::{assert_object, read};
         use serde_json::Value;
-
-        fn read(relative: &str) -> Value {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../schemas")
-                .join(relative);
-            let bytes = std::fs::read(&path)
-                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|error| panic!("parsing {}: {error}", path.display()))
-        }
-
-        /// The field names the Rust type actually serializes, from a value with every optional
-        /// field populated.
-        fn serialized(value: &impl Serialize) -> Vec<String> {
-            let mut keys: Vec<String> = serde_json::to_value(value)
-                .expect("serialize")
-                .as_object()
-                .expect("object")
-                .keys()
-                .cloned()
-                .collect();
-            keys.sort();
-            keys
-        }
-
-        /// A strict object schema must be closed, declare exactly the fields the type serializes,
-        /// and require all of them except the ones serde may omit — otherwise a schema-valid
-        /// document loses a mandatory field or a type-valid document trips
-        /// `additionalProperties`.
-        fn assert_object(object: &Value, value: &impl Serialize, optional: &[&str], what: &str) {
-            assert_eq!(
-                object["additionalProperties"],
-                Value::Bool(false),
-                "{what} is deny_unknown_fields"
-            );
-            let mut properties: Vec<String> = object["properties"]
-                .as_object()
-                .unwrap_or_else(|| panic!("{what} properties"))
-                .keys()
-                .cloned()
-                .collect();
-            properties.sort();
-            assert_eq!(properties, serialized(value), "{what} properties");
-
-            let mut required: Vec<String> = object["required"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{what} required"))
-                .iter()
-                .map(|name| name.as_str().expect("required name").to_owned())
-                .collect();
-            required.sort();
-            let mut expected: Vec<String> = properties
-                .into_iter()
-                .filter(|name| !optional.contains(&name.as_str()))
-                .collect();
-            expected.sort();
-            assert_eq!(required, expected, "{what} required");
-        }
 
         /// A value with every serde-optional field populated, so the schema's property set is
         /// compared against the widest document this type can emit.
         fn complete() -> RepositoryAssignment {
             let mut value = assignment();
-            value.report_url = Some("https://reports.example.test/nodes/".into());
-            value.runtime.secrets.push(SecretReference {
-                environment: "DATABASE_PASSWORD".into(),
-                secret: "production-database".into(),
-                key: "password".into(),
-            });
-            value.runtime.inputs.insert(
-                "database_host".into(),
-                crate::telemetry::OutputValue::String {
-                    value: "db.production.internal".into(),
-                },
-            );
+            value.runtime.inputs = crate::dataflow::InputSelection {
+                generation: "a".repeat(64),
+                object_sha256: "b".repeat(64),
+                files: std::collections::BTreeSet::from(["database_host".into()]),
+            };
             value.validate().unwrap();
             value
         }
@@ -755,12 +733,12 @@ mod tests {
             );
             let value = complete();
 
-            assert_object(&schema, &value, &["report_url"], "assignment");
+            assert_object(&schema, &value, &[], "assignment");
             assert_eq!(
                 schema["properties"]["schema"]["const"],
                 Value::from(RepositoryAssignment::SCHEMA)
             );
-            for reference in ["application", "provider_set"] {
+            for reference in ["application", "providerSet"] {
                 assert_eq!(
                     schema["properties"][reference]["$ref"],
                     Value::from("https://updated.dev/schemas/target-reference.schema.json"),
@@ -768,30 +746,73 @@ mod tests {
                 );
             }
             // `validate` demands a JSON object here, so the schema must not admit a bare string.
-            assert_eq!(schema["properties"]["release_root"]["type"], "object");
+            assert_eq!(schema["properties"]["releaseRoot"]["type"], "object");
             assert_eq!(schema["properties"]["runtime"]["$ref"], "#/$defs/runtime");
 
             let runtime = &schema["$defs"]["runtime"];
-            assert_object(runtime, &value.runtime, &["secrets", "inputs"], "runtime");
+            assert_object(runtime, &value.runtime, &["inputs"], "runtime");
             assert_eq!(
-                runtime["properties"]["secrets"]["maxItems"],
-                Value::from(64)
+                runtime["properties"]["product"]["maxLength"],
+                Value::from(crate::identity::MAX_SEGMENT_BYTES)
             );
             assert_eq!(
-                runtime["properties"]["inputs"]["maxProperties"],
-                Value::from(crate::telemetry::OutputManifest::MAX_VALUES)
+                runtime["properties"]["product"]["pattern"],
+                Value::from(crate::identity::SEGMENT_PATTERN)
             );
-            assert_object(
-                &schema["$defs"]["secret_reference"],
-                &value.runtime.secrets[0],
-                &[],
-                "secret_reference",
+            for field in ["deployment", "channel"] {
+                let property = if field == "deployment" {
+                    &schema["properties"][field]
+                } else {
+                    &runtime["properties"][field]
+                };
+                assert_eq!(
+                    property["maxLength"],
+                    Value::from(crate::identity::MAX_SEGMENT_BYTES),
+                    "{field}"
+                );
+                // Against the exported grammar, never a literal. This assertion used to carry
+                // its own copy of the pattern, so it agreed with a schema that had drifted away
+                // from `is_segment` entirely and still passed.
+                assert_eq!(
+                    property["pattern"],
+                    Value::from(crate::identity::SEGMENT_PATTERN),
+                    "{field}"
+                );
+            }
+            assert_eq!(
+                runtime["properties"]["inputs"]["$ref"],
+                Value::from("#/$defs/input_selection")
             );
+            let selection = &schema["$defs"]["input_selection"];
+            assert_object(selection, &value.runtime.inputs, &[], "input selection");
+            assert_eq!(
+                selection["properties"]["files"]["maxItems"],
+                Value::from(crate::dataflow::FileSnapshot::MAX_FILES)
+            );
+            assert_eq!(
+                selection["properties"]["files"]["items"]["pattern"],
+                Value::from(crate::path::SAFE_COMPONENT_PATTERN)
+            );
+            for digest_field in ["generation", "object_sha256"] {
+                assert_eq!(
+                    selection["properties"][digest_field]["pattern"],
+                    Value::from(foundation::digest::CANONICAL_SHA256_PATTERN),
+                    "{digest_field}"
+                );
+            }
             assert_object(
                 &schema["$defs"]["repository_limits"],
                 &value.runtime.repository,
                 &[],
                 "repository_limits",
+            );
+            assert_eq!(
+                schema["$defs"]["repository_limits"]["properties"]["metadataLimit"]["maximum"],
+                Value::from(MAX_REPOSITORY_METADATA_BYTES)
+            );
+            assert_eq!(
+                schema["$defs"]["repository_limits"]["properties"]["targetLimit"]["maximum"],
+                Value::from(MAX_REPOSITORY_TARGET_BYTES)
             );
             assert_object(
                 &schema["$defs"]["storage"],
@@ -805,7 +826,7 @@ mod tests {
             // closed on every node.
             let timeouts = &schema["$defs"]["timeouts"];
             assert_object(timeouts, &value.runtime.timeouts, &[], "timeouts");
-            for cadence in ["check_interval_seconds", "refresh_retry_seconds"] {
+            for cadence in ["checkIntervalSeconds", "refreshRetrySeconds"] {
                 assert_eq!(
                     timeouts["properties"][cadence]["maximum"],
                     Value::from(crate::telemetry::MAX_CHECK_INTERVAL_SECONDS),
@@ -813,10 +834,10 @@ mod tests {
                 );
             }
             for bounded in [
-                "health_grace_seconds",
-                "health_interval_seconds",
-                "confirmation_window_seconds",
-                "agent_check_interval_seconds",
+                "healthGraceSeconds",
+                "healthIntervalSeconds",
+                "confirmationWindowSeconds",
+                "agentCheckIntervalSeconds",
             ] {
                 assert_eq!(
                     timeouts["properties"][bounded]["maximum"],

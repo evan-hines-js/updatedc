@@ -1,7 +1,9 @@
 use super::*;
 
 pub(crate) enum Outcome {
-    Committed,
+    Committed {
+        host_action: updated_contracts::reconciler::HostAction,
+    },
     /// A candidate failed *after* activation: it is rejected and the durable rollback journal is
     /// left in place, but the actual rollback is performed by the one rollback implementation — the
     /// boot state machine — after this disposable agent terminates and the launcher relaunches
@@ -62,57 +64,32 @@ impl Chaos {
 pub(crate) mod boundary {
     use crate::domain::TransactionPhase;
 
-    pub const PREFLIGHT_APPLIED: &str = "preflight-applied";
-    pub const PREFLIGHT_STARTED: &str = "preflight-started";
-    pub const PREFLIGHT_COMPLETED: &str = "preflight-completed";
-    pub const PREPARE_STARTED: &str = "prepare-started";
     pub const PREPARED: &str = "prepared";
-    pub const PREPARE_APPLIED: &str = "prepare-applied";
-    pub const ACTIVATE_STARTED: &str = "activate-started";
+    pub const ACTIVATING: &str = "activating";
     pub const CANDIDATE_POINTER_APPLIED: &str = "candidate-pointer-applied";
     pub const CANDIDATE_LIFECYCLE_APPLIED: &str = "candidate-lifecycle-applied";
-    pub const CANDIDATE_ACTIVATED: &str = "candidate-activated";
-    pub const CANDIDATE_HEALTHY: &str = "candidate-healthy";
-    pub const HEALTH_STARTED: &str = "health-started";
     pub const CANDIDATE_HEALTH_APPLIED: &str = "candidate-health-applied";
-    pub const FINALIZED: &str = "finalized";
-    pub const FINALIZE_STARTED: &str = "finalize-started";
-    pub const FINALIZE_APPLIED: &str = "finalize-applied";
+    pub const COMMITTING: &str = "committing";
     pub const COMMITTED: &str = "committed";
-    pub const COMMIT_STARTED: &str = "commit-started";
     pub const COMMIT_APPLIED: &str = "commit-applied";
-    pub const ROLLBACK_STARTED: &str = "rollback-started";
-    pub const ROLLBACK_ACTIVATE_STARTED: &str = "rollback-activate-started";
+    pub const ROLLBACK_ACTIVATING: &str = "rollback-activating";
     pub const PREDECESSOR_POINTER_APPLIED: &str = "predecessor-pointer-applied";
     pub const PREDECESSOR_LIFECYCLE_APPLIED: &str = "predecessor-lifecycle-applied";
-    pub const PREDECESSOR_ACTIVATED: &str = "predecessor-activated";
+    pub const ROLLBACK_APPLIED: &str = "rollback-applied";
     pub const PREDECESSOR_HEALTH_APPLIED: &str = "predecessor-health-applied";
-    pub const PREDECESSOR_HEALTHY: &str = "predecessor-healthy";
-    pub const ROLLBACK_HEALTH_STARTED: &str = "rollback-health-started";
-    pub const ROLLBACK_FINALIZE_STARTED: &str = "rollback-finalize-started";
+    pub const ROLLBACK_VERIFIED: &str = "rollback-verified";
     pub const ROLLBACK_ADAPTER_APPLIED: &str = "rollback-lifecycle-applied";
     pub const ROLLED_BACK: &str = "rolled-back";
 
     pub fn durable_phase(phase: TransactionPhase) -> &'static str {
         match phase {
-            TransactionPhase::PreflightStarted => PREFLIGHT_STARTED,
-            TransactionPhase::PreflightCompleted => PREFLIGHT_COMPLETED,
-            TransactionPhase::PrepareStarted => PREPARE_STARTED,
             TransactionPhase::Prepared => PREPARED,
-            TransactionPhase::ActivateStarted => ACTIVATE_STARTED,
-            TransactionPhase::CandidateActivated => CANDIDATE_ACTIVATED,
-            TransactionPhase::HealthStarted => HEALTH_STARTED,
-            TransactionPhase::CandidateHealthy => CANDIDATE_HEALTHY,
-            TransactionPhase::FinalizeStarted => FINALIZE_STARTED,
-            TransactionPhase::Finalized => FINALIZED,
-            TransactionPhase::CommitStarted => COMMIT_STARTED,
+            TransactionPhase::Activating => ACTIVATING,
+            TransactionPhase::Committing => COMMITTING,
             TransactionPhase::Committed => COMMITTED,
-            TransactionPhase::RollbackStarted => ROLLBACK_STARTED,
-            TransactionPhase::RollbackActivateStarted => ROLLBACK_ACTIVATE_STARTED,
-            TransactionPhase::PredecessorActivated => PREDECESSOR_ACTIVATED,
-            TransactionPhase::RollbackHealthStarted => ROLLBACK_HEALTH_STARTED,
-            TransactionPhase::PredecessorHealthy => PREDECESSOR_HEALTHY,
-            TransactionPhase::RollbackFinalizeStarted => ROLLBACK_FINALIZE_STARTED,
+            TransactionPhase::RollbackActivating => ROLLBACK_ACTIVATING,
+            TransactionPhase::RollbackApplied => ROLLBACK_APPLIED,
+            TransactionPhase::RollbackVerified => ROLLBACK_VERIFIED,
             TransactionPhase::RolledBack => ROLLED_BACK,
         }
     }
@@ -123,38 +100,24 @@ pub(crate) mod boundary {
 /// agent as a subprocess and cannot share a `const`).
 #[cfg(any(feature = "chaos", test))]
 pub(crate) const BOUNDARIES: &[&str] = &[
-    boundary::PREFLIGHT_STARTED,
-    boundary::PREFLIGHT_APPLIED,
-    boundary::PREFLIGHT_COMPLETED,
-    boundary::PREPARE_STARTED,
-    boundary::PREPARE_APPLIED,
     boundary::PREPARED,
-    boundary::ACTIVATE_STARTED,
+    boundary::ACTIVATING,
     boundary::CANDIDATE_POINTER_APPLIED,
     boundary::CANDIDATE_LIFECYCLE_APPLIED,
-    boundary::CANDIDATE_ACTIVATED,
-    boundary::HEALTH_STARTED,
     boundary::CANDIDATE_HEALTH_APPLIED,
-    boundary::CANDIDATE_HEALTHY,
-    boundary::FINALIZE_STARTED,
-    boundary::FINALIZE_APPLIED,
-    boundary::FINALIZED,
-    boundary::COMMIT_STARTED,
+    boundary::COMMITTING,
     boundary::COMMIT_APPLIED,
     boundary::COMMITTED,
 ];
 
 #[cfg(any(feature = "chaos", test))]
 pub(crate) const ROLLBACK_BOUNDARIES: &[&str] = &[
-    boundary::ROLLBACK_STARTED,
-    boundary::ROLLBACK_ACTIVATE_STARTED,
+    boundary::ROLLBACK_ACTIVATING,
     boundary::PREDECESSOR_POINTER_APPLIED,
     boundary::PREDECESSOR_LIFECYCLE_APPLIED,
-    boundary::PREDECESSOR_ACTIVATED,
-    boundary::ROLLBACK_HEALTH_STARTED,
+    boundary::ROLLBACK_APPLIED,
     boundary::PREDECESSOR_HEALTH_APPLIED,
-    boundary::PREDECESSOR_HEALTHY,
-    boundary::ROLLBACK_FINALIZE_STARTED,
+    boundary::ROLLBACK_VERIFIED,
     boundary::ROLLBACK_ADAPTER_APPLIED,
     boundary::ROLLED_BACK,
 ];
@@ -166,6 +129,50 @@ pub(crate) const ROLLBACK_BOUNDARIES: &[&str] = &[
 // the signed node reconciler that travels with the install; a test fake scripts operation outcomes
 // and health, so every fault path of [`apply_update`] is provable without a subprocess.
 
+/// The only two meanings a lifecycle failure can have.
+///
+/// `Answered` is evidence about the release: its reconciler ran and returned a non-zero status, or
+/// it ran past its signed timeout. `Unreached` is evidence about this node: resolving the provider,
+/// preparing its file exchange, spawning/waiting for the process, or publishing its outputs failed.
+/// Keeping the distinction in the type prevents an `io::ErrorKind` chosen by an unrelated
+/// filesystem or process primitive from becoming a permanent release rejection.
+#[derive(Debug)]
+pub(crate) enum InvocationFailure {
+    Answered(io::Error),
+    Unreached(io::Error),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReleaseTarget<'a> {
+    pub(crate) release: &'a updated::bundle::ReleaseId,
+    pub(crate) archive_sha256: &'a str,
+}
+
+impl ReleaseTarget<'_> {
+    fn audit_identity(self) -> updated_contracts::reconciler::ReconciledRelease {
+        updated_contracts::reconciler::ReconciledRelease {
+            version: self.release.version.clone(),
+            manifest_sha256: self.release.manifest_sha256.clone(),
+            archive_sha256: self.archive_sha256.to_string(),
+        }
+    }
+}
+
+impl InvocationFailure {
+    #[cfg(test)]
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::Answered(error) | Self::Unreached(error) => error.kind(),
+        }
+    }
+
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Answered(error) | Self::Unreached(error) => error,
+        }
+    }
+}
+
 /// Invoke the release's own reconciler — the single seam through which anything on this node
 /// changes. The port the transaction drives.
 ///
@@ -173,14 +180,20 @@ pub(crate) const ROLLBACK_BOUNDARIES: &[&str] = &[
 /// leaves a durable rollback journal, and the agent terminates so boot recovery performs the one
 /// rollback path.
 pub(crate) trait Reconciler {
-    /// Invoke one operation of the release's signed node reconciler under `lifecycle_attempt_id`.
-    fn invoke(
+    fn mutate(
         &mut self,
-        operation: Operation,
+        operation: MutationOperation,
         lifecycle_attempt_id: &str,
-        candidate: &updated::bundle::ReleaseId,
-        predecessor: &updated::bundle::ReleaseId,
-    ) -> io::Result<()>;
+        candidate: ReleaseTarget<'_>,
+        predecessor: ReleaseTarget<'_>,
+    ) -> Result<updated_contracts::reconciler::ResultDocument, InvocationFailure>;
+    fn observe(
+        &mut self,
+        operation: ObservationOperation,
+        lifecycle_attempt_id: &str,
+        candidate: ReleaseTarget<'_>,
+        predecessor: ReleaseTarget<'_>,
+    ) -> Result<(), InvocationFailure>;
     /// Agent-owned retry policy for the reconciler's single-observation `healthcheck` operation.
     fn verification_policy(&self) -> (Duration, u32, Duration);
 }
@@ -211,18 +224,37 @@ impl<'a> ReleaseReconciler<'a> {
 }
 
 impl Reconciler for ReleaseReconciler<'_> {
-    fn invoke(
+    fn mutate(
         &mut self,
-        operation: Operation,
+        operation: MutationOperation,
         lifecycle_attempt_id: &str,
-        candidate: &updated::bundle::ReleaseId,
-        predecessor: &updated::bundle::ReleaseId,
-    ) -> io::Result<()> {
-        run_lifecycle_command(
+        candidate: ReleaseTarget<'_>,
+        predecessor: ReleaseTarget<'_>,
+    ) -> Result<updated_contracts::reconciler::ResultDocument, InvocationFailure> {
+        invoke_lifecycle_mutation(
             self.lifecycle,
             self.opts,
+            operation,
             LifecycleInvocation {
-                phase: operation,
+                reason: self.reason,
+                id: lifecycle_attempt_id,
+                candidate,
+                predecessor,
+            },
+        )
+    }
+    fn observe(
+        &mut self,
+        operation: ObservationOperation,
+        lifecycle_attempt_id: &str,
+        candidate: ReleaseTarget<'_>,
+        predecessor: ReleaseTarget<'_>,
+    ) -> Result<(), InvocationFailure> {
+        invoke_lifecycle_observation(
+            self.lifecycle,
+            self.opts,
+            operation,
+            LifecycleInvocation {
                 reason: self.reason,
                 id: lifecycle_attempt_id,
                 candidate,
@@ -249,7 +281,8 @@ impl FingerprintJob {
         self,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> io::Result<updated_contracts::telemetry::Fingerprint> {
-        let output = run_prepared_lifecycle_command(self.command, Some(cancelled))?;
+        let output = run_prepared_lifecycle_command(self.command, Some(cancelled))
+            .map_err(InvocationFailure::into_io_error)?;
         fingerprint_from_output(&self.definition_sha256, output)
     }
 }
@@ -259,14 +292,8 @@ pub(crate) fn prepare_fingerprint_job(
     opts: &Options,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<FingerprintJob> {
-    if invocation.phase != Operation::Inspect {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "fingerprint job requires the fingerprint lifecycle phase",
-        ));
-    }
     Ok(FingerprintJob {
-        command: prepare_lifecycle_command(release, opts, invocation)?,
+        command: prepare_lifecycle_command(release, opts, Operation::Inspect, invocation)?,
         definition_sha256: release.archive_sha256.clone(),
     })
 }
@@ -275,23 +302,30 @@ fn fingerprint_from_output(
     definition_sha256: &str,
     output: ReconcilerOutput,
 ) -> io::Result<updated_contracts::telemetry::Fingerprint> {
-    if output.stdout_truncated {
+    let updated::reconciler::InvocationResult::Observation = output.result else {
+        unreachable!("fingerprint preparation permits only inspect observations")
+    };
+    if output.capture.stdout_truncated {
         return Err(io::Error::other(format!(
-            "node fingerprint exceeded the {RECONCILER_OUTPUT_LIMIT}-byte output limit"
+            "node fingerprint exceeded the {}-byte output limit",
+            updated::reconciler::OUTPUT_LIMIT
         )));
     }
-    if output.stdout.is_empty() {
+    if output.capture.stdout.is_empty() {
         return Err(io::Error::other(
             "node fingerprint produced no measured state on stdout",
         ));
     }
-    updated_contracts::telemetry::Fingerprint::from_output(definition_sha256, &output.stdout)
-        .map_err(io::Error::other)
+    updated_contracts::telemetry::Fingerprint::from_output(
+        definition_sha256,
+        &output.capture.stdout,
+    )
+    .map_err(io::Error::other)
 }
 
 /// THE environment converge: run the committed release's `apply` outside a release transaction,
 /// so the reconciler sees the runtime the assignment names *now* — its resolved `inputs` above
-/// all, which reach the reconciler only through `--input-file`.
+/// all, which reach the reconciler only through `--input-dir`.
 ///
 /// Release placement already happened durably — in the install machine on a first boot, in the
 /// update transaction on an upgrade — so this never places; it only asks the release's own
@@ -305,22 +339,33 @@ pub(crate) fn converge_environment(
     opts: &Options,
     store: &dyn Store,
     reason: Reason,
-) -> io::Result<()> {
+    attempt_id: &str,
+) -> io::Result<updated_contracts::reconciler::ResultDocument> {
     let updated::state::Installed::Present(installed) = store.installed() else {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a verified installed release is required for convergence",
+        ));
     };
     let installed = *installed;
     let release = installed.release;
+    let archive_sha256 = installed.archive_sha256;
     let lifecycle = installed.lifecycle;
-    run_lifecycle_command(
+    run_lifecycle_mutation(
         lifecycle.as_ref(),
         opts,
+        MutationOperation::Apply,
         LifecycleInvocation {
-            phase: Operation::Apply,
             reason,
-            id: attempt::BOOT,
-            candidate: &release,
-            predecessor: &release,
+            id: attempt_id,
+            candidate: ReleaseTarget {
+                release: &release,
+                archive_sha256: &archive_sha256,
+            },
+            predecessor: ReleaseTarget {
+                release: &release,
+                archive_sha256: &archive_sha256,
+            },
         },
     )
 }
@@ -370,8 +415,8 @@ impl Readiness {
 pub(crate) async fn became_healthy<T: Reconciler>(
     reconciler: &mut T,
     lifecycle_attempt_id: &str,
-    candidate: &updated::bundle::ReleaseId,
-    predecessor: &updated::bundle::ReleaseId,
+    candidate: ReleaseTarget<'_>,
+    predecessor: ReleaseTarget<'_>,
 ) -> Health {
     let (grace, successes, interval) = reconciler.verification_policy();
     let deadline = Instant::now() + grace;
@@ -388,8 +433,8 @@ pub(crate) async fn became_healthy<T: Reconciler>(
     let mut unreached: Option<io::Error> = None;
     while Instant::now() < deadline {
         if Instant::now() >= next {
-            let ok = match reconciler.invoke(
-                Operation::Healthcheck,
+            let ok = match reconciler.observe(
+                ObservationOperation::Healthcheck,
                 lifecycle_attempt_id,
                 candidate,
                 predecessor,
@@ -398,13 +443,13 @@ pub(crate) async fn became_healthy<T: Reconciler>(
                     unreached = None;
                     true
                 }
-                Err(error) if reconciler_answered(&error) => {
+                Err(InvocationFailure::Answered(_)) => {
                     unreached = None;
                     false
                 }
                 // The probe never reached the reconciler. It still counts as a failed observation
                 // for cadence — readiness is consecutive evidence — but it is not a verdict.
-                Err(error) => {
+                Err(InvocationFailure::Unreached(error)) => {
                     unreached = Some(error);
                     false
                 }
@@ -447,14 +492,6 @@ pub(crate) enum Health {
     Inconclusive(io::Error),
 }
 
-/// Whether a failed lifecycle invocation is the reconciler's own answer rather than a node-local
-/// fault in front of it. The reconciler's answers are its non-zero exit ([`io::Error::other`]) and
-/// its timeout; everything else — a bundle that will not resolve, a directory that cannot be
-/// created, inputs that cannot be written, a program that will not spawn — happened before it ran.
-fn reconciler_answered(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::Other | io::ErrorKind::TimedOut)
-}
-
 // ================================ the transaction ================================
 
 /// Drive one application update through the durable transaction, over the [`Store`] and
@@ -464,6 +501,7 @@ pub(crate) async fn apply_update<T: Reconciler>(
     store: &mut dyn Store,
     candidate: &updated::bundle::ReleaseId,
     candidate_archive_sha256: &str,
+    candidate_rejection_sha256: &str,
     candidate_repository_lineage: updated::state::RepositoryLineage,
     lifecycle: updated::state::ProviderRelease,
 ) -> io::Result<Outcome> {
@@ -472,18 +510,18 @@ pub(crate) async fn apply_update<T: Reconciler>(
     // this disposable agent; the launcher relaunches it through the one recovery path.
     match store.journal()? {
         None => {}
-        // A journal in a terminal phase is SPENT — its transaction already reached its end state
-        // and everything durable is written. The only reason one is still here is that the delete
-        // after commit failed (a read-only remount, an EIO). Retrying that delete is not recovery:
-        // there is nothing left to reconcile, and treating it as fatal instead ends every boot on
-        // a transient filesystem error — a relaunch loop that re-derives the same spent journal
-        // and gets no further.
-        Some(journal)
-            if matches!(
-                journal.phase,
-                TransactionPhase::Committed | TransactionPhase::RolledBack
-            ) =>
-        {
+        // A journal that can no longer drive a rollback is SPENT — its transaction already reached
+        // its end state and everything durable is written. The only reason one is still here is
+        // that the delete after commit failed (a read-only remount, an EIO). Retrying that delete
+        // is not recovery: there is nothing left to reconcile, and treating it as fatal instead
+        // ends every boot on a transient filesystem error — a relaunch loop that re-derives the
+        // same spent journal and gets no further.
+        //
+        // The question goes to the phase machine (via the recovery driver's own
+        // `boot::drives_rollback`) rather than to a list of terminal phases written out here: this
+        // is the site that DELETES the journal, and the enumerate-the-phases version of the test is
+        // exactly what once let `RolledBack` through.
+        Some(journal) if !crate::boot::drives_rollback(&journal) => {
             store.clear_journal()?;
             log("removed a spent update journal left behind by a failed post-commit cleanup");
         }
@@ -498,14 +536,14 @@ pub(crate) async fn apply_update<T: Reconciler>(
         Installed::Present(state) => state,
         _ => return Err(io::Error::other("a verified installed release is required")),
     };
-    let chaos = Chaos::from_env();
-    let mut tx = Transaction {
+    let tx = Transaction {
         id: updated::rand::token()?,
         previous_release: installed.release.clone(),
         previous_archive_sha256: installed.archive_sha256.clone(),
         previous_repository_lineage: installed.repository_lineage.clone(),
         candidate_release: candidate.clone(),
         candidate_archive_sha256: candidate_archive_sha256.to_string(),
+        candidate_rejection_sha256: candidate_rejection_sha256.to_string(),
         candidate_repository_lineage: candidate_repository_lineage.clone(),
         candidate_rejection_required: false,
         // These fields drive ROLLBACK recovery (restoring the predecessor), so they carry the
@@ -517,15 +555,9 @@ pub(crate) async fn apply_update<T: Reconciler>(
         // already carries the predecessor's providers.
         lifecycle: installed.lifecycle.clone(),
         rollback_health_failures: 0,
-        phase: TransactionPhase::PreflightStarted,
+        phase: TransactionPhase::Prepared,
     };
     persist_transaction(store, &tx)?;
-    chaos.crossing(boundary::PREFLIGHT_APPLIED);
-    advance_transaction(store, &mut tx, TransactionPhase::PreflightCompleted)?;
-
-    advance_transaction(store, &mut tx, TransactionPhase::PrepareStarted)?;
-    chaos.crossing(boundary::PREPARE_APPLIED);
-    advance_transaction(store, &mut tx, TransactionPhase::Prepared)?;
 
     // Everything up to here is side-effect free on the live node: the candidate is staged, nothing
     // is pointed at it, and a failure defers cleanly as `Err`. Past this line the pointer moves and
@@ -566,7 +598,7 @@ async fn switch_over<T: Reconciler>(
     }
     recover_on_error!(
         "recording the activation checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::ActivateStarted)
+        advance_transaction(store, &mut tx, TransactionPhase::Activating)
     );
     // Split the activation into its three failure classes. A re-verification failure means the
     // candidate's on-disk bytes are corrupt — genuinely its fault — so reject, as does an `apply`
@@ -590,49 +622,62 @@ async fn switch_over<T: Reconciler>(
     // The candidate's own `apply`: the release converges the machine onto itself — starting,
     // reloading or restarting whatever it owns. This agent touches no workload process, here or
     // anywhere.
-    if let Err(e) = reconciler.invoke(Operation::Apply, &tx.id, &candidate, &tx.previous_release) {
-        warn(&format!("activating the new version failed ({e})"));
-        return reject_then_recover(store, &mut tx);
-    }
-    chaos.crossing(boundary::CANDIDATE_LIFECYCLE_APPLIED);
-    recover_on_error!(
-        "recording the activated checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::CandidateActivated)
-    );
-
-    recover_on_error!(
-        "recording the health checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::HealthStarted)
-    );
-    match became_healthy(reconciler, &tx.id, &candidate, &tx.previous_release).await {
-        Health::Ready => {}
-        Health::Unhealthy => return reject_then_recover(store, &mut tx),
-        // The gate never reached the reconciler, so it observed nothing about the candidate.
-        // Restart for boot recovery *without* recording a rejection — the same fail-safe class as
-        // the pointer-write case above — so the healthy release is retried once the node's own
-        // fault clears, rather than excluded from this node forever.
-        Health::Inconclusive(e) => {
+    let apply_result = match reconciler.mutate(
+        MutationOperation::Apply,
+        &tx.id,
+        ReleaseTarget {
+            release: &candidate,
+            archive_sha256: &tx.candidate_archive_sha256,
+        },
+        ReleaseTarget {
+            release: &tx.previous_release,
+            archive_sha256: &tx.previous_archive_sha256,
+        },
+    ) {
+        Ok(result) => result,
+        Err(InvocationFailure::Answered(error)) => {
+            warn(&format!("activating the new version failed ({error})"));
+            return reject_then_recover(store, &mut tx);
+        }
+        Err(InvocationFailure::Unreached(error)) => {
             warn(&format!(
-                "the readiness gate could not reach the node reconciler ({e}); restarting for boot recovery"
+                "the candidate's reconciler could not be invoked ({error}); restarting for boot \
+                 recovery without rejecting the release"
             ));
             return Outcome::RollbackPending;
         }
+    };
+    chaos.crossing(boundary::CANDIDATE_LIFECYCLE_APPLIED);
+    if apply_result.host_action != updated_contracts::reconciler::HostAction::Reboot {
+        match became_healthy(
+            reconciler,
+            &tx.id,
+            ReleaseTarget {
+                release: &candidate,
+                archive_sha256: &tx.candidate_archive_sha256,
+            },
+            ReleaseTarget {
+                release: &tx.previous_release,
+                archive_sha256: &tx.previous_archive_sha256,
+            },
+        )
+        .await
+        {
+            Health::Ready => {}
+            Health::Unhealthy => return reject_then_recover(store, &mut tx),
+            // The gate never reached the reconciler, so it observed nothing about the candidate.
+            // Restart for boot recovery *without* recording a rejection — the same fail-safe class as
+            // the pointer-write case above — so the healthy release is retried once the node's own
+            // fault clears, rather than excluded from this node forever.
+            Health::Inconclusive(e) => {
+                warn(&format!(
+                    "the readiness gate could not reach the node reconciler ({e}); restarting for boot recovery"
+                ));
+                return Outcome::RollbackPending;
+            }
+        }
+        chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
     }
-    chaos.crossing(boundary::CANDIDATE_HEALTH_APPLIED);
-    recover_on_error!(
-        "recording the healthy checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::CandidateHealthy)
-    );
-
-    recover_on_error!(
-        "recording the finalize checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::FinalizeStarted)
-    );
-    chaos.crossing(boundary::FINALIZE_APPLIED);
-    recover_on_error!(
-        "recording the finalized checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::Finalized)
-    );
 
     // Commit atomically WITH the pending rollback intent: the update is unconfirmed until
     // it survives its window. Folding the rollback intent into one write means there is no
@@ -648,6 +693,7 @@ async fn switch_over<T: Reconciler>(
     // gate/watch it with the wrong hooks.
     let pending = Some(Pending {
         lifecycle_attempt_id: tx.id.clone(),
+        candidate_rejection_sha256: tx.candidate_rejection_sha256.clone(),
         previous_release: tx.previous_release.clone(),
         previous_archive_sha256: tx.previous_archive_sha256.clone(),
         previous_repository_lineage: tx.previous_repository_lineage.clone(),
@@ -656,7 +702,7 @@ async fn switch_over<T: Reconciler>(
     });
     recover_on_error!(
         "recording the commit checkpoint",
-        advance_transaction(store, &mut tx, TransactionPhase::CommitStarted)
+        advance_transaction(store, &mut tx, TransactionPhase::Committing)
     );
     recover_on_error!(
         "committing the installed release",
@@ -691,7 +737,9 @@ async fn switch_over<T: Reconciler>(
             "update committed but clearing its journal failed ({e}); recovery will remove it"
         ));
     }
-    Outcome::Committed
+    Outcome::Committed {
+        host_action: apply_result.host_action,
+    }
 }
 
 /// Persist the rejection decision before applying it. If the process dies in the gap,
@@ -704,7 +752,7 @@ fn require_candidate_rejection(store: &mut dyn Store, tx: &mut Transaction) -> i
     }
     store.reject(
         &tx.candidate_repository_lineage,
-        &tx.candidate_archive_sha256,
+        &tx.candidate_rejection_sha256,
     )
 }
 
@@ -752,39 +800,231 @@ pub(crate) fn persist_transaction(store: &mut dyn Store, tx: &Transaction) -> io
 /// The protocol is intentionally ordinary argv so an operator can implement it in Bash or
 /// PowerShell without a JSON parser or SDK. A bounded wait prevents a wedged enterprise
 /// integration from wedging the updater forever.
+#[derive(Clone, Copy)]
 pub(crate) struct LifecycleInvocation<'a> {
-    pub(crate) phase: Operation,
     pub(crate) reason: Reason,
     pub(crate) id: &'a str,
-    pub(crate) candidate: &'a updated::bundle::ReleaseId,
-    pub(crate) predecessor: &'a updated::bundle::ReleaseId,
+    pub(crate) candidate: ReleaseTarget<'a>,
+    pub(crate) predecessor: ReleaseTarget<'a>,
 }
 
-pub(crate) fn run_lifecycle_command(
+pub(crate) fn run_lifecycle_mutation(
     lifecycle: &updated::state::ProviderRelease,
     opts: &Options,
+    operation: MutationOperation,
+    invocation: LifecycleInvocation<'_>,
+) -> io::Result<updated_contracts::reconciler::ResultDocument> {
+    invoke_lifecycle_mutation(lifecycle, opts, operation, invocation)
+        .map_err(InvocationFailure::into_io_error)
+}
+
+pub(crate) fn run_lifecycle_observation(
+    lifecycle: &updated::state::ProviderRelease,
+    opts: &Options,
+    operation: ObservationOperation,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<()> {
-    run_prepared_lifecycle_command(
-        prepare_lifecycle_command(lifecycle, opts, invocation)?,
-        None,
-    )
-    .map(|_| ())
+    invoke_lifecycle_observation(lifecycle, opts, operation, invocation)
+        .map_err(InvocationFailure::into_io_error)
+}
+
+fn invoke_lifecycle_mutation(
+    lifecycle: &updated::state::ProviderRelease,
+    opts: &Options,
+    operation: MutationOperation,
+    invocation: LifecycleInvocation<'_>,
+) -> Result<updated_contracts::reconciler::ResultDocument, InvocationFailure> {
+    let phase = operation.operation();
+    let max_attempts = updated_contracts::reconciler::MAX_MUTATION_ATTEMPTS;
+
+    for attempt in 1..=max_attempts {
+        let prepared = prepare_lifecycle_command(lifecycle, opts, phase, invocation)
+            .map_err(InvocationFailure::Unreached)?;
+        let output = run_prepared_lifecycle_command(prepared, None)?;
+        let updated::reconciler::InvocationResult::Mutation(result) = output.result else {
+            unreachable!("a mutation invocation is validated before it reaches this boundary")
+        };
+        if result.status == updated_contracts::reconciler::ResultStatus::Succeeded {
+            let record = updated_contracts::reconciler::LastReconciliation {
+                schema: updated_contracts::reconciler::LastReconciliation::SCHEMA,
+                operation: phase,
+                reason: invocation.reason,
+                attempt_id: invocation.id.to_string(),
+                candidate: invocation.candidate.audit_identity(),
+                predecessor: invocation.predecessor.audit_identity(),
+                reconciler: updated_contracts::reconciler::ReconcilerIdentity {
+                    provider_set_sha256: lifecycle.provider_set_sha256.clone(),
+                    product: lifecycle.product.clone(),
+                    release: updated_contracts::reconciler::ReconciledRelease {
+                        version: lifecycle.release.version.clone(),
+                        manifest_sha256: lifecycle.release.manifest_sha256.clone(),
+                        archive_sha256: lifecycle.archive_sha256.clone(),
+                    },
+                },
+                result,
+                completed_at_ms: updated_contracts::telemetry::now_ms(),
+            };
+            updated::reconciler::write_last_reconciliation(
+                &opts.paths.last_reconciliation,
+                &record,
+            )
+            .map_err(InvocationFailure::Unreached)?;
+            if let Some(message) = &record.result.message {
+                log(&format!("reconciler {phase}: {message}"));
+            }
+            return Ok(record.result);
+        }
+
+        let delay = Duration::from_secs(
+            result
+                .retry_after_seconds
+                .expect("validated retry result has a delay"),
+        );
+        let message = result.message.as_deref().unwrap_or("temporary condition");
+        if attempt == max_attempts {
+            return Err(InvocationFailure::Unreached(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "reconciler {phase} requested another retry after {max_attempts} attempts: {message}"
+                ),
+            )));
+        }
+        warn(&format!(
+            "reconciler {phase} requested retry {attempt} of {max_attempts} in {}s: {message}",
+            delay.as_secs()
+        ));
+        without_blocking_the_runtime(|| std::thread::sleep(delay));
+    }
+    unreachable!("the retry loop always returns on its final attempt")
+}
+
+fn invoke_lifecycle_observation(
+    lifecycle: &updated::state::ProviderRelease,
+    opts: &Options,
+    operation: ObservationOperation,
+    invocation: LifecycleInvocation<'_>,
+) -> Result<(), InvocationFailure> {
+    let prepared = prepare_lifecycle_command(lifecycle, opts, operation.operation(), invocation)
+        .map_err(InvocationFailure::Unreached)?;
+    let output = run_prepared_lifecycle_command(prepared, None)?;
+    match output.result {
+        updated::reconciler::InvocationResult::Observation => Ok(()),
+        updated::reconciler::InvocationResult::Mutation(_) => {
+            unreachable!("an observation invocation is validated before it reaches this boundary")
+        }
+    }
 }
 
 struct PreparedLifecycleCommand {
     command: Command,
     phase: Operation,
     timeout: Duration,
+    invocation_data: InvocationData,
+}
+
+/// Private, per-invocation file exchange. The reconciler sees ordinary files; JSON/base64 is only
+/// the internal storage boundary between the agent and S3.
+struct InvocationData {
+    root: PathBuf,
+    input_dir: PathBuf,
+    output_dir: PathBuf,
+    result_file: PathBuf,
+    output_snapshot: PathBuf,
+}
+
+impl InvocationData {
+    fn create(
+        state_dir: &Path,
+        inputs: &updated_contracts::dataflow::FileSnapshot,
+        output_snapshot: PathBuf,
+    ) -> io::Result<Self> {
+        inputs
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let exchanges = state_dir.join("invocations");
+        std::fs::create_dir_all(&exchanges)?;
+        let root = exchanges.join(updated::rand::token()?);
+        foundation::durable::create_private_directory(&root)?;
+        let input_dir = root.join("inputs");
+        let output_dir = root.join("outputs");
+        let result_file = root.join("result.json");
+        foundation::durable::create_private_directory(&input_dir)?;
+        foundation::durable::create_private_directory(&output_dir)?;
+        for (name, value) in &inputs.files {
+            let bytes = value
+                .bytes()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let path = input_dir.join(name);
+            let mut file = foundation::durable::create_private_new(&path)?;
+            std::io::Write::write_all(&mut file, &bytes)?;
+            file.sync_all()?;
+        }
+        foundation::durable::sync_dir(&input_dir)?;
+        Ok(Self {
+            root,
+            input_dir,
+            output_dir,
+            result_file,
+            output_snapshot,
+        })
+    }
+
+    fn publish_outputs(&self) -> io::Result<()> {
+        let snapshot = updated::reconciler::snapshot_directory(&self.output_dir)?;
+        if let Some(parent) = self.output_snapshot.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        foundation::durable::atomic_write(
+            &self.output_snapshot,
+            ".outputs-",
+            &serde_json::to_vec(&snapshot)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )
+    }
+
+    fn take_result(&self, phase: Operation) -> io::Result<updated::reconciler::InvocationResult> {
+        updated::reconciler::take_result(&self.result_file, phase)
+    }
+}
+
+impl Drop for InvocationData {
+    fn drop(&mut self) {
+        if let Err(error) = foundation::durable::remove_path(&self.root) {
+            crate::warn(&format!(
+                "removing reconciler file exchange {} failed: {error}",
+                self.root.display()
+            ));
+        }
+    }
+}
+
+/// Remove every plaintext file exchange an interrupted agent could have left behind.
+///
+/// The caller holds the installation's instance lock, so every `invocations` tree is stale. Product
+/// state itself is durable reconciler-owned data and is deliberately preserved; only the one
+/// agent-owned ephemeral child is removed.
+pub(crate) fn clear_stale_invocation_data(paths: &updated::config::Paths) -> io::Result<()> {
+    let products = match std::fs::read_dir(&paths.provider_state_root) {
+        Ok(products) => products,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for product in products {
+        let product = product?;
+        if product.file_type()?.is_dir() {
+            foundation::durable::remove_path(&product.path().join("invocations"))?;
+        }
+    }
+    Ok(())
 }
 
 fn prepare_lifecycle_command(
     lifecycle: &updated::state::ProviderRelease,
     opts: &Options,
+    phase: Operation,
     invocation: LifecycleInvocation<'_>,
 ) -> io::Result<PreparedLifecycleCommand> {
     let LifecycleInvocation {
-        phase,
         reason,
         id: lifecycle_attempt_id,
         candidate,
@@ -801,47 +1041,37 @@ fn prepare_lifecycle_command(
     let timeout = lifecycle_timeout(phase, Duration::from_millis(lifecycle.timeout_millis));
     let phase_name = phase.as_str();
     let app_provider = updated::provider::BundleStore::for_app(&opts.paths);
-    let candidate_dir = app_provider.location(candidate);
-    let predecessor_dir = app_provider.location(predecessor);
-    let state_dir = opts
-        .paths
-        .install_root
-        .join("providers/state")
-        .join(&lifecycle.product);
+    let candidate_dir = app_provider.location(candidate.release);
+    let predecessor_dir = app_provider.location(predecessor.release);
+    // Both durable hook directories come from the one layout definition (`Paths`), never from a
+    // string join here: the conformance harness derives them from the same place, so a hook is
+    // never certified against a layout no node uses.
+    let state_dir = opts.paths.reconciler_state_dir(&lifecycle.product);
     std::fs::create_dir_all(&state_dir)?;
-    let output_file = reconciler_output_path(&opts.paths.install_root, &candidate.manifest_sha256);
-    if let Some(parent) = output_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let input_file = state_dir.join("inputs.json");
-    // Managed, not private: these are the deployment's own signed inputs, and the reconciler that
-    // reads them may legitimately run as a different principal than the writer. A protected
-    // owner-only DACL here would hand the operator's hook a file it cannot open.
-    foundation::durable::atomic_write_managed(
-        &input_file,
-        ".inputs-",
-        &serde_json::to_vec(&opts.application.inputs)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-    )?;
-    // The flag names come from the published grammar itself, positionally paired with their values,
-    // so the agent cannot emit a flag the contract does not name — or stop emitting one a hook still
-    // reads — without this failing to compile.
-    let values: [&std::ffi::OsStr; updated_contracts::reconciler::FLAGS.len()] = [
-        std::ffi::OsStr::new("1"),
-        std::ffi::OsStr::new(lifecycle_attempt_id),
-        std::ffi::OsStr::new(reason.as_str()),
-        opts.paths.install_root.as_os_str(),
-        state_dir.as_os_str(),
-        candidate_dir.as_os_str(),
-        std::ffi::OsStr::new(&candidate.version),
-        output_file.as_os_str(),
-        input_file.as_os_str(),
-        predecessor_dir.as_os_str(),
-        std::ffi::OsStr::new(&predecessor.version),
-    ];
+    let output_snapshot = opts
+        .paths
+        .reconciler_output_snapshot(&candidate.release.manifest_sha256);
+    let invocation_data = InvocationData::create(&state_dir, &opts.inputs, output_snapshot)?;
+    // Each value is named for the flag it belongs to, and the published grammar itself binds the
+    // two: the agent cannot emit a flag the contract does not name, stop emitting one a hook still
+    // reads, or hand a value to the flag beside it.
+    let arguments = updated_contracts::reconciler::Arguments {
+        protocol: std::ffi::OsStr::new(updated_contracts::reconciler::PROTOCOL),
+        attempt_id: std::ffi::OsStr::new(lifecycle_attempt_id),
+        reason,
+        install_root: opts.paths.install_root.as_os_str(),
+        state_dir: state_dir.as_os_str(),
+        candidate: candidate_dir.as_os_str(),
+        candidate_version: std::ffi::OsStr::new(&candidate.release.version),
+        output_dir: invocation_data.output_dir.as_os_str(),
+        result_file: invocation_data.result_file.as_os_str(),
+        input_dir: invocation_data.input_dir.as_os_str(),
+        predecessor: predecessor_dir.as_os_str(),
+        predecessor_version: std::ffi::OsStr::new(&predecessor.release.version),
+    };
     let mut cmd = reconciler_command(&resolved.program)?;
     cmd.arg(phase_name);
-    for (flag, value) in updated_contracts::reconciler::FLAGS.iter().zip(values) {
+    for (flag, value) in arguments.argv() {
         cmd.arg(flag).arg(value);
     }
     if !lifecycle.args.is_empty() {
@@ -849,11 +1079,12 @@ fn prepare_lifecycle_command(
         cmd.arg("--").args(&lifecycle.args);
     }
     cmd.current_dir(&resolved.cwd)
-        .env_clear()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    apply_reconciler_environment(&mut cmd, opts.secrets.values());
+    // THE invocation environment, shared with `updatectl reconciler-check` so the harness cannot be
+    // stricter or looser than a real node. It clears the environment itself.
+    updated::reconciler::apply_environment(&mut cmd);
     // A wrapper commonly waits on vendor CLIs, curl, or mount helpers. Run it as a
     // contained tree (Unix process group / Windows job object) so a timeout takes the
     // whole tree down, not just the shell — leaving the foreground operation orphaned.
@@ -865,19 +1096,8 @@ fn prepare_lifecycle_command(
         command: cmd,
         phase,
         timeout,
+        invocation_data,
     })
-}
-
-/// Outputs are partitioned by immutable application archive. A failed candidate can leave its own
-/// file behind without ever having those values attributed to the restored predecessor.
-pub(crate) fn reconciler_output_path(
-    install_root: &std::path::Path,
-    archive_sha256: &str,
-) -> std::path::PathBuf {
-    install_root
-        .join("providers")
-        .join("outputs")
-        .join(format!("{archive_sha256}.json"))
 }
 
 const FINGERPRINT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -918,7 +1138,7 @@ fn without_blocking_the_runtime<T>(body: impl FnOnce() -> T) -> T {
 fn run_prepared_lifecycle_command(
     prepared: PreparedLifecycleCommand,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> io::Result<ReconcilerOutput> {
+) -> Result<ReconcilerOutput, InvocationFailure> {
     without_blocking_the_runtime(move || {
         run_prepared_lifecycle_command_blocking(prepared, cancelled)
     })
@@ -927,147 +1147,188 @@ fn run_prepared_lifecycle_command(
 fn run_prepared_lifecycle_command_blocking(
     prepared: PreparedLifecycleCommand,
     cancelled: Option<&std::sync::atomic::AtomicBool>,
-) -> io::Result<ReconcilerOutput> {
+) -> Result<ReconcilerOutput, InvocationFailure> {
     let PreparedLifecycleCommand {
         command,
         phase,
         timeout,
+        invocation_data,
     } = prepared;
     let phase_name = phase.as_str();
-    let mut child = foundation::process::ContainedChild::spawn(command)?;
-    let stdout = capture_reconciler_output(
+    let mut child = foundation::process::ContainedChild::spawn(command)
+        .map_err(InvocationFailure::Unreached)?;
+    let stdout = updated::reconciler::capture_output(
         child
             .take_stdout()
-            .ok_or_else(|| io::Error::other("node reconciler stdout was not captured"))?,
+            .ok_or_else(|| io::Error::other("node reconciler stdout was not captured"))
+            .map_err(InvocationFailure::Unreached)?,
     );
-    let stderr = capture_reconciler_output(
+    let stderr = updated::reconciler::capture_output(
         child
             .take_stderr()
-            .ok_or_else(|| io::Error::other("node reconciler stderr was not captured"))?,
+            .ok_or_else(|| io::Error::other("node reconciler stderr was not captured"))
+            .map_err(InvocationFailure::Unreached)?,
     );
-    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "lifecycle timeout is too large",
-        )
-    })?;
-    loop {
-        if let Some(status) = child.try_wait()? {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lifecycle timeout is too large",
+            )
+        })
+        .map_err(InvocationFailure::Unreached)?;
+    // How this invocation ended. Nothing below returns early: the two capture threads are blocked
+    // on the hook's pipes and `report_reconciler_output` is the only place they are joined, so a
+    // `?` between spawning them and joining would leak both threads and their pipe fds, and drop
+    // `child` unreaped — `ContainedChild` has no Unix `Drop`, so the hook tree would also keep
+    // running outside any containment while the caller is told it timed out. A teardown that did
+    // not finish — a kill that really failed (EPERM against a hook that escalated privilege), or a
+    // leader still unreaped when the kill headroom expired — is folded into the reported error
+    // instead of replacing the reason we are here.
+    enum Ending {
+        Exited(std::process::ExitStatus),
+        Unwaitable(io::Error),
+        Cancelled,
+        TimedOut,
+    }
+    // Kill the tree and reap the leader — under a bound, and reaping even when the kill failed so a
+    // leader that exits anyway does not become a zombie. `stop` is the workspace's one stop
+    // sequence (ask, kill, then give the reap `KILL_HEADROOM`); the bound is the point. An
+    // unbounded `wait()` here waits on a leader the kill may never have reached — EPERM against a
+    // hook that setuid'd away from this unprivileged agent, or one wedged in uninterruptible I/O —
+    // and this is the apply/rollback path, so that wait is the whole deployment loop stopping
+    // forever rather than failing the operation with a reason.
+    let kill_and_reap = |child: &mut foundation::process::ContainedChild| {
+        match child.stop(Duration::ZERO) {
+            foundation::process::Stopped::Gracefully | foundation::process::Stopped::Killed => {
+                Ok(())
+            }
+            // Reported, not waited on. What follows still joins the capture threads, which the
+            // survivor may hold open by keeping the inherited pipes — the hook obligation
+            // `updatectl reconciler-check` exists to catch before a release ships.
+            foundation::process::Stopped::Surviving => Err(io::Error::other(format!(
+                "its leader was still unreaped {:?} after the kill",
+                foundation::process::KILL_HEADROOM
+            ))),
+        }
+    };
+    let (ending, teardown) = loop {
+        match child.try_wait() {
             // A wrapper may exit successfully while a background descendant retains the captured
             // pipes. Tear down the remainder of this disposable hook tree before joining the
-            // readers; otherwise inherited stdout/stderr can bypass the lifecycle deadline.
-            child.kill_tree()?;
-            let output = report_reconciler_output(phase, stdout, stderr)?;
-            return if status.success() {
-                Ok(output)
-            } else {
-                Err(io::Error::other(format!(
-                    "node reconciler {phase_name} exited with {status}"
-                )))
-            };
+            // readers; otherwise inherited stdout/stderr can bypass the lifecycle deadline. The
+            // leader is already reaped, so this kill must not wait on it.
+            Ok(Some(status)) => break (Ending::Exited(status), child.kill_tree()),
+            Ok(None) => {}
+            Err(error) => break (Ending::Unwaitable(error), kill_and_reap(&mut child)),
         }
         if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
-            child.kill_tree()?;
-            child.wait()?;
-            report_reconciler_output(phase, stdout, stderr)?;
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("node reconciler {phase_name} was cancelled for deployment reconciliation"),
-            ));
+            break (Ending::Cancelled, kill_and_reap(&mut child));
         }
         if Instant::now() >= deadline {
-            child.kill_tree()?;
-            child.wait()?;
-            report_reconciler_output(phase, stdout, stderr)?;
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "node reconciler {phase_name} exceeded its {}s timeout",
-                    timeout.as_secs_f64()
-                ),
-            ));
+            break (Ending::TimedOut, kill_and_reap(&mut child));
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// THE environment every reconciler invocation runs with: a cleared environment, the minimum a
-/// script needs to find an interpreter, and the deployment's resolved secret values named by
-/// `SecretReference.environment`.
-///
-/// One chokepoint, so a secret cannot reach a hook by any other route and cannot be missing from
-/// one. Values go in the environment and never in argv — argv is world-readable in `ps` on every
-/// platform this runs on — and they are applied last so a secret always wins over an ambient name.
-fn apply_reconciler_environment(
-    command: &mut Command,
-    secrets: &std::collections::BTreeMap<String, String>,
-) {
-    #[cfg(unix)]
-    command.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
-
-    #[cfg(windows)]
-    {
-        let system_root = std::env::var_os("SystemRoot")
-            .or_else(|| std::env::var_os("WINDIR"))
-            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-        let system32 = PathBuf::from(&system_root).join("System32");
-        let powershell = system32.join("WindowsPowerShell/v1.0");
-        command
-            .env("SystemRoot", &system_root)
-            .env("WINDIR", &system_root)
-            .env(
-                "PATH",
-                std::env::join_paths([system32, powershell]).unwrap_or_default(),
-            );
-        for name in ["TEMP", "TMP"] {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
+    };
+    let capture =
+        report_reconciler_output(phase, stdout, stderr).map_err(InvocationFailure::Unreached)?;
+    let also = match &teardown {
+        Ok(()) => String::new(),
+        Err(error) => format!(" (tearing down its process tree also failed: {error})"),
+    };
+    match ending {
+        Ending::Exited(status) if status.success() => match teardown {
+            Ok(()) => {
+                let result = invocation_data.take_result(phase).map_err(|error| {
+                    if error.kind() == io::ErrorKind::InvalidData {
+                        InvocationFailure::Answered(error)
+                    } else {
+                        InvocationFailure::Unreached(error)
+                    }
+                })?;
+                if phase.publishes_outputs()
+                    && matches!(&result, updated::reconciler::InvocationResult::Mutation(result) if {
+                        result.status == updated_contracts::reconciler::ResultStatus::Succeeded
+                    })
+                {
+                    invocation_data
+                        .publish_outputs()
+                        .map_err(InvocationFailure::Unreached)?;
+                }
+                Ok(ReconcilerOutput { capture, result })
             }
-        }
-    }
-
-    for (name, value) in secrets {
-        command.env(name, value);
+            Err(error) => Err(InvocationFailure::Unreached(error)),
+        },
+        Ending::Exited(status) => Err(InvocationFailure::Answered(io::Error::other(format!(
+            "node reconciler {phase_name} exited with {status}{also}"
+        )))),
+        Ending::Unwaitable(error) => Err(InvocationFailure::Unreached(io::Error::other(format!(
+            "waiting on node reconciler {phase_name} failed: {error}{also}"
+        )))),
+        Ending::Cancelled => Err(InvocationFailure::Unreached(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!(
+                "node reconciler {phase_name} was cancelled for deployment \
+                 reconciliation{also}"
+            ),
+        ))),
+        Ending::TimedOut => Err(InvocationFailure::Answered(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "node reconciler {phase_name} exceeded its {}s timeout{also}",
+                timeout.as_secs_f64()
+            ),
+        ))),
     }
 }
-
-const RECONCILER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 struct ReconcilerOutput {
+    capture: CapturedOutput,
+    result: updated::reconciler::InvocationResult,
+}
+
+struct CapturedOutput {
     stdout: Vec<u8>,
     stdout_truncated: bool,
 }
 
-fn capture_reconciler_output(
-    mut input: impl std::io::Read + Send + 'static,
-) -> std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>> {
-    std::thread::spawn(move || {
-        let mut captured = Vec::new();
-        let mut truncated = false;
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let read = input.read(&mut buffer)?;
-            if read == 0 {
-                return Ok((captured, truncated));
-            }
-            let remaining = RECONCILER_OUTPUT_LIMIT.saturating_sub(captured.len());
-            captured.extend_from_slice(&buffer[..read.min(remaining)]);
-            truncated |= read > remaining;
-        }
-    })
-}
+/// How long a captured pipe is given to reach EOF once the invocation is over and its tree has been
+/// torn down.
+///
+/// In every conforming invocation EOF has already happened and this waits for nothing: the hook and
+/// everything in its tree are gone, so their descriptors are closed. A pipe still open past it means
+/// a descendant escaped the tree entirely — detached with `setsid` while keeping the inherited
+/// stdout/stderr, which `docs/node-reconciler-protocol.md` forbids and `updatectl reconciler-check`
+/// fails a hook for. Reading that pipe is a wait no kill can end, on the apply/rollback path: the
+/// node's whole deployment loop stopped forever by one stray descendant. So the read is abandoned
+/// and the operation answered with what arrived, which for an `inspect` means no fingerprint is
+/// published rather than no report at all.
+const READER_GRACE: Duration = Duration::from_secs(5);
 
 fn report_reconciler_output(
     phase: Operation,
-    stdout: std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
-    stderr: std::thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
-) -> io::Result<ReconcilerOutput> {
+    stdout: std::sync::mpsc::Receiver<io::Result<(Vec<u8>, bool)>>,
+    stderr: std::sync::mpsc::Receiver<io::Result<(Vec<u8>, bool)>>,
+) -> io::Result<CapturedOutput> {
     let operation = phase.as_str();
     let mut stdout_result = None;
-    for (stream, handle) in [("stdout", stdout), ("stderr", stderr)] {
-        let (bytes, truncated) = handle
-            .join()
-            .map_err(|_| io::Error::other("node reconciler output reader panicked"))??;
+    for (stream, reader) in [("stdout", stdout), ("stderr", stderr)] {
+        let (bytes, truncated) = match reader.recv_timeout(READER_GRACE) {
+            Ok(result) => result?,
+            // Abandoned, not waited on: see `READER_GRACE`. Reported, because a hook that leaves a
+            // descendant holding these pipes has broken a published obligation and the operator
+            // needs the name of the hook that did it.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                warn(&format!(
+                    "node reconciler {operation} {stream} was still open {READER_GRACE:?} after its                      process tree was torn down; a descendant escaped the tree holding it.                      Abandoning the read"
+                ));
+                (Vec::new(), true)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("node reconciler output reader panicked"))
+            }
+        };
         // Fingerprint stdout is opaque measured state, not diagnostics. It is hashed below and
         // must never be copied into logs; stderr remains the script's diagnostic channel.
         if !(bytes.is_empty() || phase == Operation::Inspect && stream == "stdout") {
@@ -1083,7 +1344,7 @@ fn report_reconciler_output(
     }
     let (stdout, stdout_truncated) =
         stdout_result.ok_or_else(|| io::Error::other("node reconciler stdout result was lost"))?;
-    Ok(ReconcilerOutput {
+    Ok(CapturedOutput {
         stdout,
         stdout_truncated,
     })
@@ -1147,23 +1408,78 @@ exec "$@"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::release;
+
+    fn test_invocation_data() -> InvocationData {
+        let state_dir = std::env::temp_dir().join(format!(
+            "updated-agent-invocation-test-{}-{}",
+            std::process::id(),
+            updated::rand::token().unwrap()
+        ));
+        InvocationData::create(
+            &state_dir,
+            &updated_contracts::dataflow::FileSnapshot::default(),
+            state_dir.join("outputs.json"),
+        )
+        .unwrap()
+    }
+
+    fn observation_output(stdout: Vec<u8>, stdout_truncated: bool) -> ReconcilerOutput {
+        ReconcilerOutput {
+            capture: CapturedOutput {
+                stdout,
+                stdout_truncated,
+            },
+            result: updated::reconciler::InvocationResult::Observation,
+        }
+    }
+
+    fn successful_no_change_result() -> updated_contracts::reconciler::ResultDocument {
+        updated_contracts::reconciler::ResultDocument {
+            schema: updated_contracts::reconciler::ResultDocument::SCHEMA,
+            status: updated_contracts::reconciler::ResultStatus::Succeeded,
+            changed: false,
+            host_action: updated_contracts::reconciler::HostAction::None,
+            retry_after_seconds: None,
+            message: None,
+        }
+    }
+
+    fn target(release: &updated::bundle::ReleaseId) -> ReleaseTarget<'_> {
+        ReleaseTarget {
+            release,
+            archive_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
+    }
+
+    #[test]
+    fn boot_cleanup_removes_crashed_plaintext_exchanges_and_only_those_exchanges() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = updated::config::Paths::resolve(root.path(), &root.path().join("enrollment"));
+        let product_state = paths.reconciler_state_dir("database");
+        let stale = product_state.join("invocations/abandoned/inputs/password");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"plaintext secret").unwrap();
+        let durable = product_state.join("database.state");
+        std::fs::write(&durable, b"keep").unwrap();
+
+        clear_stale_invocation_data(&paths).unwrap();
+
+        assert!(!product_state.join("invocations").exists());
+        assert_eq!(std::fs::read(&durable).unwrap(), b"keep");
+        clear_stale_invocation_data(&paths).unwrap();
+    }
 
     #[test]
     fn fingerprint_hashes_exact_stdout_bytes_without_text_normalization() {
         let exact = fingerprint_from_output(
             &"a".repeat(64),
-            ReconcilerOutput {
-                stdout: b"state\n".to_vec(),
-                stdout_truncated: false,
-            },
+            observation_output(b"state\n".to_vec(), false),
         )
         .unwrap();
         let without_newline = fingerprint_from_output(
             &"a".repeat(64),
-            ReconcilerOutput {
-                stdout: b"state".to_vec(),
-                stdout_truncated: false,
-            },
+            observation_output(b"state".to_vec(), false),
         )
         .unwrap();
 
@@ -1175,10 +1491,7 @@ mod tests {
     fn a_truncated_fingerprint_is_never_attested() {
         let error = fingerprint_from_output(
             &"a".repeat(64),
-            ReconcilerOutput {
-                stdout: vec![0; RECONCILER_OUTPUT_LIMIT],
-                stdout_truncated: true,
-            },
+            observation_output(vec![0; updated::reconciler::OUTPUT_LIMIT], true),
         )
         .unwrap_err();
 
@@ -1187,14 +1500,8 @@ mod tests {
 
     #[test]
     fn an_empty_fingerprint_is_never_attested() {
-        let error = fingerprint_from_output(
-            &"a".repeat(64),
-            ReconcilerOutput {
-                stdout: Vec::new(),
-                stdout_truncated: false,
-            },
-        )
-        .unwrap_err();
+        let error = fingerprint_from_output(&"a".repeat(64), observation_output(Vec::new(), false))
+            .unwrap_err();
 
         assert!(error.to_string().contains("no measured state"));
     }
@@ -1252,6 +1559,7 @@ mod tests {
             command,
             phase: Operation::Inspect,
             timeout: Duration::from_secs(30),
+            invocation_data: test_invocation_data(),
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&cancelled);
@@ -1269,6 +1577,84 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    /// Every wait on this path is bounded, because this path is the deployment loop. The tree is
+    /// gone by the time the pipes are read, so a pipe that never reaches EOF is a descendant that
+    /// escaped the tree still holding the inherited stdout/stderr — detached with `setsid` but
+    /// never redirected, which the protocol forbids and `updatectl reconciler-check` fails a hook
+    /// for. Joining that reader stopped apply, rollback, and every probe on the node forever, for a
+    /// hook that had already exited zero. Now the read is abandoned and the operation answers.
+    #[test]
+    fn a_pipe_that_never_reaches_eof_is_abandoned_instead_of_stalling_the_invocation() {
+        struct NeverEof;
+        impl std::io::Read for NeverEof {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(3600));
+                Ok(0)
+            }
+        }
+        let started = Instant::now();
+        let output = report_reconciler_output(
+            Operation::Apply,
+            updated::reconciler::capture_output(NeverEof),
+            updated::reconciler::capture_output(std::io::empty()),
+        )
+        .expect("an abandoned read still answers the invocation");
+        assert!(output.stdout.is_empty());
+        assert!(
+            output.stdout_truncated,
+            "output that was never collected must not pass as complete"
+        );
+        assert!(
+            started.elapsed() < READER_GRACE * 3,
+            "the read is abandoned on a deadline, not joined"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_retry_result_cannot_publish_candidate_outputs() {
+        let invocation_data = test_invocation_data();
+        let output_snapshot = invocation_data.output_snapshot.clone();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf secret >\"$OUTPUT_DIR/value\"; \
+                 printf '%s' '{\"schema\":1,\"status\":\"retry\",\"changed\":true,\"hostAction\":\"none\",\"retryAfterSeconds\":1,\"message\":null}' >\"$RESULT_FILE\"",
+            ])
+            .env("OUTPUT_DIR", &invocation_data.output_dir)
+            .env("RESULT_FILE", &invocation_data.result_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        foundation::process::arrange_parent_death_signal(&mut command);
+
+        let output = run_prepared_lifecycle_command(
+            PreparedLifecycleCommand {
+                command,
+                phase: Operation::Apply,
+                timeout: Duration::from_secs(5),
+                invocation_data,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            output.result,
+            updated::reconciler::InvocationResult::Mutation(
+                updated_contracts::reconciler::ResultDocument {
+                    status: updated_contracts::reconciler::ResultStatus::Retry,
+                    ..
+                }
+            )
+        ));
+        assert!(
+            !output_snapshot.exists(),
+            "only a succeeded result may replace the durable output snapshot"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn successful_hook_kills_its_undetached_tree_but_not_a_detached_workload() {
@@ -1277,7 +1663,7 @@ mod tests {
         // its own successful `apply`, and a hook that wants the workload to belong to the release
         // must move it out of the tree first. Both halves are asserted, because a "fix" that spares
         // the tree on success would let a wrapper's inherited pipes outlive the deadline.
-        fn run(script: &str) -> (io::Result<ReconcilerOutput>, PathBuf) {
+        fn run(script: &str) -> (Result<ReconcilerOutput, InvocationFailure>, PathBuf) {
             let dir = std::env::temp_dir().join(format!(
                 "hook-detach-{}-{}",
                 std::process::id(),
@@ -1285,10 +1671,12 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).unwrap();
             let pidfile = dir.join("workload.pid");
+            let invocation_data = test_invocation_data();
             let mut command = Command::new("/bin/sh");
             command
                 .args(["-c", script])
                 .env("PIDFILE", &pidfile)
+                .env("RESULT_FILE", &invocation_data.result_file)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -1298,6 +1686,7 @@ mod tests {
                     command,
                     phase: Operation::Apply,
                     timeout: Duration::from_secs(30),
+                    invocation_data,
                 },
                 None,
             );
@@ -1324,7 +1713,10 @@ mod tests {
             alive(pid) == want
         }
 
-        let (outcome, pidfile) = run("sleep 60 & echo $! > \"$PIDFILE\"; exit 0");
+        let (outcome, pidfile) = run(
+            "sleep 60 & echo $! > \"$PIDFILE\"; \
+             printf '%s' '{\"schema\":1,\"status\":\"succeeded\",\"changed\":true,\"hostAction\":\"none\",\"retryAfterSeconds\":null,\"message\":null}' >\"$RESULT_FILE\"",
+        );
         outcome.expect("the hook succeeded");
         let undetached = recorded_pid(&pidfile);
         assert!(
@@ -1345,7 +1737,8 @@ mod tests {
         }
         let (outcome, pidfile) = run(
             "setsid sh -c 'echo $$ > \"$PIDFILE\"; exec sleep 60' </dev/null >/dev/null 2>&1 &\n\
-             while [ ! -s \"$PIDFILE\" ]; do sleep 0.05; done; exit 0",
+             while [ ! -s \"$PIDFILE\" ]; do sleep 0.05; done; \
+             printf '%s' '{\"schema\":1,\"status\":\"succeeded\",\"changed\":true,\"hostAction\":\"none\",\"retryAfterSeconds\":null,\"message\":null}' >\"$RESULT_FILE\"",
         );
         outcome.expect("the hook succeeded");
         let detached = recorded_pid(&pidfile);
@@ -1366,15 +1759,9 @@ mod tests {
         assert!(child.wait().unwrap().success());
     }
 
-    fn release(version: &str, digest: &str) -> updated::bundle::ReleaseId {
-        updated::bundle::ReleaseId {
-            version: version.into(),
-            manifest_sha256: digest.into(),
-        }
-    }
-
     fn reconciler_release() -> updated::state::ProviderRelease {
         updated::state::ProviderRelease {
+            provider_set_sha256: "f".repeat(64),
             product: "reconciler".into(),
             release: release("1.0.0", "reconciler-manifest"),
             archive_sha256: "reconciler-archive".into(),
@@ -1405,21 +1792,42 @@ mod tests {
     /// A scripted stand-in for the release's reconciler: it records every invocation and can be
     /// made to fail any operation, so each fault path of [`apply_update`] is provable without a
     /// subprocess.
+    #[derive(Clone, Copy)]
+    enum FakeFailure {
+        Answered,
+        Unreached(io::ErrorKind),
+    }
+
+    impl FakeFailure {
+        fn error(self, operation: &str) -> InvocationFailure {
+            match self {
+                Self::Answered => InvocationFailure::Answered(io::Error::other(format!(
+                    "injected {operation} answer"
+                ))),
+                Self::Unreached(kind) => InvocationFailure::Unreached(io::Error::new(
+                    kind,
+                    format!("injected {operation} invocation failure"),
+                )),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct FakeReconciler {
         /// Every invocation, as the operation's wire spelling and its attempt id — the two halves
         /// of the argv contract a gate is required to honour.
         invocations: Vec<(&'static str, String)>,
         fail_first_healthcheck: bool,
-        /// Fail EVERY healthcheck with this kind — a node-local fault in front of the reconciler
-        /// (`StorageFull`, `InvalidData`) as opposed to the reconciler's own answer (`Other`).
-        healthcheck_failure: Option<io::ErrorKind>,
+        /// Fail every healthcheck either before the reconciler or with its own answer.
+        healthcheck_failure: Option<FakeFailure>,
         /// The 1-based probe at which `healthcheck_failure` starts (0 and 1 both mean the first),
         /// so a fault can be made to arrive PART WAY THROUGH a grace period.
         healthcheck_failure_from: usize,
         healthcheck_calls: usize,
         fail_first_apply: bool,
+        unreach_first_apply: bool,
         applies: usize,
+        host_action: updated_contracts::reconciler::HostAction,
     }
 
     impl FakeReconciler {
@@ -1429,39 +1837,64 @@ mod tests {
                 .map(|(operation, _)| *operation)
                 .collect()
         }
-    }
 
-    impl Reconciler for FakeReconciler {
-        fn invoke(
+        fn invoke_operation(
             &mut self,
             operation: Operation,
             lifecycle_attempt_id: &str,
-            _: &updated::bundle::ReleaseId,
-            _: &updated::bundle::ReleaseId,
-        ) -> io::Result<()> {
+        ) -> Result<(), InvocationFailure> {
             self.invocations
                 .push((operation.as_str(), lifecycle_attempt_id.to_string()));
             match operation {
                 Operation::Healthcheck => {
                     self.healthcheck_calls += 1;
-                    if let Some(kind) = self.healthcheck_failure {
+                    if let Some(failure) = self.healthcheck_failure {
                         if self.healthcheck_calls >= self.healthcheck_failure_from.max(1) {
-                            return Err(io::Error::new(kind, "injected healthcheck failure"));
+                            return Err(failure.error("healthcheck"));
                         }
                     }
                     if self.fail_first_healthcheck && self.healthcheck_calls == 1 {
-                        return Err(io::Error::other("injected healthcheck failure"));
+                        return Err(FakeFailure::Answered.error("healthcheck"));
                     }
                 }
                 Operation::Apply => {
                     self.applies += 1;
+                    if self.unreach_first_apply && self.applies == 1 {
+                        return Err(
+                            FakeFailure::Unreached(io::ErrorKind::StorageFull).error("apply")
+                        );
+                    }
                     if self.fail_first_apply && self.applies == 1 {
-                        return Err(io::Error::other("injected apply failure"));
+                        return Err(FakeFailure::Answered.error("apply"));
                     }
                 }
                 Operation::Rollback | Operation::Inspect => {}
             }
             Ok(())
+        }
+    }
+
+    impl Reconciler for FakeReconciler {
+        fn mutate(
+            &mut self,
+            operation: MutationOperation,
+            lifecycle_attempt_id: &str,
+            _: ReleaseTarget<'_>,
+            _: ReleaseTarget<'_>,
+        ) -> Result<updated_contracts::reconciler::ResultDocument, InvocationFailure> {
+            self.invoke_operation(operation.operation(), lifecycle_attempt_id)?;
+            let mut result = successful_no_change_result();
+            result.host_action = self.host_action;
+            Ok(result)
+        }
+        fn observe(
+            &mut self,
+            operation: ObservationOperation,
+            lifecycle_attempt_id: &str,
+            _: ReleaseTarget<'_>,
+            _: ReleaseTarget<'_>,
+        ) -> Result<(), InvocationFailure> {
+            self.invoke_operation(operation.operation(), lifecycle_attempt_id)
         }
         fn verification_policy(&self) -> (Duration, u32, Duration) {
             (Duration::from_secs(1), 1, Duration::ZERO)
@@ -1504,7 +1937,13 @@ mod tests {
         let mut reconciler = FakeReconciler::default();
 
         assert!(matches!(
-            became_healthy(&mut reconciler, attempt::BOOT, &release, &release).await,
+            became_healthy(
+                &mut reconciler,
+                attempt::BOOT,
+                target(&release),
+                target(&release)
+            )
+            .await,
             Health::Ready
         ));
         assert_eq!(
@@ -1529,13 +1968,14 @@ mod tests {
             &mut store,
             &candidate,
             "archive-two",
+            "archive-two",
             test_lineage(),
             reconciler_release(),
         )
         .await
         .unwrap();
 
-        assert!(matches!(outcome, Outcome::Committed));
+        assert!(matches!(outcome, Outcome::Committed { .. }));
         let gates: Vec<&(&str, String)> = reconciler
             .invocations
             .iter()
@@ -1547,7 +1987,7 @@ mod tests {
         assert_eq!(gates.len(), 1);
         assert!(
             !updated_contracts::reconciler::attempt::is_reserved(attempt_id),
-            "a transaction gate carries its own attempt id, never a reserved observation identity"
+            "a transaction gate carries its own attempt id, never a reserved non-transaction identity"
         );
     }
 
@@ -1567,13 +2007,14 @@ mod tests {
             &mut store,
             &candidate,
             "archive-two",
+            "archive-two",
             test_lineage(),
             reconciler_release(),
         )
         .await
         .unwrap();
 
-        assert!(matches!(outcome, Outcome::Committed));
+        assert!(matches!(outcome, Outcome::Committed { .. }));
         assert_eq!(reconciler.operations(), ["apply", "healthcheck"]);
         assert_eq!(store.active.as_ref(), Some(&candidate));
         let attempts: std::collections::HashSet<&str> = reconciler
@@ -1582,6 +2023,50 @@ mod tests {
             .map(|(_, id)| id.as_str())
             .collect();
         assert_eq!(attempts.len(), 1, "one transaction, one attempt identity");
+    }
+
+    #[tokio::test]
+    async fn a_reboot_request_is_committed_without_a_pre_reboot_health_verdict() {
+        let previous = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = store_with(previous);
+        let mut reconciler = FakeReconciler {
+            host_action: updated_contracts::reconciler::HostAction::Reboot,
+            ..Default::default()
+        };
+
+        let outcome = apply_update(
+            &mut reconciler,
+            &mut store,
+            &candidate,
+            "archive-two",
+            "archive-two",
+            test_lineage(),
+            reconciler_release(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            Outcome::Committed {
+                host_action: updated_contracts::reconciler::HostAction::Reboot
+            }
+        ));
+        assert_eq!(
+            reconciler.operations(),
+            ["apply"],
+            "health is judged only after the host has crossed the requested reboot boundary"
+        );
+        assert_eq!(store.active.as_ref(), Some(&candidate));
+        assert!(
+            store
+                .installed
+                .as_ref()
+                .and_then(|installed| installed.pending.as_ref())
+                .is_some(),
+            "the predecessor remains available until post-reboot confirmation"
+        );
     }
 
     #[tokio::test]
@@ -1599,13 +2084,14 @@ mod tests {
             &mut store,
             &candidate,
             "archive-two",
+            "archive-two",
             test_lineage(),
             reconciler_release(),
         )
         .await
         .unwrap();
 
-        assert!(matches!(outcome, Outcome::Committed));
+        assert!(matches!(outcome, Outcome::Committed { .. }));
         assert_eq!(reconciler.healthcheck_calls, 2);
         assert!(store.rejected.is_empty());
     }
@@ -1619,20 +2105,32 @@ mod tests {
         let candidate = release("2.0.0", "two");
 
         let mut unreachable = FakeReconciler {
-            healthcheck_failure: Some(io::ErrorKind::StorageFull),
+            healthcheck_failure: Some(FakeFailure::Unreached(io::ErrorKind::StorageFull)),
             ..Default::default()
         };
         assert!(matches!(
-            became_healthy(&mut unreachable, attempt::BOOT, &candidate, &candidate).await,
+            became_healthy(
+                &mut unreachable,
+                attempt::BOOT,
+                target(&candidate),
+                target(&candidate),
+            )
+            .await,
             Health::Inconclusive(_)
         ));
 
         let mut answered = FakeReconciler {
-            healthcheck_failure: Some(io::ErrorKind::Other),
+            healthcheck_failure: Some(FakeFailure::Answered),
             ..Default::default()
         };
         assert!(matches!(
-            became_healthy(&mut answered, attempt::BOOT, &candidate, &candidate).await,
+            became_healthy(
+                &mut answered,
+                attempt::BOOT,
+                target(&candidate),
+                target(&candidate),
+            )
+            .await,
             Health::Unhealthy
         ));
     }
@@ -1649,14 +2147,20 @@ mod tests {
             // Probe 1 reaches the reconciler and it answers "not ready"; from probe 2 on, the state
             // volume is full and no probe reaches it again.
             fail_first_healthcheck: true,
-            healthcheck_failure: Some(io::ErrorKind::StorageFull),
+            healthcheck_failure: Some(FakeFailure::Unreached(io::ErrorKind::StorageFull)),
             healthcheck_failure_from: 2,
             ..Default::default()
         };
 
         assert!(
             matches!(
-                became_healthy(&mut reconciler, attempt::BOOT, &candidate, &candidate).await,
+                became_healthy(
+                    &mut reconciler,
+                    attempt::BOOT,
+                    target(&candidate),
+                    target(&candidate),
+                )
+                .await,
                 Health::Inconclusive(_)
             ),
             "one early answer must not latch the gate into judging the release"
@@ -1674,7 +2178,7 @@ mod tests {
         let candidate = release("2.0.0", "two");
         let mut store = store_with(previous);
         let mut reconciler = FakeReconciler {
-            healthcheck_failure: Some(io::ErrorKind::StorageFull),
+            healthcheck_failure: Some(FakeFailure::Unreached(io::ErrorKind::StorageFull)),
             ..Default::default()
         };
 
@@ -1682,6 +2186,7 @@ mod tests {
             &mut reconciler,
             &mut store,
             &candidate,
+            "archive-two",
             "archive-two",
             test_lineage(),
             reconciler_release(),
@@ -1715,6 +2220,7 @@ mod tests {
             &mut store,
             &candidate,
             "archive-two",
+            "archive-two",
             test_lineage(),
             reconciler_release(),
         )
@@ -1742,6 +2248,45 @@ mod tests {
         );
     }
 
+    /// Preparing and spawning the hook are node-local work. If they fail after the application
+    /// pointer moved, recovery must restore the predecessor, but the candidate's authenticated
+    /// bytes remain eligible: the release never got a chance to answer.
+    #[tokio::test]
+    async fn an_apply_that_never_reaches_the_reconciler_rolls_back_without_rejecting() {
+        let previous = release("1.0.0", "one");
+        let candidate = release("2.0.0", "two");
+        let mut store = store_with(previous);
+        let mut reconciler = FakeReconciler {
+            unreach_first_apply: true,
+            ..Default::default()
+        };
+
+        let outcome = apply_update(
+            &mut reconciler,
+            &mut store,
+            &candidate,
+            "archive-two",
+            "archive-two",
+            test_lineage(),
+            reconciler_release(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, Outcome::RollbackPending));
+        assert!(
+            store.rejected.is_empty(),
+            "a failure before the hook starts is not a verdict on the release"
+        );
+        assert!(
+            store
+                .journal
+                .as_ref()
+                .is_some_and(|tx| !tx.candidate_rejection_required),
+            "recovery is retained without inventing rejection evidence"
+        );
+    }
+
     #[tokio::test]
     async fn an_unwritable_rejection_mid_switchover_still_restarts_for_recovery() {
         // The state directory goes unwritable exactly when the failed candidate's rejection is
@@ -1761,6 +2306,7 @@ mod tests {
             &mut reconciler,
             &mut store,
             &candidate,
+            "archive-two",
             "archive-two",
             test_lineage(),
             reconciler_release(),
@@ -1787,19 +2333,21 @@ mod tests {
         let mut revised = reconciler_release();
         revised.release = release("2.0.0", "reconciler-two");
         revised.archive_sha256 = "reconciler-archive-two".into();
+        revised.provider_set_sha256 = "e".repeat(64);
 
         let outcome = apply_update(
             &mut reconciler,
             &mut store,
             &application_release,
             "previous-archive",
+            &revised.provider_set_sha256,
             test_lineage(),
             revised.clone(),
         )
         .await
         .unwrap();
 
-        assert!(matches!(outcome, Outcome::Committed));
+        assert!(matches!(outcome, Outcome::Committed { .. }));
         let Some(installed) = store.installed else {
             panic!("the reconciler revision must commit installed state");
         };
@@ -1809,90 +2357,39 @@ mod tests {
             .pending
             .expect("the reconciler revision must retain rollback intent");
         assert_ne!(pending.lifecycle.as_ref(), &revised);
+        assert_eq!(pending.candidate_rejection_sha256, "e".repeat(64));
     }
 
-    /// The one route a secret takes to the release: the environment of a reconciler invocation,
-    /// applied at the single chokepoint every hook goes through. Two properties matter and both are
-    /// asserted here — the values ARRIVE (a hook that cannot see them converges the machine onto
-    /// credentials it does not have), and they arrive in the ENVIRONMENT rather than argv, which is
-    /// world-readable in `ps` on every platform this runs on.
-    #[test]
-    fn secret_values_reach_a_reconciler_invocation_by_environment_and_never_by_argv() {
-        let secrets = std::collections::BTreeMap::from([
-            ("DATABASE_PASSWORD".to_string(), "assigned".to_string()),
-            ("API_TOKEN".to_string(), "token".to_string()),
-        ]);
-        let mut command = Command::new("/bin/true");
-        command.env_clear();
-        // An ambient name a hook might otherwise pick up; the assignment's value must win.
-        command.env("DATABASE_PASSWORD", "ambient");
-        apply_reconciler_environment(&mut command, &secrets);
+    #[tokio::test]
+    async fn a_bad_provider_only_revision_rejects_the_provider_set_not_the_running_app() {
+        let application_release = release("1.0.0", "one");
+        let mut store = store_with(application_release.clone());
+        let mut reconciler = FakeReconciler {
+            fail_first_apply: true,
+            ..Default::default()
+        };
+        let mut revised = reconciler_release();
+        revised.provider_set_sha256 = "e".repeat(64);
+        let provider_set_sha256 = revised.provider_set_sha256.clone();
 
-        let environment: std::collections::BTreeMap<String, String> = command
-            .get_envs()
-            .filter_map(|(name, value)| {
-                Some((name.to_str()?.to_string(), value?.to_str()?.to_string()))
-            })
-            .collect();
-        assert_eq!(
-            environment.get("DATABASE_PASSWORD").map(String::as_str),
-            Some("assigned"),
-            "an assigned secret outranks an ambient variable of the same name"
-        );
-        assert_eq!(
-            environment.get("API_TOKEN").map(String::as_str),
-            Some("token")
-        );
+        let outcome = apply_update(
+            &mut reconciler,
+            &mut store,
+            &application_release,
+            "previous-archive",
+            &provider_set_sha256,
+            test_lineage(),
+            revised,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, Outcome::RollbackPending));
+        assert!(store.is_rejected(&test_lineage(), &"e".repeat(64)));
         assert!(
-            command.get_args().next().is_none(),
-            "the chokepoint contributes no arguments, so no secret can land in argv"
+            !store.is_rejected(&test_lineage(), "previous-archive"),
+            "a provider failure must not blacklist application bytes already proven healthy"
         );
-
-        // And the chokepoint is the only one: the invocation builder hands the manager's values to
-        // exactly this function and reads them nowhere else, so there is no second route for a
-        // secret to reach a hook — or to be missing from one.
-        // Spelled in halves so these assertions do not count themselves.
-        let source = include_str!("update.rs");
-        assert_eq!(
-            source.matches(concat!("secrets", ".values()")).count(),
-            1,
-            "resolved secret values have exactly one reader"
-        );
-        assert!(source.contains(concat!(
-            "apply_reconciler_environment(&mut cmd, opts.secrets.",
-            "values());"
-        )));
-    }
-
-    #[test]
-    fn the_chokepoint_sets_exactly_the_names_a_secret_may_never_claim() {
-        // Secret values are applied last so a deployment's own value wins over an ambient one,
-        // which means every ambient name this chokepoint sets is shadowable — unless the contract
-        // refuses to let an assignment claim it. Coupling the two here is what stops a future
-        // ambient variable from being added on one side only.
-        let mut command = Command::new("hook");
-        apply_reconciler_environment(&mut command, &std::collections::BTreeMap::new());
-        let mut set: Vec<String> = command
-            .get_envs()
-            .filter_map(|(name, _)| Some(name.to_str()?.to_uppercase()))
-            .collect();
-        set.sort();
-        set.dedup();
-        let mut expected: Vec<String> =
-            updated_contracts::assignment::RECONCILER_AMBIENT_ENVIRONMENT
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect();
-        // TEMP/TMP are forwarded only when this machine has them; the contract blocks them either
-        // way, so the chokepoint's set is a subset of the reserved one and never exceeds it.
-        expected.sort();
-        for name in &set {
-            assert!(
-                expected.contains(name),
-                "{name} is set on every hook but no assignment is stopped from shadowing it"
-            );
-        }
-        assert!(set.contains(&"PATH".to_owned()));
     }
 
     #[test]
@@ -1905,27 +2402,7 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(catalog.len(), catalog.iter().collect::<HashSet<_>>().len());
-        for phase in [
-            TransactionPhase::PreflightStarted,
-            TransactionPhase::PreflightCompleted,
-            TransactionPhase::PrepareStarted,
-            TransactionPhase::Prepared,
-            TransactionPhase::ActivateStarted,
-            TransactionPhase::CandidateActivated,
-            TransactionPhase::HealthStarted,
-            TransactionPhase::CandidateHealthy,
-            TransactionPhase::FinalizeStarted,
-            TransactionPhase::Finalized,
-            TransactionPhase::CommitStarted,
-            TransactionPhase::Committed,
-            TransactionPhase::RollbackStarted,
-            TransactionPhase::RollbackActivateStarted,
-            TransactionPhase::PredecessorActivated,
-            TransactionPhase::RollbackHealthStarted,
-            TransactionPhase::PredecessorHealthy,
-            TransactionPhase::RollbackFinalizeStarted,
-            TransactionPhase::RolledBack,
-        ] {
+        for phase in TransactionPhase::ALL {
             assert!(catalog.contains(&boundary::durable_phase(phase)));
         }
     }

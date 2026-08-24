@@ -1,27 +1,29 @@
 //! The sole application artifact format: an immutable, manifested tar.zst release.
 
-use aws_lc_rs::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use crate::hash::{digests_match, sha256_bytes, sha256_file};
-use updated_contracts::is_sha256_hex;
+use crate::hash::sha256_file;
+use updated_contracts::digest::{digests_match, sha256_bytes, Sha256Hasher};
+use updated_contracts::is_canonical_sha256;
 
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
-/// The bundle manifest is a DESIRED-STATE contract in the sense `docs/wire-compatibility-design.md`
-/// defines: the publisher writes it and the NODE reads it, so no reader window can save a node that
-/// predates the shape (and `deny_unknown_fields` below means an added field is no cheaper than a
-/// bump). Restraint here is stricter than for the assignment, not looser: a manifest this node
-/// cannot accept surfaces as [`InstallError::Archive`] — a verdict on the BYTES — which is recorded
-/// as a durable, never-expiring rejection keyed by digest. Publishing a shape ahead of the fleet
-/// floor therefore makes every not-yet-upgraded node permanently refuse every new bundle, the one
-/// carrying its own agent included, and reverting the publisher does not heal them: the
-/// rejections outlive it, and only fresh bytes can be offered again.
+/// The one manifest shape this build reads and writes. Unknown fields and every non-current schema
+/// are refused. A malformed manifest is an [`InstallError::Archive`] and is durably rejected by
+/// content digest.
 pub(crate) const MANIFEST_SCHEMA: u32 = 1;
-const MANIFEST_BYTES_LIMIT: u64 = 4 << 20;
+const MANIFEST_BYTES_LIMIT: usize = 4 << 20;
+const ACTIVE_RELEASE_BYTES_LIMIT: usize = 4 << 10;
+const BUNDLE_TEMP_PREFIX: &str = ".bundle-";
+const DEFAULT_ARCHIVE_BYTES_LIMIT: u64 = 512 << 20;
+const BUNDLE_EXPANDED_BYTES_LIMIT: u64 = 1 << 30;
+const BUNDLE_FILE_BYTES_LIMIT: u64 = 512 << 20;
+/// Archive entries, including the generated manifest.
+const BUNDLE_FILES_LIMIT: usize = 16_384;
+const BUNDLE_PATH_BYTES_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,9 +37,15 @@ impl ReleaseId {
         format!("{}-{}", self.version, self.manifest_sha256)
     }
 
-    fn validate(&self) -> io::Result<()> {
-        semver::Version::parse(&self.version).map_err(invalid)?;
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        Self::validate_version(&self.version)?;
         validate_digest(&self.manifest_sha256)
+    }
+
+    fn validate_version(version: &str) -> io::Result<()> {
+        updated_contracts::identity::is_release_version(version)
+            .then_some(())
+            .ok_or_else(|| invalid("release version is not a bounded semantic version"))
     }
 }
 
@@ -73,11 +81,11 @@ pub(crate) struct BundleLimits {
 impl Default for BundleLimits {
     fn default() -> Self {
         Self {
-            archive_bytes: 512 << 20,
-            expanded_bytes: 1 << 30,
-            file_bytes: 512 << 20,
-            files: 16_384,
-            path_bytes: 1024,
+            archive_bytes: DEFAULT_ARCHIVE_BYTES_LIMIT,
+            expanded_bytes: BUNDLE_EXPANDED_BYTES_LIMIT,
+            file_bytes: BUNDLE_FILE_BYTES_LIMIT,
+            files: BUNDLE_FILES_LIMIT,
+            path_bytes: BUNDLE_PATH_BYTES_LIMIT,
         }
     }
 }
@@ -100,100 +108,178 @@ pub fn create_bundle(
     platform: &str,
     entrypoint: &str,
 ) -> io::Result<()> {
-    semver::Version::parse(version).map_err(invalid)?;
-    validate_relative(entrypoint, 1024)?;
+    let limits = BundleLimits::default();
+    validate_bundle_identity(product, version, platform, entrypoint, limits.path_bytes)?;
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(invalid("bundle source is not a regular directory"));
     }
     let mut paths = Vec::new();
-    collect_files(source, source, &mut paths)?;
+    collect_files(
+        source,
+        source,
+        &mut paths,
+        limits.files.saturating_sub(1),
+        limits.path_bytes,
+    )?;
     paths.sort();
-    let mut files = Vec::with_capacity(paths.len());
-    for relative in &paths {
-        let path = source.join(relative);
-        let metadata = fs::symlink_metadata(&path)?;
-        let executable = relative == entrypoint || is_executable(&metadata);
-        files.push(ManifestFile {
-            path: relative.clone(),
-            sha256: sha256_file(&path)?,
-            size: metadata.len(),
-            executable,
-        });
-    }
-    let manifest = BundleManifest {
-        schema: MANIFEST_SCHEMA,
-        product: product.to_string(),
-        version: version.to_string(),
-        platform: platform.to_string(),
-        entrypoint: entrypoint.to_string(),
-        files,
-    };
-    let expected = ExpectedBundle {
-        product,
-        version,
-        platform,
-    };
-    let manifest_bytes = serde_json::to_vec(&manifest).map_err(invalid)?;
-    BundleManifest::parse(&manifest_bytes, &expected)?;
 
-    if let Some(parent) = archive.parent().filter(|path| !path.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+    let archive_dir = foundation::durable::parent_dir(archive);
+    fs::create_dir_all(archive_dir)?;
+    let (output, temp_path) =
+        foundation::durable::create_temp_published(archive_dir, BUNDLE_TEMP_PREFIX)?;
+    let build = (|| -> io::Result<()> {
+        let encoder = zstd::stream::write::Encoder::new(output, 9)?;
+        let mut tar = tar::Builder::new(encoder);
+        tar.mode(tar::HeaderMode::Deterministic);
+
+        // Open one source at a time. The manifest digest and tar payload come from the same
+        // no-follow regular-file handle: hashing a pathname and reopening it would let a
+        // concurrent replacement publish bytes the manifest never described (and could follow a
+        // planted symlink to an unrelated local file). Appending before the generated manifest
+        // also keeps descriptor use constant for bundles all the way up to the 16K-file contract
+        // limit; the reader deliberately treats archive order as irrelevant.
+        let mut files = Vec::with_capacity(paths.len());
+        let mut expanded = 0u64;
+        for relative in &paths {
+            let path = source.join(relative);
+            let mut input =
+                foundation::file::open_regular(&path, foundation::file::FinalSymlink::Refuse)?;
+            let metadata = input.metadata()?;
+            if metadata.len() > limits.file_bytes {
+                return Err(invalid("bundle member exceeds file-size limit"));
+            }
+            let executable = relative == entrypoint || is_executable(&metadata);
+            let (sha256, size) = crate::hash::sha256_file_handle(&mut input)?;
+            if size > limits.file_bytes {
+                return Err(invalid("bundle member exceeds file-size limit"));
+            }
+            expanded = expanded
+                .checked_add(size)
+                .ok_or_else(|| invalid("bundle size overflow"))?;
+            if expanded > limits.expanded_bytes {
+                return Err(invalid("bundle exceeds expanded-size limit"));
+            }
+            let file = ManifestFile {
+                path: relative.clone(),
+                sha256,
+                size,
+                executable,
+            };
+            append_file(&mut tar, &file, &mut input)?;
+            files.push(file);
+        }
+        let manifest = BundleManifest {
+            schema: MANIFEST_SCHEMA,
+            product: product.to_string(),
+            version: version.to_string(),
+            platform: platform.to_string(),
+            entrypoint: entrypoint.to_string(),
+            files,
+        };
+        let expected = ExpectedBundle {
+            product,
+            version,
+            platform,
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).map_err(invalid)?;
+        BundleManifest::parse(&manifest_bytes, &expected)?;
+        append_bytes(&mut tar, MANIFEST_FILE, &manifest_bytes, false)?;
+        let encoder = tar.into_inner()?;
+        encoder.finish()?.sync_all()
+    })();
+    if let Err(error) = build {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    let output = File::create(archive)?;
-    let encoder = zstd::stream::write::Encoder::new(output, 9)?;
-    let mut tar = tar::Builder::new(encoder);
-    tar.mode(tar::HeaderMode::Deterministic);
-    append_bytes(&mut tar, MANIFEST_FILE, &manifest_bytes, false)?;
-    for file in &manifest.files {
-        append_file(&mut tar, source, file)?;
+    if let Err(error) = foundation::durable::replace(&temp_path, archive) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    let encoder = tar.into_inner()?;
-    encoder.finish()?.sync_all()?;
-    Ok(())
+    foundation::durable::sync_dir(archive_dir)
 }
 
 /// Build the canonical archive from a `source` that is *either* a prepared directory tree or a
 /// single executable file. A directory is bundled as-is; a lone file is first wrapped into a fresh
 /// tree — the file placed at `entrypoint`, plus a generated `config/release.toml`
-/// carrying the version — built inside `wrap_dir`, then bundled. This is the one definition of the
+/// carrying the version — built as an exclusively-created child of `wrap_root`, then bundled. This is the one definition of the
 /// "wrap a lone binary" publishing shorthand, shared by every publish front end so the generated
-/// tree layout (and its `release.toml`) cannot drift between them. `wrap_dir` is (re)created fresh,
-/// so any stale contents from a previous build are removed first.
+/// tree layout (and its `release.toml`) cannot drift between them. The caller's root is never
+/// deleted or replaced; this function removes only the fresh child it successfully created.
 pub fn create_bundle_from_source(
     source: &Path,
     archive: &Path,
-    wrap_dir: &Path,
+    wrap_root: &Path,
     product: &str,
     version: &str,
     platform: &str,
     entrypoint: &str,
 ) -> io::Result<()> {
+    validate_bundle_identity(
+        product,
+        version,
+        platform,
+        entrypoint,
+        BUNDLE_PATH_BYTES_LIMIT,
+    )?;
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.is_file() {
         return create_bundle(source, archive, product, version, platform, entrypoint);
     }
-    if wrap_dir.exists() {
-        fs::remove_dir_all(wrap_dir)?;
-    }
-    let destination = wrap_dir.join(entrypoint);
+    let wrap = WrappedSource::create(wrap_root)?;
+    let destination = wrap.path().join(entrypoint);
     let parent = destination
         .parent()
         .ok_or_else(|| invalid("bundle entrypoint has no parent directory"))?;
     fs::create_dir_all(parent)?;
-    fs::create_dir_all(wrap_dir.join("config"))?;
+    fs::create_dir_all(wrap.path().join("config"))?;
     fs::copy(source, &destination)?;
     fs::write(
-        wrap_dir.join("config/release.toml"),
+        wrap.path().join("config/release.toml"),
         format!("version = {version:?}\n"),
     )?;
-    create_bundle(wrap_dir, archive, product, version, platform, entrypoint)
+    create_bundle(wrap.path(), archive, product, version, platform, entrypoint)
+}
+
+struct WrappedSource {
+    path: PathBuf,
+}
+
+impl WrappedSource {
+    fn create(root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        let metadata = fs::symlink_metadata(root)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(invalid("bundle wrapper root is not a real directory"));
+        }
+        for _ in 0..16 {
+            let path = root.join(format!(".bundle-tree-{}.tmp", crate::rand::token()?));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique bundle wrapper",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WrappedSource {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 impl BundleManifest {
     pub(crate) fn parse(bytes: &[u8], expected: &ExpectedBundle<'_>) -> io::Result<Self> {
-        let manifest: Self = serde_json::from_slice(bytes).map_err(invalid)?;
-        manifest.validate_shape()?;
+        let manifest = Self::parse_shape(bytes)?;
         if manifest.product != expected.product
             || manifest.version != expected.version
             || manifest.platform != expected.platform
@@ -205,27 +291,52 @@ impl BundleManifest {
         Ok(manifest)
     }
 
+    /// Decode and validate the one manifest shape independently of authenticated target identity.
+    /// Both installed-tree reads and archive ingestion go through this parser, so format limits
+    /// cannot drift between those two trust boundaries.
+    fn parse_shape(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MANIFEST_BYTES_LIMIT {
+            return Err(invalid("bundle manifest exceeds size limit"));
+        }
+        let manifest: Self = serde_json::from_slice(bytes).map_err(invalid)?;
+        manifest.validate_shape()?;
+        let mut expanded = bytes.len() as u64;
+        for file in &manifest.files {
+            expanded = expanded
+                .checked_add(file.size)
+                .ok_or_else(|| invalid("bundle size overflow"))?;
+        }
+        if expanded > BUNDLE_EXPANDED_BYTES_LIMIT {
+            return Err(invalid("bundle exceeds expanded-size limit"));
+        }
+        Ok(manifest)
+    }
+
     /// The one place a manifest's own well-formedness is decided — schema included. Every reader
     /// goes through here, so no caller restates a check that could drift from it.
     fn validate_shape(&self) -> io::Result<()> {
         if self.schema != MANIFEST_SCHEMA {
             return Err(invalid("unsupported bundle manifest schema"));
         }
-        let valid_product = !self.product.is_empty()
-            && self.product.len() <= 128
-            && self.product.bytes().enumerate().all(|(index, byte)| {
-                byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
-            });
-        if !valid_product {
+        if self.files.len() >= BUNDLE_FILES_LIMIT {
+            return Err(invalid("bundle exceeds file-count limit"));
+        }
+        if !updated_contracts::identity::is_segment(&self.product) {
             return Err(invalid("bundle product is invalid"));
         }
-        semver::Version::parse(&self.version).map_err(invalid)?;
+        ReleaseId::validate_version(&self.version)?;
+        if !updated_contracts::identity::is_segment(&self.platform) {
+            return Err(invalid("bundle platform is invalid"));
+        }
         validate_relative(&self.entrypoint, 1024)?;
         let mut exact = BTreeSet::new();
         let mut folded = BTreeSet::new();
         for file in &self.files {
-            validate_relative(&file.path, 1024)?;
+            validate_relative(&file.path, BUNDLE_PATH_BYTES_LIMIT)?;
             validate_digest(&file.sha256)?;
+            if file.size > BUNDLE_FILE_BYTES_LIMIT {
+                return Err(invalid("bundle member exceeds file-size limit"));
+            }
             if !exact.insert(file.path.clone()) || !folded.insert(file.path.to_lowercase()) {
                 return Err(invalid("duplicate or case-colliding manifest path"));
             }
@@ -269,9 +380,12 @@ pub(crate) fn read_release(root: &Path, id: &ReleaseId) -> io::Result<(BundleMan
     if !directory_meta.is_dir() || directory_meta.file_type().is_symlink() {
         return Err(invalid("release identity does not name a real directory"));
     }
-    let bytes = fs::read(directory.join(MANIFEST_FILE))?;
-    let manifest: BundleManifest = serde_json::from_slice(&bytes).map_err(invalid)?;
-    manifest.validate_shape()?;
+    let bytes = foundation::file::read_bounded_regular(
+        &directory.join(MANIFEST_FILE),
+        MANIFEST_BYTES_LIMIT,
+        foundation::file::FinalSymlink::Refuse,
+    )?;
+    let manifest = BundleManifest::parse_shape(&bytes)?;
     if manifest.version != id.version || !digests_match(&sha256_bytes(&bytes), &id.manifest_sha256)
     {
         return Err(invalid("release identity does not match its manifest"));
@@ -288,14 +402,23 @@ pub fn verify_release(root: &Path, id: &ReleaseId) -> io::Result<()> {
 }
 
 pub fn read_active(path: &Path) -> io::Result<Option<ReleaseId>> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(invalid),
+    match foundation::file::read_bounded_regular(
+        path,
+        ACTIVE_RELEASE_BYTES_LIMIT,
+        foundation::file::FinalSymlink::Refuse,
+    ) {
+        Ok(bytes) => {
+            let release: ReleaseId = serde_json::from_slice(&bytes).map_err(invalid)?;
+            release.validate()?;
+            Ok(Some(release))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
 
 pub fn write_active(path: &Path, release: &ReleaseId) -> io::Result<()> {
+    release.validate()?;
     foundation::durable::atomic_write_managed(
         path,
         ".active-release-",
@@ -387,14 +510,23 @@ pub(crate) fn stage_bundle(
     expected: &ExpectedBundle<'_>,
     limits: &BundleLimits,
 ) -> Result<ReleaseId, InstallError> {
-    let archive_meta = fs::symlink_metadata(archive)?;
-    if !archive_meta.is_file() {
-        // The downloaded archive is written by this node, so anything but a regular file here is
-        // local damage, not evidence about the release.
-        return Err(InstallError::Storage(invalid(
-            "the downloaded bundle archive is not a regular file",
-        )));
-    }
+    let mut archive =
+        foundation::file::open_regular(archive, foundation::file::FinalSymlink::Refuse)?;
+    stage_bundle_file(&mut archive, staging_root, versions_root, expected, limits)
+}
+
+/// The canonical bundle ingest path once the archive has been opened. TUF callers hand this the
+/// same verified file handle they received from the repository, so extraction cannot be redirected
+/// through a pathname replacement after authentication.
+pub(crate) fn stage_bundle_file(
+    archive: &mut File,
+    staging_root: &Path,
+    versions_root: &Path,
+    expected: &ExpectedBundle<'_>,
+    limits: &BundleLimits,
+) -> Result<ReleaseId, InstallError> {
+    archive.rewind()?;
+    let archive_meta = archive.metadata()?;
     if archive_meta.len() > limits.archive_bytes {
         return Err(archive_verdict(
             "bundle archive exceeds the target size limit",
@@ -434,7 +566,12 @@ pub(crate) fn stage_bundle(
     // as the top dir — so a power loss right after the rename cannot surface a release
     // whose nested dirents were never persisted.
     foundation::durable::sync_tree(stage.path())?;
-    fs::rename(stage.path(), &destination)?;
+    // `durable::replace`, not a bare rename: this publishes the tree the managed application runs
+    // FROM, so on a node replacing a running release the destination name is exactly where a
+    // teardown handle or an antivirus scan lingers. Every other content publish in this system goes
+    // through that one retrying primitive; a rename here that lost to a transient lock would be
+    // reported as a storage fault on a release that is perfectly good.
+    foundation::durable::replace(stage.path(), &destination)?;
     foundation::durable::sync_dir(versions_root)?;
     // Re-verify the freshly published tree against its manifest. Every member was hashed on the
     // way in, so a mismatch here is the device, not the release.
@@ -647,12 +784,12 @@ impl DeviceFault {
     }
 }
 
-struct ArchiveSource {
-    file: File,
+struct ArchiveSource<'a> {
+    file: &'a mut File,
     fault: DeviceFault,
 }
 
-impl Read for ArchiveSource {
+impl Read for ArchiveSource<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.file
             .read(buffer)
@@ -661,14 +798,14 @@ impl Read for ArchiveSource {
 }
 
 fn extract(
-    archive: &Path,
+    archive: &mut File,
     stage: &Path,
     expected: &ExpectedBundle<'_>,
     limits: &BundleLimits,
 ) -> Result<(BundleManifest, Vec<u8>), InstallError> {
     let fault = DeviceFault::default();
     let source = ArchiveSource {
-        file: File::open(archive)?,
+        file: archive,
         fault: fault.clone(),
     };
     let decoder = zstd::stream::read::Decoder::new(source).map_err(|e| fault.classify(e))?;
@@ -719,7 +856,7 @@ fn extract(
         // it has no declared digest to check here, and the digest that identifies it is computed
         // once from these same bytes by `manifest.id`.
         if path == MANIFEST_FILE {
-            if size > MANIFEST_BYTES_LIMIT {
+            if size > MANIFEST_BYTES_LIMIT as u64 {
                 return Err(archive_verdict("bundle manifest exceeds size limit"));
             }
             let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
@@ -735,7 +872,7 @@ fn extract(
             continue;
         }
         let digest = {
-            let mut context = Context::new(&SHA256);
+            let mut hasher = Sha256Hasher::new();
             let mut written = 0u64;
             let mut buffer = [0u8; 64 * 1024];
             loop {
@@ -744,7 +881,7 @@ fn extract(
                     break;
                 }
                 file.write_all(&buffer[..read])?;
-                context.update(&buffer[..read]);
+                hasher.update(&buffer[..read]);
                 written = written
                     .checked_add(read as u64)
                     .ok_or_else(|| archive_verdict("bundle member size overflow"))?;
@@ -752,7 +889,7 @@ fn extract(
             if written != size {
                 return Err(archive_verdict("truncated bundle member"));
             }
-            hex::encode(context.finish().as_ref())
+            hasher.finish_hex()
         };
         file.sync_all()?;
         // Never an overwrite: `create_new` above is the single place a colliding member is
@@ -777,7 +914,13 @@ fn extract(
     Ok((manifest, bytes))
 }
 
-fn collect_files(root: &Path, directory: &Path, out: &mut Vec<String>) -> io::Result<()> {
+fn collect_files(
+    root: &Path,
+    directory: &Path,
+    out: &mut Vec<String>,
+    max_files: usize,
+    max_path_bytes: usize,
+) -> io::Result<()> {
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
@@ -787,7 +930,7 @@ fn collect_files(root: &Path, directory: &Path, out: &mut Vec<String>) -> io::Re
             return Err(invalid("bundle source contains a symlink"));
         }
         if metadata.is_dir() {
-            collect_files(root, &path, out)?;
+            collect_files(root, &path, out, max_files, max_path_bytes)?;
         } else if metadata.is_file() {
             let relative = path
                 .strip_prefix(root)
@@ -798,7 +941,10 @@ fn collect_files(root: &Path, directory: &Path, out: &mut Vec<String>) -> io::Re
             if relative == MANIFEST_FILE {
                 return Err(invalid("bundle source must not contain manifest.json"));
             }
-            validate_relative(&relative, 1024)?;
+            validate_relative(&relative, max_path_bytes)?;
+            if out.len() >= max_files {
+                return Err(invalid("bundle exceeds file-count limit"));
+            }
             out.push(relative);
         } else {
             return Err(invalid("bundle source contains a non-regular file"));
@@ -809,12 +955,11 @@ fn collect_files(root: &Path, directory: &Path, out: &mut Vec<String>) -> io::Re
 
 fn append_file(
     builder: &mut tar::Builder<zstd::stream::write::Encoder<'_, File>>,
-    root: &Path,
     file: &ManifestFile,
+    input: &mut File,
 ) -> io::Result<()> {
-    let mut input = File::open(root.join(&file.path))?;
     let mut header = deterministic_header(file.size, file.executable)?;
-    builder.append_data(&mut header, &file.path, &mut input)
+    builder.append_data(&mut header, &file.path, input)
 }
 
 fn append_bytes(
@@ -930,8 +1075,25 @@ fn validate_relative(path: &str, max: usize) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_bundle_identity(
+    product: &str,
+    version: &str,
+    platform: &str,
+    entrypoint: &str,
+    max_path_bytes: usize,
+) -> io::Result<()> {
+    if !updated_contracts::identity::is_segment(product) {
+        return Err(invalid("bundle product is invalid"));
+    }
+    ReleaseId::validate_version(version)?;
+    if !updated_contracts::identity::is_segment(platform) {
+        return Err(invalid("bundle platform is invalid"));
+    }
+    validate_relative(entrypoint, max_path_bytes)
+}
+
 fn validate_digest(value: &str) -> io::Result<()> {
-    if !is_sha256_hex(value) {
+    if !is_canonical_sha256(value) {
         return Err(invalid("invalid SHA-256 digest"));
     }
     Ok(())
@@ -966,6 +1128,160 @@ mod tests {
         let path = dir.path().join(name);
         fs::create_dir_all(&path).unwrap();
         (dir, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archiving_uses_the_same_handle_the_manifest_hashed() {
+        let (_dir, root) = root("held-source");
+        let source = root.join("source");
+        fs::write(&source, b"intended release bytes").unwrap();
+        let mut input =
+            foundation::file::open_regular(&source, foundation::file::FinalSymlink::Refuse)
+                .unwrap();
+        let (sha256, size) = crate::hash::sha256_file_handle(&mut input).unwrap();
+        let manifest = ManifestFile {
+            path: "bin/app".into(),
+            sha256,
+            size,
+            executable: true,
+        };
+
+        // Replacing the pathname after the manifest pass must not change what lands in the
+        // archive. Before the held-handle boundary, this second file was what `append_file`
+        // reopened and published.
+        let replacement = root.join("replacement");
+        fs::write(&replacement, b"unrelated local secret").unwrap();
+        fs::rename(&replacement, &source).unwrap();
+
+        let archive = root.join("held.tar.zst");
+        let output = File::create(&archive).unwrap();
+        let encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
+        let mut builder = tar::Builder::new(encoder);
+        append_file(&mut builder, &manifest, &mut input).unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let decoder = zstd::stream::read::Decoder::new(File::open(archive).unwrap()).unwrap();
+        let mut tar = tar::Archive::new(decoder);
+        let mut entry = tar.entries().unwrap().next().unwrap().unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"intended release bytes");
+        assert_eq!(
+            updated_contracts::digest::sha256_bytes(&bytes),
+            manifest.sha256
+        );
+    }
+
+    #[test]
+    fn failed_bundle_build_preserves_the_previous_archive() {
+        let (_dir, root) = root("atomic-bundle-failure");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/app"), b"application").unwrap();
+        let archive = root.join("app.tar.zst");
+        fs::write(&archive, b"previous complete archive").unwrap();
+
+        // The missing entrypoint is discovered only after the source members have been streamed,
+        // so this is a genuinely late failure. It must discard only the sibling temp, never
+        // truncate the last complete artifact callers could still publish.
+        create_bundle(
+            &source,
+            &archive,
+            "app",
+            "1.0.0",
+            "test-platform",
+            "bin/missing",
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&archive).unwrap(), b"previous complete archive");
+        assert!(
+            fs::read_dir(&root).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(BUNDLE_TEMP_PREFIX)),
+            "a handled failure must not leave its private publication temp behind"
+        );
+    }
+
+    #[test]
+    fn lone_file_wrapping_owns_only_a_fresh_child_and_validates_before_mutating() {
+        let (_dir, root) = root("safe-wrapper");
+        let source = root.join("app");
+        fs::write(&source, b"application").unwrap();
+        let wrap_root = root.join("wrap-root");
+        fs::create_dir(&wrap_root).unwrap();
+        fs::write(wrap_root.join("caller-owned"), b"keep").unwrap();
+        let archive = root.join("app.tar.zst");
+
+        create_bundle_from_source(
+            &source,
+            &archive,
+            &wrap_root,
+            "app",
+            "1.0.0",
+            "test-platform",
+            "../../outside",
+        )
+        .unwrap_err();
+        assert_eq!(
+            fs::read(wrap_root.join("caller-owned")).unwrap(),
+            b"keep",
+            "invalid identity is refused before touching the caller's scratch root"
+        );
+        assert!(!root.join("outside").exists());
+
+        create_bundle_from_source(
+            &source,
+            &archive,
+            &wrap_root,
+            "app",
+            "1.0.0",
+            "test-platform",
+            "bin/app",
+        )
+        .unwrap();
+        assert_eq!(fs::read(wrap_root.join("caller-owned")).unwrap(), b"keep");
+        assert_eq!(
+            fs::read_dir(&wrap_root).unwrap().count(),
+            1,
+            "the exclusively-created wrapper is removed after publication"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_publication_replaces_an_output_symlink_without_following_it() {
+        let (_dir, root) = root("atomic-bundle-symlink");
+        let source = root.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/app"), b"application").unwrap();
+        let outside = root.join("outside");
+        fs::write(&outside, b"must remain untouched").unwrap();
+        let archive = root.join("app.tar.zst");
+        std::os::unix::fs::symlink(&outside, &archive).unwrap();
+
+        create_bundle(
+            &source,
+            &archive,
+            "app",
+            "1.0.0",
+            "test-platform",
+            "bin/app",
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&outside).unwrap(), b"must remain untouched");
+        assert!(
+            !fs::symlink_metadata(&archive)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the archive is the newly committed regular file, not the planted link"
+        );
+        zstd::stream::read::Decoder::new(File::open(archive).unwrap())
+            .expect("the replacement is a complete zstd archive");
     }
 
     #[test]
@@ -1388,6 +1704,126 @@ mod tests {
     /// reject and descend past. Classified as `Storage` (which is what a bare `?` on
     /// `create_new`/`create_dir_all` yields) the same bad version is retried on every boot forever
     /// and the ordered fallback never runs.
+    /// Rebuild `source`'s archive with one extra entry whose name is planted straight into the tar
+    /// header.
+    ///
+    /// The bundle stays otherwise VALID — same manifest, same members, same modes — so the only
+    /// thing wrong with it is the hostile name. That matters: an archive carrying nothing but a
+    /// hostile entry is refused for having no manifest, long before extraction looks at any path,
+    /// and a test built that way passes whether or not the confinement guard exists.
+    ///
+    /// The name is written into the header's raw 100-byte field because the `tar` crate refuses to
+    /// build a `..` path at all. The safe API cannot express what the extractor defends against,
+    /// which is why no test had ever produced one.
+    fn archive_with_hostile_entry(source: &Path, dest: &Path, hostile: &str) {
+        let mut original = Vec::new();
+        zstd::stream::copy_decode(File::open(source).unwrap(), &mut original).unwrap();
+
+        let encoder = zstd::stream::write::Encoder::new(File::create(dest).unwrap(), 1).unwrap();
+        let mut out = tar::Builder::new(encoder);
+        let mut input = tar::Archive::new(&original[..]);
+        for entry in input.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let header = entry.header().clone();
+            let mut bytes = Vec::new();
+            io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+            out.append(&header, &bytes[..]).unwrap();
+        }
+
+        let payload = b"owned";
+        let mut header = deterministic_header(payload.len() as u64, false).unwrap();
+        let raw = header.as_old_mut();
+        raw.name = [0u8; 100];
+        raw.name[..hostile.len()].copy_from_slice(hostile.as_bytes());
+        header.set_cksum();
+        out.append(&header, &payload[..]).unwrap();
+        out.into_inner()
+            .unwrap()
+            .finish()
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    }
+
+    /// Whether anything anywhere under `dir` is named `name`.
+    fn contains_entry_named(dir: &Path, name: &str) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry.file_name() == name
+                || (entry.path().is_dir() && contains_entry_named(&entry.path(), name))
+        })
+    }
+
+    /// An archive entry that names a path outside the tree is refused before anything is written.
+    ///
+    /// `extract` runs every entry path through the shared confinement grammar, and nothing proved
+    /// it. The manifest's own escaping-path case was covered, but that is a different gate on a
+    /// different document: an archive can carry entry names the manifest never mentions. Drop the
+    /// `validate_relative` call during a refactor and every existing test still passes, while a
+    /// bundle writes wherever its entry names point.
+    #[test]
+    fn archive_entries_may_not_name_a_path_outside_the_tree() {
+        let (_dir, root) = root("confinement");
+        let staging = root.join("staging");
+        let versions = root.join("versions");
+        let expected = ExpectedBundle {
+            product: "app",
+            version: "1.0.0",
+            platform: "test-platform",
+        };
+
+        // A genuine, well-formed bundle to graft the hostile entry onto.
+        let source = root.join("source");
+        fs::create_dir_all(source.join("bin")).unwrap();
+        fs::write(source.join("bin/app"), b"the real executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(source.join("bin/app"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let good = root.join("good.tar.zst");
+        create_bundle(&source, &good, "app", "1.0.0", "test-platform", "bin/app").unwrap();
+        stage_bundle(
+            &good,
+            &staging,
+            &versions,
+            &expected,
+            &BundleLimits::default(),
+        )
+        .expect("the base bundle is valid, so the hostile name is the only difference");
+
+        for hostile in [
+            "../escape",
+            "bin/../../escape",
+            "/etc/escape",
+            "./../escape",
+        ] {
+            let archive = root.join("hostile.tar.zst");
+            let _ = fs::remove_file(&archive);
+            archive_with_hostile_entry(&good, &archive, hostile);
+
+            let error = stage_bundle(
+                &archive,
+                &staging,
+                &versions,
+                &expected,
+                &BundleLimits::default(),
+            )
+            .expect_err("a hostile entry name must be refused");
+            assert!(
+                matches!(error, InstallError::Archive(_)),
+                "{hostile}: a hostile entry name is a verdict on the bytes, not on the disk: \
+                 {error}"
+            );
+            assert!(
+                !contains_entry_named(&root, "escape"),
+                "{hostile}: extraction wrote outside the tree"
+            );
+        }
+    }
+
     #[test]
     fn colliding_archive_entries_are_a_verdict_on_the_bytes() {
         let (_dir, root) = root("collision");
@@ -1453,5 +1889,64 @@ mod tests {
         assert!(BundleManifest::parse(unknown, &expected).is_err());
         let escaping = br#"{"schema":1,"product":"app","version":"1.0.0","platform":"test","entrypoint":"../app","files":[]}"#;
         assert!(BundleManifest::parse(escaping, &expected).is_err());
+    }
+
+    #[test]
+    fn the_shared_manifest_parser_enforces_every_fixed_format_bound() {
+        let file = ManifestFile {
+            path: "bin/app".into(),
+            sha256: "0".repeat(64),
+            size: 0,
+            executable: true,
+        };
+        let mut manifest = BundleManifest {
+            schema: MANIFEST_SCHEMA,
+            product: "app".into(),
+            version: "1.0.0".into(),
+            platform: "test-platform".into(),
+            entrypoint: "bin/app".into(),
+            files: vec![file.clone()],
+        };
+
+        let oversized_document = vec![b' '; MANIFEST_BYTES_LIMIT + 1];
+        assert!(BundleManifest::parse_shape(&oversized_document)
+            .unwrap_err()
+            .to_string()
+            .contains("manifest exceeds"));
+
+        manifest.files = vec![file.clone(); BUNDLE_FILES_LIMIT];
+        assert!(manifest
+            .validate_shape()
+            .unwrap_err()
+            .to_string()
+            .contains("file-count"));
+
+        manifest.files = vec![ManifestFile {
+            size: BUNDLE_FILE_BYTES_LIMIT + 1,
+            ..file.clone()
+        }];
+        assert!(manifest
+            .validate_shape()
+            .unwrap_err()
+            .to_string()
+            .contains("file-size"));
+
+        manifest.files = (0..3)
+            .map(|index| ManifestFile {
+                path: if index == 0 {
+                    "bin/app".into()
+                } else {
+                    format!("data/{index}")
+                },
+                size: 400 << 20,
+                executable: index == 0,
+                ..file.clone()
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(BundleManifest::parse_shape(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("expanded-size"));
     }
 }

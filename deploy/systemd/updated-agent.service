@@ -1,5 +1,11 @@
-# systemd unit for the self-updating agent (Linux). Template — adjust paths,
-# URLs, user, and intervals for your deployment, then install as:
+# systemd unit for the self-updating agent (Linux). This is the ONE unit definition:
+# the `updated-agent` .deb/.rpm ships this exact file, install.sh places this exact
+# file from the release archive, and the Ansible role installs either that package or
+# that same archived file — it templates no copy of its own, so a node can never run a
+# unit that did not ship with the binaries it is running.
+# Tune it through /etc/updated/agent.env (see below), not by forking it.
+#
+# Installing it by hand, if you are not using a package:
 #
 #   install -m0644 updated-agent.service /etc/systemd/system/
 #   systemctl daemon-reload
@@ -37,31 +43,37 @@ Type=simple
 #
 # No --agent-config: the launcher reads the canonical /etc/updated/config.toml.
 # Pass it only if this deployment puts the config somewhere else.
-ExecStart=/usr/lib/updated/updated-launcher --state-dir /var/lib/updated --agent /usr/lib/updated/updated-agent --ready-timeout 60 --confirm-timeout 30
+#
+# The defaults below are the unit's own, so the unit is complete on its own; the
+# optional environment file overrides them. That is the one place to widen
+# --ready-timeout for a fleet whose first cold install pulls a large bundle over a
+# slow link — editing a conf file, never a second copy of this unit.
+Environment=UPDATED_STATE_DIR=/var/lib/updated
+Environment=UPDATED_AGENT=/usr/lib/updated/updated-agent
+Environment=UPDATED_READY_TIMEOUT=60
+Environment=UPDATED_CONFIRM_TIMEOUT=30
+EnvironmentFile=-/etc/updated/agent.env
+ExecStart=/usr/lib/updated/updated-launcher --state-dir ${UPDATED_STATE_DIR} --agent ${UPDATED_AGENT} --ready-timeout ${UPDATED_READY_TIMEOUT} --confirm-timeout ${UPDATED_CONFIRM_TIMEOUT}
 
 # Relaunch the launcher if it ever crashes. The start-limit defaults stop a
 # crash-looping build after a few tries.
 Restart=always
 RestartSec=2
 
-# Signal only the launcher; it coordinates a clean agent shutdown. Workloads are
-# separate units and are not signalled here.
-KillMode=process
+# Signal only the launcher first; it coordinates a clean agent shutdown. If that
+# coordination wedges, mixed mode kills every residual process in this service's
+# cgroup after TimeoutStopSec instead of leaving an orphan agent updating in the
+# background. Workloads live in separate units and are not members of this cgroup.
+KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
-# --- Sandboxing (tighten to taste). Agent candidates and installed releases
-#     live under the writable state directory (which also holds the commit
-#     journal and the TUF metadata cache). The launcher and the pinned TUF root —
-#     the two anchors of trust — stay read-only. ---
-User=updated
-Group=updated
+# Configuration management is intentionally machine-wide. The signed reconciler may manage users,
+# packages, services, mounts, networking, the boot loader, and any other host state, and the agent
+# must also be able to honor its own fixed reboot action. This system service therefore runs as
+# root. The TUF and provider signatures are the authorization boundary for privileged code.
 StateDirectory=updated
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/var/lib/updated
+StateDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target

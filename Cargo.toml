@@ -23,7 +23,7 @@ members = [
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "PolyForm-Small-Business-1.0.0"
+license = "AGPL-3.0-only"
 
 # Pinned once here so every crate agrees on versions. All hashing and signing go
 # through `aws-lc-rs` (already pulled in by the TUF client), so there is one
@@ -67,7 +67,7 @@ clap = { version = "4", features = ["derive", "env"] }
 k8s-openapi = { version = "0.25", features = ["v1_32"] }
 schemars = "0.8"
 async-trait = "0.1"
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde_yaml = "0.9"
@@ -77,6 +77,7 @@ zstd = "0.13"        # the sole application bundle compression format
 # Async HTTP for the agent's localhost health probe (no TLS needed).
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+webpki-roots = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 # Mint the fleet CA + gateway server cert + agent client cert (the way `server init` mints TUF
 # keys), on the aws-lc-rs backend so there is one crypto library.

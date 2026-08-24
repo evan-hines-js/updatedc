@@ -1,9 +1,9 @@
-//! The agent's mTLS identity for the externally-exposed enrollment/repository gateway.
+//! The agent's mTLS identity for the externally-exposed enrollment/capability gateway.
 //!
-//! The gateway is the only externally-reachable listener and it requires client auth, so every
-//! agent→gateway request — enrollment and TUF metadata/target fetches alike — presents this
-//! identity. It is built from cert/key/CA *file paths* (the node config holds paths, never
-//! secrets) into an `aws-lc-rs` rustls client config, so there is one crypto library everywhere.
+//! Only small control-plane requests present this identity. Object transfers use a distinct
+//! anonymous client, so a node certificate can never be offered to the host in a bearer URL. The
+//! identity is built from cert/key/CA *file paths* (the node config holds paths, never secrets)
+//! into an `aws-lc-rs` rustls client config, so there is one crypto library everywhere.
 
 use std::io;
 use std::path::Path;
@@ -13,6 +13,12 @@ use std::time::Duration;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
+
+/// Maximum bytes accepted from any one certificate, CA bundle, or private-key PEM.
+///
+/// Real material is kilobytes; one MiB leaves room for a large CA set while ensuring a corrupt
+/// mount or state file cannot allocate without bound in every TLS client/server constructor.
+pub const TLS_MATERIAL_MAX_BYTES: usize = 1024 * 1024;
 
 /// The one process crypto provider — always `aws-lc-rs`, so there is a single crypto library
 /// for TLS, hashing, signing, and RNG. Built with the `fips` feature it is the FIPS-validated
@@ -59,39 +65,97 @@ impl Identity {
         }
     }
 
-    /// Build an aws-lc-rs rustls client config that presents the client cert/key and trusts only
-    /// the fleet CA for the gateway. Fail-closed: any unreadable or invalid PEM is an error.
+    /// Build an aws-lc-rs rustls client config that presents the client cert/key and trusts the
+    /// fleet CA plus public WebPKI roots (the gateway itself may use a public certificate).
+    /// Fail-closed: any unreadable or invalid fleet-CA PEM is an error.
     pub fn client_config(&self) -> io::Result<ClientConfig> {
-        let roots = load_roots(&self.ca, "enrollment CA")?;
+        let mut roots = load_roots(&self.ca, "enrollment CA")?;
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let certs = load_cert_chain(&self.client_cert, "client certificate")?;
         let key = load_key(&self.client_key, "client key")?;
 
-        ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
+        client_config_builder()?
             .with_root_certificates(roots)
             .with_client_auth_cert(certs, key)
             .map_err(|error| invalid(&format!("loading the client identity failed: {error}")))
     }
 
-    /// A reqwest client that presents this identity — used for enrollment, the secrets fetch, and
-    /// every TUF metadata and **target** download.
-    ///
-    /// The bounds here are on *progress*, deliberately not on total elapsed time. `timeout()` in
-    /// reqwest covers the whole response body, so a total deadline is a hard ceiling on artifact
-    /// size × link speed: a release archive that takes longer than it to stream is cancelled
-    /// mid-body, its partial file deleted, and retried forever — the node can never install it, and
-    /// no amount of waiting helps. A stalled transfer is still caught, by the read timeout. Callers
-    /// that genuinely need a total deadline (a small control-plane request that must not hang a
-    /// boot) impose their own around the call.
-    pub fn reqwest_client(&self) -> io::Result<reqwest::Client> {
-        reqwest::Client::builder()
-            .use_preconfigured_tls(self.client_config()?)
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(io::Error::other)
+    /// mTLS client for the small control plane. Redirects are refused so the node identity is
+    /// never offered to the object-store host named by a bearer capability.
+    pub fn reqwest_control_client(&self) -> io::Result<reqwest::Client> {
+        tls_client(self.client_config()?)
     }
+
+    /// HTTPS client that spends exact-object bearer capabilities. It carries no client
+    /// certificate, refuses redirects (so a bearer URL cannot be forwarded), trusts normal public
+    /// roots, and additionally trusts the configured fleet CA for private MinIO-style endpoints.
+    pub fn reqwest_capability_client(&self) -> io::Result<reqwest::Client> {
+        anonymous_object_client_with_ca(&self.ca)
+    }
+
+    /// Anonymous client for a direct release repository. A configured fleet CA augments public
+    /// roots for private HTTPS object stores. Only an absent CA is optional; a present CA that is
+    /// unreadable or malformed fails closed instead of silently changing the trust policy.
+    pub fn reqwest_direct_object_client(&self) -> io::Result<reqwest::Client> {
+        match self.ca.try_exists()? {
+            true => self.reqwest_capability_client(),
+            false => anonymous_object_client(),
+        }
+    }
+}
+
+/// Anonymous HTTPS client for spending an exact-object bearer capability with public trust roots.
+/// Redirects are refused and the rustls config has no client certificate, so neither the bearer
+/// token nor the node identity can escape to another host.
+pub fn anonymous_object_client() -> io::Result<reqwest::Client> {
+    anonymous_object_client_with_optional_ca(None)
+}
+
+/// Anonymous HTTPS client for a bearer capability whose object store may use the fleet CA. This
+/// takes only the public trust anchor: spending a capability must never require or load an mTLS
+/// private key.
+pub fn anonymous_object_client_with_ca(ca: &Path) -> io::Result<reqwest::Client> {
+    anonymous_object_client_with_optional_ca(Some(ca))
+}
+
+fn anonymous_object_client_with_optional_ca(
+    additional_ca: Option<&Path>,
+) -> io::Result<reqwest::Client> {
+    let mut roots = match additional_ca {
+        Some(path) => load_roots(path, "client CA")?,
+        None => RootCertStore::empty(),
+    };
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    tls_client(
+        client_config_builder()?
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// The rustls client builder every outbound TLS client in this system starts from: the one crypto
+/// provider, and the safe default protocol versions. Callers choose only their trust anchors and
+/// whether they present a client identity.
+fn client_config_builder() -> io::Result<rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier>>
+{
+    ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))
+}
+
+/// Turn a finished rustls config into an HTTP client under the one outbound policy.
+///
+/// The connect and read timeouts live here rather than at each call site: an mTLS control-plane
+/// client and an anonymous capability client differ in what they trust and what they present, never
+/// in how patient they are, and having written those two numbers twice is how they stop matching.
+fn tls_client(config: ClientConfig) -> io::Result<reqwest::Client> {
+    crate::http::finish_outbound_client(
+        reqwest::Client::builder()
+            .use_preconfigured_tls(config)
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30)),
+        crate::http::OutboundDeadline::ExternallyEnforced,
+    )
 }
 
 /// Verify a newly issued client leaf against the same pinned CA and client-auth policy the
@@ -118,8 +182,8 @@ pub fn verify_client_chain(leaf: CertificateDer<'_>, ca: &Path) -> io::Result<()
 
 /// Build an aws-lc-rs rustls server config for an externally-exposed listener: it presents
 /// `cert`/`key` and REQUIRES every client to present a certificate the fleet `client_ca` signed.
-/// This is how the gateway (and the e2e's mock CDN) enforce mTLS — no unauthenticated client is
-/// ever admitted. Fail-closed on any unreadable or invalid PEM.
+/// This is the production gateway's mTLS boundary: no unauthenticated client is ever admitted.
+/// Fail-closed on any unreadable or invalid PEM.
 pub fn server_config(
     cert: &Path,
     key: &Path,
@@ -150,25 +214,126 @@ pub fn server_config(
         .map_err(|error| invalid(&format!("loading the server identity failed: {error}")))
 }
 
+/// Build the TLS policy used by the development capability gateway. Fleet certificates are
+/// verified when present, but an anonymous handshake is admitted so the same test origin can
+/// receive the bearer URL's second hop. Application routing must still reject every anonymous
+/// request that does not carry an exact, live capability.
+///
+/// Production gateways use [`server_config`] and therefore remain mTLS-only at the handshake.
+pub fn capability_fixture_server_config(
+    cert: &Path,
+    key: &Path,
+    client_ca: &Path,
+) -> io::Result<rustls::ServerConfig> {
+    let provider = Arc::new(crypto_provider());
+    let roots = load_roots(client_ca, "client CA")?;
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .allow_unauthenticated()
+    .build()
+    .map_err(|error| {
+        invalid(&format!(
+            "building the optional client-certificate verifier: {error}"
+        ))
+    })?;
+    let certs = load_cert_chain(cert, "server certificate")?;
+    let key = load_key(key, "server key")?;
+
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|error| invalid(&format!("loading the server identity failed: {error}")))
+}
+
+/// Build the anonymous HTTPS policy for a direct object-store fixture. This listener never sees a
+/// node identity; it is the local equivalent of the S3 endpoint reached after authorization.
+pub fn object_fixture_server_config(cert: &Path, key: &Path) -> io::Result<rustls::ServerConfig> {
+    let provider = Arc::new(crypto_provider());
+    let certs = load_cert_chain(cert, "server certificate")?;
+    let key = load_key(key, "server key")?;
+
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| invalid(&format!("rustls protocol setup failed: {error}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| invalid(&format!("loading the server identity failed: {error}")))
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn pem_err<E: std::fmt::Display>(label: &'static str, path: &Path) -> impl Fn(E) -> io::Error {
     let path = path.to_path_buf();
-    move |error| invalid(&format!("reading {label} {}: {error}", path.display()))
+    move |error| invalid(&format!("parsing {label} {}: {error}", path.display()))
+}
+
+/// Read mounted TLS material through the same bounded opened-handle path everywhere. Kubernetes
+/// Secret keys are final symlinks by construction, so following that one component is explicit;
+/// the opened target must still be a regular file and the byte limit applies to the handle.
+fn read_tls_material(path: &Path, label: &'static str) -> io::Result<Vec<u8>> {
+    foundation::file::read_bounded_regular(
+        path,
+        TLS_MATERIAL_MAX_BYTES,
+        foundation::file::FinalSymlink::Follow,
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("reading {label} {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Read a private-key PEM for CSR or report signing under the same byte ceiling TLS itself uses.
+/// Callers must state whether the key is a mounted projection or node-owned durable state. A
+/// node-owned key (`Refuse`) must also be owner-readable with no group/world access; this is the
+/// one read path used by enrollment retry, renewal, and report signing, so none can accidentally
+/// accept a widened durable secret.
+pub fn read_private_key_pem(
+    path: &Path,
+    final_symlink: foundation::file::FinalSymlink,
+) -> io::Result<String> {
+    let result = match final_symlink {
+        foundation::file::FinalSymlink::Follow => foundation::file::read_bounded_regular_string(
+            path,
+            TLS_MATERIAL_MAX_BYTES,
+            final_symlink,
+        ),
+        foundation::file::FinalSymlink::Refuse => {
+            foundation::file::read_bounded_private_regular_string(path, TLS_MATERIAL_MAX_BYTES)
+        }
+    };
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("reading private key {}: {error}", path.display()),
+        )
+    })
 }
 
 /// Load every PEM certificate in `path` into a fresh [`RootCertStore`]. `label` names the file in
 /// any error (e.g. "enrollment CA", "client CA"). Shared by every config builder so trust-anchor
 /// loading and its fail-closed error surface stay identical across client and server paths.
 fn load_roots(path: &Path, label: &'static str) -> io::Result<RootCertStore> {
+    let pem = read_tls_material(path, label)?;
     let mut roots = RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(path).map_err(pem_err(label, path))? {
+    for cert in CertificateDer::pem_slice_iter(&pem) {
         let cert = cert.map_err(pem_err(label, path))?;
         roots
             .add(cert)
             .map_err(|error| invalid(&format!("{label} {}: {error}", path.display())))?;
+    }
+    if roots.is_empty() {
+        return Err(invalid(&format!(
+            "{label} {} contains no certificates",
+            path.display()
+        )));
     }
     Ok(roots)
 }
@@ -176,8 +341,8 @@ fn load_roots(path: &Path, label: &'static str) -> io::Result<RootCertStore> {
 /// Load a certificate chain from a PEM file, failing closed if it is unreadable, malformed, or
 /// holds no certificate. `label` names the file in any error.
 fn load_cert_chain(path: &Path, label: &'static str) -> io::Result<Vec<CertificateDer<'static>>> {
-    let certs = CertificateDer::pem_file_iter(path)
-        .map_err(pem_err(label, path))?
+    let pem = read_tls_material(path, label)?;
+    let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(pem_err(label, path))?;
     if certs.is_empty() {
@@ -189,8 +354,38 @@ fn load_cert_chain(path: &Path, label: &'static str) -> io::Result<Vec<Certifica
     Ok(certs)
 }
 
-/// Load a private key from a PEM file, failing closed on unreadable/invalid PEM. `label` names the
-/// file in any error.
+/// Load a private key from a PEM file through the one bounded private-key reader, failing closed on
+/// unreadable/invalid PEM. TLS identities are commonly mounted Secret projections, so the final
+/// symlink is explicit here just as it is for report-signing and issuing-CA keys.
 fn load_key(path: &Path, label: &'static str) -> io::Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(path).map_err(pem_err(label, path))
+    let pem = read_private_key_pem(path, foundation::file::FinalSymlink::Follow)?;
+    PrivateKeyDer::from_pem_slice(pem.as_bytes()).map_err(pem_err(label, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_object_trust_falls_back_only_when_the_optional_ca_is_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca = directory.path().join("fleet-ca.pem");
+        let identity = Identity::new("unused.crt", "unused.key", &ca);
+        identity
+            .reqwest_direct_object_client()
+            .expect("an absent optional CA uses public roots");
+
+        std::fs::write(&ca, b"not a PEM certificate").unwrap();
+        assert!(
+            identity.reqwest_direct_object_client().is_err(),
+            "a present malformed CA must not silently change the trust policy"
+        );
+
+        std::fs::write(&ca, vec![b'x'; TLS_MATERIAL_MAX_BYTES + 1]).unwrap();
+        assert_eq!(
+            identity.reqwest_direct_object_client().unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "TLS material is bounded before PEM parsing"
+        );
+    }
 }

@@ -1,4 +1,17 @@
-FROM rust:1-bookworm AS build
+# Built on UBI like the shipped images, so one toolchain and one C library produce every binary
+# this repository ships. The RUNTIME below stays vanilla Ubuntu deliberately — see its comment —
+# and that pairing is safe in this direction only: UBI 9 is glibc 2.34 and Ubuntu 22.04 is 2.35, so
+# these binaries run there, while the reverse (bookworm's 2.36 onto UBI) would not start at all.
+FROM registry.access.redhat.com/ubi9/ubi@sha256:5426a8f45e80a07168a30ea24d84f266094b3756624a5508cc53927e6ee39e09 AS build
+
+# `aws-lc-sys` builds its C sources with cmake; `zstd-sys` and `ring` need a C compiler.
+RUN dnf install -y --setopt=install_weak_deps=False gcc cmake make perl && dnf clean all
+
+# The toolchain comes from the workspace's `rust-toolchain.toml`, never from a version named here.
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --default-toolchain none --profile minimal
+
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -18,7 +31,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Jenkins — is installed INTO this vanilla container at runtime by a signed release and started by
 # that release's own reconciler, never baked into a bespoke image. `curl`/`unzip` are ordinary
 # base tooling a runtime installer uses; the JRE and Jenkins are not here.
-FROM ubuntu:22.04
+FROM ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f
 # `haproxy` is an ordinary distro package here so the release-server can copy the binary into a
 # signed bundle and every agent (same base image, so the shared libs are present) can run it after
 # `updated` installs it — the load balancer is managed exactly like any other release, not baked
@@ -51,3 +64,4 @@ COPY scripts/haproxy/launch /usr/local/share/haproxy/launch
 RUN chmod 0755 /usr/local/bin/release-server /usr/local/bin/run-agent \
     /usr/local/share/haproxy/lifecycle /usr/local/share/haproxy/launch
 USER 65532
+ENTRYPOINT ["/usr/local/bin/updated-healthproxy"]

@@ -1,13 +1,16 @@
 //! Persistent suppression of content-addressed releases that proved unsafe.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+const MAX_REJECTION_KEYS: usize = 4096;
+const MAX_REJECTION_RECORD_BYTES: usize = 1 << 20;
 
 #[derive(Debug)]
 pub struct Rejections {
     path: PathBuf,
-    hashes: HashSet<String>,
-    overrides: HashSet<String>,
+    hashes: BTreeSet<String>,
+    overrides: BTreeSet<String>,
 }
 
 impl Rejections {
@@ -39,19 +42,35 @@ impl Rejections {
     pub fn reject(&mut self, hash: &str) -> std::io::Result<()> {
         let hash = digest_key(hash)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        self.hashes.insert(hash);
-        self.save()
+        if self.hashes.contains(&hash) {
+            return Ok(());
+        }
+        if self.hashes.len() >= MAX_REJECTION_KEYS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rejection record has reached its key limit",
+            ));
+        }
+        self.hashes.insert(hash.clone());
+        if let Err(error) = self.save() {
+            self.hashes.remove(&hash);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Drop any rejection for `hash` (e.g. once it later commits cleanly).
     pub fn clear(&mut self, hash: &str) -> std::io::Result<()> {
         let hash = digest_key(hash)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        if self.hashes.remove(&hash) {
-            self.save()
-        } else {
-            Ok(())
+        if !self.hashes.remove(&hash) {
+            return Ok(());
         }
+        if let Err(error) = self.save() {
+            self.hashes.insert(hash);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -60,19 +79,37 @@ impl Rejections {
             out.push_str(hash);
             out.push('\n');
         }
+        if out.len() > MAX_REJECTION_RECORD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rejection record exceeds its byte limit",
+            ));
+        }
         foundation::durable::atomic_write_managed(&self.path, ".rejections-", out.as_bytes())
     }
 }
 
-fn load_keys(path: &Path, record: &str) -> std::io::Result<HashSet<String>> {
-    let mut hashes = HashSet::new();
-    let text = match std::fs::read_to_string(path) {
+fn load_keys(path: &Path, record: &str) -> std::io::Result<BTreeSet<String>> {
+    let mut hashes = BTreeSet::new();
+    let text = match foundation::file::read_bounded_regular_string(
+        path,
+        MAX_REJECTION_RECORD_BYTES,
+        foundation::file::FinalSymlink::Refuse,
+    ) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
     if let Some(text) = text {
         for (line_no, line) in text.lines().enumerate() {
+            // Blank and whitespace-padded lines are skipped, not fatal: the break-glass file
+            // (see `override_path`) is hand-edited by an operator during an incident, and a
+            // stray blank line there must not turn emergency recovery into a boot failure.
+            // A non-empty line that is not a key still fails closed.
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
             let hash = digest_key(line).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -80,6 +117,12 @@ fn load_keys(path: &Path, record: &str) -> std::io::Result<HashSet<String>> {
                 )
             })?;
             hashes.insert(hash);
+            if hashes.len() > MAX_REJECTION_KEYS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{record} exceeds its key limit"),
+                ));
+            }
         }
     }
     Ok(hashes)
@@ -99,13 +142,14 @@ fn override_path(path: &Path) -> PathBuf {
 /// definition of that grammar — callers that must know in advance whether
 /// [`Rejections::reject`] would accept a key ask here rather than restating it.
 pub fn is_rejection_key(hash: &str) -> bool {
-    updated_contracts::is_sha256_hex(hash)
+    updated_contracts::is_canonical_sha256(hash)
         || hash.split_once(':').is_some_and(|(lineage, digest)| {
-            updated_contracts::is_sha256_hex(lineage) && updated_contracts::is_sha256_hex(digest)
+            updated_contracts::is_canonical_sha256(lineage)
+                && updated_contracts::is_canonical_sha256(digest)
         })
 }
 
-/// Canonical rejection key. Agent candidates use their plain digest; application
+/// Validated rejection key. Agent candidates use their plain digest; application
 /// candidates use `repository-lineage:digest`, preventing a rejection in one metadata
 /// lineage from poisoning a different lineage that happens to reuse the same bytes.
 fn digest_key(hash: &str) -> Result<String, String> {
@@ -115,7 +159,7 @@ fn digest_key(hash: &str) -> Result<String, String> {
             hash.len()
         ));
     }
-    Ok(hash.to_ascii_lowercase())
+    Ok(hash.to_string())
 }
 
 #[cfg(test)]
@@ -145,6 +189,24 @@ mod tests {
         let r2 = Rejections::load(&path).unwrap();
         assert!(r2.is_rejected(&digest), "rejection survives a restart");
         assert!(!r2.is_rejected(&hash('3')));
+    }
+
+    #[test]
+    fn the_durable_record_is_canonical_and_bounded() {
+        let (_dir, path) = tmp();
+        let mut rejections = Rejections::load(&path).unwrap();
+        rejections.reject(&hash('b')).unwrap();
+        rejections.reject(&hash('a')).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n{}\n", hash('a'), hash('b'))
+        );
+
+        std::fs::write(&path, vec![b'x'; MAX_REJECTION_RECORD_BYTES + 1]).unwrap();
+        assert_eq!(
+            Rejections::load(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -191,6 +253,25 @@ mod tests {
         assert!(
             restarted.is_rejected(&other),
             "override cannot broaden to other bytes"
+        );
+    }
+
+    #[test]
+    fn hand_edited_break_glass_whitespace_still_loads() {
+        // The break-glass file is typed by an operator mid-incident. A blank line or a
+        // padded entry must still start the runtime: the record is read before anything
+        // else the agent does, so a fatal parse here is a permanent boot failure on the
+        // one path that exists to end an outage.
+        let (_dir, path) = tmp();
+        let rejected = format!("{}:{}", hash('a'), hash('2'));
+        let mut first = Rejections::load(&path).unwrap();
+        first.reject(&rejected).unwrap();
+
+        std::fs::write(override_path(&path), format!("\n  {rejected}  \n\n")).unwrap();
+        let restarted = Rejections::load(&path).unwrap();
+        assert!(
+            !restarted.is_rejected(&rejected),
+            "a padded entry beside blank lines still overrides"
         );
     }
 
@@ -244,12 +325,17 @@ mod tests {
     }
 
     #[test]
-    fn a_digest_is_matched_case_insensitively() {
+    fn noncanonical_digest_aliases_are_refused() {
         let (_dir, path) = tmp();
         let mut r = Rejections::load(&path).unwrap();
-        r.reject(&hash('A')).unwrap();
-        assert!(r.is_rejected(&hash('a')), "one digest, one entry");
-        r.clear(&hash('a')).unwrap();
+        assert_eq!(
+            r.reject(&hash('A')).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        r.reject(&hash('a')).unwrap();
+        assert!(r.is_rejected(&hash('a')));
         assert!(!r.is_rejected(&hash('A')));
+        r.clear(&hash('a')).unwrap();
+        assert!(!r.is_rejected(&hash('a')));
     }
 }

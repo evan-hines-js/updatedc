@@ -1,6 +1,7 @@
 # Per-node operational controls
 
-Status: implemented. `UpdateAgent.spec.hold` / `.cordon`; the cordon travels to `updated-healthproxy` through the endpoint projection the control plane publishes at `endpoints/state.json` beside the telemetry namespace (`updated-contracts/src/endpoints.rs`).
+Status: implemented. `UpdateAgent.spec.hold` / `.cordon`; the cordon travels through the same
+controller-owned, revision-checked backend inventory that supplies healthproxy topology.
 
 ## Problem
 
@@ -44,25 +45,27 @@ group the hold actually wedges reported zero.
 
 One new field: `UpdateAgent.spec.cordon: true`.
 
-Cordon changes only what the healthproxy programs, through the channel that already exists: the
-control plane's endpoint projection. A cordoned node is published to the healthproxy inventory
-as `drained` regardless of its report — the same drained state a stale report produces today,
-so haproxy handling is unchanged. The application keeps running, the node keeps reporting, and
-the agent is entirely unaware — cordon is invisible on the node because it changes nothing
-the node owns.
+Cordon changes only what healthproxy programs. Each matching `UpdateBackend` projects one typed,
+revision-checked Kubernetes inventory containing either an active `{node,address,publicKey}` entry
+or a cordoned `{node}` entry. A cordoned identity is drained regardless of its report: HAProxy gets
+an explicit `drain` for its predeclared server, while EndpointSlice omits the route. The application
+keeps running, the node keeps reporting, and the agent is entirely unaware.
 
 Rollout accounting treats a cordoned node as absent (as departed nodes already are) rather than
 unhealthy, so a cordon does not eat the group's availability budget and does not wedge an
 in-flight rollout waiting for a machine the operator deliberately benched.
 
-A cordon must fail SAFE — stay drained — against everything else the reconcile does, so the
-cordoned set is collected from every agent of the repository before quarantine filtering, and the
-projection is published before anything else in the pass can fail: the object store is built, the
-agents are listed, the projection is written, and only then is the durable admitted state loaded.
-Ordering it after that load left the one failure the loop cannot repair on its own (an unreadable
-admitted-state ConfigMap fails every pass forever) wedging the cordon channel too. Otherwise
-quarantining an agent, or any faulted generation, silently released the drain while the agent's
-own `status.cordoned` still read true.
+A cordon must fail safe against malformed endpoint edits. A cordoned inventory entry therefore
+requires only the node identity: its address and report key are deliberately absent. Clearing the
+cordon attempts to reconstruct an active entry and must pass the complete route/key gate; an
+invalid active entry remains explicitly drained and makes the backend status degraded. A broken
+shard update leaves the last complete revision mounted, never a mixture of active and cordoned
+shards. Backend reconciliation runs independently before
+signed release publication, so a TUF signing or rollout-state failure cannot hold a drain hostage.
+
+There is no S3 cordon document. S3 carries signed health reports; Kubernetes carries the topology
+and operational routing intent the controller already owns. This removes an unsigned, replayable
+second authority that could previously undo a cordon while preserving a valid healthy report.
 
 Hold and cordon compose: maintenance is typically `cordon` (drain traffic), then work, then
 uncordon. `hold` is orthogonal — a node can be held but serving, or cordoned but updatable. When
@@ -74,18 +77,19 @@ reports, so its charge never cleared.
 
 ## Converge-now
 
-Deliberately not a mechanism. Nodes pull on `check_interval_seconds` from the signed runtime
+Deliberately not a mechanism. Nodes pull on `checkIntervalSeconds` from the signed runtime
 config; an operator who needs faster convergence lowers that value for the deployment. Adding a
 kick channel would be the first control-plane→node push path, which the core forbids, to save
 at most one poll interval.
 
 ## Testing
 
-Planner unit tests: hold excludes from admission and republishes the recorded body, fails
-closed on an unresolvable body, and releases cleanly; cordon projects drained endpoints while
-reports stay fresh, and admission treats the node as absent.
+Planner unit tests: hold excludes from admission and republishes the recorded body, fails closed on
+an unresolvable body, and releases cleanly; admission treats a cordoned node as absent. Backend
+contract tests prove a cordon needs only a safe identity, an uncordon restores the full address/key
+gate, mixed inventory revisions are rejected, and a healthy S3 report cannot override a cordon.
 
-The fleet e2e holds and cordons one machine of a live cohort, then rolls a release at its group:
-the node is published as drained in the endpoint projection, its group settles on the new release
-around it (`heldAgents: 1`, `Ready=True`) while the node itself stays on the old one, and clearing
-both controls converges it and returns it to rotation.
+The fleet e2e holds and cordons one machine in the externally-routed cohort, waits until its address
+is absent from the real healthproxy-programmed EndpointSlice, then rolls a release at its group.
+The group settles around it (`heldAgents: 1`, `Ready=True`) while the node stays on the old release;
+clearing both controls converges it and returns its address to rotation.

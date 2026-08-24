@@ -13,6 +13,10 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// be called at any time without racing an in-flight [`atomic_write`].
 const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 
+/// A staged directory carries this locked file for its entire active lifetime. Directory mtimes do
+/// not change when an existing child grows, so age alone can never prove a directory abandoned.
+pub const TEMP_DIRECTORY_LEASE_FILE: &str = ".updated-active.lock";
+
 /// The prefix [`install_executable`] stages under, and the one it sweeps.
 const EXECUTABLE_TEMP_PREFIX: &str = ".executable-";
 
@@ -27,20 +31,18 @@ const EXECUTABLE_TEMP_PREFIX: &str = ".executable-";
 enum Visibility {
     /// The writing account only. Secrets: an enrollment key, a minted TLS private key.
     Private,
-    /// Whoever the containing directory's ACL grants — the node's state directory is granted to
-    /// the service account by the installer, and that grant works purely by inheritance.
+    /// Whoever the containing directory's ACL grants. On Windows, managed files deliberately
+    /// inherit the state directory's access rather than replacing it with a private DACL.
     Managed,
     /// Everybody. A signed repository artifact served to the whole fleet.
     Published,
 }
 
 /// Create a fresh, uniquely named temp file in `dir` that keeps the access its directory
-/// confers: on Windows the directory's inheritable ACEs apply (the installer's
-/// `icacls %STATEDIR% /grant "NT SERVICE\…:(OI)(CI)M"` grant reaches it), on unix it is `0o600`.
+/// confers: on Windows the directory's inheritable ACEs apply; on unix it is `0o600`.
 /// Every file under the node state directory that is not a secret goes through here: with a
 /// protected DACL, a state file written by an elevated operator CLI or an installer step would
-/// commit with no ACE for the service account, which could then neither read nor replace it, and
-/// no `icacls` grant could repair it.
+/// commit without the directory's intended inherited access.
 ///
 /// There is deliberately no owner-only *temp* counterpart to this: a secret is never streamed
 /// here — it is always one in-memory buffer — so [`atomic_write`] and [`create_private_new`] are
@@ -63,6 +65,41 @@ pub fn create_private_new(path: &Path) -> io::Result<File> {
     create(path, Visibility::Private)
 }
 
+/// Create `path` exclusively as an owner-only directory on every supported platform.
+///
+/// Plaintext exchanges use directories as their first access-control boundary: a reconciler
+/// creates output files itself, so protecting only files the agent creates would leave those
+/// outputs readable through an inherited `%ProgramData%` ACL on Windows. Like
+/// [`create_private_new`], this applies the final policy at creation time—`0o700` on Unix and a
+/// protected owner/SYSTEM/Administrators DACL with private child inheritance on Windows.
+pub fn create_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let (created, error) = with_owner_only_security(true, |attributes| unsafe {
+            CreateDirectoryW(wide.as_ptr(), attributes)
+        })?;
+        if created == 0 {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::create_dir(path)
+    }
+}
+
 /// [`create_temp_managed`], but world-readable (`0o644` on unix; the directory's ACL on Windows) at
 /// creation — for a signed repository object that the whole fleet fetches. The mode is set when
 /// the file is created rather than repaired before the rename, so it is identical on the platform
@@ -76,7 +113,7 @@ fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     let mode = match visibility {
         // The state directory's own ACL is a Windows concept; on unix a managed file is as
-        // private as a secret, because only the service account is ever inside that tree.
+        // private as a secret, because only the privileged runtime is inside that tree.
         Visibility::Private | Visibility::Managed => 0o600,
         Visibility::Published => 0o644,
     };
@@ -94,7 +131,7 @@ fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
 /// and read whatever is written through it afterwards, so for a [`Visibility::Private`] file the
 /// descriptor is supplied at creation: it is never, at any instant, readable by anyone else.
 /// `Managed` and `Published` files deliberately take the inherited ACL — that inheritance is how
-/// the deployment grants the service account access to its own state directory.
+/// the deployment preserves the state directory's intended access.
 #[cfg(windows)]
 fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
     if visibility != Visibility::Private {
@@ -105,26 +142,64 @@ fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
     }
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE,
     };
 
-    // Full access to the file's owner, to SYSTEM and to the local Administrators group; to
-    // nobody else. `P` marks the DACL protected, so the parent directory's inheritable entries
-    // — the `BUILTIN\Users` read this exists to exclude — do not apply, and `fs::rename` keeps
-    // it that way when the temp is committed.
-    const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
-    let sddl: Vec<u16> = OWNER_ONLY_SDDL.encode_utf16().chain(Some(0)).collect();
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: both wide buffers are live and NUL-terminated for the duration of the calls, the
-    // converted descriptor is freed on every path, and the returned handle is either
-    // INVALID_HANDLE_VALUE or handed to a `File` that owns and closes it.
+    let (handle, error) = with_owner_only_security(false, |attributes| unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    })?;
+    if handle == INVALID_HANDLE_VALUE {
+        Err(error)
+    } else {
+        // SAFETY: a successful `CreateFileW` returned an owned file handle, transferred exactly
+        // once to `File` so Rust closes it.
+        unsafe { Ok(File::from_raw_handle(handle as _)) }
+    }
+}
+
+/// Call one Windows creation primitive with the protected owner-only security descriptor.
+///
+/// Full access goes to the owner, SYSTEM, and local Administrators, and nobody else. `P` protects
+/// the DACL from inheriting the parent directory's entries. A private directory additionally makes
+/// those same SYSTEM/Administrators ACEs object- and container-inheritable and adds an inherit-only
+/// CREATOR OWNER ACE: files a reconciler creates for itself must grant their actual creator—not the
+/// directory's original owner-rights pseudo-SID—and must not fall back to the process token's
+/// default DACL. Both private files and private directories use this function so their principals
+/// cannot drift.
+#[cfg(windows)]
+fn with_owner_only_security<T>(
+    inheritable: bool,
+    operation: impl FnOnce(*const windows_sys::Win32::Security::SECURITY_ATTRIBUTES) -> T,
+) -> io::Result<(T, io::Error)> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+    const OWNER_ONLY_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
+    const OWNER_ONLY_INHERITABLE_SDDL: &str =
+        "D:P(A;;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;FA;;;CO)";
+    let policy = if inheritable {
+        OWNER_ONLY_INHERITABLE_SDDL
+    } else {
+        OWNER_ONLY_SDDL
+    };
+    let sddl: Vec<u16> = policy.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `sddl` is live and NUL-terminated, the converted descriptor remains live through the
+    // synchronous callback, and `LocalFree` releases it on every callback outcome.
     unsafe {
         let mut descriptor = std::ptr::null_mut();
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -141,23 +216,11 @@ fn create(path: &Path, visibility: Visibility) -> io::Result<File> {
             lpSecurityDescriptor: descriptor,
             bInheritHandle: 0,
         };
-        let handle = CreateFileW(
-            wide.as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            &attributes,
-            CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        );
-        // Capture the failure reason before LocalFree can overwrite it: `create_temp_with`
-        // distinguishes an ALREADY_EXISTS collision (retry) from a real error (give up).
+        let result = operation(&attributes);
+        // Capture the creation error before `LocalFree` can overwrite it.
         let error = io::Error::last_os_error();
         LocalFree(descriptor as _);
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(error);
-        }
-        Ok(File::from_raw_handle(handle as _))
+        Ok((result, error))
     }
 }
 
@@ -214,7 +277,7 @@ pub fn atomic_write(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
 
 /// [`atomic_write`] for a non-secret file under the node's state directory: identical durability,
 /// but the committed file keeps whatever access its directory confers (on Windows the deployment's
-/// inheritable grant to the service account; on unix still `0o600`). An agent pointer, a
+/// inheritable directory ACL; on unix still `0o600`). An agent pointer, a
 /// launcher marker, a journal — anything a differently-privileged principal may legitimately have
 /// to read or replace later.
 pub fn atomic_write_managed(path: &Path, prefix: &str, data: &[u8]) -> io::Result<()> {
@@ -294,9 +357,22 @@ pub fn committed_unsynced(error: &io::Error) -> bool {
 
 /// Copy a verified executable into a fresh sibling file, persist its final mode, and atomically
 /// install it at `target`. A staged binary is not a secret: it is [`Visibility::Managed`], so on
-/// Windows the state directory's grant to the service account still reaches it and a candidate
-/// staged by an elevated installer step remains launchable by the service.
+/// Windows the state directory's inherited access still reaches it and a candidate staged by an
+/// elevated installer step remains launchable by the service.
 pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
+    let mut source = crate::file::open_regular(source, crate::file::FinalSymlink::Refuse)?;
+    install_executable_from(target, &mut source)
+}
+
+/// Install an executable from one already-open, verified file handle.
+///
+/// TUF callers use this form so the bytes copied into the executable are read from the same inode
+/// whose signed length and digest were checked, with no pathname reopen between verification and
+/// activation.
+pub fn install_executable_from(target: &Path, source: &mut File) -> io::Result<()> {
+    use std::io::Seek as _;
+
+    source.rewind()?;
     let dir = parent_dir(target);
     // Reap the leftover an earlier crash between the copy and the rename would have left HERE.
     // The prefix is private to this function, so no caller could ever sweep it; staging directories
@@ -304,9 +380,7 @@ pub fn install_executable(target: &Path, source: &Path) -> io::Result<()> {
     // the orphans accumulate one per crash and nothing prunes them.
     sweep_stale_temps(dir, EXECUTABLE_TEMP_PREFIX);
     let (mut tmp, tmp_path) = create_temp_managed(dir, EXECUTABLE_TEMP_PREFIX)?;
-    let staged = File::open(source)
-        .and_then(|mut source| io::copy(&mut source, &mut tmp))
-        .and_then(|_| tmp.sync_all());
+    let staged = io::copy(source, &mut tmp).and_then(|_| tmp.sync_all());
     if let Err(error) = staged {
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
@@ -372,8 +446,6 @@ pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
         // one in the future because the clock stepped backwards under an in-flight writer,
         // leaves the age unknown — spare the stage rather than yank one someone still owns.
         // A spared orphan is inert and the next sweep, once the clock settles, reaps it.
-        // (A directory's mtime advances as files are written into it, so a stage being filled
-        // right now reads as fresh for exactly as long as it is being filled.)
         let provably_stale = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -385,6 +457,13 @@ pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
         }
         let path = entry.path();
         let gone = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // A directory mtime records entry creation/removal, not writes to an existing child.
+            // Require the stage's ownership lock as independent proof: WouldBlock means a live
+            // writer, and a missing/unreadable ownership marker proves no abandonment, so we
+            // safely spare it.
+            let Some(_lease) = abandoned_temp_directory_lease(&path) else {
+                continue;
+            };
             fs::remove_dir_all(&path).is_ok()
         } else {
             fs::remove_file(&path).is_ok()
@@ -394,6 +473,35 @@ pub fn sweep_stale_temps(dir: &Path, prefix: &str) -> usize {
         }
     }
     removed
+}
+
+/// Hold this value for the complete lifetime of a staged directory. Closing its file releases the
+/// OS lock even after a crash; a later sweeper can then prove that no process owns the stage.
+pub struct TempDirectoryLease {
+    _file: File,
+}
+
+/// Mark a newly-created staged directory as actively owned.
+pub fn lease_temp_directory(path: &Path) -> io::Result<TempDirectoryLease> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path.join(TEMP_DIRECTORY_LEASE_FILE))?;
+    file.lock()?;
+    Ok(TempDirectoryLease { _file: file })
+}
+
+fn abandoned_temp_directory_lease(path: &Path) -> Option<File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join(TEMP_DIRECTORY_LEASE_FILE))
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(fs::TryLockError::WouldBlock | fs::TryLockError::Error(_)) => None,
+    }
 }
 
 /// Durably unlink a file this tower wrote: the removal is persisted (the parent directory is
@@ -724,6 +832,7 @@ mod tests {
         fs::write(d.join(".launcher-1-2-3.tmp"), b"in flight").unwrap();
         let in_flight_stage = d.join(".launcher-generation-live.tmp");
         fs::create_dir(&in_flight_stage).unwrap();
+        let in_flight_lease = lease_temp_directory(&in_flight_stage).unwrap();
         // An aged temp under our prefix is a crash leftover — reap it, file or directory.
         let aged = SystemTime::now() - (STALE_TEMP_AGE + Duration::from_secs(1));
         let stale = d.join(".launcher-4-5-6.tmp");
@@ -731,19 +840,63 @@ mod tests {
         filetime_set(&stale, aged);
         let stale_stage = d.join(".launcher-generation-dead.tmp");
         fs::create_dir(&stale_stage).unwrap();
+        let stale_lease = lease_temp_directory(&stale_stage).unwrap();
         fs::write(stale_stage.join("timestamp.json"), b"{}").unwrap();
+        // A crash closes the ownership handle without removing the marker.
+        drop(stale_lease);
         filetime_set(&stale_stage, aged);
 
-        assert_eq!(sweep_stale_temps(&d, ".launcher-"), 2);
-        assert!(d.join("state").exists());
-        assert!(d.join("other-9-9-9.tmp").exists());
-        assert!(d.join(".launcher-1-2-3.tmp").exists());
+        // Freshness is stamped, not assumed. Everything above dates the entries that must be
+        // REAPED explicitly, while the ones that must SURVIVE were left to inherit whatever the
+        // clock said when they were created — so the test quietly depended on less than
+        // `STALE_TEMP_AGE` of wall clock passing before the sweep, which is a thing a loaded
+        // machine or a clock step can violate without the code being wrong.
+        let fresh = SystemTime::now();
+        filetime_set(&d.join(".launcher-1-2-3.tmp"), fresh);
+        filetime_set(&in_flight_stage, fresh);
+
+        // The count is asserted LAST, deliberately. It came first once and failed under a loaded
+        // parallel run with nothing but `2 != n` to go on, while the four specific assertions that
+        // would have named the survivor sat below it and never ran. Which entry the sweep got wrong
+        // is the whole diagnosis; the total is a summary of it.
+        let removed = sweep_stale_temps(&d, ".launcher-");
+        assert!(d.join("state").exists(), "a committed file was swept");
+        assert!(
+            d.join("other-9-9-9.tmp").exists(),
+            "a temp under someone else's prefix was swept"
+        );
+        assert!(
+            d.join(".launcher-1-2-3.tmp").exists(),
+            "a fresh in-flight temp file was swept"
+        );
         assert!(in_flight_stage.exists(), "an in-flight stage was yanked");
-        assert!(!stale.exists());
+        drop(in_flight_lease);
+        assert!(!stale.exists(), "an aged orphan file survived the sweep");
         assert!(
             !stale_stage.exists(),
             "an abandoned staged directory survived the sweep"
         );
+        assert_eq!(removed, 2, "exactly the aged file and the abandoned stage");
+    }
+
+    #[test]
+    fn sweep_never_reaps_an_old_directory_while_its_owner_lock_is_held() {
+        let (_guard, d) = dir("sweep-live-directory");
+        let stage = d.join(".publish-generation-live.tmp");
+        fs::create_dir(&stage).unwrap();
+        let lease = lease_temp_directory(&stage).unwrap();
+        fs::write(stage.join("targets.json"), b"still publishing").unwrap();
+        filetime_set(
+            &stage,
+            SystemTime::now() - (STALE_TEMP_AGE + Duration::from_secs(1)),
+        );
+
+        assert_eq!(sweep_stale_temps(&d, ".publish-"), 0);
+        assert!(stage.exists(), "the active staged generation was yanked");
+
+        drop(lease);
+        assert_eq!(sweep_stale_temps(&d, ".publish-"), 1);
+        assert!(!stage.exists());
     }
 
     /// A node whose clock steps backwards (RTC ran fast, then NTP corrected it) leaves temps
@@ -829,15 +982,16 @@ mod tests {
         let state = d.join("state");
         atomic_write_managed(&state, ".launcher-", b"s").unwrap();
         assert_eq!(mode(&state), 0o600, "state stays owner-only on unix");
+        let private_directory = d.join("private-directory");
+        create_private_directory(&private_directory).unwrap();
+        assert_eq!(mode(&private_directory), 0o700);
     }
 
     #[cfg(windows)]
     #[test]
     fn a_managed_file_keeps_its_directorys_inheritable_grant() {
-        // The state directory is granted to the service account by an installer `icacls` that
-        // works purely by inheritance. A protected (`D:P`) DACL discards inherited ACEs, so a
-        // state file written by an elevated operator CLI would be unreadable and unreplaceable
-        // by the service, with no grant able to repair it. Only secrets are protected.
+        // A protected (`D:P`) DACL discards inherited ACEs. Managed state must preserve the
+        // directory's intended access; only secrets receive a private descriptor.
         let (_guard, d) = dir("managed");
         let (_file, path) = create_temp_managed(&d, ".state-").unwrap();
         assert!(
@@ -876,6 +1030,54 @@ mod tests {
             assert!(
                 !sddl.contains(unprivileged),
                 "{unprivileged} must not be granted access: {sddl}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_private_directory_is_owner_only_from_creation() {
+        let (_guard, d) = dir("private-directory");
+        let path = d.join("exchange");
+        create_private_directory(&path).unwrap();
+        let sddl = dacl_sddl(&path);
+        assert!(
+            sddl.starts_with("D:P"),
+            "the directory DACL must be protected against inheritance: {sddl}"
+        );
+        let creator_ace = sddl
+            .split('(')
+            .find(|ace| ace.ends_with(";;;CO)"))
+            .expect("the directory must give child objects to their creator owner");
+        for flag in ["OI", "CI", "IO"] {
+            assert!(
+                creator_ace.contains(flag),
+                "creator-owner ACE must be object/container inheritable and inherit-only: {sddl}"
+            );
+        }
+        for unprivileged in [";BU)", ";WD)", ";AU)", ";IU)"] {
+            assert!(
+                !sddl.contains(unprivileged),
+                "{unprivileged} must not be granted access: {sddl}"
+            );
+        }
+
+        // The reconciler, not this module, creates output files. The directory is therefore only
+        // a security boundary if an ordinary child creation inherits the same narrow principals.
+        let child = path.join("credential");
+        fs::write(&child, b"secret").unwrap();
+        assert_eq!(fs::read(&child).unwrap(), b"secret");
+        let child_sddl = dacl_sddl(&child);
+        for principal in [";SY)", ";BA)"] {
+            assert!(
+                child_sddl.contains(principal),
+                "{principal} must inherit full access: {child_sddl}"
+            );
+        }
+        for unprivileged in [";BU)", ";WD)", ";AU)", ";IU)"] {
+            assert!(
+                !child_sddl.contains(unprivileged),
+                "{unprivileged} must not inherit access: {child_sddl}"
             );
         }
     }

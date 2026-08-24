@@ -1,4 +1,5 @@
 use super::super::*;
+use updated_contracts::reconciler::Operation;
 pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     let (srv, svc) = ("127.0.0.1:21082", "127.0.0.1:21092");
     let dir = ctx.work.join("lock");
@@ -43,8 +44,10 @@ pub(crate) fn single_instance_lock(ctx: &Ctx) -> R {
     let only_owner_observations = fixture::operations(&fixture::root(&dir))[operations..]
         .iter()
         .all(|invocation| {
-            matches!(invocation.operation.as_str(), "healthcheck" | "inspect")
-                && updated_contracts::reconciler::attempt::is_reserved(&invocation.id)
+            matches!(
+                invocation.operation,
+                Operation::Healthcheck | Operation::Inspect
+            ) && updated_contracts::reconciler::attempt::is_reserved(&invocation.id)
         });
     let owner_intact = wait_for_version(svc, "1.0.0", EVENT_TIMEOUT)
         && pid_alive(workload)

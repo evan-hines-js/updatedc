@@ -1,0 +1,40 @@
+{{- if .Values.gateway.ingress.enabled }}
+{{- if not .Values.gateway.ingress.host }}
+{{- fail "gateway.ingress.host is required when gateway.ingress.enabled is set" }}
+{{- end }}
+{{- if and (not .Values.gateway.ingress.passthrough) (not .Values.gateway.ingress.acknowledgeTlsTermination) }}
+{{- fail "gateway.ingress.passthrough is false: an ingress that TERMINATES TLS breaks enrollment, because the gateway would authenticate the proxy instead of the node's client certificate. Use a LoadBalancer Service, or TLS passthrough. If your controller passes the client certificate through by some other means, set gateway.ingress.acknowledgeTlsTermination=true." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "updatec.gatewayName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  annotations:
+    {{- if .Values.gateway.ingress.passthrough }}
+    # The gateway speaks mutual TLS to its agents. The proxy must move bytes, not terminate: a
+    # terminating proxy strips the node's client certificate, which IS the enrollment identity.
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    {{- end }}
+    {{- with .Values.gateway.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.gateway.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.gateway.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "updatec.gatewayName" . }}
+                port:
+                  number: {{ .Values.gateway.service.port }}
+{{- end }}

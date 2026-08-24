@@ -1,92 +1,363 @@
 ---
-# Build the agent from source on the target (native binaries, no cross-compile) and run it as
-# a systemd service that enrolls with the control plane. This is the ONE way an agent is
-# installed on a host by install-agent.yml.
+# Bootstrap a host onto an `updated` fleet from the published release. Nothing is compiled here: CI
+# builds and attests one artifact per platform, and that is the artifact the node runs. What this
+# role checks is CI's signed provenance for both the artifact and SHA256SUMS, followed by their
+# digest agreement. Network installs cannot disable provenance verification or select a mutable
+# release; an air-gapped operator establishes that trust before staging local artifacts.
+#
+# This role's whole job is the FIRST install — after it, every agent version and every workload
+# arrives through the fleet's own signed TUF channel. Re-running this role does not upgrade an
+# agent, and it is not meant to.
 
-- name: Install build and runtime dependencies
-  ansible.builtin.apt:
-    name:
-      - build-essential
-      - cmake          # aws-lc-rs (the one crypto lib) builds C via cmake
-      - clang
-      - pkg-config
-      - curl
-      - ca-certificates
-      - socat
-    state: present
-    update_cache: true
+- name: Validate the enrollment identity was supplied
+  # Fail on the play, not on a half-configured node: without these three the service starts,
+  # cannot present a client certificate, and fails enrollment with a TLS error that names none of
+  # this. There is no shared enrollment secret — mutual TLS IS the identity.
+  ansible.builtin.assert:
+    that:
+      - updated_enrollment_client_cert | default('', true) | length > 0
+      - updated_enrollment_client_key | default('', true) | length > 0
+      - updated_enrollment_ca | default('', true) | length > 0
+    fail_msg: >-
+      updated_enrollment_client_cert, updated_enrollment_client_key, and updated_enrollment_ca are
+      required (base64 PEM). Mutual TLS against the fleet CA is the enrollment identity.
 
-- name: Install the Rust toolchain (rustup)
-  become: false
-  ansible.builtin.shell: >
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-  args:
-    creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
+- name: Validate the gateway URL was supplied and is https
+  # The role ships no default for this: it is the address nodes resolve from outside the cluster,
+  # and a placeholder would template a whole fleet onto an unreachable endpoint and only surface
+  # per host, at enrollment. `default('')` keeps an omitted variable from raising an undefined
+  # error here — the point is to fail with the message below, on the control node.
+  ansible.builtin.assert:
+    that:
+      - updated_enrollment_url | default('', true) | length > 0
+      - updated_enrollment_url | default('') is match('^https://')
+      - updated_enrollment_url | default('') is match('^https://[^"\\\\\r\n]+$')
+    fail_msg: >-
+      updated_enrollment_url is required: your gateway's URL as nodes resolve it from outside the
+      cluster, the same value the control plane was installed with as `publicUrl` — not the
+      in-cluster Service name. It must be https — enrollment is mutual TLS and a pinned trust root
+      is worthless over plaintext — and it may not contain TOML-breaking control characters.
 
-- name: Synchronize the updatedc source
-  become: false
-  when: updated_build_dir != updatedc_source
-  ansible.posix.synchronize:
-    src: "{{ updatedc_source }}/"
-    dest: "{{ updated_build_dir }}/"
-    delete: false
-    rsync_opts:
-      - "--exclude=target"
-      - "--exclude=.git"
+- name: Validate the stable node name
+  ansible.builtin.assert:
+    that:
+      - updated_hostname | length <= 253
+      - updated_hostname is match('^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$')
+      - updated_hostname != 'fleet'
+    fail_msg: >-
+      updated_hostname must be at most 253 lowercase ASCII letters, digits, or interior hyphens,
+      and may not be the reserved fleet telemetry index name.
 
-- name: Build the agent binaries
-  become: false
-  ansible.builtin.shell: >
-    . "{{ ansible_env.HOME }}/.cargo/env" &&
-    cargo build --release -p launcher -p agent
-  args:
-    chdir: "{{ updated_build_dir }}"
+- name: Validate the immutable release trust boundary
+  ansible.builtin.assert:
+    that:
+      - >-
+        updated_release_local_dir | length > 0 or
+        updated_release_tag is match('^build-[0-9a-f]{40}$')
+      - updated_release_local_dir | length > 0 or updated_verify_attestation | bool
+      - >-
+        not (updated_verify_attestation | bool) or
+        updated_release_tag is match('^build-[0-9a-f]{40}$')
+    fail_msg: >-
+      Network installs require updated_release_tag=build-<40-hex-commit> and mandatory provenance
+      verification. Local artifacts may omit both only when every asset was provenance-verified on
+      the control node before it was staged.
 
-- name: Install the agent binaries
-  ansible.builtin.copy:
-    remote_src: true
-    src: "{{ updated_build_dir }}/target/release/{{ item }}"
-    dest: "/usr/local/bin/{{ item }}"
-    mode: "0755"
-  loop:
-    - updated-launcher
-    - updated-agent
+- name: Select the release artifact for this host's architecture
+  ansible.builtin.set_fact:
+    updated_pkg_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_architecture] }}"
+    updated_archive_platform: "linux-{{ ansible_architecture }}"
+  failed_when: ansible_architecture not in ['x86_64', 'aarch64']
 
-# ── Agent service ─────────────────────────────────────────────────────────────
-- name: Ensure the agent mTLS directory exists
+- name: Select the package format for this host
+  ansible.builtin.set_fact:
+    updated_pkg_format: "{{ 'deb' if ansible_pkg_mgr in ['apt'] else 'rpm' }}"
+  when: updated_install_method == 'package'
+
+- name: Name the artifact to install
+  ansible.builtin.set_fact:
+    updated_artifact: >-
+      {{ ('updated-agent_' ~ updated_pkg_arch ~ '.' ~ updated_pkg_format)
+         if updated_install_method == 'package'
+         else ('updated-' ~ updated_archive_platform ~ '.tar.gz') }}
+
+- name: Create the staging directory
   ansible.builtin.file:
-    path: /etc/updated/agent-tls
+    path: /var/cache/updated-install
     state: directory
     mode: "0700"
+
+# ── Fetch the artifact and its checksums ──────────────────────────────────────
+- name: Stage the release from the control node
+  # Air-gapped path: the artifacts were downloaded once, to the control node, and are copied from
+  # there — so a fleet of hosts needs no route to GitHub at all.
+  when: updated_release_local_dir | length > 0
+  block:
+    - name: Copy the release artifact and checksums
+      ansible.builtin.copy:
+        src: "{{ updated_release_local_dir }}/{{ item }}"
+        dest: "/var/cache/updated-install/{{ item }}"
+        mode: "0600"
+      loop:
+        - "{{ updated_artifact }}"
+        - SHA256SUMS
+
+- name: Download the release onto the host
+  when: updated_release_local_dir | length == 0
+  block:
+    - name: Download the release artifact and checksums
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/{{ updated_release_repo }}/releases/download/{{ updated_release_tag }}/{{ item }}
+        dest: "/var/cache/updated-install/{{ item }}"
+        mode: "0600"
+      loop:
+        - "{{ updated_artifact }}"
+        - SHA256SUMS
+
+# ── Verify before installing ──────────────────────────────────────────────────
+# Provenance is checked before SHA256SUMS is parsed. `--source-digest` binds an attestation from the
+# right workflow to the exact immutable build selected by `updated_release_tag`.
+- name: Verify the build provenance CI attested
+  when: updated_verify_attestation | bool
+  ansible.builtin.command:
+    argv:
+      - gh
+      - attestation
+      - verify
+      - "/var/cache/updated-install/{{ item }}"
+      - --repo
+      - "{{ updated_release_repo }}"
+      - --signer-workflow
+      - "{{ updated_release_repo }}/.github/workflows/ci.yml"
+      - --source-ref
+      - refs/heads/main
+      - --source-digest
+      - "{{ updated_release_tag | regex_replace('^build-', '') }}"
+      - --deny-self-hosted-runners
+  loop:
+    - "{{ updated_artifact }}"
+    - SHA256SUMS
+  changed_when: false
+
+# The attested manifest and artifact must also agree on their bytes. An artifact it does not list is
+# refused outright rather than installed as an unknown.
+- name: Read the published checksums
+  ansible.builtin.slurp:
+    src: /var/cache/updated-install/SHA256SUMS
+  register: updated_sha256sums
+
+- name: Measure the staged artifact
+  ansible.builtin.stat:
+    path: "/var/cache/updated-install/{{ updated_artifact }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: updated_staged
+
+- name: Find the published digest for this artifact
+  # The line is matched on the whole trailing filename, so `updated-agent_amd64.deb` is never
+  # satisfied by a line for `updated-agent_amd64.deb.sig`. A sha256sum line always begins with the
+  # 64-character digest, which is why this slices rather than splitting.
+  ansible.builtin.set_fact:
+    updated_expected_digest: >-
+      {{ ((updated_sha256sums.content | b64decode).splitlines()
+          | select('search', '\s' ~ (updated_artifact | regex_escape) ~ '$')
+          | list | first | default(''))[:64] }}
+
+- name: Verify the artifact against the published checksums
+  ansible.builtin.assert:
+    that:
+      - updated_expected_digest | length == 64
+      - updated_staged.stat.checksum == updated_expected_digest
+    fail_msg: >-
+      {{ updated_artifact }} does not match the digest published in SHA256SUMS
+      (expected '{{ updated_expected_digest }}', got '{{ updated_staged.stat.checksum }}').
+      Refusing to install.
+
+# ── Install ───────────────────────────────────────────────────────────────────
+# The package owns the root-only directory modes, the systemd unit, and
+# config-merge-on-upgrade. That is why it is the default: none of it is reimplemented here.
+- name: Install the agent package (deb)
+  when: updated_install_method == 'package' and updated_pkg_format == 'deb'
+  ansible.builtin.apt:
+    deb: "/var/cache/updated-install/{{ updated_artifact }}"
+
+- name: Install the agent package (rpm)
+  when: updated_install_method == 'package' and updated_pkg_format == 'rpm'
+  ansible.builtin.dnf:
+    # The release .rpm is not GPG-signed — there is no repository and no signing key, only the
+    # per-release SHA256SUMS verified above and the provenance attestation. Leaving the check on
+    # would simply refuse a local file no key can vouch for; it is not a control being waived.
+    disable_gpg_check: true
+    name: "/var/cache/updated-install/{{ updated_artifact }}"
+    state: present
+
+- name: Install from the archive
+  # For hosts with neither dpkg nor rpm. Everything the package would have declared is declared
+  # here instead, so a node installed either way is the same node.
+  when: updated_install_method != 'package'
+  block:
+    - name: Create the binary and state directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: /usr/lib/updated, mode: "0755"}
+        - {path: /var/lib/updated, mode: "0700"}
+
+    - name: Create a private archive staging directory
+      ansible.builtin.file:
+        path: /var/cache/updated-install/archive
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Inspect the release archive before extraction
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -tzf
+          - "/var/cache/updated-install/{{ updated_artifact }}"
+      register: updated_archive_members
+      changed_when: false
+
+    - name: Refuse archives with unexpected members
+      ansible.builtin.assert:
+        that:
+          - updated_archive_members.stdout_lines ==
+            ['updated-launcher', 'updated-agent', 'updated-agent.service']
+        fail_msg: >-
+          {{ updated_artifact }} must contain exactly updated-launcher, updated-agent, and
+          updated-agent.service in that order. Refusing to extract unexpected paths as root.
+
+    - name: Inspect the release archive member types
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -tvzf
+          - "/var/cache/updated-install/{{ updated_artifact }}"
+      register: updated_archive_headers
+      changed_when: false
+
+    - name: Refuse linked or special archive members
+      ansible.builtin.assert:
+        that:
+          - updated_archive_headers.stdout_lines | reject('match', '^-') | list | length == 0
+        fail_msg: >-
+          {{ updated_artifact }} contains a non-regular archive member. Refusing to extract it as
+          root.
+
+    - name: Unpack the release archive into private staging
+      ansible.builtin.unarchive:
+        src: "/var/cache/updated-install/{{ updated_artifact }}"
+        dest: /var/cache/updated-install/archive
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Inspect the extracted release files
+      ansible.builtin.stat:
+        path: "/var/cache/updated-install/archive/{{ item }}"
+        follow: false
+      loop:
+        - updated-launcher
+        - updated-agent
+        - updated-agent.service
+      register: updated_archive_files
+
+    - name: Refuse non-regular or linked release files
+      ansible.builtin.assert:
+        that:
+          - item.stat.isreg | default(false)
+          - not (item.stat.islnk | default(false))
+          - item.stat.nlink | default(0) == 1
+        fail_msg: >-
+          {{ item.item }} must be a regular, unlinked file in {{ updated_artifact }}.
+      loop: "{{ updated_archive_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Install the agent binaries
+      ansible.builtin.copy:
+        src: "/var/cache/updated-install/archive/{{ item }}"
+        dest: "/usr/lib/updated/{{ item }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - updated-launcher
+        - updated-agent
+
+    - name: Install the verified agent service
+      ansible.builtin.copy:
+        src: /var/cache/updated-install/archive/updated-agent.service
+        dest: /etc/systemd/system/updated-agent.service
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload systemd
+
+# ── Configure this node ───────────────────────────────────────────────────────
+- name: Ensure the configuration directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: /etc/updated, mode: "0755"}
+    - {path: /etc/updated/agent-tls, mode: "0700"}
 
 - name: Write the agent mTLS identity (client cert, key, fleet CA)
   ansible.builtin.copy:
     dest: "/etc/updated/agent-tls/{{ item.name }}"
-    content: "{{ item.content }}"
+    content: "{{ item.content | b64decode }}"
+    owner: root
+    group: root
     mode: "0600"
   loop:
-    - { name: tls.crt, content: "{{ updated_enrollment_client_cert | b64decode }}" }
-    - { name: tls.key, content: "{{ updated_enrollment_client_key | b64decode }}" }
-    - { name: ca.crt, content: "{{ updated_enrollment_ca | b64decode }}" }
+    - {name: tls.crt, content: "{{ updated_enrollment_client_cert }}"}
+    - {name: tls.key, content: "{{ updated_enrollment_client_key }}"}
+    - {name: ca.crt, content: "{{ updated_enrollment_ca }}"}
   loop_control:
     label: "{{ item.name }}"
   no_log: true
+  notify: Restart the updated agent
 
 - name: Write the launcher enrollment config
   ansible.builtin.template:
     src: config.toml.j2
     dest: /etc/updated/config.toml
+    owner: root
+    group: root
     mode: "0600"
+  notify: Restart the updated agent
 
-- name: Install the agent service
+- name: Write the service tunables
   ansible.builtin.template:
-    src: updated-agent.service.j2
-    dest: /etc/systemd/system/updated-agent.service
+    src: agent.env.j2
+    dest: /etc/updated/agent.env
+    owner: root
+    group: root
     mode: "0644"
+  notify: Restart the updated agent
+
+- name: Remove the staged artifacts
+  ansible.builtin.file:
+    path: /var/cache/updated-install
+    state: absent
 
 - name: Start the agent
-  ansible.builtin.systemd:
+  ansible.builtin.systemd_service:
     name: updated-agent
-    state: restarted
-    enabled: true
+    state: "{{ 'started' if updated_agent_started else 'stopped' }}"
+    enabled: "{{ updated_agent_started }}"
     daemon_reload: true

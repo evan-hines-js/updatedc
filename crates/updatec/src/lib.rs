@@ -6,17 +6,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kube::CustomResource;
+use object_store::ObjectStoreExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use updated_contracts::artifact::TargetReference as ExactTarget;
 use updated_contracts::assignment::RepositoryAssignment as DesiredDeployment;
-use updated_contracts::enrollment::{EnrollmentBundle, InitialSignedConfiguration};
+use updated_contracts::enrollment::EnrollmentBundle;
 
+pub mod admission;
 pub mod alerts;
+pub mod crd;
+pub(crate) mod dataflow;
 pub(crate) mod domain;
+pub mod env;
 pub mod evidence;
 pub mod gateway;
+pub(crate) mod input_data;
 pub mod join;
 pub mod metrics;
 pub mod publisher;
@@ -24,9 +30,79 @@ pub(crate) mod rollout;
 pub mod runtime;
 pub mod served;
 pub mod subscription;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub(crate) mod webhook;
 pub mod window;
 
 pub use window::{CalendarEntry, RolloutWindow, Weekday};
+
+/// The operator-selected consequence of an authoritative Draupnir verdict. These are enums rather
+/// than booleans so the generated CRD is self-documenting and cannot accumulate two inverse knobs
+/// for the same decision.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum AdmissionAction {
+    Allow,
+    Block,
+}
+
+/// One namespaced release-admission policy. A repository either references exactly one of these or
+/// has no external admission gate; there are no environment-variable or per-group override paths.
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[kube(
+    group = "updated.dev",
+    version = "v1alpha1",
+    kind = "UpdateAdmissionPolicy",
+    plural = "updateadmissionpolicies",
+    namespaced,
+    shortname = "uap",
+    printcolumn = r#"{"name":"URL","type":"string","jsonPath":".spec.webhook.url"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAdmissionPolicySpec {
+    pub webhook: AdmissionWebhookSpec,
+    pub actions: AdmissionActions,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionWebhookSpec {
+    /// Absolute HTTP(S) endpoint implementing updatedc's versioned release-admission contract.
+    /// At most every 30 seconds (and immediately for a previously unseen subject), the controller
+    /// POSTs the complete active subject set. The idempotent request is both event notification and
+    /// verdict refresh; there is no second event or admission endpoint.
+    pub url: String,
+    /// Secret in the same namespace whose `key` entry authenticates the exact REQUEST bytes with
+    /// HMAC-SHA256 (`X-Updated-Signature: sha256=<hex>`). Caller authentication only: the response
+    /// is authenticated by [`Self::decision_public_key`] instead.
+    pub secret_ref: LocalSecretReference,
+    /// Draupnir's admission public key, pinned here the way a release-signing root is pinned:
+    /// hex of an uncompressed P-256 point (65 bytes, `04`-prefixed), the same encoding
+    /// [`AgentIdentity::public_key`] uses, so the fleet has exactly one public-key encoding.
+    ///
+    /// The decision is an authoritative compliance assertion that gates deployment, so it is signed
+    /// ASYMMETRICALLY over the exact response body bytes and verified against this pin. A shared
+    /// HMAC could not serve here: this control plane holds that key, so it could mint its own
+    /// verdict, and no third party could ever verify what Draupnir decided. Because the signed
+    /// document is byte-identical to the enforced one, Draupnir's retained attestation — which
+    /// embeds the digest of these bytes — cannot silently disagree with what was enforced.
+    ///
+    /// There is no unsigned or symmetric fallback: a policy that cannot verify a decision has no
+    /// safe reading, so this is required and a malformed pin fails closed.
+    pub decision_public_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionActions {
+    /// What to do when Draupnir has information and declares the subject noncompliant.
+    pub non_compliant: AdmissionAction,
+    /// What to do when Draupnir authoritatively says it has no information for the subject.
+    /// Transport failure, a missing verdict, and `Pending` are not `NoInformation`; they always
+    /// hold movement until an authoritative response arrives.
+    pub no_information: AdmissionAction,
+}
 
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[kube(
@@ -107,9 +183,6 @@ pub struct DeploymentSpec {
     pub ordered_install_fallback: bool,
     pub provider_set: TargetSpec,
     pub runtime: RuntimeSpec,
-    /// Telemetry write location signed into each agent's assignment. Rollout safety requires
-    /// attributable node feedback, so every deployment must provide it.
-    pub report_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -122,60 +195,35 @@ pub struct ReleaseRepositorySpec {
     pub root_json: String,
 }
 
+/// The CRD spelling of [`updated_contracts::assignment::ManagedRuntime`].
+///
+/// It is a near-twin, not a full one, and the difference is the point. This side is a Kubernetes
+/// object: deserialized from apiserver JSON, versioned by the CRD's own `v1alpha1`, and free to gain
+/// an optional field whenever an operator needs one. The contract side is the SIGNED, node-facing
+/// document, governed by [`updated_contracts::assignment::RepositoryAssignment::SCHEMA`], where any
+/// shape change — even an added optional field — strands every not-yet-upgraded node behind a parse
+/// error. Two things with genuinely different evolution rules get two types.
+///
+/// What this type must never contain is a second DEFINITION of a value the node acts on. It used to:
+/// `repository`, `storage` and `timeouts` were declared here as field-for-field copies of the
+/// contract structs, and a copy drifts. Adding a field to the contract failed to compile, but adding
+/// one *here* did not — an operator could set it in YAML and it would silently never reach a node —
+/// and nothing at all caught a mis-wired mapping between two `u64` fields. Those three are now the
+/// contract's own types, carried across whole. There is one declaration of each, so there is nothing
+/// left to drift against and no field mapping to get wrong.
+///
+/// What remains is genuinely this side's own: `product`, `channel`, and an `installRoot` the
+/// contract holds as a `PathBuf`. `TryFrom<DeploymentSpec> for DesiredDeployment` destructures every
+/// spec exhaustively, so a field added to either side is a compile error until both agree.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSpec {
     pub product: String,
     pub channel: String,
     pub install_root: String,
-    #[serde(default)]
-    pub secrets: Vec<SecretReferenceSpec>,
-    pub repository: RepositoryLimitsSpec,
-    pub storage: StorageSpec,
-    pub timeouts: TimeoutsSpec,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SecretReferenceSpec {
-    pub environment: String,
-    /// Secret in the control-plane namespace, which the gateway serves to the assigned node at
-    /// `/v1/node/secrets` ONLY if it carries the label `updated.dev/fleet-distributable: "true"`.
-    /// Writing this field needs `update` on `updategroups.updated.dev`, which does not imply `get`
-    /// on Secrets, so the opt-in deliberately lives on the Secret: naming one here is a request,
-    /// never a grant. The control plane's own key material (signing keys, object-store credentials,
-    /// cert-manager-issued certificates, and the enrollment Secrets it owns) is refused whatever it
-    /// is labelled.
-    pub secret: String,
-    pub key: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RepositoryLimitsSpec {
-    pub metadata_limit: u64,
-    pub target_limit: u64,
-    pub transport_timeout_seconds: u64,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageSpec {
-    pub inactive_releases: usize,
-    pub inactive_providers: usize,
-    pub inactive_agents: usize,
-    pub inactive_bytes: u64,
-    pub inactive_repository_caches: usize,
-}
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TimeoutsSpec {
-    pub check_interval_seconds: u64,
-    pub health_grace_seconds: u64,
-    pub health_successes: u32,
-    pub health_interval_seconds: u64,
-    pub refresh_retry_seconds: u64,
-    pub confirmation_window_seconds: u64,
-    pub agent_check_interval_seconds: u64,
+    pub repository: updated_contracts::assignment::ManagedRepositoryLimits,
+    pub storage: updated_contracts::assignment::ManagedStorage,
+    pub timeouts: updated_contracts::assignment::ManagedTimeouts,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -187,68 +235,70 @@ pub struct TargetSpec {
 impl TryFrom<DeploymentSpec> for DesiredDeployment {
     type Error = String;
 
+    /// Every field is DESTRUCTURED, never read by dotted access.
+    ///
+    /// That is the whole drift guard, and it closes the direction a field-by-field copy leaves
+    /// open. Adding a field to the contract already failed to compile here (the struct literal
+    /// below would be missing it). Adding one to the *spec* did not: `value.runtime.timeouts.x`
+    /// simply never mentions it, so an operator could set a field in YAML that silently never
+    /// reached a node. A non-exhaustive destructuring pattern is a compile error, so now neither
+    /// side can gain a field the other does not.
     fn try_from(value: DeploymentSpec) -> Result<Self, Self::Error> {
-        let release_root = serde_json::from_str(&value.release_repository.root_json)
+        let DeploymentSpec {
+            name,
+            release_repository:
+                ReleaseRepositorySpec {
+                    metadata_url,
+                    targets_url,
+                    root_json,
+                },
+            application,
+            ordered_install_fallback,
+            provider_set,
+            runtime:
+                RuntimeSpec {
+                    product,
+                    channel,
+                    install_root,
+                    repository,
+                    storage,
+                    timeouts,
+                },
+        } = value;
+        let release_root = serde_json::from_str(&root_json)
             .map_err(|error| format!("releaseRepository.rootJson is invalid JSON: {error}"))?;
         let desired = Self {
             schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
-            deployment: value.name,
-            metadata_url: value.release_repository.metadata_url,
-            targets_url: value.release_repository.targets_url,
-            report_url: Some(value.report_url),
-            application: ExactTarget {
-                path: value.application.path,
-                sha256: value.application.sha256,
-            },
-            ordered_install_fallback: value.ordered_install_fallback,
-            provider_set: ExactTarget {
-                path: value.provider_set.path,
-                sha256: value.provider_set.sha256,
-            },
+            deployment: name,
+            metadata_url,
+            targets_url,
+            application: application.into(),
+            ordered_install_fallback,
+            provider_set: provider_set.into(),
             release_root,
             runtime: updated_contracts::assignment::ManagedRuntime {
-                product: value.runtime.product,
-                channel: value.runtime.channel,
-                install_root: value.runtime.install_root.into(),
-                secrets: value
-                    .runtime
-                    .secrets
-                    .into_iter()
-                    .map(|reference| updated_contracts::assignment::SecretReference {
-                        environment: reference.environment,
-                        secret: reference.secret,
-                        key: reference.key,
-                    })
-                    .collect(),
-                inputs: BTreeMap::new(),
-                repository: updated_contracts::assignment::ManagedRepositoryLimits {
-                    metadata_limit: value.runtime.repository.metadata_limit,
-                    target_limit: value.runtime.repository.target_limit,
-                    transport_timeout_seconds: value.runtime.repository.transport_timeout_seconds,
-                },
-                storage: updated_contracts::assignment::ManagedStorage {
-                    inactive_releases: value.runtime.storage.inactive_releases,
-                    inactive_providers: value.runtime.storage.inactive_providers,
-                    inactive_agents: value.runtime.storage.inactive_agents,
-                    inactive_bytes: value.runtime.storage.inactive_bytes,
-                    inactive_repository_caches: value.runtime.storage.inactive_repository_caches,
-                },
-                timeouts: updated_contracts::assignment::ManagedTimeouts {
-                    check_interval_seconds: value.runtime.timeouts.check_interval_seconds,
-                    health_grace_seconds: value.runtime.timeouts.health_grace_seconds,
-                    health_successes: value.runtime.timeouts.health_successes,
-                    health_interval_seconds: value.runtime.timeouts.health_interval_seconds,
-                    refresh_retry_seconds: value.runtime.timeouts.refresh_retry_seconds,
-                    confirmation_window_seconds: value.runtime.timeouts.confirmation_window_seconds,
-                    agent_check_interval_seconds: value
-                        .runtime
-                        .timeouts
-                        .agent_check_interval_seconds,
-                },
+                product,
+                channel,
+                install_root: install_root.into(),
+                // The operator does not choose a node's inputs: they are resolved from the group's
+                // own subscriptions, so the signed document starts empty here.
+                inputs: updated_contracts::dataflow::InputSelection::default(),
+                // Carried, not copied: these three are the contract's own types, so there is no
+                // field mapping to get wrong and no second declaration to fall behind.
+                repository,
+                storage,
+                timeouts,
             },
         };
         desired.validate()?;
         Ok(desired)
+    }
+}
+
+impl From<TargetSpec> for ExactTarget {
+    fn from(value: TargetSpec) -> Self {
+        let TargetSpec { path, sha256 } = value;
+        Self { path, sha256 }
     }
 }
 
@@ -257,6 +307,126 @@ impl TryFrom<DeploymentSpec> for DesiredDeployment {
 pub struct LabelSelector {
     #[serde(default)]
     pub match_labels: BTreeMap<String, String>,
+}
+
+/// A dynamically managed load-balancer projection. This is the sole topology input for
+/// `updated-healthproxy`: the operator derives its inventory from matching [`UpdateAgent`]s and
+/// owns the workload and its least-privilege RBAC for the lifetime of this object.
+#[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[kube(
+    group = "updated.dev",
+    version = "v1alpha1",
+    kind = "UpdateBackend",
+    plural = "updatebackends",
+    namespaced,
+    shortname = "upb",
+    status = "UpdateBackendStatus",
+    printcolumn = r#"{"name":"Repository","type":"string","jsonPath":".spec.repositoryRef.name"}"#,
+    printcolumn = r#"{"name":"Agents","type":"integer","jsonPath":".status.matchedAgents"}"#,
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type == 'Ready')].status"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateBackendSpec {
+    pub repository_ref: LocalObjectReference,
+    /// Selects `UpdateAgent.spec.labels`. An empty selector is refused rather than interpreted as
+    /// the whole fleet.
+    pub selector: LabelSelector,
+    /// Public base URL from which healthproxy reads this repository's signed telemetry projection.
+    pub health_base: String,
+    pub target: BackendTarget,
+    #[serde(default = "default_backend_interval_seconds")]
+    #[schemars(range(min = "BACKEND_POLL_SECONDS_MIN", max = "BACKEND_INTERVAL_SECONDS_MAX"))]
+    pub interval_seconds: u64,
+    #[serde(default = "default_backend_health_timeout_seconds")]
+    #[schemars(range(
+        min = "BACKEND_POLL_SECONDS_MIN",
+        max = "BACKEND_HEALTH_TIMEOUT_SECONDS_MAX"
+    ))]
+    pub health_timeout_seconds: u64,
+}
+
+/// The poll bounds an `UpdateBackend` must satisfy, stated once. The `schemars(range(...))`
+/// attributes above render them into the shipped CRD, so the apiserver refuses an out-of-range
+/// value up front, and `runtime::validate_backend` refuses one that reaches the controller anyway
+/// (an older CRD in the cluster, a hand-written object). Two enforcement points that disagree give
+/// an operator a CR the apiserver accepts and every reconcile then fails with `InvalidPollPlan`, so
+/// both read these — including the message that quotes them back.
+pub const BACKEND_POLL_SECONDS_MIN: u64 = 1;
+/// The slowest poll a backend may be given, DERIVED from the telemetry freshness window rather
+/// than written beside it.
+///
+/// `spec.intervalSeconds` reaches the healthproxy verbatim as `HEALTHPROXY_INTERVAL_SECS` and
+/// becomes its per-cycle sleep, so it is the reader half of the budget
+/// [`updated_contracts::telemetry::MAX_CHECK_INTERVAL_SECONDS`] derives for the writer: of the
+/// three gaps that must fit inside [`updated_contracts::telemetry::REPORT_FRESHNESS`], one is
+/// spent on "the reader's own poll interval". Taking the same number keeps both halves of that
+/// budget answerable to the one window.
+///
+/// The literal 300 that stood here admitted intervals five times the window. Two things break past
+/// it, and neither is visible in steady state. A report is routinely older than
+/// `NodeReport::is_fresh` accepts by the time the reader looks at it; and — the reason this is a
+/// bound rather than a warning — `LastKnownGood::STALENESS` IS `REPORT_FRESHNESS`, so the entry
+/// stored on cycle N-1 has already expired when cycle N runs. The last-known-good cache is then
+/// inert by construction, and a single failed fetch (one CDN 5xx) programs every member of the
+/// backend not-ready in one cycle: the whole healthy fleet drained out of the load balancer, which
+/// is exactly what that cache exists to prevent ("a checker-side outage is not evidence a node is
+/// down"). At this bound the bridge spans at least three consecutive failed cycles.
+pub const BACKEND_INTERVAL_SECONDS_MAX: u64 =
+    updated_contracts::telemetry::MAX_CHECK_INTERVAL_SECONDS;
+/// Three whole poll cycles must fit inside the staleness window the healthproxy's last-known-good
+/// cache uses, so a reader outage spanning several cycles still cannot drain a healthy fleet.
+const _: () = assert!(
+    BACKEND_INTERVAL_SECONDS_MAX * 3 <= updated_contracts::telemetry::REPORT_FRESHNESS.as_secs()
+);
+pub const BACKEND_HEALTH_TIMEOUT_SECONDS_MAX: u64 = 30;
+
+fn default_backend_interval_seconds() -> u64 {
+    2
+}
+
+fn default_backend_health_timeout_seconds() -> u64 {
+    2
+}
+
+/// One structurally valid Kubernetes object for both load-balancer integrations. Reconciliation
+/// enforces the discriminator strictly: fields belonging to the other kind are rejected, so there
+/// is still exactly one valid configuration shape without relying on CRD `oneOf` constructs that
+/// Kubernetes cannot make structural.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendTarget {
+    pub kind: BackendTargetKind,
+    /// Selectorless Service in the `UpdateBackend` namespace. Cross-namespace traffic mutation is
+    /// deliberately not supported; it would require namespace-wide operator credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_name: Option<String>,
+    /// HAProxy Runtime API TCP sockets as `host:port`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum BackendTargetKind {
+    #[serde(rename = "endpointSlice")]
+    EndpointSlice,
+    #[serde(rename = "haProxy")]
+    HAProxy,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateBackendStatus {
+    pub observed_generation: Option<i64>,
+    pub matched_agents: Option<u32>,
+    pub workload: Option<String>,
+    #[serde(default)]
+    pub conditions: Vec<ResourceCondition>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -336,6 +506,31 @@ pub struct UpdateGroupSetSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub max_regressions: Option<u32>,
+    /// What happens to this set's groups, beyond the fleet-wide halt, when the regression verdict
+    /// fires on a deployment they are staging. `halt` (the default) stops admission and leaves
+    /// every node where it is — nodes that attempted the bad release already rolled themselves
+    /// back, and nodes that settled healthy on it stay on it. `rollback` additionally rebases each
+    /// affected group onto the deployment its rollout was staging away from, so the nodes that
+    /// settled on the proven-bad body are staged back too (bounded by `maxUnavailable`, exactly
+    /// like the forward direction).
+    ///
+    /// The rollback response is deliberately conservative in three ways. It fires only once every
+    /// node whose evidence triggered the halt is OBSERVABLY RECOVERED — an authentic, fresh report
+    /// that is healthy and still claims the rejection — because a node whose own rollback failed
+    /// is a machine in an unknown state, not proof that reverting the rest of the fleet is safe;
+    /// until then the halt alone stands. It requires a predecessor to exist (a group whose FIRST
+    /// deployment regressed has nowhere to go and stays halted). And a group governed by several
+    /// sets rolls back only when every one of them says `rollback` — automatic movement needs
+    /// unanimous operator intent, a freeze does not.
+    ///
+    /// Rolling back consumes the very evidence the halt is recomputed from (the rejecting nodes
+    /// are reassigned the predecessor, so their reports stop naming the bad assignment), so the
+    /// response also records a durable VETO of the deployment identity in the admitted-state
+    /// document: the proven-bad body stays refused across controller restarts, until no group
+    /// names it any more. The exit is the same as for a halt — publish corrected bytes, which have
+    /// a new digest.
+    #[serde(default)]
+    pub on_regression: RegressionResponse,
     /// How long a member group may sit in `staging` with no node newly settled before the
     /// `RolloutStuck` condition is raised on it. Defaults to 3600 seconds. Alerting policy only —
     /// it gates nothing.
@@ -424,6 +619,39 @@ pub struct HaltedDeployment {
     pub deployment: String,
     /// Distinct nodes whose signed reports prove they attempted this deployment and rolled back.
     pub evidence: u32,
+    /// Whether an `onRegression: rollback` response has consumed this halt: the affected groups
+    /// were rebased onto their predecessors and the identity carries a durable veto, so it stays
+    /// refused even though the rejecting nodes — reassigned to the predecessor — no longer state
+    /// the rejection in their reports.
+    #[serde(default)]
+    pub rolled_back: bool,
+}
+
+/// What a set does, beyond the fleet-wide halt, when the regression verdict fires on a deployment
+/// its groups are staging. See `UpdateGroupSetSpec::on_regression` for the full contract.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RegressionResponse {
+    /// Stop admitting anyone to the proven-bad deployment; leave every node where it is.
+    #[default]
+    Halt,
+    /// Additionally rebase each affected group onto the deployment it was staging away from, once
+    /// every rejecting node's own rollback is observably complete and healthy.
+    Rollback,
+}
+
+/// The durable record of a deployment identity an `onRegression: rollback` response has consumed
+/// the evidence for. Persisted in the admitted-state document, because the response reassigns the
+/// rejecting nodes to the predecessor — after which their reports no longer state the rejection —
+/// and a verdict recomputed from reports alone would re-admit the proven-bad body on the next
+/// leader change. Pruned when no group's desired or admitted deployments name the identity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VetoedDeployment {
+    /// The deployment's operator-facing name, for the status projection.
+    pub deployment: String,
+    /// Distinct nodes whose evidence triggered the response, frozen at the moment it fired.
+    pub evidence: u32,
 }
 
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -447,6 +675,14 @@ pub struct UpdateAgentSpec {
     /// does not need to be a Kubernetes Node, Pod, or workload.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Host a load balancer uses to reach this agent's managed service: one IP literal or DNS name,
+    /// never a URL or `host:port`. The [`UpdateBackend`] target owns the service port, so there is
+    /// one port authority rather than an ignored per-agent spelling. It is optional because not
+    /// every managed machine serves traffic; an [`UpdateBackend`] selecting an uncordoned agent
+    /// without a valid host and pinned key projects that identity as explicitly drained and reports
+    /// the degraded inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_address: Option<String>,
     /// Freeze this node on exactly the body its recorded assignment names — a hardware swap is
     /// scheduled, do not move it. A held node keeps its group membership for accounting but is
     /// excluded from admission: it neither advances to a staged deployment nor releases a rollout
@@ -457,12 +693,12 @@ pub struct UpdateAgentSpec {
     #[serde(default)]
     pub hold: bool,
     /// Take this node out of load-balancer rotation gracefully, without stopping the application.
-    /// A cordoned node is published to the healthproxy's endpoint projection as drained regardless
-    /// of its report — the same drained state a stale report produces — while the application
-    /// keeps running, the node keeps reporting, and the agent stays entirely unaware. Rollout
-    /// accounting treats it as absent (like a departed node) rather than unhealthy, so a cordon
-    /// neither eats the group's availability budget nor wedges an in-flight rollout. Orthogonal to
-    /// [`hold`](Self::hold): a node can be held but serving, or cordoned but updatable.
+    /// A cordoned identity is projected through every matching [`UpdateBackend`]'s trusted
+    /// inventory as an explicit drain, regardless of its report. The application keeps running,
+    /// the node keeps reporting, and the agent stays unaware. Rollout accounting treats it as
+    /// absent (like a departed node), so a cordon neither eats the group's availability budget nor
+    /// wedges an in-flight rollout. Orthogonal to [`hold`](Self::hold): a node can be held but
+    /// serving, or cordoned but updatable.
     #[serde(default)]
     pub cordon: bool,
 }
@@ -474,28 +710,56 @@ pub struct AgentIdentity {
     /// Present only for controller-created dynamic inventory. It is the stable digest of the
     /// validated enrollment name and makes retries resolve to the same agent.
     pub registration_sha256: Option<String>,
-    /// The node's pinned public key (hex uncompressed EC point), set at enrollment from its CSR —
-    /// the same key that certifies its mTLS leaf. Rollout planning verifies the node's *signed*
-    /// telemetry against this, so a report is attributable end-to-end (node → planner), not merely
-    /// authenticated on the write hop. `None` for a manual or pre-signing agent, whose reports then
-    /// fail verification and so fail closed: the planner treats such a node as BLIND (see
-    /// `rollout::NodeEvidence`) — never counted healthy, never counted as holding its group back —
-    /// and stages it on what was published to it, so its group stays throttled and stays
-    /// updatable without any unverifiable report ever being believed.
+    /// The node's pinned public key (hex uncompressed EC point) — set from the CSR at online
+    /// enrollment or supplied by the operator for a manual identity. It is the same key that
+    /// certifies the node's mTLS leaf. Rollout planning verifies the node's *signed* telemetry
+    /// against this, so a report is attributable end-to-end (node → planner), not merely
+    /// authenticated on the write hop. `None` only while a reserved identity has not enrolled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+}
+
+impl AgentIdentity {
+    /// Whether this identity has the one valid field shape for its kind and node name.
+    ///
+    /// A manual identity carries the public key the operator provisioned but no online-registration
+    /// digest. A reserved identity carries neither until enrollment. An enrolled identity carries
+    /// both, with the same canonical SHA-256 and P-256 encodings the enrollment and telemetry paths
+    /// use. Keeping this rule here prevents callers from inventing subtly different meanings for an
+    /// identity kind.
+    /// The registration digest is not merely shaped like SHA-256:
+    /// enrollment defines it as the digest of the validated node name, so accepting any other
+    /// value would create a second, forgeable meaning for the field.
+    pub fn is_well_formed_for(&self, node: &str) -> bool {
+        let public_key_is_valid = || {
+            self.public_key.as_deref().is_some_and(|encoded| {
+                updated_contracts::key::P256PublicKey::parse_hex(encoded).is_ok()
+            })
+        };
+        match self.kind {
+            AgentIdentityKind::Manual => {
+                self.registration_sha256.is_none() && public_key_is_valid()
+            }
+            AgentIdentityKind::Reserved => {
+                self.registration_sha256.is_none() && self.public_key.is_none()
+            }
+            AgentIdentityKind::Enrolled => {
+                self.registration_sha256.as_deref().is_some_and(|digest| {
+                    digest == updated_contracts::telemetry::node_object_digest(node)
+                }) && public_key_is_valid()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentIdentityKind {
-    /// Offline provisioning: the operator declares the agent and exports its immutable enrollment
-    /// Secret out of band. The machine never talks to `/enroll`, so this identity is NEVER
-    /// completable over the shared fleet bootstrap certificate — and therefore never carries a
-    /// pinned key, which is why such a node is planned BLIND (see [`AgentIdentity::public_key`]).
-    /// Its report writes are refused for the life of the machine; the node's own agent backs off to
-    /// its agent-check cadence after the first refusal rather than reporting into a `403` every
-    /// cycle (`agent::telemetry::Refusal`).
+    /// Offline provisioning: the operator declares the agent, pins the public half of its
+    /// provisioned node key, and copies its content-addressed S3 enrollment object out of band. The
+    /// machine never talks to `/enroll`, and this identity is NEVER completable over the shared
+    /// fleet bootstrap certificate. Its signed reports and mTLS requests use the same pinned key as
+    /// every enrolled node; only the initial delivery path differs.
     Manual,
     /// The operator reserved this exact name for a machine that will enroll dynamically, and
     /// deferred the identity to the node's own CSR. This is the ONLY shape `/enroll` may complete
@@ -515,7 +779,14 @@ pub struct UpdateAgentStatus {
     pub selected_group: Option<String>,
     pub assignment_path: Option<String>,
     pub published_digest: Option<String>,
-    pub enrollment_secret_ref: Option<LocalSecretReference>,
+    /// SHA-256 of this node's exact currently published signed assignment document.
+    /// Informational only: the gateway independently resolves the assignment through TUF and
+    /// never treats status as data-plane authority.
+    pub assignment_sha256: Option<String>,
+    /// Repository-relative S3 key of this agent's current content-addressed enrollment bundle.
+    /// The gateway authorizes this exact object for live enrollment; an operator may copy the same
+    /// object out of band for a manual identity. No gateway response carries its bytes.
+    pub enrollment_object_key: Option<String>,
     /// The version the node last reported it is actually running, from its rollout telemetry.
     /// This is the control plane's authoritative view of a node's running version — no
     /// consumer probes the managed app, so it works for any app kind (a Rust service, a real
@@ -523,6 +794,11 @@ pub struct UpdateAgentStatus {
     pub reported_version: Option<String>,
     /// Whether the node last reported itself settled and healthy on its assignment.
     pub reported_ready: Option<bool>,
+    /// The latest successful state-changing reconciler invocation, durably bound and signed by the
+    /// node. This exposes change, immutable release identities, and any requested host action
+    /// without trusting script logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reconciliation: Option<ReconciliationStatus>,
     /// Mirror of `spec.hold`, written as an explicit bool every reconcile (a merge patch that
     /// omitted it would leave a cleared hold reading `true` forever). Surfaced so a forgotten hold
     /// is a visible condition, not a mystery.
@@ -533,6 +809,68 @@ pub struct UpdateAgentStatus {
     pub cordoned: Option<bool>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciledReleaseStatus {
+    pub version: String,
+    pub manifest_sha256: String,
+    pub archive_sha256: String,
+}
+
+impl From<&updated_contracts::reconciler::ReconciledRelease> for ReconciledReleaseStatus {
+    fn from(release: &updated_contracts::reconciler::ReconciledRelease) -> Self {
+        Self {
+            version: release.version.clone(),
+            manifest_sha256: release.manifest_sha256.clone(),
+            archive_sha256: release.archive_sha256.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcilerStatus {
+    pub provider_set_sha256: String,
+    pub product: String,
+    pub release: ReconciledReleaseStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationStatus {
+    pub operation: String,
+    pub reason: String,
+    pub attempt_id: String,
+    pub candidate: ReconciledReleaseStatus,
+    pub predecessor: ReconciledReleaseStatus,
+    pub reconciler: ReconcilerStatus,
+    pub changed: bool,
+    pub host_action: String,
+    pub message: Option<String>,
+    pub completed_at_ms: u64,
+}
+
+impl From<&updated_contracts::reconciler::LastReconciliation> for ReconciliationStatus {
+    fn from(record: &updated_contracts::reconciler::LastReconciliation) -> Self {
+        Self {
+            operation: record.operation.as_str().into(),
+            reason: record.reason.as_str().into(),
+            attempt_id: record.attempt_id.clone(),
+            candidate: (&record.candidate).into(),
+            predecessor: (&record.predecessor).into(),
+            reconciler: ReconcilerStatus {
+                provider_set_sha256: record.reconciler.provider_set_sha256.clone(),
+                product: record.reconciler.product.clone(),
+                release: (&record.reconciler.release).into(),
+            },
+            changed: record.result.changed,
+            host_action: record.result.host_action.as_str().into(),
+            message: record.result.message.clone(),
+            completed_at_ms: record.completed_at_ms,
+        }
+    }
 }
 
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -551,17 +889,36 @@ pub struct UpdateAgentStatus {
 pub struct UpdateRepositorySpec {
     /// Deployment selected when no named group matches an agent.
     pub default_deployment: DeploymentSpec,
-    /// Secret in the same namespace containing root, targets, snapshot, and timestamp
-    /// private keys. The controller never stores private keys in CRD status.
+    /// Secret in the same namespace containing active and standby root keys (`root.pk8` and
+    /// `root.next.pk8`) plus targets, snapshot, and timestamp private keys. The controller never
+    /// stores private keys in CRD status.
     pub signing_secret_ref: LocalSecretReference,
     /// Trusted labels applied to dynamic registrations. Enrollment is authenticated by mutual
     /// TLS at the gateway (a cert-manager-issued server cert + fleet client CA, mounted), so
     /// there is no shared secret here.
     pub enrollment: EnrollmentSpec,
-    pub s3: S3Destination,
+    /// Object store that holds this managed repository. The controller derives the repository's
+    /// key prefix from its Kubernetes namespace and name; operators cannot select or retarget it.
+    pub s3: RepositoryStorage,
     /// Prefix below the TUF targets namespace at which assignments are published.
     #[serde(default = "default_assignment_prefix")]
     pub assignment_prefix: String,
+    /// Exact maximum number of bounded ConfigMaps used for the durable rollout-state document.
+    /// The controller atomically rebalances the entire document when this changes. Two slots are
+    /// used so a process death can never expose a partially rewritten state; a live rebalance may
+    /// transiently hold the old width plus the new width, and reclaims the old slot afterwards.
+    #[serde(default = "default_state_max_shards")]
+    #[schemars(range(min = 1, max = "crate::runtime::MAX_ADMITTED_STATE_SHARDS"))]
+    pub state_max_shards: u8,
+    /// Optional namespace-local release-admission policy. Presence enables the one Draupnir
+    /// integration path; absence disables external admission. Policy behavior lives only in the
+    /// referenced CRD, never in environment variables or group-level overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_policy_ref: Option<LocalObjectReference>,
+}
+
+fn default_state_max_shards() -> u8 {
+    8
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -571,8 +928,9 @@ pub struct EnrollmentSpec {
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct LocalSecretReference {
+    #[schemars(length(min = 1))]
     pub name: String,
 }
 
@@ -604,6 +962,11 @@ pub struct UpdateRepositoryStatus {
     /// refuses to serve a bundle until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_root_sha256: Option<String>,
+    /// Storage coordinates this controller bound before it added the external-artifact finalizer
+    /// or published the first object. The status subresource is controller-owned, so deletion uses
+    /// this record rather than reconstructing an irreversible target from mutable access settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_ownership: Option<RepositoryStorageOwnership>,
     #[serde(default)]
     pub conditions: Vec<ResourceCondition>,
 }
@@ -686,7 +1049,7 @@ pub struct UpdateSubscriptionStatus {
     pub conditions: Vec<ResourceCondition>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct S3Destination {
     pub bucket: String,
@@ -697,6 +1060,76 @@ pub struct S3Destination {
     /// AWS_SECRET_ACCESS_KEY entries. When absent, workload identity is used.
     pub credentials_secret_ref: Option<LocalSecretReference>,
     pub endpoint: Option<String>,
+    /// Public HTTPS S3-compatible endpoint placed in short-lived object capabilities. Omit for AWS
+    /// S3 or when `endpoint` is already public HTTPS. An internal HTTP endpoint must provide this:
+    /// payload proxying is not a fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_endpoint: Option<String>,
+}
+
+/// Storage configuration accepted by a managed [`UpdateRepository`]. Unlike the generic
+/// [`S3Destination`] used by `updatectl`, it intentionally has no prefix: the controller assigns
+/// one canonical, non-overlapping key space from the repository's Kubernetes identity.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryStorage {
+    #[schemars(length(min = 1))]
+    pub bucket: String,
+    #[schemars(length(min = 1))]
+    pub region: String,
+    /// Optional Secret containing standard AWS_ACCESS_KEY_ID and
+    /// AWS_SECRET_ACCESS_KEY entries. When absent, workload identity is used.
+    pub credentials_secret_ref: Option<LocalSecretReference>,
+    #[schemars(length(min = 1))]
+    pub endpoint: Option<String>,
+    /// Public HTTPS S3-compatible endpoint placed in short-lived object capabilities. Omit for AWS
+    /// S3 or when `endpoint` is already public HTTPS. An internal HTTP endpoint must provide this:
+    /// payload proxying is not a fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub public_endpoint: Option<String>,
+}
+
+/// Controller-owned identity of the object-store key space a repository is allowed to delete.
+/// Secret contents and the public download endpoint are deliberately absent: they may rotate and
+/// do not change which physical keys the finalizer owns. The Secret REFERENCE is included because
+/// selecting another credential identity can select another cloud account and therefore another
+/// physical bucket even when endpoint and bucket strings remain equal.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryStorageOwnership {
+    pub bucket: String,
+    pub prefix: String,
+    pub region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+impl From<&S3Destination> for RepositoryStorageOwnership {
+    fn from(destination: &S3Destination) -> Self {
+        Self {
+            bucket: destination.bucket.clone(),
+            prefix: destination.prefix.clone(),
+            region: destination.region.clone(),
+            credentials_secret_ref: destination.credentials_secret_ref.clone(),
+            endpoint: destination.endpoint.clone(),
+        }
+    }
+}
+
+impl RepositoryStorageOwnership {
+    pub(crate) fn destination_with_access(&self, access: &RepositoryStorage) -> S3Destination {
+        S3Destination {
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+            region: self.region.clone(),
+            credentials_secret_ref: self.credentials_secret_ref.clone(),
+            endpoint: self.endpoint.clone(),
+            public_endpoint: access.public_endpoint.clone(),
+        }
+    }
 }
 
 fn default_assignment_prefix() -> String {
@@ -730,13 +1163,22 @@ pub struct ResolvedGroup {
     pub match_labels: BTreeMap<String, String>,
     pub depends_on: Vec<String>,
     pub inputs: BTreeMap<String, GroupOutputReference>,
-    /// Computed each reconcile after authentic producer reports are resolved.
-    pub inputs_ready: bool,
+    /// Sensitive resolved bytes retained only inside this reconciliation so the controller can
+    /// write the private keyed-blinded S3 publication before publishing its non-secret exact-byte
+    /// commitment. `None` means unresolved when bindings exist; groups with no bindings are ready
+    /// without a private object.
+    pub input_snapshot: Option<updated_contracts::dataflow::FileSnapshot>,
     pub deployment: DesiredDeployment,
     pub max_unavailable: usize,
     /// [`UpdateGroupSpec::emergency_correction`] — the operator's stated intent that `deployment`
     /// is an emergency correction, which exempts its admission from the governing set's schedule.
     pub emergency_correction: bool,
+}
+
+impl ResolvedGroup {
+    pub fn inputs_ready(&self) -> bool {
+        self.inputs.is_empty() || self.input_snapshot.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -768,7 +1210,7 @@ pub enum PlanError {
         group: String,
         input: String,
     },
-    /// More dependency inputs than the signed output manifest admits, so the group's resolved
+    /// More dependency inputs than the signed file snapshot admits, so the group's resolved
     /// `runtime.inputs` could never be published.
     TooManyDependencyInputs {
         group: String,
@@ -785,24 +1227,22 @@ pub enum PlanError {
     Serialize(String),
 }
 
-/// Whether a name may be a key of a signed output manifest — the grammar dependency inputs must
+/// Whether a name may be a key of a signed file snapshot — the grammar dependency inputs must
 /// satisfy, asked of the contract itself rather than restated here.
 ///
 /// A dependency input name becomes a key of `deployment.runtime.inputs`, which
-/// `RepositoryAssignment::validate` runs through `OutputManifest::validate` at publication time.
+/// `RepositoryAssignment::validate` runs through `FileSnapshot::validate` at publication time.
 /// Admitting an input name against the weaker traversal rule alone let an over-long one (the
 /// manifest bounds names at 128 bytes) through admission and detonate later: nothing is written
 /// into `runtime.inputs` until the producer reports healthy, and from that moment every reconcile
 /// for the whole repository failed to build a publication at all — no group ever got another
 /// generation, and no new agent could enroll. One grammar, checked where the name is accepted.
 fn is_output_name(name: &str) -> bool {
-    updated_contracts::telemetry::OutputManifest {
-        schema: updated_contracts::telemetry::OutputManifest::SCHEMA,
-        values: BTreeMap::from([(
+    updated_contracts::dataflow::FileSnapshot {
+        files: BTreeMap::from([(
             name.to_string(),
-            updated_contracts::telemetry::OutputValue::String {
-                value: String::new(),
-            },
+            updated_contracts::dataflow::FileValue::from_bytes(b"")
+                .expect("an empty file is contract-valid"),
         )]),
     }
     .validate()
@@ -862,7 +1302,7 @@ pub(crate) fn validate_dependency_graph(
         // group declaring more than the manifest admits parses fine at admission and detonates the
         // moment its producer first reports healthy: `deployment_identity` returns None from then
         // on and every reconcile for the whole repository fails to build a publication.
-        if groups[name].inputs.len() > updated_contracts::telemetry::OutputManifest::MAX_VALUES {
+        if groups[name].inputs.len() > updated_contracts::dataflow::FileSnapshot::MAX_FILES {
             return Err(PlanError::TooManyDependencyInputs {
                 group: name.to_string(),
                 inputs: groups[name].inputs.len(),
@@ -892,28 +1332,92 @@ pub(crate) fn validate_dependency_graph(
     Ok(())
 }
 
+/// Every group whose dependency wiring cannot be planned, with the human-readable reason — the
+/// PER-GROUP reading of exactly what [`validate_dependency_graph`] enforces. A malformed input
+/// name, a reference to a group outside `dependsOn`, a dependency that does not exist, and
+/// membership in a dependency cycle are all facts about specific groups, and the operator-facing
+/// response to each is the same as for an invalid deployment: QUARANTINE those groups (their
+/// nodes hold what they run) and keep planning everyone else. Surfacing them as a plan error
+/// instead made one bad edit to one group fail every reconcile for the whole repository, forever
+/// — a fleet-wide control-plane outage with a per-group cause. The graph validation itself stays
+/// in the pure planner as the backstop invariant; this classifier is what keeps it from ever
+/// firing in the operator.
+pub(crate) fn dependency_violations(
+    groups: &BTreeMap<String, ResolvedGroup>,
+    quarantined: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut violations: BTreeMap<String, String> = BTreeMap::new();
+    for (name, group) in groups {
+        if group.inputs.len() > updated_contracts::dataflow::FileSnapshot::MAX_FILES {
+            violations.insert(
+                name.clone(),
+                format!(
+                    "This group declares {} dependency inputs; a signed file snapshot admits at most {}.",
+                    group.inputs.len(),
+                    updated_contracts::dataflow::FileSnapshot::MAX_FILES
+                ),
+            );
+            continue;
+        }
+        if let Some((input, reference)) = group.inputs.iter().find(|(input, reference)| {
+            !is_output_name(input)
+                || !is_output_name(&reference.output)
+                || !group.depends_on.contains(&reference.group)
+        }) {
+            violations.insert(
+                name.clone(),
+                format!(
+                    "This group's input {input:?} is invalid: its name and referenced output must \
+                     satisfy the output grammar, and its group {:?} must be listed in dependsOn.",
+                    reference.group
+                ),
+            );
+            continue;
+        }
+        if let Some(dependency) = group.depends_on.iter().find(|dependency| {
+            !quarantined.contains(*dependency) && !groups.contains_key(*dependency)
+        }) {
+            violations.insert(
+                name.clone(),
+                format!("This group depends on {dependency:?}, which does not exist."),
+            );
+        }
+    }
+    // Cycles, on whatever remains: each pass of the graph validation reports one cycle; every
+    // member is quarantined and the walk repeats until the remainder is acyclic. Bounded by the
+    // group count — each pass removes at least one group.
+    loop {
+        let mut remaining = groups.clone();
+        remaining.retain(|name, _| !violations.contains_key(name));
+        let mut skip: BTreeSet<String> = quarantined.clone();
+        skip.extend(violations.keys().cloned());
+        match validate_dependency_graph(&remaining, &skip) {
+            Ok(()) => break,
+            Err(PlanError::DependencyCycle(cycle)) => {
+                let display = cycle.join(" -> ");
+                for member in cycle {
+                    violations.entry(member).or_insert_with(|| {
+                        format!("This group is part of a dependency cycle: {display}.")
+                    });
+                }
+            }
+            // Local shapes and dangling dependencies were classified above; the only error the
+            // remainder can still raise is a cycle. A new variant reaching here is a missed
+            // classification, and quarantining nothing for it would resurrect the fleet-wide
+            // failure this exists to prevent — so it is a bug to fix, loudly.
+            Err(other) => {
+                unreachable!("dependency violation not classified per-group: {other:?}")
+            }
+        }
+    }
+    violations
+}
+
 /// The pseudo-group a node that matched no `UpdateGroup` routes to; it receives the repository's
 /// `default_deployment` directly and is never throttled. Reserved: a real `UpdateGroup` claiming
 /// this name would have its own throttled, gated rollout silently replaced by that fleet-wide
 /// switch, so [`resolve_node_groups`] refuses it outright.
 pub const DEFAULT_GROUP: &str = "default";
-
-/// Whether this node could ever report — i.e. whether its name survives a round trip through the
-/// telemetry path grammar, which is stricter than the traversal rule placement gates on: a report
-/// is a URL segment, so it additionally forbids `.`, `%`, `?` and `#`.
-///
-/// Asked of the grammar itself rather than restated, so the name a node is admitted under and the
-/// name the gateway recovers from `/telemetry/<node>.json` can never drift apart. A node admitted
-/// under a name only one of the two accepts is placed, published, and enrolled, and then has every
-/// report it ever sends refused with a 404 — permanently Silent, spending its group's
-/// `maxUnavailable` forever.
-pub(crate) fn node_name_is_reportable(name: &str) -> bool {
-    let path = format!(
-        "{}{name}.json",
-        updated_contracts::telemetry::REPORT_PATH_PREFIX
-    );
-    updated_contracts::telemetry::node_from_path(&path) == Some(name)
-}
 
 /// Resolve selectors before rollout admission without constructing a throwaway publication.
 pub(crate) fn resolve_node_groups(
@@ -936,7 +1440,7 @@ pub(crate) fn resolve_node_groups(
     let mut node_groups = BTreeMap::new();
     for node in nodes {
         let name = node.name;
-        if !updated_contracts::path::is_safe_component(&name) || node_groups.contains_key(&name) {
+        if !updated_contracts::telemetry::is_valid_node(&name) || node_groups.contains_key(&name) {
             return if node_groups.contains_key(&name) {
                 Err(PlanError::DuplicateNode(name))
             } else {
@@ -990,35 +1494,35 @@ pub(crate) fn build_publication_plan(
         return Err(PlanError::NodeDeploymentMismatch);
     }
     let mut targets = Vec::new();
-    let mut references = BTreeMap::new();
-    for deployment in node_deployments.values() {
-        let bytes = canonical_json(deployment)?;
-        let id = updated::hash::sha256_bytes(&bytes);
-        if references.contains_key(&id) {
-            continue;
-        }
-        let config = target(
-            updated_contracts::telemetry::config_object_key(prefix, &id),
-            bytes,
-        );
-        references.insert(
-            id,
-            ExactTarget {
-                path: config.path.clone(),
-                sha256: config.sha256.clone(),
-            },
-        );
-        targets.push(config);
-    }
+    let mut references: BTreeMap<String, ExactTarget> = BTreeMap::new();
     let mut node_assignments = BTreeMap::new();
+    // One canonicalization per node, and no more: serializing a deployment validates it and hashing
+    // it is what gives it its identity, so both the shared config target (one per DISTINCT body,
+    // however many nodes hold it) and this node's own assignment document are derived from that
+    // single pass rather than the body being re-serialized to look its own identity back up.
     for (node, deployment) in &node_deployments {
-        let id = updated::hash::sha256_bytes(&canonical_json(deployment)?);
+        let (bytes, id) = deployment
+            .publication()
+            .map_err(PlanError::InvalidDeployment)?;
+        if !references.contains_key(&id) {
+            let config = target(
+                updated_contracts::telemetry::config_object_key(prefix, &id),
+                bytes,
+            );
+            references.insert(
+                id.clone(),
+                ExactTarget {
+                    path: config.path.clone(),
+                    sha256: config.sha256.clone(),
+                },
+            );
+            targets.push(config);
+        }
         let assignment = updated_contracts::artifact::AgentDocument {
             schema: 1,
             config: references[&id].clone(),
         };
-        let bytes = serde_json::to_vec(&assignment)
-            .map_err(|error| PlanError::Serialize(error.to_string()))?;
+        let bytes = assignment.to_bounded_json().map_err(PlanError::Serialize)?;
         targets.push(target(
             updated_contracts::telemetry::assignment_object_key(prefix, node),
             bytes,
@@ -1055,18 +1559,11 @@ pub(crate) fn selector_matches(
 ///
 /// An invalid deployment has no identity — `None` — and can never match a report.
 pub(crate) fn deployment_identity(value: &DesiredDeployment) -> Option<String> {
-    canonical_json(value)
-        .ok()
-        .map(|bytes| updated::hash::sha256_bytes(&bytes))
-}
-
-fn canonical_json(value: &DesiredDeployment) -> Result<Vec<u8>, PlanError> {
-    value.validate().map_err(PlanError::InvalidDeployment)?;
-    serde_json::to_vec(value).map_err(|error| PlanError::Serialize(error.to_string()))
+    value.publication().ok().map(|(_, identity)| identity)
 }
 
 fn target(path: String, bytes: Vec<u8>) -> PublicationTarget {
-    let sha256 = updated::hash::sha256_bytes(&bytes);
+    let sha256 = updated_contracts::digest::sha256_bytes(&bytes);
     PublicationTarget {
         path,
         bytes,
@@ -1075,7 +1572,7 @@ fn target(path: String, bytes: Vec<u8>) -> PublicationTarget {
 }
 
 fn publication_digest(targets: &[PublicationTarget]) -> String {
-    let mut digest = updated::hash::Sha256Hasher::new();
+    let mut digest = updated_contracts::digest::Sha256Hasher::new();
     for target in targets {
         digest.update(target.path.as_bytes());
         digest.update(&[0]);
@@ -1099,82 +1596,123 @@ pub fn object_key(prefix: &str, relative: &str) -> object_store::path::Path {
     )
 }
 
+/// Whether `object` belongs to `root` rather than merely sharing its byte prefix.
+///
+/// S3 list requests use byte prefixes: asking for `tenant/repository` may also return
+/// `tenant/repository-old`. Every destructive namespace walk goes through this boundary check so
+/// one repository can never retire a sibling repository's objects.
+pub(crate) fn object_in_namespace(
+    root: &object_store::path::Path,
+    object: &object_store::path::Path,
+) -> bool {
+    object == root
+        || object
+            .as_ref()
+            .strip_prefix(root.as_ref())
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Total wall-clock budget for best-effort object-store garbage collection and private namespace
+/// scans. All such walks stream their results; this budget additionally prevents a slow or hostile
+/// backend from monopolizing the repository reconciler indefinitely.
+pub(crate) const OBJECT_STORE_MAINTENANCE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 /// Upper bound on any single repository object the control plane reads back into memory: a signed
 /// metadata document, an assignment, a managed configuration, or a node report. All are small, and
 /// all are bounded at *write* time (the gateway caps request bodies) — but the bucket is not
 /// exclusively ours, so a direct writer must not be able to make a reconcile or an `/enroll`
 /// response allocate without limit. Generous relative to any legitimate document.
-pub(crate) const OBJECT_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
+pub const OBJECT_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
 
-// The projection's shared wire bound is the same ceiling, so the writer's read-compare probe and
-// the healthproxy's fetch accept exactly the same documents.
 const _: () =
-    assert!(updated_contracts::endpoints::MAX_PROJECTION_BYTES as u64 == OBJECT_BYTES_LIMIT);
+    assert!(updated_contracts::enrollment::MAX_DOCUMENT_BYTES as u64 == OBJECT_BYTES_LIMIT);
 
-/// Read one object fully into memory, refusing anything larger than [`OBJECT_BYTES_LIMIT`]. The
-/// size is checked from the store's own metadata before a byte is buffered, so an oversized object
-/// costs a `head`-equivalent rather than the allocation. The single bounded read every
-/// control-plane object load goes through, so the `/enroll` resolution path and the rollout
-/// telemetry read cannot drift apart on it.
-pub(crate) async fn read_object_bounded(
-    store: &dyn object_store::ObjectStore,
+/// Collect an object-store result without trusting its declared size as the allocation bound.
+/// Metadata rejects an honestly oversized object before reading it; the running byte count also
+/// rejects a backend that streams more than it declared. This is the one collection path for every
+/// control-plane object read, including the gateway's versioned fleet-document merge.
+pub(crate) async fn collect_object_bounded(
+    result: object_store::GetResult,
     key: &object_store::path::Path,
-) -> Result<Vec<u8>, object_store::Error> {
-    let result = store.get(key).await?;
-    if result.meta.size > OBJECT_BYTES_LIMIT {
+    limit: u64,
+) -> Result<(object_store::ObjectMeta, Vec<u8>), object_store::Error> {
+    use futures::StreamExt as _;
+
+    let meta = result.meta.clone();
+    if meta.size > limit {
         return Err(object_store::Error::Generic {
             store: "updatec",
             source: format!(
-                "object {key} is {} bytes, over the {OBJECT_BYTES_LIMIT}-byte limit",
-                result.meta.size
+                "object {key} is {} bytes, over the {limit}-byte limit",
+                meta.size
             )
             .into(),
         });
     }
-    Ok(result.bytes().await?.to_vec())
+    let capacity = usize::try_from(meta.size.min(limit)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut stream = result.into_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let next_len = u64::try_from(bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if next_len > limit {
+            return Err(object_store::Error::Generic {
+                store: "updatec",
+                source: format!("object {key} streamed more than the {limit}-byte limit").into(),
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((meta, bytes))
+}
+
+/// Read one object through [`collect_object_bounded`]. The convenience wrapper deliberately adds
+/// no second collection implementation: callers that do not need version metadata discard it.
+pub async fn read_object_bounded(
+    store: &dyn object_store::ObjectStore,
+    key: &object_store::path::Path,
+    limit: u64,
+) -> Result<Vec<u8>, object_store::Error> {
+    let result = store.get(key).await?;
+    collect_object_bounded(result, key, limit)
+        .await
+        .map(|(_, bytes)| bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The API server refuses a CRD whose schema carries `additionalProperties` beside
-    /// `properties` — closedness for custom resources comes from structural pruning, never from
-    /// serde's `deny_unknown_fields` (which schemars would translate into exactly that illegal
-    /// pair). This walks every generated CRD schema and enforces the server's own rule, so the
-    /// mistake fails `cargo test` instead of the first `kubectl apply`.
-    #[test]
-    fn crd_schemas_are_structural() {
-        use kube::CustomResourceExt;
+    #[tokio::test]
+    async fn bounded_object_collection_does_not_trust_declared_size() {
+        use axum::body::Bytes;
+        use futures::stream;
+        use object_store::{Attributes, GetResult, GetResultPayload, ObjectMeta};
 
-        fn assert_structural(value: &serde_json::Value, path: &str) {
-            if let Some(object) = value.as_object() {
-                assert!(
-                    !(object.contains_key("properties")
-                        && object.contains_key("additionalProperties")),
-                    "{path}: additionalProperties beside properties is refused by the API server"
-                );
-                for (key, child) in object {
-                    assert_structural(child, &format!("{path}.{key}"));
-                }
-            } else if let Some(items) = value.as_array() {
-                for (index, child) in items.iter().enumerate() {
-                    assert_structural(child, &format!("{path}[{index}]"));
-                }
-            }
-        }
+        let key = object_store::path::Path::from("lying-object");
+        let result = GetResult {
+            payload: GetResultPayload::Stream(Box::pin(stream::iter([Ok(Bytes::from_static(
+                b"too large",
+            ))]))),
+            meta: ObjectMeta {
+                location: key.clone(),
+                last_modified: chrono::Utc::now(),
+                size: 1,
+                e_tag: None,
+                version: None,
+            },
+            range: 0..1,
+            attributes: Attributes::new(),
+            extensions: Default::default(),
+        };
 
-        for crd in [
-            UpdateGroup::crd(),
-            UpdateGroupSet::crd(),
-            UpdateAgent::crd(),
-            UpdateRepository::crd(),
-            UpdateSubscription::crd(),
-        ] {
-            let name = crd.metadata.name.clone().unwrap_or_default();
-            let value = serde_json::to_value(&crd).expect("a CRD serializes");
-            assert_structural(&value, &name);
-        }
+        let error = collect_object_bounded(result, &key, 4)
+            .await
+            .expect_err("the running byte count must enforce the bound");
+        assert!(error.to_string().contains("streamed more"), "{error}");
     }
 
     fn group_set(max_concurrent: Option<u32>) -> UpdateGroupSetSpec {
@@ -1183,6 +1721,7 @@ mod tests {
             max_concurrent,
             rollout_windows: vec![],
             calendar: vec![],
+            on_regression: RegressionResponse::default(),
             max_regressions: None,
             stuck_after_seconds: None,
         }
@@ -1203,6 +1742,24 @@ mod tests {
         );
         // An empty sub-path must not leave a trailing slash.
         assert_eq!(object_key("a/b", "").as_ref(), "a/b");
+    }
+
+    #[test]
+    fn object_namespace_membership_is_segment_aware() {
+        let root = object_key("tenant", "routing");
+        assert!(object_in_namespace(&root, &root));
+        assert!(object_in_namespace(
+            &root,
+            &object_key("tenant/routing", "metadata/root.json")
+        ));
+        assert!(!object_in_namespace(
+            &root,
+            &object_key("tenant", "routing-old/metadata/root.json")
+        ));
+        assert!(!object_in_namespace(
+            &root,
+            &object_key("tenant", "routing2")
+        ));
     }
 
     #[test]
@@ -1229,7 +1786,6 @@ mod tests {
             deployment: id.into(),
             metadata_url: "https://cdn.example/tuf/metadata/".into(),
             targets_url: "https://cdn.example/tuf/targets/".into(),
-            report_url: Some("https://control.example/v1/telemetry".into()),
             application: ExactTarget {
                 path: "app".into(),
                 sha256: "1".repeat(64),
@@ -1244,71 +1800,46 @@ mod tests {
         }
     }
 
+    /// The managed runtime a nominal [`DeploymentSpec`] resolves to.
+    ///
+    /// Derived from [`runtime_spec`] through the real `TryFrom` conversion rather than written out
+    /// a second time: the CRD spec and the signed contract carry the same policy in two type
+    /// systems, and two hand-written fixtures for one nominal value are two fixtures that can
+    /// disagree. This way the fixture also exercises the conversion every deployment goes through.
     pub(crate) fn managed_runtime() -> updated_contracts::assignment::ManagedRuntime {
-        updated_contracts::assignment::ManagedRuntime {
-            product: "app".into(),
-            channel: "stable".into(),
-            install_root: "/opt/app".into(),
-            secrets: vec![],
-            inputs: BTreeMap::new(),
-            repository: updated_contracts::assignment::ManagedRepositoryLimits {
-                metadata_limit: 1_048_576,
-                target_limit: 536_870_912,
-                transport_timeout_seconds: 30,
-            },
-            storage: updated_contracts::assignment::ManagedStorage {
-                inactive_releases: 2,
-                inactive_providers: 2,
-                inactive_agents: 2,
-                inactive_bytes: 1_073_741_824,
-                inactive_repository_caches: 2,
-            },
-            timeouts: updated_contracts::assignment::ManagedTimeouts {
-                check_interval_seconds: 15,
-                health_grace_seconds: 30,
-                health_successes: 2,
-                health_interval_seconds: 1,
-                refresh_retry_seconds: 5,
-                confirmation_window_seconds: 120,
-                agent_check_interval_seconds: 3600,
-            },
-        }
+        DesiredDeployment::try_from(deployment_spec("fixture"))
+            .expect("the nominal deployment spec is valid")
+            .runtime
     }
 
+    /// The one nominal CRD runtime spec, built from the one nominal managed runtime.
+    ///
+    /// The three policy structs are the contract's own types now, so they are moved across rather
+    /// than restated — there is no second set of nominal limits in this workspace to fall out of
+    /// step with `updated_contracts::assignment::testing::runtime`.
     pub(crate) fn runtime_spec() -> RuntimeSpec {
+        let updated_contracts::assignment::ManagedRuntime {
+            product,
+            channel,
+            repository,
+            storage,
+            timeouts,
+            install_root: _,
+            inputs: _,
+        } = updated_contracts::assignment::testing::runtime();
         RuntimeSpec {
-            product: "app".into(),
-            channel: "stable".into(),
+            product,
+            channel,
             install_root: "/opt/app".into(),
-            secrets: vec![],
-            repository: RepositoryLimitsSpec {
-                metadata_limit: 1_048_576,
-                target_limit: 536_870_912,
-                transport_timeout_seconds: 30,
-            },
-            storage: StorageSpec {
-                inactive_releases: 2,
-                inactive_providers: 2,
-                inactive_agents: 2,
-                inactive_bytes: 1_073_741_824,
-                inactive_repository_caches: 2,
-            },
-            timeouts: TimeoutsSpec {
-                check_interval_seconds: 15,
-                health_grace_seconds: 30,
-                health_successes: 2,
-                health_interval_seconds: 1,
-                refresh_retry_seconds: 5,
-                confirmation_window_seconds: 120,
-                agent_check_interval_seconds: 3600,
-            },
+            repository,
+            storage,
+            timeouts,
         }
     }
 
     pub(crate) fn deployment_spec(id: &str) -> DeploymentSpec {
         DeploymentSpec {
             name: id.into(),
-            report_url: "https://control.example/v1/telemetry".into(),
             release_repository: ReleaseRepositorySpec {
                 metadata_url: "https://cdn.example/tuf/metadata/".into(),
                 targets_url: "https://cdn.example/tuf/targets/".into(),
@@ -1336,11 +1867,64 @@ mod tests {
                 .collect(),
             depends_on: vec![],
             inputs: BTreeMap::new(),
-            inputs_ready: true,
+            input_snapshot: None,
             deployment: deployment(name),
             max_unavailable: 1,
             emergency_correction: false,
         }
+    }
+
+    /// One bad edit quarantines exactly the groups it names — never the fleet. Each violation
+    /// class (input outside dependsOn, dangling dependency, cycle membership) maps to its own
+    /// groups, the healthy sibling stays plannable, and the remainder passes the pure planner's
+    /// backstop validation, so `plan_reconcile` can no longer fail on wiring an operator can fix
+    /// per group.
+    #[test]
+    fn dependency_violations_are_classified_per_group_and_spare_the_rest() {
+        let mut cyclic_a = group("cycle-a", &[("g", "a")]);
+        cyclic_a.depends_on = vec!["cycle-b".into()];
+        let mut cyclic_b = group("cycle-b", &[("g", "b")]);
+        cyclic_b.depends_on = vec!["cycle-a".into()];
+        let mut dangling = group("dangling", &[("g", "d")]);
+        dangling.depends_on = vec!["never-created".into()];
+        let mut unwired = group("unwired", &[("g", "u")]);
+        unwired.inputs = BTreeMap::from([(
+            "upstream".to_string(),
+            GroupOutputReference {
+                group: "healthy".into(),
+                output: "endpoint".into(),
+            },
+        )]);
+        // The reference names a real group — but one this group does not depend on.
+        let healthy = group("healthy", &[("g", "h")]);
+        let groups = BTreeMap::from([
+            ("cycle-a".to_string(), cyclic_a),
+            ("cycle-b".to_string(), cyclic_b),
+            ("dangling".to_string(), dangling),
+            ("unwired".to_string(), unwired),
+            ("healthy".to_string(), healthy),
+        ]);
+
+        let violations = dependency_violations(&groups, &BTreeSet::new());
+        assert_eq!(
+            violations.keys().collect::<Vec<_>>(),
+            ["cycle-a", "cycle-b", "dangling", "unwired"],
+            "every broken group is named, the healthy one is not"
+        );
+        // The survivors pass the pure planner's own gate: quarantining these groups is exactly
+        // what keeps `plan_reconcile` from ever failing on dependency wiring.
+        let mut remaining = groups.clone();
+        remaining.retain(|name, _| !violations.contains_key(name));
+        let skip: BTreeSet<String> = violations.keys().cloned().collect();
+        assert!(validate_dependency_graph(&remaining, &skip).is_ok());
+
+        // A dependency on an already-quarantined group is NOT a violation: the planner skips it,
+        // holding the dependent rather than punishing it for its prerequisite's spec.
+        let mut waiting = group("waiting", &[("g", "w")]);
+        waiting.depends_on = vec!["broken-elsewhere".into()];
+        let groups = BTreeMap::from([("waiting".to_string(), waiting)]);
+        let quarantined = BTreeSet::from(["broken-elsewhere".to_string()]);
+        assert!(dependency_violations(&groups, &quarantined).is_empty());
     }
 
     fn node(name: &str, labels: &[(&str, &str)]) -> ResolvedNode {
@@ -1391,6 +1975,32 @@ mod tests {
         )
     }
 
+    /// The one nominal object destination. Fixtures that care about the bucket or prefix override
+    /// those two fields; nothing else about a destination varies between them, and writing the rest
+    /// out again is how three fixtures came to disagree about what "nominal" meant.
+    pub(crate) fn s3_destination() -> S3Destination {
+        S3Destination {
+            bucket: "updates".into(),
+            prefix: String::new(),
+            region: "us-east-1".into(),
+            credentials_secret_ref: None,
+            endpoint: None,
+            public_endpoint: None,
+        }
+    }
+
+    pub(crate) fn repository_storage() -> RepositoryStorage {
+        RepositoryStorage {
+            bucket: "updates".into(),
+            region: "us-east-1".into(),
+            credentials_secret_ref: None,
+            endpoint: None,
+            public_endpoint: None,
+        }
+    }
+
+    /// The one nominal repository spec. Every fixture in this crate starts here and overrides only
+    /// what its test is actually about.
     pub(crate) fn repository() -> UpdateRepositorySpec {
         UpdateRepositorySpec {
             default_deployment: deployment_spec("default"),
@@ -1400,14 +2010,10 @@ mod tests {
             enrollment: EnrollmentSpec {
                 labels: BTreeMap::new(),
             },
-            s3: S3Destination {
-                bucket: "updates".into(),
-                prefix: String::new(),
-                region: "us-east-1".into(),
-                credentials_secret_ref: None,
-                endpoint: None,
-            },
+            s3: repository_storage(),
             assignment_prefix: "assignments".into(),
+            state_max_shards: 8,
+            admission_policy_ref: None,
         }
     }
 
@@ -1471,6 +2077,28 @@ mod tests {
     }
 
     #[test]
+    fn rollout_planning_uses_the_one_shared_node_name_grammar() {
+        for invalid in ["NODE-0", "node_0", "node..0"] {
+            assert_eq!(
+                resolve_node_groups(
+                    [group("edge", &[("role", "edge")])],
+                    [node(invalid, &[("role", "edge")])],
+                ),
+                Err(PlanError::InvalidNodeName),
+                "{invalid:?} must not enter rollout planning"
+            );
+        }
+        assert_eq!(
+            resolve_node_groups(
+                [group("edge", &[("role", "edge")])],
+                [node("rack-1.node-0", &[("role", "edge")])],
+            )
+            .unwrap()["rack-1.node-0"],
+            "edge"
+        );
+    }
+
+    #[test]
     fn dependency_graph_rejects_missing_groups_and_cycles() {
         let mut groups = BTreeMap::from([
             ("a".into(), group("a", &[("role", "a")])),
@@ -1514,7 +2142,8 @@ mod tests {
         );
     }
 
-    /// An input name is a key of the SIGNED output manifest, which bounds names at 128 bytes.
+    /// An input name is a published output filename, which the shared snapshot contract bounds at
+    /// 128 bytes.
     /// Admitting one against the traversal rule alone accepted an over-long name here and detonated
     /// hours later: `resolve_one` writes it into `runtime.inputs` the moment the producer reports
     /// healthy, and from then on every reconcile for the whole repository failed to build a
@@ -1560,7 +2189,7 @@ mod tests {
             ("b".into(), group("b", &[("role", "b")])),
         ]);
         groups.get_mut("b").unwrap().depends_on = vec!["a".into()];
-        let limit = updated_contracts::telemetry::OutputManifest::MAX_VALUES;
+        let limit = updated_contracts::dataflow::FileSnapshot::MAX_FILES;
         for index in 0..limit {
             groups.get_mut("b").unwrap().inputs.insert(
                 format!("peer{index}"),
@@ -1609,23 +2238,6 @@ mod tests {
         // which was never admitted and therefore has no pin to hold.
         let quarantined = BTreeSet::from(["initialize".to_string()]);
         assert_eq!(validate_dependency_graph(&groups, &quarantined), Ok(()));
-    }
-
-    /// Placement and telemetry must agree on what a node may be called. A dot is a legal Kubernetes
-    /// name and passes the traversal rule, but the gateway recovers the node from
-    /// `/telemetry/<node>.json` and refuses one — so such an agent would be placed, published and
-    /// enrolled, and then 404 on every report for the life of the machine: permanently Silent,
-    /// spending its group's `maxUnavailable` and blocking every dependent group.
-    #[test]
-    fn a_node_name_the_telemetry_path_refuses_is_not_reportable() {
-        assert!(node_name_is_reportable("web-prod-01"));
-        assert!(node_name_is_reportable("v1_2_3"));
-        assert!(!node_name_is_reportable("web.prod"));
-        assert!(!node_name_is_reportable("web%prod"));
-        assert!(!node_name_is_reportable("web?prod"));
-        assert!(!node_name_is_reportable("web#prod"));
-        assert!(!node_name_is_reportable("../escape"));
-        assert!(!node_name_is_reportable(""));
     }
 
     #[test]

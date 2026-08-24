@@ -8,14 +8,20 @@
 //! fact.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ResourceCondition;
 
 const ROLLOUT_STUCK: &str = "RolloutStuck";
 const REPORTS_STALE: &str = "ReportsStale";
-const DEPLOYMENT_HALTED: &str = "DeploymentHalted";
+/// Named beyond this module because the repository writer looks its previous entry up by name to
+/// carry the transition (the default cohort's halt has no set or group status to ride on).
+pub const DEPLOYMENT_HALTED: &str = "DeploymentHalted";
 pub const RECONCILE_FAILING: &str = "ReconcileFailing";
+
+/// A webhook credential is a token, not an artifact. Bounding the opened handle makes a mistaken
+/// device/FIFO path or a file replaced while it is read unable to consume the controller's memory.
+const BEARER_TOKEN_BYTES_LIMIT: usize = 8 * 1024;
 
 /// The default for `UpdateGroupSet.spec.stuckAfterSeconds`: an hour of staging with no node newly
 /// settled before `RolloutStuck` rises.
@@ -189,10 +195,20 @@ pub fn deployment_halted(
             halted
                 .iter()
                 .map(|halt| {
-                    format!(
-                        "deployment {} is halted: {} node(s) attempted it and rolled back",
-                        halt.deployment, halt.evidence
-                    )
+                    if halt.rolled_back {
+                        format!(
+                            "deployment {} is halted: {} node(s) attempted it and rolled back; \
+                             the onRegression response rolled its groups back to their \
+                             predecessors, and the body stays vetoed until a corrected \
+                             deployment (a new digest) is published",
+                            halt.deployment, halt.evidence
+                        )
+                    } else {
+                        format!(
+                            "deployment {} is halted: {} node(s) attempted it and rolled back",
+                            halt.deployment, halt.evidence
+                        )
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("; "),
@@ -250,6 +266,46 @@ pub fn carry_transition(
             (next, fires)
         }
     }
+}
+
+/// Merge a freshly computed conditions ARRAY over the one a resource already carries, applying
+/// [`carry_transition`] to every entry and preserving every condition this writer does not speak
+/// for. The one place a status writer's conditions array is assembled for the wire.
+///
+/// Both halves are load-bearing, and both were learned the hard way:
+///
+/// * A merge patch replaces an array wholesale, so a writer that rebuilds it bare DELETES the
+///   entries it does not compute — the regression `quarantine_group` and `failure_status` document.
+/// * A rebuilt entry stamped with a fresh `lastTransitionTime` makes the patched document differ on
+///   every pass, so the apiserver persists it and bumps `resourceVersion`. The loop runs once a
+///   second over every custom resource, so an idle fleet at the enrollment ceiling would be tens of
+///   thousands of etcd writes and watch events per second with nothing changing. `carry_transition`
+///   keeps an unchanged status's original timestamp, which both stabilizes the document and makes
+///   the field mean what it says: the timestamp marks transitions, not observations.
+///
+/// Transitions are not reported here: this is for the writers that speak for conditions with no
+/// webhook (`Ready`, `EnrollmentCapacity`, `RootRenewal`). An alertable condition is carried through
+/// [`carry_transition`] at its own site first, for the `fired` flag, and passing it through again
+/// here is a no-op.
+pub fn merge_conditions(
+    observed: &[ResourceCondition],
+    next: Vec<ResourceCondition>,
+) -> Vec<ResourceCondition> {
+    let mut merged: Vec<ResourceCondition> = next
+        .into_iter()
+        .map(|next| carry_transition(existing(observed, &next.condition_type), next).0)
+        .collect();
+    let foreign: Vec<ResourceCondition> = observed
+        .iter()
+        .filter(|condition| {
+            !merged
+                .iter()
+                .any(|entry| entry.condition_type == condition.condition_type)
+        })
+        .cloned()
+        .collect();
+    merged.extend(foreign);
+    merged
 }
 
 /// The condition of `condition_type` a resource's status currently carries, if any.
@@ -313,7 +369,7 @@ const DELIVERY_ATTEMPTS: u32 = 3;
 /// semantics for a level-triggered condition: what the receiver must eventually learn is the
 /// current state, and dropping whole batches lost exactly the recovery clears.
 pub struct AlertSink {
-    url: String,
+    url: reqwest::Url,
     /// A mounted secret file holding the bearer token, re-read per delivery so a rotated secret
     /// takes effect without a restart. `None` sends no Authorization header.
     token_file: Option<PathBuf>,
@@ -336,21 +392,22 @@ impl AlertSink {
         // A URL that cannot be parsed would otherwise fail on every delivery, forever, behind a
         // per-event warning — a muted alert channel on a running controller. Its sibling setting
         // (the metrics address) fails fast at startup; this one does too.
-        let parsed =
-            reqwest::Url::parse(&url).map_err(|error| format!("parsing {url:?}: {error}"))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(format!(
-                "the alert URL must be http or https, got {:?}",
-                parsed.scheme()
-            ));
-        }
+        // Plain HTTP is an explicit option only for an unauthenticated in-cluster receiver. A
+        // mounted bearer token is a credential, so accepting HTTP beside it would faithfully send
+        // that credential in cleartext on every retry.
+        let transport = if token_file.is_some() {
+            updated::http::EndpointTransport::HttpsOnly
+        } else {
+            updated::http::EndpointTransport::HttpOrHttps
+        };
+        let url = updated::http::network_endpoint(&url, transport, "alert URL")
+            .map_err(|error| error.to_string())?;
         // Same egress discipline as the subscription webhook: never follow a redirect off the
         // operator-configured host.
-        let client = reqwest::Client::builder()
-            .timeout(DELIVERY_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| format!("building the alert HTTP client: {error}"))?;
+        let client = updated::http::outbound_client(updated::http::OutboundDeadline::Total(
+            DELIVERY_TIMEOUT,
+        ))
+        .map_err(|error| format!("building the alert HTTP client: {error}"))?;
         Ok(Self {
             url,
             token_file,
@@ -427,17 +484,17 @@ impl AlertSink {
                 // FAIL CLOSED on the credential: a configured token must never degrade to an
                 // unauthenticated POST. Every attempt is spent on reading it, and the condition on
                 // the resource remains the durable record either way.
-                Some(path) => match tokio::fs::read_to_string(path).await {
+                Some(path) => match read_bearer_token(path).await {
                     // An EMPTY read is a credential failure too, not a token: a Secret key set to
                     // the empty string, a key not yet populated, or a truncate-then-write rotation
                     // caught mid-flight all read `Ok("")`, and `bearer_auth("")` builds the
                     // perfectly legal header `Bearer ` — the unauthenticated POST this arm exists
                     // to prevent.
-                    Ok(token) if token.trim().is_empty() => {
+                    Ok(token) if token.is_empty() => {
                         tracing::warn!(path = %path.display(), "alert bearer-token file is empty; skipping this attempt");
                         continue;
                     }
-                    Ok(token) => Some(token.trim().to_string()),
+                    Ok(token) => Some(token),
                     Err(error) => {
                         tracing::warn!(%error, path = %path.display(), "alert bearer-token file is unreadable; skipping this attempt");
                         continue;
@@ -447,7 +504,7 @@ impl AlertSink {
             };
             let mut request = self
                 .client
-                .post(&self.url)
+                .post(self.url.clone())
                 .header("content-type", "application/json")
                 .body(body.clone());
             if let Some(token) = &token {
@@ -462,7 +519,7 @@ impl AlertSink {
                     "alert webhook refused the transition"
                 ),
                 Err(error) => tracing::warn!(
-                    %error,
+                    error = %updated::http::redacted_reqwest_error("alert webhook delivery", &error),
                     condition = %event.condition,
                     resource = %event.resource,
                     "alert webhook delivery failed"
@@ -478,9 +535,68 @@ impl AlertSink {
     }
 }
 
+/// Read one mounted bearer token through a fixed-size opened handle.
+///
+/// Kubernetes Secret projections are symlinks, so the path itself may be one; the opened target
+/// must be a regular file. The actual read is still capped because metadata is only an advisory
+/// snapshot and a trusted-but-broken mount can change underneath us.
+async fn read_bearer_token(path: &Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || {
+        foundation::file::read_bounded_regular(
+            &path,
+            BEARER_TOKEN_BYTES_LIMIT,
+            foundation::file::FinalSymlink::Follow,
+        )
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("bearer-token read task failed: {error}")))??;
+    let token = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "bearer token is not UTF-8")
+    })?;
+    Ok(token.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bearer_token_reads_are_bounded_and_normalized() {
+        let token = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token.path(), "  s3cret\n").unwrap();
+        assert_eq!(read_bearer_token(token.path()).await.unwrap(), "s3cret");
+
+        std::fs::write(token.path(), vec![b'x'; BEARER_TOKEN_BYTES_LIMIT + 1]).unwrap();
+        let error = read_bearer_token(token.path()).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn alert_endpoints_use_the_shared_safe_url_grammar() {
+        for invalid in [
+            "file:///tmp/alerts",
+            "https://user@alerts.example/hook",
+            "https://alerts.example/hook?token=secret",
+            "https://alerts.example/hook#fragment",
+            "alerts.example/hook",
+        ] {
+            let error = AlertSink::new(invalid.into(), None)
+                .err()
+                .expect("invalid alert URL must fail at startup");
+            assert!(!error.contains("secret"), "URL leaked in {error}");
+        }
+
+        let token = tempfile::NamedTempFile::new().unwrap();
+        let error = AlertSink::new(
+            "http://alerts.updated-system.svc/hook".into(),
+            Some(token.path().into()),
+        )
+        .err()
+        .expect("a bearer token must never be sent over HTTP");
+        assert!(error.contains("HTTPS"), "{error}");
+    }
 
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339("2026-08-08T12:00:00Z")
@@ -569,6 +685,7 @@ mod tests {
         let halted = deployment_halted(
             Some(2),
             &[crate::HaltedDeployment {
+                rolled_back: false,
                 deployment: "app-v2".into(),
                 evidence: 3,
             }],
@@ -620,6 +737,51 @@ mod tests {
         );
     }
 
+    /// A status writer's array, merged over the one the resource carries: an entry whose status did
+    /// not change keeps its original `lastTransitionTime` — so a pass that changes nothing patches a
+    /// document identical to the stored one and the apiserver writes nothing — and a condition this
+    /// writer does not speak for survives instead of being deleted by the merge patch.
+    #[test]
+    fn merging_conditions_keeps_transition_times_and_foreign_entries() {
+        let stamped = |condition_type: &str, status: &str, when: &str| ResourceCondition {
+            condition_type: condition_type.into(),
+            status: status.into(),
+            reason: "Published".into(),
+            message: "steady".into(),
+            observed_generation: Some(1),
+            last_transition_time: when.into(),
+        };
+        let observed = vec![
+            stamped("Ready", "True", "2026-01-01T00:00:00Z"),
+            stamped("PolicyApproved", "True", "2026-01-01T00:00:00Z"),
+        ];
+
+        // The same verdict, restamped by this pass's constructor: the merged entry carries the
+        // ORIGINAL timestamp, so the whole document is byte-identical to what is already stored.
+        let merged = merge_conditions(
+            &observed,
+            vec![stamped("Ready", "True", "2026-08-08T12:00:00Z")],
+        );
+        assert_eq!(
+            merged[0], observed[0],
+            "an unchanged verdict must produce an unchanged document, or every pass is an \
+             apiserver write per resource"
+        );
+        assert_eq!(
+            merged.get(1),
+            observed.get(1),
+            "a condition this writer does not speak for is carried forward, not deleted"
+        );
+
+        // A genuine flip takes the new timestamp.
+        let merged = merge_conditions(
+            &observed,
+            vec![stamped("Ready", "False", "2026-08-08T12:00:00Z")],
+        );
+        assert_eq!(merged[0].status, "False");
+        assert_eq!(merged[0].last_transition_time, "2026-08-08T12:00:00Z");
+    }
+
     /// The webhook client against a local listener: transitions are POSTed as one JSON document
     /// with the bearer token, a refused delivery is retried the bounded number of times and then
     /// dropped, and the deadline bounds a hung receiver.
@@ -666,11 +828,18 @@ mod tests {
 
         let token_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(token_file.path(), "s3cret\n").unwrap();
-        let sink = AlertSink::new(
-            format!("http://{addr}/alerts"),
-            Some(token_file.path().to_path_buf()),
-        )
-        .unwrap();
+        // The local fixture is plain HTTP. Construct the sink directly so this test can exercise
+        // token rotation and Authorization-header behavior without weakening the production
+        // constructor, whose test above proves that this exact pairing is refused.
+        let sink = AlertSink {
+            url: reqwest::Url::parse(&format!("http://{addr}/alerts")).unwrap(),
+            token_file: Some(token_file.path().to_path_buf()),
+            client: updated::http::outbound_client(updated::http::OutboundDeadline::Total(
+                DELIVERY_TIMEOUT,
+            ))
+            .unwrap(),
+            queue: std::sync::Mutex::new(AlertQueue::default()),
+        };
 
         let event = AlertEvent {
             resource: "UpdateGroup/edge".into(),

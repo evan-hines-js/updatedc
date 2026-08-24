@@ -1,0 +1,16 @@
+# Workspace-wide bans on functions that must have exactly one caller.
+#
+# These are enforced by `cargo clippy -- -D warnings`, which CI runs over `--all-targets
+# --all-features`. That matters more than it looks: the ban resolves each call to its definition,
+# so it cannot be evaded by importing the function and calling it bare, and it covers every file in
+# the workspace automatically — including ones that do not exist yet. A guard that enumerates the
+# files it checks silently stops covering the crate the moment a module is added or split.
+#
+# Every legitimate caller carries `#[allow(clippy::disallowed_methods)]` with the reason it is the
+# one door. That allow is the exception list, and it lives at the exception.
+disallowed-methods = [
+  { path = "updated_contracts::telemetry::report_is_authentic", reason = "verifying a node report is the most expensive work a control-plane pass does; the controller verifies its whole fleet once through evidence::VerifiedReports::verify_fleet and reads the result. Call that instead." },
+  { path = "updated_contracts::telemetry::report_is_authentic_and_fresh", reason = "same single verification door: go through evidence::VerifiedReports (controller) rather than re-verifying bytes a pass has already checked." },
+  { path = "updated_contracts::telemetry::accept_report_envelope", reason = "stamps a fresh acceptance instant, which the fleet projection evicts by. Accept bytes once, where they arrive off the store, and carry the resulting AcceptedReport; re-accepting a stored envelope restamps it and turns 'evict the stalest' into 'evict whoever sorts first'." },
+  { path = "updated_contracts::telemetry::unverified_report", reason = "reads a report WITHOUT checking its signature. Observability only — never a trust decision. If you are deciding anything about a node, use the verified path." },
+]

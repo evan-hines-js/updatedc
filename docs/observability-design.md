@@ -1,6 +1,6 @@
 # Operator observability
 
-Status: implemented. `UPDATED_METRICS_ADDRESS` and `HEALTHPROXY_METRICS_ADDRESS` each serve `GET /metrics` (plain Prometheus text exposition, hand-rolled, default off).
+Status: implemented. `UPDATED_METRICS_ADDRESS` and `HEALTHPROXY_METRICS_ADDRESS` each serve `GET /metrics` (plain Prometheus text exposition, hand-rolled, default off for a hand-run process). An OPERATOR-managed healthproxy — the deployment `updatec` builds for an `UpdateBackend` — always serves it, on the fixed `runtime::BACKEND_METRICS_PORT` (9090): that pod is the one observer of out-of-cluster nodes, and running it dark makes the freshness of the very projection that drains those machines unobservable exactly where it matters.
 
 ## Problem
 
@@ -49,15 +49,14 @@ already aggregates every fact a node is allowed to assert.
 - `updatec_group_nodes{group=...}` / `updatec_group_nodes_on_target{group=...}` — rollout
   progress as the admission logic counts it, not a re-derivation.
 - `updatec_reports_fresh` / `updatec_reports_stale` — node reports inside/outside
-  `REPORT_FRESHNESS`, the same staleness the admission gate applies.
-- `updatec_report_schema{schema=...}` — nodes with a fresh authentic report, by the report schema
-  they wrote. The compatibility window (docs/wire-compatibility-design.md) admits older reports
-  with newer fields at their fail-safe default, which degrades what the fleet can prove without
-  changing anything else an operator can see: a pre-7 agent cannot assert `rejected`, so its
-  durable rejections mint no regression evidence and "no node rejected the release" reads
-  identically to "every rejection was invisible". This is also the only in-system answer to the question raising
-  `MIN_SUPPORTED_SCHEMA` depends on — whether any supported fleet still runs the older agent.
-  Bounded by the number of live schemas, not by nodes.
+  `REPORT_FRESHNESS`, the same staleness the admission gate applies. Both are sums of the planner's
+  own per-group counts, so they cover the OBSERVABLE population and not the fleet: a node is stale
+  only if it has a pinned key and has already uploaded at least one envelope, because a freshly
+  enrolled node that has never reported is unobserved rather than silent — counting it would make
+  every mass enrollment page and then resolve itself. Cordoned nodes and nodes no planned group
+  selects are in neither series either. So `fresh + stale` is a lower bound on the agent count, not
+  a partition of it: do not derive `stale = total − fresh`, and do not read `stale == 0` as "every
+  machine checked in".
 - `updatec_quarantined_groups` — size of the quarantine set.
 
 `updated-healthproxy`:
@@ -66,12 +65,13 @@ already aggregates every fact a node is allowed to assert.
 - `healthproxy_reports_stale_total` — drains caused by report staleness, the number that turns
   a silent freshness failure into a visible one.
 - `healthproxy_reconcile_timestamp_seconds` — is it alive.
-- `healthproxy_endpoints_timestamp_seconds` — when the control plane's endpoint projection was
-  last observed. The projection fails OPEN by design, so once this falls further behind than the
-  freshness window every cordon has been released and health alone governs — the one number that
-  makes a silently lost cordon alertable, as `reports_stale_total` does for a silently aged-out
-  report. The proxy also logs both edges of that observation, and says "no longer cordoned" rather
-  than "health report ready" when a node rejoins because its cordon went away.
+- `healthproxy_reports_timestamp_seconds` — when a usable fleet report index was last observed,
+  the document readiness itself is read from. While the index is unreadable every node resolves
+  through its cached report, and once
+  those age out the WHOLE inventory drains. `reports_stale_total` counts that one node at a time
+  and reads identically to a fleet that genuinely stopped heartbeating, so this series (and the
+  two edges the proxy logs beside it) is what tells "the index is unreadable" from "everyone went
+  silent".
 
 ## Non-goals
 
@@ -83,5 +83,9 @@ the path, not to grow the metrics surface.
 ## Testing
 
 Exposition is a pure function of reconciler state: unit-test it as text against constructed
-state, the same way status projection is tested. (Not yet implemented: an e2e kind step that
-scrapes both endpoints after convergence and asserts the settled fleet shape.)
+state, the same way status projection is tested. The kind e2e then scrapes both endpoints from
+inside the cluster after convergence (`assert_metrics_exposed`) and asserts the settled fleet
+shape. It reads sample VALUES, never series names: every `# HELP`/`# TYPE` pair is written
+unconditionally, so a name check passes against an exposition that projected nothing — no planned
+groups, no programmed backends, and a freshness stamp of zero, which is the very failure these
+series exist to make alertable.

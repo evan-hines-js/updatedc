@@ -2,7 +2,7 @@
 //! targets are uploaded first and timestamp metadata last.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use updated_tuf::repo::{self, PublishTarget};
 
@@ -40,103 +40,115 @@ pub async fn sign_plan(
             custom: HashMap::new(),
         });
     }
-    repo::replace_release(
-        repository_dir,
-        &repo::Keys::in_dir(keys_dir),
-        targets,
-        expiry_days,
-    )
-    .await
-    .map_err(|e| PublishError(format!("signing TUF publication: {e}")))
+    let keys = repo::Keys::in_dir(keys_dir)
+        .map_err(|e| PublishError(format!("resolving TUF signing keys: {e}")))?;
+    repo::replace_release(repository_dir, &keys, targets, expiry_days)
+        .await
+        .map_err(|e| PublishError(format!("signing TUF publication: {e}")))
 }
 
-/// Stable S3 upload order. Immutable target bytes precede metadata; timestamp is the
-/// final visibility/commit object.
-pub fn upload_order(repository_dir: &Path) -> Result<Vec<PathBuf>, PublishError> {
-    let mut targets = files_below(&repository_dir.join("targets"))?;
-    let mut metadata = files_below(&repository_dir.join("metadata"))?;
-    let mut timestamp = Vec::new();
-    metadata.retain(|path| {
-        if path.file_name().and_then(|name| name.to_str()) == Some("timestamp.json") {
-            timestamp.push(path.clone());
-            false
-        } else {
-            true
-        }
-    });
-    targets.sort();
-    metadata.sort();
-    targets.extend(metadata);
-    targets.extend(timestamp);
-    Ok(targets)
-}
-
-fn files_below(root: &Path) -> Result<Vec<PathBuf>, PublishError> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut pending = vec![root.to_path_buf()];
-    let mut files = Vec::new();
-    while let Some(path) = pending.pop() {
-        for entry in std::fs::read_dir(&path)
-            .map_err(|e| PublishError(format!("reading {}: {e}", path.display())))?
-        {
-            let path = entry
-                .map_err(|e| PublishError(format!("reading {}: {e}", path.display())))?
-                .path();
-            let kind = std::fs::symlink_metadata(&path)
-                .map_err(|e| PublishError(format!("inspecting {}: {e}", path.display())))?
-                .file_type();
-            if kind.is_symlink() {
-                return Err(PublishError(format!(
-                    "repository contains a symlink: {}",
-                    path.display()
-                )));
-            }
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file() {
-                files.push(path);
-            } else {
-                return Err(PublishError(format!(
-                    "repository contains a non-regular file: {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(files)
+/// Resolve the one publication plan: local immutable bytes precede metadata, retained
+/// content-addressed targets must already exist remotely, and timestamp is the final commit.
+pub async fn publication_plan(
+    repository_dir: &Path,
+) -> Result<repo::PublicationPlan, PublishError> {
+    repo::current_publication_plan(repository_dir)
+        .await
+        .map_err(|e| PublishError(format!("resolving current TUF publication closure: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    #[test]
-    fn timestamp_is_always_uploaded_last() {
+    async fn repository_with_target(root: &Path) -> (PathBuf, repo::Keys) {
+        let repo_dir = root.join("repo");
+        let keys = repo::generate_keys(&root.join("keys")).await.unwrap();
+        repo::init(&repo_dir, &keys, 365).await.unwrap();
+        let source = root.join("application");
+        std::fs::write(&source, b"target").unwrap();
+        repo::replace_release(
+            &repo_dir,
+            &keys,
+            vec![PublishTarget::application(
+                "app", "stable", "1.0.0", "linux", "x86_64", "app", source,
+            )],
+            365,
+        )
+        .await
+        .unwrap();
+        (repo_dir, keys)
+    }
+
+    #[tokio::test]
+    async fn timestamp_is_always_uploaded_last() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("metadata")).unwrap();
-        std::fs::create_dir_all(root.path().join("targets/a")).unwrap();
-        std::fs::write(root.path().join("targets/a/value"), b"target").unwrap();
-        std::fs::write(root.path().join("metadata/targets.json"), b"targets").unwrap();
-        std::fs::write(root.path().join("metadata/timestamp.json"), b"timestamp").unwrap();
-        let files = upload_order(root.path()).unwrap();
-        assert_eq!(files.last().unwrap().file_name().unwrap(), "timestamp.json");
-        assert!(files[0].starts_with(root.path().join("targets")));
+        let (repo_dir, _) = repository_with_target(root.path()).await;
+        let plan = publication_plan(&repo_dir).await.unwrap();
+        assert_eq!(
+            plan.uploads.last().unwrap().file_name().unwrap(),
+            "timestamp.json"
+        );
+        assert!(plan.uploads[0].starts_with(repo_dir.join("targets")));
     }
 
     #[cfg(unix)]
-    #[test]
-    fn upload_order_rejects_symlinks() {
+    #[tokio::test]
+    async fn publication_plan_rejects_symlinks() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("metadata")).unwrap();
-        std::fs::create_dir_all(root.path().join("targets")).unwrap();
+        let (repo_dir, _) = repository_with_target(root.path()).await;
+        let target = publication_plan(&repo_dir)
+            .await
+            .unwrap()
+            .uploads
+            .into_iter()
+            .find(|path| path.starts_with(repo_dir.join("targets")))
+            .unwrap();
         std::fs::write(root.path().join("outside"), b"secret").unwrap();
-        std::os::unix::fs::symlink(
-            root.path().join("outside"),
-            root.path().join("targets/link"),
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(root.path().join("outside"), target).unwrap();
+        assert!(publication_plan(&repo_dir).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn later_publications_do_not_reupload_historical_targets_or_online_roles() {
+        let root = tempfile::tempdir().unwrap();
+        let (repo_dir, keys) = repository_with_target(root.path()).await;
+        let first = publication_plan(&repo_dir).await.unwrap().uploads;
+        let old_target = first
+            .iter()
+            .find(|path| path.starts_with(repo_dir.join("targets")))
+            .unwrap()
+            .clone();
+        let old_targets_role = first
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".targets.json"))
+            })
+            .unwrap()
+            .clone();
+
+        let source = root.path().join("application-v2");
+        std::fs::write(&source, b"target-v2").unwrap();
+        repo::replace_release(
+            &repo_dir,
+            &keys,
+            vec![PublishTarget::application(
+                "app", "stable", "2.0.0", "linux", "x86_64", "app", source,
+            )],
+            365,
         )
+        .await
         .unwrap();
-        assert!(upload_order(root.path()).is_err());
+        let current = publication_plan(&repo_dir).await.unwrap().uploads;
+        assert!(!current.contains(&old_target));
+        assert!(!current.contains(&old_targets_role));
+        assert_eq!(
+            current.last().unwrap().file_name().unwrap(),
+            "timestamp.json"
+        );
     }
 }

@@ -16,18 +16,16 @@ pub(crate) fn cold_install_applies_the_first_release(ctx: &Ctx) -> R {
         .workload(svc)
         .check_interval("1s")
         .launcher()?;
-    if dir.join("install/state/installed.json").exists()
-        || dir.join("install/active-release").exists()
-    {
+    if node_paths(&dir).installed.exists() || node_paths(&dir).active_release.exists() {
         return fail("cold-install fixture accidentally contained a preinstalled application");
     }
     let process = Proc::spawn("cold-install", &mut node)?;
     let installed = process.wait_for_log(
         "cold-installed application 1.0.0 from the first trusted assignment",
         120,
-    ) && wait_for_version(svc, "1.0.0", 120)
-        && dir.join("install/state/installed.json").is_file()
-        && dir.join("install/active-release").is_file();
+    ) && wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT)
+        && node_paths(&dir).installed.is_file()
+        && node_paths(&dir).active_release.is_file();
     let log = process.captured_log();
     drop(process);
     if !installed {
@@ -60,9 +58,9 @@ pub(crate) fn cold_install_hands_off_to_update(ctx: &Ctx) -> R {
     let node = Service::spawn("handoff", &cmd);
     let fail_log = |msg: &str| -> R { fail(format!("{msg}\nlog:\n{}", node.captured_log())) };
 
-    let install_journal = dir.join("install/state/install.json");
-    let update_journal = dir.join("install/state/transaction.json");
-    let installed = dir.join("install/state/installed.json");
+    let install_journal = node_paths(&dir).install_journal;
+    let update_journal = node_paths(&dir).journal;
+    let installed = node_paths(&dir).installed;
 
     // Install machine: cold-install v1, then prove it converged and left NO install journal.
     if !node.wait_for_log(
@@ -343,7 +341,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
             .faulty_workload(&svc, fault)
             .launcher()?;
         let node = Service::spawn("chaotic-app", &command);
-        let rejected = dir.join("install/state/rejected");
+        let rejected = node_paths(&dir).rejected;
 
         let held = if proves_healthy_first {
             // It must first be proven — the gate passed and the head confirmed — and then stay
@@ -352,7 +350,7 @@ pub(crate) fn chaotic_application_health_failures(ctx: &Ctx) -> R {
             if !wait_for_version(&svc, "1.0.0", EVENT_TIMEOUT)
                 || !wait_until(EVENT_TIMEOUT, || {
                     matches!(
-                        updated::state::read_installed(&dir.join("install/state/installed.json")),
+                        updated::state::read_installed(&node_paths(&dir).installed),
                         updated::state::Installed::Present(ref state) if state.confirmed
                     )
                 })
@@ -427,8 +425,7 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     // Recovery is proven when the descended-to 1.0.0 actually serves — the node recovered rather
     // than crash-looping the broken head forever. A working descent takes a few boots (~30s); cap
     // the wait so a failure surfaces its rich per-attempt diagnostics quickly instead of hanging.
-    const DESCENT_TIMEOUT: u64 = 90;
-    if !wait_for_version(svc, "1.0.0", DESCENT_TIMEOUT) {
+    if !wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT) {
         let log = node.captured_log();
         return fail(format!(
             "cold node stranded on a broken assigned head instead of descending to the healthy \
@@ -438,13 +435,7 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     }
     // Durability: the committed install record names the descended-to 1.0.0, so a further restart
     // converges 1.0.0 and never climbs back onto a rejected broken head.
-    let state_path = dir.join("install/state/installed.json");
-    let settled = wait_until(DESCENT_TIMEOUT, || {
-        matches!(
-            updated::state::read_installed(&state_path),
-            updated::state::Installed::Present(ref state) if state.release.version == "1.0.0"
-        )
-    });
+    let settled = wait_for_installed_version(&dir, "1.0.0", CONVERGE_TIMEOUT);
     drop(node);
     if !settled {
         return fail(
@@ -487,22 +478,15 @@ pub(crate) fn cold_install_descends_past_corrupt_bundle(ctx: &Ctx) -> R {
     let node = Service::spawn("cold-install-corrupt", &command);
     // The malformed heads are rejected at ingest (no hook), so the descent is fast; keep a
     // generous cap so a regression surfaces its diagnostics instead of hanging.
-    const DESCENT_TIMEOUT: u64 = 90;
-    if !wait_for_version(svc, "1.0.0", DESCENT_TIMEOUT) {
+    if !wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT) {
         let log = node.captured_log();
         return fail(format!(
             "cold node stranded on a malformed assigned bundle instead of rejecting it at ingest \
              and descending to the healthy 1.0.0:\n{log}"
         ));
     }
-    let state_path = dir.join("install/state/installed.json");
-    let settled = wait_until(DESCENT_TIMEOUT, || {
-        matches!(
-            updated::state::read_installed(&state_path),
-            updated::state::Installed::Present(ref state) if state.release.version == "1.0.0"
-        )
-    });
-    let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
+    let settled = wait_for_installed_version(&dir, "1.0.0", CONVERGE_TIMEOUT);
+    let rejected = std::fs::read_to_string(node_paths(&dir).rejected).unwrap_or_default();
     let rejected_count = rejected.lines().filter(|l| !l.trim().is_empty()).count();
     drop(node);
     if !settled {
@@ -574,7 +558,7 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
         "failed its boot health gate inside its confirmation window; reverting to 1.0.0",
         EVENT_TIMEOUT,
     ) && wait_for_version(svc, "1.0.0", EVENT_TIMEOUT);
-    let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
+    let rejected = std::fs::read_to_string(node_paths(&dir).rejected).unwrap_or_default();
     let log = node.captured_log();
     drop(node);
     if !reverted {
@@ -626,9 +610,9 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
     let held = reported
         && stays_true(READINESS_SETTLE, || {
             matches!(
-                updated::state::read_installed(&dir.join("install/state/installed.json")),
+                updated::state::read_installed(&node_paths(&dir).installed),
                 updated::state::Installed::Present(ref state) if state.release.version == "2.0.0"
-            ) && std::fs::read_to_string(dir.join("install/state/rejected"))
+            ) && std::fs::read_to_string(node_paths(&dir).rejected)
                 .map(|text| text.trim().is_empty())
                 .unwrap_or(true)
         });

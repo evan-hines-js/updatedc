@@ -1,0 +1,17 @@
+misconfigurations:
+  - id: KSV-0050
+    paths:
+      - updatec.yaml
+    statement: >-
+      updatec materializes one isolated healthproxy identity per operator-owned UpdateBackend, so
+      the controller must create that identity's Role and RoleBinding. Kubernetes's RBAC
+      anti-escalation check still limits every generated Role to permissions the controller already
+      holds, and generated bindings name only that backend's generated ServiceAccount and Role.
+  - id: KSV-0056
+    paths:
+      - updatec.yaml
+    statement: >-
+      Kubernetes's RBAC anti-escalation check requires the controller to hold the EndpointSlice
+      permissions it delegates. Each generated healthproxy Role pins ongoing verbs to the backend's
+      two deterministic resourceNames, and a fail-closed ValidatingAdmissionPolicy denies the
+      controller identity any direct EndpointSlice mutation.

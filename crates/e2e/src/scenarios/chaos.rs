@@ -60,8 +60,8 @@ pub(crate) fn chaos_recovery(ctx: &Ctx) -> R {
         // Prove durable convergence as well as liveness: installed state names the
         // exact v2 bytes and the transaction journal is gone. This catches recovery
         // that briefly serves v2 but leaves a half-committed transaction on disk.
-        let state_path = dir.join("install/state/installed.json");
-        let journal_path = dir.join("install/state/transaction.json");
+        let state_path = node_paths(&dir).installed;
+        let journal_path = node_paths(&dir).journal;
         let durable = wait_until(RECOVERY_TIMEOUT, || {
             matches!(
                 updated::state::read_installed(&state_path),
@@ -128,8 +128,8 @@ pub(crate) fn install_chaos_recovery(ctx: &Ctx) -> R {
         // Durable convergence: the installed record names the exact v1 bytes and the install
         // journal is gone. Since the first agent died mid-install, only recovery could
         // have reached this state.
-        let state_path = dir.join("install/state/installed.json");
-        let journal_path = dir.join("install/state/install.json");
+        let state_path = node_paths(&dir).installed;
+        let journal_path = node_paths(&dir).install_journal;
         let durable = wait_until(RECOVERY_TIMEOUT, || {
             matches!(
                 updated::state::read_installed(&state_path),
@@ -232,8 +232,8 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             &format!("CHAOS: exiting at boundary \"{point}\""),
             RECOVERY_TIMEOUT,
         );
-        let state_path = dir.join("install/state/installed.json");
-        let journal_path = dir.join("install/state/transaction.json");
+        let state_path = node_paths(&dir).installed;
+        let journal_path = node_paths(&dir).journal;
         let durable = wait_until(RECOVERY_TIMEOUT, || {
             matches!(
                 updated::state::read_installed(&state_path),
@@ -242,7 +242,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
             ) && !journal_path.exists()
         });
         let live = wait_for_version(&svc, "1.0.0", RECOVERY_TIMEOUT);
-        let rejected = std::fs::read_to_string(dir.join("install/state/rejected"))
+        let rejected = std::fs::read_to_string(node_paths(&dir).rejected)
             .is_ok_and(|contents| !contents.trim().is_empty());
         let attempts = fixture::attempts(&fixture_root);
         // One transaction, two directions, two identities. The forward direction runs under the
@@ -356,11 +356,9 @@ fn provider_failure_case(ctx: &Ctx, phase: &str, index: u16) -> R {
     // transaction: however many times recovery replays, everything folds to one transaction —
     // its forward token plus at most that token's own compensating identity.
     let one_recovery_identity = fixture::transactions(&attempts).len() == 1;
-    let completed_journal_cleared = phase == "rollback"
-        || wait_until(RECOVERY_TIMEOUT, || {
-            !dir.join("install/state/transaction.json").is_file()
-        });
-    let journal_present = dir.join("install/state/transaction.json").is_file();
+    let completed_journal_cleared =
+        phase == "rollback" || wait_until(RECOVERY_TIMEOUT, || !node_paths(&dir).journal.is_file());
+    let journal_present = node_paths(&dir).journal.is_file();
     drop(node);
     drop(server);
 
@@ -513,8 +511,8 @@ pub(crate) fn apply_replay_converges_exactly_once(ctx: &Ctx) -> R {
         "CHAOS: exiting at boundary \"candidate-lifecycle-applied\"",
         RECOVERY_TIMEOUT,
     );
-    let state_path = dir.join("install/state/installed.json");
-    let journal_path = dir.join("install/state/transaction.json");
+    let state_path = node_paths(&dir).installed;
+    let journal_path = node_paths(&dir).journal;
     let durable = wait_until(RECOVERY_TIMEOUT, || {
         matches!(
             updated::state::read_installed(&state_path),
@@ -759,10 +757,8 @@ pub(crate) fn migration_shaped_failed_migration_rolls_back(ctx: &Ctx) -> R {
             && wait_for_version(svc, "1.0.0", 1)
     });
     let attempts = fixture::attempts(&fixture_root);
-    let rejected = std::fs::read_to_string(dir.join("install/state/rejected")).unwrap_or_default();
-    let journal_cleared = wait_until(RECOVERY_TIMEOUT, || {
-        !dir.join("install/state/transaction.json").is_file()
-    });
+    let rejected = std::fs::read_to_string(node_paths(&dir).rejected).unwrap_or_default();
+    let journal_cleared = wait_until(RECOVERY_TIMEOUT, || !node_paths(&dir).journal.is_file());
     let identities = fixture::transactions(&attempts).len();
     let log = node.captured_log();
     drop(node);
@@ -851,10 +847,10 @@ pub(crate) fn a_reboot_mid_rollback_still_converges_the_predecessor(ctx: &Ctx) -
 
     let converged = wait_until(RECOVERY_TIMEOUT, || {
         matches!(
-            updated::state::read_installed(&dir.join("install/state/installed.json")),
+            updated::state::read_installed(&node_paths(&dir).installed),
             updated::state::Installed::Present(ref state)
                 if state.release.version == "1.0.0" && state.pending.is_none()
-        ) && !dir.join("install/state/transaction.json").exists()
+        ) && !node_paths(&dir).journal.exists()
     }) && wait_for_version(svc, "1.0.0", RECOVERY_TIMEOUT);
     let log = node.captured_log();
     // A healthy predecessor must never be charged a health failure: the bound exists for a

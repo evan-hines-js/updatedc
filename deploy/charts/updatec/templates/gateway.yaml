@@ -1,0 +1,142 @@
+{{- $shards := int .Values.gateway.fleetReportMaxShards }}
+{{/*
+The bound is owned by `MAX_FLEET_REPORT_SHARDS` in crates/updated-contracts/src/telemetry.rs, and
+the gateway enforces it at start-up. Helm cannot read a Rust constant, so the ceiling below is a
+copy — kept only so a wrong value fails while rendering instead of as a crash loop, and pinned by
+`scripts/ci.sh charts`, which reads that constant and asserts this chart accepts exactly it and
+refuses one past it. Change the constant and CI fails here until this number follows.
+*/}}
+{{- if or (lt $shards 1) (gt $shards 64) }}
+{{- fail (printf "gateway.fleetReportMaxShards must be between 1 and 64, got %d: the gateway refuses to start outside that range, so this fails here instead of as a crash loop." $shards) }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "updatec.gatewayName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "updatec.gatewayName" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "updatec.gatewayName" . }}
+        {{- include "updatec.labels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+      {{- with .Values.gateway.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "updatec.gatewayServiceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- include "updatec.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: updatec
+          image: {{ include "updatec.imageRef" (dict "ctx" . "image" .Values.image "label" "image") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [serve]
+          ports:
+            - name: http
+              containerPort: 8080
+            # Plaintext health port for the kubelet probes, which cannot present a client cert.
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet: {path: /healthz, port: health}
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          resources: {{- toYaml .Values.gateway.resources | nindent 12 }}
+          env:
+            {{- include "updatec.commonEnv" . | nindent 12 }}
+            - name: UPDATED_LISTEN
+              value: "0.0.0.0:8080"
+            - name: UPDATED_HEALTH_LISTEN
+              value: "0.0.0.0:8081"
+            - name: UPDATED_GATEWAY_TLS_DIR
+              value: /etc/gateway-tls
+            - name: UPDATED_ISSUING_CA_DIR
+              value: /etc/issuing-ca
+            - name: UPDATED_ENROLLMENT_CLIENT_CN
+              value: {{ .Values.gateway.enrollmentClientCN | quote }}
+            - name: UPDATED_ENROLLMENT_LOCK_NAME
+              value: {{ include "updatec.gatewayEnrollmentLeaseName" . | quote }}
+            - name: UPDATED_FLEET_REPORT_MAX_SHARDS
+              value: {{ .Values.gateway.fleetReportMaxShards | quote }}
+            {{- with .Values.gateway.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            # The gateway is externally exposed, so it terminates mTLS itself. tls.crt/tls.key are
+            # its server identity; ca.crt is the CA a connecting agent is verified against.
+            - name: gateway-tls
+              mountPath: /etc/gateway-tls
+              readOnly: true
+            # The fleet CA *with its private key*, so the /enroll handler can sign a node's CSR into
+            # a per-node client cert the mTLS listener accepts. Holding the CA key here widens the
+            # gateway's blast radius; scope that CA to the fleet and nothing else.
+            - name: issuing-ca
+              mountPath: /etc/issuing-ca
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: gateway-tls
+          secret:
+            secretName: {{ .Values.gateway.tlsSecretName }}
+            defaultMode: 0440
+        - name: issuing-ca
+          secret:
+            secretName: {{ .Values.gateway.issuingCaSecretName }}
+            defaultMode: 0440
+      {{- with .Values.gateway.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "updatec.gatewayName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+  {{- with .Values.gateway.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  {{- if eq .Values.gateway.service.type "LoadBalancer" }}
+  {{- with .Values.gateway.service.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.gateway.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  selector:
+    app: {{ include "updatec.gatewayName" . }}
+  # Agents reach the gateway under mTLS; map the published port to the container's mTLS data port.
+  # The plaintext health port is probe-only and deliberately not exposed here.
+  ports:
+    - name: https
+      port: {{ .Values.gateway.service.port }}
+      targetPort: http

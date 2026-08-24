@@ -1,18 +1,15 @@
-//! The request grammar for a served TUF repository object: which request paths name an object,
-//! and how a `Range` header over one is read.
+//! The request grammar for a served TUF repository object, plus the byte-range grammar used by the
+//! development object-store fixture.
 //!
-//! Two servers answer requests against the same repository layout — the production gateway
-//! ([`crate::gateway`]) in front of the object store, and the dev CDN (`server`) in front of a
-//! directory — and an agent cannot tell them apart. Written twice, the grammars drifted: the dev
-//! CDN accepted `/metadata//root.json` and `/targets/x?y` that production 404s, and refused the
-//! bounded (`bytes=0-99`) and suffix (`bytes=-500`) ranges production serves, so every e2e and demo
-//! run exercised a shape production does not implement and never exercised production's rule. It is
-//! written once here and both call it.
+//! The production gateway and the development repository fixture both accept the path layout. The
+//! gateway never serves payload bytes: it validates the path and mints an exact S3 capability.
+//! The fixture is the only in-process byte server, so it also uses [`ByteRange`] to emulate the
+//! range behavior a direct object store provides. Authentication and capability policy remain
+//! explicit responsibilities of their respective listeners.
 
 /// A request path that names a repository object: its namespace (`metadata`, `targets`, …) and the
 /// object's path within that namespace. Which namespaces a given server publishes is the server's
-/// own business — the dev CDN also reads back the report namespace it accepts writes into — so the
-/// caller matches `namespace` against the set it serves.
+/// own business, so the caller matches `namespace` against the set it serves.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ObjectRequest<'a> {
     /// The first path segment.
@@ -69,7 +66,11 @@ pub enum ByteRange {
 impl ByteRange {
     /// Place the range over an object of `length` bytes: `Some((start, count))`, or `None` if the
     /// range is unsatisfiable (a 416). A bounded end past the last byte and a suffix longer than
-    /// the object are clamped, as the RFC requires; a start at or past the end is not satisfiable.
+    /// the object are clamped, as the RFC requires; a start at or past the end is not satisfiable,
+    /// and nothing is satisfiable over an empty object.
+    ///
+    /// The directory fixture asks this before it writes its status line. Production payloads go
+    /// directly to S3, whose range implementation is outside this process.
     pub fn resolve(self, length: u64) -> Option<(u64, u64)> {
         match self {
             Self::Offset(start) if start < length => Some((start, length - start)),

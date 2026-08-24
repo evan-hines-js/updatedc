@@ -127,7 +127,8 @@ impl DefaultPolicy {
 }
 
 fn parse_semver(v: &str) -> Result<semver::Version, PolicyError> {
-    semver::Version::parse(v).map_err(|e| PolicyError(format!("invalid version `{v}`: {e}")))
+    updated_contracts::identity::parse_release_version(v)
+        .ok_or_else(|| PolicyError(format!("invalid or oversized version `{v}`")))
 }
 
 #[cfg(test)]

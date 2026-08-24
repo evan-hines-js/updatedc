@@ -9,20 +9,19 @@ fn runtime() -> RuntimeSpec {
         product: "app".into(),
         channel: "stable".into(),
         install_root: "/var/lib/updated".into(),
-        secrets: vec![],
-        repository: RepositoryLimitsSpec {
+        repository: updated_contracts::assignment::ManagedRepositoryLimits {
             metadata_limit: 1_048_576,
             target_limit: 536_870_912,
             transport_timeout_seconds: 30,
         },
-        storage: StorageSpec {
+        storage: updated_contracts::assignment::ManagedStorage {
             inactive_releases: 2,
             inactive_providers: 2,
             inactive_agents: 2,
             inactive_bytes: 1_073_741_824,
             inactive_repository_caches: 2,
         },
-        timeouts: TimeoutsSpec {
+        timeouts: updated_contracts::assignment::ManagedTimeouts {
             check_interval_seconds: 1,
             health_grace_seconds: 30,
             health_successes: 2,
@@ -44,10 +43,6 @@ fn deployment(
 ) -> DeploymentSpec {
     DeploymentSpec {
         name: name.into(),
-        // `updated_contracts::telemetry::report_url` appends the canonical
-        // `/telemetry/<node>.json` key.
-        // Point at the authenticated gateway base, not a second hand-written telemetry route.
-        report_url: "https://updatec-gateway".into(),
         release_repository: ReleaseRepositorySpec {
             metadata_url: format!("https://release-{name}/metadata/"),
             targets_url: format!("https://release-{name}/targets/"),
@@ -150,19 +145,18 @@ fn main() {
             enrollment: EnrollmentSpec {
                 labels: BTreeMap::new(),
             },
-            s3: S3Destination {
+            s3: RepositoryStorage {
                 bucket: "updates".into(),
-                // A real prefix, never the bucket root: the repository's published artifacts must
-                // be scoped to something the delete finalizer can prune without reaching the
-                // release TUF repository that shares this bucket.
-                prefix: "routing".into(),
                 region: "us-east-1".into(),
                 credentials_secret_ref: Some(LocalSecretReference {
                     name: "s3-credentials".into(),
                 }),
                 endpoint: Some("http://minio:9000".into()),
+                public_endpoint: Some("https://minio-direct.updated-system.svc".into()),
             },
             assignment_prefix: "assignments".into(),
+            state_max_shards: 8,
+            admission_policy_ref: None,
         },
     );
     repository.metadata.namespace = Some("updated-system".into());

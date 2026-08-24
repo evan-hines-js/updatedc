@@ -1,0 +1,112 @@
+# RBAC cannot constrain CREATE by resourceNames and cannot enumerate ConfigMaps for UpdateBackend
+# objects that do not exist yet. This policy is the object-level half of the controller boundary:
+# only the release's durable state and ConfigMaps owned by an UpdateBackend may be mutated.
+#
+# Deliberately NOT gated on `rbac.create`. These policies bind to the controller's ServiceAccount
+# username, not to the Roles this chart happens to author, and `rbac.create=false` is a supported
+# configuration (values.yaml recommends it for a repository on workload identity). An operator who
+# hand-writes the two Roles copies the same unconstrained `configmaps: create` and namespace-wide
+# `endpointslices` grants — which is exactly when the object-level fence must still be there. It
+# always renders: `Chart.yaml` requires Kubernetes >= 1.30 for this API.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-controller-configmaps
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["configmaps"]
+  matchConditions:
+    - name: this-controller
+      expression: >-
+        request.namespace == {{ .Release.Namespace | quote }} &&
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "updatec.controllerServiceAccountName" .) | quote }}
+  variables:
+    - name: candidate
+      expression: >-
+        request.operation == 'DELETE' ? oldObject : object
+    - name: ownedBackendInventory
+      expression: >-
+        has(variables.candidate.metadata.labels) &&
+        variables.candidate.metadata.labels['app.kubernetes.io/managed-by'] == 'updatec' &&
+        variables.candidate.metadata.labels['app.kubernetes.io/component'] == 'healthproxy' &&
+        variables.candidate.metadata.name.startsWith('updated-backend-') &&
+        variables.candidate.metadata.name.matches('-inventory-0[0-7]$') &&
+        has(variables.candidate.metadata.ownerReferences) &&
+        variables.candidate.metadata.ownerReferences.exists(owner,
+          owner.apiVersion == 'updated.dev/v1alpha1' &&
+          owner.kind == 'UpdateBackend' &&
+          owner.controller == true)
+    - name: ownedDurableState
+      expression: >-
+        (
+          variables.candidate.metadata.name == {{ include "updatec.admittedConfigMapName" . | quote }} ||
+          (
+            variables.candidate.metadata.name.startsWith({{ printf "%s-" (include "updatec.admittedConfigMapName" .) | quote }}) &&
+            variables.candidate.metadata.name.size() == {{ add (len (include "updatec.admittedConfigMapName" .)) 5 }} &&
+            variables.candidate.metadata.name.matches('-[ab]-(0[0-9]|[1-5][0-9]|6[0-3])$')
+          )
+        ) &&
+        has(variables.candidate.metadata.labels) &&
+        variables.candidate.metadata.labels['app.kubernetes.io/managed-by'] == 'updatec' &&
+        variables.candidate.metadata.labels['app.kubernetes.io/component'] == 'controller-state' &&
+        has(variables.candidate.metadata.ownerReferences) &&
+        variables.candidate.metadata.ownerReferences.exists(owner,
+          owner.apiVersion == 'updated.dev/v1alpha1' &&
+          owner.kind == 'UpdateRepository' &&
+          owner.name == {{ .Values.repository | quote }} &&
+          owner.controller == true)
+  validations:
+    - expression: variables.ownedDurableState || variables.ownedBackendInventory
+      message: >-
+        updatec's controller identity may mutate only its exact durable-state index/shards or an
+        operator-managed ConfigMap controlled by an UpdateBackend
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-controller-configmaps
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-controller-configmaps
+  validationActions: [Deny]
+---
+# The controller needs EndpointSlice PATCH in RBAC only because Kubernetes' anti-escalation check
+# requires a Role creator to hold everything it delegates. It never patches traffic itself. Deny
+# that identity at admission, leaving the generated healthproxy identities as the only writers.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-controller-no-endpointslices
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["discovery.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["endpointslices"]
+  matchConditions:
+    - name: this-controller
+      expression: >-
+        request.namespace == {{ .Release.Namespace | quote }} &&
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "updatec.controllerServiceAccountName" .) | quote }}
+  validations:
+    - expression: "false"
+      message: >-
+        updatec's controller may delegate EndpointSlice access but may not mutate traffic itself
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-controller-no-endpointslices
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-controller-no-endpointslices
+  validationActions: [Deny]

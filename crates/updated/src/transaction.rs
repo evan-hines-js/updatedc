@@ -4,7 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::Path;
 
 use crate::bundle::ReleaseId;
 use crate::state::{ProviderRelease, RepositoryLineage};
@@ -21,6 +20,9 @@ pub struct Transaction {
     pub previous_repository_lineage: RepositoryLineage,
     pub candidate_release: ReleaseId,
     pub candidate_archive_sha256: String,
+    /// Exact content identity to reject if the candidate proves bad. Usually the application
+    /// archive; for a provider-only transition it is the provider-set document instead.
+    pub candidate_rejection_sha256: String,
     pub candidate_repository_lineage: RepositoryLineage,
     /// Recovery must durably reject the candidate before this transaction may be
     /// cleared. This records the verdict of whatever judged the candidate — a failed activation, a
@@ -44,44 +46,71 @@ pub struct Transaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
-    PreflightStarted,
-    PreflightCompleted,
-    PrepareStarted,
+    /// Candidate and reconciler bytes are verified and staged; live state is untouched.
     Prepared,
-    ActivateStarted,
-    CandidateActivated,
-    HealthStarted,
-    CandidateHealthy,
-    FinalizeStarted,
-    Finalized,
-    CommitStarted,
+    /// The active pointer, candidate apply, and health gate may be in flight. Any crash from this
+    /// point restores the predecessor.
+    Activating,
+    /// The candidate is ready to become the committed head. A crash after the installed-state
+    /// write is distinguished by comparing that record and the active pointer, not by another
+    /// journal phase.
+    Committing,
     Committed,
-    RollbackStarted,
-    RollbackActivateStarted,
-    PredecessorActivated,
-    RollbackHealthStarted,
-    PredecessorHealthy,
-    RollbackFinalizeStarted,
+    /// Restoring and applying the predecessor is pending.
+    RollbackActivating,
+    /// The predecessor apply completed; its health gate is pending.
+    RollbackApplied,
+    /// The predecessor passed its gate; candidate compensation is pending.
+    RollbackVerified,
     RolledBack,
+}
+
+impl Phase {
+    pub const ALL: [Self; 8] = [
+        Self::Prepared,
+        Self::Activating,
+        Self::Committing,
+        Self::Committed,
+        Self::RollbackActivating,
+        Self::RollbackApplied,
+        Self::RollbackVerified,
+        Self::RolledBack,
+    ];
 }
 
 impl Transaction {
     pub fn validate(&self) -> io::Result<()> {
-        if self.id.is_empty() {
+        if !crate::rand::is_token(&self.id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "transaction id must not be empty",
+                "transaction id is invalid",
             ));
         }
-        if !updated_contracts::is_sha256_hex(self.previous_repository_lineage.as_str())
-            || !updated_contracts::is_sha256_hex(self.candidate_repository_lineage.as_str())
+        self.previous_release.validate()?;
+        self.candidate_release.validate()?;
+        if !updated_contracts::is_canonical_sha256(&self.previous_archive_sha256)
+            || !updated_contracts::is_canonical_sha256(&self.candidate_archive_sha256)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction archive identity is invalid",
+            ));
+        }
+        if !updated_contracts::is_canonical_sha256(self.previous_repository_lineage.as_str())
+            || !updated_contracts::is_canonical_sha256(self.candidate_repository_lineage.as_str())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transaction repository lineage is invalid",
             ));
         }
-        if self.lifecycle.product.is_empty() || self.lifecycle.timeout_millis == 0 {
+        if !updated_contracts::is_canonical_sha256(&self.candidate_rejection_sha256) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction rejection identity is invalid",
+            ));
+        }
+        if !self.lifecycle.is_valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transaction provider identity is invalid",
@@ -105,36 +134,39 @@ impl Transaction {
     pub fn is_rollback(&self) -> bool {
         matches!(
             self.phase,
-            Phase::RollbackStarted
-                | Phase::RollbackActivateStarted
-                | Phase::PredecessorActivated
-                | Phase::RollbackHealthStarted
-                | Phase::PredecessorHealthy
-                | Phase::RollbackFinalizeStarted
+            Phase::RollbackActivating
+                | Phase::RollbackApplied
+                | Phase::RollbackVerified
                 | Phase::RolledBack
         )
     }
 
-    /// Position in the recovery path (0 = rollback just began, 6 = fully rolled back), or `None`
-    /// when the transaction is not on the rollback path at all. This lets a fresh agent resume
-    /// after the last durable boundary without re-running an operation already recorded complete.
-    pub fn rollback_rank(&self) -> Option<u8> {
-        Self::rollback_rank_of(self.phase)
+    /// Whether this transaction has discharged every forward or compensating obligation.
+    ///
+    /// A settled journal may be replaced by a new transaction even when cleanup left its file
+    /// behind. A same-id rewrite still satisfies [`Transaction::permits_replacement`], including
+    /// the one explicit committed-to-pending-rollback edge. Keeping terminality here prevents
+    /// storage and recovery callers from growing their own phase lists.
+    pub fn is_settled(&self) -> bool {
+        matches!(self.phase, Phase::Committed | Phase::RolledBack)
     }
 
-    /// The recovery rank of a phase — its position on the rollback path, or `None` for a phase that
-    /// is not on that path. The single mapping every resume gate reads, so the ordering lives in one
-    /// place; [`recovery_pending`](Self::recovery_pending) is how the driver consumes it.
+    /// The recovery rank of a phase — its position on the recovery path (0 = activation pending,
+    /// 3 = fully rolled back), or `None` for a phase that is not on that path. The single mapping
+    /// every resume gate reads, so the ordering lives in one place; it stays private because
+    /// [`recovery_pending`](Self::recovery_pending) is the only way call sites are meant to consume
+    /// it — a bare rank integer outside this module would be a second ordering-aware gate.
     fn rollback_rank_of(phase: Phase) -> Option<u8> {
         match phase {
-            Phase::RollbackStarted => Some(0),
-            Phase::RollbackActivateStarted => Some(1),
-            Phase::PredecessorActivated => Some(2),
-            Phase::RollbackHealthStarted => Some(3),
-            Phase::PredecessorHealthy => Some(4),
-            Phase::RollbackFinalizeStarted => Some(5),
-            Phase::RolledBack => Some(6),
-            _ => None,
+            Phase::RollbackActivating => Some(0),
+            Phase::RollbackApplied => Some(1),
+            Phase::RollbackVerified => Some(2),
+            Phase::RolledBack => Some(3),
+            // The forward path, named rather than left to `_`. A phase added to the ROLLBACK path
+            // and silently ranked `None` here would read as "not rolling back at all": the resume
+            // gate would skip the step that phase exists to re-run, and a rollback would resume by
+            // stepping over its own unfinished work.
+            Phase::Prepared | Phase::Activating | Phase::Committing | Phase::Committed => None,
         }
     }
 
@@ -147,61 +179,47 @@ impl Transaction {
     /// construction rather than by matching literals.
     pub fn recovery_pending(&self, target: Phase) -> bool {
         matches!(
-            (self.rollback_rank(), Self::rollback_rank_of(target)),
+            (
+                Self::rollback_rank_of(self.phase),
+                Self::rollback_rank_of(target),
+            ),
             (Some(current), Some(boundary)) if current < boundary
         )
     }
 
     /// Whether this journal may be destroyed. The single definition of the rule the store
     /// enforces: a transaction that may have displaced machine state (any phase from
-    /// `ActivateStarted` on) owes the machine either a completed commit or a settled rollback —
+    /// `Activating` on) owes the machine either a completed commit or a settled rollback —
     /// `Committed` and `RolledBack` are the only phases that discharge that debt, and reaching
     /// `RolledBack` is what runs (or durably abandons) the compensating `rollback` hook. Before
-    /// `ActivateStarted` nothing was displaced, so there is nothing to compensate and the journal
+    /// `Activating` nothing was displaced, so there is nothing to compensate and the journal
     /// is mere intent.
     pub fn may_discard(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::PreflightStarted
-                | Phase::PreflightCompleted
-                | Phase::PrepareStarted
-                | Phase::Prepared
-                | Phase::Committed
-                | Phase::RolledBack
-        )
+        self.is_settled() || self.phase == Phase::Prepared
     }
 
     pub fn advance(&mut self, next: Phase) -> io::Result<()> {
         let forward = matches!(
             (self.phase, next),
-            (Phase::PreflightStarted, Phase::PreflightCompleted)
-                | (Phase::PreflightCompleted, Phase::PrepareStarted)
-                | (Phase::PrepareStarted, Phase::Prepared)
-                | (Phase::Prepared, Phase::ActivateStarted)
-                | (Phase::ActivateStarted, Phase::CandidateActivated)
-                | (Phase::CandidateActivated, Phase::HealthStarted)
-                | (Phase::HealthStarted, Phase::CandidateHealthy)
-                | (Phase::CandidateHealthy, Phase::FinalizeStarted)
-                | (Phase::FinalizeStarted, Phase::Finalized)
-                | (Phase::Finalized, Phase::CommitStarted)
-                | (Phase::CommitStarted, Phase::Committed)
+            (Phase::Prepared, Phase::Activating)
+                | (Phase::Activating, Phase::Committing)
+                | (Phase::Committing, Phase::Committed)
         );
-        let begin_rollback = next == Phase::RollbackStarted
-            && !matches!(self.phase, Phase::Committed | Phase::RolledBack);
+        let begin_rollback = matches!(
+            (self.phase, next),
+            (
+                Phase::Prepared | Phase::Activating | Phase::Committing,
+                Phase::RollbackActivating
+            )
+        );
         let rollback = matches!(
             (self.phase, next),
-            (Phase::RollbackStarted, Phase::RollbackActivateStarted)
-                | (Phase::RollbackActivateStarted, Phase::PredecessorActivated)
-                | (Phase::PredecessorActivated, Phase::RollbackHealthStarted)
-                | (Phase::RollbackHealthStarted, Phase::PredecessorHealthy)
-                | (Phase::PredecessorHealthy, Phase::RollbackFinalizeStarted)
-                // Finalization may also begin when the health gate is durably ABANDONED, not only
-                // when it passes: the bounded-unhealthy descend concludes the rollback after its
-                // one recorded compensation attempt, and the journal may only be discarded from a
-                // terminal phase — so the abandonment path must be able to reach `RolledBack`
-                // through the same edges as the healthy one.
-                | (Phase::RollbackHealthStarted, Phase::RollbackFinalizeStarted)
-                | (Phase::RollbackFinalizeStarted, Phase::RolledBack)
+            (Phase::RollbackActivating, Phase::RollbackApplied)
+                | (Phase::RollbackApplied, Phase::RollbackVerified)
+                | (Phase::RollbackVerified, Phase::RolledBack)
+                // A bounded unhealthy rollback compensates once and settles without claiming the
+                // predecessor passed its gate.
+                | (Phase::RollbackApplied, Phase::RolledBack)
         );
         if !(forward || begin_rollback || rollback) {
             return Err(io::Error::new(
@@ -211,6 +229,91 @@ impl Transaction {
         }
         self.phase = next;
         Ok(())
+    }
+
+    /// Record one failed authoritative boot gate while a rollback is waiting to settle.
+    ///
+    /// A reboot can repeat that gate after any durable point from `RollbackApplied`
+    /// through `RollbackVerified`: a later phase records what a previous process completed,
+    /// not that the predecessor is healthy in this process. This is the only mutation path for the
+    /// durable tally, and [`permits_replacement`](Self::permits_replacement) replays it when
+    /// validating a journal write, so execution and persistence cannot acquire different phase or
+    /// overflow rules.
+    pub fn record_rollback_health_failure(&mut self) -> io::Result<u32> {
+        let boot_gate_is_active = !self.recovery_pending(Phase::RollbackApplied)
+            && self.recovery_pending(Phase::RolledBack);
+        if !boot_gate_is_active {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot record a rollback health failure at phase {:?}",
+                    self.phase
+                ),
+            ));
+        }
+        self.rollback_health_failures =
+            self.rollback_health_failures
+                .checked_add(1)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rollback health failure count overflow",
+                    )
+                })?;
+        Ok(self.rollback_health_failures)
+    }
+
+    /// Whether `next` is a legitimate durable rewrite of this transaction.
+    ///
+    /// The immutable identity is compared as a whole after normalizing only the three fields the
+    /// machine is allowed to change. This is intentionally fail-closed for future fields. A valid
+    /// rewrite is exactly one of: an identical replay, one state-machine edge, the one-way
+    /// candidate-rejection verdict, or one failed rollback-health observation.
+    pub fn permits_replacement(&self, next: &Self) -> bool {
+        let mut identity = next.clone();
+        identity.phase = self.phase;
+        identity.candidate_rejection_required = self.candidate_rejection_required;
+        identity.rollback_health_failures = self.rollback_health_failures;
+        if identity != *self {
+            return false;
+        }
+        if self == next {
+            return true;
+        }
+
+        if self.phase != next.phase {
+            // A failed confirmation-window gate can already have moved the pointer back while the
+            // original update's spent Committed journal survived cleanup. Recovery materializes
+            // the rollback from the committed record's Pending intent under the same lifecycle
+            // attempt id. This is the only terminal same-id restart; RolledBack has no remaining
+            // obligation and cannot be repurposed.
+            let resumes_committed_pending = self.phase == Phase::Committed
+                && next.phase == Phase::RollbackActivating
+                && self.candidate_rejection_required == next.candidate_rejection_required
+                && self.rollback_health_failures == next.rollback_health_failures;
+            if resumes_committed_pending {
+                return true;
+            }
+            let mut advanced = self.clone();
+            return advanced.advance(next.phase).is_ok() && advanced == *next;
+        }
+
+        // A permanent verdict is meaningful only after candidate bytes were re-verified at the
+        // activation boundary or its reconciler answered during activation/health. Earlier phases
+        // have observed no candidate behavior, and later phases already proved it healthy.
+        let may_record_rejection = matches!(self.phase, Phase::Activating);
+        let records_rejection = may_record_rejection
+            && !self.candidate_rejection_required
+            && next.candidate_rejection_required
+            && self.rollback_health_failures == next.rollback_health_failures;
+        let mut failed_rollback_health = self.clone();
+        let records_failed_rollback_health = self.candidate_rejection_required
+            == next.candidate_rejection_required
+            && failed_rollback_health
+                .record_rollback_health_failure()
+                .is_ok()
+            && failed_rollback_health == *next;
+        records_rejection || records_failed_rollback_health
     }
 }
 
@@ -230,77 +333,49 @@ pub fn classify_recovery(
     active: Option<&ReleaseId>,
     committed: Option<&ReleaseId>,
 ) -> Recovery {
-    let commit_may_have_landed = matches!(tx.phase, Phase::CommitStarted | Phase::Committed);
+    // The commit may have landed without its journal write: the swap and the state commit are two
+    // steps, and a crash between them leaves a node fully updated but journalled as mid-flight.
+    if matches!(tx.phase, Phase::Committing | Phase::Committed)
+        && active == Some(&tx.candidate_release)
+        && committed == Some(&tx.candidate_release)
+    {
+        return Recovery::Committed;
+    }
     match tx.phase {
-        _ if commit_may_have_landed
-            && active == Some(&tx.candidate_release)
-            && committed == Some(&tx.candidate_release) =>
-        {
-            Recovery::Committed
-        }
-        Phase::PreflightStarted
-        | Phase::PreflightCompleted
-        | Phase::PrepareStarted
-        | Phase::Prepared
-            if active == Some(&tx.previous_release) =>
-        {
-            Recovery::NeverSwapped
-        }
+        Phase::Prepared if active == Some(&tx.previous_release) => Recovery::NeverSwapped,
         Phase::RolledBack if active == Some(&tx.previous_release) => Recovery::NeverSwapped,
-        _ => Recovery::RestorePredecessor,
+        // Everything else restores the predecessor, spelled out rather than left to `_`.
+        //
+        // Restoring is the safe default only for a phase that precedes the commit. A phase added
+        // AFTER the commit would inherit it silently and undo a finished update on the next boot —
+        // the one outcome recovery must never produce — and a wildcard is what makes that a quiet
+        // behaviour change instead of a compile error. Naming every phase means a new one cannot
+        // join without someone deciding, here, which side of the commit it falls on.
+        Phase::Prepared
+        | Phase::Activating
+        | Phase::Committing
+        | Phase::Committed
+        | Phase::RollbackActivating
+        | Phase::RollbackApplied
+        | Phase::RollbackVerified
+        | Phase::RolledBack => Recovery::RestorePredecessor,
     }
 }
 
-pub fn read(path: &Path) -> io::Result<Option<Transaction>> {
-    match std::fs::read(path) {
-        Ok(raw) => {
-            let transaction: Transaction = serde_json::from_slice(&raw)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            transaction.validate()?;
-            Ok(Some(transaction))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+/// Persisted through [`crate::journal`], which owns the read/write/clear the first-install
+/// transaction needs in exactly the same shape.
+impl crate::journal::Journaled for Transaction {
+    const STAGING_PREFIX: &'static str = ".transaction-";
+
+    fn validate(&self) -> io::Result<()> {
+        Transaction::validate(self)
     }
-}
-
-pub fn write(path: &Path, tx: &Transaction) -> io::Result<()> {
-    tx.validate()?;
-    foundation::durable::atomic_write_managed(
-        path,
-        ".transaction-",
-        &serde_json::to_vec(tx).map_err(io::Error::other)?,
-    )
-}
-
-pub fn clear(path: &Path) -> io::Result<()> {
-    foundation::durable::remove_file(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{provider, release};
-
-    fn tx() -> Transaction {
-        Transaction {
-            id: "transaction-id".into(),
-            previous_release: release("1.0.0", "old"),
-            previous_archive_sha256: "previous-archive".into(),
-            previous_repository_lineage: crate::state::RepositoryLineage::from_metadata_url(
-                "https://old/metadata/",
-            ),
-            candidate_release: release("2.0.0", "new"),
-            candidate_archive_sha256: "archive".into(),
-            candidate_repository_lineage: crate::state::RepositoryLineage::from_metadata_url(
-                "https://new/metadata/",
-            ),
-            candidate_rejection_required: false,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase: Phase::PreflightStarted,
-        }
-    }
+    use crate::testing::update_transaction as tx;
 
     #[test]
     fn recovery_is_derived_from_active_pointer_and_commit() {
@@ -314,12 +389,12 @@ mod tests {
             ),
             Recovery::Committed
         );
-        tx.phase = Phase::CandidateActivated;
+        tx.phase = Phase::Activating;
         assert_eq!(
             classify_recovery(&tx, Some(&tx.candidate_release), Some(&tx.previous_release)),
             Recovery::RestorePredecessor
         );
-        tx.phase = Phase::PreflightCompleted;
+        tx.phase = Phase::Prepared;
         assert_eq!(
             classify_recovery(&tx, Some(&tx.previous_release), Some(&tx.previous_release)),
             Recovery::NeverSwapped
@@ -329,7 +404,7 @@ mod tests {
             Recovery::RestorePredecessor
         );
 
-        tx.phase = Phase::CommitStarted;
+        tx.phase = Phase::Committing;
         assert_eq!(
             classify_recovery(
                 &tx,
@@ -342,34 +417,149 @@ mod tests {
     }
 
     #[test]
+    fn durable_update_identity_is_fully_validated() {
+        let valid = tx();
+        valid.validate().unwrap();
+        for invalid in [
+            {
+                let mut value = valid.clone();
+                value.id = "attempt".into();
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.previous_release.manifest_sha256 = "bad".into();
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.candidate_archive_sha256 = "bad".into();
+                value
+            },
+            {
+                let mut value = valid;
+                value.previous_archive_sha256 = "bad".into();
+                value
+            },
+        ] {
+            assert_eq!(
+                invalid.validate().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
     fn transaction_accepts_only_its_explicit_path() {
         let mut supervised = tx();
-        for phase in [
-            Phase::PreflightCompleted,
-            Phase::PrepareStarted,
-            Phase::Prepared,
-            Phase::ActivateStarted,
-            Phase::CandidateActivated,
-            Phase::HealthStarted,
-            Phase::CandidateHealthy,
-            Phase::FinalizeStarted,
-            Phase::Finalized,
-            Phase::CommitStarted,
-            Phase::Committed,
-        ] {
+        for phase in [Phase::Activating, Phase::Committing, Phase::Committed] {
             supervised.advance(phase).unwrap();
         }
-        assert!(supervised.advance(Phase::RollbackStarted).is_err());
+        assert!(supervised.advance(Phase::RollbackActivating).is_err());
+    }
+
+    #[test]
+    fn every_phase_edge_is_explicit_and_monotonic() {
+        for from in Phase::ALL {
+            for to in Phase::ALL {
+                let expected = matches!(
+                    (from, to),
+                    (Phase::Prepared, Phase::Activating)
+                        | (Phase::Activating, Phase::Committing)
+                        | (Phase::Committing, Phase::Committed)
+                        | (
+                            Phase::Prepared | Phase::Activating | Phase::Committing,
+                            Phase::RollbackActivating
+                        )
+                        | (Phase::RollbackActivating, Phase::RollbackApplied)
+                        | (
+                            Phase::RollbackApplied,
+                            Phase::RollbackVerified | Phase::RolledBack
+                        )
+                        | (Phase::RollbackVerified, Phase::RolledBack)
+                );
+                let mut transaction = tx();
+                transaction.phase = from;
+                assert_eq!(
+                    transaction.advance(to).is_ok(),
+                    expected,
+                    "unexpected transition {from:?} -> {to:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn journal_replacement_cannot_rewrite_identity_or_history() {
+        let started = tx();
+        assert!(started.permits_replacement(&started));
+
+        let mut activation = started.clone();
+        activation.advance(Phase::Activating).unwrap();
+        assert!(started.permits_replacement(&activation));
+        assert!(!activation.permits_replacement(&started));
+        let mut rejected = activation.clone();
+        rejected.candidate_rejection_required = true;
+        assert!(activation.permits_replacement(&rejected));
+        assert!(!rejected.permits_replacement(&activation));
+        let mut premature_rejection = started.clone();
+        premature_rejection.candidate_rejection_required = true;
+        assert!(
+            !started.permits_replacement(&premature_rejection),
+            "prepared state has no evidence with which to reject the candidate"
+        );
+
+        let mut rollback = started.clone();
+        rollback.advance(Phase::RollbackActivating).unwrap();
+        let mut too_early = rollback.clone();
+        too_early.rollback_health_failures = 1;
+        assert!(!rollback.permits_replacement(&too_early));
+        rollback.advance(Phase::RollbackApplied).unwrap();
+        for phase in [Phase::RollbackApplied, Phase::RollbackVerified] {
+            rollback.phase = phase;
+            let mut failed_once = rollback.clone();
+            failed_once.rollback_health_failures = 1;
+            assert!(
+                rollback.permits_replacement(&failed_once),
+                "a reboot can observe a failed rollback boot gate at {phase:?}"
+            );
+            let mut skipped = rollback.clone();
+            skipped.rollback_health_failures = 2;
+            assert!(!rollback.permits_replacement(&skipped));
+        }
+        rollback.phase = Phase::RolledBack;
+        let mut too_late = rollback.clone();
+        too_late.rollback_health_failures = 1;
+        assert!(!rollback.permits_replacement(&too_late));
+
+        let mut mutated = activation.clone();
+        mutated.candidate_archive_sha256 = "f".repeat(64);
+        assert!(
+            !started.permits_replacement(&mutated),
+            "an id cannot make different update evidence the same transaction"
+        );
+
+        let mut committed = activation;
+        committed.advance(Phase::Committing).unwrap();
+        committed.advance(Phase::Committed).unwrap();
+        let mut pending_rollback = committed.clone();
+        pending_rollback.phase = Phase::RollbackActivating;
+        assert!(committed.permits_replacement(&pending_rollback));
+        let mut repurposed = pending_rollback.clone();
+        repurposed.candidate_archive_sha256 = "0".repeat(64);
+        assert!(!committed.permits_replacement(&repurposed));
+        let mut rolled_back = committed;
+        rolled_back.phase = Phase::RolledBack;
+        assert!(!rolled_back.permits_replacement(&pending_rollback));
     }
 
     /// An abandoned health gate concludes through the same terminal edges as a passed one: the
     /// bounded-unhealthy descend must be able to reach `RolledBack` (where the journal becomes
-    /// discardable) without lying about `PredecessorHealthy`.
+    /// discardable) without lying about `RollbackVerified`.
     #[test]
     fn an_abandoned_health_gate_still_reaches_the_rollback_terminal() {
         let mut transaction = tx();
-        transaction.phase = Phase::RollbackHealthStarted;
-        transaction.advance(Phase::RollbackFinalizeStarted).unwrap();
+        transaction.phase = Phase::RollbackApplied;
         transaction.advance(Phase::RolledBack).unwrap();
         assert!(transaction.may_discard());
     }
@@ -378,67 +568,51 @@ mod tests {
     #[test]
     fn may_discard_admits_only_settled_or_never_displaced_transactions() {
         let mut transaction = tx();
-        for (phase, discardable) in [
-            (Phase::PreflightStarted, true),
-            (Phase::Prepared, true),
-            (Phase::ActivateStarted, false),
-            (Phase::CandidateHealthy, false),
-            (Phase::CommitStarted, false),
-            (Phase::Committed, true),
-            (Phase::RollbackStarted, false),
-            (Phase::RollbackFinalizeStarted, false),
-            (Phase::RolledBack, true),
-        ] {
+        for phase in Phase::ALL {
             transaction.phase = phase;
-            assert_eq!(transaction.may_discard(), discardable, "{phase:?}");
+            assert_eq!(
+                transaction.may_discard(),
+                matches!(
+                    phase,
+                    Phase::Prepared | Phase::Committed | Phase::RolledBack
+                ),
+                "{phase:?}"
+            );
         }
     }
 
     #[test]
     fn rollback_records_every_completed_recovery_operation() {
         let mut transaction = tx();
-        transaction.phase = Phase::CandidateHealthy;
+        transaction.phase = Phase::Activating;
         for (phase, rank) in [
-            (Phase::RollbackStarted, 0),
-            (Phase::RollbackActivateStarted, 1),
-            (Phase::PredecessorActivated, 2),
-            (Phase::RollbackHealthStarted, 3),
-            (Phase::PredecessorHealthy, 4),
-            (Phase::RollbackFinalizeStarted, 5),
-            (Phase::RolledBack, 6),
+            (Phase::RollbackActivating, 0),
+            (Phase::RollbackApplied, 1),
+            (Phase::RollbackVerified, 2),
+            (Phase::RolledBack, 3),
         ] {
             transaction.advance(phase).unwrap();
-            assert_eq!(transaction.rollback_rank(), Some(rank));
+            assert_eq!(Transaction::rollback_rank_of(transaction.phase), Some(rank));
         }
-        assert!(transaction.advance(Phase::PredecessorActivated).is_err());
+        assert!(transaction.advance(Phase::RollbackApplied).is_err());
     }
 
     #[test]
     fn recovery_pending_is_true_only_for_phases_not_yet_reached() {
-        // Sit the transaction at PredecessorActivated (rank 2). Every rollback phase strictly ahead
+        // Sit the transaction at RollbackApplied (rank 1). Every rollback phase strictly ahead
         // is pending; the current phase and everything behind it are not — the exact resume gate the
         // agent drives, expressed without a single rank literal.
         let mut transaction = tx();
-        transaction.phase = Phase::CandidateHealthy;
-        transaction.advance(Phase::RollbackStarted).unwrap();
-        transaction.advance(Phase::RollbackActivateStarted).unwrap();
-        transaction.advance(Phase::PredecessorActivated).unwrap();
+        transaction.phase = Phase::Activating;
+        transaction.advance(Phase::RollbackActivating).unwrap();
+        transaction.advance(Phase::RollbackApplied).unwrap();
 
         // Behind / at the current phase: nothing to replay.
-        for done in [
-            Phase::RollbackStarted,
-            Phase::RollbackActivateStarted,
-            Phase::PredecessorActivated,
-        ] {
+        for done in [Phase::RollbackActivating, Phase::RollbackApplied] {
             assert!(!transaction.recovery_pending(done), "{done:?} already done");
         }
         // Ahead on the rollback path: still pending.
-        for pending in [
-            Phase::RollbackHealthStarted,
-            Phase::PredecessorHealthy,
-            Phase::RollbackFinalizeStarted,
-            Phase::RolledBack,
-        ] {
+        for pending in [Phase::RollbackVerified, Phase::RolledBack] {
             assert!(
                 transaction.recovery_pending(pending),
                 "{pending:?} still pending"
@@ -452,49 +626,18 @@ mod tests {
         assert!(!forward.recovery_pending(Phase::RolledBack));
     }
 
-    fn tmp(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path().join(name);
-        std::fs::create_dir_all(&d).unwrap();
-        let path = d.join("update.tx");
-        (dir, path)
-    }
-
-    #[test]
-    fn journal_round_trips_and_absent_is_none() {
-        let (_dir, path) = tmp("journal");
-        assert_eq!(read(&path).unwrap(), None, "absent journal reads as None");
-
-        write(&path, &tx()).unwrap();
-        assert_eq!(
-            read(&path).unwrap(),
-            Some(tx()),
-            "written journal reads back"
-        );
-
-        clear(&path).unwrap();
-        assert_eq!(read(&path).unwrap(), None, "cleared journal reads as None");
-    }
-
     #[test]
     fn obsolete_or_unknown_journal_shapes_are_rejected() {
-        let (_dir, path) = tmp("strict-schema");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("update.tx");
         std::fs::write(
             &path,
             br#"{"previous_release":{"version":"1","manifest_sha256":"a"},"candidate_release":{"version":"2","manifest_sha256":"b"},"candidate_archive_sha256":"c","legacy":true}"#,
         )
         .unwrap();
         assert!(
-            read(&path).is_err(),
+            crate::journal::read::<Transaction>(&path).is_err(),
             "unknown fields are not a second schema"
         );
-    }
-
-    #[test]
-    fn unreadable_journal_is_an_error_not_absent() {
-        // A read error that is *not* NotFound (here, the path is a directory) must
-        // propagate, never be mistaken for an absent journal.
-        let d = tempfile::tempdir().unwrap();
-        assert!(read(d.path()).is_err());
     }
 }

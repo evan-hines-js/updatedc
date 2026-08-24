@@ -4,15 +4,26 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use updated_contracts::assignment::{ManagedRuntime, SecretReference};
+use updated_contracts::assignment::{ManagedRuntime, ManagedStorage};
 
 /// Fully verified, materialized runtime configuration.
 #[derive(Debug)]
 pub struct Config {
     pub deployment: String,
+    /// SHA-256 of the exact TUF-authenticated assignment document this runtime was materialized
+    /// from. Assigned-input requests name it so a gateway authorization cached for a predecessor
+    /// can never feed stale values to this configuration.
+    pub assignment_sha256: String,
     pub routing: Routing,
     pub application: Application,
-    pub storage: Storage,
+    /// The retention bounds the signed runtime carries, held as the contract's own type. Bounds
+    /// for inactive immutable material: releases needed by installed state, rollback state, or an
+    /// active transaction are always protected regardless of these limits, which apply only to
+    /// disposable history. A node-local twin of this struct — the same five fields under a local
+    /// name, copied across field by field — is the drift
+    /// `node_adapter_does_not_redeclare_or_reexport_wire_contracts` forbids: a sixth retention
+    /// bound added to the contract would compile clean and be silently dropped on the node.
+    pub storage: ManagedStorage,
     pub timeouts: Timeouts,
 }
 
@@ -26,9 +37,9 @@ pub struct Routing {
     /// Exact TUF target to resolve (for example `assignments/agents/agent-123.json`).
     pub assignment: String,
     pub transport_timeout: Duration,
-    /// The agent's mTLS identity for reaching the gateway — mandatory, never plaintext. The
-    /// routing and release repositories are the same externally-exposed gateway, so both fetch
-    /// under this identity.
+    /// The agent's mTLS identity for reaching the private routing gateway — mandatory, never
+    /// plaintext. Release clients may reuse its CA bundle as TLS trust, but never its client
+    /// certificate: release objects are fetched anonymously from the assignment-selected origin.
     pub mtls: crate::tls::Identity,
 }
 
@@ -42,7 +53,7 @@ impl Routing {
 
 /// Whether a routing `base_url` names a local repository (a `file:` URL or an absolute directory
 /// path) rather than a network gateway. The single definition of "local" — the offline-repair path,
-/// the secrets manager, and enrollment all gate on it, and must agree: one deciding to reach the
+/// assigned-input manager, and enrollment all gate on it, and must agree: one deciding to reach the
 /// network while another assumes offline would split the trust model.
 pub fn base_url_is_local(base_url: &str) -> bool {
     base_url.starts_with("file:") || Path::new(base_url).is_absolute()
@@ -58,36 +69,29 @@ pub struct RepositorySource {
     pub metadata_limit: u64,
     pub target_limit: u64,
     pub transport_timeout: Duration,
-    /// The agent's mTLS identity for this gateway fetch — mandatory, never plaintext.
+    /// Whether the first HTTP hop is the mTLS gateway that mints an exact S3 read capability, or
+    /// an already-direct release repository. This is explicit so a client identity can never be
+    /// offered to a host merely because it appeared in a signed release assignment.
+    pub access: RepositoryAccess,
     pub mtls: crate::tls::Identity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryAccess {
+    GatewayCapability,
+    Direct,
 }
 
 impl Application {
     /// The launch spec and probes the signed runtime carries. The single construction path for
-    /// [`Application`] — used both when the config is first materialized and when a running
-    /// agent reconciles a control-plane reassignment (which may change the declared secrets
-    /// or health checks independently of the release version).
+    /// [`Application`] — used both when the config is first materialized and when a running agent
+    /// reconciles a control-plane reassignment.
     pub fn from_runtime(runtime: &ManagedRuntime) -> Application {
         Application {
             product: runtime.product.clone(),
             channel: runtime.channel.clone(),
             install_root: runtime.install_root.clone(),
-            secrets: runtime.secrets.clone(),
-            inputs: runtime.inputs.clone(),
-        }
-    }
-}
-
-impl Storage {
-    /// The inactive-material retention bounds the signed runtime carries. Single construction
-    /// path, shared by materialization and steady-state reassignment.
-    pub fn from_runtime(runtime: &ManagedRuntime) -> Storage {
-        Storage {
-            inactive_releases: runtime.storage.inactive_releases,
-            inactive_providers: runtime.storage.inactive_providers,
-            inactive_agents: runtime.storage.inactive_agents,
-            inactive_bytes: runtime.storage.inactive_bytes,
-            inactive_repository_caches: runtime.storage.inactive_repository_caches,
+            input_selection: runtime.inputs.clone(),
         }
     }
 }
@@ -115,44 +119,25 @@ impl Config {
     pub fn materialize(
         runtime: &ManagedRuntime,
         deployment: &str,
+        assignment_sha256: &str,
         routing: Routing,
     ) -> Result<Config, String> {
         runtime.validate()?;
+        if !updated_contracts::is_canonical_sha256(assignment_sha256) {
+            return Err("materialized assignment identity is not a canonical SHA-256".into());
+        }
         // The release root is NOT materialized here. `TrustedRepository::assigned` writes the root
         // it actually pins, into the per-assignment datastore, from the assignment it just
         // verified. Writing a second copy from here — out of a config that may have come from an
         // unverified persisted file — produced a durable trust anchor nothing ever read.
         Ok(Config {
             deployment: deployment.to_owned(),
+            assignment_sha256: assignment_sha256.to_owned(),
             routing,
             application: Application::from_runtime(runtime),
-            storage: Storage::from_runtime(runtime),
+            storage: runtime.storage.clone(),
             timeouts: Timeouts::from_runtime(runtime),
         })
-    }
-}
-
-/// Bounds for inactive immutable material. Releases needed by installed state,
-/// rollback state, or an active transaction are always protected regardless of these
-/// limits; the limits apply only to disposable history.
-#[derive(Debug, Clone)]
-pub struct Storage {
-    pub inactive_releases: usize,
-    pub inactive_providers: usize,
-    pub inactive_agents: usize,
-    pub inactive_bytes: u64,
-    pub inactive_repository_caches: usize,
-}
-
-impl Default for Storage {
-    fn default() -> Self {
-        Self {
-            inactive_releases: 2,
-            inactive_providers: 2,
-            inactive_agents: 1,
-            inactive_bytes: 1024 * 1024 * 1024,
-            inactive_repository_caches: 2,
-        }
     }
 }
 
@@ -163,8 +148,9 @@ pub struct Application {
     pub channel: String,
     /// Root containing active-release, immutable versions, staging, and durable state.
     pub install_root: PathBuf,
-    pub secrets: Vec<SecretReference>,
-    pub inputs: std::collections::BTreeMap<String, updated_contracts::telemetry::OutputValue>,
+    /// Descriptor of the file bundle authorized by the signed assignment. The corresponding bytes
+    /// live in private S3 and are fetched through a short-lived exact-object capability.
+    pub input_selection: updated_contracts::dataflow::InputSelection,
 }
 
 /// Every tunable duration in the system, in one place. Omit any (or the whole
@@ -241,20 +227,30 @@ pub struct Paths {
     pub journal: PathBuf,
     pub install_journal: PathBuf,
     pub rejected: PathBuf,
+    /// Durable platform-owned evidence for the latest successful state-changing reconciler run.
+    pub last_reconciliation: PathBuf,
     pub provider_versions: PathBuf,
     pub provider_staging: PathBuf,
     pub provider_download: PathBuf,
     /// The same writable working directories for lifecycle-provider releases, which are re-verified
     /// on exactly the same terms every time one is invoked.
     pub provider_work: PathBuf,
+    /// Root of the reconcilers' private per-product state directories — the parent of every
+    /// `--state-dir`. Part of the layout rather than an invoker-local string because
+    /// `docs/node-reconciler-protocol.md` promises a hook this directory is "preserved across
+    /// replays and boots": moving it silently discards every hook's durable sub-progress.
+    pub provider_state_root: PathBuf,
+    /// Where the agent's internal snapshots of reconciler output directories land, partitioned by
+    /// the candidate's immutable archive identity. Hooks see only fresh ordinary directories.
+    pub provider_outputs: PathBuf,
 }
 
 /// Where the last live routing assignment is kept: beside the enrollment material in the
 /// launcher's state directory, never under `install_root`.
 ///
 /// This file is read *before any network fetch* to decide what the managed application is
-/// launched with — its args, which secret populates which environment variable, which product and
-/// channel are acceptable. Nothing local can re-verify it at that moment, so it may only live
+/// launched with — its args, assigned input selection, and acceptable product/channel. Nothing
+/// local can re-verify it at that moment, so it may only live
 /// where every other boot input already lives: the enrollment directory that also holds the
 /// node config, the enrollment bundle, and the node's private key. Kept under `install_root`
 /// it would let write access to a directory full of otherwise-recoverable state choose the
@@ -280,16 +276,36 @@ impl Paths {
             installed: state_dir.join("installed.json"),
             state_dir: state_dir.clone(),
             datastore: state_dir.join("tuf"),
-            routing_datastore: state_dir.join("routing-tuf"),
+            // Routing trust is needed before `install_root` can be derived from the live signed
+            // assignment, so its rollback floor belongs beside enrollment state, not below the
+            // install root whose location that assignment defines.
+            routing_datastore: enrollment_state.join("routing-tuf"),
             assignment: persisted_assignment_path(enrollment_state),
             journal: state_dir.join("transaction.json"),
             install_journal: state_dir.join("install.json"),
             rejected: state_dir.join("rejected"),
+            last_reconciliation: state_dir.join("reconciliation.json"),
             provider_versions: install_root.join("providers/versions"),
             provider_staging: install_root.join("providers/staging"),
             provider_download: install_root.join("providers/staging/bundle.download"),
             provider_work: install_root.join("providers/work"),
+            provider_state_root: install_root.join("providers/state"),
+            provider_outputs: install_root.join("providers/outputs"),
         }
+    }
+
+    /// One reconciler's `--state-dir`: private to the product, so two lifecycle providers on one
+    /// node never share scratch.
+    pub fn reconciler_state_dir(&self, product: &str) -> PathBuf {
+        self.provider_state_root.join(product)
+    }
+
+    /// Agent-internal canonical snapshot for one release manifest's last successful output
+    /// directory. The manifest digest is the identity every lifecycle invocation already carries,
+    /// so writers, telemetry readers, and retention all name this file the same way.
+    pub fn reconciler_output_snapshot(&self, manifest_sha256: &str) -> PathBuf {
+        self.provider_outputs
+            .join(format!("{manifest_sha256}.json"))
     }
 }
 

@@ -1,0 +1,107 @@
+# RBAC must grant the internet-facing gateway CREATE and UPDATE on UpdateAgent, but those verbs are
+# broader than the enrollment transaction it implements. This policy makes the application-level
+# contract an API-server boundary: CREATE can only produce a fresh enrolled identity in this
+# release's repository, and UPDATE can only complete one operator-reserved identity without changing
+# routing, rollout controls, labels, backend topology, or metadata.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-gateway-updateagents
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: updated.dev/v1alpha1
+    kind: UpdateRepository
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["updated.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["updateagents"]
+  matchConditions:
+    - name: this-gateway
+      expression: >-
+        request.namespace == {{ .Release.Namespace | quote }} &&
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "updatec.gatewayServiceAccountName" .) | quote }}
+  variables:
+    - name: enrolledIdentity
+      expression: >-
+        object.spec.identity.kind == 'enrolled' &&
+        has(object.spec.identity.registrationSha256) &&
+        object.spec.identity.registrationSha256.matches('^[0-9a-f]{64}$') &&
+        has(object.spec.identity.publicKey) &&
+        object.spec.identity.publicKey.matches('^04[0-9a-f]{128}$')
+    - name: backendAddressPreserved
+      expression: >-
+        request.operation != 'UPDATE' ||
+        (
+          has(object.spec.backendAddress) == has(oldObject.spec.backendAddress) &&
+          (!has(object.spec.backendAddress) || object.spec.backendAddress == oldObject.spec.backendAddress)
+        )
+    - name: metadataPreserved
+      expression: >-
+        request.operation != 'UPDATE' ||
+        (
+          has(object.metadata.labels) == has(oldObject.metadata.labels) &&
+          (!has(object.metadata.labels) || object.metadata.labels == oldObject.metadata.labels) &&
+          has(object.metadata.annotations) == has(oldObject.metadata.annotations) &&
+          (!has(object.metadata.annotations) || object.metadata.annotations == oldObject.metadata.annotations) &&
+          has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) &&
+          (!has(object.metadata.finalizers) || object.metadata.finalizers == oldObject.metadata.finalizers) &&
+          has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
+          (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences)
+        )
+  validations:
+    - expression: variables.enrolledIdentity
+      message: >-
+        updatec's gateway may write only a complete enrolled identity with canonical registration
+        and P-256 public-key encodings
+    - expression: object.spec.repositoryRef.name == {{ .Values.repository | quote }}
+      message: updatec's gateway may write agents only in its configured repository
+    - expression: >-
+        request.operation != 'CREATE' || object.spec.labels == params.spec.enrollment.labels
+      message: >-
+        a gateway-created agent must use the configured repository's operator-owned enrollment labels
+    - expression: >-
+        request.operation != 'CREATE' ||
+        (object.spec.hold == false && object.spec.cordon == false && !has(object.spec.backendAddress))
+      message: a gateway-created agent must start unheld, uncordoned, and without a backend address
+    - expression: >-
+        request.operation != 'CREATE' ||
+        (
+          (!has(object.metadata.labels) || object.metadata.labels.size() == 0) &&
+          (!has(object.metadata.annotations) || object.metadata.annotations.size() == 0) &&
+          (!has(object.metadata.finalizers) || object.metadata.finalizers.size() == 0) &&
+          (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences.size() == 0)
+        )
+      message: a gateway-created agent may not add metadata labels, annotations, finalizers, or owners
+    - expression: >-
+        request.operation != 'UPDATE' ||
+        (
+          oldObject.spec.identity.kind == 'reserved' &&
+          (!has(oldObject.spec.identity.registrationSha256) || oldObject.spec.identity.registrationSha256 == null) &&
+          (!has(oldObject.spec.identity.publicKey) || oldObject.spec.identity.publicKey == null) &&
+          object.spec.repositoryRef == oldObject.spec.repositoryRef &&
+          object.spec.labels == oldObject.spec.labels &&
+          object.spec.hold == oldObject.spec.hold &&
+          object.spec.cordon == oldObject.spec.cordon &&
+          variables.backendAddressPreserved &&
+          variables.metadataPreserved
+        )
+      message: >-
+        updatec's gateway may update only the identity of an unclaimed reserved agent; every other
+        spec and metadata field must be preserved
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-gateway-updateagents
+  labels: {{- include "updatec.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "updatec.fullname" . }}-{{ .Release.Namespace }}-gateway-updateagents
+  paramRef:
+    name: {{ .Values.repository }}
+    namespace: {{ .Release.Namespace }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
