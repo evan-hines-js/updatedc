@@ -139,7 +139,7 @@ if (`$operation -eq 'inspect') { Write-Output "candidate-version=`$(Value '--can
 if (`$operation -eq 'apply' -or `$operation -eq 'rollback') {
     [IO.File]::WriteAllText(
         (Value '--result-file'),
-        '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}',
+        '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","message":null}',
         [Text.UTF8Encoding]::new(`$false)
     )
 }

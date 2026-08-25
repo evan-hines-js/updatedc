@@ -42,7 +42,8 @@ use crate::Error;
 /// The transaction token both directions of the checked transaction are keyed to. The compensating
 /// direction is the agent's own derivation (`Transaction::rollback_attempt_id`): the forward token
 /// with `r` appended.
-const ATTEMPT: &str = "conformance1";
+const TRANSACTION_ATTEMPT: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// The versions the scratch releases carry. Two different ones, so a hook that reads
 /// `--candidate-version` and `--predecessor-version` cannot pass by accident.
@@ -147,7 +148,7 @@ struct Invocation {
     stdout_truncated: bool,
     stderr: String,
     outputs: Result<FileSnapshot, String>,
-    result: Result<Option<updated_contracts::reconciler::ResultDocument>, String>,
+    result: Result<Option<updated_contracts::reconciler::MutationResolution>, String>,
 }
 
 impl Invocation {
@@ -159,9 +160,9 @@ impl Invocation {
         self.succeeded()
             && matches!(
                 &self.result,
-                Ok(Some(result))
-                    if result.status
-                        == updated_contracts::reconciler::ResultStatus::Succeeded
+                Ok(Some(
+                    updated_contracts::reconciler::MutationResolution::Succeeded(_)
+                ))
             )
     }
 
@@ -170,7 +171,11 @@ impl Invocation {
     }
 
     fn reports_changed(&self, expected: bool) -> bool {
-        matches!(&self.result, Ok(Some(result)) if result.changed == expected)
+        matches!(
+            &self.result,
+            Ok(Some(updated_contracts::reconciler::MutationResolution::Succeeded(result)))
+                if result.changed() == expected
+        )
     }
 
     /// How the invocation ended, for the report line.
@@ -187,9 +192,16 @@ impl Invocation {
 
     fn result_diagnostic(&self) -> String {
         match &self.result {
-            Ok(Some(result)) => format!(
-                "; result status={:?}, changed={}, hostAction={:?}",
-                result.status, result.changed, result.host_action
+            Ok(Some(updated_contracts::reconciler::MutationResolution::Succeeded(result))) => {
+                format!(
+                    "; result status=succeeded, changed={}, hostAction={:?}",
+                    result.changed(),
+                    result.host_action()
+                )
+            }
+            Ok(Some(updated_contracts::reconciler::MutationResolution::Retry(result))) => format!(
+                "; result status=retry, retryAfterSeconds={}",
+                result.after_seconds()
             ),
             Ok(None) => "; no result document was published".to_string(),
             Err(error) => format!("; invalid result document: {error}"),
@@ -270,6 +282,31 @@ impl Harness {
     ///    plain `Command::output()` waits on it forever with nothing to break the wait. The
     ///    deadline plus the teardown is what bounds it.
     fn invoke(
+        &self,
+        operation: Operation,
+        protocol: &str,
+        attempt_id: &str,
+        reason: Reason,
+        converge_onto: &Release,
+        undoing: &Release,
+    ) -> io::Result<Invocation> {
+        operation
+            .validate_invocation(reason, attempt_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        self.invoke_raw(
+            operation.as_str(),
+            protocol,
+            attempt_id,
+            reason,
+            converge_onto,
+            undoing,
+        )
+    }
+
+    /// Bypass the typed operation gate only for conformance checks that intentionally send an
+    /// unknown wire operation. Every invocation the agent can actually emit goes through
+    /// [`Self::invoke`] and therefore the contracts crate's canonical invocation grammar.
+    fn invoke_raw(
         &self,
         operation: &str,
         protocol: &str,
@@ -503,15 +540,15 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
     // whether an invocation half-ran and its only correct recovery is to invoke again — with the
     // same attempt id and the same arguments.
     let first = harness.invoke(
-        Operation::Apply.as_str(),
+        Operation::Apply,
         updated_contracts::reconciler::PROTOCOL,
-        ATTEMPT,
-        Reason::Install,
+        TRANSACTION_ATTEMPT,
+        Reason::Update,
         &harness.candidate,
         &harness.predecessor,
     )?;
     report.check(
-        "apply/install succeeds",
+        "apply/update succeeds",
         first.mutation_succeeded(),
         format!(
             "{}{}\n        {}",
@@ -542,10 +579,10 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
     );
     let first_outputs = first.outputs.clone();
     let replay = harness.invoke(
-        Operation::Apply.as_str(),
+        Operation::Apply,
         updated_contracts::reconciler::PROTOCOL,
-        ATTEMPT,
-        Reason::Install,
+        TRANSACTION_ATTEMPT,
+        Reason::Update,
         &harness.candidate,
         &harness.predecessor,
     )?;
@@ -596,7 +633,7 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
     let health: Vec<Invocation> = (0..2)
         .map(|_| {
             harness.invoke(
-                Operation::Healthcheck.as_str(),
+                Operation::Healthcheck,
                 updated_contracts::reconciler::PROTOCOL,
                 updated_contracts::reconciler::attempt::PERIODIC,
                 Reason::Restart,
@@ -619,7 +656,7 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
     let inspect: Vec<Invocation> = (0..2)
         .map(|_| {
             harness.invoke(
-                Operation::Inspect.as_str(),
+                Operation::Inspect,
                 updated_contracts::reconciler::PROTOCOL,
                 updated_contracts::reconciler::attempt::FINGERPRINT,
                 Reason::Restart,
@@ -682,11 +719,11 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
 
     // Compensation. The rollback direction carries its own token — the forward one with `r`
     // appended — and converges ONTO the release being restored, so candidate and predecessor swap.
-    let rollback_attempt = format!("{ATTEMPT}r");
+    let rollback_attempt = format!("{TRANSACTION_ATTEMPT}r");
     let rollback: Vec<Invocation> = (0..2)
         .map(|_| {
             harness.invoke(
-                Operation::Rollback.as_str(),
+                Operation::Rollback,
                 updated_contracts::reconciler::PROTOCOL,
                 &rollback_attempt,
                 Reason::Update,
@@ -731,10 +768,10 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
 
     // The two refusals. A hook that runs whatever it is handed is a hook that will one day converge
     // a machine on a protocol it does not implement.
-    let unknown = harness.invoke(
+    let unknown = harness.invoke_raw(
         "converge",
         updated_contracts::reconciler::PROTOCOL,
-        ATTEMPT,
+        TRANSACTION_ATTEMPT,
         Reason::Update,
         &harness.candidate,
         &harness.predecessor,
@@ -745,10 +782,10 @@ pub(crate) fn reconciler_check(args: ReconcilerCheckArgs) -> Result<(), Error> {
         format!("`converge` ended with {}", unknown.status()),
     );
     let wrong_protocol = harness.invoke(
-        Operation::Apply.as_str(),
+        Operation::Apply,
         "2",
-        ATTEMPT,
-        Reason::Install,
+        TRANSACTION_ATTEMPT,
+        Reason::Update,
         &harness.candidate,
         &harness.predecessor,
     )?;
@@ -811,7 +848,7 @@ case "$operation" in
     # Every invocation receives a fresh output directory, including a replay of the same attempt.
     # Re-emitting the same declaration is observation, not a repeated side effect.
     printf 'https://svc:8200' >"$output_dir/endpoint"
-    printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","retryAfterSeconds":null,"message":null}' "$changed" >"$result_file"
+    printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","message":null}' "$changed" >"$result_file"
     ;;
   healthcheck) ;;
   inspect) printf 'state=ready\n' ;;
@@ -844,7 +881,7 @@ case "$operation" in
       exit 1
     fi
     : >"$state_dir/$operation.installed"
-    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}' >"$result_file"
+    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","message":null}' >"$result_file"
     ;;
   healthcheck) ;;
   # An observation that writes, and a fingerprint that never repeats itself.
@@ -884,13 +921,13 @@ case "$operation" in
   apply|rollback)
     marker="$state_dir/$operation.$attempt.done"
     if [ -f "$marker" ]; then
-      printf '%s' '{"schema":1,"status":"succeeded","changed":false,"hostAction":"none","retryAfterSeconds":null,"message":null}' >"$result_file"
+      printf '%s' '{"schema":1,"status":"succeeded","changed":false,"hostAction":"none","message":null}' >"$result_file"
       exit 0
     fi
     # The defect: no `setsid`, no stdio redirection. The "workload" stays in the tree.
     sleep 300 &
     : >"$marker"
-    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}' >"$result_file"
+    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","message":null}' >"$result_file"
     ;;
   healthcheck) ;;
   inspect) printf 'state=ready\n' ;;
@@ -958,9 +995,9 @@ esac
         let harness = Harness::new(scratch.path(), hook, Vec::new()).unwrap();
         let invocation = harness
             .invoke(
-                Operation::Inspect.as_str(),
+                Operation::Inspect,
                 "1",
-                ATTEMPT,
+                updated_contracts::reconciler::attempt::FINGERPRINT,
                 Reason::Restart,
                 &harness.candidate,
                 &harness.predecessor,
@@ -1007,9 +1044,9 @@ printf 'state=ready\n'
         let harness = Harness::new(scratch.path(), hook, Vec::new()).unwrap();
         let invocation = harness
             .invoke(
-                Operation::Inspect.as_str(),
+                Operation::Inspect,
                 "1",
-                ATTEMPT,
+                updated_contracts::reconciler::attempt::FINGERPRINT,
                 Reason::Restart,
                 &harness.candidate,
                 &harness.predecessor,

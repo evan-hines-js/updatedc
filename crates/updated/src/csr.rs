@@ -45,7 +45,8 @@ pub fn csr_for(key_pem: &str, subject_cn: &str) -> io::Result<String> {
         .map_err(|error| io::Error::other(format!("encoding CSR: {error}")))
 }
 
-/// The PKCS#8 DER form of a PEM key, for aws-lc-rs signing (`telemetry::sign_report`).
+/// The PKCS#8 DER form of a PEM key, for aws-lc-rs signing
+/// (`telemetry::encode_signed_report`).
 pub fn key_pem_to_pkcs8_der(key_pem: &str) -> io::Result<Vec<u8>> {
     let key = parse_key(key_pem)?;
     Ok(key.serialize_der())

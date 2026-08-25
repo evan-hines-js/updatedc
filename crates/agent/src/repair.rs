@@ -41,7 +41,7 @@ pub(crate) enum Repair {
 
 pub(crate) async fn repair_committed_bundle(
     opts: &Options,
-    store: &mut FileStore,
+    store: &mut Store,
 ) -> Result<Repair, Box<dyn std::error::Error>> {
     let assignment_error = match repair_from_assignment(opts, store).await {
         Ok(repo) => return Ok(Repair::FromAssignment(Box::new(repo))),
@@ -82,27 +82,27 @@ pub(crate) async fn repair_committed_bundle(
 /// things. The candidate is not rejected: the same reasoning that forbids rejecting the corrupt
 /// archive applies to the release whose tree this disk damaged.
 pub(crate) fn journal_predecessor_fallback(
-    store: &mut dyn Store,
+    store: &mut Store,
     installed: &updated::state::InstalledState,
     pending: &Pending,
 ) -> io::Result<()> {
     persist_transaction(store, &rollback_of_unconfirmed(installed, pending, false))
 }
 
-/// Re-acquire and re-commit the assigned application from the signed deployment contract. This is
-/// the ordinary update machinery's `prepare` step run for repair: the release is re-downloaded and
-/// re-materialized, which republishes the drifted tree.
+/// Re-acquire and re-commit the exact application already named by durable state. Repair shares
+/// the ordinary acquisition machinery, but it is not desired-state selection: an assignment that
+/// moved is handled later by the one journaled update path and cannot make this function activate a
+/// new release or provider as a side effect.
 pub(crate) async fn repair_from_assignment(
     opts: &Options,
-    store: &mut FileStore,
+    store: &mut Store,
 ) -> Result<TrustedRepository, Box<dyn std::error::Error>> {
     let repo = TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
         .await
         .map_err(|error| format!("loading the signed repair assignment: {error}"))?;
-    let assignment = repo
-        .assignment()
-        .ok_or("the signed repository has no desired deployment")?;
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+    let Installed::Present(installed) = store.installed() else {
+        return Err("repair requires a valid committed application record".into());
+    };
     // A repair re-acquires the release this node is ALREADY committed to, so it must lift the
     // selector's "you already have that version, nothing to do" short-circuit — and nothing else.
     // It used to say `None`, which the selector reads as "nothing is installed": that is the one
@@ -112,14 +112,9 @@ pub(crate) async fn repair_from_assignment(
     // and keeps the exact-pin branch; if the assigned head really is unselectable the repair fails
     // here and `repair_committed_bundle` falls back to the journaled predecessor revert, which is
     // a rollback this node has evidence for rather than a silent downgrade.
-    let installed = store.installed();
-    let stance = match &installed {
-        Installed::Present(state) => state
-            .version_floor_for(&lineage)
-            .map_or(updated_tuf::select::Stance::Nothing, |version| {
-                updated_tuf::select::Stance::Reacquire(version)
-            }),
-        Installed::Missing | Installed::Invalid => updated_tuf::select::Stance::Nothing,
+    let stance = updated_tuf::select::Stance::Reacquire {
+        version: &installed.release.version,
+        sha256: &installed.archive_sha256,
     };
     let request = crate::acquire::ApplicationRequest {
         repository: &repo,
@@ -127,46 +122,27 @@ pub(crate) async fn repair_from_assignment(
         paths: &opts.paths,
         stance,
     };
-    let selected = crate::acquire::select_assigned_application(&request, |sha256| {
-        store.is_rejected(&lineage, sha256)
-    })
-    .map_err(|error| format!("preparing the signed repair: {error}"))?
-    .ok_or("the signed assignment contains no installable application")?;
-    // The set signed into the version just selected, decided once with it.
-    let version_provider_set = selected.provider_set.clone();
+    let selected =
+        crate::acquire::select_assigned_application(&request, |application, provider| {
+            store.rejects_selection(&installed.repository_lineage, application, provider)
+        })
+        .map_err(|error| format!("preparing the signed repair: {error}"))?
+        .ok_or("the signed assignment contains no installable application")?;
     let prepared = crate::acquire::prepare_assigned_application(&request, selected)
         .await
         .map_err(|error| format!("preparing the signed repair: {error}"))?;
-    let providers = selection::stage_providers(opts, &repo, store, version_provider_set.as_ref())
-        .await
-        .map_err(|error| format!("staging the providers for the repair: {error}"))?;
-    // A repair replaces drifted BYTES; it does not decide an in-flight update. When it lands back
-    // on the release the record already names, the record's rollback intent and its provisional
-    // flag are carried through unchanged: erasing them would silently confirm an unconfirmed head —
-    // nothing left for `plan_boot` to revert on the next crash, and `garbage_collect` free to prune
-    // the very predecessor this function's own fallback depends on. A repair that lands on a
-    // different head (the assignment moved on) is a head this node has never launched, let alone
-    // health-gated, so it is committed provisional exactly as a cold install commits one — ordered
-    // fallback has to be able to descend past it if it turns out to be broken.
-    let (pending, confirmed) = match store.installed() {
-        Installed::Present(state) if state.release == prepared.release => {
-            (state.pending, state.confirmed)
-        }
-        _ => (None, false),
-    };
+    if prepared.release != installed.release || prepared.archive_sha256 != installed.archive_sha256
+    {
+        return Err(
+            "authenticated repair selection did not reproduce the committed artifact".into(),
+        );
+    }
     // Verify-then-point, and only then commit — the same order, and for the same reason, as the
     // predecessor fallback in `repair_committed_bundle`: a failed `activate` (ENOSPC, a read-only
     // remount) must leave the committed record exactly as it found it, so the fallback still has
     // the `pending` it reads to recover.
     store.activate(&prepared.release)?;
-    store.commit_installed(&updated::state::InstalledState {
-        repository_lineage: lineage,
-        release: prepared.release.clone(),
-        archive_sha256: prepared.archive_sha256,
-        lifecycle: Box::new(providers),
-        pending,
-        confirmed,
-    })?;
+    store.commit_installed(&installed)?;
     // Wording held stable: the e2e's offline-repair scenario asserts on this exact line, and the
     // scenario it covers — a `file:` routing repository, no network — is the one it names.
     log(&format!(

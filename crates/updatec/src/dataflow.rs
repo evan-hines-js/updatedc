@@ -15,7 +15,9 @@ use updated_contracts::dataflow::FileSnapshot;
 use updated_contracts::dataflow::{
     InputPublication, InputSelection, OutputPublication, MAX_DATAFLOW_BODY_BYTES,
 };
-use updated_contracts::telemetry::{AcceptedReport, Envelope};
+use updated_contracts::telemetry::{
+    accept_stored_report, AcceptedReport, Envelope, ReportStoredAt,
+};
 
 const GENERATION_KEY_OBJECT: &str = "internal/dataflow/generation.key";
 pub(crate) const INPUT_ROOT: &str = "internal/dataflow/inputs";
@@ -396,12 +398,25 @@ impl OutputCache {
 pub(crate) struct ReportCache {
     /// The gate's own verdict is what is cached, not just the envelope it produced.
     ///
-    /// An entry survives a pass untouched whenever its ETag is unchanged, so its `accepted_at_ms`
-    /// remains the instant this controller first accepted those exact bytes — which is the value
-    /// the fleet projection evicts by. Keeping the `AcceptedReport` is therefore not a convenience:
-    /// it is the only way the projection can know a real acceptance time rather than inventing one.
-    entries: HashMap<ObjectPath, (Option<String>, AcceptedReport)>,
+    /// An entry survives a pass untouched only while both its content ETag and durable storage
+    /// instant are unchanged. Some stores reuse a content-derived ETag when identical bytes are
+    /// written again; ignoring `last_modified` there would make a running controller retain the
+    /// old order while a restarted controller observed the new one.
+    entries: HashMap<ObjectPath, CachedReport>,
     initialized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedReport {
+    etag: Option<String>,
+    stored_at: ReportStoredAt,
+    accepted: AcceptedReport,
+}
+
+impl CachedReport {
+    fn matches(&self, etag: &Option<String>, stored_at: ReportStoredAt) -> bool {
+        same_etag(&self.etag, etag) && self.stored_at == stored_at
+    }
 }
 
 pub(crate) struct ReportSnapshot {
@@ -455,10 +470,17 @@ impl ReportCache {
                     continue;
                 };
                 seen.insert(meta.location.clone());
+                let Some(stored_at) =
+                    ReportStoredAt::from_unix_millis(meta.last_modified.timestamp_millis())
+                else {
+                    tracing::warn!(%node, "ignoring raw node report with pre-epoch metadata");
+                    self.entries.remove(&meta.location);
+                    continue;
+                };
                 if self
                     .entries
                     .get(&meta.location)
-                    .is_some_and(|(etag, _)| same_etag(etag, &meta.e_tag))
+                    .is_some_and(|entry| entry.matches(&meta.e_tag, stored_at))
                 {
                     continue;
                 }
@@ -477,16 +499,23 @@ impl ReportCache {
                     }
                 };
                 // THE acceptance point: the only place raw report bytes enter this control
-                // plane. Everything downstream carries the resulting `AcceptedReport`, instant
-                // included, rather than re-deriving it. `clippy.toml` bans the gate elsewhere.
-                #[allow(clippy::disallowed_methods)]
-                let accepted = updated_contracts::telemetry::accept_report_envelope(&body, node);
+                // plane. The store's durable timestamp survives controller restarts; stamping
+                // `now` here would make every cached object equally new after a restart and turn
+                // bounded eviction into node-name order.
+                let accepted = accept_stored_report(&body, node, stored_at);
                 let Some(accepted) = accepted else {
                     tracing::warn!(%node, "ignoring malformed raw node report");
                     self.entries.remove(&meta.location);
                     continue;
                 };
-                self.entries.insert(meta.location, (meta.e_tag, accepted));
+                self.entries.insert(
+                    meta.location,
+                    CachedReport {
+                        etag: meta.e_tag,
+                        stored_at,
+                        accepted,
+                    },
+                );
             }
             Ok::<(), object_store::Error>(())
         };
@@ -501,7 +530,7 @@ impl ReportCache {
             .filter_map(|(object, node)| {
                 self.entries
                     .get(&object)
-                    .map(|(_, accepted)| (node, accepted.clone()))
+                    .map(|entry| (node, entry.accepted.clone()))
             })
             .collect();
         Ok(ReportSnapshot { accepted, changed })
@@ -660,14 +689,35 @@ mod tests {
     }
 
     /// A signed report carried through the one acceptance gate, the way the scanner produces one.
-    #[allow(clippy::disallowed_methods)]
     fn accepted_report(node: &str) -> AcceptedReport {
         let envelope = signed_report(node);
-        updated_contracts::telemetry::accept_report_envelope(
+        accept_stored_report(
             &serde_json::to_vec(&envelope).unwrap(),
             node,
+            ReportStoredAt::from_unix_millis(1).unwrap(),
         )
         .expect("a freshly signed report is acceptable")
+    }
+
+    #[test]
+    fn report_cache_identity_includes_durable_storage_time() {
+        let entry = CachedReport {
+            etag: Some("same-content".into()),
+            stored_at: ReportStoredAt::from_unix_millis(1).unwrap(),
+            accepted: accepted_report("database-0"),
+        };
+
+        assert!(entry.matches(
+            &Some("same-content".into()),
+            ReportStoredAt::from_unix_millis(1).unwrap()
+        ));
+        assert!(
+            !entry.matches(
+                &Some("same-content".into()),
+                ReportStoredAt::from_unix_millis(2).unwrap()
+            ),
+            "rewriting identical bytes is still a new durable storage event"
+        );
     }
 
     #[tokio::test]
@@ -836,8 +886,9 @@ mod tests {
             first
                 .accepted
                 .get("database-0")
-                .map(AcceptedReport::envelope),
-            Some(&envelope)
+                .cloned()
+                .map(AcceptedReport::into_envelope),
+            Some(envelope)
         );
         assert!(!first.accepted.contains_key("database-1"));
         assert!(!cache.refresh(&dataflow, nodes).await.unwrap().changed);

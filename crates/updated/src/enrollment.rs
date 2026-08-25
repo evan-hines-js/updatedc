@@ -280,7 +280,9 @@ pub async fn load_or_enroll_http(
             // repository) reads routing and secrets straight from disk and never makes an mTLS
             // request, so it needs no per-node identity — and forcing an `/enroll` handshake it
             // cannot reach would wedge its boot. This mirrors the split the secrets client uses.
-            if !crate::config::base_url_is_local(&bundle.routing_base_url) {
+            let routing_is_local = crate::config::base_url_is_local(&bundle.routing_base_url)
+                .map_err(|error| invalid(&format!("invalid routing base URL: {error}")))?;
+            if !routing_is_local {
                 let identity_complete = joined_cert_path(state_dir).try_exists()?
                     && joined_key_path(state_dir).try_exists()?;
                 if !identity_complete {

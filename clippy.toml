@@ -9,8 +9,16 @@
 # Every legitimate caller carries `#[allow(clippy::disallowed_methods)]` with the reason it is the
 # one door. That allow is the exception list, and it lives at the exception.
 disallowed-methods = [
-  { path = "updated_contracts::telemetry::report_is_authentic", reason = "verifying a node report is the most expensive work a control-plane pass does; the controller verifies its whole fleet once through evidence::VerifiedReports::verify_fleet and reads the result. Call that instead." },
-  { path = "updated_contracts::telemetry::report_is_authentic_and_fresh", reason = "same single verification door: go through evidence::VerifiedReports (controller) rather than re-verifying bytes a pass has already checked." },
-  { path = "updated_contracts::telemetry::accept_report_envelope", reason = "stamps a fresh acceptance instant, which the fleet projection evicts by. Accept bytes once, where they arrive off the store, and carry the resulting AcceptedReport; re-accepting a stored envelope restamps it and turns 'evict the stalest' into 'evict whoever sorts first'." },
-  { path = "updated_contracts::telemetry::unverified_report", reason = "reads a report WITHOUT checking its signature. Observability only — never a trust decision. If you are deciding anything about a node, use the verified path." },
+  { path = "updated_agent::store::Store::verify_release", reason = "raw half of activation; use Store::activate so verifying bytes and moving the active pointer remain one fail-closed operation." },
+  { path = "updated_agent::store::Store::point_active", reason = "raw half of activation; use Store::activate so no caller can point at bytes it did not just verify." },
+  { path = "updated_agent::store::Store::record_journal", reason = "unconditional storage primitive; use Store::write_journal so transaction identity and phase monotonicity cannot be bypassed." },
+  { path = "updated_agent::store::Store::remove_journal", reason = "unconditional storage primitive; use Store::clear_journal so an outstanding compensation obligation cannot be discarded." },
+  { path = "updated_agent::store::Store::record_install_journal", reason = "unconditional storage primitive; use Store::write_install_journal so interrupted first-install intent cannot be buried." },
+  { path = "updated_agent::store::Store::remove_install_journal", reason = "unconditional storage primitive; use Store::clear_install_journal so install intent survives until the exact release commits." },
+  { path = "updated_agent::store::Store::remove_rejection", reason = "unconditional storage primitive; use Store::clear_application_rejection so proven-bad application bytes are re-admitted only after the same bytes settle successfully." },
+  { path = "updated::bundle::write_active", reason = "raw active-pointer writer; production activation must pass through updated-agent Store::activate, which verifies immutable bytes first and keeps every activation failure node-local." },
+  { path = "updated::state::write_installed", reason = "raw installed-state writer; updated-agent Store is the one durable policy boundary for committing installed state." },
+  { path = "updated::journal::write", reason = "raw journal writer; updated-agent Store::write_journal and Store::write_install_journal enforce identity and state-machine replacement rules." },
+  { path = "updated::journal::clear", reason = "raw journal remover; updated-agent Store clear methods prove the recorded obligation is discharged before deleting it." },
+  { path = "updated::reject::Rejections::clear", reason = "raw rejection remover; updated-agent Store::clear_application_rejection requires proof that the exact rejected application bytes became the committed head." },
 ]

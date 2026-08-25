@@ -574,7 +574,7 @@ spec:
         description: Auto-generated derived type for UpdateGroupSetSpec via `CustomResource`
         properties:
           spec:
-            description: 'A blast-radius throttle over a set of [`UpdateGroup`]s. Membership is label-based like everything else: `selector` matches `UpdateGroup` **metadata labels** (not agent labels), so a set can gather any number of member groups. The control plane rolls no more than [`Self::effective_max_concurrent`] members at once, holding the rest on their last-admitted deployment until an in-flight member settles (all its agents report the desired deployment, healthy). A member "settles" only through the node telemetry the control plane reads out of storage. Deployments require a report URL; unverifiable or missing telemetry fails closed.'
+            description: 'A blast-radius throttle over a set of [`UpdateGroup`]s. Membership is label-based like everything else: `selector` matches `UpdateGroup` **metadata labels** (not agent labels) within the repository named by `repositoryRef`, so a set can gather any number of that repository''s member groups. The control plane rolls no more than [`Self::effective_max_concurrent`] members at once, holding the rest on their last-admitted deployment until an in-flight member settles (all its agents report the desired deployment, healthy). A member "settles" only through the node telemetry the control plane reads out of storage. Deployments require a report URL; unverifiable or missing telemetry fails closed.'
             properties:
               calendar:
                 default: []
@@ -624,6 +624,14 @@ spec:
                 - halt
                 - rollback
                 type: string
+              repositoryRef:
+                description: The repository whose groups this set governs. A set is reconciled and has its status written by exactly that repository's controller; selectors never cross repository boundaries, even when another repository uses the same group labels in this namespace.
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
               rolloutWindows:
                 default: []
                 description: UTC windows during which this set may admit new rollouts. Empty means always open. When non-empty, the set freezes (admits nothing new) whenever "now" (UTC) falls outside every window; members already rolling keep settling. See [`RolloutWindow`] for the schedule model, including weekly and every-other-week ("every other Sunday") recurrences and past-midnight time spans.
@@ -688,6 +696,7 @@ spec:
                 nullable: true
                 type: integer
             required:
+            - repositoryRef
             - selector
             type: object
           status:

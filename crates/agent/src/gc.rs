@@ -3,7 +3,7 @@
 
 use crate::*;
 
-pub(crate) fn garbage_collect(opts: &Options, store: &dyn Store) {
+pub(crate) fn garbage_collect(opts: &Options, store: &Store) {
     let Installed::Present(installed) = store.installed() else {
         return;
     };

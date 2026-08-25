@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 use crate::bundle::ReleaseId;
-use crate::state::{ProviderRelease, RepositoryLineage};
+use crate::state::{InstalledState, ProviderRelease, RepositoryLineage};
 
 /// Durable intent for an in-flight first install of a single release.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,7 +67,7 @@ impl InstallTransaction {
                 "install transaction archive identity is invalid",
             ));
         }
-        if !updated_contracts::is_canonical_sha256(self.repository_lineage.as_str()) {
+        if !self.repository_lineage.validate() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "install transaction repository lineage is invalid",
@@ -112,6 +112,16 @@ impl InstallTransaction {
         let mut advanced = self.clone();
         advanced.advance(next.phase).is_ok() && advanced == *next
     }
+
+    /// Whether the committed record names the exact deployed unit this install staged. Release,
+    /// archive, repository trust lineage, and reconciler are one identity: matching only the
+    /// application would let a substituted provider or archive erase crash-recovery evidence.
+    pub fn matches_installed(&self, installed: &InstalledState) -> bool {
+        self.release == installed.release
+            && self.archive_sha256 == installed.archive_sha256
+            && self.repository_lineage == installed.repository_lineage
+            && self.lifecycle == installed.lifecycle
+    }
 }
 
 /// The recovery action implied by an install journal and the committed installed record.
@@ -125,9 +135,9 @@ pub enum InstallRecovery {
 
 pub fn classify_install_recovery(
     tx: &InstallTransaction,
-    installed: Option<&ReleaseId>,
+    installed: Option<&InstalledState>,
 ) -> InstallRecovery {
-    if installed == Some(&tx.release) {
+    if installed.is_some_and(|state| tx.matches_installed(state)) {
         InstallRecovery::Committed
     } else {
         InstallRecovery::Resume
@@ -148,7 +158,6 @@ impl crate::journal::Journaled for InstallTransaction {
 mod tests {
     use super::*;
     use crate::testing::install_transaction as tx;
-    use crate::testing::release;
 
     #[test]
     fn advance_is_forward_only() {
@@ -181,15 +190,34 @@ mod tests {
     #[test]
     fn recovery_is_committed_only_when_installed_matches() {
         let t = tx();
+        let exact = InstalledState::provisional(
+            t.repository_lineage.clone(),
+            t.release.clone(),
+            t.archive_sha256.clone(),
+            t.lifecycle.clone(),
+        );
         assert_eq!(
-            classify_install_recovery(&t, Some(&t.release)),
+            classify_install_recovery(&t, Some(&exact)),
             InstallRecovery::Committed
         );
         assert_eq!(classify_install_recovery(&t, None), InstallRecovery::Resume);
-        assert_eq!(
-            classify_install_recovery(&t, Some(&release("9.9.9", "other"))),
-            InstallRecovery::Resume
-        );
+
+        let mut wrong_release = exact.clone();
+        wrong_release.release.version = "9.9.9".into();
+        let mut wrong_archive = exact.clone();
+        wrong_archive.archive_sha256 = "e".repeat(64);
+        let mut wrong_lineage = exact.clone();
+        wrong_lineage.repository_lineage =
+            RepositoryLineage::from_metadata_url("https://other/metadata/").unwrap();
+        let mut wrong_lifecycle = exact;
+        wrong_lifecycle.lifecycle.product = "other-reconciler".into();
+        for substituted in [wrong_release, wrong_archive, wrong_lineage, wrong_lifecycle] {
+            assert_eq!(
+                classify_install_recovery(&t, Some(&substituted)),
+                InstallRecovery::Resume,
+                "no partial deployed identity can discharge first-install recovery"
+            );
+        }
     }
 
     #[test]

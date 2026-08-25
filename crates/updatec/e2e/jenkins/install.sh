@@ -163,7 +163,7 @@ case "$PHASE" in
     echo "jenkins-install: converging to ${CANDIDATE_VERSION:-?}, reusing JENKINS_HOME at $DATA/home" >&2
     printf '%s\n' "${CANDIDATE_VERSION:-?}" > "$DATA/installed-version"
     start_controller "$CANDIDATE"
-    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}' >"$RESULT_FILE"
+    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","message":null}' >"$RESULT_FILE"
     ;;
 
   healthcheck)
@@ -188,7 +188,7 @@ case "$PHASE" in
     fi
     printf '%s\n' "${CANDIDATE_VERSION:-?}" > "$DATA/installed-version"
     start_controller "$CANDIDATE"
-    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","retryAfterSeconds":null,"message":null}' >"$RESULT_FILE"
+    printf '%s' '{"schema":1,"status":"succeeded","changed":true,"hostAction":"none","message":null}' >"$RESULT_FILE"
     ;;
 
   *)

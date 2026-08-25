@@ -118,8 +118,8 @@ impl std::error::Error for PrepareError {
 
 /// Decide which application this node should be running, against the verified control plane.
 ///
-/// `Ok(None)` means the current version is already desired or these exact bytes were
-/// previously rejected. Activation and rejection persistence remain front-end policy.
+/// `Ok(None)` means the current version is already desired or the candidate's artifact/deployment
+/// identity was previously rejected. Activation and rejection persistence remain front-end policy.
 ///
 /// The decision is deterministic and side-effect free, and it answers two questions at once: which
 /// release to acquire, and — when ordered fallback descended below the assigned head — which signed
@@ -129,7 +129,7 @@ impl std::error::Error for PrepareError {
 /// evaluation sites.
 pub(crate) fn select_assigned_application(
     request: &ApplicationRequest<'_>,
-    mut is_rejected: impl FnMut(&str) -> bool,
+    mut is_rejected: impl FnMut(&str, Option<&str>) -> bool,
 ) -> Result<Option<SelectedRelease>, PrepareError> {
     let policy = DefaultPolicy::current(&request.application.product, &request.application.channel);
     // Rejection filtering now happens inside selection: exact-pin returns None when
@@ -142,7 +142,12 @@ pub(crate) fn select_assigned_application(
             &policy,
             request.stance,
             |_message| {},
-            |target, _version| is_rejected(&target_sha(target)),
+            |target, _version, provider_set| {
+                is_rejected(
+                    &target_sha(target),
+                    provider_set.map(|provider| provider.sha256.as_str()),
+                )
+            },
         )
         .map_err(PrepareError::Repository)
 }

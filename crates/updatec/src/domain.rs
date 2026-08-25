@@ -588,11 +588,7 @@ fn resolve_one(
             // The same gate the planner reads through, so a producer's health is judged from the
             // one verification this pass performed rather than a second one of its own. Freshness
             // is applied here, on top: it is a clock comparison, never part of the crypto.
-            let Some(report) = context
-                .verified
-                .authentic(node, envelope, key)
-                .filter(|report| report.is_fresh(context.now_ms))
-            else {
+            let Some(report) = context.verified.fresh(node, envelope, key, context.now_ms) else {
                 return false;
             };
             // The producer node must be healthy on the EXACT configuration desired for its

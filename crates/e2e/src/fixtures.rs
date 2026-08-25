@@ -57,6 +57,12 @@ pub struct Node {
 /// the agent does not speak.
 const INERT: &str = "inert";
 
+/// A scenario that deliberately crashes a candidate while it is unconfirmed may spend two full
+/// positive-event waits arranging that crash. Keep the confirmation deadline beyond those waits,
+/// plus one convergence window, so load can delay the setup without changing the state under test.
+/// The scenario never waits for this deadline; it forces the next boot immediately.
+const HELD_UNCONFIRMED_SECONDS: u64 = EVENT_TIMEOUT * 2 + CONVERGE_TIMEOUT;
+
 /// The launcher state directory — every boot-time input: node config, enrollment bundle, private
 /// key, persisted assignment — for a scenario rooted at `dir`.
 ///
@@ -137,6 +143,14 @@ impl Node {
     }
     pub fn confirmation_window(mut self, s: &str) -> Self {
         self.confirmation_window = Some(s.into());
+        self
+    }
+    /// Keep a candidate unconfirmed while a crash/rollback scenario arranges its next boot.
+    ///
+    /// This owns the relationship between the harness's wait ceilings and the confirmation window;
+    /// individual scenarios must not copy a duration that can expire during their own setup.
+    pub fn hold_unconfirmed(mut self) -> Self {
+        self.confirmation_window = Some(format!("{HELD_UNCONFIRMED_SECONDS}s"));
         self
     }
     /// Select the reconciler's mode (see `crate::fixture`). A scenario selects it exactly once: two
@@ -456,6 +470,7 @@ impl Node {
         Ok(config)
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn seed_install(&self) -> R {
         // The layout production resolves, not a copy of it: a scenario that plants or reads a
         // file through these paths must exercise the same locations the agent under test uses.
@@ -500,7 +515,8 @@ impl Node {
         let lineage = updated::state::RepositoryLineage::from_metadata_url(&format!(
             "{}metadata/",
             self.release_base_url()?
-        ));
+        ))
+        .map_err(str_err)?;
         updated::state::enroll(&paths.installed).map_err(str_err)?;
         // Carry the same signed provider set the published assignment references, so the seeded
         // predecessor is faithful to a cold-installed node (install stages its providers). Without

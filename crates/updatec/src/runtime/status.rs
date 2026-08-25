@@ -751,11 +751,9 @@ pub(crate) async fn publish_resource_statuses(
         // succeeded. It reads the pass's one verification rather than performing a second.
         let report = public_keys.get(&name).and_then(|key| {
             let now_ms = now.timestamp_millis().max(0) as u64;
-            reports.get(&name).and_then(|envelope| {
-                verified
-                    .authentic(&name, envelope, key)
-                    .filter(|report| report.is_fresh(now_ms))
-            })
+            reports
+                .get(&name)
+                .and_then(|envelope| verified.fresh(&name, envelope, key, now_ms))
         });
         let status = UpdateAgentStatus {
             observed_generation: agent.metadata.generation,

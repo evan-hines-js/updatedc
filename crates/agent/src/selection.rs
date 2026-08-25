@@ -53,17 +53,7 @@ fn provider_only_candidate(
 pub(crate) enum ProviderStagingError {
     /// The provider set is genuinely unusable: malformed, invalid, or naming a reconciler already
     /// rejected.
-    ///
-    /// `version_bound` says whether descending could possibly help. A set resolved from an
-    /// application version's own signed metadata is that version's problem, so rejecting it and
-    /// descending finds a version whose set is good. A set that came from the ASSIGNMENT is
-    /// version-independent: every version fails on it identically, so rejecting them one by one
-    /// walks a fresh node to the bottom of the descent and permanently excludes every release it
-    /// has — for a cause that has nothing to do with any of them.
-    Unusable {
-        message: String,
-        version_bound: bool,
-    },
+    Unusable(String),
     /// An I/O, network, or storage failure. It says nothing about the release; retry later.
     Transient(String),
 }
@@ -71,27 +61,77 @@ pub(crate) enum ProviderStagingError {
 impl std::fmt::Display for ProviderStagingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unusable { message, .. } | Self::Transient(message) => f.write_str(message),
+            Self::Unusable(message) | Self::Transient(message) => f.write_str(message),
         }
     }
+}
+
+/// Decode bytes already verified against the signed provider-set digest and persist the only
+/// permanent verdict this layer can prove about that document.
+///
+/// Resolution and download failures stay outside this function because either may be repaired
+/// without changing the signed digest. Once digest-verified bytes fail the bounded contract,
+/// however, those exact bytes can never become a valid provider set. Recording that fact here
+/// keeps selection's never-retry check and heartbeat's rejection report on the same evidence path.
+fn decode_provider_set(
+    store: &mut Store,
+    lineage: &updated::state::RepositoryLineage,
+    provider_set_sha256: &str,
+    bytes: &[u8],
+) -> Result<updated_contracts::artifact::ProviderSet, ProviderStagingError> {
+    match updated_contracts::artifact::ProviderSet::from_bounded_json(bytes) {
+        Ok(set) => Ok(set),
+        Err(error) => {
+            let message = format!("desired provider set is invalid: {error}");
+            store
+                .reject_artifact(lineage, provider_set_sha256)
+                .map_err(|reject_error| {
+                    ProviderStagingError::Transient(format!(
+                        "{message}; recording its rejection also failed: {reject_error}"
+                    ))
+                })?;
+            Err(ProviderStagingError::Unusable(message))
+        }
+    }
+}
+
+/// Reject a reconciler archive and the exact provider-set document that binds it as one unusable
+/// deployed unit. The archive verdict prevents any set from retrying the same bad bytes; the set
+/// verdict lets application selection skip only candidates that resolve through this binding,
+/// without poisoning an otherwise healthy application archive.
+fn reject_provider_unit(
+    store: &mut Store,
+    lineage: &updated::state::RepositoryLineage,
+    provider_set_sha256: &str,
+    provider_archive_sha256: &str,
+    message: String,
+) -> ProviderStagingError {
+    for (kind, digest) in [
+        ("node reconciler", provider_archive_sha256),
+        ("provider set", provider_set_sha256),
+    ] {
+        if let Err(error) = store.reject_artifact(lineage, digest) {
+            return ProviderStagingError::Transient(format!(
+                "{message}; recording the {kind} rejection also failed: {error}"
+            ));
+        }
+    }
+    ProviderStagingError::Unusable(message)
 }
 
 pub(crate) async fn stage_providers(
     opts: &Options,
     repo: &TrustedRepository,
-    store: &mut dyn Store,
+    store: &mut Store,
     version_provider_set: Option<&updated_contracts::artifact::TargetReference>,
 ) -> Result<updated::state::ProviderRelease, ProviderStagingError> {
     use ProviderStagingError::Transient;
-    // Until the provider set's origin is known, no failure can be blamed on an application version.
-    let unusable = |message: String| ProviderStagingError::Unusable {
-        message,
-        version_bound: false,
-    };
+    let unusable = ProviderStagingError::Unusable;
     let assignment = repo
-        .assignment()
+        .assignment_context()
         .ok_or_else(|| unusable("release repository has no desired deployment".into()))?;
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+    let lineage = assignment.repository_lineage();
+    let assignment = assignment.document();
     std::fs::create_dir_all(&opts.paths.provider_staging).map_err(|e| {
         Transient(format!(
             "creating lifecycle provider staging directory failed: {e}"
@@ -107,13 +147,6 @@ pub(crate) async fn stage_providers(
     let provider_ref = version_provider_set
         .cloned()
         .unwrap_or_else(|| assignment.provider_set.clone());
-    // From here the set's origin is known: a version's own signed metadata (descending can help)
-    // or the assignment (it cannot).
-    let version_bound = version_provider_set.is_some();
-    let unusable = |message: String| ProviderStagingError::Unusable {
-        message,
-        version_bound,
-    };
     let set_target = repo
         .exact_target(&provider_ref)
         .map_err(|e| unusable(format!("resolving desired provider set failed: {e}")))?;
@@ -124,7 +157,7 @@ pub(crate) async fn stage_providers(
             updated_contracts::artifact::ProviderSet::MAX_DOCUMENT_BYTES
         )));
     }
-    if store.is_rejected(&lineage, &provider_ref.sha256) {
+    if store.is_rejected(lineage, &provider_ref.sha256) {
         return Err(unusable(
             "desired provider set was previously rejected".into(),
         ));
@@ -137,15 +170,18 @@ pub(crate) async fn stage_providers(
     let bytes = downloaded_set
         .read_bounded(updated_contracts::artifact::ProviderSet::MAX_DOCUMENT_BYTES)
         .map_err(|e| Transient(format!("reading desired provider set failed: {e}")))?;
-    let set = updated_contracts::artifact::ProviderSet::from_bounded_json(&bytes)
-        .map_err(|error| unusable(format!("desired provider set is invalid: {error}")))?;
+    let set = decode_provider_set(store, lineage, &provider_ref.sha256, &bytes)?;
     let provider = set.reconciler;
     let target = repo
         .exact_target(&provider.artifact)
         .map_err(|e| unusable(format!("resolving node reconciler failed: {e}")))?;
     let sha = target_sha(&target);
-    if store.is_rejected(&lineage, &sha) {
-        return Err(unusable(
+    if store.is_rejected(lineage, &sha) {
+        return Err(reject_provider_unit(
+            store,
+            lineage,
+            &provider_ref.sha256,
+            &sha,
             "desired node reconciler was previously rejected".into(),
         ));
     }
@@ -171,27 +207,30 @@ pub(crate) async fn stage_providers(
     let provider_store = updated::provider::BundleStore::for_lifecycle(&opts.paths)
         .with_target_limit(repo.target_limit());
     let staged_bundle = crate::acquire::acquire_verified_bundle(
-            repo,
-            &target,
-            &opts.paths.provider_download,
-            &provider_store,
-            &updated::bundle::ExpectedBundle {
-                product,
-                version,
-                platform: &platform,
-            },
-        )
-        .await
-        .map_err(|error| {
-            // Only invalid *content* is a verdict on the bundle; a failed acquisition is transient.
-            if matches!(&error, crate::acquire::AcquireBundleError::Invalid { .. }) {
-                if let Err(reject_error) = store.reject(&lineage, &sha) {
-                    return unusable(format!("staging node reconciler failed: {error}; recording its rejection also failed: {reject_error}"));
-                }
-                return unusable(format!("staging node reconciler failed: {error}"));
-            }
-            Transient(format!("acquiring node reconciler failed: {error}"))
-        })?;
+        repo,
+        &target,
+        &opts.paths.provider_download,
+        &provider_store,
+        &updated::bundle::ExpectedBundle {
+            product,
+            version,
+            platform: &platform,
+        },
+    )
+    .await
+    .map_err(|error| {
+        // Only invalid *content* is a verdict on the bundle; a failed acquisition is transient.
+        if matches!(&error, crate::acquire::AcquireBundleError::Invalid { .. }) {
+            return reject_provider_unit(
+                store,
+                lineage,
+                &provider_ref.sha256,
+                &sha,
+                format!("staging node reconciler failed: {error}"),
+            );
+        }
+        Transient(format!("acquiring node reconciler failed: {error}"))
+    })?;
     let release = updated::state::ProviderRelease {
         provider_set_sha256: provider_ref.sha256,
         product: product.to_string(),
@@ -210,22 +249,23 @@ pub(crate) async fn stage_providers(
 pub(crate) async fn check_application(
     opts: &Options,
     repo: &TrustedRepository,
-    store: &mut dyn Store,
+    store: &mut Store,
     before_deployment: impl FnOnce(),
 ) -> AppOutcome {
-    let assignment = match repo.assignment() {
+    let assignment = match repo.assignment_context() {
         Some(assignment) => assignment,
         None => return AppOutcome::Fatal("release repository has no desired deployment".into()),
     };
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+    let lineage = assignment.repository_lineage();
+    let assignment = assignment.document();
     let installed = store.installed();
     let ordered_current = match &installed {
-        updated::state::Installed::Present(state) => state.version_floor_for(&lineage),
+        updated::state::Installed::Present(state) => state.version_floor_for(lineage),
         updated::state::Installed::Missing | updated::state::Installed::Invalid => None,
     };
-    // A persisted rejection applies to the failed bytes only (keyed by hash), so it
-    // pins the installation neither below a healthy intermediate release nor against
-    // a corrected republish of the same version.
+    // A persisted rejection applies to one malformed artifact or one exact failed deployment, so
+    // it pins the installation neither below a healthy intermediate release nor against a new
+    // combination that reuses one of the same artifacts.
     let request = crate::acquire::ApplicationRequest {
         repository: repo,
         application: &opts.application,
@@ -234,9 +274,12 @@ pub(crate) async fn check_application(
             updated_tuf::select::Stance::Installed(version)
         }),
     };
-    let selected = match crate::acquire::select_assigned_application(&request, |sha256| {
-        store.is_rejected(&lineage, sha256)
-    }) {
+    let selected = match crate::acquire::select_assigned_application(
+        &request,
+        |application_sha256, provider_set_sha256| {
+            store.rejects_selection(lineage, application_sha256, provider_set_sha256)
+        },
+    ) {
         Ok(selected) => selected,
         Err(error) => {
             warn(&format!(
@@ -265,25 +308,25 @@ pub(crate) async fn check_application(
     };
     // Every provider is now present before downloading the application. Nothing below this point
     // writes transaction intent or touches the live deployment.
-    let (prepared, rejection_sha256, provider_only) = match selected {
+    let (prepared, provider_only) = match selected {
         Some(selected) => {
-            let prepared =
-                match crate::acquire::prepare_assigned_application(&request, selected).await {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        if let Some((version, archive_sha256)) = error.rejected_archive() {
-                            if let Err(reject_error) = store.reject(&lineage, archive_sha256) {
-                                return AppOutcome::Fatal(format!(
+            let prepared = match crate::acquire::prepare_assigned_application(&request, selected)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some((version, archive_sha256)) = error.rejected_archive() {
+                        if let Err(reject_error) = store.reject_artifact(lineage, archive_sha256) {
+                            return AppOutcome::Fatal(format!(
                                 "rejecting malformed application bundle {version}: {reject_error}"
                             ));
-                            }
                         }
-                        warn(&error.to_string());
-                        return AppOutcome::Unchanged;
                     }
-                };
-            let rejection = prepared.archive_sha256.clone();
-            (prepared, rejection, false)
+                    warn(&error.to_string());
+                    return AppOutcome::Unchanged;
+                }
+            };
+            (prepared, false)
         }
         None => {
             let Some(prepared) =
@@ -291,10 +334,14 @@ pub(crate) async fn check_application(
             else {
                 return AppOutcome::Unchanged;
             };
-            if store.is_rejected(&lineage, &reconciler.provider_set_sha256) {
+            if store.rejects_deployment(
+                lineage,
+                &prepared.archive_sha256,
+                &reconciler.provider_set_sha256,
+            ) {
                 return AppOutcome::Unchanged;
             }
-            (prepared, reconciler.provider_set_sha256.clone(), true)
+            (prepared, true)
         }
     };
 
@@ -337,10 +384,12 @@ pub(crate) async fn check_application(
         }
     }
 
-    let from = match &installed {
-        updated::state::Installed::Present(state) => state.release.version.as_str(),
-        updated::state::Installed::Missing | updated::state::Installed::Invalid => "none",
+    let updated::state::Installed::Present(installed_state) = &installed else {
+        return AppOutcome::Fatal(
+            "an update candidate was selected without a valid installed predecessor".into(),
+        );
     };
+    let from = installed_state.release.version.as_str();
     // This is the single boundary between side-effect-free staging and deployment mutation.
     // Stop background observers before any lifecycle transaction hook can run.
     before_deployment();
@@ -358,7 +407,6 @@ pub(crate) async fn check_application(
         store,
         &prepared.release,
         &prepared.archive_sha256,
-        &rejection_sha256,
         lineage.clone(),
         reconciler.clone(),
     )
@@ -366,7 +414,8 @@ pub(crate) async fn check_application(
     match outcome {
         Ok(Outcome::Committed { host_action }) => {
             if !provider_only {
-                if let Err(e) = store.clear_rejection(&lineage, &prepared.archive_sha256) {
+                if let Err(e) = store.clear_application_rejection(lineage, &prepared.archive_sha256)
+                {
                     warn(&format!(
                         "upgraded to {}, but clearing its stale rejection failed: {e}",
                         prepared.version
@@ -402,7 +451,8 @@ mod tests {
 
     fn installed(version: &str) -> updated::state::Installed {
         updated::state::Installed::Present(Box::new(updated::state::InstalledState::confirmed(
-            updated::state::RepositoryLineage::from_metadata_url("https://releases.example/"),
+            updated::state::RepositoryLineage::from_metadata_url("https://releases.example/")
+                .expect("fixture metadata URL is valid"),
             updated::bundle::ReleaseId {
                 version: version.into(),
                 manifest_sha256: "1".repeat(64),
@@ -451,5 +501,41 @@ mod tests {
         )
         .is_none());
         assert!(provider_only_candidate(&installed, &"7".repeat(64), &revised).is_none());
+    }
+
+    #[test]
+    fn verified_malformed_provider_set_bytes_are_rejected_at_the_decode_boundary() {
+        let lineage =
+            updated::state::RepositoryLineage::from_metadata_url("https://releases.example/")
+                .expect("fixture metadata URL is valid");
+        let digest = "a".repeat(64);
+        let mut store = Store::default();
+
+        let result = decode_provider_set(&mut store, &lineage, &digest, br#"{}"#);
+
+        assert!(matches!(result, Err(ProviderStagingError::Unusable(_))));
+        assert!(store.is_rejected(&lineage, &digest));
+    }
+
+    #[test]
+    fn bad_reconciler_bytes_reject_both_halves_of_the_provider_binding() {
+        let lineage =
+            updated::state::RepositoryLineage::from_metadata_url("https://releases.example/")
+                .expect("fixture metadata URL is valid");
+        let provider_set = "a".repeat(64);
+        let reconciler = "b".repeat(64);
+        let mut store = Store::default();
+
+        let error = reject_provider_unit(
+            &mut store,
+            &lineage,
+            &provider_set,
+            &reconciler,
+            "invalid reconciler".into(),
+        );
+
+        assert!(matches!(error, ProviderStagingError::Unusable(_)));
+        assert!(store.is_rejected(&lineage, &provider_set));
+        assert!(store.is_rejected(&lineage, &reconciler));
     }
 }

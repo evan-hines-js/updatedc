@@ -77,6 +77,7 @@ pub fn clear(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

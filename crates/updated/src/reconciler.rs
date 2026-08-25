@@ -27,7 +27,7 @@ pub const OUTPUT_LIMIT: usize = 64 * 1024;
 /// validated document; an observation is structurally incapable of carrying one.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InvocationResult {
-    Mutation(updated_contracts::reconciler::ResultDocument),
+    Mutation(updated_contracts::reconciler::MutationResolution),
     Observation,
 }
 
@@ -63,7 +63,8 @@ pub fn take_result(
         (None, None) => Ok(InvocationResult::Observation),
         (Some(_), Some(bytes)) => {
             let result = ResultDocument::from_bounded_json(&bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                .into_resolution();
             std::fs::remove_file(path)?;
             Ok(InvocationResult::Mutation(result))
         }
@@ -256,7 +257,9 @@ mod tests {
 
     #[test]
     fn mutations_require_a_structured_result_and_observations_forbid_one() {
-        use updated_contracts::reconciler::{HostAction, Operation, ResultDocument, ResultStatus};
+        use updated_contracts::reconciler::{
+            HostAction, MutationResolution, Operation, ResultDocument, SuccessfulMutation,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("result.json");
@@ -265,31 +268,19 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
-        let result = ResultDocument {
-            schema: ResultDocument::SCHEMA,
-            status: ResultStatus::Succeeded,
-            changed: true,
-            host_action: HostAction::None,
-            retry_after_seconds: None,
-            message: None,
-        };
+        let result = ResultDocument::succeeded(true, HostAction::None, None).unwrap();
         write_result(&path, &result);
         assert_eq!(
             take_result(&path, Operation::Apply).unwrap(),
-            InvocationResult::Mutation(result)
+            InvocationResult::Mutation(MutationResolution::Succeeded(
+                SuccessfulMutation::new(true, HostAction::None, None).unwrap()
+            ))
         );
         assert!(!path.exists());
 
         write_result(
             &path,
-            &ResultDocument {
-                schema: ResultDocument::SCHEMA,
-                status: ResultStatus::Succeeded,
-                changed: false,
-                host_action: HostAction::None,
-                retry_after_seconds: None,
-                message: None,
-            },
+            &ResultDocument::succeeded(false, HostAction::None, None).unwrap(),
         );
         assert_eq!(
             take_result(&path, Operation::Healthcheck)
@@ -302,47 +293,30 @@ mod tests {
     #[test]
     fn the_last_reconciliation_is_durable_bounded_and_validated_on_read() {
         use updated_contracts::reconciler::{
-            HostAction, LastReconciliation, Operation, Reason, ReconciledRelease,
-            ReconcilerIdentity, ResultDocument, ResultStatus,
+            HostAction, LastReconciliation, MutationOperation, Reason, ReconciledRelease,
+            ReconcilerIdentity, ReconciliationTransition, SuccessfulMutation,
         };
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reconciliation.json");
         assert_eq!(read_last_reconciliation(&path).unwrap(), None);
-        let record = LastReconciliation {
-            schema: LastReconciliation::SCHEMA,
-            operation: Operation::Rollback,
-            reason: Reason::Update,
-            attempt_id: format!("{}r", "a".repeat(64)),
-            candidate: ReconciledRelease {
-                version: "1.0.0".into(),
-                manifest_sha256: "a".repeat(64),
-                archive_sha256: "b".repeat(64),
-            },
-            predecessor: ReconciledRelease {
-                version: "2.0.0".into(),
-                manifest_sha256: "c".repeat(64),
-                archive_sha256: "d".repeat(64),
-            },
-            reconciler: ReconcilerIdentity {
-                provider_set_sha256: "e".repeat(64),
-                product: "system".into(),
-                release: ReconciledRelease {
-                    version: "3.0.0".into(),
-                    manifest_sha256: "f".repeat(64),
-                    archive_sha256: "0".repeat(64),
-                },
-            },
-            result: ResultDocument {
-                schema: ResultDocument::SCHEMA,
-                status: ResultStatus::Succeeded,
-                changed: true,
-                host_action: HostAction::None,
-                retry_after_seconds: None,
-                message: Some("restored predecessor".into()),
-            },
-            completed_at_ms: 1,
-        };
+        let transition = ReconciliationTransition::new(
+            ReconciledRelease::new("1.0.0".into(), "a".repeat(64), "b".repeat(64)).unwrap(),
+            ReconciledRelease::new("2.0.0".into(), "c".repeat(64), "d".repeat(64)).unwrap(),
+        );
+        let reconciler_release =
+            ReconciledRelease::new("3.0.0".into(), "f".repeat(64), "0".repeat(64)).unwrap();
+        let record = LastReconciliation::new(
+            MutationOperation::Rollback,
+            Reason::Update,
+            format!("{}r", "a".repeat(64)),
+            transition,
+            ReconcilerIdentity::new("e".repeat(64), "system".into(), reconciler_release).unwrap(),
+            SuccessfulMutation::new(true, HostAction::None, Some("restored predecessor".into()))
+                .unwrap(),
+            1,
+        )
+        .unwrap();
         write_last_reconciliation(&path, &record).unwrap();
         assert_eq!(read_last_reconciliation(&path).unwrap(), Some(record));
 

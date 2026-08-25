@@ -146,15 +146,15 @@ pub(crate) fn drives_rollback(tx: &Transaction) -> bool {
 /// Such a journal outlives its transaction whenever `clear_journal` fails (tolerated, with a
 /// warning, by the update's switch-over and by the rollback's finalize), and it stops classifying
 /// benignly the moment the active pointer moves off the release it names — an in-loop repair
-/// falling back to the predecessor, a `repair_from_assignment` installing the assigned release, or
-/// a restored backup. Classified `RestorePredecessor` it produced a boot that planned an
+/// falling back to the predecessor, or a restored backup. Classified `RestorePredecessor` it
+/// produced a boot that planned an
 /// activation and a commit, ran neither (every gate closed), and cleared the journal anyway:
 /// the node ran one release while the installed record — and every heartbeat derived from it —
 /// named another. It is spent, so the committed record decides instead.
 pub(crate) fn journal_recovery(
     tx: &Transaction,
     active: Option<&updated::bundle::ReleaseId>,
-    committed: Option<&updated::bundle::ReleaseId>,
+    committed: Option<&InstalledState>,
 ) -> Recovery {
     match transaction::classify_recovery(tx, active, committed) {
         Recovery::RestorePredecessor if !drives_rollback(tx) => Recovery::Committed,
@@ -169,9 +169,9 @@ fn reconcile_transaction(
     installed: &InstalledState,
 ) -> Recovery {
     plan.clear_journal = true;
-    let recovery = journal_recovery(tx, situation.active.as_ref(), Some(&installed.release));
+    let recovery = journal_recovery(tx, situation.active.as_ref(), Some(installed));
     if tx.candidate_rejection_required {
-        plan.reject_app.push((
+        plan.reject_candidate.push((
             tx.candidate_repository_lineage.clone(),
             tx.candidate_rejection_sha256.clone(),
         ));
@@ -215,7 +215,7 @@ fn reconcile_transaction(
             tx.previous_repository_lineage.clone(),
             tx.previous_release.clone(),
             tx.previous_archive_sha256.clone(),
-            tx.lifecycle.clone(),
+            tx.previous_lifecycle.clone(),
         ));
         plan.current = Some(tx.previous_release.version.clone());
     }
@@ -246,13 +246,12 @@ fn confirm_if_window_passed(
     pending: &Pending,
 ) {
     if window_passed(pending, situation.confirm_window, situation.now) {
-        // Confirming the current install: carry its providers forward unchanged.
-        plan.commit = Some(InstalledState::confirmed(
-            installed.repository_lineage.clone(),
-            installed.release.clone(),
-            installed.archive_sha256.clone(),
-            installed.lifecycle.clone(),
-        ));
+        // The value owns the one settlement transition. Cloning then settling preserves every
+        // other authenticated identity field instead of reconstructing a lookalike record here.
+        let mut settled = installed.clone();
+        let changed = settled.settle_update();
+        debug_assert!(changed, "this branch is entered with a pending update");
+        plan.commit = Some(settled);
         plan.info(format!("release {} confirmed", installed.release.version));
     }
 }
@@ -260,25 +259,77 @@ fn confirm_if_window_passed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{lineage, provider, release};
+    use crate::test_support::{deployment_rejection, digest, lineage, provider, release};
     use std::time::Duration;
     use updated::bundle::ReleaseId;
 
     fn steady() -> Situation {
         let current = release("1.0.0", "one");
+        let installed = InstalledState::confirmed(
+            lineage(),
+            current.clone(),
+            digest("archive-one"),
+            provider(),
+        );
+        installed.validate().expect("nominal fixture is durable");
         Situation {
-            installed: Installed::Present(Box::new(InstalledState::confirmed(
-                lineage(),
-                current.clone(),
-                "archive-one".into(),
-                provider(),
-            ))),
+            installed: Installed::Present(Box::new(installed)),
             active: Some(current),
             journal: None,
             bad_agent: None,
             confirm_window: Duration::from_secs(60),
             now: 100,
         }
+    }
+
+    fn transaction(
+        predecessor: ReleaseId,
+        candidate: ReleaseId,
+        phase: TransactionPhase,
+        candidate_rejection_required: bool,
+    ) -> Transaction {
+        let tx = Transaction {
+            id: digest("attempt"),
+            previous_release: predecessor,
+            previous_archive_sha256: digest("archive-one"),
+            previous_repository_lineage: lineage(),
+            candidate_release: candidate,
+            candidate_archive_sha256: digest("archive-two"),
+            candidate_rejection_sha256: deployment_rejection(
+                &digest("archive-two"),
+                &provider().provider_set_sha256,
+            ),
+            candidate_repository_lineage: lineage(),
+            candidate_rejection_required,
+            previous_lifecycle: provider(),
+            candidate_lifecycle: provider(),
+            rollback_health_failures: 0,
+            phase,
+        };
+        tx.validate().expect("nominal fixture is durable");
+        tx
+    }
+
+    fn update_head(predecessor: ReleaseId, candidate: ReleaseId) -> InstalledState {
+        let tx = transaction(predecessor, candidate, TransactionPhase::Committed, false);
+        let state = InstalledState {
+            repository_lineage: tx.candidate_repository_lineage,
+            release: tx.candidate_release,
+            archive_sha256: tx.candidate_archive_sha256,
+            lifecycle: tx.candidate_lifecycle,
+            pending: Some(Pending {
+                lifecycle_attempt_id: tx.id,
+                candidate_rejection_sha256: tx.candidate_rejection_sha256,
+                previous_release: tx.previous_release,
+                previous_archive_sha256: tx.previous_archive_sha256,
+                previous_repository_lineage: tx.previous_repository_lineage,
+                committed_at: 100,
+                lifecycle: tx.previous_lifecycle,
+            }),
+            confirmed: true,
+        };
+        state.validate().expect("nominal fixture is durable");
+        state
     }
 
     #[test]
@@ -293,23 +344,21 @@ mod tests {
         let mut situation = steady();
         let candidate = release("2.0.0", "two");
         situation.active = Some(candidate.clone());
-        situation.journal = Some(Transaction {
-            id: "attempt".into(),
-            previous_release: release("1.0.0", "one"),
-            previous_archive_sha256: "archive-one".into(),
-            previous_repository_lineage: lineage(),
-            candidate_release: candidate,
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
-            candidate_repository_lineage: lineage(),
-            candidate_rejection_required: true,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase: TransactionPhase::Activating,
-        });
+        situation.journal = Some(transaction(
+            release("1.0.0", "one"),
+            candidate,
+            TransactionPhase::Activating,
+            true,
+        ));
         let plan = plan_boot(&situation);
         assert_eq!(plan.release, ReleaseFix::Activate(release("1.0.0", "one")));
-        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
+        assert_eq!(
+            plan.reject_candidate,
+            vec![(
+                lineage(),
+                deployment_rejection(&digest("archive-two"), &provider().provider_set_sha256)
+            )]
+        );
         assert!(plan
             .notes
             .iter()
@@ -321,22 +370,14 @@ mod tests {
         let mut situation = steady();
         let candidate = release("2.0.0", "two");
         situation.active = Some(candidate.clone());
-        situation.journal = Some(Transaction {
-            id: "attempt".into(),
-            previous_release: release("1.0.0", "one"),
-            previous_archive_sha256: "archive-one".into(),
-            previous_repository_lineage: lineage(),
-            candidate_release: candidate,
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
-            candidate_repository_lineage: lineage(),
-            candidate_rejection_required: false,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase: TransactionPhase::Activating,
-        });
+        situation.journal = Some(transaction(
+            release("1.0.0", "one"),
+            candidate,
+            TransactionPhase::Activating,
+            false,
+        ));
         let plan = plan_boot(&situation);
-        assert!(plan.reject_app.is_empty());
+        assert!(plan.reject_candidate.is_empty());
     }
 
     #[test]
@@ -348,77 +389,61 @@ mod tests {
         situation.installed = Installed::Present(Box::new(InstalledState {
             repository_lineage: lineage(),
             release: candidate.clone(),
-            archive_sha256: "archive-two".into(),
+            archive_sha256: digest("archive-two"),
             lifecycle: provider(),
             pending: None,
             confirmed: true,
         }));
-        situation.journal = Some(Transaction {
-            id: "attempt".into(),
-            previous_release: predecessor,
-            previous_archive_sha256: "archive-one".into(),
-            previous_repository_lineage: lineage(),
-            candidate_release: candidate,
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
-            candidate_repository_lineage: lineage(),
-            candidate_rejection_required: true,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase: TransactionPhase::RollbackActivating,
-        });
+        situation.journal = Some(transaction(
+            predecessor,
+            candidate,
+            TransactionPhase::RollbackActivating,
+            true,
+        ));
 
         let plan = plan_boot(&situation);
 
-        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
+        assert_eq!(
+            plan.reject_candidate,
+            vec![(
+                lineage(),
+                deployment_rejection(&digest("archive-two"), &provider().provider_set_sha256)
+            )]
+        );
     }
 
     #[test]
-    fn journaled_rejection_is_replayed_when_activation_never_started() {
+    fn journaled_rejection_is_replayed_when_activation_failed_before_pointer_move() {
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let mut situation = steady();
-        situation.journal = Some(Transaction {
-            id: "attempt".into(),
-            previous_release: predecessor,
-            previous_archive_sha256: "archive-one".into(),
-            previous_repository_lineage: lineage(),
-            candidate_release: candidate,
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
-            candidate_repository_lineage: lineage(),
-            candidate_rejection_required: true,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase: TransactionPhase::Prepared,
-        });
+        situation.journal = Some(transaction(
+            predecessor.clone(),
+            candidate,
+            // Activation intent is durable before the Store re-verifies and moves the pointer.
+            // A verification failure can therefore reject the candidate while the pointer still
+            // names the predecessor, but a Prepared journal cannot carry that verdict.
+            TransactionPhase::Activating,
+            true,
+        ));
 
         let plan = plan_boot(&situation);
 
-        assert_eq!(plan.release, ReleaseFix::None);
-        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
+        assert_eq!(plan.release, ReleaseFix::Activate(predecessor));
+        assert_eq!(
+            plan.reject_candidate,
+            vec![(
+                lineage(),
+                deployment_rejection(&digest("archive-two"), &provider().provider_set_sha256)
+            )]
+        );
         assert!(plan.clear_journal);
     }
 
     /// The record as it looks when an update committed but its rollback was interrupted: the
     /// installed candidate still holds the `pending` naming the predecessor it displaced.
     fn candidate_with_pending(predecessor: &ReleaseId, candidate: ReleaseId) -> Installed {
-        Installed::Present(Box::new(InstalledState {
-            repository_lineage: lineage(),
-            release: candidate,
-            archive_sha256: "archive-two".into(),
-            lifecycle: provider(),
-            pending: Some(Pending {
-                lifecycle_attempt_id: "attempt".into(),
-                candidate_rejection_sha256: "f".repeat(64),
-                previous_release: predecessor.clone(),
-                previous_archive_sha256: "archive-one".into(),
-                previous_repository_lineage: lineage(),
-                committed_at: 100,
-                lifecycle: provider(),
-            }),
-            confirmed: true,
-        }))
+        Installed::Present(Box::new(update_head(predecessor.clone(), candidate)))
     }
 
     fn spent_journal(
@@ -426,20 +451,7 @@ mod tests {
         candidate: ReleaseId,
         phase: TransactionPhase,
     ) -> Transaction {
-        Transaction {
-            id: "attempt".into(),
-            previous_release: predecessor,
-            previous_archive_sha256: "archive-one".into(),
-            previous_repository_lineage: lineage(),
-            candidate_release: candidate,
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
-            candidate_repository_lineage: lineage(),
-            candidate_rejection_required: false,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase,
-        }
+        transaction(predecessor, candidate, phase, false)
     }
 
     fn spent_committed_journal(predecessor: ReleaseId, candidate: ReleaseId) -> Transaction {
@@ -467,8 +479,14 @@ mod tests {
             );
             // A spent journal must never be handed a recovery its resume gates cannot run.
             if spent {
+                let committed = InstalledState::confirmed(
+                    tx.candidate_repository_lineage.clone(),
+                    tx.candidate_release.clone(),
+                    tx.candidate_archive_sha256.clone(),
+                    tx.candidate_lifecycle.clone(),
+                );
                 assert_eq!(
-                    journal_recovery(&tx, Some(&release("3.0.0", "three")), Some(&candidate)),
+                    journal_recovery(&tx, Some(&release("3.0.0", "three")), Some(&committed)),
                     Recovery::Committed,
                     "{phase:?} cannot drive a rollback, so it must not claim one"
                 );
@@ -495,7 +513,7 @@ mod tests {
         situation.installed = Installed::Present(Box::new(InstalledState::confirmed(
             lineage(),
             repaired.clone(),
-            "archive-three".into(),
+            digest("archive-three"),
             provider(),
         )));
         situation.journal = Some(spent_journal(
@@ -547,7 +565,7 @@ mod tests {
             Some(InstalledState::confirmed(
                 lineage(),
                 predecessor,
-                "archive-one".into(),
+                digest("archive-one"),
                 provider(),
             )),
             "the record must name the release that is actually running"
@@ -577,7 +595,7 @@ mod tests {
             Some(InstalledState::confirmed(
                 lineage(),
                 candidate,
-                "archive-two".into(),
+                digest("archive-two"),
                 provider(),
             )),
             "the passed window confirms the candidate and clears its pending record"
@@ -587,22 +605,7 @@ mod tests {
     /// The record of an update that committed over `1.0.0` and is still inside its confirmation
     /// window: the head, plus the `pending` naming the predecessor it displaced.
     fn unconfirmed_head() -> InstalledState {
-        InstalledState {
-            repository_lineage: lineage(),
-            release: release("2.0.0", "two"),
-            archive_sha256: "archive-two".into(),
-            lifecycle: provider(),
-            pending: Some(Pending {
-                lifecycle_attempt_id: "attempt".into(),
-                candidate_rejection_sha256: "f".repeat(64),
-                previous_release: release("1.0.0", "one"),
-                previous_archive_sha256: "archive-one".into(),
-                previous_repository_lineage: lineage(),
-                committed_at: 100,
-                lifecycle: provider(),
-            }),
-            confirmed: true,
-        }
+        update_head(release("1.0.0", "one"), release("2.0.0", "two"))
     }
 
     #[test]
@@ -618,7 +621,7 @@ mod tests {
         let confirmed = InstalledState::confirmed(
             lineage(),
             release("2.0.0", "two"),
-            "archive-two".into(),
+            digest("archive-two"),
             provider(),
         );
         assert_eq!(plan_gate_failure(&confirmed), GateFailure::Report);
@@ -632,7 +635,7 @@ mod tests {
         let provisional = InstalledState::provisional(
             lineage(),
             release("2.0.0", "two"),
-            "archive-two".into(),
+            digest("archive-two"),
             provider(),
         );
         assert_eq!(
@@ -653,13 +656,13 @@ mod tests {
         let plan = plan_boot(&situation);
 
         assert_eq!(plan.release, ReleaseFix::None);
-        assert!(plan.reject_app.is_empty());
+        assert!(plan.reject_candidate.is_empty());
         assert_eq!(
             plan.commit,
             Some(InstalledState::confirmed(
                 lineage(),
                 release("2.0.0", "two"),
-                "archive-two".into(),
+                digest("archive-two"),
                 provider(),
             ))
         );
@@ -676,29 +679,27 @@ mod tests {
         situation.installed = Installed::Present(Box::new(InstalledState {
             repository_lineage: lineage(),
             release: candidate.clone(),
-            archive_sha256: "archive-two".into(),
+            archive_sha256: digest("archive-two"),
             lifecycle: provider(),
             pending: None,
             confirmed: true,
         }));
-        situation.journal = Some(Transaction {
-            id: "attempt".into(),
-            previous_release: predecessor,
-            previous_archive_sha256: "archive-one".into(),
-            previous_repository_lineage: lineage(),
-            candidate_release: candidate,
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
-            candidate_repository_lineage: lineage(),
-            candidate_rejection_required: true,
-            lifecycle: provider(),
-            rollback_health_failures: 0,
-            phase: TransactionPhase::RollbackActivating,
-        });
+        situation.journal = Some(transaction(
+            predecessor,
+            candidate,
+            TransactionPhase::RollbackActivating,
+            true,
+        ));
 
         let plan = plan_boot(&situation);
 
-        assert_eq!(plan.reject_app, vec![(lineage(), "f".repeat(64))]);
+        assert_eq!(
+            plan.reject_candidate,
+            vec![(
+                lineage(),
+                deployment_rejection(&digest("archive-two"), &provider().provider_set_sha256)
+            )]
+        );
     }
 
     #[test]
@@ -707,22 +708,8 @@ mod tests {
         let candidate = release("2.0.0", "two");
         let mut situation = steady();
         situation.active = Some(predecessor.clone());
-        situation.installed = Installed::Present(Box::new(InstalledState {
-            repository_lineage: lineage(),
-            release: candidate,
-            archive_sha256: "archive-two".into(),
-            lifecycle: provider(),
-            pending: Some(Pending {
-                lifecycle_attempt_id: "attempt".into(),
-                candidate_rejection_sha256: "f".repeat(64),
-                previous_release: predecessor.clone(),
-                previous_archive_sha256: "archive-one".into(),
-                previous_repository_lineage: lineage(),
-                committed_at: 100,
-                lifecycle: provider(),
-            }),
-            confirmed: true,
-        }));
+        situation.installed =
+            Installed::Present(Box::new(update_head(predecessor.clone(), candidate)));
 
         let plan = plan_boot(&situation);
 
@@ -733,7 +720,7 @@ mod tests {
             Some(InstalledState::confirmed(
                 lineage(),
                 predecessor,
-                "archive-one".into(),
+                digest("archive-one"),
                 provider(),
             ))
         );

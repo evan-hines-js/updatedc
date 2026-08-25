@@ -75,6 +75,21 @@ pub(crate) fn signed_local_repair_without_network(ctx: &Ctx) -> R {
 
     ctx.publish(&dir, "app", "2.0.0", &v2)?;
     republish_assignment(&node, "offline-repair")?;
+    // Do not sample `active-release` immediately after publishing. Under load the assignment can
+    // be visible before the running node has completed its update, which makes this scenario
+    // corrupt 1.0.0, observe its perfectly valid repair, and then falsely demand a 2.0.0 repair.
+    // The success log is emitted only after `apply_update` has returned and cleared its journal;
+    // pair it with the durable installed record so the bytes modified below are unambiguously the
+    // committed 2.0.0 deployment this scenario intends to repair.
+    if !wait_until(EVENT_TIMEOUT, || {
+        stack.captured_log().contains("upgraded to 2.0.0")
+    }) || !wait_for_installed_version(&dir, "2.0.0", EVENT_TIMEOUT)
+    {
+        return fail(format!(
+            "the local deployment did not durably advance to 2.0.0 before repair setup:\n{}",
+            stack.captured_log()
+        ));
+    }
     let active: updated::bundle::ReleaseId = serde_json::from_slice(
         &std::fs::read(node.install_root.join("active-release")).map_err(str_err)?,
     )

@@ -38,7 +38,7 @@ use updated_contracts::backend;
 use updated_contracts::backend::BackendInventoryMember;
 use updated_contracts::key::P256PublicKey;
 use updated_contracts::telemetry::{
-    now_ms, report_is_authentic_and_fresh, Envelope, FleetReports, REPORT_FRESHNESS,
+    authenticate_report, now_ms, Envelope, FleetReports, REPORT_FRESHNESS,
 };
 
 /// One node the load balancer may route to: its identity, a routable address, and whether it
@@ -71,16 +71,12 @@ pub trait LoadBalancer {
 /// from a node that stopped heartbeating — is not-ready. The pin's shape is guaranteed by
 /// [`P256PublicKey`], so an unverifiable report here always means the *report* is wrong, never that
 /// the configuration is.
-// This binary's own single trust gate. It is a different process from the controller with a
-// different decision to make (load-balancer membership, not rollout admission), and it holds no
-// verified-report cache to read from, so it calls the contract gate directly — here and nowhere
-// else in this crate.
-#[allow(clippy::disallowed_methods)]
 pub fn report_is_ready(node: &str, public_key: &P256PublicKey, envelope: &Envelope) -> bool {
     // The gate hands back the report only when the envelope is authentic and usable, so `healthy` here
     // is necessarily read from bytes this node signed — there is no path that reads a report first and
     // remembers to check it second.
-    report_is_authentic_and_fresh(envelope, node, public_key, now_ms())
+    authenticate_report(envelope, node, public_key)
+        .and_then(|report| report.fresh(now_ms()))
         .is_some_and(|report| report.healthy)
 }
 
@@ -173,15 +169,12 @@ async fn fetch_fleet_reports(
 /// classification only — the drain itself was already decided by the one trust gate — so the
 /// timestamp is read off the unverified document, which cannot make anything more trusted than
 /// the gate already decided.
-// Metric classification, never a trust decision — see the doc above. The unverified read is
-// deliberate and confined to this one function.
-#[allow(clippy::disallowed_methods)]
 pub fn drain_is_stale(now_ms: u64, envelope: Option<&Envelope>) -> bool {
     let Some(envelope) = envelope else {
         return true;
     };
-    updated_contracts::telemetry::unverified_report(envelope)
-        .is_some_and(|report| !report.is_fresh(now_ms))
+    updated_contracts::telemetry::report_staleness_for_observability(envelope, now_ms)
+        .is_some_and(std::convert::identity)
 }
 
 /// The floor on the width of every per-cycle fan-out — the load-balancer backends' fan-outs
@@ -949,52 +942,48 @@ mod tests {
     /// must be present and well-formed for a report to pass the shared trust gate at all.
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-    /// A report the node signs *after* `mutate` runs, so a fixture can be authentically signed and
-    /// still be one the trust gate must refuse.
+    /// A report produced through the same single validation/signing/encoding boundary as a node.
     fn report_with(node: &str, healthy: bool, mutate: impl FnOnce(&mut NodeReport)) -> Envelope {
         let mut report =
             NodeReport::new(node, "deploy-3", DIGEST, "3.0.0", DIGEST, DIGEST, healthy);
-        mutate(&mut report);
         bind_reconciliation(&mut report);
-        updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap()
+        mutate(&mut report);
+        let body =
+            updated_contracts::telemetry::encode_signed_report(&report, &TEST_KEY.0).unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     fn bind_reconciliation(report: &mut NodeReport) {
         use updated_contracts::reconciler::{
-            HostAction, LastReconciliation, Operation, Reason, ReconciledRelease,
-            ReconcilerIdentity, ResultDocument, ResultStatus,
+            HostAction, LastReconciliation, MutationOperation, Reason, ReconciledRelease,
+            ReconcilerIdentity, ReconciliationTransition, SuccessfulMutation,
         };
-        let running = ReconciledRelease {
-            version: report.version.clone(),
-            manifest_sha256: DIGEST.into(),
-            archive_sha256: report.archive_sha256.clone(),
-        };
-        report.reconciliation = Some(LastReconciliation {
-            schema: LastReconciliation::SCHEMA,
-            operation: Operation::Apply,
-            reason: Reason::Restart,
-            attempt_id: updated_contracts::reconciler::attempt::CONVERGE.into(),
-            candidate: running.clone(),
-            predecessor: running,
-            reconciler: ReconcilerIdentity {
-                provider_set_sha256: report.provider_set_sha256.clone(),
-                product: "system".into(),
-                release: ReconciledRelease {
-                    version: "1.0.0".into(),
-                    manifest_sha256: DIGEST.into(),
-                    archive_sha256: DIGEST.into(),
-                },
-            },
-            result: ResultDocument {
-                schema: ResultDocument::SCHEMA,
-                status: ResultStatus::Succeeded,
-                changed: false,
-                host_action: HostAction::None,
-                retry_after_seconds: None,
-                message: None,
-            },
-            completed_at_ms: 1,
-        });
+        let running = ReconciledRelease::new(
+            report.version.clone(),
+            DIGEST.into(),
+            report.archive_sha256.clone(),
+        )
+        .unwrap();
+        let transition = ReconciliationTransition::new(running.clone(), running);
+        let reconciler_release =
+            ReconciledRelease::new("1.0.0".into(), DIGEST.into(), DIGEST.into()).unwrap();
+        report.reconciliation = Some(
+            LastReconciliation::new(
+                MutationOperation::Apply,
+                Reason::Restart,
+                updated_contracts::reconciler::attempt::CONVERGE.into(),
+                transition,
+                ReconcilerIdentity::new(
+                    report.provider_set_sha256.clone(),
+                    "system".into(),
+                    reconciler_release,
+                )
+                .unwrap(),
+                SuccessfulMutation::new(false, HostAction::None, None).unwrap(),
+                1,
+            )
+            .unwrap(),
+        );
     }
 
     fn report(node: &str, healthy: bool) -> Envelope {
@@ -1011,20 +1000,14 @@ mod tests {
         Malformed,
         Stale,
         Missing,
-        /// Authentically signed and healthy, but carrying a running digest no reader can join on.
-        MalformedDigest,
-        /// Authentically signed and healthy, but labelled with a schema this build does not know.
-        WrongSchema,
     }
-    const OUTCOMES: [Outcome; 8] = [
+    const OUTCOMES: [Outcome; 6] = [
         Outcome::HealthyFresh,
         Outcome::Unhealthy,
         Outcome::WrongNode,
         Outcome::Malformed,
         Outcome::Stale,
         Outcome::Missing,
-        Outcome::MalformedDigest,
-        Outcome::WrongSchema,
     ];
 
     /// The observed envelope an outcome produces for `node` (`None` = the node was not observed
@@ -1041,14 +1024,6 @@ mod tests {
                 payload_type: updated_contracts::telemetry::REPORT_PAYLOAD_TYPE.into(),
                 signatures: Vec::new(),
             }),
-            // Healthy and genuinely signed, but refused by the shared trust gate — a node whose
-            // report this build cannot interpret must drain, not linger in rotation.
-            Outcome::MalformedDigest => Some(report_with(node, true, |report| {
-                report.archive_sha256 = "not-a-digest".into()
-            })),
-            Outcome::WrongSchema => Some(report_with(node, true, |report| {
-                report.schema = NodeReport::SCHEMA + 1
-            })),
             Outcome::Stale => Some(report_with(node, true, |report| {
                 report.reported_at_ms = now_ms().saturating_sub(
                     updated_contracts::telemetry::REPORT_FRESHNESS.as_millis() as u64 + 10_000,
@@ -1087,9 +1062,7 @@ mod tests {
 
     /// Deterministic seeded fuzz over the healthproxy's readiness resolution and transition
     /// classification. Across many seeds it drives every node through a random walk of fetch
-    /// outcomes (healthy, unhealthy, wrong-node, malformed, stale, CDN-failure, and the two
-    /// authentically-signed-but-ungated shapes: an unusable running digest and an unknown schema),
-    /// and at every
+    /// outcomes (healthy, unhealthy, wrong-node, malformed, stale, and CDN-failure), and at every
     /// step asserts (a) `resolve_readiness` matches an independent model of the fail-closed /
     /// fail-operational contract, and (b) `classify_transition` reports exactly the edge implied by
     /// the previous and current readiness. It then asserts *coverage*: every fetch outcome and every

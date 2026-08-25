@@ -235,12 +235,12 @@ impl HealthWatch {
 /// changed assignment when convergence fails.
 async fn reconverge_environment(
     opts: &Options,
-    store: &dyn Store,
+    store: &Store,
     health: &mut HealthWatch,
-) -> io::Result<updated_contracts::reconciler::ResultDocument> {
+) -> io::Result<updated_contracts::reconciler::SuccessfulMutation> {
     health.reconverging(&opts.timeouts);
     let result = converge_environment(opts, store, Reason::Restart, attempt::CONVERGE)?;
-    if result.host_action == HostAction::Reboot {
+    if result.host_action() == HostAction::Reboot {
         return Ok(result);
     }
 
@@ -345,7 +345,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let mut launcher =
         Launcher::connect().map_err(|e| format!("connecting to the launcher: {e}"))?;
 
-    let mut store = FileStore::open(opts.paths.clone())?;
+    let mut store = Store::open(opts.paths.clone())?;
 
     // Reconcile any in-flight install journal and cold-install a fresh node, returning whether
     // this boot performed the install. That selects the boot converge's reason (install vs.
@@ -550,7 +550,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // recovery instead re-runs the predecessor's own `apply` on every boot until the rollback
     // completes — see [`complete_recovery_activation`].
     if recovery_transaction.is_none()
-        && converge_environment(&opts, &store, boot_reason, attempt::BOOT)?.host_action
+        && converge_environment(&opts, &store, boot_reason, attempt::BOOT)?.host_action()
             == HostAction::Reboot
     {
         request_host_reboot(&shutdown).await?;
@@ -573,8 +573,8 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     };
     // Attempt identity, release identity and providers are resolved together, from one source, so
     // the gate can never observe one release with another's hooks or under another's attempt.
-    let target = boot_gate_target(recovery_transaction.as_ref(), &installed_state);
-    let mut reconciler = ReleaseReconciler::new(&opts, target.lifecycle.as_ref(), boot_reason);
+    let target = boot_gate_target(recovery_transaction.as_ref(), &installed_state, boot_reason);
+    let mut reconciler = ReleaseReconciler::new(&opts, target.lifecycle.as_ref(), target.reason);
     let gate = update::became_healthy(
         &mut reconciler,
         &target.attempt,
@@ -614,7 +614,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             let opts = &opts;
             match bound_unhealthy_rollback(&mut store, tx, &mut |tx: &Transaction| {
                 run_lifecycle_mutation(
-                    tx.lifecycle.as_ref(),
+                    tx.previous_lifecycle.as_ref(),
                     opts,
                     MutationOperation::Rollback,
                     LifecycleInvocation {
@@ -692,7 +692,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     // (proven) head is reported and reconciled, not rejected as a broken head.
     if gate_passed {
         if let updated::state::Installed::Present(mut state) = store.installed() {
-            if state.confirm() {
+            if state.confirm_provisional() {
                 if let Err(error) = store.commit_installed(&state) {
                     warn(&format!("confirming the proven head failed: {error}"));
                 }
@@ -719,7 +719,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             recovery_transaction.as_ref(),
             recovery_transaction
                 .as_ref()
-                .map(|tx| tx.lifecycle.as_ref()),
+                .map(|tx| tx.previous_lifecycle.as_ref()),
         ) {
             let rollback_result = match run_lifecycle_mutation(
                 lifecycle,
@@ -741,7 +741,7 @@ async fn run(mut opts: Options) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(result) => result,
                 Err(error) => return Err(exit_for_relaunch("rollback recovery hook", &error)),
             };
-            if rollback_result.host_action == HostAction::Reboot {
+            if rollback_result.host_action() == HostAction::Reboot {
                 request_host_reboot(&shutdown).await?;
                 return Ok(());
             }
@@ -783,7 +783,7 @@ struct SteadyState {
     opts: Options,
     shutdown: Arc<AtomicBool>,
     launcher: Launcher,
-    store: FileStore,
+    store: Store,
     pending: Option<updated::state::Pending>,
     current: Option<String>,
     self_update: SelfUpdateState,
@@ -812,7 +812,11 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
     // for spending that capability. A broken remote identity is a configuration error, never an
     // excuse to silently downgrade. Local file repositories have no telemetry endpoint, so they
     // use one inert anonymous client without requiring node credentials.
-    let (telemetry_control_client, telemetry_object_client) = if opts.routing.is_local() {
+    let routing_is_local = opts
+        .routing
+        .is_local()
+        .map_err(|error| format!("invalid routing base URL: {error}"))?;
+    let (telemetry_control_client, telemetry_object_client) = if routing_is_local {
         let client = updated::tls::anonymous_object_client()?;
         (client.clone(), client)
     } else {
@@ -822,11 +826,12 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
         )
     };
     let signing_key = load_report_signing_key(
-        (!opts.routing.is_local()).then_some(opts.routing.mtls.client_key.as_path()),
+        (!routing_is_local).then_some(opts.routing.mtls.client_key.as_path()),
     )?;
     let mut heartbeat = Heartbeat {
         control_client: telemetry_control_client,
         object_client: telemetry_object_client,
+        control_base: (!routing_is_local).then_some(opts.routing.base_url.clone()),
         node: telemetry::node_identity(&opts.routing),
         // The node signs each report with the SAME per-node key that certifies its mTLS leaf, so
         // the control plane verifies authenticity end-to-end (not just on the write hop). Loaded
@@ -1049,7 +1054,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                         .map_err(|error| {
                             format!("converging the environment onto the repaired bundle: {error}")
                         })?;
-                    if result.host_action == HostAction::Reboot {
+                    if result.host_action() == HostAction::Reboot {
                         return Ok(TickFlow::Reboot);
                     }
                     // Take the repaired bundle through a LATER tick rather than falling through to the
@@ -1124,9 +1129,9 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
             // rest of the runtime — repository bounds, cadence, retention, and resolved inputs —
             // is signed into the same assignment and can change on a control-plane reassignment
             // with no version bump. Applying it here keeps every converge on the current contract.
-            if let Some((assignment, assignment_sha256)) =
-                repo.assignment().zip(repo.assignment_sha256())
-            {
+            if let Some(assignment_context) = repo.assignment_context() {
+                let assignment = assignment_context.document();
+                let assignment_sha256 = assignment_context.sha256();
                 match opts
                     .runtime_data
                     .reconcile(assignment_sha256, &assignment.runtime.inputs)
@@ -1167,7 +1172,7 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                             format!("converging the environment onto the new runtime: {error}")
                         })?;
                     opts.runtime_converged();
-                    if result.host_action == HostAction::Reboot {
+                    if result.host_action() == HostAction::Reboot {
                         return Ok(TickFlow::Reboot);
                     }
                     // Re-gate readiness from scratch — under the configured start grace, since
@@ -1221,10 +1226,10 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                             .map_err(|error| {
                                 format!("periodically converging the desired state: {error}")
                             })?;
-                        if result.changed {
+                        if result.changed() {
                             fingerprints.restart_after_deployment(Instant::now());
                         }
-                        if result.host_action == HostAction::Reboot {
+                        if result.host_action() == HostAction::Reboot {
                             return Ok(TickFlow::Reboot);
                         }
                     }
@@ -1261,7 +1266,6 @@ async fn run_steady_state(state: SteadyState) -> Result<(), Box<dyn std::error::
                 &opts,
                 last_repo.as_ref(),
                 &store,
-                current.as_deref(),
                 Settlement {
                     settled: pending.is_none() && health.last_ready,
                     updating: pending.is_some(),
@@ -1353,14 +1357,14 @@ pub(crate) fn error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemStore;
-    use crate::test_support::{provider, release};
+    use crate::store::MemoryBackend;
+    use crate::test_support::{deployment_rejection, digest, provider, release};
     use updated::bundle::ReleaseId;
     use updated::state::{Installed, InstalledState, RepositoryLineage};
     use updated::transaction::Phase;
 
     /// One loop tick's steady-state probe, recording exactly what it was lent.
-    fn tick(store: &dyn Store) -> (ReleaseId, Box<updated::state::ProviderRelease>) {
+    fn tick(store: &Store) -> (ReleaseId, Box<updated::state::ProviderRelease>) {
         probe_steady_target(store, |installed, _, lifecycle| {
             (installed.clone(), Box::new(lifecycle.clone()))
         })
@@ -1418,9 +1422,9 @@ mod tests {
 
     #[test]
     fn the_steady_probe_is_handed_the_provider_the_record_names_at_that_tick() {
-        // Two ticks of the health-probe loop with an in-loop repair between them, driven through
-        // the same call the loop makes. The repair commits a release AND a provider set of its own,
-        // and `garbage_collect` protects only what the installed record names — so a provider
+        // Two ticks of the health-probe loop with a normal journaled update between them, driven
+        // through the same call the loop makes. The update commits a release AND a provider set of
+        // its own, and `garbage_collect` protects only what the installed record names — so a provider
         // resolved once at boot named a bundle the very next collection was free to prune, after
         // which every periodic probe failed to resolve its command and the third one called
         // `application_failed`, terminal, on a tower that was serving fine.
@@ -1428,29 +1432,66 @@ mod tests {
         // The re-read is now structural rather than a convention this test could only watch: the
         // target is *lent* to the probe for the length of one call, so hoisting it back out of the
         // loop cannot compile without a deliberate clone.
-        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        let lineage = crate::test_support::lineage();
         let mut damaged = provider();
         damaged.release = release("1.0.0", "damaged-provider-manifest");
-        let mut store = MemStore {
-            installed: Some(InstalledState::confirmed(
-                lineage.clone(),
-                release("1.0.0", "damaged"),
-                "archive-damaged".into(),
-                damaged.clone(),
-            )),
-            ..MemStore::default()
-        };
+        let damaged_release = release("1.0.0", "damaged");
+        let damaged_state = InstalledState::confirmed(
+            lineage.clone(),
+            damaged_release.clone(),
+            digest("archive-damaged"),
+            damaged.clone(),
+        );
+        let mut store = Store::memory(MemoryBackend {
+            installed: Some(damaged_state.clone()),
+            active: Some(damaged_release.clone()),
+            ..MemoryBackend::default()
+        });
         let at_boot = tick(&store);
         assert_eq!(at_boot, (release("1.0.0", "damaged"), damaged));
 
         let repaired = release("1.0.1", "repaired");
+        let mut tx = Transaction {
+            id: digest("probe-update"),
+            previous_release: damaged_state.release.clone(),
+            previous_archive_sha256: damaged_state.archive_sha256.clone(),
+            previous_repository_lineage: damaged_state.repository_lineage.clone(),
+            candidate_release: repaired.clone(),
+            candidate_archive_sha256: digest("archive-repaired"),
+            candidate_rejection_sha256: deployment_rejection(
+                &digest("archive-repaired"),
+                &provider().provider_set_sha256,
+            ),
+            candidate_repository_lineage: lineage.clone(),
+            candidate_rejection_required: false,
+            previous_lifecycle: damaged_state.lifecycle.clone(),
+            candidate_lifecycle: provider(),
+            rollback_health_failures: 0,
+            phase: Phase::Prepared,
+        };
+        store.write_journal(&tx).unwrap();
+        tx.advance(Phase::Activating).unwrap();
+        store.write_journal(&tx).unwrap();
+        tx.advance(Phase::Committing).unwrap();
+        store.write_journal(&tx).unwrap();
+        store.activate(&repaired).unwrap();
         store
-            .commit_installed(&InstalledState::confirmed(
-                lineage,
-                repaired.clone(),
-                "archive-repaired".into(),
-                provider(),
-            ))
+            .commit_installed(&InstalledState {
+                repository_lineage: lineage,
+                release: repaired.clone(),
+                archive_sha256: digest("archive-repaired"),
+                lifecycle: provider(),
+                pending: Some(Pending {
+                    lifecycle_attempt_id: tx.id.clone(),
+                    candidate_rejection_sha256: tx.candidate_rejection_sha256,
+                    previous_release: tx.previous_release,
+                    previous_archive_sha256: tx.previous_archive_sha256,
+                    previous_repository_lineage: tx.previous_repository_lineage,
+                    lifecycle: tx.previous_lifecycle,
+                    committed_at: 1,
+                }),
+                confirmed: true,
+            })
             .unwrap();
 
         let after_repair = tick(&store);
@@ -1471,20 +1512,27 @@ mod tests {
     /// or a settled rollback. This is the structural guarantee behind "an abandoned rollback can
     /// never skip its compensation": no call site — present or future — can discard mid-flight
     /// evidence, because the refusal lives on the destroy operation itself. Pre-activation
-    /// journals displaced nothing and terminal phases have settled their debt, so those (and
-    /// only those) may go.
+    /// journals displaced nothing; a landed forward commit has transferred its exact rollback
+    /// authority to `installed.pending`; and a finished rollback has committed its exact
+    /// predecessor. Those proofs — never a terminal phase by itself — make a journal disposable.
     #[test]
     fn a_journal_that_owes_compensation_cannot_be_discarded() {
         for phase in Phase::ALL {
             let discardable = matches!(
                 phase,
-                Phase::Prepared | Phase::Committed | Phase::RolledBack
+                Phase::Prepared | Phase::Committing | Phase::Committed
             );
             let situation = interrupted_revert(Some(phase));
-            let mut store = MemStore {
-                journal: situation.journal,
-                ..MemStore::default()
+            let installed = match situation.installed {
+                Installed::Present(state) => Some(*state),
+                Installed::Missing | Installed::Invalid => None,
             };
+            let mut store = Store::memory(MemoryBackend {
+                journal: situation.journal,
+                installed,
+                active: situation.active,
+                ..MemoryBackend::default()
+            });
             let cleared = store.clear_journal();
             assert_eq!(
                 cleared.is_ok(),
@@ -1500,7 +1548,7 @@ mod tests {
             );
         }
         // No journal at all is trivially clearable — recovery retries a failed post-commit delete.
-        assert!(MemStore::default().clear_journal().is_ok());
+        assert!(Store::default().clear_journal().is_ok());
     }
 
     /// The one non-terminal phase whose journal can still be spent: a crash between the durable
@@ -1512,29 +1560,26 @@ mod tests {
         let situation = interrupted_revert(Some(Phase::Committing));
         let tx = situation.journal.unwrap();
         let candidate = tx.candidate_release.clone();
-
-        let landed = updated::state::InstalledState::provisional(
-            tx.candidate_repository_lineage.clone(),
-            candidate.clone(),
-            tx.candidate_archive_sha256.clone(),
-            tx.lifecycle.clone(),
-        );
-        let mut store = MemStore {
+        let landed = match situation.installed {
+            Installed::Present(state) => *state,
+            Installed::Missing | Installed::Invalid => panic!("expected committed candidate"),
+        };
+        let mut store = Store::memory(MemoryBackend {
             journal: Some(tx.clone()),
             installed: Some(landed),
             active: Some(candidate),
-            ..MemStore::default()
-        };
+            ..MemoryBackend::default()
+        });
         store.clear_journal().unwrap();
         assert!(store.journal().unwrap().is_none());
 
         // Same phase, but the machine still shows the predecessor: the commit did NOT land, the
         // transaction still owes it, and the journal survives.
-        let mut unlanded = MemStore {
+        let mut unlanded = Store::memory(MemoryBackend {
             active: Some(tx.previous_release.clone()),
             journal: Some(tx),
-            ..MemStore::default()
-        };
+            ..MemoryBackend::default()
+        });
         assert!(unlanded.clear_journal().is_err());
         assert!(unlanded.journal().unwrap().is_some());
     }
@@ -1546,10 +1591,18 @@ mod tests {
     fn an_unsettled_journal_cannot_be_buried_by_another_transaction() {
         let situation = interrupted_revert(Some(Phase::RollbackApplied));
         let unsettled = situation.journal.unwrap();
-        let mut store = MemStore {
+        let candidate = InstalledState::confirmed(
+            unsettled.candidate_repository_lineage.clone(),
+            unsettled.candidate_release.clone(),
+            unsettled.candidate_archive_sha256.clone(),
+            provider(),
+        );
+        let mut store = Store::memory(MemoryBackend {
             journal: Some(unsettled.clone()),
-            ..MemStore::default()
-        };
+            installed: Some(candidate.clone()),
+            active: Some(candidate.release),
+            ..MemoryBackend::default()
+        });
 
         // The same transaction advancing is the normal durable path.
         let mut same = unsettled.clone();
@@ -1558,7 +1611,8 @@ mod tests {
 
         // A different transaction must not bury it...
         let mut other = unsettled.clone();
-        other.id = "another-attempt".into();
+        other.id = digest("another-attempt");
+        other.phase = Phase::Prepared;
         assert!(store.write_journal(&other).is_err());
         assert_eq!(store.journal().unwrap().unwrap().id, unsettled.id);
 
@@ -1567,6 +1621,15 @@ mod tests {
         store.write_journal(&settled).unwrap();
         settled.advance(Phase::RolledBack).unwrap();
         store.write_journal(&settled).unwrap();
+        store.activate(&settled.previous_release).unwrap();
+        store
+            .commit_installed(&InstalledState::confirmed(
+                settled.previous_repository_lineage.clone(),
+                settled.previous_release.clone(),
+                settled.previous_archive_sha256.clone(),
+                settled.previous_lifecycle.clone(),
+            ))
+            .unwrap();
         assert!(store.write_journal(&other).is_ok());
     }
 
@@ -1579,22 +1642,36 @@ mod tests {
             panic!("the fixture commits a head");
         };
         let lineage = installed.repository_lineage.clone();
-        let mut store = MemStore {
+        let mut store = Store::memory(MemoryBackend {
             installed: Some(*installed.clone()),
-            ..MemStore::default()
-        };
-        store.reject(&lineage, "not-the-committed-archive").unwrap();
-        store.reject(&lineage, &installed.archive_sha256).unwrap();
+            active: Some(installed.release.clone()),
+            ..MemoryBackend::default()
+        });
+        let other_archive = digest("not-the-committed-archive");
+        store.reject_artifact(&lineage, &other_archive).unwrap();
+        store
+            .reject_artifact(&lineage, &installed.archive_sha256)
+            .unwrap();
 
         // Bytes that never became the head keep their rejection.
         assert!(store
-            .clear_rejection(&lineage, "not-the-committed-archive")
+            .clear_application_rejection(&lineage, &other_archive)
             .is_err());
-        assert!(store.is_rejected(&lineage, "not-the-committed-archive"));
+        assert!(store.is_rejected(&lineage, &other_archive));
+
+        // A rollback may leave the candidate's committed record durable for crash recovery after
+        // the pointer has already returned to its predecessor. That stale record is not proof the
+        // rejected candidate now works and cannot erase the never-retry verdict.
+        store.memory_backend_mut().active = Some(release("0.9.0", "predecessor"));
+        assert!(store
+            .clear_application_rejection(&lineage, &installed.archive_sha256)
+            .is_err());
+        assert!(store.is_rejected(&lineage, &installed.archive_sha256));
 
         // The committed head's own stale rejection is the one erasure with proof behind it.
+        store.memory_backend_mut().active = Some(installed.release.clone());
         store
-            .clear_rejection(&lineage, &installed.archive_sha256)
+            .clear_application_rejection(&lineage, &installed.archive_sha256)
             .unwrap();
         assert!(!store.is_rejected(&lineage, &installed.archive_sha256));
     }
@@ -1603,19 +1680,22 @@ mod tests {
     /// revert a previous boot began — the active pointer is already back on the predecessor — with
     /// `journal` still on disk in the given phase.
     fn interrupted_revert(phase: Option<Phase>) -> Situation {
-        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        let lineage = crate::test_support::lineage();
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let installed = InstalledState {
             repository_lineage: lineage.clone(),
             release: candidate.clone(),
-            archive_sha256: "archive-two".into(),
+            archive_sha256: digest("archive-two"),
             lifecycle: provider(),
             pending: Some(updated::state::Pending {
-                lifecycle_attempt_id: "attempt".into(),
-                candidate_rejection_sha256: "f".repeat(64),
+                lifecycle_attempt_id: digest("attempt"),
+                candidate_rejection_sha256: deployment_rejection(
+                    &digest("archive-two"),
+                    &provider().provider_set_sha256,
+                ),
                 previous_release: predecessor.clone(),
-                previous_archive_sha256: "archive-one".into(),
+                previous_archive_sha256: digest("archive-one"),
                 previous_repository_lineage: lineage.clone(),
                 committed_at: 100,
                 lifecycle: provider(),
@@ -1626,16 +1706,20 @@ mod tests {
             installed: Installed::Present(Box::new(installed)),
             active: Some(predecessor.clone()),
             journal: phase.map(|phase| Transaction {
-                id: "attempt".into(),
+                id: digest("attempt"),
                 previous_release: predecessor,
-                previous_archive_sha256: "archive-one".into(),
+                previous_archive_sha256: digest("archive-one"),
                 previous_repository_lineage: lineage.clone(),
                 candidate_release: candidate,
-                candidate_archive_sha256: "archive-two".into(),
-                candidate_rejection_sha256: "f".repeat(64),
+                candidate_archive_sha256: digest("archive-two"),
+                candidate_rejection_sha256: deployment_rejection(
+                    &digest("archive-two"),
+                    &provider().provider_set_sha256,
+                ),
                 candidate_repository_lineage: lineage,
                 candidate_rejection_required: false,
-                lifecycle: provider(),
+                previous_lifecycle: provider(),
+                candidate_lifecycle: provider(),
                 rollback_health_failures: 0,
                 phase,
             }),
@@ -1720,17 +1804,20 @@ mod tests {
 
     /// The committed record of an unconfirmed update, as the boot health gate finds it.
     fn unconfirmed_head() -> InstalledState {
-        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        let lineage = crate::test_support::lineage();
         InstalledState {
             repository_lineage: lineage.clone(),
             release: release("2.0.0", "two"),
-            archive_sha256: "archive-two".into(),
+            archive_sha256: digest("archive-two"),
             lifecycle: provider(),
             pending: Some(updated::state::Pending {
-                lifecycle_attempt_id: "attempt".into(),
-                candidate_rejection_sha256: "f".repeat(64),
+                lifecycle_attempt_id: digest("attempt"),
+                candidate_rejection_sha256: deployment_rejection(
+                    &digest("archive-two"),
+                    &provider().provider_set_sha256,
+                ),
                 previous_release: release("1.0.0", "one"),
-                previous_archive_sha256: "archive-one".into(),
+                previous_archive_sha256: digest("archive-one"),
                 previous_repository_lineage: lineage,
                 committed_at: 100,
                 lifecycle: provider(),
@@ -1742,6 +1829,13 @@ mod tests {
     #[test]
     fn output_retention_uses_the_same_manifest_identity_as_its_writer_and_reader() {
         let head = unconfirmed_head();
+        let predecessor_manifest = head
+            .pending
+            .as_ref()
+            .unwrap()
+            .previous_release
+            .manifest_sha256
+            .clone();
         assert_ne!(head.release.manifest_sha256, head.archive_sha256);
         assert_ne!(
             head.pending
@@ -1753,26 +1847,26 @@ mod tests {
         );
         assert_eq!(
             protected_output_snapshot_manifests(&head),
-            vec!["two".to_string(), "one".to_string()],
+            vec![head.release.manifest_sha256.clone(), predecessor_manifest],
             "GC must protect the exact paths lifecycle output writes and telemetry reads"
         );
     }
 
-    fn store_holding(installed: &InstalledState) -> MemStore {
-        MemStore {
+    fn store_holding(installed: &InstalledState) -> Store {
+        Store::memory(MemoryBackend {
             installed: Some(installed.clone()),
             active: Some(installed.release.clone()),
-            ..MemStore::default()
-        }
+            ..MemoryBackend::default()
+        })
     }
 
     #[test]
     fn a_failed_gate_inside_the_window_records_a_drivable_revert_and_the_rejection() {
         // The one local revert left in the agent, at its decision point: the release's
         // `healthcheck` would not pass at boot while the update was still unconfirmed, so the
-        // candidate is rejected by content hash and a rollback journal is left for the next boot —
-        // the single rollback implementation. Recording the intent rather than performing it here
-        // is what keeps that true.
+        // exact candidate deployment is rejected and a rollback journal is left for the next boot
+        // — the single rollback implementation. Recording the intent rather than performing it
+        // here is what keeps that true.
         let head = unconfirmed_head();
         let mut store = store_holding(&head);
 
@@ -1784,15 +1878,17 @@ mod tests {
         assert!(journal.candidate_rejection_required);
         assert!(journal.recovery_pending(Phase::RollbackApplied));
         assert!(journal.recovery_pending(Phase::RolledBack));
-        assert!(store.is_rejected(&head.repository_lineage, &"f".repeat(64)));
+        let rejection = &head.pending.as_ref().unwrap().candidate_rejection_sha256;
+        assert!(store.is_rejected(&head.repository_lineage, rejection));
+        assert!(!store.is_rejected(&head.repository_lineage, &digest("archive-two")));
     }
 
     #[test]
     fn a_repaired_boot_still_owes_the_revert_but_not_the_rejection() {
-        // A rejection is permanent and keyed by archive hash, so it may never be charged to bytes
+        // A rejection is permanent, so it may never be charged to a deployment whose application
         // this same boot re-downloaded and re-verified — the gate failed on a tree that no longer
-        // exists. The revert is owed either way: it is reversible, and the next boot finds an
-        // intact tree and charges a repeat failure to the release.
+        // exists. The revert is owed either way: it is reversible, and the next boot finds an intact
+        // tree and charges a repeat failure to the exact deployment.
         let head = unconfirmed_head();
         let mut store = store_holding(&head);
 
@@ -1801,9 +1897,10 @@ mod tests {
         let journal = store.journal().unwrap().expect("the revert is still owed");
         assert!(journal.is_rollback());
         assert!(!journal.candidate_rejection_required);
+        let rejection = &head.pending.as_ref().unwrap().candidate_rejection_sha256;
         assert!(
-            !store.is_rejected(&head.repository_lineage, "archive-two"),
-            "the repair re-verified these bytes; they must not be blacklisted"
+            !store.is_rejected(&head.repository_lineage, rejection),
+            "the repair re-verified the application; the deployment must not be blacklisted"
         );
     }
 
@@ -1814,9 +1911,9 @@ mod tests {
         // there is no predecessor image left, and reverting would fight the assignment — so it is
         // reported unhealthy and the agent keeps reconciling.
         let confirmed = InstalledState::confirmed(
-            RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+            crate::test_support::lineage(),
             release("2.0.0", "two"),
-            "archive-two".into(),
+            digest("archive-two"),
             provider(),
         );
         assert_eq!(boot::plan_gate_failure(&confirmed), GateFailure::Report);
@@ -1864,36 +1961,51 @@ mod tests {
 
     #[test]
     fn a_persistently_unhealthy_rollback_target_descends_instead_of_looping() {
-        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        let lineage = crate::test_support::lineage();
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
         let tx = Transaction {
-            id: "attempt".into(),
+            id: digest("attempt"),
             previous_release: predecessor.clone(),
-            previous_archive_sha256: "archive-one".into(),
+            previous_archive_sha256: digest("archive-one"),
             previous_repository_lineage: lineage.clone(),
             candidate_release: candidate.clone(),
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
+            candidate_archive_sha256: digest("archive-two"),
+            candidate_rejection_sha256: deployment_rejection(
+                &digest("archive-two"),
+                &provider().provider_set_sha256,
+            ),
             candidate_repository_lineage: lineage.clone(),
             candidate_rejection_required: true,
-            lifecycle: provider(),
+            previous_lifecycle: provider(),
+            candidate_lifecycle: provider(),
             rollback_health_failures: 0,
             // Reproduce a later resume boot: a prior process recorded a healthy predecessor, then
             // a machine reboot lost the workload before this boot's authoritative gate. The
             // durable failure tally must remain writable at this phase too.
             phase: Phase::RollbackVerified,
         };
-        let mut store = MemStore {
+        let mut store = Store::memory(MemoryBackend {
             installed: Some(InstalledState::confirmed(
                 lineage.clone(),
                 candidate.clone(),
-                "archive-two".into(),
+                digest("archive-two"),
                 provider(),
             )),
+            active: Some(predecessor.clone()),
             journal: Some(tx),
-            ..MemStore::default()
-        };
+            ..MemoryBackend::default()
+        });
+        // A real rollback journal that requires rejection is created only after the candidate's
+        // verdict is durable. Keep the synthetic machine state complete so the final clear proves
+        // both the original rejection and this test's later predecessor rejection.
+        store
+            .reject_deployment(
+                &lineage,
+                &digest("archive-two"),
+                &provider().provider_set_sha256,
+            )
+            .unwrap();
 
         // Each iteration models one boot that re-derives the rollback from the durable journal and
         // fails the predecessor's health gate. The loop must terminate (descend), never spin.
@@ -1936,13 +2048,20 @@ mod tests {
         // destroyed.
         assert_eq!(
             compensations,
-            vec![("attemptr".to_string(), predecessor.clone(), candidate)],
+            vec![(
+                format!("{}r", digest("attempt")),
+                predecessor.clone(),
+                candidate
+            )],
             "the descend compensates exactly once, with the rollback direction's arguments"
         );
-        // On descent the predecessor's bytes are rejected and it is recorded provisional with the
-        // journal cleared — exactly the state `ensure_installed` treats as "descend via ordered
-        // fallback past this head" on the next boot.
-        assert!(store.is_rejected(&lineage, "archive-one"));
+        // On descent the exact predecessor deployment is rejected and it is recorded provisional
+        // with the journal cleared — exactly the state `ensure_installed` treats as "descend via
+        // ordered fallback past this head" on the next boot. Neither reusable artifact is poisoned.
+        let predecessor_rejection =
+            deployment_rejection(&digest("archive-one"), &provider().provider_set_sha256);
+        assert!(store.is_rejected(&lineage, &predecessor_rejection));
+        assert!(!store.is_rejected(&lineage, &digest("archive-one")));
         assert!(store.journal().unwrap().is_none());
         match store.installed() {
             Installed::Present(state) => {
@@ -1962,33 +2081,45 @@ mod tests {
         // bound journals the tally, invokes the hook, and — if the hook fails — exits with the
         // journal intact so the launcher relaunches. The next boot must NOT re-invoke it forever;
         // it descends uncompensated, which is what bounds the whole thing at two boots.
-        let lineage = RepositoryLineage::from_metadata_url("https://repo/metadata/");
+        let lineage = crate::test_support::lineage();
         let predecessor = release("1.0.0", "one");
         let candidate = release("2.0.0", "two");
-        let mut store = MemStore {
+        let mut store = Store::memory(MemoryBackend {
             installed: Some(InstalledState::confirmed(
                 lineage.clone(),
                 candidate.clone(),
-                "archive-two".into(),
+                digest("archive-two"),
                 provider(),
             )),
+            active: Some(predecessor.clone()),
             journal: Some(Transaction {
-                id: "attempt".into(),
+                id: digest("attempt"),
                 previous_release: predecessor.clone(),
-                previous_archive_sha256: "archive-one".into(),
+                previous_archive_sha256: digest("archive-one"),
                 previous_repository_lineage: lineage.clone(),
                 candidate_release: candidate,
-                candidate_archive_sha256: "archive-two".into(),
-                candidate_rejection_sha256: "f".repeat(64),
+                candidate_archive_sha256: digest("archive-two"),
+                candidate_rejection_sha256: deployment_rejection(
+                    &digest("archive-two"),
+                    &provider().provider_set_sha256,
+                ),
                 candidate_repository_lineage: lineage.clone(),
                 candidate_rejection_required: true,
-                lifecycle: provider(),
+                previous_lifecycle: provider(),
+                candidate_lifecycle: provider(),
                 // Two boots have already failed the gate; this is the boot that reaches the bound.
                 rollback_health_failures: MAX_ROLLBACK_HEALTH_ATTEMPTS - 1,
                 phase: Phase::RollbackApplied,
             }),
-            ..MemStore::default()
-        };
+            ..MemoryBackend::default()
+        });
+        store
+            .reject_deployment(
+                &lineage,
+                &digest("archive-two"),
+                &provider().provider_set_sha256,
+            )
+            .unwrap();
 
         let mut invocations = 0u32;
         let mut derived = store.journal().unwrap().expect("the rollback journal");
@@ -2004,7 +2135,7 @@ mod tests {
             .expect("the journal survives so the next boot still owes the descend");
         assert_eq!(held.rollback_health_failures, MAX_ROLLBACK_HEALTH_ATTEMPTS);
         assert!(
-            !store.is_rejected(&lineage, "archive-one"),
+            !store.is_rejected(&lineage, &digest("archive-one")),
             "nothing is decided until the descend actually runs"
         );
 
@@ -2020,7 +2151,10 @@ mod tests {
             invocations, 1,
             "the durable tally makes the compensation one-shot, never a relaunch loop"
         );
-        assert!(store.is_rejected(&lineage, "archive-one"));
+        let predecessor_rejection =
+            deployment_rejection(&digest("archive-one"), &provider().provider_set_sha256);
+        assert!(store.is_rejected(&lineage, &predecessor_rejection));
+        assert!(!store.is_rejected(&lineage, &digest("archive-one")));
         assert!(store.journal().unwrap().is_none());
         match store.installed() {
             Installed::Present(state) => {
@@ -2100,9 +2234,10 @@ mod tests {
             Some(rollback_of_unconfirmed(&head, &pending, false)),
             "the fallback's revert is the one shape every other revert produces"
         );
+        let rejection = &head.pending.as_ref().unwrap().candidate_rejection_sha256;
         assert!(
-            !store.is_rejected(&head.repository_lineage, "archive-two"),
-            "damage to this disk is never charged to the release"
+            !store.is_rejected(&head.repository_lineage, rejection),
+            "damage to this disk is never charged to the deployment"
         );
         // And the boot that follows can still drive it: the record still names the candidate, so
         // the journal classifies as a resumable rollback.
@@ -2182,7 +2317,7 @@ mod tests {
         let root = PathBuf::from("/nonexistent/updated-agent-tests");
         let routing = Routing {
             root: root.join("enrollment/routing"),
-            base_url: root.join("routing").display().to_string(),
+            base_url: format!("{}/", root.join("routing").display()),
             assignment: "assignments/agents/agent-test.json".into(),
             transport_timeout: Duration::from_secs(30),
             mtls: updated::tls::Identity::new(
@@ -2233,12 +2368,11 @@ mod tests {
         }
     }
 
-    /// The one bit the control plane cannot derive for itself, locked to the key the acquisition
-    /// paths actually write. A rejection is recorded under `(repository lineage, archive digest)`;
-    /// the heartbeat has to ask the same question with the same key, and a drift between the two
-    /// would not fail anything here — it would silently report "no rejection" for ever, so the
-    /// fleet-wide halt would never fire and the rejecting group would hold its set's rollout slot
-    /// with nothing naming the cause.
+    /// The one bit the control plane cannot derive for itself, locked to the identity the
+    /// acquisition paths actually write. A rejection is scoped by repository lineage and names
+    /// either one malformed artifact or the exact failed app/provider deployment; the heartbeat
+    /// has to ask the same central predicate or it can silently wait forever for impossible
+    /// convergence.
     #[test]
     fn the_heartbeat_reports_a_rejection_of_exactly_the_assigned_release() {
         use updated_contracts::artifact::TargetReference;
@@ -2261,30 +2395,51 @@ mod tests {
             release_root: serde_json::json!({}),
             runtime: runtime(),
         };
-        let mut store = MemStore::default();
+        let mut store = Store::default();
+        let lineage = RepositoryLineage::from_metadata_url(&assignment.metadata_url)
+            .expect("fixture metadata URL is valid");
         assert!(
-            !rejects_assigned_release(&store, &assignment),
+            !rejects_release(&store, &lineage, &assignment),
             "a node with no rejection record claims none"
         );
 
-        // Recorded through the very call every failure path uses, so this cannot pass on a key the
-        // production writer never produces.
-        let lineage = RepositoryLineage::from_metadata_url(&assignment.metadata_url);
-        store.reject(&lineage, &"c".repeat(64)).unwrap();
+        // Unrelated evidence says nothing about this assignment.
+        store.reject_artifact(&lineage, &"c".repeat(64)).unwrap();
         assert!(
-            !rejects_assigned_release(&store, &assignment),
+            !rejects_release(&store, &lineage, &assignment),
             "a rejection of OTHER bytes says nothing about the assigned release"
         );
         store
-            .reject(&lineage, &assignment.application.sha256)
+            .reject_deployment(
+                &lineage,
+                &assignment.application.sha256,
+                &assignment.provider_set.sha256,
+            )
             .unwrap();
-        assert!(rejects_assigned_release(&store, &assignment));
+        assert!(rejects_release(&store, &lineage, &assignment));
+        assert!(
+            !store.is_rejected(&lineage, &assignment.application.sha256)
+                && !store.is_rejected(&lineage, &assignment.provider_set.sha256),
+            "a failed combination does not poison either reusable artifact"
+        );
+
+        let mut malformed_artifact_store = Store::default();
+        malformed_artifact_store
+            .reject_artifact(&lineage, &assignment.application.sha256)
+            .unwrap();
+        assert!(rejects_release(
+            &malformed_artifact_store,
+            &lineage,
+            &assignment
+        ));
 
         // A different repository lineage is a different key: the same digest published through
         // another repository is not the release this node refused.
         let mut elsewhere = assignment.clone();
         elsewhere.metadata_url = "https://other-repo/metadata/".into();
-        assert!(!rejects_assigned_release(&store, &elsewhere));
+        let elsewhere_lineage = RepositoryLineage::from_metadata_url(&elsewhere.metadata_url)
+            .expect("fixture metadata URL is valid");
+        assert!(!rejects_release(&store, &elsewhere_lineage, &elsewhere));
     }
 
     #[test]

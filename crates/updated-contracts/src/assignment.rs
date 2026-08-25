@@ -101,11 +101,8 @@ impl RepositoryAssignment {
             ("metadataUrl", self.metadata_url.as_str()),
             ("targetsUrl", self.targets_url.as_str()),
         ] {
-            if !valid_repository_base(location) {
-                return Err(format!(
-                    "repository assignment {name} must be an HTTPS or absolute offline directory ending in /"
-                ));
-            }
+            canonical_repository_base(location)
+                .map_err(|error| format!("repository assignment {name} is invalid: {error}"))?;
         }
         for (name, reference) in [
             ("application", &self.application),
@@ -163,28 +160,40 @@ impl RepositoryAssignment {
     }
 }
 
-/// One grammar for any TUF repository base carried across the wire: authenticated HTTPS or an
-/// explicit absolute offline location, always directory-shaped and never carrying credentials or
-/// bearer query material.
-pub fn valid_repository_base(value: &str) -> bool {
-    if PathBuf::from(value).is_absolute() {
-        return value.ends_with(std::path::MAIN_SEPARATOR);
-    }
-    let Ok(url) = url::Url::parse(value) else {
-        return false;
+/// Parse and canonicalize the one TUF repository-base grammar carried across the wire.
+///
+/// Every consumer must go through this function: assignment and enrollment validation, transport
+/// construction, and durable repository-lineage identity. That makes equivalent URL spellings
+/// (host case, default ports and dot segments) the same repository, and makes it impossible for a
+/// parser at the trust boundary to admit a value the transport later interprets differently.
+/// Authenticated HTTPS and explicit absolute offline locations are accepted; every result is
+/// directory-shaped and carries no credentials or bearer query material.
+pub fn canonical_repository_base(value: &str) -> Result<url::Url, String> {
+    let url = if PathBuf::from(value).is_absolute() {
+        if !value.ends_with(std::path::MAIN_SEPARATOR) {
+            return Err("absolute offline directory must end in a path separator".into());
+        }
+        url::Url::from_directory_path(value)
+            .map_err(|()| "absolute offline directory cannot be represented as a file URL")?
+    } else {
+        url::Url::parse(value).map_err(|error| {
+            format!("must be an HTTPS/file base URL or absolute directory: {error}")
+        })?
     };
     if url.query().is_some()
         || url.fragment().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
-        || !url.path().ends_with('/')
     {
-        return false;
+        return Err("must not contain credentials, a query, or a fragment".into());
+    }
+    if url.cannot_be_a_base() || !url.path().ends_with('/') {
+        return Err("must identify a base directory ending with '/'".into());
     }
     match url.scheme() {
-        "https" => url.host_str().is_some(),
-        "file" => url.host_str().is_none() && url.to_file_path().is_ok(),
-        _ => false,
+        "https" if url.host_str().is_some() => Ok(url),
+        "file" if url.host_str().is_none() && url.to_file_path().is_ok() => Ok(url),
+        scheme => Err(format!("uses unsupported {scheme} scheme")),
     }
 }
 

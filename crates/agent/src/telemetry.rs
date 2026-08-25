@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use updated::config::Routing;
 use updated_contracts::dataflow::{FileSnapshot, OutputPublication, MAX_DATAFLOW_BODY_BYTES};
-use updated_contracts::telemetry::{sign_report, NodeReport};
+use updated_contracts::telemetry::{encode_signed_report, NodeReport};
 
 async fn upload_via_capability(
     control_client: &reqwest::Client,
@@ -390,7 +390,7 @@ pub async fn report_running_state(
     // end-to-end, rather than trusting the write hop.
     // Encoded under the ceiling every reader decodes with, so an over-large report fails here,
     // on the one machine that can do anything about it, rather than being dropped by the fleet.
-    let body = match sign_report(&report, key).and_then(|envelope| envelope.to_bounded_json()) {
+    let body = match encode_signed_report(&report, key) {
         Ok(body) => body,
         Err(error) => {
             crate::warn(&format!(
@@ -674,7 +674,7 @@ mod tests {
             },
             &RunningState {
                 deployment: "deployment",
-                assignment_sha256: "assignment",
+                assignment_sha256: &digest,
                 version: "1.0.0",
                 archive_sha256: &digest,
                 provider_set_sha256: &digest,
@@ -699,40 +699,34 @@ mod tests {
         manifest_sha256: &str,
     ) {
         use updated_contracts::reconciler::{
-            HostAction, LastReconciliation, Operation, Reason, ReconciledRelease,
-            ReconcilerIdentity, ResultDocument, ResultStatus,
+            HostAction, LastReconciliation, MutationOperation, Reason, ReconciledRelease,
+            ReconcilerIdentity, ReconciliationTransition, SuccessfulMutation,
         };
-        let release = ReconciledRelease {
-            version: version.into(),
-            manifest_sha256: manifest_sha256.into(),
-            archive_sha256: archive_sha256.into(),
-        };
-        let record = LastReconciliation {
-            schema: LastReconciliation::SCHEMA,
-            operation: Operation::Apply,
-            reason: Reason::Restart,
-            attempt_id: updated_contracts::reconciler::attempt::CONVERGE.into(),
-            candidate: release.clone(),
-            predecessor: release,
-            reconciler: ReconcilerIdentity {
-                provider_set_sha256: provider_set_sha256.into(),
-                product: "system".into(),
-                release: ReconciledRelease {
-                    version: "1.0.0".into(),
-                    manifest_sha256: archive_sha256.into(),
-                    archive_sha256: archive_sha256.into(),
-                },
-            },
-            result: ResultDocument {
-                schema: ResultDocument::SCHEMA,
-                status: ResultStatus::Succeeded,
-                changed: false,
-                host_action: HostAction::None,
-                retry_after_seconds: None,
-                message: None,
-            },
-            completed_at_ms: 1,
-        };
+        let release = ReconciledRelease::new(
+            version.into(),
+            manifest_sha256.into(),
+            archive_sha256.into(),
+        )
+        .unwrap();
+        let transition = ReconciliationTransition::new(release.clone(), release);
+        let reconciler_release =
+            ReconciledRelease::new("1.0.0".into(), archive_sha256.into(), archive_sha256.into())
+                .unwrap();
+        let record = LastReconciliation::new(
+            MutationOperation::Apply,
+            Reason::Restart,
+            updated_contracts::reconciler::attempt::CONVERGE.into(),
+            transition,
+            ReconcilerIdentity::new(
+                provider_set_sha256.into(),
+                "system".into(),
+                reconciler_release,
+            )
+            .unwrap(),
+            SuccessfulMutation::new(false, HostAction::None, None).unwrap(),
+            1,
+        )
+        .unwrap();
         std::fs::create_dir_all(paths.last_reconciliation.parent().unwrap()).unwrap();
         updated::reconciler::write_last_reconciliation(&paths.last_reconciliation, &record)
             .unwrap();

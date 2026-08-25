@@ -1,6 +1,6 @@
 use updated_contracts::reconciler::{
-    HostAction, LastReconciliation, Operation, Reason, ReconciledRelease, ReconcilerIdentity,
-    ResultDocument, ResultStatus,
+    HostAction, LastReconciliation, MutationOperation, Reason, ReconciledRelease,
+    ReconcilerIdentity, ReconciliationTransition, SuccessfulMutation,
 };
 use updated_contracts::telemetry::{Envelope, NodeReport};
 
@@ -11,40 +11,40 @@ pub(crate) fn bind_reconciliation(report: &mut NodeReport) {
         report.reconciliation = None;
         return;
     }
-    let running = ReconciledRelease {
-        version: report.version.clone(),
-        manifest_sha256: MANIFEST_SHA256.into(),
-        archive_sha256: report.archive_sha256.clone(),
-    };
-    report.reconciliation = Some(LastReconciliation {
-        schema: LastReconciliation::SCHEMA,
-        operation: Operation::Apply,
-        reason: Reason::Restart,
-        attempt_id: updated_contracts::reconciler::attempt::CONVERGE.into(),
-        candidate: running.clone(),
-        predecessor: running,
-        reconciler: ReconcilerIdentity {
-            provider_set_sha256: report.provider_set_sha256.clone(),
-            product: "system".into(),
-            release: ReconciledRelease {
-                version: "1.0.0".into(),
-                manifest_sha256: MANIFEST_SHA256.into(),
-                archive_sha256: MANIFEST_SHA256.into(),
-            },
-        },
-        result: ResultDocument {
-            schema: ResultDocument::SCHEMA,
-            status: ResultStatus::Succeeded,
-            changed: false,
-            host_action: HostAction::None,
-            retry_after_seconds: None,
-            message: None,
-        },
-        completed_at_ms: 1,
-    });
+    let running = ReconciledRelease::new(
+        report.version.clone(),
+        MANIFEST_SHA256.into(),
+        report.archive_sha256.clone(),
+    )
+    .unwrap();
+    let transition = ReconciliationTransition::new(running.clone(), running);
+    let reconciler_release = ReconciledRelease::new(
+        "1.0.0".into(),
+        MANIFEST_SHA256.into(),
+        MANIFEST_SHA256.into(),
+    )
+    .unwrap();
+    report.reconciliation = Some(
+        LastReconciliation::new(
+            MutationOperation::Apply,
+            Reason::Restart,
+            updated_contracts::reconciler::attempt::CONVERGE.into(),
+            transition,
+            ReconcilerIdentity::new(
+                report.provider_set_sha256.clone(),
+                "system".into(),
+                reconciler_release,
+            )
+            .unwrap(),
+            SuccessfulMutation::new(false, HostAction::None, None).unwrap(),
+            1,
+        )
+        .unwrap(),
+    );
 }
 
 pub(crate) fn sign_report(report: &mut NodeReport, key: &[u8]) -> Envelope {
     bind_reconciliation(report);
-    updated_contracts::telemetry::sign_report(report, key).unwrap()
+    let body = updated_contracts::telemetry::encode_signed_report(report, key).unwrap();
+    serde_json::from_slice(&body).unwrap()
 }

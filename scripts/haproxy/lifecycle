@@ -51,7 +51,7 @@ runtime="$root/runtime"
 publish_result() {
   local changed=$1
   [[ -n $result_file ]] || die "missing --result-file"
-  printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","retryAfterSeconds":null,"message":null}' \
+  printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","message":null}' \
     "$changed" >"$result_file"
 }
 

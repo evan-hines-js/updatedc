@@ -55,11 +55,11 @@ pub enum Stance<'a> {
     Nothing,
     /// `version` is installed: it is the anti-rollback floor, and re-selecting it is a no-op.
     Installed(&'a str),
-    /// `version` is installed and its bytes must be re-acquired anyway — a repair republishing a
-    /// drifted tree over the release the node is already committed to. Still the anti-rollback
-    /// floor and still no descent; only the "already installed, nothing to do" short-circuit is
-    /// lifted, because re-selecting it is the entire point.
-    Reacquire(&'a str),
+    /// These exact installed bytes must be re-acquired — a repair republishing a drifted tree over
+    /// the release the node is already committed to. Both version and digest are required: a
+    /// version-only repair followed the assignment when it moved and became an unjournaled second
+    /// update path. This identity is still the anti-rollback floor and can never descend.
+    Reacquire { version: &'a str, sha256: &'a str },
 }
 
 impl<'a> Stance<'a> {
@@ -68,7 +68,7 @@ impl<'a> Stance<'a> {
     pub fn floor(self) -> Option<&'a str> {
         match self {
             Self::Nothing => None,
-            Self::Installed(version) | Self::Reacquire(version) => Some(version),
+            Self::Installed(version) | Self::Reacquire { version, .. } => Some(version),
         }
     }
 
@@ -77,7 +77,7 @@ impl<'a> Stance<'a> {
     fn already_have(self) -> Option<&'a str> {
         match self {
             Self::Installed(version) => Some(version),
-            Self::Nothing | Self::Reacquire(_) => None,
+            Self::Nothing | Self::Reacquire { .. } => None,
         }
     }
 
@@ -91,7 +91,7 @@ impl<'a> Stance<'a> {
         match self {
             Self::Nothing => "<none>".into(),
             Self::Installed(version) => version.to_string(),
-            Self::Reacquire(version) => format!("{version} (re-acquiring)"),
+            Self::Reacquire { version, .. } => format!("{version} (re-acquiring exact bytes)"),
         }
     }
 }
@@ -119,8 +119,9 @@ enum CandidateVerdict {
     Installed,
     /// Below the running version: repository history, not an update.
     BelowInstalled,
-    /// These exact bytes were attempted and rolled back. Keyed by content hash, so a corrected
-    /// republish is eligible at once and the same bad bytes stay blocked under any label.
+    /// An artifact or this exact application/provider deployment was rejected. Every verdict is
+    /// content-addressed, so corrected content or a new artifact combination is eligible at once
+    /// while the exact failed identity stays blocked under any label.
     Rejected,
     /// Refused by policy — product, channel, platform, or the upgrade-only rule.
     Unauthorized(String),
@@ -135,50 +136,97 @@ impl CandidateVerdict {
             Self::NotAssignedHeadBytes => "not the assigned head bytes (sha256 mismatch)".into(),
             Self::Installed => "already installed".into(),
             Self::BelowInstalled => "below the installed version (downgrade policy)".into(),
-            Self::Rejected => "these bytes were attempted and rolled back".into(),
+            Self::Rejected => "its artifact or exact deployment was rejected".into(),
             Self::Unauthorized(error) => error.clone(),
+        }
+    }
+
+    /// Interpret the verdict for an exact target rather than a fallback walk.
+    ///
+    /// An already-installed or rejected target is an ordinary no-op. Every other refusal is a
+    /// trust/configuration failure: exact selection has no lower candidate to continue to, so
+    /// silently returning `None` would hide a malformed or unauthorized assignment.
+    fn exact_outcome(self) -> Result<bool, crate::Error> {
+        match self {
+            Self::Eligible => Ok(true),
+            Self::Installed | Self::Rejected => Ok(false),
+            other => Err(crate::Error::Trust(other.reason())),
+        }
+    }
+}
+
+/// The assigned ceiling is one indivisible version-and-digest pin.
+///
+/// Keeping the two values in one type makes it impossible to apply a version ceiling without the
+/// corresponding assigned bytes, or a digest pin at an unrelated version.
+#[derive(Clone, Copy)]
+struct AssignedCeiling<'a> {
+    version: &'a Version,
+    sha256: &'a str,
+}
+
+/// The complete immutable context for one candidate judgement.
+///
+/// Selection and diagnostics construct this once per walk and hand the same value to every
+/// candidate. The floor is derived here from the stance, and an assigned ceiling carries its digest
+/// in one value, so neither shared invariant can drift at a call site.
+struct CandidateRules<'policy, 'stance, 'ceiling> {
+    policy: &'policy DefaultPolicy,
+    stance: Stance<'stance>,
+    floor: Option<Version>,
+    ceiling: Option<AssignedCeiling<'ceiling>>,
+}
+
+impl<'policy, 'stance, 'ceiling> CandidateRules<'policy, 'stance, 'ceiling> {
+    fn new(
+        policy: &'policy DefaultPolicy,
+        stance: Stance<'stance>,
+        ceiling: Option<AssignedCeiling<'ceiling>>,
+    ) -> Self {
+        Self {
+            policy,
+            stance,
+            floor: stance
+                .floor()
+                .and_then(|version| Version::parse(version).ok()),
+            ceiling,
         }
     }
 }
 
 /// Judge one candidate against every gate, in the order the selector applies them.
-#[allow(clippy::too_many_arguments)]
 fn judge_candidate(
     target: &VerifiedTarget,
     version: &Version,
-    policy: &DefaultPolicy,
-    stance: Stance<'_>,
-    floor: Option<&Version>,
-    ceiling: Option<&Version>,
-    head_sha: Option<&str>,
+    rules: &CandidateRules<'_, '_, '_>,
     rejected: &mut impl FnMut(&VerifiedTarget, &str) -> bool,
 ) -> CandidateVerdict {
-    if ceiling.is_some_and(|ceiling| version > ceiling) {
-        return CandidateVerdict::AboveCeiling;
-    }
-    if let (Some(ceiling), Some(head_sha)) = (ceiling, head_sha) {
+    if let Some(ceiling) = rules.ceiling {
+        if version > ceiling.version {
+            return CandidateVerdict::AboveCeiling;
+        }
         // Through `digest::digests_match`, like every digest comparison on the trust path. The
         // assignment already requires canonical lowercase hex; the shared comparison also fails
         // closed if a locally corrupted value bypasses that boundary.
-        if version == ceiling
-            && !updated_contracts::digest::digests_match(&target_sha(target), head_sha)
+        if version == ceiling.version
+            && !updated_contracts::digest::digests_match(&target_sha(target), ceiling.sha256)
         {
             return CandidateVerdict::NotAssignedHeadBytes;
         }
     }
     // The anti-rollback floor. It comes off the stance, never off "is there a version string
     // here", so lifting the no-op short-circuit below cannot lift this with it.
-    if floor.is_some_and(|floor| version < floor) {
+    if rules.floor.as_ref().is_some_and(|floor| version < floor) {
         return CandidateVerdict::BelowInstalled;
     }
     let text = version.to_string();
-    if stance.already_have() == Some(text.as_str()) {
+    if rules.stance.already_have() == Some(text.as_str()) {
         return CandidateVerdict::Installed;
     }
     if rejected(target, &text) {
         return CandidateVerdict::Rejected;
     }
-    match policy.authorize(stance.floor(), target) {
+    match rules.policy.authorize(rules.stance.floor(), target) {
         Ok(()) => CandidateVerdict::Eligible,
         Err(error) => CandidateVerdict::Unauthorized(error.to_string()),
     }
@@ -196,31 +244,22 @@ fn select_update_from(
     targets: impl IntoIterator<Item = (VerifiedTarget, Version)>,
     policy: &DefaultPolicy,
     stance: Stance<'_>,
-    ceiling: Option<&Version>,
-    head_sha: Option<&str>,
+    ceiling: Option<AssignedCeiling<'_>>,
     mut note_skip: impl FnMut(&str),
     mut rejected: impl FnMut(&VerifiedTarget, &str) -> bool,
 ) -> Option<(VerifiedTarget, String)> {
     // Newest-first ordering lets the anti-rollback floor act as a watermark.
-    let floor = stance.floor().and_then(|v| Version::parse(v).ok());
+    let rules = CandidateRules::new(policy, stance, ceiling);
     let mut saw_current = false;
     for (target, version) in targets {
-        let verdict = judge_candidate(
-            &target,
-            &version,
-            policy,
-            stance,
-            floor.as_ref(),
-            ceiling,
-            head_sha,
-            &mut rejected,
-        );
+        let verdict = judge_candidate(&target, &version, &rules, &mut rejected);
         // Only once past the ceiling gates does an equal version count as "we have reached the
         // installed release": a candidate the ceiling excluded says nothing about where the node is.
         if !matches!(
             verdict,
             CandidateVerdict::AboveCeiling | CandidateVerdict::NotAssignedHeadBytes
-        ) && floor
+        ) && rules
+            .floor
             .as_ref()
             .is_some_and(|installed| &version == installed)
         {
@@ -234,7 +273,7 @@ fn select_update_from(
                 if !saw_current {
                     note_skip(&format!(
                         "no eligible update: downgrade policy blocks releases below {}",
-                        floor.as_ref().expect("a version to be below")
+                        rules.floor.as_ref().expect("a version to be below")
                     ));
                 }
                 break;
@@ -284,6 +323,22 @@ fn signed_provider_set(
     Ok(Some(reference))
 }
 
+/// The provider-set reference a desired application candidate would actually use.
+///
+/// The assigned head and older targets without a binding use the assignment set; a descended
+/// target with a readable binding uses its own. Selection, rejection filtering, and diagnostics
+/// all call this one classifier so none can report or skip a different deployed unit.
+fn effective_provider_set(
+    target: &VerifiedTarget,
+    assignment: &updated_contracts::assignment::RepositoryAssignment,
+    head_sha256: &str,
+) -> Result<updated_contracts::artifact::TargetReference, String> {
+    if updated_contracts::digest::digests_match(&target_sha(target), head_sha256) {
+        return Ok(assignment.provider_set.clone());
+    }
+    Ok(signed_provider_set(target)?.unwrap_or_else(|| assignment.provider_set.clone()))
+}
+
 /// Shared select-and-download path used by the long-running and one-shot modes.
 impl TrustedRepository {
     /// Resolve and authorize the application selected by the signed deployment
@@ -305,11 +360,54 @@ impl TrustedRepository {
         policy: &DefaultPolicy,
         stance: Stance<'_>,
         note_skip: impl FnMut(&str),
-        mut rejected: impl FnMut(&VerifiedTarget, &str) -> bool,
+        mut rejected: impl FnMut(
+            &VerifiedTarget,
+            &str,
+            Option<&updated_contracts::artifact::TargetReference>,
+        ) -> bool,
     ) -> Result<Option<SelectedRelease>, crate::Error> {
-        let assignment = self.assignment().ok_or_else(|| {
-            crate::Error::Trust("release repository has no desired deployment".into())
-        })?;
+        // Repair is not desired-state selection. It is reconstruction of the exact immutable
+        // artifact already committed on this node. Bind that request to both identity halves and
+        // resolve it from authenticated targets without requiring or consulting desired state. If
+        // the assignment moved or is temporarily absent, the ordinary update loop handles that
+        // separately; repair cannot activate a new head as a side effect.
+        if let Stance::Reacquire { version, sha256 } = stance {
+            let selected =
+                matching_targets(self, policy)
+                    .into_iter()
+                    .find(|(target, candidate)| {
+                        candidate.to_string() == version
+                            && updated_contracts::digest::digests_match(&target_sha(target), sha256)
+                    });
+            let Some((target, candidate)) = selected else {
+                return Ok(None);
+            };
+            // Repair carries the already-committed provider unchanged, so only the application
+            // archive participates in selection here.
+            let rules = CandidateRules::new(policy, stance, None);
+            if !judge_candidate(&target, &candidate, &rules, &mut |target, version| {
+                rejected(target, version, None)
+            })
+            .exact_outcome()?
+            {
+                return Ok(None);
+            }
+            return Ok(Some(SelectedRelease {
+                sha256: target_sha(&target),
+                target,
+                version: candidate.to_string(),
+                // Repair carries the already-committed provider identity unchanged. Returning a
+                // provider-set choice here would invite its caller to turn local byte repair into
+                // a provider-only desired-state transition.
+                provider_set: None,
+            }));
+        }
+        let assignment = self
+            .assignment_context()
+            .ok_or_else(|| {
+                crate::Error::Trust("release repository has no desired deployment".into())
+            })?
+            .document();
         let target = self.exact_target(&assignment.application)?;
         let ceiling = policy
             .candidate_version(&target)
@@ -324,13 +422,12 @@ impl TrustedRepository {
                 matching_targets(self, policy),
                 policy,
                 stance,
-                Some(&ceiling),
-                Some(head_sha),
+                Some(AssignedCeiling {
+                    version: &ceiling,
+                    sha256: head_sha,
+                }),
                 &mut note_skip,
                 |target, version| {
-                    if rejected(target, version) {
-                        return true;
-                    }
                     // Below the head, the app version's own signed provider set is what makes the
                     // descent a rollback of app and providers as one unit. A binding this build
                     // cannot read makes the candidate uninstallable, not provider-less: selecting
@@ -338,16 +435,14 @@ impl TrustedRepository {
                     // against the head's newer reconciler. Refuse it and keep descending, the same
                     // treatment a policy-ineligible target gets. At the head there is nothing to
                     // pin (the assignment governs), so its binding is not consulted at all.
-                    if updated_contracts::digest::digests_match(&target_sha(target), head_sha) {
-                        return false;
-                    }
-                    match signed_provider_set(target) {
-                        Ok(_) => false,
+                    let provider_set = match effective_provider_set(target, assignment, head_sha) {
+                        Ok(provider_set) => provider_set,
                         Err(error) => {
                             unbindable.push(format!("skipping {version}: {error}"));
-                            true
+                            return true;
                         }
-                    }
+                    };
+                    rejected(target, version, Some(&provider_set))
                 },
             )
             .map(|(target, version)| {
@@ -380,15 +475,21 @@ impl TrustedRepository {
         }
 
         let version = ceiling.to_string();
-        if stance.already_have() == Some(version.as_str()) {
+        let rules = CandidateRules::new(
+            policy,
+            stance,
+            Some(AssignedCeiling {
+                version: &ceiling,
+                sha256: &assignment.application.sha256,
+            }),
+        );
+        if !judge_candidate(&target, &ceiling, &rules, &mut |target, version| {
+            rejected(target, version, Some(&assignment.provider_set))
+        })
+        .exact_outcome()?
+        {
             return Ok(None);
         }
-        if rejected(&target, &version) {
-            return Ok(None);
-        }
-        policy
-            .authorize(stance.floor(), &target)
-            .map_err(|error| crate::Error::Trust(error.to_string()))?;
         let sha256 = target_sha(&target);
         Ok(Some(SelectedRelease {
             target,
@@ -400,16 +501,19 @@ impl TrustedRepository {
 
     /// A human-readable audit of every candidate ordered fallback could descend to and why each
     /// is or isn't selectable — for diagnosing an empty selection ("no installable application").
-    /// `is_rejected_sha` mirrors the caller's content-hash rejection check.
+    /// `is_rejected` mirrors the selector's deployed-unit rejection check. The provider argument
+    /// is absent only for a `Reacquire`, whose contract is to reproduce the already-committed
+    /// application archive rather than choose a new deployment.
     pub fn selection_diagnostics(
         &self,
         policy: &DefaultPolicy,
         stance: Stance<'_>,
-        mut is_rejected_sha: impl FnMut(&str) -> bool,
+        mut is_rejected: impl FnMut(&str, Option<&str>) -> bool,
     ) -> String {
-        let Some(assignment) = self.assignment() else {
+        let Some(assignment) = self.assignment_context() else {
             return "no desired deployment in the release repository".into();
         };
+        let assignment = assignment.document();
         let ceiling = self
             .exact_target(&assignment.application)
             .ok()
@@ -430,27 +534,42 @@ impl TrustedRepository {
                     .into(),
             );
         }
-        let floor = stance.floor().and_then(|v| Version::parse(v).ok());
-        // The same pin `assigned_application` walks with: the digest the control plane named.
-        let head_sha = ceiling
-            .as_ref()
-            .map(|_| assignment.application.sha256.clone());
+        // The same indivisible pin `assigned_application` walks with: the version and digest the
+        // control plane named.
+        let rules = CandidateRules::new(
+            policy,
+            stance,
+            ceiling.as_ref().map(|version| AssignedCeiling {
+                version,
+                sha256: &assignment.application.sha256,
+            }),
+        );
         for (target, version) in candidates {
             let sha = target_sha(&target);
             let short = &sha[..sha.len().min(12)];
+            let mut provider_error = None;
             // The selector's own judgement, not a second opinion assembled here: every gate it
             // applies is named, in the order it applies them, including the two this listing used
             // to be blind to.
-            let verdict = judge_candidate(
-                &target,
-                &version,
-                policy,
-                stance,
-                floor.as_ref(),
-                ceiling.as_ref(),
-                head_sha.as_deref(),
-                &mut |target, _| is_rejected_sha(&target_sha(target)),
-            );
+            let verdict = judge_candidate(&target, &version, &rules, &mut |target, _| {
+                let application_sha256 = target_sha(target);
+                if matches!(stance, Stance::Reacquire { .. }) {
+                    return is_rejected(&application_sha256, None);
+                }
+                match effective_provider_set(target, assignment, &assignment.application.sha256) {
+                    Ok(provider_set) => {
+                        is_rejected(&application_sha256, Some(&provider_set.sha256))
+                    }
+                    Err(error) => {
+                        provider_error = Some(error);
+                        true
+                    }
+                }
+            });
+            let verdict = match (verdict, provider_error) {
+                (CandidateVerdict::Rejected, Some(error)) => CandidateVerdict::Unauthorized(error),
+                (verdict, _) => verdict,
+            };
             lines.push(format!(
                 "  candidate {version} ({}) sha={short} verdict={}",
                 target.path,
@@ -471,7 +590,6 @@ impl TrustedRepository {
             matching_targets(self, policy),
             policy,
             stance,
-            None,
             None,
             note_skip,
             rejected,
@@ -532,35 +650,25 @@ mod tests {
         let judge = |target: &VerifiedTarget,
                      version: &Version,
                      stance: Stance<'_>,
-                     floor: Option<&Version>,
-                     ceiling: Option<&Version>,
-                     head: Option<&str>,
+                     ceiling: Option<AssignedCeiling<'_>>,
                      rejected: &mut dyn FnMut(&VerifiedTarget, &str) -> bool| {
-            judge_candidate(
-                target,
-                version,
-                &policy,
-                stance,
-                floor,
-                ceiling,
-                head,
-                &mut |t, v| rejected(t, v),
-            )
+            let rules = CandidateRules::new(&policy, stance, ceiling);
+            judge_candidate(target, version, &rules, &mut |t, v| rejected(t, v))
         };
 
         let (target, version) = candidate("2.0.0", 1);
         let head_sha = target_sha(&target);
         let ceiling = Version::parse("1.5.0").unwrap();
-        let installed = Version::parse("1.0.0").unwrap();
 
         assert_eq!(
             judge(
                 &target,
                 &version,
                 Stance::Nothing,
-                None,
-                Some(&ceiling),
-                None,
+                Some(AssignedCeiling {
+                    version: &ceiling,
+                    sha256: &head_sha,
+                }),
                 never
             ),
             CandidateVerdict::AboveCeiling
@@ -572,9 +680,10 @@ mod tests {
                 &target,
                 &version,
                 Stance::Nothing,
-                None,
-                Some(&at_ceiling),
-                Some(&"f".repeat(64)),
+                Some(AssignedCeiling {
+                    version: &at_ceiling,
+                    sha256: &"f".repeat(64),
+                }),
                 never
             ),
             CandidateVerdict::NotAssignedHeadBytes
@@ -585,9 +694,10 @@ mod tests {
                 &target,
                 &version,
                 Stance::Nothing,
-                None,
-                Some(&at_ceiling),
-                Some(&head_sha),
+                Some(AssignedCeiling {
+                    version: &at_ceiling,
+                    sha256: &head_sha,
+                }),
                 never
             ),
             CandidateVerdict::Eligible
@@ -598,46 +708,28 @@ mod tests {
                 &older,
                 &older_version,
                 Stance::Installed("1.0.0"),
-                Some(&installed),
-                None,
                 None,
                 never
             ),
             CandidateVerdict::BelowInstalled
         );
         assert_eq!(
-            judge(
-                &target,
-                &version,
-                Stance::Installed("2.0.0"),
-                None,
-                None,
-                None,
-                never
-            ),
+            judge(&target, &version, Stance::Installed("2.0.0"), None, never),
             CandidateVerdict::Installed
         );
         assert_eq!(
-            judge(&target, &version, Stance::Nothing, None, None, None, always),
+            judge(&target, &version, Stance::Nothing, None, always),
             CandidateVerdict::Rejected
         );
         // A downgrade the policy itself refuses, distinct from the watermark above.
         let wrong = DefaultPolicy::current("other-product", "stable");
+        let wrong_rules = CandidateRules::new(&wrong, Stance::Nothing, None);
         assert!(matches!(
-            judge_candidate(
-                &target,
-                &version,
-                &wrong,
-                Stance::Nothing,
-                None,
-                None,
-                None,
-                never
-            ),
+            judge_candidate(&target, &version, &wrong_rules, never),
             CandidateVerdict::Unauthorized(_)
         ));
         assert_eq!(
-            judge(&target, &version, Stance::Nothing, None, None, None, never),
+            judge(&target, &version, Stance::Nothing, None, never),
             CandidateVerdict::Eligible
         );
     }
@@ -654,7 +746,6 @@ mod tests {
             &policy(),
             Stance::Installed("2.0.0"),
             None,
-            None,
             |_| {},
             |_, v| v == "4.0.0",
         )
@@ -670,7 +761,6 @@ mod tests {
             targets.clone(),
             &policy(),
             Stance::Installed("3.0.0"),
-            None,
             None,
             |message| diagnostics.push(message.to_string()),
             |_, _| false,
@@ -696,7 +786,6 @@ mod tests {
             &policy(),
             Stance::Installed("4.0.0"),
             None,
-            None,
             |message| diagnostics.push(message.to_string()),
             |_, _| false,
         )
@@ -721,8 +810,10 @@ mod tests {
             foreign_head,
             &policy(),
             Stance::Nothing,
-            Some(&ceiling),
-            Some(assigned_head_sha.as_str()),
+            Some(AssignedCeiling {
+                version: &ceiling,
+                sha256: assigned_head_sha.as_str(),
+            }),
             |_| {},
             |_, _| false,
         )
@@ -735,8 +826,10 @@ mod tests {
             with_assigned_head,
             &policy(),
             Stance::Nothing,
-            Some(&ceiling),
-            Some(assigned_head_sha.as_str()),
+            Some(AssignedCeiling {
+                version: &ceiling,
+                sha256: assigned_head_sha.as_str(),
+            }),
             |_| {},
             |_, _| false,
         )
@@ -753,7 +846,6 @@ mod tests {
             targets,
             &policy(),
             Stance::Installed("1.0.0"),
-            None,
             None,
             |_| {},
             |t, _| target_sha(t) == rejected_hash,
@@ -837,7 +929,7 @@ mod provider_binding {
             .await
             .unwrap();
         // The assigned head is 2.0.0 + provider set B — both published together.
-        repository.assignment = Some(updated_contracts::assignment::RepositoryAssignment {
+        let document = updated_contracts::assignment::RepositoryAssignment {
             schema: updated_contracts::assignment::RepositoryAssignment::SCHEMA,
             deployment: "deploy".into(),
             metadata_url: source.metadata_url.clone(),
@@ -853,6 +945,14 @@ mod provider_binding {
             },
             release_root: serde_json::json!({}),
             runtime: runtime(),
+        };
+        let repository_lineage =
+            updated::state::RepositoryLineage::from_metadata_url(&document.metadata_url)
+                .expect("fixture metadata URL is valid");
+        repository.assignment = Some(crate::AssignmentContext {
+            document,
+            sha256: updated_contracts::digest::sha256_bytes(b"assignment fixture"),
+            repository_lineage,
         });
         (guard, repository)
     }
@@ -929,7 +1029,7 @@ mod provider_binding {
                 &policy(),
                 Stance::Nothing,
                 |skip| skips.push(skip.to_string()),
-                |_, version| version == "2.0.0",
+                |_, version, _| version == "2.0.0",
             )
             .unwrap()
             .expect("a readable predecessor is selectable");
@@ -960,7 +1060,7 @@ mod provider_binding {
                 &policy(),
                 Stance::Nothing,
                 |_| {},
-                |_, version| version == "2.0.0",
+                |_, version, _| version == "2.0.0",
             )
             .unwrap()
             .expect("a healthy predecessor is selectable");
@@ -983,7 +1083,7 @@ mod provider_binding {
     async fn first_install_at_head_defers_providers_to_the_assignment_like_every_other_node() {
         let (_tmp, repo) = repo_with_assignment(true).await;
         let selected = repo
-            .assigned_application(&policy(), Stance::Nothing, |_| {}, |_, _| false)
+            .assigned_application(&policy(), Stance::Nothing, |_| {}, |_, _, _| false)
             .unwrap()
             .expect("the head is selectable");
         assert_eq!(selected.version, "2.0.0");
@@ -992,6 +1092,50 @@ mod provider_binding {
             "ordered fallback binds a provider set only where it descended BELOW the assigned \
              head; at the head the assignment governs, so a provider-set-only revision reaches \
              newly enrolled and long-enrolled nodes alike"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_set_rejection_skips_the_whole_deployed_unit_without_poisoning_app_bytes() {
+        let (_tmp, repo) = repo_with_assignment(true).await;
+        let rejected_provider_set = repo
+            .assignment_context()
+            .expect("the fixture has an assignment")
+            .document()
+            .provider_set
+            .sha256
+            .clone();
+
+        let selected = repo
+            .assigned_application(
+                &policy(),
+                Stance::Nothing,
+                |_| {},
+                |_, _, provider_set| {
+                    provider_set.is_some_and(|provider| provider.sha256 == rejected_provider_set)
+                },
+            )
+            .unwrap()
+            .expect("ordered fallback can descend past a rejected provider set");
+
+        assert_eq!(selected.version, "1.0.0");
+        assert_eq!(
+            selected
+                .provider_set
+                .expect("the predecessor carries its own provider set")
+                .path,
+            "provider-sets/a.json"
+        );
+        let diagnostics =
+            repo.selection_diagnostics(&policy(), Stance::Nothing, |_, provider_set_sha256| {
+                provider_set_sha256 == Some(rejected_provider_set.as_str())
+            });
+        assert!(
+            diagnostics
+                .lines()
+                .any(|line| line.contains("candidate 2.0.0")
+                    && line.contains("artifact or exact deployment was rejected")),
+            "diagnostics must consume the same deployed-unit rejection rule: {diagnostics}"
         );
     }
 
@@ -1016,22 +1160,47 @@ mod provider_binding {
 
         // The version the node already has IS the assigned head: a repair must still select it,
         // where an ordinary `Installed` stance correctly answers "nothing to do".
+        let head_sha = repo
+            .assignment_context()
+            .expect("the fixture has an assignment")
+            .document()
+            .application
+            .sha256
+            .clone();
         let repaired = repo
-            .assigned_application(&policy(), Stance::Reacquire("2.0.0"), |_| {}, |_, _| false)
+            .assigned_application(
+                &policy(),
+                Stance::Reacquire {
+                    version: "2.0.0",
+                    sha256: &head_sha,
+                },
+                |_| {},
+                |_, _, _| false,
+            )
             .unwrap()
             .expect("a repair re-selects the release it is repairing");
         assert_eq!(repaired.version, "2.0.0");
         assert!(
-            repo.assigned_application(&policy(), Stance::Installed("2.0.0"), |_| {}, |_, _| false)
-                .unwrap()
-                .is_none(),
+            repo.assigned_application(
+                &policy(),
+                Stance::Installed("2.0.0"),
+                |_| {},
+                |_, _, _| false,
+            )
+            .unwrap()
+            .is_none(),
             "an ordinary pass over the installed head has nothing to do"
         );
 
         // The head is rejected. `Nothing` — a genuine cold install — descends to 1.0.0, which is
         // the whole point of ordered fallback. A repair on a node holding 2.0.0 must NOT: that
         // would be a downgrade past the floor, so it selects nothing instead.
-        let head_rejected = |_: &VerifiedTarget, version: &str| version == "2.0.0";
+        let head_rejected =
+            |_: &VerifiedTarget,
+             version: &str,
+             _: Option<&updated_contracts::artifact::TargetReference>| {
+                version == "2.0.0"
+            };
         assert_eq!(
             repo.assigned_application(&policy(), Stance::Nothing, |_| {}, head_rejected)
                 .unwrap()
@@ -1040,10 +1209,66 @@ mod provider_binding {
             "1.0.0"
         );
         assert!(
-            repo.assigned_application(&policy(), Stance::Reacquire("2.0.0"), |_| {}, head_rejected)
-                .unwrap()
-                .is_none(),
+            repo.assigned_application(
+                &policy(),
+                Stance::Reacquire {
+                    version: "2.0.0",
+                    sha256: &head_sha,
+                },
+                |_| {},
+                head_rejected,
+            )
+            .unwrap()
+            .is_none(),
             "a repair must not descend below the release the node is committed to"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repair_reacquires_the_committed_bytes_not_a_moved_assignment() {
+        let (_tmp, mut repo) = repo_with_assignment(true).await;
+        let (target, _) = matching_targets(&repo, &policy())
+            .into_iter()
+            .find(|(_, version)| version.to_string() == "1.0.0")
+            .expect("the committed predecessor is still authenticated by targets metadata");
+        let committed_sha = target_sha(&target);
+        // Repair is reconstruction of committed state, not desired-state selection. It remains
+        // possible while an assignment is absent, provided TUF still authenticates the exact
+        // committed version and digest.
+        repo.assignment = None;
+
+        let repaired = repo
+            .assigned_application(
+                &policy(),
+                Stance::Reacquire {
+                    version: "1.0.0",
+                    sha256: &committed_sha,
+                },
+                |_| {},
+                |_, _, _| false,
+            )
+            .unwrap()
+            .expect("the exact committed bytes remain repairable");
+        assert_eq!(repaired.version, "1.0.0");
+        assert_eq!(repaired.sha256, committed_sha);
+        assert!(
+            repaired.provider_set.is_none(),
+            "repair preserves the committed provider instead of selecting a desired one"
+        );
+
+        assert!(
+            repo.assigned_application(
+                &policy(),
+                Stance::Reacquire {
+                    version: "1.0.0",
+                    sha256: &"0".repeat(64),
+                },
+                |_| {},
+                |_, _, _| false,
+            )
+            .unwrap()
+            .is_none(),
+            "a version match cannot substitute differently packed bytes"
         );
     }
 
@@ -1051,7 +1276,12 @@ mod provider_binding {
     async fn established_node_defers_providers_to_the_assignment_for_provider_only_updates() {
         let (_tmp, repo) = repo_with_assignment(false).await;
         let selected = repo
-            .assigned_application(&policy(), Stance::Installed("1.0.0"), |_| {}, |_, _| false)
+            .assigned_application(
+                &policy(),
+                Stance::Installed("1.0.0"),
+                |_| {},
+                |_, _, _| false,
+            )
             .unwrap()
             .expect("the assigned head is an upgrade from 1.0.0");
         assert_eq!(selected.version, "2.0.0");

@@ -157,9 +157,14 @@ mod fixture {
 
 #[cfg(test)]
 mod error_tests {
-    use super::{assignment_identity, transport_timeout, validate_release_url, Error};
+    use super::{transport_timeout, Error};
     use crate::fixture::{assignment, runtime};
     use updated_contracts::assignment::RepositoryAssignment;
+
+    fn lineage(assignment: &RepositoryAssignment) -> updated::state::RepositoryLineage {
+        updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url)
+            .expect("fixture metadata URL is valid")
+    }
 
     /// Every way of not having a usable persisted assignment changes whether a transport outage can
     /// be survived, so each must be distinguishable. An `Option` would collapse ordinary first boot
@@ -199,7 +204,7 @@ mod error_tests {
             ("would move installRoot", |v| {
                 v["runtime"]["installRoot"] = serde_json::json!("/elsewhere");
             }),
-            ("metadataUrl must be", |v| {
+            ("metadataUrl is invalid", |v| {
                 v["metadataUrl"] = serde_json::json!("ftp://cdn/metadata/");
             }),
             ("deployment identity is invalid", |v| {
@@ -272,9 +277,9 @@ mod error_tests {
         };
         let a = at("https://cdn/a/metadata/", "https://cdn/a/targets/");
         let b = at("https://cdn/b/metadata/", "https://cdn/b/targets/");
-        assert_eq!(assignment_identity(&a), assignment_identity(&a));
-        assert_ne!(assignment_identity(&a), assignment_identity(&b));
-        assert_eq!(assignment_identity(&a).len(), 64);
+        assert_eq!(lineage(&a), lineage(&a));
+        assert_ne!(lineage(&a), lineage(&b));
+        assert_eq!(lineage(&a).as_str().len(), 64);
     }
 
     #[test]
@@ -288,10 +293,21 @@ mod error_tests {
             },
             ..assignment("deploy-1")
         };
-        let datastore = assignment_identity(&first);
+        let datastore = lineage(&first);
         first.deployment = "deploy-2".into();
         first.application.sha256 = "c".repeat(64);
-        assert_eq!(datastore, assignment_identity(&first));
+        assert_eq!(datastore, lineage(&first));
+    }
+
+    #[test]
+    fn changing_only_the_targets_mirror_keeps_the_tuf_rollback_history() {
+        let first = assignment("deployment");
+        let mirrored = RepositoryAssignment {
+            targets_url: "https://mirror/targets/".into(),
+            ..first.clone()
+        };
+
+        assert_eq!(lineage(&first), lineage(&mirrored));
     }
 
     #[test]
@@ -299,12 +315,12 @@ mod error_tests {
         // Mirror the exact protected-set construction in `assigned`: the active assignment's
         // identity is the one directory that must survive pruning, because it carries tough's
         // anti-rollback floor. A stale inactive assignment's cache is fair game.
-        let active = assignment_identity(&RepositoryAssignment {
+        let active = lineage(&RepositoryAssignment {
             metadata_url: "https://cdn/active/metadata/".into(),
             targets_url: "https://cdn/active/targets/".into(),
             ..assignment("active")
         });
-        let stale = assignment_identity(&RepositoryAssignment {
+        let stale = lineage(&RepositoryAssignment {
             metadata_url: "https://cdn/stale/metadata/".into(),
             targets_url: "https://cdn/stale/targets/".into(),
             ..assignment("stale")
@@ -314,13 +330,13 @@ mod error_tests {
         let guard = tempfile::tempdir().unwrap();
         let datastore = guard.path().to_path_buf();
         for identity in [&active, &stale] {
-            let dir = datastore.join(identity);
+            let dir = datastore.join(identity.as_str());
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("timestamp.json"), b"floor").unwrap();
         }
 
         // The active identity is excluded from the prune set exactly as in `assigned`.
-        let protected = std::iter::once(std::ffi::OsString::from(active.clone())).collect();
+        let protected = std::iter::once(std::ffi::OsString::from(active.as_str())).collect();
         // Zero inactive retention: without protection, both directories would be eligible.
         let removed =
             updated::gc::prune_directories(&datastore, &protected, 0, 0).expect("prune succeeds");
@@ -330,35 +346,14 @@ mod error_tests {
             "only the stale inactive cache should be removed"
         );
         assert!(
-            datastore.join(&active).is_dir(),
+            datastore.join(active.as_str()).is_dir(),
             "the active assignment's datastore (and its rollback floor) must survive pruning"
         );
         assert!(
-            !datastore.join(&stale).exists(),
+            !datastore.join(stale.as_str()).exists(),
             "a stale inactive assignment's cache is eligible for GC"
         );
         let _ = std::fs::remove_dir_all(&datastore);
-    }
-
-    #[test]
-    fn assigned_endpoints_are_https_or_local_base_locations() {
-        assert!(validate_release_url("metadataUrl", "https://cdn.example/metadata/").is_ok());
-        assert!(validate_release_url("metadataUrl", "file:///opt/update/metadata/").is_ok());
-        assert!(validate_release_url("metadataUrl", "/opt/update/metadata/").is_ok());
-        for invalid in [
-            "relative/metadata/",
-            "http://cdn.example/metadata/",
-            "ftp://cdn.example/metadata/",
-            "https://user:pass@cdn.example/metadata/",
-            "https://cdn.example/metadata/?generation=1",
-            "https://cdn.example/metadata/#fragment",
-            "https://cdn.example/metadata",
-        ] {
-            assert!(
-                validate_release_url("metadataUrl", invalid).is_err(),
-                "{invalid}"
-            );
-        }
     }
 
     fn routing() -> updated::config::Routing {
@@ -545,8 +540,33 @@ impl DownloadedTarget {
 pub struct TrustedRepository {
     config: updated::config::RepositorySource,
     repo: Repository,
-    assignment: Option<updated_contracts::assignment::RepositoryAssignment>,
-    assignment_sha256: Option<String>,
+    assignment: Option<AssignmentContext>,
+}
+
+/// The three identities authenticated together when the routing repository resolves an assignment.
+///
+/// Keeping the document, its exact-byte digest, and its repository lineage in one immutable value
+/// prevents downstream code from recomputing or accidentally pairing facts from different
+/// assignments. A plain [`TrustedRepository::load`] has no context; only
+/// [`TrustedRepository::assigned`] can construct one.
+pub struct AssignmentContext {
+    document: updated_contracts::assignment::RepositoryAssignment,
+    sha256: String,
+    repository_lineage: updated::state::RepositoryLineage,
+}
+
+impl AssignmentContext {
+    pub fn document(&self) -> &updated_contracts::assignment::RepositoryAssignment {
+        &self.document
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn repository_lineage(&self) -> &updated::state::RepositoryLineage {
+        &self.repository_lineage
+    }
 }
 
 /// Enroll (or load the one-way preplaced enrollment bundle), verify the current
@@ -719,11 +739,11 @@ fn persisted_assignment(enrollment_state: &Path, install_root: &Path) -> LiveAss
 
 /// Whether a routing document may serve as this node's live boot config, or why it may not.
 ///
-/// The signed contract's own `validate` covers its shape, but two of the facts that decide whether
-/// a node can boot on it are node-local and no publisher can check them: whether this build can
-/// fetch from the endpoints it names, and whether it leaves the node where the enrollment bundle
-/// put it. An `install_root` taken out of such a document would move the binary, state, journal and
-/// rejection set the launcher and agent operate on.
+/// The signed contract's own `validate` covers its shape and repository transport grammar. The
+/// remaining fact that decides whether this node can boot on it is node-local and no publisher can
+/// check it: whether the assignment leaves the node where the enrollment bundle put it. An
+/// `install_root` taken out of such a document would move the binary, state, journal and rejection
+/// set the launcher and agent operate on.
 ///
 /// The writer that commits a freshly resolved document and the reader that boots on the committed
 /// one both come through here, so no document can become the live config by a route that skips a
@@ -735,14 +755,6 @@ fn usable_as_boot_config(
 ) -> Result<(), String> {
     if let Err(error) = assignment.validate() {
         return Err(format!("is invalid ({error})"));
-    }
-    for (field, url) in [
-        ("metadataUrl", &assignment.metadata_url),
-        ("targetsUrl", &assignment.targets_url),
-    ] {
-        if let Err(error) = validate_release_url(field, url) {
-            return Err(format!("has a bad {field}: {error}"));
-        }
     }
     if assignment.runtime.install_root != install_root {
         return Err(format!(
@@ -1071,8 +1083,15 @@ impl TrustedRepository {
             sha256: assignment_sha256,
         } = resolved;
         let limits = &assignment.runtime.repository;
-        let assignment_key = assignment_identity(&assignment);
-        let assignment_store = paths.datastore.join(&assignment_key);
+        // The TUF rollback floor, installed-version ordering, and rejection policy are one
+        // repository-lineage fact. They all key exclusively on the authenticated metadata origin;
+        // moving the target-object mirror must not manufacture a blank rollback history.
+        let repository_lineage =
+            updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url)
+                .map_err(|error| {
+                    Error::Trust(format!("assignment metadataUrl is invalid: {error}"))
+                })?;
+        let assignment_store = paths.datastore.join(repository_lineage.as_str());
         std::fs::create_dir_all(&assignment_store).map_err(|error| {
             Error::Local(format!("creating assigned repository state: {error}"))
         })?;
@@ -1097,8 +1116,11 @@ impl TrustedRepository {
             mtls: routing_config.mtls.clone(),
         };
         let mut repository = Self::load(&source, &assignment_store).await?;
-        repository.assignment = Some(assignment);
-        repository.assignment_sha256 = Some(assignment_sha256);
+        repository.assignment = Some(AssignmentContext {
+            document: assignment,
+            sha256: assignment_sha256,
+            repository_lineage: repository_lineage.clone(),
+        });
         // The active assignment's datastore holds tough's version-monotonicity floor
         // (the highest timestamp/snapshot version this node has ever accepted). Pruning it
         // would let the next load restart with no floor and accept an older validly-signed,
@@ -1109,7 +1131,8 @@ impl TrustedRepository {
         // so the anti-rollback window collapses to the timestamp/snapshot expiry horizon.
         // Keeping that horizon short is a publishing-side concern, not enforced here; the
         // floor below is the durable defense and must not be discarded.
-        let protected = std::iter::once(assignment_key.into()).collect();
+        let protected =
+            std::iter::once(std::ffi::OsString::from(repository_lineage.as_str())).collect();
         if let Err(error) = updated::gc::prune_directories(
             &paths.datastore,
             &protected,
@@ -1133,7 +1156,6 @@ impl TrustedRepository {
             config: config.clone(),
             repo,
             assignment: None,
-            assignment_sha256: None,
         })
     }
 
@@ -1200,15 +1222,10 @@ impl TrustedRepository {
             .map(|target| to_verified(path, target))
     }
 
-    /// The exact desired deployment authenticated by the routing repository.
-    pub fn assignment(&self) -> Option<&updated_contracts::assignment::RepositoryAssignment> {
+    /// The exact desired deployment, exact-byte digest, and repository lineage authenticated by
+    /// the routing repository, exposed only as the unit they were resolved as.
+    pub fn assignment_context(&self) -> Option<&AssignmentContext> {
         self.assignment.as_ref()
-    }
-
-    /// The content digest of the assignment document this repository was resolved from — what the
-    /// node reports so the control plane can tell which exact configuration it is acting on.
-    pub fn assignment_sha256(&self) -> Option<&str> {
-        self.assignment_sha256.as_deref()
     }
 
     /// The largest target this repository will fetch — for [`assigned`](Self::assigned), the
@@ -1364,65 +1381,12 @@ impl TrustedRepository {
     }
 }
 
-fn assignment_identity(assignment: &updated_contracts::assignment::RepositoryAssignment) -> String {
-    // Metadata rollback history belongs to a repository endpoint, not a deployment.
-    // Changing exact desired targets must reuse the same datastore or every rollout
-    // would accidentally reset TUF's remembered version floor.
-    let mut bytes = Vec::new();
-    for endpoint in [&assignment.metadata_url, &assignment.targets_url] {
-        bytes.extend_from_slice(&(endpoint.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(endpoint.as_bytes());
-    }
-    updated_contracts::digest::sha256_bytes(&bytes)
-}
-
-fn validate_release_url(name: &str, raw: &str) -> Result<(), Error> {
-    repository_base(&format!("assignment {name}"), raw).map(|_| ())
-}
-
-/// One location grammar for automatic and manual deployments. HTTPS and file URLs are accepted
-/// directly; an absolute directory path is the shorthand used by a manually placed assignment.
-/// Plaintext network repositories are rejected here, before a transport exists. All admitted
-/// forms resolve to the same TUF transport.
+/// Turn the contracts crate's one repository grammar into the URL used by the transport. Keeping
+/// no local parser here is important: a location cannot pass the signed-contract boundary and then
+/// acquire a different meaning when TUF constructs its transport.
 fn repository_base(name: &str, raw: &str) -> Result<Url, Error> {
-    // An absolute path is decided by the platform, not by URL syntax: a Windows
-    // drive-letter path parses as a URL whose scheme is the drive letter, so it
-    // must be recognised as a directory before `Url::parse` sees it. This is the
-    // same rule `updated::config::base_url_is_local` applies to the same string.
-    let parsed = if Path::new(raw).is_absolute() {
-        None
-    } else {
-        Url::parse(raw).ok()
-    };
-    let url = match parsed {
-        Some(url) if matches!(url.scheme(), "https" | "file") => url,
-        Some(url) if !url.scheme().is_empty() => {
-            return Err(Error::Trust(format!(
-                "{name} uses unsupported {} scheme",
-                url.scheme()
-            )))
-        }
-        _ => Url::from_directory_path(Path::new(raw)).map_err(|_| {
-            Error::Trust(format!(
-                "{name} must be an HTTPS/file base URL or an absolute directory path"
-            ))
-        })?,
-    };
-    if url.cannot_be_a_base() || !url.path().ends_with('/') {
-        return Err(Error::Trust(format!(
-            "{name} must identify a base directory ending with '/'"
-        )));
-    }
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(Error::Trust(format!(
-            "{name} must not contain credentials, a query, or a fragment"
-        )));
-    }
-    Ok(url)
+    updated_contracts::assignment::canonical_repository_base(raw)
+        .map_err(|error| Error::Trust(format!("{name} is invalid: {error}")))
 }
 
 fn transport_timeout(timeout: Duration, operation: &str) -> Error {
@@ -1505,7 +1469,7 @@ fn to_verified(path: &str, target: &Target) -> VerifiedTarget {
 
 #[cfg(test)]
 mod integrity_tests {
-    use super::{classify, repository_base, validate_release_url, Error};
+    use super::{classify, repository_base, Error};
     use crate::repo;
     use std::path::{Path, PathBuf};
     use tough::{ExpirationEnforcement, FilesystemTransport, Limits, RepositoryLoader};
@@ -1634,8 +1598,7 @@ mod integrity_tests {
         };
         let url = repository_base("metadata base", base).expect("an absolute path is a location");
         assert_eq!(url.scheme(), "file");
-        assert!(validate_release_url("metadataUrl", base).is_ok());
         // A real unsupported scheme is still refused.
-        assert!(validate_release_url("metadataUrl", "ftp://cdn.example/metadata/").is_err());
+        assert!(repository_base("metadata base", "ftp://cdn.example/metadata/").is_err());
     }
 }

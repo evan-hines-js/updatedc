@@ -328,10 +328,12 @@ async fn publish_then_verify_and_download() {
         .unwrap()
         .display()
         .to_string();
+    local.metadata_url.push(std::path::MAIN_SEPARATOR);
     local.targets_url = std::fs::canonicalize(repo_dir.join("targets"))
         .unwrap()
         .display()
         .to_string();
+    local.targets_url.push(std::path::MAIN_SEPARATOR);
     let local_repo = TrustedRepository::load(&local, &tmp.join("ds-local-paths"))
         .await
         .unwrap();

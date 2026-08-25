@@ -163,6 +163,7 @@ fn digest_key(hash: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

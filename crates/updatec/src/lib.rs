@@ -449,7 +449,8 @@ pub struct UpdateGroupStatus {
 
 /// A blast-radius throttle over a set of [`UpdateGroup`]s. Membership is label-based
 /// like everything else: `selector` matches `UpdateGroup` **metadata labels** (not agent
-/// labels), so a set can gather any number of member groups. The control plane rolls no
+/// labels) within the repository named by `repositoryRef`, so a set can gather any number of
+/// that repository's member groups. The control plane rolls no
 /// more than [`Self::effective_max_concurrent`] members at once, holding the rest on
 /// their last-admitted deployment until an in-flight member settles (all its agents
 /// report the desired deployment, healthy). A member "settles" only through the node
@@ -471,6 +472,10 @@ pub struct UpdateGroupStatus {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateGroupSetSpec {
+    /// The repository whose groups this set governs. A set is reconciled and has its status
+    /// written by exactly that repository's controller; selectors never cross repository
+    /// boundaries, even when another repository uses the same group labels in this namespace.
+    pub repository_ref: LocalObjectReference,
     /// Selects member `UpdateGroup`s by their Kubernetes metadata labels.
     pub selector: LabelSelector,
     /// Maximum member groups allowed to roll at once. Defaults to `members - 1`, so at
@@ -822,9 +827,9 @@ pub struct ReconciledReleaseStatus {
 impl From<&updated_contracts::reconciler::ReconciledRelease> for ReconciledReleaseStatus {
     fn from(release: &updated_contracts::reconciler::ReconciledRelease) -> Self {
         Self {
-            version: release.version.clone(),
-            manifest_sha256: release.manifest_sha256.clone(),
-            archive_sha256: release.archive_sha256.clone(),
+            version: release.version().into(),
+            manifest_sha256: release.manifest_sha256().into(),
+            archive_sha256: release.archive_sha256().into(),
         }
     }
 }
@@ -855,20 +860,20 @@ pub struct ReconciliationStatus {
 impl From<&updated_contracts::reconciler::LastReconciliation> for ReconciliationStatus {
     fn from(record: &updated_contracts::reconciler::LastReconciliation) -> Self {
         Self {
-            operation: record.operation.as_str().into(),
-            reason: record.reason.as_str().into(),
-            attempt_id: record.attempt_id.clone(),
-            candidate: (&record.candidate).into(),
-            predecessor: (&record.predecessor).into(),
+            operation: record.operation().as_str().into(),
+            reason: record.reason().as_str().into(),
+            attempt_id: record.attempt_id().into(),
+            candidate: record.candidate().into(),
+            predecessor: record.predecessor().into(),
             reconciler: ReconcilerStatus {
-                provider_set_sha256: record.reconciler.provider_set_sha256.clone(),
-                product: record.reconciler.product.clone(),
-                release: (&record.reconciler.release).into(),
+                provider_set_sha256: record.reconciler().provider_set_sha256().into(),
+                product: record.reconciler().product().into(),
+                release: record.reconciler().release().into(),
             },
-            changed: record.result.changed,
-            host_action: record.result.host_action.as_str().into(),
-            message: record.result.message.clone(),
-            completed_at_ms: record.completed_at_ms,
+            changed: record.result().changed(),
+            host_action: record.result().host_action().as_str().into(),
+            message: record.result().message().map(str::to_owned),
+            completed_at_ms: record.completed_at_ms(),
         }
     }
 }
@@ -1717,6 +1722,9 @@ mod tests {
 
     fn group_set(max_concurrent: Option<u32>) -> UpdateGroupSetSpec {
         UpdateGroupSetSpec {
+            repository_ref: LocalObjectReference {
+                name: "default".into(),
+            },
             selector: LabelSelector::default(),
             max_concurrent,
             rollout_windows: vec![],

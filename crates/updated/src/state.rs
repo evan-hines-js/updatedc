@@ -11,29 +11,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::bundle::ReleaseId;
 
-/// Identity of the repository whose version ordering and rejection policy applies.
-/// It deliberately depends only on the metadata URL: moving a node to another metadata
-/// origin starts a new release lineage even when version strings move backwards.
+/// Identity of the repository whose TUF rollback floor, installed-version ordering, and rejection
+/// policy apply. It deliberately depends only on the canonical metadata base: moving a node to
+/// another metadata origin starts a new release lineage even when version strings move backwards,
+/// while a spelling-only change cannot manufacture blank trust history.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RepositoryLineage(String);
 
 impl RepositoryLineage {
-    pub fn from_metadata_url(metadata_url: &str) -> Self {
-        Self(updated_contracts::digest::sha256_bytes(
-            metadata_url.as_bytes(),
-        ))
+    pub fn from_metadata_url(metadata_url: &str) -> Result<Self, String> {
+        let canonical = updated_contracts::assignment::canonical_repository_base(metadata_url)?;
+        Ok(Self(updated_contracts::digest::sha256_bytes(
+            canonical.as_str().as_bytes(),
+        )))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub fn rejection_key(&self, archive_sha256: &str) -> String {
-        format!("{}:{archive_sha256}", self.0)
+    pub fn rejection_key(&self, digest: &str) -> String {
+        format!("{}:{digest}", self.0)
     }
 
-    fn validate(&self) -> bool {
+    /// Whether this is the canonical digest identity used by durable state and rejection keys.
+    pub fn validate(&self) -> bool {
         updated_contracts::is_canonical_sha256(&self.0)
     }
 }
@@ -86,6 +89,36 @@ impl ProviderRelease {
             && (ProviderSet::MIN_TIMEOUT_MILLIS..=ProviderSet::MAX_TIMEOUT_MILLIS)
                 .contains(&self.timeout_millis)
     }
+}
+
+/// Derive the only runtime rejection identity an executable replacement may carry.
+///
+/// A health or lifecycle failure proves that the exact application/provider deployment failed; it
+/// does not prove either independently reusable artifact malformed. The identity is therefore the
+/// same domain-separated pair whether one artifact changed or both did. Structurally invalid
+/// content is rejected directly at its verification boundary instead. A metadata-only lineage
+/// rebind returns `None`: it is not an executable replacement and must use
+/// [`InstalledState::rebind_if_same_artifact`] instead of manufacturing an update transaction.
+/// Durable records and the agent's transaction constructor all call this function, so cold install,
+/// update, rollback, and validation cannot drift into different runtime verdicts.
+pub fn candidate_rejection_sha256(
+    previous_release: &ReleaseId,
+    previous_archive_sha256: &str,
+    previous_lifecycle: &ProviderRelease,
+    candidate_release: &ReleaseId,
+    candidate_archive_sha256: &str,
+    candidate_lifecycle: &ProviderRelease,
+) -> Option<String> {
+    if previous_release == candidate_release
+        && previous_archive_sha256 == candidate_archive_sha256
+        && previous_lifecycle == candidate_lifecycle
+    {
+        return None;
+    }
+    updated_contracts::digest::deployment_rejection_sha256(
+        candidate_archive_sha256,
+        &candidate_lifecycle.provider_set_sha256,
+    )
 }
 
 const INSTALLED_RECORD_MAX_BYTES: usize = 2 * ProviderRelease::MAX_SERIALIZED_BYTES + 8 * 1024;
@@ -142,7 +175,13 @@ pub struct Pending {
 }
 
 impl InstalledState {
-    fn validate(&self) -> io::Result<()> {
+    /// Validate the complete durable installed-state invariant.
+    ///
+    /// Persistence facades with non-file backends call this same rule before committing, while
+    /// [`write_installed`] and [`read_installed`] retain it at the raw file boundary. Keeping the
+    /// rule on the value prevents test and production stores from defining different accepted
+    /// states.
+    pub fn validate(&self) -> io::Result<()> {
         if !self.repository_lineage.validate() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -174,6 +213,15 @@ impl InstalledState {
             ));
         }
         if let Some(pending) = &self.pending {
+            if pending.committed_at == 0 {
+                // Zero is not a timestamp the update path can produce. Treating it as one would
+                // make `window_passed` immediately settle the update on the next boot, erasing its
+                // rollback intent before the candidate passed a health gate.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pending confirmation timestamp is invalid",
+                ));
+            }
             if !pending.previous_repository_lineage.validate() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -186,16 +234,21 @@ impl InstalledState {
                     "pending lifecycle id is invalid",
                 ));
             }
-            if !updated_contracts::is_canonical_sha256(&pending.candidate_rejection_sha256) {
+            let expected_rejection = candidate_rejection_sha256(
+                &pending.previous_release,
+                &pending.previous_archive_sha256,
+                &pending.lifecycle,
+                &self.release,
+                &self.archive_sha256,
+                &self.lifecycle,
+            );
+            if !updated_contracts::is_canonical_sha256(&pending.candidate_rejection_sha256)
+                || expected_rejection.as_deref()
+                    != Some(pending.candidate_rejection_sha256.as_str())
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "pending rejection identity is invalid",
-                ));
-            }
-            if pending.previous_release == self.release && pending.lifecycle == self.lifecycle {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "pending predecessor must differ by application or node reconciler",
+                    "pending rejection identity does not match the executable replacement",
                 ));
             }
             if !pending.lifecycle.is_valid() {
@@ -250,8 +303,16 @@ impl InstalledState {
 
     /// Promote a provisional cold install to confirmed after it passes its first health gate.
     /// Idempotent; returns whether the flag changed, so the caller only rewrites on transition.
-    pub fn confirm(&mut self) -> bool {
+    /// This deliberately does not settle an update's [`Pending`] rollback intent — that is the
+    /// distinct [`InstalledState::settle_update`] transition.
+    pub fn confirm_provisional(&mut self) -> bool {
         !std::mem::replace(&mut self.confirmed, true)
+    }
+
+    /// Settle an update after its confirmation window by removing its rollback intent.
+    /// Idempotent; returns whether durable state changed.
+    pub fn settle_update(&mut self) -> bool {
+        self.pending.take().is_some()
     }
 
     /// Version ordering is meaningful only inside one metadata lineage.
@@ -272,13 +333,9 @@ impl InstalledState {
             && self.release == *release
             && self.archive_sha256 == archive_sha256
             && self.lifecycle.as_ref() == reconciler)
-            .then(|| {
-                Self::confirmed(
-                    lineage,
-                    self.release.clone(),
-                    self.archive_sha256.clone(),
-                    self.lifecycle.clone(),
-                )
+            .then(|| Self {
+                repository_lineage: lineage,
+                ..self.clone()
             })
     }
 }
@@ -370,6 +427,7 @@ pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::testing::provider;
@@ -386,13 +444,17 @@ mod tests {
         std::iter::repeat_n(byte, 64).collect()
     }
 
+    fn lineage(metadata_url: &str) -> RepositoryLineage {
+        RepositoryLineage::from_metadata_url(metadata_url).expect("fixture metadata URL is valid")
+    }
+
     #[test]
     fn round_trips() {
         let (_dir, path) = tmp("ok");
         write_installed(
             &path,
             &InstalledState {
-                repository_lineage: RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+                repository_lineage: lineage("https://repo/metadata/"),
                 release: ReleaseId {
                     version: "2.3.4".into(),
                     manifest_sha256: digest('a'),
@@ -401,15 +463,18 @@ mod tests {
                 lifecycle: provider(),
                 pending: Some(Pending {
                     lifecycle_attempt_id: digest('c'),
-                    candidate_rejection_sha256: "f".repeat(64),
+                    candidate_rejection_sha256:
+                        updated_contracts::digest::deployment_rejection_sha256(
+                            &digest('b'),
+                            &provider().provider_set_sha256,
+                        )
+                        .unwrap(),
                     previous_release: ReleaseId {
                         version: "2.3.3".into(),
                         manifest_sha256: digest('d'),
                     },
                     previous_archive_sha256: digest('e'),
-                    previous_repository_lineage: RepositoryLineage::from_metadata_url(
-                        "https://old/metadata/",
-                    ),
+                    previous_repository_lineage: lineage("https://old/metadata/"),
                     lifecycle: provider(),
                     committed_at: 1_700_000_000,
                 }),
@@ -456,7 +521,7 @@ mod tests {
             let mut lifecycle = provider();
             mutate(&mut lifecycle);
             InstalledState::confirmed(
-                RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+                lineage("https://repo/metadata/"),
                 ReleaseId {
                     version: "2.3.4".into(),
                     manifest_sha256: digest('a'),
@@ -534,7 +599,7 @@ mod tests {
     #[test]
     fn the_installed_artifact_identity_is_revalidated_as_one_unit() {
         let valid = InstalledState::confirmed(
-            RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+            lineage("https://repo/metadata/"),
             ReleaseId {
                 version: "2.3.4".into(),
                 manifest_sha256: digest('a'),
@@ -559,6 +624,99 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_confirmation_timestamp_cannot_erase_rollback_intent() {
+        let tx = crate::testing::update_transaction();
+        let state = InstalledState {
+            repository_lineage: tx.candidate_repository_lineage,
+            release: tx.candidate_release,
+            archive_sha256: tx.candidate_archive_sha256,
+            lifecycle: provider(),
+            pending: Some(Pending {
+                lifecycle_attempt_id: tx.id,
+                candidate_rejection_sha256: tx.candidate_rejection_sha256,
+                previous_release: tx.previous_release,
+                previous_archive_sha256: tx.previous_archive_sha256,
+                previous_repository_lineage: tx.previous_repository_lineage,
+                lifecycle: tx.previous_lifecycle,
+                committed_at: 0,
+            }),
+            confirmed: true,
+        };
+        assert_eq!(
+            state.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let (_dir, path) = tmp("zero-confirmation-time");
+        assert_eq!(
+            write_installed(&path, &state).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn every_runtime_failure_rejects_the_exact_deployment_only() {
+        let tx = crate::testing::update_transaction();
+        let mut state = InstalledState {
+            repository_lineage: tx.candidate_repository_lineage,
+            release: tx.candidate_release,
+            archive_sha256: tx.candidate_archive_sha256,
+            lifecycle: tx.candidate_lifecycle,
+            pending: Some(Pending {
+                lifecycle_attempt_id: tx.id,
+                candidate_rejection_sha256: digest('0'),
+                previous_release: tx.previous_release,
+                previous_archive_sha256: tx.previous_archive_sha256,
+                previous_repository_lineage: tx.previous_repository_lineage,
+                lifecycle: tx.previous_lifecycle,
+                committed_at: 1,
+            }),
+            confirmed: true,
+        };
+        assert_eq!(
+            state.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let deployment_rejection = updated_contracts::digest::deployment_rejection_sha256(
+            &state.archive_sha256,
+            &state.lifecycle.provider_set_sha256,
+        )
+        .unwrap();
+        state.pending.as_mut().unwrap().candidate_rejection_sha256 = deployment_rejection.clone();
+        state.validate().unwrap();
+
+        state.pending.as_mut().unwrap().candidate_rejection_sha256 = state.archive_sha256.clone();
+        assert_eq!(
+            state.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "runtime evidence cannot poison reusable application bytes"
+        );
+        state.pending.as_mut().unwrap().candidate_rejection_sha256 =
+            state.lifecycle.provider_set_sha256.clone();
+        assert_eq!(
+            state.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "runtime evidence cannot poison a reusable provider set"
+        );
+
+        // Reaching the same candidate through a provider-only transition yields the same identity.
+        let pending = state.pending.as_mut().unwrap();
+        pending.previous_release = state.release.clone();
+        pending.previous_archive_sha256 = state.archive_sha256.clone();
+        pending.lifecycle.provider_set_sha256 = digest('e');
+        state.pending.as_mut().unwrap().candidate_rejection_sha256 = deployment_rejection.clone();
+        state.validate().unwrap();
+
+        // Reaching it with both artifacts changed still yields that one candidate identity.
+        let pending = state.pending.as_mut().unwrap();
+        pending.previous_release.version = "0.9.0".into();
+        pending.previous_archive_sha256 = digest('b');
+        state.pending.as_mut().unwrap().candidate_rejection_sha256 = deployment_rejection;
+        state.validate().unwrap();
+    }
+
+    #[test]
     fn missing_is_not_invalid() {
         let (_dir, path) = tmp("missing");
         assert!(matches!(read_installed(&path), Installed::Missing));
@@ -578,22 +736,26 @@ mod tests {
     }
 
     #[test]
-    fn metadata_url_is_the_exact_lineage_boundary() {
-        let x = RepositoryLineage::from_metadata_url("https://x/metadata/");
+    fn canonical_metadata_base_is_the_exact_lineage_boundary() {
+        let x = lineage("https://EXAMPLE.com:443/a/../metadata/");
+        assert_eq!(x, lineage("https://example.com/metadata/"));
+        assert_ne!(x, lineage("https://example.com/other/"));
+        assert!(RepositoryLineage::from_metadata_url("http://example.com/metadata/").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_and_file_url_share_one_offline_lineage() {
         assert_eq!(
-            x,
-            RepositoryLineage::from_metadata_url("https://x/metadata/")
-        );
-        assert_ne!(
-            x,
-            RepositoryLineage::from_metadata_url("https://y/metadata/")
+            lineage("/opt/updated/repository/metadata/"),
+            lineage("file:///opt/updated/repository/metadata/")
         );
     }
 
     #[test]
     fn version_floor_and_rebind_share_the_same_lineage_rule() {
-        let old = RepositoryLineage::from_metadata_url("https://gateway/metadata/");
-        let new = RepositoryLineage::from_metadata_url("https://batch/metadata/");
+        let old = lineage("https://gateway/metadata/");
+        let new = lineage("https://batch/metadata/");
         let release = ReleaseId {
             version: "8.0.0".into(),
             manifest_sha256: digest('a'),
@@ -627,6 +789,65 @@ mod tests {
         assert!(installed
             .rebind_if_same_artifact(new, &release, &digest('e'), &reconciler)
             .is_none());
+    }
+
+    #[test]
+    fn rebind_changes_only_lineage_and_cannot_settle_lifecycle_state() {
+        let old = lineage("https://old/metadata/");
+        let new = lineage("https://new/metadata/");
+        let release = ReleaseId {
+            version: "8.0.0".into(),
+            manifest_sha256: digest('a'),
+        };
+        let lifecycle = Box::new(ProviderRelease {
+            provider_set_sha256: digest('b'),
+            product: "reconciler".into(),
+            release: ReleaseId {
+                version: "1.0.0".into(),
+                manifest_sha256: digest('c'),
+            },
+            archive_sha256: digest('d'),
+            args: Vec::new(),
+            timeout_millis: 1_000,
+        });
+        let mut installed =
+            InstalledState::confirmed(old.clone(), release.clone(), digest('e'), lifecycle.clone());
+        installed.pending = Some(Pending {
+            lifecycle_attempt_id: digest('f'),
+            candidate_rejection_sha256: updated_contracts::digest::deployment_rejection_sha256(
+                &digest('e'),
+                &installed.lifecycle.provider_set_sha256,
+            )
+            .unwrap(),
+            previous_release: ReleaseId {
+                version: "7.0.0".into(),
+                manifest_sha256: digest('2'),
+            },
+            previous_archive_sha256: digest('3'),
+            previous_repository_lineage: old,
+            lifecycle,
+            committed_at: 42,
+        });
+
+        let rebound = installed
+            .rebind_if_same_artifact(new.clone(), &release, &digest('e'), &installed.lifecycle)
+            .unwrap();
+        assert_eq!(rebound.repository_lineage, new);
+        assert_eq!(rebound.pending, installed.pending);
+        assert_eq!(rebound.confirmed, installed.confirmed);
+
+        let mut provisional = installed;
+        provisional.pending = None;
+        provisional.confirmed = false;
+        let rebound = provisional
+            .rebind_if_same_artifact(
+                lineage("https://third/metadata/"),
+                &release,
+                &digest('e'),
+                &provisional.lifecycle,
+            )
+            .unwrap();
+        assert!(!rebound.confirmed);
     }
 
     #[test]

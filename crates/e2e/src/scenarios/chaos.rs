@@ -184,7 +184,7 @@ pub(crate) fn rollback_chaos_recovery(ctx: &Ctx) -> R {
         let mut cmd = Node::new(ctx, &dir, &srv, "app")
             .check_interval("1s")
             .health_grace(HEALTH_GRACE)
-            .confirmation_window("120s")
+            .hold_unconfirmed()
             // The candidate passes its transaction health gate on its first observation and fails
             // every one after it. A workload that merely died would be restarted by the next boot's
             // own converge — the reconciler owns it — so a running, unhealthy release is what makes
@@ -793,7 +793,7 @@ pub(crate) fn a_reboot_mid_rollback_still_converges_the_predecessor(ctx: &Ctx) -
     let mut cmd = Node::new(ctx, &dir, srv, "app")
         .check_interval("1s")
         .health_grace(HEALTH_GRACE)
-        .confirmation_window("120s")
+        .hold_unconfirmed()
         .faulty_workload(svc, "degrade-after-ready")
         .launcher()?;
     // Crash the agent immediately after the predecessor's `apply` — the point at which a resume

@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::collections::{BTreeSet, HashSet};
 use updated_contracts::key::P256PublicKey;
-use updated_contracts::telemetry::{Envelope, NodeReport};
+use updated_contracts::telemetry::{AuthenticReport, Envelope, NodeReport};
 
 /// Which nodes have ever been heard from.
 ///
@@ -91,11 +91,11 @@ pub struct VerifiedReports {
 struct VerifiedEntry {
     key: P256PublicKey,
     envelope: Envelope,
-    report: Option<NodeReport>,
+    report: Option<AuthenticReport>,
 }
 
 impl VerifiedReports {
-    /// The verdict for this node, or `None` when there is none to read.
+    /// The authenticated capability for this node, or `None` when there is none to read.
     ///
     /// A pure lookup: it cannot verify. [`VerifiedReports::verify_fleet`] is the single place an
     /// ECDSA verification happens, and it runs over the whole fleet before any of this is read, so
@@ -104,16 +104,40 @@ impl VerifiedReports {
     /// The envelope and key are still compared, and a mismatch reads as `None`. That cannot happen
     /// after a warm-up over the same inputs; it is here so that if it somehow did, the planner would
     /// treat the node as unverifiable rather than act on a verdict reached from other bytes.
-    pub(crate) fn authentic(
+    fn authentic(
         &self,
         node: &str,
         envelope: &Envelope,
         key: &P256PublicKey,
-    ) -> Option<NodeReport> {
+    ) -> Option<&AuthenticReport> {
         let entry = self.entries.get(node)?;
         (&entry.envelope == envelope && &entry.key == key)
-            .then(|| entry.report.clone())
+            .then_some(entry.report.as_ref())
             .flatten()
+    }
+
+    /// This node's full report, only after both cached authenticity and the shared freshness gate.
+    pub(crate) fn fresh(
+        &self,
+        node: &str,
+        envelope: &Envelope,
+        key: &P256PublicKey,
+        now_ms: u64,
+    ) -> Option<NodeReport> {
+        self.authentic(node, envelope, key)
+            .and_then(|report| report.fresh(now_ms))
+    }
+
+    /// This node's one nonperishable claim, without exposing any stale machine state.
+    pub(crate) fn durable_rejection(
+        &self,
+        node: &str,
+        envelope: &Envelope,
+        key: &P256PublicKey,
+    ) -> Option<(String, bool)> {
+        self.authentic(node, envelope, key)
+            .map(AuthenticReport::durable_rejection)
+            .map(|(identity, rejected)| (identity.to_string(), rejected))
     }
 
     /// Verify the whole fleet up front, across every available core.
@@ -137,14 +161,6 @@ impl VerifiedReports {
     // second full ECDSA pass over bytes the planner had just verified, the most expensive work the
     // controller does, paid twice and invisibly.
     //
-    // `clippy.toml` bans the contract's verification functions workspace-wide, so this allow is
-    // what makes this the reachable one. It replaced a source scan over a hand-listed set of
-    // modules, which could not survive its own crate being refactored: splitting `runtime.rs` left
-    // five new modules unscanned, `dataflow.rs` was never listed at all, and matching one spelling
-    // of the call meant an ordinary `use` import walked straight past it. The lint resolves each
-    // call to its definition, so a renamed bare import in a new file is caught. Deleting this
-    // allow does not relax the rule; it breaks the build.
-    #[allow(clippy::disallowed_methods)]
     pub(crate) fn verify_fleet(
         &mut self,
         reports: &HashMap<String, Envelope>,
@@ -169,13 +185,13 @@ impl VerifiedReports {
             .map(usize::from)
             .unwrap_or(1)
             .min(pending.len());
-        let verdicts: Vec<(String, Option<NodeReport>)> = if lanes <= 1 {
+        let verdicts: Vec<(String, Option<AuthenticReport>)> = if lanes <= 1 {
             pending
                 .iter()
                 .map(|(node, envelope, key)| {
                     (
                         (*node).clone(),
-                        updated_contracts::telemetry::report_is_authentic(envelope, node, key),
+                        updated_contracts::telemetry::authenticate_report(envelope, node, key),
                     )
                 })
                 .collect()
@@ -190,7 +206,7 @@ impl VerifiedReports {
                                 .map(|(node, envelope, key)| {
                                     (
                                         (*node).clone(),
-                                        updated_contracts::telemetry::report_is_authentic(
+                                        updated_contracts::telemetry::authenticate_report(
                                             envelope, node, key,
                                         ),
                                     )

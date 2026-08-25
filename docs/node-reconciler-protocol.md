@@ -68,7 +68,23 @@ and durably record its service or process handle before accepting traffic.
 - `fingerprint` for steady-state inspection.
 
 Reserved identities are not idempotency keys because they are deliberately reused. A transaction
-token is stable across crash replay and is never reused with different arguments.
+token is exactly 64 lowercase hexadecimal characters, is stable across crash replay, and is never
+reused with different arguments. Its compensating direction appends `r` to that token.
+
+The operation, reason, and attempt identity are one grammar, not independent options:
+
+| Operation | Reason | Accepted attempt identity |
+| --- | --- | --- |
+| `apply` | `install` | `boot` |
+| `apply` | `restart` | `boot` or `converge` |
+| `apply` | `update` | transaction token or its compensating form |
+| `rollback` | `update` | compensating transaction token |
+| `healthcheck` | `install` | `boot` |
+| `healthcheck` | `restart` | `boot`, `converge`, or `periodic` |
+| `healthcheck` | `update` | transaction token or its compensating form |
+| `inspect` | `restart` | `fingerprint` |
+
+Every other combination is invalid and is refused before the hook is started.
 
 ## File dataflow
 
@@ -114,15 +130,15 @@ missing, malformed, oversized, or contradictory document fails the invocation.
   "status": "succeeded",
   "changed": true,
   "hostAction": "none",
-  "retryAfterSeconds": null,
   "message": "optional one-line diagnostic"
 }
 ```
 
 - `status` is `succeeded` or `retry`.
-- `changed` states whether this invocation changed managed host state.
-- `hostAction` is `none` or `reboot`; a reboot is valid only with `succeeded`.
-- `retryAfterSeconds` is required only for `retry`, from 1 through 3600.
+- A `succeeded` result carries `changed` and `hostAction` (`none` or `reboot`) and never carries a
+  retry delay.
+- A `retry` result carries only `retryAfterSeconds` (from 1 through 3600) and `message`; it cannot
+  claim completion, changed state, or a host action.
 - `message` is optional, control-character-free, and at most 4 KiB.
 
 The agent owns retry policy: it repeats the same operation, attempt id, and arguments up to five
@@ -216,7 +232,7 @@ emit_outputs() {
 
 publish_success() {
   local changed=$1 host_action=${2:-none}
-  printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"%s","retryAfterSeconds":null,"message":null}' \
+  printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"%s","message":null}' \
     "$changed" "$host_action" >"$result_file"
 }
 

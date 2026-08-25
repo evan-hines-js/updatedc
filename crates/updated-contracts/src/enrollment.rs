@@ -75,7 +75,7 @@ impl EnrollmentBundle {
                 "unsupported enrollment bundle or invalid agent identity",
             ));
         }
-        if !crate::assignment::valid_repository_base(&self.routing_base_url)
+        if crate::assignment::canonical_repository_base(&self.routing_base_url).is_err()
             || self.assignment.starts_with('/')
             || !self.install_root.is_absolute()
         {

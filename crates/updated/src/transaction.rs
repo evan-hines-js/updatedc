@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::io;
 
 use crate::bundle::ReleaseId;
-use crate::state::{ProviderRelease, RepositoryLineage};
+use crate::state::{
+    candidate_rejection_sha256, InstalledState, Pending, ProviderRelease, RepositoryLineage,
+};
 
 /// Durable intent for an in-flight executable replacement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,17 +22,21 @@ pub struct Transaction {
     pub previous_repository_lineage: RepositoryLineage,
     pub candidate_release: ReleaseId,
     pub candidate_archive_sha256: String,
-    /// Exact content identity to reject if the candidate proves bad. Usually the application
-    /// archive; for a provider-only transition it is the provider-set document instead.
+    /// Domain-separated identity of the exact candidate application/provider deployment.
     pub candidate_rejection_sha256: String,
     pub candidate_repository_lineage: RepositoryLineage,
     /// Recovery must durably reject the candidate before this transaction may be
     /// cleared. This records the verdict of whatever judged the candidate — a failed activation, a
     /// failed health gate — so a later recovery boot, which has no way to re-derive it, still
-    /// applies it.
+    /// applies it. Node-local activation failures carry no candidate verdict.
     pub candidate_rejection_required: bool,
-    /// Recovery must replay the operator lifecycle provider before clearing this intent.
-    pub lifecycle: Box<ProviderRelease>,
+    /// The predecessor's lifecycle provider. Recovery replays this exact reconciler while
+    /// restoring the predecessor; it is part of the deployed unit being compensated back to.
+    pub previous_lifecycle: Box<ProviderRelease>,
+    /// The candidate's lifecycle provider. The commit gate binds this durable identity together
+    /// with the candidate application bytes, so a caller cannot commit a different reconciler than
+    /// the one the update transaction authorized.
+    pub candidate_lifecycle: Box<ProviderRelease>,
     /// How many consecutive boots have failed to health-gate the restored predecessor during a
     /// crash-recovered rollback. The agent's boot health gate bounds this: once it reaches its
     /// limit, a predecessor whose bytes can no longer pass the gate stops looping the node and
@@ -96,27 +102,105 @@ impl Transaction {
                 "transaction archive identity is invalid",
             ));
         }
-        if !updated_contracts::is_canonical_sha256(self.previous_repository_lineage.as_str())
-            || !updated_contracts::is_canonical_sha256(self.candidate_repository_lineage.as_str())
+        if !self.previous_repository_lineage.validate()
+            || !self.candidate_repository_lineage.validate()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transaction repository lineage is invalid",
             ));
         }
-        if !updated_contracts::is_canonical_sha256(&self.candidate_rejection_sha256) {
+        let Some(expected_rejection) = candidate_rejection_sha256(
+            &self.previous_release,
+            &self.previous_archive_sha256,
+            &self.previous_lifecycle,
+            &self.candidate_release,
+            &self.candidate_archive_sha256,
+            &self.candidate_lifecycle,
+        ) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "transaction rejection identity is invalid",
+                "update transaction must change the application or node reconciler",
+            ));
+        };
+        if !updated_contracts::is_canonical_sha256(&self.candidate_rejection_sha256)
+            || self.candidate_rejection_sha256 != expected_rejection
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction rejection identity does not match the executable replacement",
             ));
         }
-        if !self.lifecycle.is_valid() {
+        if !self.previous_lifecycle.is_valid() || !self.candidate_lifecycle.is_valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "transaction provider identity is invalid",
             ));
         }
+        if !self.phase_evidence_is_valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transaction phase contradicts its durable evidence",
+            ));
+        }
         Ok(())
+    }
+
+    /// Whether the evidence carried by this record could have been observed at its phase.
+    ///
+    /// This is deliberately a value invariant, not only a Store transition check: journals are
+    /// unauthenticated JSON and recovery reads them before it has any prior in-memory state with
+    /// which to replay their history. A candidate verdict can first be learned during activation
+    /// and must immediately take the rollback branch; rollback health cannot be observed until the
+    /// predecessor apply has completed. Deserialization, ordinary writes, and phase advancement
+    /// all consume this one rule.
+    fn phase_evidence_is_valid(&self) -> bool {
+        let rejection_is_possible = !self.candidate_rejection_required
+            || matches!(
+                self.phase,
+                Phase::Activating
+                    | Phase::RollbackActivating
+                    | Phase::RollbackApplied
+                    | Phase::RollbackVerified
+                    | Phase::RolledBack
+            );
+        let rollback_health_is_possible = self.rollback_health_failures == 0
+            || matches!(
+                self.phase,
+                Phase::RollbackApplied | Phase::RollbackVerified | Phase::RolledBack
+            );
+        rejection_is_possible && rollback_health_is_possible
+    }
+
+    /// Whether `state` is the exact deployed predecessor this transaction names.
+    ///
+    /// Application bytes and their lifecycle provider are one deployed unit. Keeping this full
+    /// comparison on the transaction prevents commit, rollback, and journal-start gates from
+    /// growing subtly different notions of "the predecessor".
+    pub fn matches_previous(&self, state: &InstalledState) -> bool {
+        self.previous_repository_lineage == state.repository_lineage
+            && self.previous_release == state.release
+            && self.previous_archive_sha256 == state.archive_sha256
+            && self.previous_lifecycle == state.lifecycle
+    }
+
+    /// Whether `state` is the exact deployed candidate this transaction names.
+    pub fn matches_candidate(&self, state: &InstalledState) -> bool {
+        self.candidate_repository_lineage == state.repository_lineage
+            && self.candidate_release == state.release
+            && self.candidate_archive_sha256 == state.archive_sha256
+            && self.candidate_lifecycle == state.lifecycle
+    }
+
+    /// Whether a committed candidate's rollback intent is the predecessor half of this exact
+    /// transaction. Candidate identity is checked separately with [`Self::matches_candidate`].
+    pub fn matches_pending(&self, pending: &Pending) -> bool {
+        self.id == pending.lifecycle_attempt_id
+            && self.candidate_rejection_sha256 == pending.candidate_rejection_sha256
+            && self.previous_repository_lineage == pending.previous_repository_lineage
+            && self.previous_release == pending.previous_release
+            && self.previous_archive_sha256 == pending.previous_archive_sha256
+            && self.previous_lifecycle == pending.lifecycle
     }
 
     /// The attempt identity every compensating operation of this transaction carries — the
@@ -139,16 +223,6 @@ impl Transaction {
                 | Phase::RollbackVerified
                 | Phase::RolledBack
         )
-    }
-
-    /// Whether this transaction has discharged every forward or compensating obligation.
-    ///
-    /// A settled journal may be replaced by a new transaction even when cleanup left its file
-    /// behind. A same-id rewrite still satisfies [`Transaction::permits_replacement`], including
-    /// the one explicit committed-to-pending-rollback edge. Keeping terminality here prevents
-    /// storage and recovery callers from growing their own phase lists.
-    pub fn is_settled(&self) -> bool {
-        matches!(self.phase, Phase::Committed | Phase::RolledBack)
     }
 
     /// The recovery rank of a phase — its position on the recovery path (0 = activation pending,
@@ -187,17 +261,6 @@ impl Transaction {
         )
     }
 
-    /// Whether this journal may be destroyed. The single definition of the rule the store
-    /// enforces: a transaction that may have displaced machine state (any phase from
-    /// `Activating` on) owes the machine either a completed commit or a settled rollback —
-    /// `Committed` and `RolledBack` are the only phases that discharge that debt, and reaching
-    /// `RolledBack` is what runs (or durably abandons) the compensating `rollback` hook. Before
-    /// `Activating` nothing was displaced, so there is nothing to compensate and the journal
-    /// is mere intent.
-    pub fn may_discard(&self) -> bool {
-        self.is_settled() || self.phase == Phase::Prepared
-    }
-
     pub fn advance(&mut self, next: Phase) -> io::Result<()> {
         let forward = matches!(
             (self.phase, next),
@@ -227,7 +290,15 @@ impl Transaction {
                 format!("invalid transaction phase {:?} -> {next:?}", self.phase),
             ));
         }
+        let previous = self.phase;
         self.phase = next;
+        if !self.phase_evidence_is_valid() {
+            self.phase = previous;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("transaction evidence cannot advance from {previous:?} to {next:?}"),
+            ));
+        }
         Ok(())
     }
 
@@ -331,13 +402,13 @@ pub enum Recovery {
 pub fn classify_recovery(
     tx: &Transaction,
     active: Option<&ReleaseId>,
-    committed: Option<&ReleaseId>,
+    committed: Option<&InstalledState>,
 ) -> Recovery {
     // The commit may have landed without its journal write: the swap and the state commit are two
     // steps, and a crash between them leaves a node fully updated but journalled as mid-flight.
     if matches!(tx.phase, Phase::Committing | Phase::Committed)
         && active == Some(&tx.candidate_release)
-        && committed == Some(&tx.candidate_release)
+        && committed.is_some_and(|state| tx.matches_candidate(state))
     {
         return Recovery::Committed;
     }
@@ -377,42 +448,62 @@ mod tests {
     use super::*;
     use crate::testing::update_transaction as tx;
 
+    fn previous_state(tx: &Transaction) -> InstalledState {
+        InstalledState::confirmed(
+            tx.previous_repository_lineage.clone(),
+            tx.previous_release.clone(),
+            tx.previous_archive_sha256.clone(),
+            tx.previous_lifecycle.clone(),
+        )
+    }
+
+    fn candidate_state(tx: &Transaction) -> InstalledState {
+        InstalledState::confirmed(
+            tx.candidate_repository_lineage.clone(),
+            tx.candidate_release.clone(),
+            tx.candidate_archive_sha256.clone(),
+            tx.candidate_lifecycle.clone(),
+        )
+    }
+
     #[test]
     fn recovery_is_derived_from_active_pointer_and_commit() {
         let mut tx = tx();
+        let previous = previous_state(&tx);
+        let candidate = candidate_state(&tx);
         tx.phase = Phase::Committed;
         assert_eq!(
-            classify_recovery(
-                &tx,
-                Some(&tx.candidate_release),
-                Some(&tx.candidate_release)
-            ),
+            classify_recovery(&tx, Some(&tx.candidate_release), Some(&candidate)),
             Recovery::Committed
         );
         tx.phase = Phase::Activating;
         assert_eq!(
-            classify_recovery(&tx, Some(&tx.candidate_release), Some(&tx.previous_release)),
+            classify_recovery(&tx, Some(&tx.candidate_release), Some(&previous)),
             Recovery::RestorePredecessor
         );
         tx.phase = Phase::Prepared;
         assert_eq!(
-            classify_recovery(&tx, Some(&tx.previous_release), Some(&tx.previous_release)),
+            classify_recovery(&tx, Some(&tx.previous_release), Some(&previous)),
             Recovery::NeverSwapped
         );
         assert_eq!(
-            classify_recovery(&tx, None, Some(&tx.previous_release)),
+            classify_recovery(&tx, None, Some(&previous)),
             Recovery::RestorePredecessor
         );
 
         tx.phase = Phase::Committing;
         assert_eq!(
-            classify_recovery(
-                &tx,
-                Some(&tx.candidate_release),
-                Some(&tx.candidate_release)
-            ),
+            classify_recovery(&tx, Some(&tx.candidate_release), Some(&candidate)),
             Recovery::Committed,
             "a crash after installed-state commit but before its phase write is committed"
+        );
+
+        let mut substituted = candidate;
+        substituted.lifecycle.provider_set_sha256 = "1".repeat(64);
+        assert_eq!(
+            classify_recovery(&tx, Some(&tx.candidate_release), Some(&substituted)),
+            Recovery::RestorePredecessor,
+            "matching application bytes with another reconciler are not a committed deployed unit"
         );
     }
 
@@ -437,8 +528,21 @@ mod tests {
                 value
             },
             {
-                let mut value = valid;
+                let mut value = valid.clone();
                 value.previous_archive_sha256 = "bad".into();
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.candidate_rejection_sha256 = "0".repeat(64);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value.candidate_release = value.previous_release.clone();
+                value.candidate_archive_sha256 = value.previous_archive_sha256.clone();
+                value.candidate_lifecycle = value.previous_lifecycle.clone();
+                value.candidate_rejection_sha256 = value.candidate_archive_sha256.clone();
                 value
             },
         ] {
@@ -447,6 +551,40 @@ mod tests {
                 io::ErrorKind::InvalidData
             );
         }
+
+        let mut provider_only = valid.clone();
+        provider_only.candidate_release = provider_only.previous_release.clone();
+        provider_only.candidate_archive_sha256 = provider_only.previous_archive_sha256.clone();
+        provider_only.candidate_lifecycle.provider_set_sha256 = "e".repeat(64);
+        provider_only.candidate_rejection_sha256 =
+            updated_contracts::digest::deployment_rejection_sha256(
+                &provider_only.candidate_archive_sha256,
+                &provider_only.candidate_lifecycle.provider_set_sha256,
+            )
+            .unwrap();
+        provider_only.validate().unwrap();
+        provider_only.candidate_rejection_sha256 = "e".repeat(64);
+        assert_eq!(
+            provider_only.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "a provider-only runtime failure cannot poison the provider artifact globally"
+        );
+
+        let mut combined = valid;
+        combined.candidate_lifecycle.provider_set_sha256 = "e".repeat(64);
+        combined.candidate_rejection_sha256 =
+            updated_contracts::digest::deployment_rejection_sha256(
+                &combined.candidate_archive_sha256,
+                &combined.candidate_lifecycle.provider_set_sha256,
+            )
+            .unwrap();
+        combined.validate().unwrap();
+        combined.candidate_rejection_sha256 = combined.candidate_archive_sha256.clone();
+        assert_eq!(
+            combined.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "a combined replacement must reject its exact deployed pair"
+        );
     }
 
     #[test]
@@ -456,6 +594,41 @@ mod tests {
             supervised.advance(phase).unwrap();
         }
         assert!(supervised.advance(Phase::RollbackActivating).is_err());
+
+        let mut rejected = tx();
+        rejected.advance(Phase::Activating).unwrap();
+        rejected.candidate_rejection_required = true;
+        assert!(rejected.advance(Phase::Committing).is_err());
+        assert_eq!(rejected.phase, Phase::Activating);
+    }
+
+    #[test]
+    fn durable_evidence_is_valid_only_after_its_observation_boundary() {
+        let mut premature_rejection = tx();
+        premature_rejection.candidate_rejection_required = true;
+        assert_eq!(
+            premature_rejection.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut rejected_forward_commit = tx();
+        rejected_forward_commit.phase = Phase::Committing;
+        rejected_forward_commit.candidate_rejection_required = true;
+        assert_eq!(
+            rejected_forward_commit.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut premature_health = tx();
+        premature_health.phase = Phase::RollbackActivating;
+        premature_health.rollback_health_failures = 1;
+        assert_eq!(
+            premature_health.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        premature_health.phase = Phase::RollbackApplied;
+        premature_health.validate().unwrap();
     }
 
     #[test]
@@ -561,24 +734,7 @@ mod tests {
         let mut transaction = tx();
         transaction.phase = Phase::RollbackApplied;
         transaction.advance(Phase::RolledBack).unwrap();
-        assert!(transaction.may_discard());
-    }
-
-    /// The discard rule the store enforces: displaced-but-unsettled phases hold the journal.
-    #[test]
-    fn may_discard_admits_only_settled_or_never_displaced_transactions() {
-        let mut transaction = tx();
-        for phase in Phase::ALL {
-            transaction.phase = phase;
-            assert_eq!(
-                transaction.may_discard(),
-                matches!(
-                    phase,
-                    Phase::Prepared | Phase::Committed | Phase::RolledBack
-                ),
-                "{phase:?}"
-            );
-        }
+        assert_eq!(transaction.phase, Phase::RolledBack);
     }
 
     #[test]

@@ -16,6 +16,10 @@ pub(crate) struct Heartbeat {
     pub(crate) control_client: reqwest::Client,
     /// Spends bearer capabilities without presenting the node identity or following redirects.
     pub(crate) object_client: reqwest::Client,
+    /// The authenticated gateway origin for remote reporting. Its absence is the one durable
+    /// local/remote decision made when the loop starts, after the shared repository parser accepts
+    /// the routing base; report cycles never reinterpret the raw string.
+    pub(crate) control_base: Option<String>,
     /// The node identity reports are keyed by; absent on a node with no derivable identity, which
     /// simply never reports.
     pub(crate) node: Option<String>,
@@ -50,18 +54,57 @@ pub(crate) struct Settlement {
     pub(crate) updating: bool,
 }
 
-/// Whether this node has durably rejected either half of the release `assignment` names — the
-/// application archive or the signed provider set. A node that has is finished with that unit for
-/// good: it never retries it, so no
+/// The complete release identity a heartbeat may attest, read from one durable installed record.
+/// Keeping the version with its archive, provider set, and manifest makes it impossible to combine
+/// loop memory from one commit boundary with digests from another.
+#[derive(Default)]
+struct InstalledReleaseIdentity {
+    version: String,
+    archive_sha256: String,
+    provider_set_sha256: String,
+    manifest_sha256: String,
+}
+
+fn installed_release_identity(store: &Store) -> InstalledReleaseIdentity {
+    match store.installed() {
+        updated::state::Installed::Present(state) => InstalledReleaseIdentity {
+            version: state.release.version,
+            archive_sha256: state.archive_sha256,
+            provider_set_sha256: state.lifecycle.provider_set_sha256.clone(),
+            manifest_sha256: state.release.manifest_sha256,
+        },
+        updated::state::Installed::Missing | updated::state::Installed::Invalid => {
+            InstalledReleaseIdentity::default()
+        }
+    }
+}
+
+/// Whether this node has durably rejected the release `assignment` names — either invalid
+/// artifact or this exact application/provider pair. A node that has is finished with that unit
+/// for good: it never retries it, so no
 /// later report of it will ever name that release as running, and the control plane has to be told
 /// or it waits for a convergence that cannot happen.
-pub(crate) fn rejects_assigned_release(
-    store: &dyn Store,
+pub(super) fn rejects_release(
+    store: &Store,
+    lineage: &updated::state::RepositoryLineage,
     assignment: &updated_contracts::assignment::RepositoryAssignment,
 ) -> bool {
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
-    store.is_rejected(&lineage, &assignment.application.sha256)
-        || store.is_rejected(&lineage, &assignment.provider_set.sha256)
+    store.rejects_deployment(
+        lineage,
+        &assignment.application.sha256,
+        &assignment.provider_set.sha256,
+    )
+}
+
+pub(crate) fn rejects_assigned_release(
+    store: &Store,
+    assignment: &updated_tuf::AssignmentContext,
+) -> bool {
+    rejects_release(
+        store,
+        assignment.repository_lineage(),
+        assignment.document(),
+    )
 }
 
 impl Heartbeat {
@@ -84,25 +127,23 @@ impl Heartbeat {
         &mut self,
         opts: &Options,
         repo: Option<&TrustedRepository>,
-        store: &dyn Store,
-        version: Option<&str>,
+        store: &Store,
         state: Settlement,
         fingerprint: Option<&updated_contracts::telemetry::Fingerprint>,
     ) {
-        let Some(assignment) = repo.and_then(|repo| repo.assignment()) else {
+        let Some(assignment) = repo.and_then(|repo| repo.assignment_context()) else {
             return;
         };
-        let repo = repo.expect("an assignment came from a repository");
-        let (archive_sha256, provider_set_sha256, manifest_sha256) =
-            installed_release_identity(store);
+        let document = assignment.document();
+        let installed = installed_release_identity(store);
         let rejected = rejects_assigned_release(store, assignment);
-        let runtime_converged = opts.runtime_is_converged(&assignment.runtime);
+        let runtime_converged = opts.runtime_is_converged(&document.runtime);
         let healthy = state.settled && runtime_converged;
         telemetry::report_running_state(
             &telemetry::ReportChannel {
                 control_client: &self.control_client,
                 object_client: &self.object_client,
-                control_base: (!opts.routing.is_local()).then_some(opts.routing.base_url.as_str()),
+                control_base: self.control_base.as_deref(),
                 node: self.node.as_deref(),
                 signing_key: self.signing_key.as_deref(),
                 // The slowest cadence the agent already has, read fresh each cycle so an
@@ -110,17 +151,17 @@ impl Heartbeat {
                 refusal_backoff: opts.timeouts.agent_check_interval,
             },
             &telemetry::RunningState {
-                deployment: &assignment.deployment,
-                assignment_sha256: repo.assignment_sha256().unwrap_or_default(),
-                version: version.unwrap_or_default(),
-                archive_sha256: &archive_sha256,
-                provider_set_sha256: &provider_set_sha256,
+                deployment: &document.deployment,
+                assignment_sha256: assignment.sha256(),
+                version: &installed.version,
+                archive_sha256: &installed.archive_sha256,
+                provider_set_sha256: &installed.provider_set_sha256,
                 healthy,
                 updating: state.updating,
                 rejected,
                 fingerprint,
                 paths: &opts.paths,
-                manifest_sha256: &manifest_sha256,
+                manifest_sha256: &installed.manifest_sha256,
             },
             &mut self.refusal,
             &mut self.outputs,

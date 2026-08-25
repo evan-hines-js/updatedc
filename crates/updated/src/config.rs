@@ -46,7 +46,7 @@ pub struct Routing {
 impl Routing {
     /// Whether this routing repository is local (a `file:` URL or an absolute directory path)
     /// rather than a network gateway. See [`base_url_is_local`].
-    pub fn is_local(&self) -> bool {
+    pub fn is_local(&self) -> Result<bool, String> {
         base_url_is_local(&self.base_url)
     }
 }
@@ -54,9 +54,24 @@ impl Routing {
 /// Whether a routing `base_url` names a local repository (a `file:` URL or an absolute directory
 /// path) rather than a network gateway. The single definition of "local" — the offline-repair path,
 /// assigned-input manager, and enrollment all gate on it, and must agree: one deciding to reach the
-/// network while another assumes offline would split the trust model.
-pub fn base_url_is_local(base_url: &str) -> bool {
-    base_url.starts_with("file:") || Path::new(base_url).is_absolute()
+/// network while another assumes offline would split the trust model. Classification is fallible:
+/// an invalid location is neither silently "remote" nor silently "local".
+pub fn base_url_is_local(base_url: &str) -> Result<bool, String> {
+    updated_contracts::assignment::canonical_repository_base(base_url)
+        .map(|url| url.scheme() == "file")
+}
+
+#[cfg(test)]
+mod repository_location_tests {
+    use super::base_url_is_local;
+
+    #[test]
+    fn locality_uses_the_canonical_repository_grammar() {
+        assert!(base_url_is_local("FILE:///opt/updated/").unwrap());
+        assert!(!base_url_is_local("https://EXAMPLE.com:443/").unwrap());
+        assert!(base_url_is_local("file:relative").is_err());
+        assert!(base_url_is_local("http://example.com/").is_err());
+    }
 }
 
 /// Fully resolved repository input. Values of this type are constructed only

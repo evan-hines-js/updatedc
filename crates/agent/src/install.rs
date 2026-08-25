@@ -40,7 +40,7 @@ pub(crate) const INSTALL_BOUNDARIES: &[&str] = &[
 ];
 
 fn advance_install(
-    store: &mut FileStore,
+    store: &mut Store,
     tx: &mut InstallTransaction,
     next: InstallPhase,
 ) -> io::Result<()> {
@@ -60,20 +60,21 @@ fn advance_install(
 /// Safety of the interaction with the update state machine rests on one invariant this
 /// function upholds: it runs before the boot/update recovery ([`gather_situation`] +
 /// [`apply_update`]) and, on `Ok`, always leaves *no* install journal on disk (on `Err` the
-/// boot never proceeds). So the two journals are temporally disjoint — the install journal
-/// exists only before the first commit (installed absent), the update journal only after
-/// (`apply_update` requires an installed release) — and the update machine never observes an
-/// install in flight. They live in separate files and are never read by each other's machine.
+/// boot never proceeds). So the two journals are temporally disjoint: the install journal exists
+/// on an empty node or while descending from a rejected provisional head, always with no update
+/// journal; the update journal exists only after a confirmed install. During fallback the old
+/// record remains authoritative until the new install commits. Neither machine ever reads the
+/// other's journal.
 pub(crate) async fn ensure_installed(
     opts: &Options,
-    store: &mut FileStore,
+    store: &mut Store,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some(tx) = store.install_journal()? {
         let installed = match store.installed() {
-            updated::state::Installed::Present(state) => Some(state.release.clone()),
+            updated::state::Installed::Present(state) => Some(state),
             _ => None,
         };
-        match classify_install_recovery(&tx, installed.as_ref()) {
+        match classify_install_recovery(&tx, installed.as_deref()) {
             // The install committed but crashed before clearing its journal — the app never
             // launched. Clearing it is the last install step, so this boot still owns the first
             // install: report it as such so the boot converge runs with `reason=install`.
@@ -100,16 +101,8 @@ pub(crate) async fn ensure_installed(
         updated::state::read_enrollment(&opts.paths.installed),
     ) {
         (updated::state::Installed::Missing, updated::state::EnrollmentState::Missing) => {
-            match apply_install(opts, store).await? {
-                ColdInstall::Installed => Ok(true),
-                // A truly fresh node with nothing installable at or below the assigned head has
-                // no committed release to fall back to — this is genuinely fatal.
-                ColdInstall::NothingSelectable(diagnostics) => Err(format!(
-                    "the first trusted assignment contains no installable application; ordered \
-                     fallback found nothing selectable at or below the assigned head:\n{diagnostics}"
-                )
-                .into()),
-            }
+            apply_install(opts, store).await?;
+            Ok(true)
         }
         (updated::state::Installed::Missing, _) => Err(
             "installed state is missing after enrollment with no recoverable install journal; refusing to cold-install"
@@ -129,29 +122,18 @@ pub(crate) async fn ensure_installed(
             // defer whenever the head has proven healthy, or an update transaction is mid-flight.
             if !state.confirmed
                 && store.journal()?.is_none()
-                && store.is_rejected(&state.repository_lineage, &state.archive_sha256)
+                && store.rejects_deployment(
+                    &state.repository_lineage,
+                    &state.archive_sha256,
+                    &state.lifecycle.provider_set_sha256,
+                )
             {
                 warn(&format!(
                     "provisional head {} is rejected; re-installing so ordered fallback descends past it",
                     state.release.version
                 ));
-                match apply_install(opts, store).await? {
-                    ColdInstall::Installed => Ok(true),
-                    // Fail open: nothing is installable at or below the assigned head, but this
-                    // release is already committed on disk. Bricking (exit fatal → launcher
-                    // crash-loop) is never better than relaunching a release we already committed
-                    // and verified — hold it and keep serving; it confirms on a passing gate. This
-                    // is a first-install node whose only healthy floor was transiently rejected
-                    // (e.g. a slow first-boot gate under load): it must recover, not strand.
-                    ColdInstall::NothingSelectable(diagnostics) => {
-                        warn(&format!(
-                            "ordered fallback found nothing selectable below the rejected head; \
-                             holding the committed {} rather than bricking the node:\n{diagnostics}",
-                            state.release.version
-                        ));
-                        Ok(false)
-                    }
-                }
+                apply_install(opts, store).await?;
+                Ok(true)
             } else {
                 Ok(false)
             }
@@ -165,30 +147,19 @@ pub(crate) async fn ensure_installed(
     }
 }
 
-/// The result of a cold install attempt.
-enum ColdInstall {
-    /// A selectable release was staged and committed (provisional).
-    Installed,
-    /// Ordered fallback found nothing installable at or below the assigned head — the descent
-    /// emptied out. Carries the selection diagnostics. The caller decides whether that is fatal
-    /// (a fresh node with nothing at all to run) or survivable (a node already holding a committed
-    /// release it can keep serving instead of bricking).
-    NothingSelectable(String),
-}
-
 /// Resolve the first trusted assignment, stage the application and its lifecycle provider,
 /// then drive the durable install to a committed, cleared journal.
 async fn apply_install(
     opts: &Options,
-    store: &mut FileStore,
-) -> Result<ColdInstall, Box<dyn std::error::Error>> {
+    store: &mut Store,
+) -> Result<(), Box<dyn std::error::Error>> {
     let repo = TrustedRepository::assigned(&opts.routing, &opts.storage, &opts.paths)
         .await
         .map_err(|error| format!("loading the first trusted assignment: {error}"))?;
     let assignment = repo
-        .assignment()
+        .assignment_context()
         .ok_or("the first trusted repository has no desired deployment")?;
-    let lineage = updated::state::RepositoryLineage::from_metadata_url(&assignment.metadata_url);
+    let lineage = assignment.repository_lineage().clone();
     // Resolve, download and verify the first application, descending past any *malformed* bundle
     // inline. A malformed head (corrupt archive, bad manifest, bad/missing entrypoint) passes its
     // signed archive sha but fails to extract/validate — the update path rejects it and moves on
@@ -205,23 +176,34 @@ async fn apply_install(
             // `orderedInstallFallback` may descend. The one stance that permits a descent.
             stance: updated_tuf::select::Stance::Nothing,
         };
-        let selected = match crate::acquire::select_assigned_application(&request, |sha256| {
-            store.is_rejected(&lineage, sha256)
-        }) {
+        let selected = match crate::acquire::select_assigned_application(
+            &request,
+            |application_sha256, provider_set_sha256| {
+                store.rejects_selection(&lineage, application_sha256, provider_set_sha256)
+            },
+        ) {
             Ok(Some(selected)) => selected,
             Ok(None) => {
                 // Enumerate exactly what the repository offered and why nothing was selectable, so
-                // an empty ordered-fallback descent is diagnosable from the log, not opaque. The
-                // caller decides whether an empty descent is fatal or survivable.
+                // an empty ordered-fallback descent is diagnosable rather than opaque. Rejection
+                // is never-retry evidence: there is no availability exception that may relaunch
+                // already-rejected bytes, even when this node previously committed them.
                 let policy = updated_tuf::DefaultPolicy::current(
                     &opts.application.product,
                     &opts.application.channel,
                 );
-                return Ok(ColdInstall::NothingSelectable(repo.selection_diagnostics(
+                let diagnostics = repo.selection_diagnostics(
                     &policy,
                     updated_tuf::select::Stance::Nothing,
-                    |sha| store.is_rejected(&lineage, sha),
-                )));
+                    |application_sha256, provider_set_sha256| {
+                        store.rejects_selection(&lineage, application_sha256, provider_set_sha256)
+                    },
+                );
+                return Err(format!(
+                    "the first trusted assignment contains no installable application; ordered \
+                     fallback found nothing selectable at or below the assigned head:\n{diagnostics}"
+                )
+                .into());
             }
             // A failure to read the signed metadata at all says nothing about any release, so
             // nothing is rejected: the boot retries the whole cold install later.
@@ -229,39 +211,37 @@ async fn apply_install(
         };
         // The set signed into the version just selected, decided once with it.
         let version_provider_set = selected.provider_set.clone();
+        let provider_set_sha256 = version_provider_set
+            .as_ref()
+            .unwrap_or(&assignment.document().provider_set)
+            .sha256
+            .clone();
         match crate::acquire::prepare_assigned_application(&request, selected).await {
             Ok(prepared) => {
                 // Stage the operator's providers *for this app version* — its own signed provider
                 // set governs (app + providers are one signed rollback unit, see `stage_providers`).
-                // A corrupt or previously-rejected provider set makes this whole version
-                // uninstallable: reject the app version so ordered fallback descends to one whose
-                // provider set is good, rather than crash-looping on a version we can never bring up.
+                // A content-rejected provider set makes this deployed-unit candidate
+                // uninstallable. Selection now checks both halves, so retrying the loop descends
+                // without falsely attaching that provider verdict to healthy application bytes.
                 match stage_providers(opts, &repo, store, version_provider_set.as_ref()).await {
                     Ok(providers) => break (prepared, providers),
-                    Err(crate::selection::ProviderStagingError::Unusable {
-                        message,
-                        version_bound: true,
-                    }) => {
-                        warn(&format!(
-                            "first-install provider set for {} is unusable ({message}); rejecting \
-                             this version so ordered fallback descends to one with a good set",
-                            prepared.version
-                        ));
-                        store.reject(&lineage, &prepared.archive_sha256)?;
-                        continue;
-                    }
-                    // The set came from the ASSIGNMENT, not from this version — every version
-                    // fails on it identically. Rejecting them one at a time would walk the descent
-                    // to the bottom and permanently exclude every release this node has, for a
-                    // cause none of them owns. Fail the install and let the operator fix the
-                    // assignment; the next boot retries with nothing thrown away.
-                    Err(crate::selection::ProviderStagingError::Unusable {
-                        message,
-                        version_bound: false,
-                    }) => {
+                    Err(crate::selection::ProviderStagingError::Unusable(message)) => {
+                        if store.is_rejected(&lineage, &provider_set_sha256) {
+                            warn(&format!(
+                                "first-install deployed unit for {} has a rejected provider set \
+                                 ({message}); ordered fallback will select the next complete unit",
+                                prepared.version
+                            ));
+                            continue;
+                        }
+                        // Metadata resolution/custom-field failures may be repaired without
+                        // changing any content digest. No permanent evidence exists, so do not
+                        // spin the in-process selector or poison either artifact; retry after the
+                        // repository is corrected.
                         return Err(format!(
-                            "the assignment's lifecycle provider set is unusable ({message}); no \
-                             application version can install until it is corrected"
+                            "staging the provider set for {} found a repairable repository error: \
+                             {message}",
+                            prepared.version
                         )
                         .into());
                     }
@@ -287,7 +267,7 @@ async fn apply_install(
                         "first-install bundle {version} is malformed; rejecting it so ordered \
                          fallback descends past it ({error})"
                     ));
-                    store.reject(&lineage, archive_sha256)?;
+                    store.reject_artifact(&lineage, archive_sha256)?;
                     continue;
                 }
                 return Err(format!("preparing the first application: {error}").into());
@@ -311,7 +291,7 @@ async fn apply_install(
     advance_install(store, &mut tx, InstallPhase::Prepared)?;
     chaos.crossing(install_boundary::PREPARED);
     place_and_commit(opts, store, tx).await?;
-    Ok(ColdInstall::Installed)
+    Ok(())
 }
 
 /// Drive an install from its current journaled phase to a committed, cleared state. Every step
@@ -319,7 +299,7 @@ async fn apply_install(
 /// atomic, the provider placement is idempotent, and enrollment + commit are one-way writes.
 async fn place_and_commit(
     opts: &Options,
-    store: &mut FileStore,
+    store: &mut Store,
     mut tx: InstallTransaction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let chaos = Chaos::from_env();
@@ -356,7 +336,12 @@ async fn place_and_commit(
         tx.archive_sha256.clone(),
         tx.lifecycle.clone(),
     ))?;
-    advance_install(store, &mut tx, InstallPhase::Committed)?;
+    // A valid but machine-inconsistent terminal journal can only come from external corruption,
+    // not [`Store::write_install_journal`]. Still converge it: recommit the exact unit above, then
+    // retain its already-terminal phase instead of attempting an impossible self-transition.
+    if tx.phase == InstallPhase::Placed {
+        advance_install(store, &mut tx, InstallPhase::Committed)?;
+    }
     chaos.crossing(install_boundary::COMMITTED);
     store.clear_install_journal()?;
     log(&format!(

@@ -138,7 +138,7 @@ case "$operation" in
     changed=true
     if running && [ "$(cat "$releasefile" 2>/dev/null || true)" = "$candidate" ]; then changed=false; fi
     converge
-    printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","retryAfterSeconds":null,"message":null}' "$changed" >"$result_file"
+    printf '{"schema":1,"status":"succeeded","changed":%s,"hostAction":"none","message":null}' "$changed" >"$result_file"
     ;;
   healthcheck) curl -fsS -o /dev/null --max-time 3 http://127.0.0.1:8080/healthz ;;
   inspect) printf 'release=%s\n' "$(cat "$releasefile" 2>/dev/null || true)" ;;

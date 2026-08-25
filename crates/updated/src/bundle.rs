@@ -37,7 +37,11 @@ impl ReleaseId {
         format!("{}-{}", self.version, self.manifest_sha256)
     }
 
-    pub(crate) fn validate(&self) -> io::Result<()> {
+    /// Validate the complete durable release identity.
+    ///
+    /// Store backends call this same rule before accepting an active pointer, so an in-memory test
+    /// record and the on-disk pointer cannot disagree about which identities exist.
+    pub fn validate(&self) -> io::Result<()> {
         Self::validate_version(&self.version)?;
         validate_digest(&self.manifest_sha256)
     }

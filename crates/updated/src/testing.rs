@@ -39,7 +39,8 @@ pub(crate) fn install_transaction() -> InstallTransaction {
         id: "a".repeat(64),
         release: release("1.0.0", "new"),
         archive_sha256: updated_contracts::digest::sha256_bytes(b"archive"),
-        repository_lineage: RepositoryLineage::from_metadata_url("https://repo/metadata/"),
+        repository_lineage: RepositoryLineage::from_metadata_url("https://repo/metadata/")
+            .expect("fixture metadata URL is valid"),
         lifecycle: provider(),
         phase: InstallPhase::Started,
     }
@@ -51,13 +52,20 @@ pub(crate) fn update_transaction() -> Transaction {
         id: "b".repeat(64),
         previous_release: release("1.0.0", "old"),
         previous_archive_sha256: updated_contracts::digest::sha256_bytes(b"previous-archive"),
-        previous_repository_lineage: RepositoryLineage::from_metadata_url("https://old/metadata/"),
+        previous_repository_lineage: RepositoryLineage::from_metadata_url("https://old/metadata/")
+            .expect("fixture metadata URL is valid"),
         candidate_release: release("2.0.0", "new"),
         candidate_archive_sha256: updated_contracts::digest::sha256_bytes(b"archive"),
-        candidate_rejection_sha256: "f".repeat(64),
-        candidate_repository_lineage: RepositoryLineage::from_metadata_url("https://new/metadata/"),
+        candidate_rejection_sha256: updated_contracts::digest::deployment_rejection_sha256(
+            &updated_contracts::digest::sha256_bytes(b"archive"),
+            &provider().provider_set_sha256,
+        )
+        .expect("fixture artifact identities are canonical"),
+        candidate_repository_lineage: RepositoryLineage::from_metadata_url("https://new/metadata/")
+            .expect("fixture metadata URL is valid"),
         candidate_rejection_required: false,
-        lifecycle: provider(),
+        previous_lifecycle: provider(),
+        candidate_lifecycle: provider(),
         rollback_health_failures: 0,
         phase: Phase::Prepared,
     }

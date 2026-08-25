@@ -69,7 +69,7 @@ impl NodeSpiffeId {
 /// The node's public key (uncompressed EC point) from its PEM CSR — the value the control plane
 /// pins on the `UpdateAgent` so it can later verify the node's *signed* telemetry against the same
 /// key that certifies its mTLS leaf. This is the exact bytes `aws-lc-rs` `ECDSA_P256_SHA256`
-/// verification (in `updated_contracts::telemetry::report_is_authentic_and_fresh`) expects.
+/// verification (in `updated_contracts::telemetry::authenticate_report`) expects.
 ///
 /// Extraction goes through the SAME parse the CA signs with, which verifies the CSR self-signature,
 /// the signature algorithm, and the extension set. Proof-of-possession therefore holds at the
@@ -79,7 +79,7 @@ impl NodeSpiffeId {
 /// The key is admitted here, at the one place a pin is produced, through the one gate that admits
 /// one — it is returned as a [`P256PublicKey`], so nothing downstream holds an unchecked pin.
 /// CSR parsing accepts Ed25519, P-384 and RSA keys just as happily as P-256, and every one of them
-/// would otherwise be pinned and certified — after which `report_is_authentic_and_fresh` could
+/// would otherwise be pinned and certified — after which `authenticate_report` could
 /// never verify a report the node sends. The node would then look permanently `Silent`: holding a
 /// `maxUnavailable` slot in its group and a concurrency slot in its set, for a reason nothing
 /// surfaces. Refusing the CSR turns that into a 400 at the moment of the mistake.
@@ -161,7 +161,6 @@ impl IssuingCa {
 #[cfg(test)]
 // These tests assert the end-to-end claim that a key pinned at enrollment is the key that later
 // verifies that node's telemetry, which cannot be shown through the controller's report cache.
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -246,10 +245,9 @@ mod tests {
         // The whole point of pinning the CSR's key at enrollment: it is the key that later verifies
         // this node's own signed telemetry, end to end.
         assert!(
-            updated_contracts::telemetry::report_is_authentic_and_fresh(
-                &envelope, "agent-9", &pinned, now_ms
-            )
-            .is_some(),
+            updated_contracts::telemetry::authenticate_report(&envelope, "agent-9", &pinned)
+                .and_then(|report| report.fresh(now_ms))
+                .is_some(),
             "pinned CSR key must verify the node's own signed report"
         );
 
@@ -268,19 +266,19 @@ mod tests {
             &base64::engine::general_purpose::STANDARD,
             serde_json::to_vec(&inner).unwrap(),
         );
-        assert!(updated_contracts::telemetry::report_is_authentic_and_fresh(
-            &tampered, "agent-9", &pinned, now_ms
-        )
-        .is_none());
+        assert!(
+            updated_contracts::telemetry::authenticate_report(&tampered, "agent-9", &pinned)
+                .and_then(|report| report.fresh(now_ms))
+                .is_none()
+        );
 
         let other_key = updated::csr::generate_key().unwrap();
         let other_csr = updated::csr::csr_for(&other_key, "x").unwrap();
         let other_pin = csr_public_key(&other_csr).unwrap();
         assert!(
-            updated_contracts::telemetry::report_is_authentic_and_fresh(
-                &envelope, "agent-9", &other_pin, now_ms
-            )
-            .is_none(),
+            updated_contracts::telemetry::authenticate_report(&envelope, "agent-9", &other_pin)
+                .and_then(|report| report.fresh(now_ms))
+                .is_none(),
             "a different node's pinned key must not verify this report"
         );
     }
@@ -422,7 +420,7 @@ mod tests {
 
     /// A CSR is not automatically an ECDSA P-256 CSR: rcgen parses Ed25519, P-384 and RSA just as
     /// happily. Pinning one of those keys mints a leaf for a node whose every signed report is then
-    /// rejected by `report_is_authentic_and_fresh`, leaving it permanently `Silent` — spending its
+    /// rejected by `authenticate_report`, leaving it permanently `Silent` — spending its
     /// group's `maxUnavailable` and its set's concurrency slot with nothing to explain it. The wrong
     /// key type must fail at enrollment instead.
     #[test]

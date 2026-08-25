@@ -31,8 +31,7 @@ pub const MAX_RESULT_MESSAGE_BYTES: usize = 4 * 1024;
 pub const MAX_MUTATION_ATTEMPTS: u32 = 5;
 
 /// A platform action requested after a successful state-changing operation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HostAction {
     #[default]
     None,
@@ -40,6 +39,8 @@ pub enum HostAction {
 }
 
 impl HostAction {
+    const ALL: [Self; 2] = [Self::None, Self::Reboot];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -48,36 +49,201 @@ impl HostAction {
     }
 }
 
-/// The semantic result of `apply` or `rollback`.
-///
-/// The process must still exit successfully. A missing, malformed, or contradictory result is a
-/// reconciler failure; this prevents an accidental `exit 0` from committing machine state whose
-/// meaning the platform never learned.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResultDocument {
-    pub schema: u32,
-    pub status: ResultStatus,
-    pub changed: bool,
-    pub host_action: HostAction,
-    pub retry_after_seconds: Option<u64>,
-    pub message: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub enum ResultStatus {
-    Succeeded,
-    Retry,
-}
-
-impl ResultStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Retry => "retry",
-        }
+impl Serialize for HostAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
     }
+}
+
+impl<'de> Deserialize<'de> for HostAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::ALL
+            .into_iter()
+            .find(|action| action.as_str() == value)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown host action {value:?}")))
+    }
+}
+
+/// The successful semantic result of a state-changing operation.
+///
+/// This is also the only result shape durable reconciliation evidence can contain. A retry is a
+/// request to invoke the same attempt again, not a completed reconciliation, so it has a different
+/// type and cannot leak into an audit record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuccessfulMutation(SuccessfulMutationWire);
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SuccessfulMutationWire {
+    changed: bool,
+    host_action: HostAction,
+    message: Option<String>,
+}
+
+impl Serialize for SuccessfulMutation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SuccessfulMutation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = SuccessfulMutationWire::deserialize(deserializer)?;
+        Self::new(wire.changed, wire.host_action, wire.message).map_err(serde::de::Error::custom)
+    }
+}
+
+impl SuccessfulMutation {
+    pub fn new(
+        changed: bool,
+        host_action: HostAction,
+        message: Option<String>,
+    ) -> Result<Self, String> {
+        let result = Self(SuccessfulMutationWire {
+            changed,
+            host_action,
+            message,
+        });
+        result.validate()?;
+        Ok(result)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_message(self.0.message.as_deref())
+    }
+
+    pub const fn changed(&self) -> bool {
+        self.0.changed
+    }
+
+    pub const fn host_action(&self) -> HostAction {
+        self.0.host_action
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.0.message.as_deref()
+    }
+}
+
+/// A bounded request to repeat the same mutation attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetryRequest {
+    after_seconds: u64,
+    message: Option<String>,
+}
+
+impl RetryRequest {
+    fn new(after_seconds: u64, message: Option<String>) -> Result<Self, String> {
+        if !(ResultDocument::MIN_RETRY_AFTER_SECONDS..=ResultDocument::MAX_RETRY_AFTER_SECONDS)
+            .contains(&after_seconds)
+        {
+            return Err("a retry result requires a bounded delay".into());
+        }
+        validate_message(message.as_deref())?;
+        Ok(Self {
+            after_seconds,
+            message,
+        })
+    }
+
+    pub const fn after_seconds(&self) -> u64 {
+        self.after_seconds
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
+/// The only two meanings a valid mutation result can have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MutationResolution {
+    Succeeded(SuccessfulMutation),
+    Retry(RetryRequest),
+}
+
+/// The semantic result document produced by `apply` or `rollback`.
+///
+/// The wire shape is a tagged union rather than a bag of optional fields: a successful answer has a
+/// host action and no retry delay; a retry has a delay and no host action or `changed` claim. Those
+/// combinations are impossible to construct or deserialize instead of being conventions every
+/// producer and consumer must independently remember.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResultDocument(MutationResolution);
+
+#[derive(Deserialize, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum ResultDocumentWire {
+    Succeeded {
+        schema: u32,
+        changed: bool,
+        host_action: HostAction,
+        message: Option<String>,
+    },
+    Retry {
+        schema: u32,
+        retry_after_seconds: u64,
+        message: Option<String>,
+    },
+}
+
+impl Serialize for ResultDocument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.0 {
+            MutationResolution::Succeeded(result) => ResultDocumentWire::Succeeded {
+                schema: Self::SCHEMA,
+                changed: result.changed(),
+                host_action: result.host_action(),
+                message: result.0.message.clone(),
+            },
+            MutationResolution::Retry(retry) => ResultDocumentWire::Retry {
+                schema: Self::SCHEMA,
+                retry_after_seconds: retry.after_seconds(),
+                message: retry.message.clone(),
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResultDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ResultDocumentWire::deserialize(deserializer)?;
+        Self::from_wire(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_message(message: Option<&str>) -> Result<(), String> {
+    if message.is_some_and(|message| {
+        message.len() > MAX_RESULT_MESSAGE_BYTES || message.chars().any(char::is_control)
+    }) {
+        return Err("reconciler result message is oversized or contains control characters".into());
+    }
+    Ok(())
 }
 
 impl ResultDocument {
@@ -85,55 +251,66 @@ impl ResultDocument {
     pub const MIN_RETRY_AFTER_SECONDS: u64 = 1;
     pub const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 
-    pub fn validate(&self) -> Result<(), String> {
-        if self.schema != Self::SCHEMA {
-            return Err(format!(
-                "unsupported reconciler result schema {}",
-                self.schema
-            ));
-        }
-        if self.message.as_ref().is_some_and(|message| {
-            message.len() > MAX_RESULT_MESSAGE_BYTES || message.chars().any(char::is_control)
-        }) {
-            return Err(
-                "reconciler result message is oversized or contains control characters".into(),
-            );
-        }
-        match self.status {
-            ResultStatus::Succeeded if self.retry_after_seconds.is_some() => {
-                Err("a successful reconciler result cannot request a retry".into())
+    pub fn succeeded(
+        changed: bool,
+        host_action: HostAction,
+        message: Option<String>,
+    ) -> Result<Self, String> {
+        SuccessfulMutation::new(changed, host_action, message)
+            .map(MutationResolution::Succeeded)
+            .map(Self)
+    }
+
+    pub fn retry(retry_after_seconds: u64, message: Option<String>) -> Result<Self, String> {
+        RetryRequest::new(retry_after_seconds, message)
+            .map(MutationResolution::Retry)
+            .map(Self)
+    }
+
+    pub fn into_resolution(self) -> MutationResolution {
+        self.0
+    }
+
+    fn from_wire(wire: ResultDocumentWire) -> Result<Self, String> {
+        match wire {
+            ResultDocumentWire::Succeeded {
+                schema,
+                changed,
+                host_action,
+                message,
+            } => {
+                Self::validate_schema(schema)?;
+                Self::succeeded(changed, host_action, message)
             }
-            ResultStatus::Retry
-                if self.host_action != HostAction::None
-                    || !self.retry_after_seconds.is_some_and(|seconds| {
-                        (Self::MIN_RETRY_AFTER_SECONDS..=Self::MAX_RETRY_AFTER_SECONDS)
-                            .contains(&seconds)
-                    }) =>
-            {
-                Err(
-                    "a retry result requires a bounded delay and cannot request a host action"
-                        .into(),
-                )
+            ResultDocumentWire::Retry {
+                schema,
+                retry_after_seconds,
+                message,
+            } => {
+                Self::validate_schema(schema)?;
+                Self::retry(retry_after_seconds, message)
             }
-            _ => Ok(()),
         }
+    }
+
+    fn validate_schema(schema: u32) -> Result<(), String> {
+        if schema != Self::SCHEMA {
+            return Err(format!("unsupported reconciler result schema {}", schema));
+        }
+        Ok(())
     }
 
     pub fn from_bounded_json(bytes: &[u8]) -> Result<Self, String> {
-        let result: Self = crate::bounded::decode(bytes, "reconciler result", MAX_RESULT_BYTES)?;
-        result.validate()?;
-        Ok(result)
+        crate::bounded::decode(bytes, "reconciler result", MAX_RESULT_BYTES)
     }
 
     pub fn to_bounded_json(&self) -> Result<Vec<u8>, String> {
-        self.validate()?;
         crate::bounded::encode(self, "reconciler result", MAX_RESULT_BYTES)
     }
 }
 
 /// The four public reconciler operations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Operation {
     /// Idempotently converge machine state to the candidate.
     Apply,
@@ -161,6 +338,27 @@ impl MutationOperation {
             Self::Rollback => Operation::Rollback,
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        self.operation().as_str()
+    }
+
+    /// Enforce the complete mutation invocation grammar in one place, before execution and again
+    /// when durable evidence is decoded.
+    pub fn validate_invocation(self, reason: Reason, id: &str) -> Result<(), String> {
+        let accepted = match (self, reason) {
+            (Self::Apply, Reason::Install) => id == attempt::BOOT,
+            (Self::Apply, Reason::Restart) => matches!(id, attempt::BOOT | attempt::CONVERGE),
+            (Self::Apply, Reason::Update) => attempt::is_transaction_invocation(id),
+            (Self::Rollback, Reason::Update) => attempt::is_compensation(id),
+            (Self::Rollback, Reason::Install | Reason::Restart) => false,
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err("invalid mutation operation, reason, and attempt combination".into())
+        }
+    }
 }
 
 /// Read-only operations. These never publish a result document, outputs, retries, or host actions.
@@ -177,9 +375,38 @@ impl ObservationOperation {
             Self::Inspect => Operation::Inspect,
         }
     }
+
+    /// Enforce the observation invocation grammar beside the mutation grammar. A healthcheck is
+    /// evidence for the operation whose attempt identity it carries; an inspect is the one
+    /// periodic fingerprint observation. Keeping these combinations here prevents an invoker from
+    /// giving a reserved observation ID transaction meaning, or from claiming a transaction probe
+    /// is an ordinary restart.
+    pub fn validate_invocation(self, reason: Reason, id: &str) -> Result<(), String> {
+        let accepted = match (self, reason) {
+            (Self::Healthcheck, Reason::Install) => id == attempt::BOOT,
+            (Self::Healthcheck, Reason::Restart) => {
+                matches!(id, attempt::BOOT | attempt::CONVERGE | attempt::PERIODIC)
+            }
+            (Self::Healthcheck, Reason::Update) => attempt::is_transaction_invocation(id),
+            (Self::Inspect, Reason::Restart) => id == attempt::FINGERPRINT,
+            (Self::Inspect, Reason::Install | Reason::Update) => false,
+        };
+        if accepted {
+            Ok(())
+        } else {
+            Err("invalid observation operation, reason, and attempt combination".into())
+        }
+    }
 }
 
 impl Operation {
+    pub const ALL: [Self; 4] = [
+        Self::Apply,
+        Self::Healthcheck,
+        Self::Rollback,
+        Self::Inspect,
+    ];
+
     /// The wire spelling passed as the reconciler's first argument.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -214,6 +441,16 @@ impl Operation {
             Self::Apply | Self::Rollback => None,
         }
     }
+
+    /// The complete invocation grammar, called at the one command-preparation boundary before any
+    /// reconciler process can run.
+    pub fn validate_invocation(self, reason: Reason, id: &str) -> Result<(), String> {
+        match (self.mutation(), self.observation()) {
+            (Some(operation), None) => operation.validate_invocation(reason, id),
+            (None, Some(operation)) => operation.validate_invocation(reason, id),
+            _ => unreachable!("every operation belongs to exactly one typed class"),
+        }
+    }
 }
 
 /// An argv operation that is not one of the four.
@@ -232,13 +469,50 @@ impl FromStr for Operation {
     type Err = UnknownOperation;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "apply" => Ok(Self::Apply),
-            "healthcheck" => Ok(Self::Healthcheck),
-            "rollback" => Ok(Self::Rollback),
-            "inspect" => Ok(Self::Inspect),
-            other => Err(UnknownOperation(other.to_string())),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|operation| operation.as_str() == value)
+            .ok_or_else(|| UnknownOperation(value.to_string()))
+    }
+}
+
+impl Serialize for Operation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Operation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for MutationOperation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MutationOperation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Operation::deserialize(deserializer)?
+            .mutation()
+            .ok_or_else(|| serde::de::Error::custom("operation is not state-changing"))
     }
 }
 
@@ -252,8 +526,7 @@ impl fmt::Display for Operation {
 /// grammar exactly like [`FLAGS`] and [`Operation`] — the agent emits these spellings and a
 /// reconciler may branch on only these — so it lives here rather than privately in the invoker,
 /// where a second speller (a conformance harness, a test fixture) could drift from it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     /// First convergence onto a release this node has not run before.
     Install,
@@ -264,6 +537,8 @@ pub enum Reason {
 }
 
 impl Reason {
+    pub const ALL: [Self; 3] = [Self::Install, Self::Restart, Self::Update];
+
     /// The wire spelling passed after `--reason`.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -292,10 +567,30 @@ impl FromStr for Reason {
     /// Matched against the vocabulary's own [`as_str`](Reason::as_str) rather than a second set of
     /// literals, so a reader cannot end up recognizing a spelling the writer no longer sends.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        [Self::Install, Self::Restart, Self::Update]
+        Self::ALL
             .into_iter()
             .find(|reason| reason.as_str() == value)
             .ok_or_else(|| UnknownReason(value.to_string()))
+    }
+}
+
+impl Serialize for Reason {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Reason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -310,103 +605,273 @@ impl fmt::Display for Reason {
 /// This is platform-owned audit evidence: a reconciler describes the semantic result, while the
 /// agent binds it to the operation, reason, attempt, immutable releases, and completion time before
 /// it treats the invocation as successful.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciledRelease(ReconciledReleaseWire);
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReconciledRelease {
-    pub version: String,
-    pub manifest_sha256: String,
-    pub archive_sha256: String,
+struct ReconciledReleaseWire {
+    version: String,
+    manifest_sha256: String,
+    archive_sha256: String,
+}
+
+impl Serialize for ReconciledRelease {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReconciledRelease {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ReconciledReleaseWire::deserialize(deserializer)?;
+        Self::new(wire.version, wire.manifest_sha256, wire.archive_sha256)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ReconciledRelease {
-    fn validate(&self, name: &str) -> Result<(), String> {
-        if !crate::identity::is_release_version(&self.version)
-            || !crate::is_canonical_sha256(&self.manifest_sha256)
-            || !crate::is_canonical_sha256(&self.archive_sha256)
+    pub fn new(
+        version: String,
+        manifest_sha256: String,
+        archive_sha256: String,
+    ) -> Result<Self, String> {
+        if !crate::identity::is_release_version(&version)
+            || !crate::is_canonical_sha256(&manifest_sha256)
+            || !crate::is_canonical_sha256(&archive_sha256)
         {
-            return Err(format!(
-                "last reconciliation has an invalid {name} release identity"
-            ));
+            return Err("invalid reconciled release identity".into());
         }
-        Ok(())
+        Ok(Self(ReconciledReleaseWire {
+            version,
+            manifest_sha256,
+            archive_sha256,
+        }))
+    }
+
+    pub fn version(&self) -> &str {
+        &self.0.version
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.0.manifest_sha256
+    }
+
+    pub fn archive_sha256(&self) -> &str {
+        &self.0.archive_sha256
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconcilerIdentity(ReconcilerIdentityWire);
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReconcilerIdentity {
-    pub provider_set_sha256: String,
-    pub product: String,
-    pub release: ReconciledRelease,
+struct ReconcilerIdentityWire {
+    provider_set_sha256: String,
+    product: String,
+    release: ReconciledRelease,
+}
+
+impl Serialize for ReconcilerIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReconcilerIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ReconcilerIdentityWire::deserialize(deserializer)?;
+        Self::new(wire.provider_set_sha256, wire.product, wire.release)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl ReconcilerIdentity {
-    fn validate(&self) -> Result<(), String> {
-        if !crate::is_canonical_sha256(&self.provider_set_sha256)
-            || !crate::identity::is_segment(&self.product)
+    pub fn new(
+        provider_set_sha256: String,
+        product: String,
+        release: ReconciledRelease,
+    ) -> Result<Self, String> {
+        if !crate::is_canonical_sha256(&provider_set_sha256)
+            || !crate::identity::is_segment(&product)
         {
-            return Err("last reconciliation has an invalid reconciler identity".into());
+            return Err("invalid reconciler identity".into());
         }
-        self.release.validate("reconciler")
+        Ok(Self(ReconcilerIdentityWire {
+            provider_set_sha256,
+            product,
+            release,
+        }))
+    }
+
+    pub fn provider_set_sha256(&self) -> &str {
+        &self.0.provider_set_sha256
+    }
+
+    pub fn product(&self) -> &str {
+        &self.0.product
+    }
+
+    pub const fn release(&self) -> &ReconciledRelease {
+        &self.0.release
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+/// The immutable release identities on both sides of one state-changing reconciliation.
+///
+/// Each identity is already valid by construction; grouping them prevents candidate/predecessor
+/// ordering from becoming another long argument list at every audit-record call site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciliationTransition {
+    candidate: ReconciledRelease,
+    predecessor: ReconciledRelease,
+}
+
+impl ReconciliationTransition {
+    pub fn new(candidate: ReconciledRelease, predecessor: ReconciledRelease) -> Self {
+        Self {
+            candidate,
+            predecessor,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastReconciliation(LastReconciliationWire);
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LastReconciliation {
-    pub schema: u32,
-    pub operation: Operation,
-    pub reason: Reason,
-    pub attempt_id: String,
-    pub candidate: ReconciledRelease,
-    pub predecessor: ReconciledRelease,
-    pub reconciler: ReconcilerIdentity,
-    pub result: ResultDocument,
-    pub completed_at_ms: u64,
+struct LastReconciliationWire {
+    schema: u32,
+    operation: MutationOperation,
+    reason: Reason,
+    attempt_id: String,
+    candidate: ReconciledRelease,
+    predecessor: ReconciledRelease,
+    reconciler: ReconcilerIdentity,
+    result: SuccessfulMutation,
+    completed_at_ms: u64,
+}
+
+impl Serialize for LastReconciliation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LastReconciliation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = LastReconciliationWire::deserialize(deserializer)?;
+        if wire.schema != Self::SCHEMA {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported last-reconciliation schema {}",
+                wire.schema
+            )));
+        }
+        let transition = ReconciliationTransition::new(wire.candidate, wire.predecessor);
+        Self::new(
+            wire.operation,
+            wire.reason,
+            wire.attempt_id,
+            transition,
+            wire.reconciler,
+            wire.result,
+            wire.completed_at_ms,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl LastReconciliation {
-    pub const SCHEMA: u32 = 1;
+    const SCHEMA: u32 = 1;
     pub const MAX_BYTES: usize = 32 * 1024;
 
-    pub fn validate(&self) -> Result<(), String> {
-        if self.schema != Self::SCHEMA {
-            return Err(format!(
-                "unsupported last-reconciliation schema {}",
-                self.schema
-            ));
-        }
-        let valid_attempt = match self.operation.mutation() {
-            Some(MutationOperation::Apply) => attempt::is_mutation(&self.attempt_id),
-            Some(MutationOperation::Rollback) => attempt::is_compensation(&self.attempt_id),
-            None => {
-                return Err("last reconciliation must describe a state-changing operation".into())
-            }
-        };
-        if !valid_attempt {
-            return Err("last reconciliation has an invalid attempt id".into());
-        }
-        self.candidate.validate("candidate")?;
-        self.predecessor.validate("predecessor")?;
-        self.reconciler.validate()?;
-        self.result.validate()?;
-        if self.result.status != ResultStatus::Succeeded {
-            return Err("last reconciliation cannot record an incomplete retry result".into());
-        }
-        if self.completed_at_ms == 0 {
+    pub fn new(
+        operation: MutationOperation,
+        reason: Reason,
+        attempt_id: String,
+        transition: ReconciliationTransition,
+        reconciler: ReconcilerIdentity,
+        result: SuccessfulMutation,
+        completed_at_ms: u64,
+    ) -> Result<Self, String> {
+        operation.validate_invocation(reason, &attempt_id)?;
+        if completed_at_ms == 0 {
             return Err("last reconciliation has no completion time".into());
         }
-        Ok(())
+        Ok(Self(LastReconciliationWire {
+            schema: Self::SCHEMA,
+            operation,
+            reason,
+            attempt_id,
+            candidate: transition.candidate,
+            predecessor: transition.predecessor,
+            reconciler,
+            result,
+            completed_at_ms,
+        }))
+    }
+
+    pub const fn operation(&self) -> MutationOperation {
+        self.0.operation
+    }
+
+    pub const fn reason(&self) -> Reason {
+        self.0.reason
+    }
+
+    pub fn attempt_id(&self) -> &str {
+        &self.0.attempt_id
+    }
+
+    pub const fn candidate(&self) -> &ReconciledRelease {
+        &self.0.candidate
+    }
+
+    pub const fn predecessor(&self) -> &ReconciledRelease {
+        &self.0.predecessor
+    }
+
+    pub const fn reconciler(&self) -> &ReconcilerIdentity {
+        &self.0.reconciler
+    }
+
+    pub const fn result(&self) -> &SuccessfulMutation {
+        &self.0.result
+    }
+
+    pub const fn completed_at_ms(&self) -> u64 {
+        self.0.completed_at_ms
+    }
+
+    pub fn into_result(self) -> SuccessfulMutation {
+        self.0.result
     }
 
     pub fn from_bounded_json(bytes: &[u8]) -> Result<Self, String> {
-        let record: Self = crate::bounded::decode(bytes, "last reconciliation", Self::MAX_BYTES)?;
-        record.validate()?;
-        Ok(record)
+        crate::bounded::decode(bytes, "last reconciliation", Self::MAX_BYTES)
     }
 
     pub fn to_bounded_json(&self) -> Result<Vec<u8>, String> {
-        self.validate()?;
         crate::bounded::encode(self, "last reconciliation", Self::MAX_BYTES)
     }
 }
@@ -512,11 +977,11 @@ pub mod attempt {
         ALL.contains(&id)
     }
 
-    /// Whether `id` can belong to a state-changing invocation: boot or steady convergence, a
-    /// deployment transaction, or that transaction's compensating direction. Observation-only
-    /// identities are deliberately excluded from durable reconciliation evidence.
-    pub fn is_mutation(id: &str) -> bool {
-        matches!(id, BOOT | CONVERGE) || crate::is_canonical_sha256(id) || is_compensation(id)
+    /// Whether `id` names either direction of one deployment transaction. Every transactional
+    /// operation and observation uses this predicate, so the forward/compensating grammar cannot
+    /// drift between `apply`, `healthcheck`, and durable audit evidence.
+    pub fn is_transaction_invocation(id: &str) -> bool {
+        crate::is_canonical_sha256(id) || is_compensation(id)
     }
 
     /// Whether `id` is the derived compensating direction of one transaction. A `rollback`
@@ -542,6 +1007,44 @@ mod tests {
         ] {
             assert_eq!(operation.as_str(), spelling);
             assert_eq!(spelling.parse::<Operation>().unwrap(), operation);
+            assert_eq!(serde_json::to_value(operation).unwrap(), spelling);
+            assert_eq!(
+                serde_json::from_value::<Operation>(spelling.into()).unwrap(),
+                operation
+            );
+        }
+    }
+
+    #[test]
+    fn every_protocol_enum_uses_its_canonical_spelling_for_json() {
+        for action in HostAction::ALL {
+            let encoded = serde_json::to_value(action).unwrap();
+            assert_eq!(encoded, action.as_str());
+            assert_eq!(
+                serde_json::from_value::<HostAction>(encoded).unwrap(),
+                action
+            );
+        }
+        for reason in Reason::ALL {
+            let encoded = serde_json::to_value(reason).unwrap();
+            assert_eq!(encoded, reason.as_str());
+            assert_eq!(serde_json::from_value::<Reason>(encoded).unwrap(), reason);
+        }
+        for operation in Operation::ALL.into_iter().filter_map(Operation::mutation) {
+            let encoded = serde_json::to_value(operation).unwrap();
+            assert_eq!(encoded, operation.as_str());
+            assert_eq!(
+                serde_json::from_value::<MutationOperation>(encoded).unwrap(),
+                operation
+            );
+        }
+        for operation in Operation::ALL
+            .into_iter()
+            .filter(|operation| operation.observation().is_some())
+        {
+            assert!(
+                serde_json::from_value::<MutationOperation>(operation.as_str().into()).is_err()
+            );
         }
     }
 
@@ -555,12 +1058,7 @@ mod tests {
 
     #[test]
     fn every_operation_belongs_to_exactly_one_typed_class() {
-        for operation in [
-            Operation::Apply,
-            Operation::Healthcheck,
-            Operation::Rollback,
-            Operation::Inspect,
-        ] {
+        for operation in Operation::ALL {
             assert_ne!(
                 operation.mutation().is_some(),
                 operation.observation().is_some()
@@ -575,89 +1073,165 @@ mod tests {
     }
 
     #[test]
-    fn result_documents_are_bounded_and_semantically_consistent() {
-        let succeeded = ResultDocument {
-            schema: ResultDocument::SCHEMA,
-            status: ResultStatus::Succeeded,
-            changed: true,
-            host_action: HostAction::Reboot,
-            retry_after_seconds: None,
-            message: Some("kernel configuration changed".into()),
-        };
+    fn result_documents_are_bounded_tagged_unions() {
+        let succeeded = ResultDocument::succeeded(
+            true,
+            HostAction::Reboot,
+            Some("kernel configuration changed".into()),
+        )
+        .unwrap();
         assert_eq!(
             ResultDocument::from_bounded_json(&succeeded.to_bounded_json().unwrap()).unwrap(),
             succeeded
         );
+        let succeeded_json = serde_json::to_value(&succeeded).unwrap();
+        assert!(succeeded_json.get("retryAfterSeconds").is_none());
 
-        let retry = ResultDocument {
-            schema: ResultDocument::SCHEMA,
-            status: ResultStatus::Retry,
-            changed: false,
-            host_action: HostAction::None,
-            retry_after_seconds: Some(30),
-            message: Some("package manager is locked".into()),
-        };
-        assert!(retry.validate().is_ok());
+        let retry = ResultDocument::retry(30, Some("package manager is locked".into())).unwrap();
+        let retry_json = serde_json::to_value(&retry).unwrap();
+        assert!(retry_json.get("changed").is_none());
+        assert!(retry_json.get("hostAction").is_none());
+        assert!(ResultDocument::retry(0, None).is_err());
+        assert!(ResultDocument::retry(ResultDocument::MAX_RETRY_AFTER_SECONDS + 1, None).is_err());
 
-        let mut invalid = retry.clone();
-        invalid.host_action = HostAction::Reboot;
-        assert!(invalid.validate().is_err());
-        invalid = succeeded;
-        invalid.retry_after_seconds = Some(1);
-        assert!(invalid.validate().is_err());
+        let maximum_message = "a".repeat(MAX_RESULT_MESSAGE_BYTES);
+        assert!(
+            ResultDocument::succeeded(false, HostAction::None, Some(maximum_message.clone()))
+                .is_ok()
+        );
+        assert!(ResultDocument::retry(1, Some(maximum_message)).is_ok());
+
+        let oversized_message = "a".repeat(MAX_RESULT_MESSAGE_BYTES + 1);
+        assert!(ResultDocument::succeeded(
+            false,
+            HostAction::None,
+            Some(oversized_message.clone())
+        )
+        .is_err());
+        assert!(ResultDocument::retry(1, Some(oversized_message)).is_err());
+
+        let contradictory = br#"{
+            "schema": 1,
+            "status": "retry",
+            "retryAfterSeconds": 1,
+            "hostAction": "none",
+            "message": null
+        }"#;
+        assert!(ResultDocument::from_bounded_json(contradictory).is_err());
+
+        for invalid in [
+            serde_json::json!({
+                "schema": 2,
+                "status": "succeeded",
+                "changed": false,
+                "hostAction": "none",
+                "message": null
+            }),
+            serde_json::json!({
+                "schema": 1,
+                "status": "retry",
+                "retryAfterSeconds": 0,
+                "message": null
+            }),
+            serde_json::json!({
+                "schema": 1,
+                "status": "succeeded",
+                "changed": false,
+                "hostAction": "none",
+                "retryAfterSeconds": null,
+                "message": null
+            }),
+            serde_json::json!({
+                "schema": 1,
+                "status": "succeeded",
+                "changed": false,
+                "hostAction": "none",
+                "message": "two\nlines"
+            }),
+        ] {
+            assert!(serde_json::from_value::<ResultDocument>(invalid).is_err());
+        }
+        assert!(
+            serde_json::from_value::<SuccessfulMutation>(serde_json::json!({
+                "changed": false,
+                "hostAction": "none",
+                "message": "two\nlines"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn platform_audit_evidence_binds_a_success_to_both_immutable_releases() {
-        let record = LastReconciliation {
-            schema: LastReconciliation::SCHEMA,
-            operation: Operation::Apply,
-            reason: Reason::Update,
-            attempt_id: "a".repeat(64),
-            candidate: ReconciledRelease {
-                version: "2.0.0".into(),
-                manifest_sha256: "a".repeat(64),
-                archive_sha256: "c".repeat(64),
-            },
-            predecessor: ReconciledRelease {
-                version: "1.0.0".into(),
-                manifest_sha256: "b".repeat(64),
-                archive_sha256: "d".repeat(64),
-            },
-            reconciler: ReconcilerIdentity {
-                provider_set_sha256: "e".repeat(64),
-                product: "system".into(),
-                release: ReconciledRelease {
-                    version: "3.0.0".into(),
-                    manifest_sha256: "f".repeat(64),
-                    archive_sha256: "0".repeat(64),
-                },
-            },
-            result: ResultDocument {
-                schema: ResultDocument::SCHEMA,
-                status: ResultStatus::Succeeded,
-                changed: true,
-                host_action: HostAction::Reboot,
-                retry_after_seconds: None,
-                message: Some("kernel changed".into()),
-            },
-            completed_at_ms: 1,
-        };
+        let transition = ReconciliationTransition::new(
+            ReconciledRelease::new("2.0.0".into(), "a".repeat(64), "c".repeat(64)).unwrap(),
+            ReconciledRelease::new("1.0.0".into(), "b".repeat(64), "d".repeat(64)).unwrap(),
+        );
+        let reconciler = ReconcilerIdentity::new(
+            "e".repeat(64),
+            "system".into(),
+            ReconciledRelease::new("3.0.0".into(), "f".repeat(64), "0".repeat(64)).unwrap(),
+        )
+        .unwrap();
+        let result =
+            SuccessfulMutation::new(true, HostAction::Reboot, Some("kernel changed".into()))
+                .unwrap();
+        let record = LastReconciliation::new(
+            MutationOperation::Apply,
+            Reason::Update,
+            "a".repeat(64),
+            transition.clone(),
+            reconciler.clone(),
+            result.clone(),
+            1,
+        )
+        .unwrap();
         assert_eq!(
             LastReconciliation::from_bounded_json(&record.to_bounded_json().unwrap()).unwrap(),
             record
         );
 
-        let mut invalid = record;
-        invalid.operation = Operation::Inspect;
-        assert!(invalid.validate().is_err());
-
-        invalid.operation = Operation::Rollback;
-        invalid.attempt_id = "a".repeat(64);
+        let mut encoded = serde_json::to_value(&record).unwrap();
+        encoded["operation"] = serde_json::json!("inspect");
+        assert!(serde_json::from_value::<LastReconciliation>(encoded.clone()).is_err());
         assert!(
-            invalid.validate().is_err(),
-            "rollback evidence must carry the transaction's compensating identity"
+            LastReconciliation::from_bounded_json(&serde_json::to_vec(&encoded).unwrap()).is_err()
         );
+
+        for mutate in [
+            (|value: &mut serde_json::Value| value["schema"] = serde_json::json!(2))
+                as fn(&mut serde_json::Value),
+            |value| value["completedAtMs"] = serde_json::json!(0),
+            |value| value["candidate"]["archiveSha256"] = serde_json::json!("not-a-digest"),
+            |value| {
+                value["reconciler"]["providerSetSha256"] = serde_json::json!("not-a-digest");
+            },
+        ] {
+            let mut invalid = serde_json::to_value(&record).unwrap();
+            mutate(&mut invalid);
+            assert!(serde_json::from_value::<LastReconciliation>(invalid).is_err());
+        }
+
+        assert!(
+            ReconciledRelease::new("2.0.0".into(), "not-a-digest".into(), "c".repeat(64)).is_err()
+        );
+        assert!(ReconcilerIdentity::new(
+            "not-a-digest".into(),
+            "system".into(),
+            record.reconciler().release().clone(),
+        )
+        .is_err());
+
+        assert!(LastReconciliation::new(
+            MutationOperation::Rollback,
+            Reason::Update,
+            "a".repeat(64),
+            transition,
+            reconciler,
+            result,
+            1,
+        )
+        .is_err());
     }
 
     #[test]
@@ -676,19 +1250,128 @@ mod tests {
     }
 
     #[test]
-    fn mutation_identities_have_one_exact_grammar() {
+    fn mutation_invocations_have_one_exact_grammar() {
         let transaction = "a".repeat(64);
-        assert!(attempt::is_mutation(attempt::BOOT));
-        assert!(attempt::is_mutation(attempt::CONVERGE));
-        assert!(attempt::is_mutation(&transaction));
-        assert!(attempt::is_mutation(&format!("{transaction}r")));
-        assert!(attempt::is_compensation(&format!("{transaction}r")));
-        assert!(!attempt::is_compensation(&transaction));
-        for observation_only in [attempt::PERIODIC, attempt::FINGERPRINT] {
-            assert!(!attempt::is_mutation(observation_only));
+        let compensation = format!("{transaction}r");
+        for (operation, reason, attempt_id) in [
+            (MutationOperation::Apply, Reason::Install, attempt::BOOT),
+            (MutationOperation::Apply, Reason::Restart, attempt::BOOT),
+            (MutationOperation::Apply, Reason::Restart, attempt::CONVERGE),
+            (MutationOperation::Apply, Reason::Update, &transaction),
+            (MutationOperation::Apply, Reason::Update, &compensation),
+            (MutationOperation::Rollback, Reason::Update, &compensation),
+        ] {
+            assert!(
+                operation.validate_invocation(reason, attempt_id).is_ok(),
+                "valid mutation invocation was refused: {operation:?} {reason:?} {attempt_id}"
+            );
         }
-        for malformed in ["", "attempt", &"A".repeat(64), &format!("{transaction}rr")] {
-            assert!(!attempt::is_mutation(malformed));
+        for (operation, reason, attempt_id) in [
+            (MutationOperation::Apply, Reason::Install, attempt::CONVERGE),
+            (MutationOperation::Apply, Reason::Restart, &transaction),
+            (MutationOperation::Apply, Reason::Update, attempt::BOOT),
+            (MutationOperation::Rollback, Reason::Restart, &compensation),
+            (MutationOperation::Rollback, Reason::Update, &transaction),
+        ] {
+            assert!(
+                operation.validate_invocation(reason, attempt_id).is_err(),
+                "invalid mutation invocation was accepted: {operation:?} {reason:?} {attempt_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_invocations_have_one_exact_grammar() {
+        let transaction = "a".repeat(64);
+        let compensation = format!("{transaction}r");
+        for (operation, reason, attempt_id) in [
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Install,
+                attempt::BOOT,
+            ),
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Restart,
+                attempt::BOOT,
+            ),
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Restart,
+                attempt::CONVERGE,
+            ),
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Restart,
+                attempt::PERIODIC,
+            ),
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Update,
+                &transaction,
+            ),
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Update,
+                &compensation,
+            ),
+            (
+                ObservationOperation::Inspect,
+                Reason::Restart,
+                attempt::FINGERPRINT,
+            ),
+        ] {
+            assert!(
+                operation.validate_invocation(reason, attempt_id).is_ok(),
+                "valid observation invocation was refused: {operation:?} {reason:?} {attempt_id}"
+            );
+            assert!(
+                operation
+                    .operation()
+                    .validate_invocation(reason, attempt_id)
+                    .is_ok(),
+                "the shared execution gate disagreed with the typed observation grammar"
+            );
+        }
+        for (operation, reason, attempt_id) in [
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Install,
+                attempt::PERIODIC,
+            ),
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Restart,
+                &transaction,
+            ),
+            (
+                ObservationOperation::Healthcheck,
+                Reason::Update,
+                attempt::BOOT,
+            ),
+            (
+                ObservationOperation::Inspect,
+                Reason::Restart,
+                attempt::PERIODIC,
+            ),
+            (
+                ObservationOperation::Inspect,
+                Reason::Install,
+                attempt::FINGERPRINT,
+            ),
+            (ObservationOperation::Inspect, Reason::Update, &transaction),
+        ] {
+            assert!(
+                operation.validate_invocation(reason, attempt_id).is_err(),
+                "invalid observation invocation was accepted: {operation:?} {reason:?} {attempt_id}"
+            );
+            assert!(
+                operation
+                    .operation()
+                    .validate_invocation(reason, attempt_id)
+                    .is_err(),
+                "the shared execution gate disagreed with the typed observation grammar"
+            );
         }
     }
 

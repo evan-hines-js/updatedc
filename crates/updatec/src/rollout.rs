@@ -475,13 +475,15 @@ impl<'a> Observations<'a> {
     ///
     /// The authentic report is memoized ([`Self::verified`]); the freshness bound is a comparison
     /// against this pass's clock re-applied on every read, which is what the trust gate is made of
-    /// — `report_is_authentic_and_fresh` is `report_is_authentic` filtered by
+    /// — `AuthenticReport::fresh` is the single authentication verdict filtered by
     /// [`NodeReport::is_fresh`]. Freshness is deliberately NOT folded into the memo: it is the one
     /// part of the verdict that is a fact about the clock rather than about the bytes, and a memo
     /// of it would be the thing that goes stale.
     fn report(&self, node: &str) -> Option<NodeReport> {
-        self.claim(node)
-            .filter(|report| report.is_fresh(self.now_ms))
+        self.reports
+            .get(node)
+            .zip(self.public_keys.get(node))
+            .and_then(|(envelope, key)| self.verified.fresh(node, envelope, key, self.now_ms))
     }
 
     /// What is known about `node` relative to the exact assignment `identity` names — the digest of
@@ -716,32 +718,6 @@ impl<'a> Observations<'a> {
             .all(|node| self.advanced(node, &identity))
     }
 
-    /// This node's report read for its ONE durable claim, at any age: the authenticity gate
-    /// (`report_is_authentic`) without the freshness bound [`Self::report`] puts on top of it.
-    ///
-    /// Everything else a report says is perishable and must be fresh — that is [`Self::report`],
-    /// and it is what every health, settlement, and availability gate reads. A REJECTION is not:
-    /// it is a statement about bytes the node refused for good, and requiring freshness for it made
-    /// one contained node going quiet for longer than `REPORT_FRESHNESS` — a rejection restarts the
-    /// app and often reboots the host, so this is the ordinary case — drop the fleet's evidence
-    /// below `maxRegressions`, clear the halt for that pass, and admit another `maxUnavailable`
-    /// batch onto the proven-bad body, one blip at a time.
-    ///
-    /// The claim is about BYTES, not about where the node is now: it names the assignment it was
-    /// rejected FOR, and it keeps standing for that identity after the node has been retargeted
-    /// somewhere else — the bytes did not become good because the machine moved on. It ends when
-    /// that identity leaves every generation (corrected bytes have a new digest) or the node leaves
-    /// the fleet, which is exactly what [`ObservationLog`] bounds it by.
-    ///
-    /// This is also where the pass's ONE verification of this node happens; [`Self::report`] adds
-    /// the freshness bound on top of the same verified report.
-    fn claim(&self, node: &str) -> Option<NodeReport> {
-        self.reports
-            .get(node)
-            .zip(self.public_keys.get(node))
-            .and_then(|(envelope, key)| self.verified.authentic(node, envelope, key))
-    }
-
     /// Whether this node's own signed report says it has DURABLY REJECTED the deployment `identity`
     /// names: it attempted those exact bytes and refused them for good. Read once per pass and
     /// remembered by [`ObservationLog::note_rejection`], because a rejection is a standing fact and
@@ -755,8 +731,10 @@ impl<'a> Observations<'a> {
     /// just changed leader, or was merely slow that second never saw it again, because the node
     /// never retries rejected bytes.
     fn claims_rejection(&self, node: &str) -> Option<(String, bool)> {
-        self.claim(node)
-            .map(|report| (report.assignment_sha256, report.rejected))
+        self.reports
+            .get(node)
+            .zip(self.public_keys.get(node))
+            .and_then(|(envelope, key)| self.verified.durable_rejection(node, envelope, key))
     }
 
     /// Whether ANY node in the fleet is still placed on `deployment`, whatever group it is in now.
@@ -2374,6 +2352,9 @@ mod tests {
         UpdateGroupSet::new(
             "pair-00",
             crate::UpdateGroupSetSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: "default".into(),
+                },
                 selector: crate::LabelSelector {
                     match_labels: BTreeMap::from([("set".into(), "pair-00".into())]),
                 },
@@ -3694,6 +3675,9 @@ mod tests {
         UpdateGroupSet::new(
             name,
             crate::UpdateGroupSetSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: "default".into(),
+                },
                 selector: crate::LabelSelector {
                     match_labels: BTreeMap::from([(label_key.into(), label_value.into())]),
                 },
@@ -3893,6 +3877,9 @@ mod tests {
         UpdateGroupSet::new(
             "pair-00",
             crate::UpdateGroupSetSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: "default".into(),
+                },
                 selector: crate::LabelSelector {
                     match_labels: BTreeMap::from([("set".into(), "pair-00".into())]),
                 },
@@ -4380,6 +4367,9 @@ mod tests {
         UpdateGroupSet::new(
             "pair-00",
             crate::UpdateGroupSetSpec {
+                repository_ref: crate::LocalObjectReference {
+                    name: "default".into(),
+                },
                 selector: crate::LabelSelector {
                     match_labels: BTreeMap::from([("set".into(), "pair-00".into())]),
                 },

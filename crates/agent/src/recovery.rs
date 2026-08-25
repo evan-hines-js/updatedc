@@ -4,20 +4,25 @@
 
 use crate::*;
 
-/// Reject the bytes of a *provisional* (never-health-proven) cold-installed head so the next
-/// boot's cold install descends via ordered fallback past it.
+/// Reject the exact deployed unit of a *provisional* (never-health-proven) cold-installed head so
+/// the next boot's cold install descends via ordered fallback past it. The application and provider
+/// remain independently reusable because a runtime health failure proves only their combination.
 ///
 /// Called only for a head [`boot::plan_gate_failure`] has already classified provisional: a head
 /// with a predecessor to revert to takes the revert path instead, and a confirmed head is never
 /// rejected for ill health at all.
 pub(crate) fn reject_provisional_head(
-    store: &mut FileStore,
+    store: &mut Store,
     state: &updated::state::InstalledState,
 ) -> std::io::Result<()> {
-    store.reject(&state.repository_lineage, &state.archive_sha256)?;
+    store.reject_deployment(
+        &state.repository_lineage,
+        &state.archive_sha256,
+        &state.lifecycle.provider_set_sha256,
+    )?;
     warn(&format!(
-        "provisional head {} never passed a health gate; rejected its bytes so the next cold \
-         install descends via ordered fallback",
+        "provisional head {} never passed a health gate; rejected its exact deployment so the \
+         next cold install descends via ordered fallback",
         state.release.version
     ));
     Ok(())
@@ -36,13 +41,14 @@ pub(crate) enum RollbackHealthOutcome {
     /// retried on the next boot. Carries the attempt number for the log.
     Retry(u32),
     /// The bound was reached: the failed candidate's `rollback` compensation is run first, then the
-    /// predecessor's bytes are rejected, it is recorded as a provisional (now-rejected) head, and
+    /// predecessor's deployed unit is rejected, it is recorded as a provisional (now-rejected)
+    /// head, and
     /// the rollback journal is cleared, so the next boot's [`ensure_installed`] descends via ordered
     /// fallback past it exactly as a cold install does.
     Descend,
 }
 
-/// Bound rollback-target health failures so a predecessor whose bytes can no longer pass the gate
+/// Bound rollback-target health failures so a predecessor deployment that can no longer pass the gate
 /// cannot crash-loop the node forever. The failure count rides the journal (the very thing that
 /// re-derives the rollback on each boot, so it survives the launcher relaunch). Once it reaches
 /// [`MAX_ROLLBACK_HEALTH_ATTEMPTS`], this compensates the failed candidate through the release's
@@ -61,7 +67,7 @@ pub(crate) enum RollbackHealthOutcome {
 /// The phase is deliberately not advanced across this: the predecessor never became healthy, and
 /// [`Transaction::advance`] admits only the true rollback edges.
 pub(crate) fn bound_unhealthy_rollback(
-    store: &mut dyn Store,
+    store: &mut Store,
     tx: &mut Transaction,
     compensate: &mut dyn FnMut(&Transaction) -> io::Result<()>,
 ) -> io::Result<RollbackHealthOutcome> {
@@ -88,12 +94,16 @@ pub(crate) fn bound_unhealthy_rollback(
         if tx.recovery_pending(TransactionPhase::RolledBack) {
             update::advance_transaction(store, tx, TransactionPhase::RolledBack)?;
         }
-        store.reject(&tx.previous_repository_lineage, &tx.previous_archive_sha256)?;
+        store.reject_deployment(
+            &tx.previous_repository_lineage,
+            &tx.previous_archive_sha256,
+            &tx.previous_lifecycle.provider_set_sha256,
+        )?;
         store.commit_installed(&updated::state::InstalledState::provisional(
             tx.previous_repository_lineage.clone(),
             tx.previous_release.clone(),
             tx.previous_archive_sha256.clone(),
-            tx.lifecycle.clone(),
+            tx.previous_lifecycle.clone(),
         ))?;
         store.clear_journal()?;
         Ok(RollbackHealthOutcome::Descend)
@@ -107,7 +117,7 @@ pub(crate) fn bound_unhealthy_rollback(
 pub(crate) fn recovery_transaction(situation: &Situation) -> Option<Transaction> {
     if let Some(tx) = &situation.journal {
         let committed = match &situation.installed {
-            Installed::Present(state) => Some(&state.release),
+            Installed::Present(state) => Some(state.as_ref()),
             Installed::Missing | Installed::Invalid => None,
         };
         return match boot::journal_recovery(tx, situation.active.as_ref(), committed) {
@@ -171,7 +181,8 @@ pub(crate) fn rollback_of_unconfirmed(
         candidate_rejection_sha256: pending.candidate_rejection_sha256.clone(),
         candidate_repository_lineage: installed.repository_lineage.clone(),
         candidate_rejection_required: reject_candidate,
-        lifecycle: pending.lifecycle.clone(),
+        previous_lifecycle: pending.lifecycle.clone(),
+        candidate_lifecycle: installed.lifecycle.clone(),
         rollback_health_failures: 0,
         phase: TransactionPhase::RollbackActivating,
     }
@@ -190,7 +201,7 @@ pub(crate) fn rollback_of_unconfirmed(
 /// reversible — and a release that fails the gate again on the next boot, which finds the tree
 /// intact, is charged for it, so the descent still terminates.
 pub(crate) fn revert_unconfirmed_head(
-    store: &mut dyn Store,
+    store: &mut Store,
     installed: &updated::state::InstalledState,
     bytes_repaired: bool,
 ) -> io::Result<()> {
@@ -205,9 +216,10 @@ pub(crate) fn revert_unconfirmed_head(
     ));
     persist_transaction(store, &tx)?;
     if tx.candidate_rejection_required {
-        store.reject(
-            &installed.repository_lineage,
-            &tx.candidate_rejection_sha256,
+        store.reject_deployment(
+            &tx.candidate_repository_lineage,
+            &tx.candidate_archive_sha256,
+            &tx.candidate_lifecycle.provider_set_sha256,
         )?;
     }
     Ok(())
@@ -227,7 +239,7 @@ pub(crate) fn revert_unconfirmed_head(
 /// and a reconciler that keys completion on the attempt id would otherwise skip this one.
 pub(crate) fn complete_recovery_activation(
     opts: &Options,
-    store: &mut dyn Store,
+    store: &mut Store,
     recovery: Option<&mut Transaction>,
 ) -> io::Result<updated_contracts::reconciler::HostAction> {
     let Some(tx) = recovery else {
@@ -239,7 +251,7 @@ pub(crate) fn complete_recovery_activation(
     // Restore the predecessor's machine state through the same reconciler operation used for the
     // candidate — the predecessor's own `apply`, which is what re-converges whatever it owns.
     let result = run_lifecycle_mutation(
-        tx.lifecycle.as_ref(),
+        tx.previous_lifecycle.as_ref(),
         opts,
         MutationOperation::Apply,
         LifecycleInvocation {
@@ -255,8 +267,8 @@ pub(crate) fn complete_recovery_activation(
             },
         },
     )?;
-    if result.host_action == updated_contracts::reconciler::HostAction::Reboot {
-        return Ok(result.host_action);
+    if result.host_action() == updated_contracts::reconciler::HostAction::Reboot {
+        return Ok(result.host_action());
     }
     Chaos::from_env().crossing(update::boundary::PREDECESSOR_LIFECYCLE_APPLIED);
     if tx.recovery_pending(TransactionPhase::RollbackApplied) {
@@ -273,7 +285,7 @@ pub(crate) fn complete_recovery_activation(
 /// the boot path clears the claim only once the intent it implies is durable.
 pub(crate) fn gather_situation(
     opts: &Options,
-    store: &dyn Store,
+    store: &Store,
     evidence: &launcher::Evidence,
 ) -> io::Result<Situation> {
     let active = store.active_release()?;
@@ -293,7 +305,7 @@ pub(crate) fn gather_situation(
 /// update (if any) for the loop to watch.
 pub(crate) fn execute_boot_plan(
     plan: &Plan,
-    store: &mut dyn Store,
+    store: &mut Store,
     self_update: &mut SelfUpdateState,
     defer_commit: bool,
     recovery: Option<&mut Transaction>,
@@ -339,25 +351,28 @@ pub(crate) fn execute_boot_plan(
 /// Apply the durable half of a boot [`Plan`] to the [`Store`].
 pub(crate) fn apply_store_plan(
     plan: &Plan,
-    store: &mut dyn Store,
+    store: &mut Store,
     defer_commit: bool,
     activate_release: bool,
 ) -> io::Result<()> {
-    // Commit the intended state before activation; immutable predecessor releases remain
-    // available if a crash interrupts pointer reconciliation.
-    if !defer_commit {
-        if let Some(state) = &plan.commit {
-            store.commit_installed(state)?;
-        }
-    }
+    // One ordering everywhere: verify/activate the release, then commit metadata that names it.
+    // The Store enforces the same relationship, so a future caller cannot accidentally make the
+    // installed record authoritative for bytes the active pointer does not run. Immutable releases
+    // remain available across either crash boundary; the journal/pending record re-derives the
+    // same idempotent plan on the next boot.
     if activate_release {
         match &plan.release {
             ReleaseFix::None => {}
             ReleaseFix::Activate(release) => store.activate(release)?,
         }
     }
-    for (lineage, hash) in &plan.reject_app {
-        store.reject(lineage, hash)?;
+    if !defer_commit {
+        if let Some(state) = &plan.commit {
+            store.commit_installed(state)?;
+        }
+    }
+    for (lineage, hash) in &plan.reject_candidate {
+        store.reject_artifact(lineage, hash)?;
     }
     Ok(())
 }
@@ -376,26 +391,10 @@ pub(crate) fn rejected_agent_hash(path: &std::path::Path) -> Option<&str> {
 }
 
 /// The unconfirmed update recorded in the installed state, if any.
-pub(crate) fn installed_pending(store: &dyn Store) -> Option<Pending> {
+pub(crate) fn installed_pending(store: &Store) -> Option<Pending> {
     match store.installed() {
         Installed::Present(s) => s.pending,
         _ => None,
-    }
-}
-
-/// The application, provider-set and manifest digests of the committed head, for the heartbeat.
-/// Read from the store at report time rather than tracked alongside the running version: the
-/// version is a local carried across four separate commit paths, and a digest that drifted out of
-/// step with it would name bytes that are not running — worse than naming none. Empty when nothing
-/// is committed (no install yet, or an unreadable record), reported as "running no known bytes".
-pub(crate) fn installed_release_identity(store: &dyn Store) -> (String, String, String) {
-    match store.installed() {
-        Installed::Present(state) => (
-            state.archive_sha256,
-            state.lifecycle.provider_set_sha256.clone(),
-            state.release.manifest_sha256,
-        ),
-        _ => (String::new(), String::new(), String::new()),
     }
 }
 
@@ -411,7 +410,7 @@ pub(crate) fn installed_release_identity(store: &dyn Store) -> (String, String, 
 /// about to disappear, and every periodic probe after it failed to resolve — so a node whose
 /// release was serving perfectly well reported itself unready and was drained out of rotation.
 pub(crate) fn probe_steady_target<T>(
-    store: &dyn Store,
+    store: &Store,
     probe: impl FnOnce(&updated::bundle::ReleaseId, &str, &updated::state::ProviderRelease) -> T,
 ) -> io::Result<T> {
     match store.installed() {
@@ -430,16 +429,79 @@ pub(crate) fn probe_steady_target<T>(
 /// Confirm the current update by clearing its pending record.
 /// Returns `true` only once the confirmation is durable, so callers must keep their
 /// in-memory pending intent (and continue suppressing updates) after a write failure.
-pub(crate) fn confirm_update(store: &mut dyn Store) -> bool {
-    if let Installed::Present(mut st) = store.installed() {
-        st.pending = None;
-        if let Err(e) = store.commit_installed(&st) {
-            // Could not durably clear the pending intent; retry on the next tick or boot.
-            warn(&format!(
-                "could not durably confirm the update ({e}); will retry"
-            ));
-            return false;
+pub(crate) fn confirm_update(store: &mut Store) -> bool {
+    match store.installed() {
+        Installed::Present(mut st) => {
+            if !st.settle_update() {
+                return true;
+            }
+            if let Err(e) = store.commit_installed(&st) {
+                // Could not durably clear the pending intent; retry on the next tick or boot.
+                warn(&format!(
+                    "could not durably confirm the update ({e}); will retry"
+                ));
+                return false;
+            }
+            true
+        }
+        Installed::Missing | Installed::Invalid => {
+            // In-memory pending intent must not be cleared when its authoritative durable record
+            // disappeared or became corrupt. Keep reporting the update in flight and let the next
+            // boot fail closed on the same state.
+            warn("could not durably confirm the update: installed state is missing or invalid");
+            false
         }
     }
-    true
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+    use crate::test_support::{deployment_rejection, digest, lineage, provider, release};
+
+    fn unconfirmed_update() -> updated::state::InstalledState {
+        updated::state::InstalledState {
+            repository_lineage: lineage(),
+            release: release("2.0.0", "candidate"),
+            archive_sha256: digest("candidate-archive"),
+            lifecycle: provider(),
+            pending: Some(updated::state::Pending {
+                lifecycle_attempt_id: digest("attempt"),
+                candidate_rejection_sha256: deployment_rejection(
+                    &digest("candidate-archive"),
+                    &provider().provider_set_sha256,
+                ),
+                previous_release: release("1.0.0", "predecessor"),
+                previous_archive_sha256: digest("predecessor-archive"),
+                previous_repository_lineage: lineage(),
+                lifecycle: provider(),
+                committed_at: 1,
+            }),
+            confirmed: true,
+        }
+    }
+
+    #[test]
+    fn confirmation_clears_memory_only_after_the_durable_transition() {
+        let candidate = unconfirmed_update();
+        let mut store = Store::memory(MemoryBackend {
+            active: Some(candidate.release.clone()),
+            installed: Some(candidate),
+            ..Default::default()
+        });
+
+        assert!(confirm_update(&mut store));
+        assert!(matches!(
+            store.installed(),
+            Installed::Present(state) if state.pending.is_none()
+        ));
+
+        store.memory_backend_mut().installed = None;
+        assert!(!confirm_update(&mut store));
+
+        let mut corrupt = unconfirmed_update();
+        corrupt.archive_sha256 = "not-a-digest".into();
+        store.memory_backend_mut().installed = Some(corrupt);
+        assert!(!confirm_update(&mut store));
+    }
 }

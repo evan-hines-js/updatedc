@@ -7,12 +7,10 @@
 //! Reporting is strictly best-effort — a node that cannot write its report keeps
 //! running, and a control plane that finds no report rolls without completion gating.
 
-// This module DEFINES the report gates that `clippy.toml` bans elsewhere. The ban exists so that
-// consumers go through their one door — the controller's verified-report cache, the healthproxy's
-// single gate — rather than verifying bytes a pass has already checked. Neither the composition
-// below (`report_is_authentic_and_fresh` is `report_is_authentic` plus a clock) nor this module's
-// own tests are such a consumer, so the ban does not apply to the file that owns the functions.
-#![allow(clippy::disallowed_methods)]
+// This module DEFINES the report gates that `clippy.toml` bans elsewhere. The one owning
+// composition and this module's tests receive narrow exemptions at their call sites below; the
+// rest of this production module remains under the same enforcement as every consumer, so adding
+// a second verification or acceptance path here cannot silently bypass the shared gate.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -296,7 +294,7 @@ impl Fingerprint {
 /// A node's self-reported running state, signed by the node's own per-node key.
 ///
 /// Authenticity IS load-bearing: a report is consumed only through
-/// [`report_is_authentic_and_fresh`], which requires the signature to verify against the key the
+/// [`authenticate_report`], which requires the signature to verify against the key the
 /// control plane pinned at enrollment. Without that, a compromised gateway or anyone who can write
 /// the shared bucket could forge a healthy report and drive a rollout past unhealthy peers, or hold
 /// a drained node in load-balancer rotation. Every failure — missing, unsigned, forged, stale, or
@@ -449,7 +447,7 @@ impl NodeReport {
     ///
     /// The schema first: a record of a version this build does not know is not a report it may
     /// interpret, whatever the rest of it says. It is checked HERE, in the one predicate both the
-    /// write gate ([`accept_report_envelope`]) and the read gate ([`report_is_authentic_and_fresh`])
+    /// storage gate ([`accept_stored_report`]) and the read gate ([`authenticate_report`])
     /// run, because the two must agree. A skewed record the writer accepts and every reader then
     /// discards strands the node: it reads as silent to the rollout throttle and drains out of the
     /// load balancer, with a 200 telling the writer all is well.
@@ -464,42 +462,85 @@ impl NodeReport {
     /// one signed report asserting simultaneously that a rollout has completed and that the
     /// transaction behind it is still in flight.
     pub fn is_wellformed(&self) -> bool {
-        self.schema == Self::SCHEMA
-            && is_valid_node(&self.node)
-            && crate::identity::is_segment(&self.deployment)
-            && self.reported_at_ms > 0
-            && (self.version.is_empty() == self.archive_sha256.is_empty())
-            && (self.version.is_empty() || crate::identity::is_release_version(&self.version))
-            && (self.archive_sha256.is_empty() == self.provider_set_sha256.is_empty())
-            && (!self.healthy || !self.archive_sha256.is_empty())
-            && !(self.healthy && self.updating)
-            && (self.archive_sha256.is_empty() || crate::is_canonical_sha256(&self.archive_sha256))
-            && (self.provider_set_sha256.is_empty()
-                || crate::is_canonical_sha256(&self.provider_set_sha256))
-            && (self.assignment_sha256.is_empty()
-                || crate::is_canonical_sha256(&self.assignment_sha256))
-            && self
-                .fingerprint
-                .as_ref()
-                .is_none_or(Fingerprint::is_wellformed)
-            && self
-                .output_sha256
-                .as_deref()
-                .is_none_or(crate::is_canonical_sha256)
-            && (self.healthy || (self.fingerprint.is_none() && self.output_sha256.is_none()))
-            && self
-                .reconciliation
-                .as_ref()
-                .is_none_or(|record| record.validate().is_ok())
-            && match &self.reconciliation {
-                None => self.version.is_empty(),
-                Some(record) => {
-                    !self.version.is_empty()
-                        && record.candidate.version == self.version
-                        && record.candidate.archive_sha256 == self.archive_sha256
-                        && record.reconciler.provider_set_sha256 == self.provider_set_sha256
-                }
+        self.shape_error().is_none()
+    }
+
+    /// The diagnostic form of [`Self::is_wellformed`]. Private so callers still have one public
+    /// structural predicate; the producer uses the reason only to make a fail-closed omission
+    /// actionable instead of logging an opaque "malformed" warning.
+    fn shape_error(&self) -> Option<&'static str> {
+        if self.schema != Self::SCHEMA {
+            return Some("unknown schema");
+        }
+        if !is_valid_node(&self.node) {
+            return Some("invalid node identity");
+        }
+        if !crate::identity::is_segment(&self.deployment) {
+            return Some("invalid deployment identity");
+        }
+        if self.reported_at_ms == 0 {
+            return Some("missing report timestamp");
+        }
+        if self.version.is_empty() != self.archive_sha256.is_empty() {
+            return Some("version and archive identity are incomplete");
+        }
+        if !self.version.is_empty() && !crate::identity::is_release_version(&self.version) {
+            return Some("invalid release version");
+        }
+        if self.archive_sha256.is_empty() != self.provider_set_sha256.is_empty() {
+            return Some("archive and provider-set identity are incomplete");
+        }
+        if self.healthy && self.archive_sha256.is_empty() {
+            return Some("healthy report has no installed release");
+        }
+        if self.healthy && self.updating {
+            return Some("report is both healthy and updating");
+        }
+        if !self.archive_sha256.is_empty() && !crate::is_canonical_sha256(&self.archive_sha256) {
+            return Some("invalid archive digest");
+        }
+        if !self.provider_set_sha256.is_empty()
+            && !crate::is_canonical_sha256(&self.provider_set_sha256)
+        {
+            return Some("invalid provider-set digest");
+        }
+        if !self.assignment_sha256.is_empty()
+            && !crate::is_canonical_sha256(&self.assignment_sha256)
+        {
+            return Some("invalid assignment digest");
+        }
+        if self
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| !fingerprint.is_wellformed())
+        {
+            return Some("invalid fingerprint");
+        }
+        if self
+            .output_sha256
+            .as_deref()
+            .is_some_and(|digest| !crate::is_canonical_sha256(digest))
+        {
+            return Some("invalid output digest");
+        }
+        if !self.healthy && (self.fingerprint.is_some() || self.output_sha256.is_some()) {
+            return Some("unhealthy report carries healthy-only evidence");
+        }
+        match &self.reconciliation {
+            None if self.version.is_empty() => None,
+            None => Some("installed release has no reconciliation evidence"),
+            Some(_) if self.version.is_empty() => {
+                Some("reconciliation evidence has no installed release")
             }
+            Some(record)
+                if record.candidate().version() != self.version
+                    || record.candidate().archive_sha256() != self.archive_sha256
+                    || record.reconciler().provider_set_sha256() != self.provider_set_sha256 =>
+            {
+                Some("reconciliation evidence names a different release")
+            }
+            Some(_) => None,
+        }
     }
 
     /// Whether this report is inside the shared freshness window as seen from `now_ms`.
@@ -562,18 +603,6 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    /// The wire bytes, under the same ceiling every reader decodes with.
-    ///
-    /// Pairs with [`accept_report_envelope`]. Without it the node encoded its report with a bare
-    /// `serde_json::to_vec` and uploaded whatever came out, while every consumer refused anything
-    /// past [`MAX_REPORT_ENVELOPE_BYTES`] — so a report that grew past the ceiling would be dropped
-    /// by the whole fleet at once and read as a node that had gone quiet: it holds its group's
-    /// rollout open and drains from the load balancer, with nothing anywhere naming the cause.
-    /// Encoding under the ceiling makes that a diagnosable failure on the one machine responsible.
-    pub fn to_bounded_json(&self) -> Result<Vec<u8>, String> {
-        crate::bounded::encode(self, "node report envelope", MAX_REPORT_ENVELOPE_BYTES)
-    }
-
     /// The most signatures a report envelope may carry. A node signs with exactly one key, so this
     /// is generous; it exists because verification is the expensive step and the count is otherwise
     /// attacker-chosen — a body full of bogus signatures with the valid one last would cost a full
@@ -606,9 +635,23 @@ pub fn pae(payload: &[u8], payload_type: &str) -> Vec<u8> {
     out
 }
 
-/// Sign a report into a DSSE envelope with a node's private key (PKCS#8 DER — the aws-lc-rs form of
-/// the rcgen-minted ECDSA P-256 key that also certifies the node's mTLS leaf).
-pub fn sign_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Envelope, String> {
+/// The one node-report producer boundary.
+///
+/// Validates the same report shape every write and trust gate consumes, signs the exact JSON
+/// payload with the node's private key (PKCS#8 DER), and encodes the envelope under the same byte
+/// ceiling every reader enforces. Keeping all three operations inseparable prevents callers from
+/// publishing a signed report no consumer can use or forgetting the wire bound after signing.
+pub fn encode_signed_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Vec<u8>, String> {
+    if let Some(error) = report.shape_error() {
+        return Err(format!("refusing to sign a malformed node report: {error}"));
+    }
+    encode_report_envelope(&sign_report_envelope(report, pkcs8_der)?)
+}
+
+/// Cryptographic primitive behind [`encode_signed_report`]. Private so production callers cannot
+/// bypass the shared report-shape and wire-size invariants. Tests use it only to construct
+/// authentic malformed inputs for fail-closed consumer coverage.
+fn sign_report_envelope(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Envelope, String> {
     use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
     use base64::Engine as _;
 
@@ -631,8 +674,27 @@ pub fn sign_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Envelope, St
     })
 }
 
-/// The one write-side acceptance gate for a report envelope: the rule every hop that *stores* a
-/// report applies before it stores it.
+fn encode_report_envelope(envelope: &Envelope) -> Result<Vec<u8>, String> {
+    crate::bounded::encode(envelope, "node report envelope", MAX_REPORT_ENVELOPE_BYTES)
+}
+
+/// The durable object-store timestamp attached to raw report bytes.
+///
+/// Fleet eviction uses storage order, not an untrusted payload timestamp or the instant a
+/// controller happened to restart and reread an object. The private field prevents callers from
+/// confusing an arbitrary integer with that ordering evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReportStoredAt(u64);
+
+impl ReportStoredAt {
+    /// Convert an object store's Unix-millisecond timestamp. Pre-epoch metadata is not a valid
+    /// ordering instant for this protocol and is rejected instead of silently clamped.
+    pub fn from_unix_millis(value: i64) -> Option<Self> {
+        u64::try_from(value).ok().map(Self)
+    }
+}
+
+/// The one fleet-admission gate for a stored report envelope.
 ///
 /// Returns an opaque accepted report only when the body fits [`MAX_REPORT_ENVELOPE_BYTES`], is an envelope
 /// of the report payload type, carries one to [`Envelope::MAX_SIGNATURES`] signatures, and decodes
@@ -643,18 +705,22 @@ pub fn sign_report(report: &NodeReport, pkcs8_der: &[u8]) -> Result<Envelope, St
 /// verified here, and this is the only function that decodes a payload without checking it: a writer
 /// hop authorizes by the transport identity that presented the bytes, and the signature is
 /// end-to-end evidence for the consumers that later read them back, every one of which must go
-/// through [`report_is_authentic_and_fresh`] instead.
+/// through [`authenticate_report`] instead.
 ///
 /// It lives here, beside the envelope types, because every production ingestion/projection path
 /// and every fixture must enforce the *same* thing. Maintained as copies, a tightening in one path
 /// would silently make another accept a report no consumer can use.
-pub fn accept_report_envelope(body: &[u8], node: &str) -> Option<AcceptedReport> {
+pub fn accept_stored_report(
+    body: &[u8],
+    node: &str,
+    stored_at: ReportStoredAt,
+) -> Option<AcceptedReport> {
     let envelope: Envelope =
         crate::bounded::decode(body, "node report envelope", MAX_REPORT_ENVELOPE_BYTES).ok()?;
     report_envelope_is_acceptable(&envelope, node).then_some(AcceptedReport {
         node: node.to_string(),
         envelope,
-        accepted_at_ms: now_ms(),
+        stored_at_ms: stored_at.0,
     })
 }
 
@@ -679,7 +745,7 @@ fn report_envelope_is_acceptable(envelope: &Envelope, node: &str) -> bool {
     is_valid_node(node) && report.node == node && report.is_wellformed()
 }
 
-/// Proof that a report passed [`accept_report_envelope`].
+/// Proof that a report passed [`accept_stored_report`].
 ///
 /// The fields are intentionally private: writers cannot construct or alter this value and
 /// [`FleetReports::record`] accepts no raw envelope. Consequently every report entering a fleet
@@ -689,14 +755,12 @@ fn report_envelope_is_acceptable(envelope: &Envelope, node: &str) -> bool {
 pub struct AcceptedReport {
     node: String,
     envelope: Envelope,
-    /// When the gate accepted these exact bytes.
+    /// When the object store durably recorded these exact bytes.
     ///
     /// A property of the acceptance, never of the moment someone asks. [`FleetReports`] evicts by
-    /// this value, so a holder that re-derives it by pushing a stored envelope back through the
-    /// gate does not merely waste the parse — it restamps every report with the current instant,
-    /// collapsing "evict the stalest" into "evict whichever node sorts first". Hold this value;
-    /// do not recompute it.
-    accepted_at_ms: u64,
+    /// this value. It therefore survives controller restarts and cannot collapse "evict the
+    /// stalest" into "evict whichever node sorts first" when a cache is rebuilt.
+    stored_at_ms: u64,
 }
 
 impl AcceptedReport {
@@ -709,11 +773,6 @@ impl AcceptedReport {
         self.envelope
     }
 
-    /// The accepted envelope, for a holder that must keep the proof as well.
-    pub fn envelope(&self) -> &Envelope {
-        &self.envelope
-    }
-
     /// The node these bytes are attributed to, as the gate confirmed it.
     pub fn node(&self) -> &str {
         &self.node
@@ -724,43 +783,40 @@ impl AcceptedReport {
             self.node,
             StoredReport {
                 envelope: self.envelope,
-                accepted_at_ms: self.accepted_at_ms,
+                stored_at_ms: self.stored_at_ms,
             },
         )
     }
 }
 
-/// The one trust gate for consuming a node report.
+/// An authenticated report whose perishable fields remain sealed behind the shared freshness gate.
 ///
-/// Returns the report ONLY when the envelope is authentic and usable, so a caller structurally cannot
-/// read a node's state without having verified it — the previous shape (a bool beside a separately
-/// parsed struct) let a caller forget. A report is usable only when the envelope's `payloadType` is a
-/// node report, a signature verifies against that node's pinned enrollment key over the PAE, the
-/// payload parses, the schema is one this build understands, the running digest is well-formed, it
-/// names the expected node, and it is inside the shared freshness window.
-///
-/// Rollout admission and load-balancer membership both call this, so attribution, replay resistance,
-/// and signature policy cannot drift between control-plane consumers. Health and deployment matching
-/// remain consumer-specific decisions made only after this gate succeeds.
-///
-/// The schema is checked explicitly even though it is signed: a signature proves the *node* wrote that
-/// value, not that this build agrees with what it means.
-pub fn report_is_authentic_and_fresh(
-    envelope: &Envelope,
-    expected_node: &str,
-    public_key: &P256PublicKey,
-    now_ms: u64,
-) -> Option<NodeReport> {
-    report_is_authentic(envelope, expected_node, public_key)
-        .filter(|report| report.is_fresh(now_ms))
+/// The inner [`NodeReport`] is intentionally private. Authentication alone is not authority to
+/// read current health, deployment, or output state: those claims expire. A holder can obtain the
+/// full report only through [`AuthenticReport::fresh`], or read the one nonperishable claim through
+/// [`AuthenticReport::durable_rejection`]. This makes the trust distinction a type boundary rather
+/// than a warning every cache and consumer has to remember.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticReport(NodeReport);
+
+impl AuthenticReport {
+    /// The full report, only while it is inside the one shared freshness window.
+    pub fn fresh(&self, now_ms: u64) -> Option<NodeReport> {
+        self.0.is_fresh(now_ms).then(|| self.0.clone())
+    }
+
+    /// The report's one durable claim: whether this node permanently rejected the exact signed
+    /// assignment identity returned beside it.
+    pub fn durable_rejection(&self) -> (&str, bool) {
+        (&self.0.assignment_sha256, self.0.rejected)
+    }
 }
 
-/// The same trust gate WITHOUT the freshness bound: the envelope is authentic, attributed to this
-/// node, and of a schema this build understands, but it may be of any age.
+/// The one trust gate for consuming a node report.
 ///
-/// Deliberately narrow, and never a substitute for [`report_is_authentic_and_fresh`]: almost
-/// everything a report says is a perishable fact about a machine RIGHT NOW (is it healthy, is it on
-/// this deployment), and reading a stale one as current is what keeps a dead node in rotation.
+/// The envelope is authentic, attributed to this node, and of a schema this build understands, but
+/// it may be of any age. The returned [`AuthenticReport`] enforces the only two legal ways to read
+/// it, so caching an authenticity verdict cannot accidentally turn stale health into current state.
 ///
 /// One claim in a report is not perishable — [`NodeReport::rejected`], which is a statement about
 /// BYTES: this node durably refused this release, a record that never expires and that the node
@@ -768,11 +824,14 @@ pub fn report_is_authentic_and_fresh(
 /// [`REPORT_FRESHNESS`] — a rejection restarts the app and often reboots the host, so this is the
 /// ordinary case — drop the fleet's evidence below its threshold, clear the halt for that pass, and
 /// admit another batch onto the proven-bad body, one blip at a time.
-pub fn report_is_authentic(
+///
+/// The schema is checked explicitly even though it is signed: a signature proves the *node* wrote
+/// that value, not that this build agrees with what it means.
+pub fn authenticate_report(
     envelope: &Envelope,
     expected_node: &str,
     public_key: &P256PublicKey,
-) -> Option<NodeReport> {
+) -> Option<AuthenticReport> {
     use base64::Engine as _;
 
     if envelope.payload_type != REPORT_PAYLOAD_TYPE
@@ -799,16 +858,17 @@ pub fn report_is_authentic(
     let report: NodeReport = serde_json::from_slice(&payload).ok()?;
     let usable = report.is_wellformed() && report.node == expected_node;
 
-    usable.then_some(report)
+    usable.then_some(AuthenticReport(report))
 }
 
-/// The report an envelope CLAIMS to carry, decoded without verifying any signature or freshness.
+/// Whether the report an envelope CLAIMS to carry is stale, decoded without verifying a signature.
 ///
-/// For OBSERVABILITY only, never a trust decision: [`report_is_authentic_and_fresh`] remains the
-/// one gate anything acting on a report goes through. This exists so a metric can say WHY a node
-/// was drained — "its report aged out" versus "its report is unusable" — which requires reading a
-/// timestamp off a document the gate has already refused.
-pub fn unverified_report(envelope: &Envelope) -> Option<NodeReport> {
+/// For OBSERVABILITY only, never a trust decision: [`authenticate_report`] remains the
+/// one gate anything acting on a report goes through. Deliberately returns only the one permitted
+/// observation instead of a full [`NodeReport`]; unverified health, deployment and rejection fields
+/// therefore cannot escape this boundary and accidentally become control-plane input later.
+/// `None` means the envelope did not even contain a parseable report.
+pub fn report_staleness_for_observability(envelope: &Envelope, now_ms: u64) -> Option<bool> {
     use base64::Engine as _;
     if envelope.payload_type != REPORT_PAYLOAD_TYPE {
         return None;
@@ -816,7 +876,9 @@ pub fn unverified_report(envelope: &Envelope) -> Option<NodeReport> {
     let payload = base64::engine::general_purpose::STANDARD
         .decode(&envelope.payload)
         .ok()?;
-    serde_json::from_slice(&payload).ok()
+    serde_json::from_slice::<NodeReport>(&payload)
+        .ok()
+        .map(|report| !report.is_fresh(now_ms))
 }
 
 /// The index readers use to discover one complete fleet generation. Its fields are private and it
@@ -972,7 +1034,7 @@ impl FleetGeneration {
 /// this aggregate is never serialized directly.
 ///
 /// This is TRANSPORT, not authority. Each envelope is consumed only through
-/// [`report_is_authentic_and_fresh`] against its node's pinned key. Reordering or dropping an entry
+/// [`authenticate_report`] against its node's pinned key. Reordering or dropping an entry
 /// only drains a node; forging one still requires its private key.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FleetReports {
@@ -982,7 +1044,7 @@ pub struct FleetReports {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredReport {
-    accepted_at_ms: u64,
+    stored_at_ms: u64,
     envelope: Envelope,
 }
 
@@ -1027,8 +1089,8 @@ impl FleetReports {
         Some(Self { reports })
     }
 
-    /// Record a report produced by the shared write gate. Acceptance order, never an unverified
-    /// payload timestamp, decides which report wins.
+    /// Record a report produced by the shared storage gate. Durable object-store order, never an
+    /// unverified payload timestamp or controller process age, decides which report is evicted.
     pub fn record(&mut self, accepted: AcceptedReport) {
         let (node, stored) = accepted.into_stored();
         self.reports.insert(node, stored);
@@ -1120,7 +1182,7 @@ impl FleetReports {
         // The placement rule is wire-visible: writer and reader must land a node on the same
         // shard, so it is defined on the canonical digest spelling every other identity uses —
         // the leading 64 bits, read big-endian out of the first sixteen hex characters.
-        let digest = crate::digest::sha256_bytes(node.as_bytes());
+        let digest = node_object_digest(node);
         let prefix = u64::from_str_radix(&digest[..16], 16).expect("sixteen hex characters");
         let divisor = u64::try_from(shard_count).expect("the absolute shard bound fits u64");
         usize::try_from(prefix % divisor).expect("a shard index fits usize")
@@ -1161,7 +1223,7 @@ impl FleetReports {
             .iter()
             .map(|(node, stored)| {
                 (
-                    stored.accepted_at_ms,
+                    stored.stored_at_ms,
                     node.clone(),
                     Self::entry_len(node, stored),
                 )
@@ -1275,12 +1337,12 @@ impl FleetReportBuffer {
             shard.encoded_len -= FleetReports::entry_len(&node, &previous);
             shard
                 .eviction_order
-                .remove(&(previous.accepted_at_ms, node.clone()));
+                .remove(&(previous.stored_at_ms, node.clone()));
         } else if entries_before > 0 {
             shard.encoded_len += 1;
         }
         shard.encoded_len += FleetReports::entry_len(&node, &stored);
-        shard.eviction_order.insert((stored.accepted_at_ms, node));
+        shard.eviction_order.insert((stored.stored_at_ms, node));
 
         let mut evicted = 0;
         while shard.encoded_len > MAX_FLEET_REPORT_SHARD_BYTES {
@@ -1327,6 +1389,27 @@ mod tests {
         FleetShardLimit::new(value).unwrap()
     }
 
+    fn stored_at(value: i64) -> ReportStoredAt {
+        ReportStoredAt::from_unix_millis(value).unwrap()
+    }
+
+    /// Test assertion shorthand. Production has one public authentication gate and freshness is
+    /// always opened through the capability it returns.
+    fn fresh_report_fixture(
+        envelope: &Envelope,
+        expected_node: &str,
+        public_key: &P256PublicKey,
+        now_ms: u64,
+    ) -> Option<NodeReport> {
+        authenticate_report(envelope, expected_node, public_key)
+            .and_then(|report| report.fresh(now_ms))
+    }
+
+    /// Test shorthand for the fleet-admission gate with a deterministic durable-store instant.
+    fn accept_report_fixture(body: &[u8], node: &str) -> Option<AcceptedReport> {
+        accept_stored_report(body, node, stored_at(1))
+    }
+
     /// A keypair plus the public key the control plane pins at enrollment.
     fn keypair() -> (Vec<u8>, P256PublicKey) {
         let rng = aws_lc_rs::rand::SystemRandom::new();
@@ -1351,74 +1434,115 @@ mod tests {
         report
     }
 
-    /// A report the node genuinely signed *after* `mutate` ran. Signing last is the point: it isolates
-    /// what the gate refuses on policy grounds from what it refuses because a signature broke.
+    fn encoded_envelope(report: &NodeReport, pkcs8: &[u8]) -> Envelope {
+        let bytes = encode_signed_report(report, pkcs8).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A well-formed report produced through the only public producer boundary.
     fn signed(mutate: impl FnOnce(&mut NodeReport)) -> (Envelope, P256PublicKey) {
         let (pkcs8, public) = keypair();
         let mut report = report();
         mutate(&mut report);
-        (sign_report(&report, &pkcs8).unwrap(), public)
+        (encoded_envelope(&report, &pkcs8), public)
+    }
+
+    /// An authentic malformed input for fail-closed consumer tests. Product code cannot call the
+    /// private signing primitive and therefore cannot create this state.
+    fn signed_unchecked(mutate: impl FnOnce(&mut NodeReport)) -> (Envelope, P256PublicKey) {
+        let (pkcs8, public) = keypair();
+        let mut report = report();
+        mutate(&mut report);
+        (sign_report_envelope(&report, &pkcs8).unwrap(), public)
+    }
+
+    /// Sign an intentionally untyped report payload. Invalid contract values cannot be constructed
+    /// through the Rust types, so negative wire tests mutate JSON before signing it.
+    fn signed_json(mutate: impl FnOnce(&mut serde_json::Value)) -> (Envelope, P256PublicKey) {
+        let (pkcs8, public) = keypair();
+        let mut value = serde_json::to_value(report()).unwrap();
+        mutate(&mut value);
+        let payload = serde_json::to_vec(&value).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8).unwrap();
+        let signature = key
+            .sign(
+                &aws_lc_rs::rand::SystemRandom::new(),
+                &pae(&payload, REPORT_PAYLOAD_TYPE),
+            )
+            .unwrap();
+        (
+            Envelope {
+                payload: b64().encode(payload),
+                payload_type: REPORT_PAYLOAD_TYPE.into(),
+                signatures: vec![Signature {
+                    sig: b64().encode(signature.as_ref()),
+                }],
+            },
+            public,
+        )
     }
 
     fn reconciliation() -> crate::reconciler::LastReconciliation {
-        crate::reconciler::LastReconciliation {
-            schema: crate::reconciler::LastReconciliation::SCHEMA,
-            operation: crate::reconciler::Operation::Apply,
-            reason: crate::reconciler::Reason::Update,
-            attempt_id: crate::reconciler::attempt::CONVERGE.into(),
-            candidate: crate::reconciler::ReconciledRelease {
-                version: "2.0.0".into(),
-                manifest_sha256: DIGEST.into(),
-                archive_sha256: DIGEST.into(),
-            },
-            predecessor: crate::reconciler::ReconciledRelease {
-                version: "1.0.0".into(),
-                manifest_sha256: OTHER_DIGEST.into(),
-                archive_sha256: OTHER_DIGEST.into(),
-            },
-            reconciler: crate::reconciler::ReconcilerIdentity {
-                provider_set_sha256: DIGEST.into(),
-                product: "system".into(),
-                release: crate::reconciler::ReconciledRelease {
-                    version: "3.0.0".into(),
-                    manifest_sha256: DIGEST.into(),
-                    archive_sha256: OTHER_DIGEST.into(),
-                },
-            },
-            result: crate::reconciler::ResultDocument {
-                schema: crate::reconciler::ResultDocument::SCHEMA,
-                status: crate::reconciler::ResultStatus::Succeeded,
-                changed: true,
-                host_action: crate::reconciler::HostAction::Reboot,
-                retry_after_seconds: None,
-                message: Some("kernel changed".into()),
-            },
-            completed_at_ms: 1,
-        }
+        let transition = crate::reconciler::ReconciliationTransition::new(
+            crate::reconciler::ReconciledRelease::new("2.0.0".into(), DIGEST.into(), DIGEST.into())
+                .unwrap(),
+            crate::reconciler::ReconciledRelease::new(
+                "1.0.0".into(),
+                OTHER_DIGEST.into(),
+                OTHER_DIGEST.into(),
+            )
+            .unwrap(),
+        );
+        let reconciler_release = crate::reconciler::ReconciledRelease::new(
+            "3.0.0".into(),
+            DIGEST.into(),
+            OTHER_DIGEST.into(),
+        )
+        .unwrap();
+        crate::reconciler::LastReconciliation::new(
+            crate::reconciler::MutationOperation::Apply,
+            crate::reconciler::Reason::Update,
+            "a".repeat(64),
+            transition,
+            crate::reconciler::ReconcilerIdentity::new(
+                DIGEST.into(),
+                "system".into(),
+                reconciler_release,
+            )
+            .unwrap(),
+            crate::reconciler::SuccessfulMutation::new(
+                true,
+                crate::reconciler::HostAction::Reboot,
+                Some("kernel changed".into()),
+            )
+            .unwrap(),
+            1,
+        )
+        .unwrap()
     }
 
     fn accepted(node: &str, envelope: &Envelope) -> AcceptedReport {
         let body = serde_json::to_vec(envelope).unwrap();
-        accept_report_envelope(&body, node).unwrap()
+        accept_report_fixture(&body, node).unwrap()
     }
 
     #[test]
     fn every_non_current_schema_is_refused() {
         for schema in [NodeReport::SCHEMA - 1, NodeReport::SCHEMA + 1] {
-            let (envelope, point) = signed(|report| report.schema = schema);
+            let (envelope, point) = signed_unchecked(|report| report.schema = schema);
             assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
                 "schema {schema} must be refused"
             );
         }
         let (envelope, point) = signed(|_| {});
-        assert!(report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_some());
+        assert!(fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_some());
     }
 
     #[test]
     fn a_genuine_envelope_verifies_and_yields_the_report() {
         let (envelope, point) = signed(|_| {});
-        let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
+        let report = fresh_report_fixture(&envelope, "agent-9", &point, now_ms())
             .expect("a genuine envelope must verify");
 
         assert_eq!(report.node, "agent-9");
@@ -1437,7 +1561,7 @@ mod tests {
             });
         });
 
-        let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
+        let report = fresh_report_fixture(&envelope, "agent-9", &point, now_ms())
             .expect("a well-formed signed fingerprint must verify");
         assert_eq!(
             report.fingerprint,
@@ -1447,13 +1571,13 @@ mod tests {
             })
         );
 
-        let (malformed, point) = signed(|report| {
+        let (malformed, point) = signed_unchecked(|report| {
             report.fingerprint = Some(Fingerprint {
                 definition_sha256: DIGEST.into(),
                 output_sha256: "not-a-digest".into(),
             });
         });
-        assert!(report_is_authentic_and_fresh(&malformed, "agent-9", &point, now_ms()).is_none());
+        assert!(fresh_report_fixture(&malformed, "agent-9", &point, now_ms()).is_none());
     }
 
     #[test]
@@ -1471,17 +1595,15 @@ mod tests {
                 report.output_sha256 = Some(DIGEST.into());
             },
         ] {
-            let (envelope, point) = signed(mutate);
-            assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none()
-            );
+            let (envelope, point) = signed_unchecked(mutate);
+            assert!(fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none());
         }
     }
 
     #[test]
     fn a_restored_healthy_predecessor_can_attest_the_rejected_assignment() {
         let (envelope, point) = signed(|report| report.rejected = true);
-        let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
+        let report = fresh_report_fixture(&envelope, "agent-9", &point, now_ms())
             .expect("a rollback reports both the restored release health and the rejection");
         assert!(report.healthy);
         assert!(report.rejected);
@@ -1510,50 +1632,40 @@ mod tests {
         let (envelope, point) = signed(|report| {
             report.reconciliation = Some(reconciliation());
         });
-        let verified = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
+        let verified = fresh_report_fixture(&envelope, "agent-9", &point, now_ms())
             .expect("valid audit evidence remains inside the signed report");
         assert_eq!(
             verified
                 .reconciliation
                 .expect("the report contains audit evidence")
-                .result
-                .host_action,
+                .result()
+                .host_action(),
             crate::reconciler::HostAction::Reboot
         );
 
-        let (malformed, point) = signed(|report| {
-            let mut record = reconciliation();
-            record.operation = crate::reconciler::Operation::Inspect;
-            report.reconciliation = Some(record);
+        let (malformed, point) = signed_json(|report| {
+            report["reconciliation"]["result"]["message"] = serde_json::json!("invalid\nmessage");
         });
-        assert!(report_is_authentic_and_fresh(&malformed, "agent-9", &point, now_ms()).is_none());
+        assert!(fresh_report_fixture(&malformed, "agent-9", &point, now_ms()).is_none());
     }
 
     #[test]
     fn an_installed_report_must_bind_reconciliation_to_its_running_bytes_and_provider_set() {
         for mutate in [
-            (|report: &mut NodeReport| report.reconciliation = None) as fn(&mut NodeReport),
+            (|report: &mut serde_json::Value| {
+                report["reconciliation"] = serde_json::Value::Null;
+            }) as fn(&mut serde_json::Value),
             |report| {
-                report
-                    .reconciliation
-                    .as_mut()
-                    .unwrap()
-                    .candidate
-                    .archive_sha256 = OTHER_DIGEST.into();
+                report["reconciliation"]["candidate"]["archiveSha256"] =
+                    serde_json::json!(OTHER_DIGEST);
             },
             |report| {
-                report
-                    .reconciliation
-                    .as_mut()
-                    .unwrap()
-                    .reconciler
-                    .provider_set_sha256 = OTHER_DIGEST.into();
+                report["reconciliation"]["reconciler"]["providerSetSha256"] =
+                    serde_json::json!(OTHER_DIGEST);
             },
         ] {
-            let (envelope, point) = signed(mutate);
-            assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none()
-            );
+            let (envelope, point) = signed_json(mutate);
+            assert!(fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none());
         }
     }
 
@@ -1579,13 +1691,13 @@ mod tests {
         inner.archive_sha256 = OTHER_DIGEST.into();
         forged.payload = b64().encode(serde_json::to_vec(&inner).unwrap());
         assert!(
-            report_is_authentic_and_fresh(&forged, "agent-9", &point, now_ms()).is_none(),
+            fresh_report_fixture(&forged, "agent-9", &point, now_ms()).is_none(),
             "a re-pointed payload must not verify"
         );
 
         let (_, other_key) = keypair();
         assert!(
-            report_is_authentic_and_fresh(&envelope, "agent-9", &other_key, now_ms()).is_none(),
+            fresh_report_fixture(&envelope, "agent-9", &other_key, now_ms()).is_none(),
             "another node's key must not verify this report"
         );
         // A malformed pin cannot reach this gate at all: `P256PublicKey` is the only shape it
@@ -1601,7 +1713,7 @@ mod tests {
         let mut mistyped = envelope;
         mistyped.payload_type = "application/vnd.updated.something-else+json".into();
 
-        assert!(report_is_authentic_and_fresh(&mistyped, "agent-9", &point, now_ms()).is_none());
+        assert!(fresh_report_fixture(&mistyped, "agent-9", &point, now_ms()).is_none());
     }
 
     #[test]
@@ -1609,23 +1721,32 @@ mod tests {
         let (envelope, point) = signed(|_| {});
 
         assert!(
-            report_is_authentic_and_fresh(&envelope, "another-agent", &point, now_ms()).is_none(),
+            fresh_report_fixture(&envelope, "another-agent", &point, now_ms()).is_none(),
             "a report must not be credited to a node it does not name"
         );
 
-        let stamped = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms())
-            .unwrap()
-            .reported_at_ms;
-        let too_late = stamped + REPORT_FRESHNESS.as_millis() as u64 + 1;
+        let fresh = fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).unwrap();
+        let assignment_sha256 = fresh.assignment_sha256.clone();
+        let too_late = fresh.reported_at_ms + REPORT_FRESHNESS.as_millis() as u64 + 1;
         assert!(
-            report_is_authentic_and_fresh(&envelope, "agent-9", &point, too_late).is_none(),
+            fresh_report_fixture(&envelope, "agent-9", &point, too_late).is_none(),
             "a stale report must fail closed"
+        );
+        let authentic = authenticate_report(&envelope, "agent-9", &point).unwrap();
+        assert!(
+            authentic.fresh(too_late).is_none(),
+            "the cached authenticity capability must enforce the identical freshness gate"
+        );
+        assert_eq!(
+            authentic.durable_rejection(),
+            (assignment_sha256.as_str(), false),
+            "authentication without freshness may expose only the standing rejection claim"
         );
 
         // A genuinely signed record whose field meanings this build does not know.
-        let (future, future_point) = signed(|r| r.schema = NodeReport::SCHEMA + 1);
+        let (future, future_point) = signed_unchecked(|r| r.schema = NodeReport::SCHEMA + 1);
         assert!(
-            report_is_authentic_and_fresh(&future, "agent-9", &future_point, now_ms()).is_none(),
+            fresh_report_fixture(&future, "agent-9", &future_point, now_ms()).is_none(),
             "an unknown schema must fail closed even when authentic"
         );
     }
@@ -1641,7 +1762,7 @@ mod tests {
             r.healthy = false;
             r.updating = true;
         });
-        let report = report_is_authentic_and_fresh(&unsettled, "agent-9", &point, now_ms())
+        let report = fresh_report_fixture(&unsettled, "agent-9", &point, now_ms())
             .expect("an unsettled report with a transaction in flight is well-formed");
         assert!(!report.healthy && report.updating);
 
@@ -1649,13 +1770,13 @@ mod tests {
             r.healthy = false;
             r.updating = false;
         });
-        let report = report_is_authentic_and_fresh(&blip, "agent-9", &point, now_ms())
+        let report = fresh_report_fixture(&blip, "agent-9", &point, now_ms())
             .expect("so is an unsettled report with no update anywhere near it");
         assert!(!report.healthy && !report.updating);
 
-        let (contradictory, point) = signed(|r| r.updating = true);
+        let (contradictory, point) = signed_unchecked(|r| r.updating = true);
         assert!(
-            report_is_authentic_and_fresh(&contradictory, "agent-9", &point, now_ms()).is_none(),
+            fresh_report_fixture(&contradictory, "agent-9", &point, now_ms()).is_none(),
             "settled means the confirmation window is closed; a record claiming both is malformed"
         );
     }
@@ -1666,7 +1787,7 @@ mod tests {
         // zero under a backwards-only check and pins the node healthy and settled permanently.
         let (envelope, point) = signed(|r| r.reported_at_ms = u64::MAX);
         assert!(
-            report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+            fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
             "a report from the far future must fail closed, not read as age zero"
         );
 
@@ -1675,7 +1796,7 @@ mod tests {
             r.reported_at_ms = now_ms() + REPORT_MAX_SKEW.as_millis() as u64 / 2;
         });
         assert!(
-            report_is_authentic_and_fresh(&skewed, "agent-9", &point, now_ms()).is_some(),
+            fresh_report_fixture(&skewed, "agent-9", &point, now_ms()).is_some(),
             "ordinary clock skew must not reject a live node"
         );
     }
@@ -1685,7 +1806,7 @@ mod tests {
         // `now_ms()` reads 0 when the host clock cannot be read. Under a plain subtraction that
         // makes every report age zero — fresh forever, the fail-OPEN direction.
         let (envelope, point) = signed(|_| {});
-        assert!(report_is_authentic_and_fresh(&envelope, "agent-9", &point, 0).is_none());
+        assert!(fresh_report_fixture(&envelope, "agent-9", &point, 0).is_none());
     }
 
     /// The one write-side gate both storing hops call. It must accept a genuine envelope filed under
@@ -1693,31 +1814,29 @@ mod tests {
     #[test]
     fn the_write_gate_accepts_only_a_wellformed_envelope_filed_under_its_own_node() {
         let (pkcs8, _) = keypair();
-        let envelope = sign_report(&report(), &pkcs8).unwrap();
-        let body = serde_json::to_vec(&envelope).unwrap();
+        let body = encode_signed_report(&report(), &pkcs8).unwrap();
+        let envelope: Envelope = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(
-            accept_report_envelope(&body, "agent-9").map(|report| report.node),
+            accept_report_fixture(&body, "agent-9").map(|report| report.node),
             Some("agent-9".to_string())
         );
         assert!(
-            accept_report_envelope(&body, "agent-8").is_none(),
+            accept_report_fixture(&body, "agent-8").is_none(),
             "a report must not be storable under another node's name"
         );
-        assert!(accept_report_envelope(b"not json", "agent-9").is_none());
+        assert!(accept_report_fixture(b"not json", "agent-9").is_none());
         let mut padded = body.clone();
         padded.resize(MAX_REPORT_ENVELOPE_BYTES + 1, b' ');
         assert!(
-            accept_report_envelope(&padded, "agent-9").is_none(),
+            accept_report_fixture(&padded, "agent-9").is_none(),
             "the shared write gate owns the envelope byte bound"
         );
 
         // Wrong payload type: an envelope this node legitimately signed for something else.
         let mut retyped = envelope.clone();
         retyped.payload_type = "application/vnd.updated.something-else+json".into();
-        assert!(
-            accept_report_envelope(&serde_json::to_vec(&retyped).unwrap(), "agent-9").is_none()
-        );
+        assert!(accept_report_fixture(&serde_json::to_vec(&retyped).unwrap(), "agent-9").is_none());
 
         // A stuffed signature list is refused at the door, not left for every reader to pay for.
         let mut stuffed = envelope.clone();
@@ -1728,19 +1847,17 @@ mod tests {
             Envelope::MAX_SIGNATURES + 1,
         )
         .collect();
-        assert!(
-            accept_report_envelope(&serde_json::to_vec(&stuffed).unwrap(), "agent-9").is_none()
-        );
+        assert!(accept_report_fixture(&serde_json::to_vec(&stuffed).unwrap(), "agent-9").is_none());
 
         let mut unsigned = envelope.clone();
         unsigned.signatures.clear();
         assert!(
-            accept_report_envelope(&serde_json::to_vec(&unsigned).unwrap(), "agent-9").is_none(),
+            accept_report_fixture(&serde_json::to_vec(&unsigned).unwrap(), "agent-9").is_none(),
             "an envelope no reader can authenticate must be refused before storage"
         );
 
         // A payload that parses but is not well formed: the reader-side shape gate, applied on write.
-        let malformed = sign_report(
+        let malformed = sign_report_envelope(
             &{
                 let mut report = report();
                 report.archive_sha256 = "deadbeef".into();
@@ -1750,14 +1867,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            accept_report_envelope(&serde_json::to_vec(&malformed).unwrap(), "agent-9").is_none()
+            accept_report_fixture(&serde_json::to_vec(&malformed).unwrap(), "agent-9").is_none()
         );
 
         // A schema every reader will discard. Storing it answered 200 while the rollout throttle
         // and the health proxy both dropped the record, so a node mid-fleet-upgrade read as silent
         // and drained out of rotation permanently — the exact stranding this gate exists to refuse
         // at the door, where the writer still learns about it.
-        let skewed = sign_report(
+        let skewed = sign_report_envelope(
             &{
                 let mut report = report();
                 report.schema = NodeReport::SCHEMA + 1;
@@ -1767,7 +1884,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            accept_report_envelope(&serde_json::to_vec(&skewed).unwrap(), "agent-9").is_none(),
+            accept_report_fixture(&serde_json::to_vec(&skewed).unwrap(), "agent-9").is_none(),
             "the write gate must enforce the schema every reader enforces"
         );
     }
@@ -1775,7 +1892,7 @@ mod tests {
     #[test]
     fn an_envelope_stuffed_with_signatures_is_refused_before_any_verification() {
         let (pkcs8, point) = keypair();
-        let mut envelope = sign_report(&report(), &pkcs8).unwrap();
+        let mut envelope = encoded_envelope(&report(), &pkcs8);
         let genuine = envelope.signatures[0].clone();
         envelope.signatures = (0..Envelope::MAX_SIGNATURES)
             .map(|_| Signature {
@@ -1784,7 +1901,7 @@ mod tests {
             .chain(std::iter::once(genuine))
             .collect();
         assert!(
-            report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+            fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
             "an attacker-chosen signature count must not buy unbounded ECDSA verifications"
         );
     }
@@ -1799,21 +1916,21 @@ mod tests {
             "z".repeat(64),
             format!("sha256:{DIGEST}"),
         ] {
-            let (envelope, point) = signed(|r| r.archive_sha256 = malformed.clone());
+            let (envelope, point) = signed_unchecked(|r| r.archive_sha256 = malformed.clone());
             assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
                 "a digest a reader cannot join on must fail the gate: {malformed}"
             );
         }
-        let (envelope, point) = signed(|r| r.provider_set_sha256 = "not-a-digest".into());
+        let (envelope, point) = signed_unchecked(|r| r.provider_set_sha256 = "not-a-digest".into());
         assert!(
-            report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+            fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
             "the provider half of the running identity must fail closed too"
         );
         for malformed in ["deadbeef".to_string(), "A".repeat(64), "z".repeat(64)] {
-            let (envelope, point) = signed(|r| r.output_sha256 = Some(malformed.clone()));
+            let (envelope, point) = signed_unchecked(|r| r.output_sha256 = Some(malformed.clone()));
             assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
                 "an output identity not produced by the exact-byte hasher must fail closed: {malformed}"
             );
         }
@@ -1825,9 +1942,10 @@ mod tests {
             "nested/deployment".to_string(),
             "a".repeat(crate::identity::MAX_SEGMENT_BYTES + 1),
         ] {
-            let (envelope, point) = signed(|report| report.deployment = deployment.clone());
+            let (envelope, point) =
+                signed_unchecked(|report| report.deployment = deployment.clone());
             assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
                 "invalid deployment identity must fail closed: {deployment:?}"
             );
         }
@@ -1838,9 +1956,9 @@ mod tests {
                 "a".repeat(crate::identity::MAX_RELEASE_VERSION_BYTES)
             ),
         ] {
-            let (envelope, point) = signed(|report| report.version = version.clone());
+            let (envelope, point) = signed_unchecked(|report| report.version = version.clone());
             assert!(
-                report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).is_none(),
+                fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).is_none(),
                 "invalid release version must fail closed: {version:?}"
             );
         }
@@ -1858,7 +1976,7 @@ mod tests {
             r.healthy = false;
         });
 
-        let report = report_is_authentic_and_fresh(&envelope, "agent-9", &point, now_ms()).unwrap();
+        let report = fresh_report_fixture(&envelope, "agent-9", &point, now_ms()).unwrap();
         assert!(report.version.is_empty());
         assert!(report.archive_sha256.is_empty());
         assert!(report.provider_set_sha256.is_empty());
@@ -1870,40 +1988,52 @@ mod tests {
 
         let mut bad_payload = envelope.clone();
         bad_payload.payload = "!!!not base64!!!".into();
-        assert!(report_is_authentic_and_fresh(&bad_payload, "agent-9", &point, now_ms()).is_none());
+        assert!(fresh_report_fixture(&bad_payload, "agent-9", &point, now_ms()).is_none());
 
         let mut bad_sig = envelope.clone();
         bad_sig.signatures[0].sig = "!!!".into();
-        assert!(report_is_authentic_and_fresh(&bad_sig, "agent-9", &point, now_ms()).is_none());
+        assert!(fresh_report_fixture(&bad_sig, "agent-9", &point, now_ms()).is_none());
 
         let mut no_sigs = envelope.clone();
         no_sigs.signatures.clear();
-        assert!(report_is_authentic_and_fresh(&no_sigs, "agent-9", &point, now_ms()).is_none());
+        assert!(fresh_report_fixture(&no_sigs, "agent-9", &point, now_ms()).is_none());
 
         // A valid signature over a payload that is not a report.
         let mut not_a_report = envelope;
         not_a_report.payload = b64().encode(b"{}");
-        assert!(
-            report_is_authentic_and_fresh(&not_a_report, "agent-9", &point, now_ms()).is_none()
-        );
+        assert!(fresh_report_fixture(&not_a_report, "agent-9", &point, now_ms()).is_none());
     }
 
     /// The producer and the consumer of a report envelope share one ceiling.
     #[test]
     fn an_envelope_is_encoded_under_the_ceiling_its_readers_enforce() {
-        let (envelope, _) = signed(|_| {});
-        let bytes = envelope.to_bounded_json().expect("a real report fits");
+        let (pkcs8, _) = keypair();
+        let bytes = encode_signed_report(&report(), &pkcs8).expect("a real report fits");
+        let envelope: Envelope = serde_json::from_slice(&bytes).unwrap();
         assert!(bytes.len() <= MAX_REPORT_ENVELOPE_BYTES);
         assert!(
-            accept_report_envelope(&bytes, "agent-9").is_some(),
+            accept_report_fixture(&bytes, "agent-9").is_some(),
             "what the producer emits is exactly what the one acceptance gate takes"
         );
 
         // An envelope past the ceiling fails at the node instead of being dropped by every reader.
         let mut bloated = envelope.clone();
         bloated.payload = "A".repeat(MAX_REPORT_ENVELOPE_BYTES + 1);
-        let error = bloated.to_bounded_json().expect_err("over the ceiling");
+        let error = encode_report_envelope(&bloated).expect_err("over the ceiling");
         assert!(error.contains("node report envelope"), "{error}");
+    }
+
+    #[test]
+    fn the_producer_refuses_every_report_the_shared_shape_gate_refuses() {
+        let (pkcs8, _) = keypair();
+        let mut malformed = report();
+        malformed.archive_sha256 = "deadbeef".into();
+
+        assert!(!malformed.is_wellformed());
+        assert_eq!(
+            encode_signed_report(&malformed, &pkcs8).unwrap_err(),
+            "refusing to sign a malformed node report: invalid archive digest"
+        );
     }
 
     #[test]
@@ -1931,7 +2061,7 @@ mod tests {
             let mut report = report();
             report.node = node.to_string();
             report.reported_at_ms = at;
-            sign_report(&report, &pkcs8).unwrap()
+            encoded_envelope(&report, &pkcs8)
         };
 
         let mut reports = FleetReports::default();
@@ -2000,13 +2130,40 @@ mod tests {
     }
 
     #[test]
+    fn durable_store_order_survives_projection_recovery() {
+        let (envelope, _) = signed(|_| {});
+        let body = serde_json::to_vec(&envelope).unwrap();
+        let mut fleet = FleetReports::default();
+        fleet.record(
+            accept_stored_report(&body, "agent-9", stored_at(42))
+                .expect("a valid stored report is admitted"),
+        );
+
+        let (index, _, shards, _) = fleet.rebalance(shard_limit(1)).unwrap().into_parts();
+        let stored_at_in = |body: &[u8]| {
+            serde_json::from_slice::<serde_json::Value>(body).unwrap()["reports"]["agent-9"]
+                ["stored_at_ms"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(stored_at_in(&shards[0].1), 42);
+
+        // Rebuild the aggregate exactly as a fresh process does, then publish a new generation.
+        // The generation changes; the durable object ordering evidence must not.
+        let recovered = FleetReports::parse_shard(&shards[0].1, &shards[0].0).unwrap();
+        let (_, _, republished, _) = recovered.rebalance(shard_limit(1)).unwrap().into_parts();
+        assert_eq!(stored_at_in(&republished[0].1), 42);
+        assert_eq!(index.max_shards, shard_limit(1).0);
+    }
+
+    #[test]
     fn steady_state_updates_only_the_canonical_shard_and_preserve_the_index() {
         let (pkcs8, _) = keypair();
         let sign_at = |node: &str, at: u64| {
             let mut report = report();
             report.node = node.into();
             report.reported_at_ms = at;
-            sign_report(&report, &pkcs8).unwrap()
+            encoded_envelope(&report, &pkcs8)
         };
         let original_a = sign_at("a", 1);
         let original_b = sign_at("b", 1);
@@ -2154,7 +2311,7 @@ mod tests {
         entries.insert("oversized".into(), oversized);
         entries.insert(
             "malformed".into(),
-            serde_json::json!({"accepted_at_ms": "not an integer"}),
+            serde_json::json!({"stored_at_ms": "not an integer"}),
         );
         let tampered = serde_json::to_vec(&value).unwrap();
         let mut parsed = FleetReports::parse_shard(&tampered, &location).unwrap();
@@ -2211,12 +2368,12 @@ mod tests {
             }
         };
         let reports: BTreeMap<String, StoredReport> = (1..=9u64)
-            .map(|accepted_at_ms| {
+            .map(|stored_at_ms| {
                 (
-                    format!("agent-{accepted_at_ms}"),
+                    format!("agent-{stored_at_ms}"),
                     StoredReport {
-                        accepted_at_ms,
-                        envelope: big_envelope(10 - accepted_at_ms),
+                        stored_at_ms,
+                        envelope: big_envelope(10 - stored_at_ms),
                     },
                 )
             })
@@ -2245,7 +2402,7 @@ mod tests {
             buffer_evicted += buffer.record(AcceptedReport {
                 node,
                 envelope: stored.envelope,
-                accepted_at_ms: stored.accepted_at_ms,
+                stored_at_ms: stored.stored_at_ms,
             });
         }
         assert_eq!(

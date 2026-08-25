@@ -14,6 +14,7 @@ use updated::bundle::ReleaseId;
 use updated::config::Timeouts;
 pub(crate) use updated::state::{Installed, InstalledState, Pending};
 pub(crate) use updated::transaction::{Phase as TransactionPhase, Transaction};
+use updated_contracts::reconciler::Reason;
 
 /// Whether a [`Pending`] update's confirmation window has passed as of `now` (unix secs).
 pub(crate) fn window_passed(pending: &Pending, window: Duration, now: u64) -> bool {
@@ -91,6 +92,9 @@ pub(crate) struct GateTarget {
     /// The attempt this observation belongs to: the rollback transaction's own compensating token
     /// when the gate is that transaction's health step, and the reserved boot identity otherwise.
     pub attempt: String,
+    /// The semantic event this observation belongs to. Recovery is an update even though it runs
+    /// during process boot; ordinary gates retain the boot's install/restart reason.
+    pub reason: Reason,
     pub candidate: ReleaseId,
     pub candidate_archive_sha256: String,
     pub predecessor: ReleaseId,
@@ -108,18 +112,21 @@ pub(crate) struct GateTarget {
 pub(crate) fn boot_gate_target(
     recovery: Option<&Transaction>,
     installed: &InstalledState,
+    boot_reason: Reason,
 ) -> GateTarget {
     match recovery {
         Some(tx) if tx.is_rollback() => GateTarget {
             attempt: tx.rollback_attempt_id(),
+            reason: Reason::Update,
             candidate: tx.previous_release.clone(),
             candidate_archive_sha256: tx.previous_archive_sha256.clone(),
             predecessor: tx.candidate_release.clone(),
             predecessor_archive_sha256: tx.candidate_archive_sha256.clone(),
-            lifecycle: tx.lifecycle.clone(),
+            lifecycle: tx.previous_lifecycle.clone(),
         },
         _ => GateTarget {
             attempt: updated_contracts::reconciler::attempt::BOOT.to_string(),
+            reason: boot_reason,
             candidate: installed.release.clone(),
             candidate_archive_sha256: installed.archive_sha256.clone(),
             predecessor: installed.release.clone(),
@@ -159,8 +166,8 @@ pub(crate) struct Plan {
     /// Remove the transaction journal after reconciling it (an in-flight update was
     /// resolved). Never set for a plain drift/steady-state boot, which has no journal.
     pub clear_journal: bool,
-    /// Application release hashes to add to the rejected set.
-    pub reject_app: Vec<(updated::state::RepositoryLineage, String)>,
+    /// Candidate verdict identities to add to the rejected set.
+    pub reject_candidate: Vec<(updated::state::RepositoryLineage, String)>,
     /// A rolled-back candidate agent to reject, by its content-addressed path.
     pub reject_agent: Option<PathBuf>,
     /// Installed-state to (re)write — set to confirm an update (clear pending) or to
@@ -208,33 +215,18 @@ pub(crate) enum Level {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn provider() -> Box<updated::state::ProviderRelease> {
-        Box::new(updated::state::ProviderRelease {
-            provider_set_sha256: "f".repeat(64),
-            product: "reconciler".into(),
-            release: updated::bundle::ReleaseId {
-                version: "1.0.0".into(),
-                manifest_sha256: "manifest".into(),
-            },
-            archive_sha256: "archive".into(),
-            args: Vec::new(),
-            timeout_millis: 1_000,
-        })
-    }
+    use crate::test_support::{deployment_rejection, digest, lineage, provider, release};
 
     fn pending() -> Pending {
         Pending {
-            lifecycle_attempt_id: "attempt".into(),
-            candidate_rejection_sha256: "f".repeat(64),
-            previous_release: updated::bundle::ReleaseId {
-                version: "1.0.0".into(),
-                manifest_sha256: "aa".into(),
-            },
-            previous_archive_sha256: "archive-aa".into(),
-            previous_repository_lineage: updated::state::RepositoryLineage::from_metadata_url(
-                "https://repo/metadata/",
+            lifecycle_attempt_id: digest("attempt"),
+            candidate_rejection_sha256: deployment_rejection(
+                &digest("candidate-archive"),
+                &provider().provider_set_sha256,
             ),
+            previous_release: release("1.0.0", "one"),
+            previous_archive_sha256: digest("archive-one"),
+            previous_repository_lineage: lineage(),
             lifecycle: provider(),
             committed_at: 1000,
         }
@@ -255,7 +247,7 @@ mod tests {
         // A `committed_at` in the future must not produce a duration that panics the
         // loop's `Instant + Duration`; at most one window of waiting is ever correct.
         let future = Pending {
-            lifecycle_attempt_id: "attempt".into(),
+            lifecycle_attempt_id: digest("attempt"),
             committed_at: u64::MAX - 1,
             ..pending()
         };
@@ -267,42 +259,35 @@ mod tests {
         assert!(window_passed(&pending(), window, 1120));
     }
 
-    fn release(version: &str) -> ReleaseId {
-        ReleaseId {
-            version: version.into(),
-            manifest_sha256: format!("{version}-manifest"),
-        }
-    }
-
-    fn lineage() -> updated::state::RepositoryLineage {
-        updated::state::RepositoryLineage::from_metadata_url("https://repo/metadata/")
-    }
-
     /// The installed record as it looks mid-rollback: the CANDIDATE, because its predecessor's
     /// commit is deferred until after the boot health gate.
     fn deferred_candidate_record() -> InstalledState {
         InstalledState::confirmed(
             lineage(),
-            release("2.0.0"),
-            "archive-two".into(),
+            release("2.0.0", "two"),
+            digest("archive-two"),
             provider(),
         )
     }
 
     fn rollback_of(predecessor: ReleaseId) -> Transaction {
         let mut predecessor_provider = provider();
-        predecessor_provider.release = release("0.9.0");
+        predecessor_provider.release = release("0.9.0", "predecessor-provider");
         Transaction {
-            id: "attempt".into(),
+            id: digest("attempt"),
             previous_release: predecessor,
-            previous_archive_sha256: "archive-one".into(),
+            previous_archive_sha256: digest("archive-one"),
             previous_repository_lineage: lineage(),
-            candidate_release: release("2.0.0"),
-            candidate_archive_sha256: "archive-two".into(),
-            candidate_rejection_sha256: "f".repeat(64),
+            candidate_release: release("2.0.0", "two"),
+            candidate_archive_sha256: digest("archive-two"),
+            candidate_rejection_sha256: deployment_rejection(
+                &digest("archive-two"),
+                &provider().provider_set_sha256,
+            ),
             candidate_repository_lineage: lineage(),
             candidate_rejection_required: true,
-            lifecycle: predecessor_provider,
+            previous_lifecycle: predecessor_provider,
+            candidate_lifecycle: provider(),
             rollback_health_failures: 0,
             phase: TransactionPhase::RollbackActivating,
         }
@@ -313,17 +298,18 @@ mod tests {
         // A crash-recovered rollback restored 1.0.0 but the installed record still names the
         // candidate. Both the identity AND the providers must come from the transaction: gating
         // 1.0.0 with `--candidate 2.0.0` makes a conforming reconciler report unhealthy.
-        let predecessor = release("1.0.0");
+        let predecessor = release("1.0.0", "one");
         let tx = rollback_of(predecessor.clone());
         let record = deferred_candidate_record();
 
-        let target = boot_gate_target(Some(&tx), &record);
+        let target = boot_gate_target(Some(&tx), &record, Reason::Restart);
         assert_eq!(target.candidate, predecessor);
-        assert_eq!(target.lifecycle, tx.lifecycle);
+        assert_eq!(target.lifecycle, tx.previous_lifecycle);
         // The gate is this rollback's health step, so it carries the transaction's own compensating
         // identity and names the failed candidate as the predecessor — the same three arguments its
         // predecessor `apply` and its `rollback` carry.
         assert_eq!(target.attempt, tx.rollback_attempt_id());
+        assert_eq!(target.reason, Reason::Update);
         assert_eq!(target.predecessor, tx.candidate_release);
         assert!(
             !updated_contracts::reconciler::attempt::is_reserved(&target.attempt),
@@ -332,20 +318,22 @@ mod tests {
 
         // An ordinary boot has no rollback, so the committed record is the running release and the
         // gate belongs to no transaction.
-        let target = boot_gate_target(None, &record);
+        let target = boot_gate_target(None, &record, Reason::Restart);
         assert_eq!(target.candidate, record.release);
         assert_eq!(target.predecessor, record.release);
         assert_eq!(target.lifecycle, record.lifecycle);
         assert_eq!(target.attempt, updated_contracts::reconciler::attempt::BOOT);
+        assert_eq!(target.reason, Reason::Restart);
 
         // A forward transaction is not a rollback: nothing was restored, the record still governs
         // and the gate is still a reserved-identity observation.
-        let mut forward = rollback_of(release("1.0.0"));
+        let mut forward = rollback_of(release("1.0.0", "one"));
         forward.phase = TransactionPhase::Activating;
-        let target = boot_gate_target(Some(&forward), &record);
+        let target = boot_gate_target(Some(&forward), &record, Reason::Install);
         assert_eq!(target.candidate, record.release);
         assert_eq!(target.predecessor, record.release);
         assert_eq!(target.attempt, updated_contracts::reconciler::attempt::BOOT);
+        assert_eq!(target.reason, Reason::Install);
     }
 
     #[test]

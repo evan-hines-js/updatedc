@@ -252,6 +252,22 @@ pub fn select_repository_agents(
     agents
 }
 
+/// Which group sets this repository owns, in the stable order every planner and status projection
+/// uses. Repository ownership is an explicit identity boundary: label selectors are evaluated only
+/// after this filter, so identical labels in sibling repositories cannot share a concurrency gate
+/// that neither controller could enforce globally.
+pub fn select_repository_group_sets(
+    all: impl IntoIterator<Item = UpdateGroupSet>,
+    repository: &str,
+) -> Vec<UpdateGroupSet> {
+    let mut sets: Vec<UpdateGroupSet> = all
+        .into_iter()
+        .filter(|set| set.spec.repository_ref.name == repository)
+        .collect();
+    sets.sort_by_key(|set| set.name_any());
+    sets
+}
+
 impl Drop for FleetWatch {
     fn drop(&mut self) {
         self.pump.abort();
@@ -654,7 +670,7 @@ pub async fn reconcile_once(
         })
         .collect();
     let mut set_resources = sets_api.list(&ListParams::default()).await?;
-    set_resources.items.sort_by_key(|set| set.name_any());
+    set_resources.items = select_repository_group_sets(set_resources.items, repository_name);
     // Surface misconfigured schedule entries in the controller log. An invalid window or
     // calendar entry still fails safe (it never opens), so this is observability, not a gate.
     for set in &set_resources.items {
@@ -1163,6 +1179,43 @@ pub(crate) mod wiring_tests {
     use std::sync::Mutex as StdMutex;
 
     const TEST_MANAGED_PREFIX: &str = "routing/default/default";
+
+    #[test]
+    fn group_set_ownership_is_filtered_before_label_selection() {
+        let group_set = |name: &str, repository: &str| {
+            UpdateGroupSet::new(
+                name,
+                crate::UpdateGroupSetSpec {
+                    repository_ref: crate::LocalObjectReference {
+                        name: repository.into(),
+                    },
+                    selector: crate::LabelSelector::default(),
+                    max_concurrent: None,
+                    rollout_windows: Vec::new(),
+                    calendar: Vec::new(),
+                    max_regressions: None,
+                    on_regression: crate::RegressionResponse::Halt,
+                    stuck_after_seconds: None,
+                },
+            )
+        };
+
+        let selected = select_repository_group_sets(
+            [
+                group_set("z-local", "default"),
+                group_set("foreign", "other"),
+                group_set("a-local", "default"),
+            ],
+            "default",
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(kube::ResourceExt::name_any)
+                .collect::<Vec<_>>(),
+            ["a-local", "z-local"]
+        );
+    }
 
     #[derive(Debug)]
     struct RecordingMultipartUpload {
@@ -1789,9 +1842,12 @@ pub(crate) mod wiring_tests {
         mutate(&mut report);
         let envelope = crate::test_support::sign_report(&mut report, &NODE_KEY.0);
         let body = serde_json::to_vec(&envelope).expect("encoded report");
-        #[allow(clippy::disallowed_methods)]
-        updated_contracts::telemetry::accept_report_envelope(&body, node)
-            .expect("the fixture produces an acceptable report");
+        updated_contracts::telemetry::accept_stored_report(
+            &body,
+            node,
+            updated_contracts::telemetry::ReportStoredAt::from_unix_millis(1).unwrap(),
+        )
+        .expect("the fixture produces an acceptable report");
         // Through the production key builder, not a second spelling of the layout: a fixture that
         // knows independently where reports live is a fixture that can keep passing after the real
         // namespace moves out from under it.
@@ -2170,6 +2226,9 @@ pub(crate) mod wiring_tests {
             let mut set = UpdateGroupSet::new(
                 "edge-set",
                 crate::UpdateGroupSetSpec {
+                    repository_ref: crate::LocalObjectReference {
+                        name: "default".into(),
+                    },
                     selector: crate::LabelSelector {
                         match_labels: BTreeMap::from([("tier".to_string(), "edge".to_string())]),
                     },
@@ -2294,6 +2353,9 @@ pub(crate) mod wiring_tests {
             let mut set = UpdateGroupSet::new(
                 "edge-set",
                 crate::UpdateGroupSetSpec {
+                    repository_ref: crate::LocalObjectReference {
+                        name: "default".into(),
+                    },
                     selector: crate::LabelSelector {
                         match_labels: BTreeMap::from([("tier".to_string(), "edge".to_string())]),
                     },

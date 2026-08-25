@@ -17,7 +17,7 @@ use foundation::durable;
 /// The reconciler protocol vocabulary is defined once, in the contracts crate; this fixture
 /// answers exactly the operations the agent invokes.
 use updated_contracts::reconciler::{
-    attempt, HostAction, Operation, Reason, ResultDocument, ResultStatus, PROTOCOL,
+    attempt, HostAction, Operation, Reason, ResultDocument, PROTOCOL,
 };
 
 type Error = Box<dyn std::error::Error>;
@@ -175,14 +175,8 @@ impl Deployment {
     }
 
     fn publish_result(&self, changed: bool) -> Result<(), Error> {
-        let result = ResultDocument {
-            schema: ResultDocument::SCHEMA,
-            status: ResultStatus::Succeeded,
-            changed,
-            host_action: HostAction::None,
-            retry_after_seconds: None,
-            message: None,
-        };
+        let result = ResultDocument::succeeded(changed, HostAction::None, None)
+            .map_err(std::io::Error::other)?;
         durable::atomic_write(
             &self.result_file,
             ".result-",

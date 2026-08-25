@@ -22,7 +22,7 @@ pub(crate) fn cold_install_applies_the_first_release(ctx: &Ctx) -> R {
     let process = Proc::spawn("cold-install", &mut node)?;
     let installed = process.wait_for_log(
         "cold-installed application 1.0.0 from the first trusted assignment",
-        120,
+        CONVERGE_TIMEOUT,
     ) && wait_for_version(svc, "1.0.0", CONVERGE_TIMEOUT)
         && node_paths(&dir).installed.is_file()
         && node_paths(&dir).active_release.is_file();
@@ -446,6 +446,48 @@ pub(crate) fn cold_install_descends_past_broken_head(ctx: &Ctx) -> R {
     Ok(())
 }
 
+/// Rejection is a fail-closed invariant even when ordered fallback has no lower release left.
+/// Once the only signed deployment has failed its first health gate, later boots must stop with
+/// diagnostics; they may never relaunch the rejected provisional head as an availability escape.
+pub(crate) fn cold_install_fails_closed_when_every_candidate_is_rejected(ctx: &Ctx) -> R {
+    let (srv, svc) = ("127.0.0.1:21630", "127.0.0.1:21631");
+    let dir = ctx.work.join("cold-install-exhausted");
+    std::fs::create_dir_all(&dir).map_err(str_err)?;
+    let _workload = fixture::workload(&dir);
+    ctx.init_repo(&dir)?;
+    let broken = dir.join("only-broken-app");
+    std::fs::write(&broken, b"not-a-runnable-application-entrypoint\n").map_err(str_err)?;
+    ctx.publish(&dir, "app", "1.0.0", &broken)?;
+    let _server = ctx.serve(&dir, srv)?;
+    let command = Node::new(ctx, &dir, srv, "app")
+        .cold_install()
+        .ordered_install_fallback()
+        .workload(svc)
+        .check_interval("1s")
+        .health_grace("2s")
+        .launcher()?;
+    let node = Service::spawn("cold-install-exhausted", &command);
+    let failed_closed = node.wait_for_log(
+        "the first trusted assignment contains no installable application",
+        CONVERGE_TIMEOUT,
+    );
+    let remained_down = stays_true(READINESS_SETTLE, || {
+        http_text(&format!("http://{svc}/version")).is_none()
+    });
+    let rejected = std::fs::read_to_string(node_paths(&dir).rejected).unwrap_or_default();
+    let log = node.captured_log();
+    drop(node);
+    if !failed_closed || !remained_down || rejected.trim().is_empty() {
+        return fail(format!(
+            "an exhausted cold-install fallback did not fail closed (diagnostic={failed_closed}, \
+             stayed_down={remained_down}, rejection_recorded={}):\n{log}",
+            !rejected.trim().is_empty()
+        ));
+    }
+    ok("a cold node with no healthy fallback kept the rejected deployment down and emitted complete selection diagnostics");
+    Ok(())
+}
+
 /// A cold node whose assigned head is a *malformed* bundle — one that verifies its signed archive
 /// hash but cannot be extracted or validated (a corrupt or truncated tar.zst, not merely a bad
 /// entrypoint) — must reject it at ingest and descend, exactly like a head whose apply fails. Two
@@ -532,8 +574,7 @@ pub(crate) fn crash_evidence_reverts_only_the_unconfirmed(ctx: &Ctx) -> R {
     let cmd = Node::new(ctx, &dir, srv, "app")
         .check_interval("2s")
         .health_grace("2s")
-        // Long enough that the update is still unconfirmed when its workload degrades.
-        .confirmation_window("120s")
+        .hold_unconfirmed()
         .faulty_workload(svc, "degrade-after-ready")
         .launcher()?;
     let node = Service::spawn("unconfirmed", &cmd);
@@ -635,11 +676,12 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
         ("healthy", "127.0.0.1:21120", "127.0.0.1:21130", false),
         ("failing", "127.0.0.1:21121", "127.0.0.1:21131", true),
     ];
-    // Declared ahead of the handles below so it drops last: each node's workload is ended after
-    // its agent and its repository server are gone.
+    // Drop order is intentional: stop each node first, then its repository, and only then the
+    // hook-managed workloads. This keeps teardown from generating transport failures or killing a
+    // workload before the node stack has stopped observing it.
     let mut workloads = Vec::new();
-    let mut services = Vec::new();
     let mut servers = Vec::new();
+    let mut services = Vec::new();
 
     for (name, repository_addr, service_addr, fails) in nodes {
         let dir = root.join(name);
@@ -651,11 +693,14 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
 
         // The failing peer keeps a long window so its update is still unconfirmed when its release
         // degrades; the healthy peer's short window lets it settle.
-        let confirmation_window = if fails { "120s" } else { "8s" };
         let mut node = Node::new(ctx, &dir, repository_addr, "app")
             .check_interval("1s")
-            .health_grace("2s")
-            .confirmation_window(confirmation_window);
+            .health_grace("2s");
+        node = if fails {
+            node.hold_unconfirmed()
+        } else {
+            node.confirmation_window("8s")
+        };
         // Only the failing peer's release degrades after its first health observation; the two
         // nodes are otherwise identical, so what separates them is the release's own health.
         node = if fails {
@@ -705,8 +750,6 @@ pub(crate) fn group_peer_failure_is_node_local(ctx: &Ctx) -> R {
     {
         return fail("healthy peer was incorrectly rolled back with its failing peer");
     }
-    drop(servers);
-    drop(workloads);
     ok("one node reverted locally while its group peer remained committed at 2.0.0");
     Ok(())
 }

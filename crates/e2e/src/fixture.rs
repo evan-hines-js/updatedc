@@ -355,14 +355,12 @@ pub fn run() -> R {
     };
     outcome?;
     if operation.mutation().is_some() {
-        let result = updated_contracts::reconciler::ResultDocument {
-            schema: updated_contracts::reconciler::ResultDocument::SCHEMA,
-            status: updated_contracts::reconciler::ResultStatus::Succeeded,
-            changed: true,
-            host_action: updated_contracts::reconciler::HostAction::None,
-            retry_after_seconds: None,
-            message: None,
-        };
+        let result = updated_contracts::reconciler::ResultDocument::succeeded(
+            true,
+            updated_contracts::reconciler::HostAction::None,
+            None,
+        )
+        .map_err(str_err)?;
         foundation::durable::atomic_write(
             &result_file,
             ".result-",

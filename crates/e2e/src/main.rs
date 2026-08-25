@@ -71,6 +71,10 @@ fn scenarios() -> Vec<Scenario> {
             cold_install_descends_past_broken_head,
         ),
         (
+            "a cold node fails closed when every ordered-install candidate has been rejected",
+            cold_install_fails_closed_when_every_candidate_is_rejected,
+        ),
+        (
             "a cold node rejects a malformed (unextractable) assigned bundle at ingest and descends to a healthy release",
             cold_install_descends_past_corrupt_bundle,
         ),

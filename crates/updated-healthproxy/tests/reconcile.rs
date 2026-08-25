@@ -82,12 +82,16 @@ async fn spawn_cdn(reports: Vec<(String, bool)>) -> TestCdn {
         let mut report =
             NodeReport::new(&node, "deploy-3", DIGEST, "3.0.0", DIGEST, DIGEST, healthy);
         bind_reconciliation(&mut report);
-        let envelope = updated_contracts::telemetry::sign_report(&report, &TEST_KEY.0).unwrap();
-        let body = serde_json::to_vec(&envelope).unwrap();
+        let body =
+            updated_contracts::telemetry::encode_signed_report(&report, &TEST_KEY.0).unwrap();
         // A test fixture minting the acceptance a real scanner would have produced from these
-        // bytes. Accepting once, here, is the point of the ban rather than an exception to it.
-        #[allow(clippy::disallowed_methods)]
-        let accepted = updated_contracts::telemetry::accept_report_envelope(&body, &node).unwrap();
+        // bytes and the object's durable metadata.
+        let accepted = updated_contracts::telemetry::accept_stored_report(
+            &body,
+            &node,
+            updated_contracts::telemetry::ReportStoredAt::from_unix_millis(1).unwrap(),
+        )
+        .unwrap();
         fleet.record(accepted);
     }
     let (_, index_body, shards, _) = fleet
@@ -151,40 +155,35 @@ async fn spawn_cdn(reports: Vec<(String, bool)>) -> TestCdn {
 
 fn bind_reconciliation(report: &mut NodeReport) {
     use updated_contracts::reconciler::{
-        HostAction, LastReconciliation, Operation, Reason, ReconciledRelease, ReconcilerIdentity,
-        ResultDocument, ResultStatus,
+        HostAction, LastReconciliation, MutationOperation, Reason, ReconciledRelease,
+        ReconcilerIdentity, ReconciliationTransition, SuccessfulMutation,
     };
-    let running = ReconciledRelease {
-        version: report.version.clone(),
-        manifest_sha256: DIGEST.into(),
-        archive_sha256: report.archive_sha256.clone(),
-    };
-    report.reconciliation = Some(LastReconciliation {
-        schema: LastReconciliation::SCHEMA,
-        operation: Operation::Apply,
-        reason: Reason::Restart,
-        attempt_id: updated_contracts::reconciler::attempt::CONVERGE.into(),
-        candidate: running.clone(),
-        predecessor: running,
-        reconciler: ReconcilerIdentity {
-            provider_set_sha256: report.provider_set_sha256.clone(),
-            product: "system".into(),
-            release: ReconciledRelease {
-                version: "1.0.0".into(),
-                manifest_sha256: DIGEST.into(),
-                archive_sha256: DIGEST.into(),
-            },
-        },
-        result: ResultDocument {
-            schema: ResultDocument::SCHEMA,
-            status: ResultStatus::Succeeded,
-            changed: false,
-            host_action: HostAction::None,
-            retry_after_seconds: None,
-            message: None,
-        },
-        completed_at_ms: 1,
-    });
+    let running = ReconciledRelease::new(
+        report.version.clone(),
+        DIGEST.into(),
+        report.archive_sha256.clone(),
+    )
+    .unwrap();
+    let transition = ReconciliationTransition::new(running.clone(), running);
+    let reconciler_release =
+        ReconciledRelease::new("1.0.0".into(), DIGEST.into(), DIGEST.into()).unwrap();
+    report.reconciliation = Some(
+        LastReconciliation::new(
+            MutationOperation::Apply,
+            Reason::Restart,
+            updated_contracts::reconciler::attempt::CONVERGE.into(),
+            transition,
+            ReconcilerIdentity::new(
+                report.provider_set_sha256.clone(),
+                "system".into(),
+                reconciler_release,
+            )
+            .unwrap(),
+            SuccessfulMutation::new(false, HostAction::None, None).unwrap(),
+            1,
+        )
+        .unwrap(),
+    );
 }
 
 /// A load balancer that just records the membership it was told to program.

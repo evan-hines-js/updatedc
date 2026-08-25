@@ -31,7 +31,7 @@ pub(crate) struct RuntimeDataManager {
 impl RuntimeDataManager {
     pub(crate) fn new(routing: &Routing, inputs: &InputSelection) -> Result<Self, String> {
         let (gateway_base_url, control_client, object_client) =
-            if routing.is_local() {
+            if routing.is_local()? {
                 (None, None, None)
             } else {
                 (
@@ -224,9 +224,9 @@ mod tests {
             object_sha256: "b".repeat(64),
             files: ["host".to_string()].into_iter().collect(),
         };
-        assert!(RuntimeDataManager::new(&routing("/srv/repository"), &input).is_err());
+        assert!(RuntimeDataManager::new(&routing("/srv/repository/"), &input).is_err());
         assert!(
-            RuntimeDataManager::new(&routing("/srv/repository"), &InputSelection::default())
+            RuntimeDataManager::new(&routing("/srv/repository/"), &InputSelection::default())
                 .is_ok()
         );
     }
@@ -296,7 +296,7 @@ mod tests {
             .selection()
             .unwrap();
         let mut manager =
-            RuntimeDataManager::new(&routing("/srv/repository"), &InputSelection::default())
+            RuntimeDataManager::new(&routing("/srv/repository/"), &InputSelection::default())
                 .unwrap();
         manager.current = snapshot.clone();
         manager.current_selection = selection.clone();
