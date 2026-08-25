@@ -1,0 +1,25 @@
+images:
+  tag: v2.8.3
+
+controllerManager:
+  replicaCount: 1
+  enableFilterNamespace: true
+  nodeSelector:
+    updated.dev/chaos-role: control
+  leaderElection:
+    enabled: false
+
+chaosDaemon:
+  runtime: containerd
+  socketPath: /run/k3s/containerd/containerd.sock
+  mtls:
+    enabled: true
+
+dashboard:
+  create: false
+
+dnsServer:
+  create: false
+
+prometheus:
+  create: false

@@ -1,0 +1,144 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: updatec-soak-campaign
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: updatec-soak-campaign
+    app.kubernetes.io/part-of: updatedc-chaos-lab
+spec:
+  groups:
+    - name: updatec-soak-campaign
+      interval: 15s
+      rules:
+        - record: updatedc:soak_success:ratio
+          expr: updatec_soak_successful_campaigns_total / clamp_min(updatec_soak_campaigns_total, 1)
+        - record: updatedc:soak_fleet_converged:ratio
+          expr: updatec_soak_fleet_converged_nodes / clamp_min(updatec_soak_fleet_expected_nodes, 1)
+        - record: updatedc:soak_last_success_age_seconds
+          expr: >-
+            ((time() - updatec_soak_last_success_timestamp_seconds)
+              and updatec_soak_last_success_timestamp_seconds > 0)
+            or
+            ((time() - updatec_soak_started_timestamp_seconds)
+              and updatec_soak_last_success_timestamp_seconds == 0)
+        - record: updatedc:soak_faults:1h
+          expr: sum(increase(updatec_soak_faults_total[1h]))
+        - alert: UpdatecSoakCampaignStalled
+          expr: updatec_soak_bootstrap_ready == 1 and updatedc:soak_last_success_age_seconds > 900
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: updatec soak has not completed a successful campaign for 15 minutes
+        - alert: UpdatecSoakCampaignFailing
+          expr: updatec_soak_consecutive_failures >= 3
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: updatec soak has failed at least three consecutive campaigns
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: updatec-soak-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/part-of: updatedc-chaos-lab
+data:
+  updatec-soak.json: |-
+    {
+      "annotations": {"list": []},
+      "editable": false,
+      "graphTooltip": 1,
+      "id": null,
+      "panels": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"decimals": 0, "noValue": "bootstrapping", "unit": "short"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+          "id": 1,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatec_soak_round", "instant": true, "legendFormat": "round", "range": false, "refId": "A"}],
+          "title": "Campaign round", "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"max": 1, "min": 0, "noValue": "no campaigns", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.9}, {"color": "green", "value": 0.99}]}, "unit": "percentunit"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+          "id": 2,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatedc:soak_success:ratio", "instant": true, "legendFormat": "success", "range": false, "refId": "A"}],
+          "title": "Campaign reliability", "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"max": 1, "min": 0, "noValue": "waiting for fleet", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "percentunit"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+          "id": 3,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatedc:soak_fleet_converged:ratio", "instant": true, "legendFormat": "converged", "range": false, "refId": "A"}],
+          "title": "Fleet converged", "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"decimals": 0, "noValue": "none", "unit": "short"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+          "id": 4,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "sum(updatec_soak_faults_total)", "instant": true, "legendFormat": "faults", "range": false, "refId": "A"}],
+          "title": "Faults injected", "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"decimals": 0, "noValue": "none", "unit": "short", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+          "id": 5,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatec_soak_consecutive_failures", "instant": true, "legendFormat": "failures", "range": false, "refId": "A"}],
+          "title": "Consecutive failures", "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"decimals": 0, "noValue": "waiting", "unit": "s"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+          "id": 6,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatec_soak_last_convergence_seconds", "instant": true, "legendFormat": "seconds", "range": false, "refId": "A"}],
+          "title": "Last convergence", "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "stepAfter", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "max": 1, "min": 0, "unit": "bool"}, "overrides": []},
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "id": 7,
+          "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"editorMode": "code", "expr": "updatec_soak_fault_active", "legendFormat": "{{kind}}", "range": true, "refId": "A"}],
+          "title": "Active real fault", "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "unit": "short"}, "overrides": []},
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "id": 8,
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"editorMode": "code", "expr": "updatec_soak_successful_campaigns_total", "legendFormat": "successful", "range": true, "refId": "A"},
+            {"editorMode": "code", "expr": "updatec_soak_failed_campaigns_total", "legendFormat": "failed", "range": true, "refId": "B"},
+            {"editorMode": "code", "expr": "updatec_soak_recoveries_total", "legendFormat": "recoveries", "range": true, "refId": "C"}
+          ],
+          "title": "Campaign outcomes", "type": "timeseries"
+        }
+      ],
+      "refresh": "15s",
+      "schemaVersion": 41,
+      "tags": ["updatedc", "chaos", "soak", "24x7"],
+      "templating": {"list": []},
+      "time": {"from": "now-24h", "to": "now"},
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "updatec 24/7 Campaign",
+      "uid": "updatedc-soak-campaign",
+      "version": 1,
+      "weekStart": ""
+    }

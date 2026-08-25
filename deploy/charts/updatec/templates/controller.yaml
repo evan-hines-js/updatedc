@@ -50,6 +50,9 @@ spec:
         app: {{ include "updatec.controllerName" . }}
         {{- include "updatec.labels" . | nindent 8 }}
         app.kubernetes.io/component: controller
+        {{- with .Values.controller.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.controller.podAnnotations }}
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}

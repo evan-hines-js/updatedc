@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  labels:
+    {{- include "soak.labels" . | nindent 4 }}
+    app.kubernetes.io/name: minio
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: minio}
+  template:
+    metadata:
+      labels:
+        {{- include "soak.labels" . | nindent 8 }}
+        app.kubernetes.io/name: minio
+        updated.dev/chaos-target: "true"
+    spec:
+      nodeSelector: {updated.dev/chaos-role: storage}
+      securityContext: {fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: minio
+          image: {{ .Values.minio.image | quote }}
+          imagePullPolicy: IfNotPresent
+          args: [server, /data]
+          ports: [{name: api, containerPort: 9000}]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_ACCESS_KEY_ID}}
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_SECRET_ACCESS_KEY}}
+          readinessProbe: {httpGet: {path: /minio/health/ready, port: api}, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /minio/health/live, port: api}, periodSeconds: 15}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts: [{name: data, mountPath: /data}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        storageClassName: local-path
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: {{ .Values.minio.persistence }}}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  selector: {app.kubernetes.io/name: minio}
+  ports: [{name: api, port: 9000, targetPort: api}]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-initialize
+  labels: {{- include "soak.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    helm.sh/hook-weight: "10"
+spec:
+  backoffLimit: 20
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "soak.labels" . | nindent 8 }}
+        app.kubernetes.io/name: minio-initialize
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector: {updated.dev/chaos-role: storage}
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: initialize
+          image: {{ .Values.minio.clientImage | quote }}
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              until mc alias set local http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY";
+              do sleep 2; done;
+              mc mb --ignore-existing local/updates;
+              mc anonymous set download local/updates/releases;
+              mc anonymous set download local/updates/repositories/default/telemetry
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_ACCESS_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_SECRET_ACCESS_KEY}}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+---
+# Agents follow signed redirects to this stable HTTPS name. The ExternalName enters k3s' Traefik,
+# which preserves the host, path, and SigV4 query while terminating the fleet-CA certificate.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-direct
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  type: ExternalName
+  externalName: traefik.kube-system.svc.cluster.local
+  ports: [{name: https, port: 443, targetPort: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minio-direct
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [minio-direct.updated-system.svc]
+      secretName: gateway-tls
+  rules:
+    - host: minio-direct.updated-system.svc
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: minio, port: {number: 9000}}}

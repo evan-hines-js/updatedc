@@ -1,0 +1,78 @@
+{{- if .Values.agents.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: agents
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app.kubernetes.io/name: updated-agent}
+  ports: [{name: workload, port: 8080, targetPort: workload}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agent
+  labels:
+    {{- include "soak.labels" . | nindent 4 }}
+    app.kubernetes.io/name: updated-agent
+spec:
+  serviceName: agents
+  replicas: {{ .Values.agents.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app.kubernetes.io/name: updated-agent}
+  template:
+    metadata:
+      labels:
+        {{- include "soak.labels" . | nindent 8 }}
+        app.kubernetes.io/name: updated-agent
+        updated.dev/chaos-target: "true"
+    spec:
+      automountServiceAccountToken: false
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: updated.dev/chaos-role
+                    operator: In
+                    values: [agent-a, agent-b]
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app.kubernetes.io/name: updated-agent}
+      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agent
+          image: {{ include "soak.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/usr/local/bin/run-agent]
+          ports: [{name: workload, containerPort: 8080}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: "2", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/updated}
+            - {name: tmp, mountPath: /tmp}
+            - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
+      volumes:
+        - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 128Mi}}
+        - {name: agent-tls, secret: {secretName: agent-tls}}
+  volumeClaimTemplates:
+    - metadata: {name: state}
+      spec:
+        storageClassName: local-path
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: {{ .Values.agents.statePersistence }}}}
+{{- end }}

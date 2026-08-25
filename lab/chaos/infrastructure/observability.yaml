@@ -1,0 +1,205 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: updatedc-chaos-reliability
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: updatedc-chaos-reliability
+    app.kubernetes.io/part-of: updatedc-chaos-lab
+spec:
+  groups:
+    - name: updatedc-chaos-reliability
+      interval: 15s
+      rules:
+        - record: updatedc:release_transitions:1h
+          expr: max(changes(updatec_generation[1h])) or vector(0)
+        - record: updatedc:fleet_settled:ratio
+          expr: avg(updatec_group_progress{state="settled"})
+        - record: updatedc:fleet_nodes_on_target:ratio
+          expr: sum(updatec_group_nodes_on_target) / clamp_min(sum(updatec_group_nodes), 1)
+        - record: updatedc:reports_fresh:ratio
+          expr: updatec_reports_fresh / clamp_min(updatec_reports_fresh + updatec_reports_stale, 1)
+        - record: updatedc:reconcile_age_seconds
+          expr: time() - updatec_reconcile_timestamp_seconds
+        - record: updatedc:reconcile_failures:1h
+          expr: increase(updatec_reconcile_failures_total[1h])
+        - record: updatedc:chaos_control_plane_up
+          expr: max(up{job="chaos-mesh-controller"})
+        - record: updatedc:kubernetes_nodes_ready:ratio
+          expr: avg(kube_node_status_condition{condition="Ready",status="true"})
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: updatedc-chaos-overview-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/part-of: updatedc-chaos-lab
+data:
+  updatedc-chaos-overview.json: |-
+    {
+      "annotations": {"list": []},
+      "editable": false,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"decimals": 0, "noValue": "waiting for updatec", "unit": "none"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+          "id": 1,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "max(updatec_generation)", "instant": true, "legendFormat": "generation", "range": false, "refId": "A"}],
+          "title": "Current generation",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"decimals": 0, "noValue": "0", "unit": "short"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+          "id": 2,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatedc:release_transitions:1h", "instant": true, "legendFormat": "releases", "range": false, "refId": "A"}],
+          "title": "Release transitions / hour",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"max": 1, "min": 0, "noValue": "waiting for fleet", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.9}, {"color": "green", "value": 0.99}]}, "unit": "percentunit"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+          "id": 3,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatedc:fleet_settled:ratio", "instant": true, "legendFormat": "settled", "range": false, "refId": "A"}],
+          "title": "Groups settled",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"max": 1, "min": 0, "noValue": "waiting for fleet", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.9}, {"color": "green", "value": 0.99}]}, "unit": "percentunit"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+          "id": 4,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatedc:fleet_nodes_on_target:ratio", "instant": true, "legendFormat": "on target", "range": false, "refId": "A"}],
+          "title": "Nodes on target",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"max": 1, "min": 0, "noValue": "waiting for reports", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 0.95}, {"color": "green", "value": 0.99}]}, "unit": "percentunit"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+          "id": 5,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatedc:reports_fresh:ratio", "instant": true, "legendFormat": "fresh", "range": false, "refId": "A"}],
+          "title": "Fresh node reports",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"max": 1, "min": 0, "noValue": "no data", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}, "unit": "percentunit"}, "overrides": []},
+          "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+          "id": 6,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+          "targets": [{"editorMode": "code", "expr": "updatedc:kubernetes_nodes_ready:ratio", "instant": true, "legendFormat": "ready", "range": false, "refId": "A"}],
+          "title": "Kubernetes nodes ready",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "unit": "percentunit"}, "overrides": []},
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "id": 7,
+          "options": {"legend": {"calcs": ["lastNotNull", "min"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"editorMode": "code", "expr": "updatedc:fleet_settled:ratio", "legendFormat": "groups settled", "range": true, "refId": "A"},
+            {"editorMode": "code", "expr": "updatedc:fleet_nodes_on_target:ratio", "legendFormat": "nodes on target", "range": true, "refId": "B"},
+            {"editorMode": "code", "expr": "updatedc:reports_fresh:ratio", "legendFormat": "reports fresh", "range": true, "refId": "C"}
+          ],
+          "title": "Release reliability",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "unit": "s"}, "overrides": []},
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "id": 8,
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"editorMode": "code", "expr": "updatec_reconcile_duration_seconds", "legendFormat": "reconcile duration", "range": true, "refId": "A"},
+            {"editorMode": "code", "expr": "updatedc:reconcile_age_seconds", "legendFormat": "time since reconcile", "range": true, "refId": "B"}
+          ],
+          "title": "Controller convergence",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "unit": "percent"}, "overrides": []},
+          "gridPos": {"h": 8, "w": 8, "x": 0, "y": 12},
+          "id": 9,
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"editorMode": "code", "expr": "100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "{{instance}}", "range": true, "refId": "A"}],
+          "title": "Node CPU utilization",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "unit": "percent"}, "overrides": []},
+          "gridPos": {"h": 8, "w": 8, "x": 8, "y": 12},
+          "id": 10,
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"editorMode": "code", "expr": "rate(node_disk_io_time_seconds_total[5m]) * 100", "legendFormat": "{{instance}} {{device}}", "range": true, "refId": "A"}],
+          "title": "Disk I/O busy",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "unit": "pps"}, "overrides": []},
+          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 12},
+          "id": 11,
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"editorMode": "code", "expr": "sum by(instance) (rate(node_network_receive_drop_total[5m]) + rate(node_network_transmit_drop_total[5m]))", "legendFormat": "{{instance}}", "range": true, "refId": "A"}],
+          "title": "Network drops",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "unit": "short"}, "overrides": []},
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 20},
+          "id": 12,
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"editorMode": "code", "expr": "updatedc:reconcile_failures:1h", "legendFormat": "reconcile failures / hour", "range": true, "refId": "A"},
+            {"editorMode": "code", "expr": "sum(up == 0)", "legendFormat": "scrape targets down", "range": true, "refId": "B"},
+            {"editorMode": "code", "expr": "updatec_quarantined_groups", "legendFormat": "quarantined groups", "range": true, "refId": "C"}
+          ],
+          "title": "Failure indicators",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 20, "lineInterpolation": "stepAfter", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false}, "max": 1, "min": 0, "unit": "bool"}, "overrides": []},
+          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 20},
+          "id": 13,
+          "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"editorMode": "code", "expr": "updatec_group_progress", "legendFormat": "{{group}} / {{state}}", "range": true, "refId": "A"},
+            {"editorMode": "code", "expr": "updatedc:chaos_control_plane_up", "legendFormat": "chaos controller up", "range": true, "refId": "B"}
+          ],
+          "title": "Rollout and chaos state",
+          "type": "timeseries"
+        }
+      ],
+      "refresh": "15s",
+      "schemaVersion": 41,
+      "tags": ["updatedc", "chaos", "soak"],
+      "templating": {"list": []},
+      "time": {"from": "now-6h", "to": "now"},
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "updatec Chaos Reliability",
+      "uid": "updatedc-chaos-reliability",
+      "version": 1,
+      "weekStart": ""
+    }

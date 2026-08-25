@@ -2,3 +2,5 @@ target
 .git
 .agents
 .codex
+lab/chaos/deploy.env
+lab/chaos/infrastructure/.state

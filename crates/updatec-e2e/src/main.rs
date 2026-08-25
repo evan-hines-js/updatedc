@@ -14,11 +14,13 @@ mod alertsink;
 mod chaos;
 mod cluster;
 mod controls;
+mod fixture;
 mod fleet;
 mod haproxy;
 mod labeler;
 mod layout;
 mod probe;
+mod soak;
 pub(crate) use chaos::*;
 pub(crate) use cluster::*;
 pub(crate) use controls::*;
@@ -58,9 +60,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parse()?;
             probe::run(&url, interval).await
         }
+        // The single resident campaign controller for the permanent lab. It owns release
+        // assignment, fault injection, exact assertions, recovery, state, and metrics.
+        Some("soak") => soak::run().await,
+        Some("resources") => fixture::print_kind_resources(env::args().skip(2)),
         None => run_e2e().await,
         Some(command) => {
-            Err(format!("unknown command {command:?}; use `agent-name <hostname>`, `alert-sink`, `load-probe <url> <interval_ms>`, or no argument to run the e2e").into())
+            Err(format!("unknown command {command:?}; use `agent-name <hostname>`, `alert-sink`, `load-probe <url> <interval_ms>`, `resources ...`, `soak`, or no argument to run the e2e").into())
         }
     }
 }

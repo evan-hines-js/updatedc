@@ -1,0 +1,250 @@
+---
+- name: Prepare immutable k3s nodes
+  hosts: chaos_cluster
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for the checksum-pinned guest to accept SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Refuse a guest without preinstalled Python
+      ansible.builtin.raw: test -x /usr/bin/python3
+      changed_when: false
+
+    - name: Gather guest facts
+      ansible.builtin.setup:
+
+  tasks:
+    - name: Require the reviewed Ubuntu guest
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == "Ubuntu"
+          - ansible_facts['distribution_version'] is version('24.04', '>=')
+        fail_msg: "The chaos lab only supports its checksum-pinned Ubuntu 24.04 guest."
+
+    - name: Install the controller-supplied k3s artifact
+      ansible.builtin.copy:
+        src: "{{ updatedc_chaos_k3s_binary }}"
+        dest: /usr/local/bin/k3s
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Measure the installed k3s artifact
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+        checksum_algorithm: sha256
+      register: installed_k3s
+
+    - name: Require the exact k3s bytes
+      ansible.builtin.assert:
+        that: installed_k3s.stat.checksum == updatedc_chaos_k3s_sha256
+        fail_msg: "Installed k3s bytes do not match the reviewed artifact."
+
+    - name: Disable swap without mutating package state
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: Create k3s configuration directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: /etc/rancher/k3s, mode: "0700"}
+        - {path: /var/lib/rancher/k3s, mode: "0700"}
+
+- name: Start the single k3s control plane
+  hosts: k3s_server
+  become: true
+  gather_facts: false
+  handlers:
+    - name: Restart k3s server
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: restarted
+        daemon_reload: true
+  tasks:
+    - name: Install the explicit k3s server unit
+      ansible.builtin.template:
+        src: templates/k3s-server.service.j2
+        dest: /etc/systemd/system/k3s.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart k3s server
+
+    - name: Enable and start k3s server
+      ansible.builtin.systemd_service:
+        name: k3s
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Apply pending server restart before joining agents
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for the k3s API
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 6443
+        timeout: 180
+
+    - name: Read the one k3s join token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: raw_k3s_token
+      no_log: true
+
+    - name: Hold the join token only in Ansible memory
+      ansible.builtin.set_fact:
+        updatedc_chaos_k3s_token: "{{ raw_k3s_token.content | b64decode | trim }}"
+      no_log: true
+
+- name: Join the three dedicated workers
+  hosts: k3s_agents
+  become: true
+  gather_facts: false
+  vars:
+    server_name: "{{ groups['k3s_server'][0] }}"
+  handlers:
+    - name: Restart k3s agent
+      ansible.builtin.systemd_service:
+        name: k3s-agent
+        state: restarted
+        daemon_reload: true
+  tasks:
+    - name: Install the private agent join binding
+      ansible.builtin.copy:
+        dest: /etc/default/k3s-agent
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          K3S_URL=https://{{ hostvars[server_name].ansible_host }}:6443
+          K3S_TOKEN={{ hostvars[server_name].updatedc_chaos_k3s_token }}
+      notify: Restart k3s agent
+      no_log: true
+
+    - name: Install the explicit k3s agent unit
+      ansible.builtin.template:
+        src: templates/k3s-agent.service.j2
+        dest: /etc/systemd/system/k3s-agent.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart k3s agent
+
+    - name: Enable and start k3s agent
+      ansible.builtin.systemd_service:
+        name: k3s-agent
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Apply pending agent restart before readiness
+      ansible.builtin.meta: flush_handlers
+
+- name: Prove the complete cluster and export its kubeconfig
+  hosts: k3s_server
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for every declared node
+      ansible.builtin.command: >-
+        /usr/local/bin/k3s kubectl wait --for=condition=Ready node --all --timeout=240s
+      changed_when: false
+
+    - name: Read the node inventory
+      ansible.builtin.command: /usr/local/bin/k3s kubectl get nodes -o name
+      register: cluster_nodes
+      changed_when: false
+
+    - name: Require exactly the four Terraform-owned nodes
+      ansible.builtin.assert:
+        that:
+          - cluster_nodes.stdout_lines | length == 4
+          - cluster_nodes.stdout_lines | sort == ['node/updatedc-chaos-agent-a', 'node/updatedc-chaos-agent-b', 'node/updatedc-chaos-control', 'node/updatedc-chaos-storage']
+
+    - name: Read the generated kubeconfig
+      ansible.builtin.slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: raw_kubeconfig
+      no_log: true
+
+    - name: Write the host-bound kubeconfig on the operator
+      ansible.builtin.copy:
+        dest: "{{ updatedc_chaos_state_dir }}/kubeconfig.yaml"
+        content: >-
+          {{ raw_kubeconfig.content | b64decode |
+             replace('https://127.0.0.1:6443', 'https://' ~ ansible_host ~ ':6443') }}
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+- name: Import the exact source-built images on every k3s node
+  hosts: chaos_cluster
+  become: true
+  gather_facts: false
+  vars:
+    updatedc_chaos_images:
+      - name: control
+        source: "{{ updatedc_chaos_control_image_archive }}"
+        checksum: "{{ updatedc_chaos_control_image_sha256 }}"
+      - name: e2e
+        source: "{{ updatedc_chaos_e2e_image_archive }}"
+        checksum: "{{ updatedc_chaos_e2e_image_sha256 }}"
+  tasks:
+    - name: Create the private image and import-state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      loop:
+        - /var/lib/updatedc/images
+        - /var/lib/updatedc/imported
+
+    - name: Copy the checksum-addressed image archives
+      ansible.builtin.copy:
+        src: "{{ item.source }}"
+        dest: "/var/lib/updatedc/images/{{ item.name }}-{{ item.checksum }}.tar"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ updatedc_chaos_images }}"
+
+    - name: Measure the copied image archives
+      ansible.builtin.stat:
+        path: "/var/lib/updatedc/images/{{ item.name }}-{{ item.checksum }}.tar"
+        checksum_algorithm: sha256
+      loop: "{{ updatedc_chaos_images }}"
+      register: copied_images
+
+    - name: Require exact image archive bytes
+      ansible.builtin.assert:
+        that: item.stat.checksum == item.item.checksum
+        fail_msg: "Copied image archive bytes do not match the controller artifact."
+      loop: "{{ copied_images.results }}"
+
+    - name: Import each source image exactly once
+      ansible.builtin.command:
+        cmd: >-
+          /usr/local/bin/k3s ctr images import
+          /var/lib/updatedc/images/{{ item.name }}-{{ item.checksum }}.tar
+        creates: "/var/lib/updatedc/imported/{{ item.checksum }}"
+      loop: "{{ updatedc_chaos_images }}"
+
+    - name: Record successful image imports
+      ansible.builtin.copy:
+        dest: "/var/lib/updatedc/imported/{{ item.checksum }}"
+        content: "{{ item.checksum }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ updatedc_chaos_images }}"

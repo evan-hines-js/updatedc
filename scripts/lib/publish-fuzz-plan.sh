@@ -24,6 +24,15 @@ publish_fuzz_artifact() {
   fi
 }
 
+# The fixed corrupt corpus is one shared declaration. Publishers, resident campaigns, and
+# assertions consume this function instead of carrying their own lists that can drift.
+publish_fuzz_is_corrupt() {
+  case ${1:?missing release version} in
+    18.0.0|21.0.0) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Canonical expected observation emitted by every harness and verifier.
 publish_fuzz_expectation() {
   version=$1

@@ -1,0 +1,138 @@
+alertmanager:
+  enabled: false
+
+defaultRules:
+  create: false
+
+# k3s embeds these control-plane components instead of exposing the endpoints
+# assumed by kube-prometheus-stack's stock monitors.
+kubeControllerManager:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeScheduler:
+  enabled: false
+
+grafana:
+  enabled: true
+  defaultDashboardsEnabled: false
+  admin:
+    existingSecret: updatedc-grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  nodeSelector:
+    updated.dev/chaos-role: control
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    accessModes:
+      - ReadWriteOnce
+    size: 5Gi
+  service:
+    type: NodePort
+    nodePort: 30300
+    externalTrafficPolicy: Local
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: monitoring
+      provider:
+        allowUiUpdates: false
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+      isDefaultDatasource: true
+      name: Prometheus
+      uid: prometheus
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+prometheusOperator:
+  nodeSelector:
+    updated.dev/chaos-role: control
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+kube-state-metrics:
+  nodeSelector:
+    updated.dev/chaos-role: control
+
+prometheus:
+  prometheusSpec:
+    nodeSelector:
+      updated.dev/chaos-role: storage
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    retention: 30d
+    retentionSize: 15GB
+    walCompression: true
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        memory: 3Gi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 20Gi
+    ruleSelectorNilUsesHelmValues: false
+    ruleSelector: {}
+    ruleNamespaceSelector: {}
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelector: {}
+    serviceMonitorNamespaceSelector: {}
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelector: {}
+    podMonitorNamespaceSelector: {}
+    additionalScrapeConfigs:
+      - job_name: updatec-soak
+        static_configs:
+          - targets:
+              - updatec-soak-metrics.updated-system.svc.cluster.local:9091
+      - job_name: updatec-controller
+        static_configs:
+          - targets:
+              - updatec-controller-metrics.updated-system.svc.cluster.local:9090
+      - job_name: updated-healthproxy
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - action: keep
+            source_labels:
+              - __meta_kubernetes_pod_label_app_kubernetes_io_component
+            regex: healthproxy
+          - action: keep
+            source_labels:
+              - __meta_kubernetes_pod_phase
+            regex: Running
+          - action: replace
+            source_labels:
+              - __meta_kubernetes_pod_ip
+            target_label: __address__
+            replacement: $1:9090
+          - action: replace
+            source_labels:
+              - __meta_kubernetes_pod_name
+            target_label: pod
+      - job_name: chaos-mesh-controller
+        static_configs:
+          - targets:
+              - chaos-mesh-controller-manager.chaos-mesh.svc.cluster.local:10080

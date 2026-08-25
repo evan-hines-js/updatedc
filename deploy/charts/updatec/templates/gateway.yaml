@@ -27,6 +27,9 @@ spec:
         app: {{ include "updatec.gatewayName" . }}
         {{- include "updatec.labels" . | nindent 8 }}
         app.kubernetes.io/component: gateway
+        {{- with .Values.gateway.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.gateway.podAnnotations }}
       annotations: {{- toYaml . | nindent 8 }}
       {{- end }}

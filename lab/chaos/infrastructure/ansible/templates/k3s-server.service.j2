@@ -1,0 +1,25 @@
+[Unit]
+Description=updatec chaos-lab k3s server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+Restart=always
+RestartSec=5s
+ExecStart=/usr/local/bin/k3s server \
+  --node-name {{ inventory_hostname }} \
+  --write-kubeconfig-mode 0600 \
+  --disable traefik \
+  --disable servicelb \
+  --secrets-encryption \
+  --cluster-cidr 10.62.0.0/16 \
+  --service-cidr 10.63.0.0/16 \
+  --tls-san {{ ansible_host }} \
+  --node-label updated.dev/chaos-role={{ chaos_role }}
+
+[Install]
+WantedBy=multi-user.target

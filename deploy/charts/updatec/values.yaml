@@ -65,6 +65,7 @@ controller:
   # render a combination that would deadlock.
   replicaCount: 1
   podAnnotations: {}
+  podLabels: {}
   # Spread replicas across failure domains. Only meaningful with replicaCount > 1.
   topologySpreadConstraints: []
   # Only rendered when replicaCount > 1 — a PDB over a single replica blocks node drains forever.
@@ -135,6 +136,7 @@ gateway:
   # Valid range: 1..64.
   fleetReportMaxShards: 4
   podAnnotations: {}
+  podLabels: {}
   resources:
     requests: {cpu: 25m, memory: 32Mi}
     limits: {cpu: "1", memory: 256Mi}

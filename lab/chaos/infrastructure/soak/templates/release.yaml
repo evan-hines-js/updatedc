@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: release-repository
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  storageClassName: local-path
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: {{ .Values.release.persistence }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: release-server
+  labels:
+    {{- include "soak.labels" . | nindent 4 }}
+    app.kubernetes.io/name: release-server
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: release-server}
+  template:
+    metadata:
+      labels:
+        {{- include "soak.labels" . | nindent 8 }}
+        app.kubernetes.io/name: release-server
+        updated.dev/chaos-target: "true"
+    spec:
+      nodeSelector: {updated.dev/chaos-role: storage}
+      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: release-server
+          image: {{ include "soak.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/usr/local/bin/release-server]
+          ports: [{name: https, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: https}, periodSeconds: 5, failureThreshold: 60}
+          livenessProbe: {tcpSocket: {port: https}, periodSeconds: 15, failureThreshold: 6}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - {name: repository, mountPath: /data}
+            - {name: gateway-tls, mountPath: /etc/gateway-tls, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: repository, persistentVolumeClaim: {claimName: release-repository}}
+        - {name: gateway-tls, secret: {secretName: gateway-tls}}
+        - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-server
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  selector: {app.kubernetes.io/name: release-server}
+  ports: [{name: https, port: 443, targetPort: https}]
+{{- range $name := list "default" "soak-a" "soak-b" "soak-c" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-{{ $name }}
+  labels: {{- include "soak.labels" $ | nindent 4 }}
+spec:
+  selector: {app.kubernetes.io/name: release-server}
+  ports: [{name: https, port: 443, targetPort: https}]
+{{- end }}

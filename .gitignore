@@ -12,3 +12,12 @@ keys/
 mutants.out*/
 # Added by code-review-graph
 .code-review-graph/
+
+# The Proxmox chaos lab keeps credentials, Terraform state, generated
+# inventories, kubeconfigs, plans, and downloaded artifacts outside Git.
+/lab/chaos/deploy.env
+/lab/chaos/infrastructure/.state/
+/lab/chaos/infrastructure/terraform/.terraform/
+/lab/chaos/infrastructure/terraform/*.tfstate*
+/lab/chaos/infrastructure/terraform/*.tfvars
+/lab/chaos/infrastructure/terraform/.terraform.tfstate.lock.info

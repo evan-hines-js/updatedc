@@ -1,0 +1,24 @@
+image:
+  repository: updatec-chaos-e2e
+  tag: local
+  pullPolicy: Never
+
+minio:
+  image: quay.io/minio/minio@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb
+  clientImage: quay.io/minio/mc@sha256:2582c2f48b1e31545143ba5285c67d7b38c8b8f6912142d0630686dc7aaac28b
+  persistence: 10Gi
+
+release:
+  persistence: 6Gi
+
+campaign:
+  seed: "2026082500"
+  intervalSeconds: 90
+  faultSeconds: 20
+  convergenceSeconds: 300
+  statePersistence: 2Gi
+
+agents:
+  enabled: true
+  replicas: 6
+  statePersistence: 2Gi

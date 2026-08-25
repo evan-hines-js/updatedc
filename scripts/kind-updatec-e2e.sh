@@ -476,7 +476,7 @@ kubectl -n updated-system create secret generic tuf-signing-keys \
   --from-file="$WORK/keys/timestamp.pk8"
 kubectl -n updated-system create secret generic s3-credentials --from-literal=AWS_ACCESS_KEY_ID=minio --from-literal=AWS_SECRET_ACCESS_KEY=minio123
 
-cargo run -q -p updatec --example kind_resources -- \
+cargo run -q -p updatec-e2e -- resources \
   "$PLATFORM" "$APP_V1_SHA" "$APP_V2_SHA" "$APP_V3_SHA" "$PROVIDER_SHA" \
   "$WORK/release-root.json" >"$WORK/resources.yaml"
 kubectl apply -f "$WORK/resources.yaml"
@@ -1763,7 +1763,7 @@ spec:
 YAML
 await_job routing-digest-before-overlap "$ONESHOT_JOB_SECONDS"
 before="$(kubectl -n updated-system logs job/routing-digest-before-overlap)"
-cargo run -q -p updatec --example kind_resources -- \
+cargo run -q -p updatec-e2e -- resources \
   "$PLATFORM" "$APP_V1_SHA" "$APP_V2_SHA" "$APP_V3_SHA" "$PROVIDER_SHA" \
   "$WORK/release-root.json" overlap | kubectl apply -f -
 sleep 8

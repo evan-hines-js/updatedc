@@ -1,0 +1,19 @@
+[Unit]
+Description=updatec chaos-lab k3s agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/default/k3s-agent
+KillMode=process
+Delegate=yes
+LimitNOFILE=1048576
+Restart=always
+RestartSec=5s
+ExecStart=/usr/local/bin/k3s agent \
+  --node-name {{ inventory_hostname }} \
+  --node-label updated.dev/chaos-role={{ chaos_role }}
+
+[Install]
+WantedBy=multi-user.target

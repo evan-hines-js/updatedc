@@ -347,31 +347,6 @@ mod tests {
         assert_eq!(seen.into_iter().collect::<Vec<_>>(), band);
     }
 
-    /// The one repository spec this e2e's cluster applies. The healthproxy reads the reports
-    /// the gateway writes *into that repository's object-store location*, so this test is against
-    /// the spec source rather than a copy of its literals.
-    const REPOSITORY_SPEC: &str = include_str!("../../updatec/examples/kind_resources.rs");
-
-    fn spec_field(field: &str) -> String {
-        let block = REPOSITORY_SPEC
-            .split_once("s3: RepositoryStorage {")
-            .expect("repository spec declares managed repository storage")
-            .1;
-        let value = block
-            .split_once(&format!("{field}: "))
-            .unwrap_or_else(|| panic!("S3 destination declares {field}"))
-            .1;
-        let quoted = value
-            .split_once('"')
-            .expect("field value is a string literal")
-            .1;
-        quoted
-            .split_once('"')
-            .expect("field value is a string literal")
-            .0
-            .to_string()
-    }
-
     #[test]
     fn health_cdn_addresses_the_prefix_the_gateway_flushes_the_fleet_index_under() {
         // The controller publishes the fleet index to its canonical
@@ -380,8 +355,8 @@ mod tests {
         // `<health base>/telemetry/fleet.json`. If the base omits the prefix, the GET 404s every
         // cycle, no report is ever cached, and every node is programmed `ready: false` forever —
         // silently draining the entire external LB path.
-        let endpoint = spec_field("endpoint");
-        let bucket = spec_field("bucket");
+        let endpoint = crate::fixture::RELEASE_ENDPOINT;
+        let bucket = crate::fixture::RELEASE_BUCKET;
         let prefix = updatec::runtime::managed_repository_prefix("updated-system", "default");
         assert_eq!(HEALTH_CDN, format!("{endpoint}/{bucket}/{prefix}"));
 

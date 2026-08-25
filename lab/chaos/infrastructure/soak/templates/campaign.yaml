@@ -1,0 +1,201 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: updatec-soak
+  labels: {{- include "soak.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: updatec-soak
+  labels: {{- include "soak.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [tuf-signing-keys]
+    verbs: [get]
+  # Kubernetes cannot resourceName-bound CREATE. The fail-closed admission policy below supplies
+  # the object boundary for the sole signing Secret this identity may bootstrap.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [updated.dev]
+    resources: [updaterepositories, updategroups, updategroupsets]
+    verbs: [get, create, patch]
+  - apiGroups: [updated.dev]
+    resources: [updateagents]
+    verbs: [get, list, update]
+  - apiGroups: [chaos-mesh.org]
+    resources: [networkchaos, iochaos, podchaos]
+    verbs: [get, list, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: updatec-soak
+  labels: {{- include "soak.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: updatec-soak}
+subjects:
+  - {kind: ServiceAccount, name: updatec-soak, namespace: {{ .Release.Namespace }}}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-signing-secret
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [secrets]
+  matchConditions:
+    - name: this-campaign
+      expression: >-
+        request.namespace == {{ .Release.Namespace | quote }} &&
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:updatec-soak" .Release.Namespace | quote }}
+  validations:
+    - expression: >-
+        object.metadata.name == 'tuf-signing-keys' &&
+        object.type == 'Opaque' &&
+        object.data.size() == 5 &&
+        object.data.all(key, value,
+          key in ['root.pk8', 'root.next.pk8', 'targets.pk8', 'snapshot.pk8', 'timestamp.pk8'] &&
+          value.size() > 0)
+      message: the soak identity may create only the exact five-key TUF signing Secret
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-signing-secret
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  policyName: updatec-soak-{{ .Release.Namespace }}-signing-secret
+  validationActions: [Deny]
+---
+# The campaign assigns enrolled nodes to cohorts atomically. Its broad UPDATE verb is fenced here:
+# every identity, repository binding, operator control, and metadata field must remain byte-for-byte
+# unchanged, leaving spec.labels as the only writable field.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-agent-labels
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [updated.dev]
+        apiVersions: [v1alpha1]
+        operations: [UPDATE]
+        resources: [updateagents]
+  matchConditions:
+    - name: this-campaign
+      expression: >-
+        request.namespace == {{ .Release.Namespace | quote }} &&
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:updatec-soak" .Release.Namespace | quote }}
+  validations:
+    - expression: >-
+        object.spec.repositoryRef == oldObject.spec.repositoryRef &&
+        object.spec.identity == oldObject.spec.identity &&
+        object.spec.hold == oldObject.spec.hold &&
+        object.spec.cordon == oldObject.spec.cordon &&
+        has(object.spec.backendAddress) == has(oldObject.spec.backendAddress) &&
+        (!has(object.spec.backendAddress) || object.spec.backendAddress == oldObject.spec.backendAddress) &&
+        has(object.metadata.labels) == has(oldObject.metadata.labels) &&
+        (!has(object.metadata.labels) || object.metadata.labels == oldObject.metadata.labels) &&
+        has(object.metadata.annotations) == has(oldObject.metadata.annotations) &&
+        (!has(object.metadata.annotations) || object.metadata.annotations == oldObject.metadata.annotations) &&
+        has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) &&
+        (!has(object.metadata.finalizers) || object.metadata.finalizers == oldObject.metadata.finalizers) &&
+        has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences)
+      message: the soak identity may update only an agent's cohort labels
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-agent-labels
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  policyName: updatec-soak-{{ .Release.Namespace }}-agent-labels
+  validationActions: [Deny]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: updatec-soak-state
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  storageClassName: local-path
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: {{ .Values.campaign.statePersistence }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: updatec-soak
+  labels:
+    {{- include "soak.labels" . | nindent 4 }}
+    app.kubernetes.io/name: updatec-soak
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: updatec-soak}
+  template:
+    metadata:
+      labels:
+        {{- include "soak.labels" . | nindent 8 }}
+        app.kubernetes.io/name: updatec-soak
+    spec:
+      serviceAccountName: updatec-soak
+      nodeSelector: {updated.dev/chaos-role: storage}
+      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: campaign
+          image: {{ include "soak.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/usr/local/bin/updatec-e2e, soak]
+          ports: [{name: metrics, containerPort: 9091}]
+          env:
+            - {name: UPDATEC_SOAK_SEED, value: {{ .Values.campaign.seed | quote }}}
+            - {name: UPDATEC_SOAK_AGENT_COUNT, value: {{ .Values.agents.replicas | quote }}}
+            - {name: UPDATEC_SOAK_ROUND_INTERVAL_SECONDS, value: {{ .Values.campaign.intervalSeconds | quote }}}
+            - {name: UPDATEC_SOAK_FAULT_SECONDS, value: {{ .Values.campaign.faultSeconds | quote }}}
+            - {name: UPDATEC_SOAK_CONVERGENCE_SECONDS, value: {{ .Values.campaign.convergenceSeconds | quote }}}
+          startupProbe: {httpGet: {path: /healthz, port: metrics}, periodSeconds: 2, failureThreshold: 60}
+          readinessProbe: {httpGet: {path: /readyz, port: metrics}, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /healthz, port: metrics}, periodSeconds: 15}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+          volumeMounts:
+            - {name: release, mountPath: /release-data}
+            - {name: state, mountPath: /state}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: release, persistentVolumeClaim: {claimName: release-repository}}
+        - {name: state, persistentVolumeClaim: {claimName: updatec-soak-state}}
+        - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 128Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: updatec-soak-metrics
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  selector: {app.kubernetes.io/name: updatec-soak}
+  ports: [{name: metrics, port: 9091, targetPort: metrics}]

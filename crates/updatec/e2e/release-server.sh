@@ -20,7 +20,7 @@ if [ ! -f /data/ready ]; then
     version="${major}.0.0"
     source="$fixtures/$version"
     mkdir -p "$source/bin" "$source/config"
-    if [ "$major" -eq 18 ] || [ "$major" -eq 21 ]; then
+    if publish_fuzz_is_corrupt "$version"; then
       # An unlaunchable entrypoint (not a valid executable): the agent must reject this
       # release at activation and roll back, rather than crash-loop it.
       printf 'intentionally corrupt bundle entrypoint\n' >"$source/bin/app"
@@ -185,6 +185,22 @@ RECONCILER
   printf '%s\n' "$platform" >/data/platform
   touch /data/ready
 fi
+# These indexes are derived from the one release-classification function on every start. This also
+# upgrades an existing persistent repository created before the resident campaign was installed.
+valid_tmp=/data/.valid-versions.tmp
+corrupt_tmp=/data/.corrupt-versions.tmp
+: >"$valid_tmp"
+: >"$corrupt_tmp"
+for major in $(seq 1 22); do
+  version="${major}.0.0"
+  if publish_fuzz_is_corrupt "$version"; then
+    printf '%s\n' "$version" >>"$corrupt_tmp"
+  else
+    printf '%s\n' "$version" >>"$valid_tmp"
+  fi
+done
+mv "$valid_tmp" /data/valid-versions
+mv "$corrupt_tmp" /data/corrupt-versions
 # Releases are the object plane: agents fetch them anonymously over HTTPS and never offer their
 # control-plane certificate. The real routing gateway is exercised separately and redirects its
 # authorized requests to signed MinIO URLs.

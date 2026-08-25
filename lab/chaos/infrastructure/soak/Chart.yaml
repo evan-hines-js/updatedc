@@ -1,0 +1,7 @@
+apiVersion: v2
+name: updatec-chaos-soak
+description: The permanent updatec release-fuzzing fleet and its real fault targets.
+type: application
+kubeVersion: ">=1.30.0-0"
+version: 0.1.0
+appVersion: "0.1.0"
