@@ -127,23 +127,39 @@ fi
 tofu -chdir="$terraform_dir" apply "$state_dir/chaos.tfplan"
 
 command -v docker >/dev/null || { echo 'docker is required to build the source under test' >&2; exit 69; }
-source_fingerprint=$(
+source_tree="$lab_root/../.."
+fingerprint_source() {
+  local executable source_file
   {
-    git -C "$lab_root/../.." rev-parse HEAD
-    git -C "$lab_root/../.." diff --no-ext-diff --binary HEAD --
     while IFS= read -r -d '' source_file; do
-      printf '%s\0' "$source_file"
-      openssl dgst -sha256 -r "$lab_root/../../$source_file"
-    done < <(git -C "$lab_root/../.." ls-files --others --exclude-standard -z)
+      [[ -e $source_tree/$source_file ]] || continue
+      [[ -f $source_tree/$source_file && ! -L $source_tree/$source_file && -r $source_tree/$source_file ]] || {
+        echo "Image input must be a readable regular non-symlink: $source_file" >&2
+        return 66
+      }
+      executable=0
+      [[ -x $source_tree/$source_file ]] && executable=1
+      printf '%s\0%s\0' "$source_file" "$executable"
+      openssl dgst -sha256 -r "$source_tree/$source_file" | awk '{print $1}'
+    done < <(git -C "$source_tree" ls-files --cached --others --exclude-standard -z -- "$@")
   } | openssl dgst -sha256 -r | awk '{print substr($1, 1, 20)}'
-)
-[[ $source_fingerprint =~ ^[0-9a-f]{20}$ ]] || { echo 'Could not fingerprint the source tree.' >&2; exit 70; }
-control_image="updatec-chaos-control:$source_fingerprint"
-e2e_image="updatec-chaos-e2e:$source_fingerprint"
+}
+common_image_inputs=(.dockerignore Cargo.toml Cargo.lock rust-toolchain.toml .cargo crates)
+control_fingerprint=$(fingerprint_source "${common_image_inputs[@]}")
+e2e_fingerprint=$(fingerprint_source \
+  "${common_image_inputs[@]}" \
+  scripts/lib/publish-fuzz-plan.sh \
+  scripts/haproxy)
+[[ $control_fingerprint =~ ^[0-9a-f]{20}$ && $e2e_fingerprint =~ ^[0-9a-f]{20}$ ]] || {
+  echo 'Could not fingerprint the image build inputs.' >&2
+  exit 70
+}
+control_image="updatec-chaos-control:$control_fingerprint"
+e2e_image="updatec-chaos-e2e:$e2e_fingerprint"
 artifact_dir="$state_dir/artifacts"
 mkdir -p "$artifact_dir"
-control_archive="$artifact_dir/updatec-chaos-control-$source_fingerprint.tar"
-e2e_archive="$artifact_dir/updatec-chaos-e2e-$source_fingerprint.tar"
+control_archive="$artifact_dir/updatec-chaos-control-$control_fingerprint.tar"
+e2e_archive="$artifact_dir/updatec-chaos-e2e-$e2e_fingerprint.tar"
 if [[ ! -f $control_archive ]]; then
   docker build --platform linux/amd64 --file "$lab_root/../../crates/updatec/Dockerfile" \
     --tag "$control_image" "$lab_root/../.."
@@ -246,18 +262,18 @@ kubectl -n updated-system create secret generic s3-credentials \
 # The campaign first publishes the release corpus and creates its typed control resources. Agents
 # are enabled only after the real chart is installed, avoiding a second bootstrap ordering path.
 helm upgrade --install updatec-soak "$here/soak" --namespace updated-system \
-  --set image.repository=updatec-chaos-e2e --set image.tag="$source_fingerprint" \
+  --set image.repository=updatec-chaos-e2e --set image.tag="$e2e_fingerprint" \
   --set agents.enabled=false --wait --timeout 15m
 helm upgrade --install updatec "$lab_root/../../deploy/charts/updatec" \
   --namespace updated-system \
   --values "$here/updatec-values.yaml" \
-  --set image.repository=updatec-chaos-control --set image.tag="$source_fingerprint" \
+  --set image.repository=updatec-chaos-control --set image.tag="$control_fingerprint" \
   --set healthproxy.image.repository=updatec-chaos-e2e \
-  --set healthproxy.image.tag="$source_fingerprint"
+  --set healthproxy.image.tag="$e2e_fingerprint"
 kubectl -n updated-system rollout status deployment/updatec-controller --timeout=600s
 kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=600s
 helm upgrade updatec-soak "$here/soak" --namespace updated-system \
-  --set image.repository=updatec-chaos-e2e --set image.tag="$source_fingerprint" \
+  --set image.repository=updatec-chaos-e2e --set image.tag="$e2e_fingerprint" \
   --set agents.enabled=true --wait --timeout 15m
 kubectl -n updated-system rollout status statefulset/agent --timeout=900s
 
