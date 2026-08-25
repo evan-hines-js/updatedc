@@ -1,0 +1,26 @@
+image:
+  pullPolicy: Never
+
+healthproxy:
+  image:
+    pullPolicy: Never
+
+publicUrl: https://updatec-gateway
+
+controller:
+  metrics:
+    enabled: true
+    service:
+      enabled: true
+  nodeSelector:
+    updated.dev/chaos-role: control
+  podLabels:
+    updated.dev/chaos-target: "true"
+
+gateway:
+  nodeSelector:
+    updated.dev/chaos-role: control
+  podLabels:
+    updated.dev/chaos-target: "true"
+  secretResourceNames:
+    - s3-credentials

@@ -250,19 +250,10 @@ helm upgrade --install updatec-soak "$here/soak" --namespace updated-system \
   --set agents.enabled=false --wait --timeout 15m
 helm upgrade --install updatec "$lab_root/../../deploy/charts/updatec" \
   --namespace updated-system \
+  --values "$here/updatec-values.yaml" \
   --set image.repository=updatec-chaos-control --set image.tag="$source_fingerprint" \
-  --set image.pullPolicy=Never \
   --set healthproxy.image.repository=updatec-chaos-e2e \
-  --set healthproxy.image.tag="$source_fingerprint" \
-  --set healthproxy.image.pullPolicy=Never \
-  --set publicUrl=https://updatec-gateway \
-  --set controller.metrics.enabled=true \
-  --set controller.metrics.service.enabled=true \
-  --set controller.nodeSelector.updated\.dev/chaos-role=control \
-  --set-string controller.podLabels.updated\.dev/chaos-target=true \
-  --set gateway.nodeSelector.updated\.dev/chaos-role=control \
-  --set-string gateway.podLabels.updated\.dev/chaos-target=true \
-  --set 'gateway.secretResourceNames={s3-credentials}'
+  --set healthproxy.image.tag="$source_fingerprint"
 kubectl -n updated-system rollout status deployment/updatec-controller --timeout=600s
 kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=600s
 helm upgrade updatec-soak "$here/soak" --namespace updated-system \
