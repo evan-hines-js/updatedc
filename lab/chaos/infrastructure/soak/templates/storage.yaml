@@ -1,3 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-tls-proxy
+  labels: {{- include "soak.labels" . | nindent 4 }}
+data:
+  haproxy.cfg: |
+    global
+      log stdout format raw local0
+    defaults
+      mode http
+      log global
+      option httplog
+      timeout connect 5s
+      timeout client 35s
+      timeout server 35s
+    frontend public
+      bind :8443 ssl crt /tls/tls.pem
+      default_backend minio
+    backend minio
+      server minio 127.0.0.1:9000 check
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -19,6 +41,24 @@ spec:
     spec:
       nodeSelector: {updated.dev/chaos-role: storage}
       securityContext: {fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      initContainers:
+        - name: assemble-tls-bundle
+          image: {{ include "soak.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/bin/sh, -ec]
+          args: [cat /input/tls.crt /input/tls.key > /output/tls.pem]
+          resources:
+            requests: {cpu: 5m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 32Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+          volumeMounts:
+            - {name: tls-source, mountPath: /input, readOnly: true}
+            - {name: tls-bundle, mountPath: /output}
       containers:
         - name: minio
           image: {{ .Values.minio.image | quote }}
@@ -39,6 +79,30 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
           volumeMounts: [{name: data, mountPath: /data}]
+        - name: tls-proxy
+          image: {{ include "soak.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/usr/sbin/haproxy]
+          args: [-W, -db, -f, /etc/haproxy/haproxy.cfg]
+          ports: [{name: tls, containerPort: 8443}]
+          readinessProbe: {tcpSocket: {port: tls}, periodSeconds: 5}
+          livenessProbe: {tcpSocket: {port: tls}, periodSeconds: 15}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+          volumeMounts:
+            - {name: proxy-config, mountPath: /etc/haproxy, readOnly: true}
+            - {name: tls-bundle, mountPath: /tls, readOnly: true}
+      volumes:
+        - {name: proxy-config, configMap: {name: minio-tls-proxy}}
+        - {name: tls-source, secret: {secretName: gateway-tls}}
+        - {name: tls-bundle, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
   volumeClaimTemplates:
     - metadata: {name: data}
       spec:
@@ -111,32 +175,13 @@ spec:
         - name: config
           emptyDir: {sizeLimit: 16Mi}
 ---
-# Agents follow signed redirects to this stable HTTPS name. The ExternalName enters k3s' Traefik,
-# which preserves the host, path, and SigV4 query while terminating the fleet-CA certificate.
+# Agents follow signed redirects to this stable HTTPS name. The MinIO pod terminates fleet-CA TLS
+# in one local proxy and preserves the host, path, and SigV4 query before forwarding to MinIO.
 apiVersion: v1
 kind: Service
 metadata:
   name: minio-direct
   labels: {{- include "soak.labels" . | nindent 4 }}
 spec:
-  type: ExternalName
-  externalName: traefik.kube-system.svc.cluster.local
-  ports: [{name: https, port: 443, targetPort: 443}]
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: minio-direct
-  labels: {{- include "soak.labels" . | nindent 4 }}
-spec:
-  ingressClassName: traefik
-  tls:
-    - hosts: [minio-direct.updated-system.svc]
-      secretName: gateway-tls
-  rules:
-    - host: minio-direct.updated-system.svc
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend: {service: {name: minio, port: {number: 9000}}}
+  selector: {app.kubernetes.io/name: minio}
+  ports: [{name: https, port: 443, targetPort: tls}]
