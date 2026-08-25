@@ -75,7 +75,10 @@ spec:
     spec:
       restartPolicy: OnFailure
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {seccompProfile: {type: RuntimeDefault}}
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
       containers:
         - name: initialize
           image: {{ .Values.minio.clientImage | quote }}
@@ -83,11 +86,11 @@ spec:
           command: [/bin/sh, -ec]
           args:
             - >-
-              until mc alias set local http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY";
+              until mc --config-dir /config alias set local http://minio:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY";
               do sleep 2; done;
-              mc mb --ignore-existing local/updates;
-              mc anonymous set download local/updates/releases;
-              mc anonymous set download local/updates/repositories/default/telemetry
+              mc --config-dir /config mb --ignore-existing local/updates;
+              mc --config-dir /config anonymous set download local/updates/releases;
+              mc --config-dir /config anonymous set download local/updates/repositories/default/telemetry
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_ACCESS_KEY_ID}}
@@ -96,12 +99,17 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {cpu: 200m, memory: 128Mi}
+          volumeMounts:
+            - {name: config, mountPath: /config}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
             readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 1000
+      volumes:
+        - name: config
+          emptyDir: {sizeLimit: 16Mi}
 ---
 # Agents follow signed redirects to this stable HTTPS name. The ExternalName enters k3s' Traefik,
 # which preserves the host, path, and SigV4 query while terminating the fleet-CA certificate.
