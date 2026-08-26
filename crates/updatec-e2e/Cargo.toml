@@ -19,10 +19,14 @@ serde_json.workspace = true
 tokio.workspace = true
 updated = { path = "../updated" }
 updated-contracts = { path = "../updated-contracts" }
+updated-tuf = { path = "../updated-tuf" }
 updatec = { path = "../updatec" }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [features]
-fips = ["updatec/fips", "updated/fips"]
+fips = ["updatec/fips", "updated/fips", "updated-tuf/fips"]

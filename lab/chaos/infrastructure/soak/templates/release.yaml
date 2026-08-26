@@ -28,7 +28,7 @@ spec:
         updated.dev/chaos-target: "true"
     spec:
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.agentUid" .)) | nindent 8 }}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.runtimeUid" .)) | nindent 8 }}
       containers:
         - name: release-server
           image: {{ include "soak.image" . }}
@@ -40,12 +40,7 @@ spec:
           resources:
             requests: {cpu: 100m, memory: 128Mi}
             limits: {cpu: "2", memory: 1Gi}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
+          securityContext: {{- include "soak.restrictedContainerSecurityContext" (dict "uid" (include "soak.runtimeUid" .)) | nindent 12 }}
           volumeMounts:
             - {name: repository, mountPath: /data}
             - {name: gateway-tls, mountPath: /etc/gateway-tls, readOnly: true}

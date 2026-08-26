@@ -24,8 +24,22 @@ rules:
     resources: [secrets]
     verbs: [create]
   - apiGroups: [updated.dev]
+    resources: [updaterepositories]
+    resourceNames: [default]
+    verbs: [get, patch]
+  - apiGroups: [updated.dev]
+    resources: [updategroups]
+    resourceNames: [soak-a, soak-b, soak-c]
+    verbs: [get, patch]
+  - apiGroups: [updated.dev]
+    resources: [updategroupsets]
+    resourceNames: [soak-fleet]
+    verbs: [get, patch]
+  # CREATE cannot be resourceName-bound because the object name is not part of the authorization
+  # URL. The fail-closed control-boundary policy below supplies the exact object and spec boundary.
+  - apiGroups: [updated.dev]
     resources: [updaterepositories, updategroups, updategroupsets]
-    verbs: [get, create, patch]
+    verbs: [create]
   - apiGroups: [updated.dev]
     resources: [updateagents]
     verbs: [get, list, update]
@@ -64,6 +78,11 @@ spec:
     - expression: >-
         object.metadata.name == 'tuf-signing-keys' &&
         object.type == 'Opaque' &&
+        has(object.metadata.labels) && object.metadata.labels.size() == 1 &&
+        object.metadata.labels['app.kubernetes.io/part-of'] == 'updatedc-chaos-lab' &&
+        (!has(object.metadata.annotations) || object.metadata.annotations.size() == 0) &&
+        (!has(object.metadata.finalizers) || object.metadata.finalizers.size() == 0) &&
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences.size() == 0) &&
         object.data.size() == 5 &&
         object.data.all(key, value,
           key in ['root.pk8', 'root.next.pk8', 'targets.pk8', 'snapshot.pk8', 'timestamp.pk8'] &&
@@ -115,7 +134,11 @@ spec:
         has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) &&
         (!has(object.metadata.finalizers) || object.metadata.finalizers == oldObject.metadata.finalizers) &&
         has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
-        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences)
+        (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences) &&
+        object.spec.labels.size() == 2 &&
+        object.spec.labels.all(key, value,
+          (key == 'soak.updated.dev/cohort' && value in ['soak-a', 'soak-b', 'soak-c']) ||
+          (key == 'soak.updated.dev/node' && value.matches('^agent-[0-9]+$')))
       message: the soak identity may update only an agent's cohort labels
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -125,6 +148,164 @@ metadata:
   labels: {{- include "soak.labels" . | nindent 4 }}
 spec:
   policyName: updatec-soak-{{ .Release.Namespace }}-agent-labels
+  validationActions: [Deny]
+---
+# The campaign owns exactly one repository, three groups, and one group set. Kubernetes cannot
+# resourceName-bound CREATE, so this is the authoritative boundary both when those objects first
+# appear and on every later apply. A compromised campaign can exercise release transitions, not
+# silently widen selectors, storage authority, rollout limits, or signing-key references.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-control-boundary
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [updated.dev]
+        apiVersions: [v1alpha1]
+        operations: [CREATE, UPDATE]
+        resources: [updaterepositories, updategroups, updategroupsets]
+  matchConditions:
+    - name: this-campaign
+      expression: >-
+        request.namespace == {{ .Release.Namespace | quote }} &&
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:updatec-soak" .Release.Namespace | quote }}
+  validations:
+    - expression: >-
+        (request.operation != 'CREATE' ||
+          ((!has(object.metadata.annotations) || object.metadata.annotations.size() == 0) &&
+           (!has(object.metadata.finalizers) || object.metadata.finalizers.size() == 0) &&
+           (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences.size() == 0))) &&
+        (request.operation == 'CREATE' ||
+          (object.metadata.name == oldObject.metadata.name &&
+           has(object.metadata.labels) == has(oldObject.metadata.labels) &&
+           (!has(object.metadata.labels) || object.metadata.labels == oldObject.metadata.labels) &&
+           has(object.metadata.annotations) == has(oldObject.metadata.annotations) &&
+           (!has(object.metadata.annotations) || object.metadata.annotations == oldObject.metadata.annotations) &&
+           has(object.metadata.finalizers) == has(oldObject.metadata.finalizers) &&
+           (!has(object.metadata.finalizers) || object.metadata.finalizers == oldObject.metadata.finalizers) &&
+           has(object.metadata.ownerReferences) == has(oldObject.metadata.ownerReferences) &&
+           (!has(object.metadata.ownerReferences) || object.metadata.ownerReferences == oldObject.metadata.ownerReferences))) &&
+        ((request.resource.resource == 'updaterepositories' &&
+          object.metadata.name == 'default' &&
+          (!has(object.metadata.labels) || object.metadata.labels.size() == 0) &&
+          object.spec.signingSecretRef.name == 'tuf-signing-keys' &&
+          object.spec.enrollment.labels.size() == 0 &&
+          object.spec.s3.bucket == 'updates' &&
+          object.spec.s3.region == 'us-east-1' &&
+          has(object.spec.s3.credentialsSecretRef) &&
+          object.spec.s3.credentialsSecretRef.name == 's3-credentials' &&
+          has(object.spec.s3.endpoint) && object.spec.s3.endpoint == 'http://minio:9000' &&
+          has(object.spec.s3.publicEndpoint) &&
+          object.spec.s3.publicEndpoint == 'https://minio-direct.updated-system.svc' &&
+          object.spec.assignmentPrefix == 'assignments' &&
+          object.spec.stateMaxShards == 8 &&
+          !has(object.spec.admissionPolicyRef)) ||
+         (request.resource.resource == 'updategroups' &&
+          object.metadata.name in ['soak-a', 'soak-b', 'soak-c'] &&
+          has(object.metadata.labels) && object.metadata.labels.size() == 1 &&
+          object.metadata.labels['soak.updated.dev/fleet'] == 'managed' &&
+          object.spec.repositoryRef.name == 'default' &&
+          object.spec.selector.matchLabels.size() == 1 &&
+          object.spec.selector.matchLabels['soak.updated.dev/cohort'] == object.metadata.name &&
+          object.spec.dependsOn.size() == 0 && object.spec.inputs.size() == 0 &&
+          has(object.spec.maxUnavailable) && object.spec.maxUnavailable == 1 &&
+          object.spec.emergencyCorrection == false) ||
+         (request.resource.resource == 'updategroupsets' &&
+          object.metadata.name == 'soak-fleet' &&
+          (!has(object.metadata.labels) || object.metadata.labels.size() == 0) &&
+          object.spec.repositoryRef.name == 'default' &&
+          object.spec.selector.matchLabels.size() == 1 &&
+          object.spec.selector.matchLabels['soak.updated.dev/fleet'] == 'managed' &&
+          has(object.spec.maxConcurrent) && object.spec.maxConcurrent == 2 &&
+          object.spec.rolloutWindows.size() == 0 && object.spec.calendar.size() == 0 &&
+          has(object.spec.maxRegressions) && object.spec.maxRegressions == 1 &&
+          object.spec.onRegression == 'rollback' &&
+          has(object.spec.stuckAfterSeconds) && object.spec.stuckAfterSeconds == 300))
+      message: the soak identity may own only the canonical control resources and change only deployments
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-control-boundary
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  policyName: updatec-soak-{{ .Release.Namespace }}-control-boundary
+  validationActions: [Deny]
+---
+# Chaos Mesh faults can reach beyond the namespace that contains their custom resource. Fence the
+# campaign identity to its one labeled, round-scoped object grammar and the exact selectors and
+# effects its Rust fault factory emits. DELETE is checked against oldObject so the broad dynamic
+# RBAC verb cannot remove another operator's experiment.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-chaos-boundary
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [chaos-mesh.org]
+        apiVersions: [v1alpha1]
+        operations: [CREATE, DELETE]
+        resources: [networkchaos, iochaos, podchaos]
+  matchConditions:
+    - name: this-campaign
+      expression: >-
+        request.namespace == {{ .Release.Namespace | quote }} &&
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:updatec-soak" .Release.Namespace | quote }}
+  variables:
+    - name: candidate
+      expression: >-
+        request.operation == 'DELETE' ? oldObject : object
+  validations:
+    - expression: >-
+        variables.candidate.metadata.name.matches('^soak-round-[1-9][0-9]*$') &&
+        has(variables.candidate.metadata.labels) &&
+        variables.candidate.metadata.labels['soak.updated.dev/campaign'] == 'managed' &&
+        (request.operation != 'CREATE' ||
+          (variables.candidate.metadata.labels.size() == 1 &&
+           (!has(variables.candidate.metadata.annotations) || variables.candidate.metadata.annotations.size() == 0) &&
+           (!has(variables.candidate.metadata.finalizers) || variables.candidate.metadata.finalizers.size() == 0) &&
+           (!has(variables.candidate.metadata.ownerReferences) || variables.candidate.metadata.ownerReferences.size() == 0))) &&
+        variables.candidate.spec.mode == 'all' &&
+        variables.candidate.spec.selector.namespaces == [{{ .Release.Namespace | quote }}] &&
+        variables.candidate.spec.selector.pods.size() == 1 &&
+        variables.candidate.spec.selector.pods[{{ .Release.Namespace | quote }}].size() == 1 &&
+        !has(variables.candidate.spec.duration) && !has(variables.candidate.spec.value) &&
+        ((request.resource.resource == 'networkchaos' &&
+          variables.candidate.spec.action == 'partition' &&
+          variables.candidate.spec.direction == 'both' &&
+          variables.candidate.spec.selector.pods[{{ .Release.Namespace | quote }}][0].matches('^agent-[0-9]+$') &&
+          variables.candidate.spec.target.mode == 'all' &&
+          variables.candidate.spec.target.selector.namespaces == [{{ .Release.Namespace | quote }}] &&
+          variables.candidate.spec.target.selector.labelSelectors.size() == 1 &&
+          variables.candidate.spec.target.selector.labelSelectors['updated.dev/chaos-target'] == 'true' &&
+          !has(variables.candidate.spec.externalTargets) && !has(variables.candidate.spec.device)) ||
+         (request.resource.resource == 'iochaos' &&
+          variables.candidate.spec.action == 'fault' &&
+          variables.candidate.spec.selector.pods[{{ .Release.Namespace | quote }}][0].matches('^agent-[0-9]+$') &&
+          variables.candidate.spec.volumePath == '/var/lib/updated' &&
+          variables.candidate.spec.path == '/var/lib/updated/*' &&
+          variables.candidate.spec.errno == 5 && variables.candidate.spec.percent == 25 &&
+          variables.candidate.spec.containerNames == ['agent'] && !has(variables.candidate.spec.methods)) ||
+         (request.resource.resource == 'podchaos' &&
+          variables.candidate.spec.action == 'pod-kill' &&
+          variables.candidate.spec.selector.pods[{{ .Release.Namespace | quote }}][0].matches(
+            '^(agent-[0-9]+|updatec-controller-[a-z0-9]+(-[a-z0-9]+)*)$') &&
+          !has(variables.candidate.spec.gracePeriod)))
+      message: the soak identity may create and delete only canonical round-scoped faults
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: updatec-soak-{{ .Release.Namespace }}-chaos-boundary
+  labels: {{- include "soak.labels" . | nindent 4 }}
+spec:
+  policyName: updatec-soak-{{ .Release.Namespace }}-chaos-boundary
   validationActions: [Deny]
 ---
 apiVersion: v1
@@ -156,8 +337,11 @@ spec:
         app.kubernetes.io/name: updatec-soak
     spec:
       serviceAccountName: updatec-soak
+      # A signaled campaign finishes its joined fault lifecycle (at most one convergence window),
+      # persists the outcome, and verifies all of its labeled Chaos Mesh objects are gone.
+      terminationGracePeriodSeconds: 420
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.agentUid" .)) | nindent 8 }}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.runtimeUid" .)) | nindent 8 }}
       containers:
         - name: campaign
           image: {{ include "soak.image" . }}
@@ -170,18 +354,15 @@ spec:
             - {name: UPDATEC_SOAK_ROUND_INTERVAL_SECONDS, value: {{ .Values.campaign.intervalSeconds | quote }}}
             - {name: UPDATEC_SOAK_FAULT_SECONDS, value: {{ .Values.campaign.faultSeconds | quote }}}
             - {name: UPDATEC_SOAK_CONVERGENCE_SECONDS, value: {{ .Values.campaign.convergenceSeconds | quote }}}
-          startupProbe: {httpGet: {path: /healthz, port: metrics}, periodSeconds: 2, failureThreshold: 60}
+          # A replacement may wait behind the terminating process's exclusive PVC state lock for
+          # the full graceful-fault budget. Do not restart that safe waiter before the owner exits.
+          startupProbe: {httpGet: {path: /healthz, port: metrics}, periodSeconds: 2, failureThreshold: 240}
           readinessProbe: {httpGet: {path: /readyz, port: metrics}, periodSeconds: 5}
           livenessProbe: {httpGet: {path: /healthz, port: metrics}, periodSeconds: 15}
           resources:
             requests: {cpu: 100m, memory: 128Mi}
             limits: {cpu: "2", memory: 1Gi}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
+          securityContext: {{- include "soak.restrictedContainerSecurityContext" (dict "uid" (include "soak.runtimeUid" .)) | nindent 12 }}
           volumeMounts:
             - {name: release, mountPath: /release-data}
             - {name: state, mountPath: /state}

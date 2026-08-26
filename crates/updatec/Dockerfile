@@ -8,7 +8,8 @@ FROM registry.access.redhat.com/ubi9/ubi@sha256:5426a8f45e80a07168a30ea24d84f266
 # `aws-lc-sys` builds its C sources with cmake, and `zstd-sys` and `ring` need a C compiler; perl is
 # used by the crypto build's generators. UBI carries no toolchain by default, unlike the upstream
 # `rust:` images this replaced.
-RUN dnf install -y --setopt=install_weak_deps=False gcc cmake make perl && dnf clean all
+COPY --chmod=0755 scripts/install-ubi-build-dependencies.sh /usr/local/bin/install-ubi-build-dependencies
+RUN /usr/local/bin/install-ubi-build-dependencies
 
 # The Rust version is NOT named here. `rustup` reads `rust-toolchain.toml` from the workspace and
 # installs exactly the channel it pins, so this image tracks the repository's one toolchain

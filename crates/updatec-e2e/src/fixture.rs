@@ -22,12 +22,21 @@ pub(crate) const RELEASE_PREFIX: &str = "releases";
 pub(crate) const RELEASE_REGION: &str = "us-east-1";
 pub(crate) const SIGNING_SECRET: &str = "tuf-signing-keys";
 pub(crate) const STORAGE_SECRET: &str = "s3-credentials";
+pub(crate) const ASSIGNMENT_PREFIX: &str = "assignments";
+pub(crate) const STATE_MAX_SHARDS: u8 = 8;
 pub(crate) const SOAK_FLEET_LABEL: &str = "soak.updated.dev/fleet";
 pub(crate) const SOAK_FLEET_VALUE: &str = "managed";
 pub(crate) const SOAK_COHORT_LABEL: &str = "soak.updated.dev/cohort";
 pub(crate) const SOAK_NODE_LABEL: &str = "soak.updated.dev/node";
+pub(crate) const SOAK_CHAOS_LABEL: &str = "soak.updated.dev/campaign";
+pub(crate) const SOAK_CHAOS_VALUE: &str = "managed";
+pub(crate) const SOAK_CHAOS_NAME_PREFIX: &str = "soak-round-";
 pub(crate) const SOAK_GROUPS: [&str; 3] = ["soak-a", "soak-b", "soak-c"];
 pub(crate) const SOAK_GROUP_SET: &str = "soak-fleet";
+pub(crate) const SOAK_MAX_UNAVAILABLE: usize = 1;
+pub(crate) const SOAK_MAX_CONCURRENT: u32 = 2;
+pub(crate) const SOAK_MAX_REGRESSIONS: u32 = 1;
+pub(crate) const SOAK_STUCK_AFTER_SECONDS: u64 = 300;
 
 pub(crate) fn runtime() -> RuntimeSpec {
     RuntimeSpec {
@@ -135,8 +144,8 @@ pub(crate) fn repository(default_deployment: DeploymentSpec) -> UpdateRepository
                 endpoint: Some(RELEASE_ENDPOINT.into()),
                 public_endpoint: Some(RELEASE_PUBLIC_ENDPOINT.into()),
             },
-            assignment_prefix: "assignments".into(),
-            state_max_shards: 8,
+            assignment_prefix: ASSIGNMENT_PREFIX.into(),
+            state_max_shards: STATE_MAX_SHARDS,
             admission_policy_ref: None,
         },
     );
@@ -157,7 +166,7 @@ pub(crate) fn group(name: &str, deployment: DeploymentSpec) -> UpdateGroup {
             depends_on: vec![],
             inputs: BTreeMap::new(),
             deployment,
-            max_unavailable: Some(1),
+            max_unavailable: Some(SOAK_MAX_UNAVAILABLE),
             emergency_correction: false,
         },
     );
@@ -179,12 +188,12 @@ pub(crate) fn group_set() -> UpdateGroupSet {
             selector: LabelSelector {
                 match_labels: BTreeMap::from([(SOAK_FLEET_LABEL.into(), SOAK_FLEET_VALUE.into())]),
             },
-            max_concurrent: Some(2),
+            max_concurrent: Some(SOAK_MAX_CONCURRENT),
             rollout_windows: vec![],
             calendar: vec![],
-            max_regressions: Some(1),
+            max_regressions: Some(SOAK_MAX_REGRESSIONS),
             on_regression: RegressionResponse::Rollback,
-            stuck_after_seconds: Some(300),
+            stuck_after_seconds: Some(SOAK_STUCK_AFTER_SECONDS),
         },
     );
     set.metadata.namespace = Some(NAMESPACE.into());

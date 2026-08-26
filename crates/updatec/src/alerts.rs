@@ -10,13 +10,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::ResourceCondition;
+use crate::{status_contract, ResourceCondition};
 
 const ROLLOUT_STUCK: &str = "RolloutStuck";
 const REPORTS_STALE: &str = "ReportsStale";
 /// Named beyond this module because the repository writer looks its previous entry up by name to
 /// carry the transition (the default cohort's halt has no set or group status to ride on).
-pub const DEPLOYMENT_HALTED: &str = "DeploymentHalted";
+pub const DEPLOYMENT_HALTED: &str = status_contract::DEPLOYMENT_HALTED_CONDITION;
 pub const RECONCILE_FAILING: &str = "ReconcileFailing";
 
 /// A webhook credential is a token, not an artifact. Bounding the opened handle makes a mistaken
@@ -191,7 +191,7 @@ pub fn deployment_halted(
     let active = !halted.is_empty();
     let (reason, message) = if active {
         (
-            "RegressionEvidence",
+            status_contract::REGRESSION_EVIDENCE_REASON,
             halted
                 .iter()
                 .map(|halt| {

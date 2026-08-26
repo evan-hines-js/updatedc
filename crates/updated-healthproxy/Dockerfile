@@ -4,7 +4,8 @@
 FROM registry.access.redhat.com/ubi9/ubi@sha256:5426a8f45e80a07168a30ea24d84f266094b3756624a5508cc53927e6ee39e09 AS build
 
 # `aws-lc-sys` builds its C sources with cmake; `zstd-sys` and `ring` need a C compiler.
-RUN dnf install -y --setopt=install_weak_deps=False gcc cmake make perl && dnf clean all
+COPY --chmod=0755 scripts/install-ubi-build-dependencies.sh /usr/local/bin/install-ubi-build-dependencies
+RUN /usr/local/bin/install-ubi-build-dependencies
 
 # The toolchain comes from the workspace's `rust-toolchain.toml`, never from a version named here.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH

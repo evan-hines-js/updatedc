@@ -220,12 +220,3 @@ certManager:
     create: false
     secretName: agent-tls
     commonName: updated-agent
-
-podSecurityContext:
-  seccompProfile: {type: RuntimeDefault}
-securityContext:
-  allowPrivilegeEscalation: false
-  capabilities: {drop: [ALL]}
-  readOnlyRootFilesystem: true
-  runAsNonRoot: true
-  runAsUser: 65532

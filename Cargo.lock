@@ -3466,6 +3466,7 @@ dependencies = [
  "demo-lifecycle",
  "k8s-openapi",
  "kube",
+ "libc",
  "reqwest",
  "semver",
  "serde",
@@ -3475,6 +3476,7 @@ dependencies = [
  "updatec",
  "updated",
  "updated-contracts",
+ "updated-tuf",
 ]
 
 [[package]]

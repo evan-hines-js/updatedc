@@ -3,6 +3,11 @@
 
 use super::*;
 
+// The healthproxy image, its pod-level credential group, and its container identity are one
+// invariant. Keep the numeric ownership decision here once; CI pins it to the image USER shared by
+// every first-party runtime image.
+const HEALTHPROXY_RUNTIME_UID: i64 = 65_532;
+
 /// Reconcile every backend belonging to this controller's repository. Each backend receives one
 /// workload identity and, for EndpointSlice targets, one Role pinned to its two family-specific
 /// slices. Resources are ordered so permission exists before startup and survives until shutdown.
@@ -886,12 +891,13 @@ pub(crate) async fn apply_backend_deployment(
                     termination_grace_period_seconds: Some(30),
                     security_context: Some(PodSecurityContext {
                         run_as_non_root: Some(true),
-                        run_as_user: Some(65532),
+                        run_as_user: Some(HEALTHPROXY_RUNTIME_UID),
+                        run_as_group: Some(HEALTHPROXY_RUNTIME_UID),
                         // The inventory projection is mounted 0440 (owner root, group readable),
                         // so the group is what the checker reads it through: without fsGroup the
                         // projected files stay root:root and the non-root process cannot open
                         // the very inventory it exists to serve — a crash loop on first boot.
-                        fs_group: Some(65532),
+                        fs_group: Some(HEALTHPROXY_RUNTIME_UID),
                         seccomp_profile: Some(SeccompProfile {
                             type_: "RuntimeDefault".into(),
                             localhost_profile: None,
@@ -914,7 +920,8 @@ pub(crate) async fn apply_backend_deployment(
                             allow_privilege_escalation: Some(false),
                             read_only_root_filesystem: Some(true),
                             run_as_non_root: Some(true),
-                            run_as_user: Some(65532),
+                            run_as_user: Some(HEALTHPROXY_RUNTIME_UID),
+                            run_as_group: Some(HEALTHPROXY_RUNTIME_UID),
                             capabilities: Some(Capabilities {
                                 add: None,
                                 drop: Some(vec!["ALL".into()]),

@@ -57,7 +57,7 @@ spec:
           command: [/bin/sh, -ec]
           args:
             - |
-              uid={{ include "soak.agentUid" . }}
+              uid={{ include "soak.runtimeUid" . }}
               install -d -o "$uid" -g "$uid" -m 0700 /var/lib/updated /var/lib/updated/launcher /prepared-tls
               chown -R "$uid:$uid" /var/lib/updated
               if [ -e /var/lib/updated/launcher/agent.key ]; then
@@ -91,13 +91,7 @@ spec:
           resources:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {cpu: "2", memory: 512Mi}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: {{ include "soak.agentUid" . }}
-            runAsGroup: {{ include "soak.agentUid" . }}
+          securityContext: {{- include "soak.restrictedContainerSecurityContext" (dict "uid" (include "soak.runtimeUid" .)) | nindent 12 }}
           volumeMounts:
             # toda moves /var/lib/updated to a sibling while installing its FUSE mount. The
             # writable parent is deliberately narrower than making the container root writable.

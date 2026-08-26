@@ -12,26 +12,33 @@ lab_root=$(cd "$here/.." && pwd)
 terraform_dir="$here/terraform"
 state_dir="$here/.state"
 plan_only=false
+reseed=false
 
 usage() {
   cat <<'EOF'
-Usage: lab/chaos/deploy.sh [--plan]
+Usage: lab/chaos/deploy.sh [--plan] [--reseed]
 
 Builds and qualifies the isolated Proxmox/k3s chaos environment.
 
-  --plan   verify inputs and write the exact Terraform plan without applying it
-  -h       show this help
+  --plan    verify inputs and write the exact Terraform plan without applying it
+  --reseed  destroy all product and campaign state before rebuilding the lab
+  -h        show this help
 EOF
 }
 
 while (( $# )); do
   case "$1" in
     --plan) plan_only=true ;;
+    --reseed) reseed=true ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 64 ;;
   esac
   shift
 done
+if $plan_only && $reseed; then
+  echo '--plan and --reseed are mutually exclusive.' >&2
+  exit 64
+fi
 
 if [[ -z ${UPDATEDC_CHAOS_CONFIG:-} && -r "$lab_root/deploy.env" ]]; then
   UPDATEDC_CHAOS_CONFIG="$lab_root/deploy.env"
@@ -187,6 +194,29 @@ ANSIBLE_CONFIG="$here/ansible/ansible.cfg" ansible-playbook \
   "$here/ansible/site.yml"
 
 export KUBECONFIG="$state_dir/kubeconfig.yaml"
+
+if $reseed; then
+  echo 'Reseeding the isolated product namespace...'
+  # Stop only the campaign first so it cannot recreate its repository. Keep both the controller
+  # and object storage alive until the controller has completed the one canonical repository
+  # finalization path. A timeout deliberately leaves the lab intact for diagnosis.
+  if helm status updatec-soak --namespace updated-system >/dev/null 2>&1; then
+    kubectl -n updated-system delete deployment updatec-soak --wait=true --timeout=8m
+  fi
+  if kubectl get namespace updated-system >/dev/null 2>&1 &&
+     kubectl -n updated-system get updaterepository default >/dev/null 2>&1; then
+    kubectl -n updated-system delete updaterepository default --wait=true --timeout=5m
+  fi
+  if helm status updatec-soak --namespace updated-system >/dev/null 2>&1; then
+    helm uninstall updatec-soak --namespace updated-system --wait --timeout 10m
+  fi
+  if helm status updatec --namespace updated-system >/dev/null 2>&1; then
+    helm uninstall updatec --namespace updated-system --wait --timeout 10m
+  fi
+  if kubectl get namespace updated-system >/dev/null 2>&1; then
+    kubectl delete namespace updated-system --wait=true --timeout=10m
+  fi
+fi
 
 soak_metrics() {
   kubectl get --raw \
@@ -379,16 +409,20 @@ while (( SECONDS < qualification_deadline )); do
   successful_campaigns=$(soak_metric "$current_metrics" updatec_soak_successful_campaigns_total 2>/dev/null || printf '0\n')
   faults=$(soak_fault_sum "$current_metrics" updatec_soak_faults_total 2>/dev/null || printf '0\n')
   active_faults=$(soak_fault_sum "$current_metrics" updatec_soak_fault_active 2>/dev/null || printf '1\n')
+  recovery_pending=$(soak_metric "$current_metrics" updatec_soak_recovery_pending 2>/dev/null || printf '1\n')
+  forward_recovery_pending=$(soak_metric "$current_metrics" updatec_soak_forward_recovery_pending 2>/dev/null || printf '1\n')
   campaign_healthy=$(soak_metric "$current_metrics" updatec_soak_campaign_healthy 2>/dev/null || printf '0\n')
   expected_nodes=$(soak_metric "$current_metrics" updatec_soak_fleet_expected_nodes 2>/dev/null || printf '0\n')
   converged_nodes=$(soak_metric "$current_metrics" updatec_soak_fleet_converged_nodes 2>/dev/null || printf '0\n')
-  for value in "$successful_campaigns" "$faults" "$active_faults" "$campaign_healthy" "$expected_nodes" "$converged_nodes"; do
+  for value in "$successful_campaigns" "$faults" "$active_faults" "$recovery_pending" "$forward_recovery_pending" "$campaign_healthy" "$expected_nodes" "$converged_nodes"; do
     [[ $value =~ ^[0-9]+$ ]] || { echo "Campaign published a non-integer qualification metric: $value" >&2; exit 65; }
   done
 
   if (( successful_campaigns > successful_campaigns_before &&
         faults > faults_before &&
         active_faults == 0 &&
+        recovery_pending == 0 &&
+        forward_recovery_pending == 0 &&
         campaign_healthy == 1 &&
         expected_nodes == configured_agents &&
         converged_nodes == expected_nodes )); then
@@ -398,7 +432,7 @@ while (( SECONDS < qualification_deadline )); do
   fi
 
   if (( qualification_attempt % 6 == 0 )); then
-    echo "Waiting for a new permanent campaign success (successes $successful_campaigns/$((successful_campaigns_before + 1)), faults $faults/$((faults_before + 1)), fleet $converged_nodes/$expected_nodes)..."
+    echo "Waiting for a new permanent campaign success (successes $successful_campaigns/$((successful_campaigns_before + 1)), faults $faults/$((faults_before + 1)), recovery_pending $recovery_pending/$forward_recovery_pending, fleet $converged_nodes/$expected_nodes)..."
   fi
   qualification_attempt=$((qualification_attempt + 1))
   sleep 5

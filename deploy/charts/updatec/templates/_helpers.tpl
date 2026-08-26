@@ -63,19 +63,31 @@ gateway everything above; bring-your-own ServiceAccounts must now be named expli
 {{- include "updatec.serviceAccountName" (dict "ctx" . "role" "gateway") -}}
 {{- end -}}
 
+{{/* The image-owned runtime identity. It is a security invariant, not a values-file knob. */}}
+{{- define "updatec.runtimeUid" -}}65532{{- end -}}
+
+{{/* The only restricted container context emitted for either updatec workload. */}}
+{{- define "updatec.containerSecurityContext" -}}
+allowPrivilegeEscalation: false
+capabilities: {drop: [ALL]}
+readOnlyRootFilesystem: true
+runAsNonRoot: true
+runAsUser: {{ include "updatec.runtimeUid" . }}
+runAsGroup: {{ include "updatec.runtimeUid" . }}
+{{- end -}}
+
 {{/*
 The one pod-level security context for every updatec workload. Kubernetes Secret projections are
 owned by root; both binaries deliberately run as the same non-root UID. Making that UID the pod's
 supplemental group lets credential volumes use 0440 instead of Kubernetes' world-readable 0644
 default. A recursive fsGroup rewrite on every mount would also widen durable owner-only signing
 keys from 0600 to 0660. `OnRootMismatch` prepares a new volume once, before any keys exist, and
-never rewrites its contents afterward. Both fields are derived here and removed from the free-form
-map, so a values override cannot weaken only one workload.
+never rewrites its contents afterward. The identity is derived here, so workloads cannot drift.
 */}}
 {{- define "updatec.podSecurityContext" -}}
-fsGroup: {{ required "securityContext.runAsUser is required so private Secret projections can be group-readable only" .Values.securityContext.runAsUser }}
+fsGroup: {{ include "updatec.runtimeUid" . }}
 fsGroupChangePolicy: OnRootMismatch
-{{- omit .Values.podSecurityContext "fsGroup" "fsGroupChangePolicy" | toYaml | nindent 0 }}
+seccompProfile: {type: RuntimeDefault}
 {{- end -}}
 
 {{/*

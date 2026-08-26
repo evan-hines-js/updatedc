@@ -16,6 +16,16 @@ use updated_contracts::enrollment::EnrollmentBundle;
 
 pub mod admission;
 pub mod alerts;
+
+/// Stable condition names and reasons shared by condition producers and exact consumers.
+/// Keeping the wire contract here prevents a controller wording refactor from silently disabling
+/// admission, monitoring, or campaign assertions that depend on a semantic verdict.
+pub mod status_contract {
+    pub const READY_CONDITION: &str = "Ready";
+    pub const DEPLOYMENT_HALTED_CONDITION: &str = "DeploymentHalted";
+    pub const REJECTED_REASON: &str = "Rejected";
+    pub const REGRESSION_EVIDENCE_REASON: &str = "RegressionEvidence";
+}
 pub mod crd;
 pub(crate) mod dataflow;
 pub(crate) mod domain;

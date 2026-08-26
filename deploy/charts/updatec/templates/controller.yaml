@@ -67,7 +67,7 @@ spec:
           image: {{ include "updatec.imageRef" (dict "ctx" . "image" .Values.image "label" "image") }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: [controller]
-          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          securityContext: {{- include "updatec.containerSecurityContext" . | nindent 12 }}
           resources: {{- toYaml .Values.controller.resources | nindent 12 }}
           {{- if .Values.controller.metrics.enabled }}
           ports:

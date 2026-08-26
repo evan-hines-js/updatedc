@@ -253,6 +253,31 @@ run_charts() {
   local digest_manifests="$WORK/digest.yaml"
   local default_manifests="$WORK/default.yaml"
   local soak_manifests="$WORK/soak.yaml"
+  local runtime_uid e2e_runtime_uid healthproxy_runtime_uid backend_runtime_uid
+
+  local dockerfile
+  for dockerfile in \
+    crates/updatec/Dockerfile \
+    crates/updatec/Dockerfile.e2e \
+    crates/updated-healthproxy/Dockerfile; do
+    grep -Fq \
+      'COPY --chmod=0755 scripts/install-ubi-build-dependencies.sh /usr/local/bin/install-ubi-build-dependencies' \
+      "$dockerfile" && \
+      grep -Fq 'RUN /usr/local/bin/install-ubi-build-dependencies' "$dockerfile" || {
+      echo "FAIL: $dockerfile bypasses the shared UBI build-dependency installer" >&2
+      return 1
+    }
+  done
+
+  runtime_uid="$(awk '$1 == "USER" {value = $2} END {print value}' crates/updatec/Dockerfile)"
+  e2e_runtime_uid="$(awk '$1 == "USER" {value = $2} END {print value}' crates/updatec/Dockerfile.e2e)"
+  healthproxy_runtime_uid="$(awk '$1 == "USER" {value = $2} END {print value}' crates/updated-healthproxy/Dockerfile)"
+  backend_runtime_uid="$(grep -oE 'HEALTHPROXY_RUNTIME_UID: i64 = [0-9_]+' \
+    crates/updatec/src/runtime/backend.rs | grep -oE '[0-9_]+$' | tr -d '_')"
+  [[ "$runtime_uid" =~ ^[0-9]+$ && "$runtime_uid" == "$e2e_runtime_uid" && "$runtime_uid" == "$healthproxy_runtime_uid" && "$runtime_uid" == "$backend_runtime_uid" ]] || {
+    echo "FAIL: updatec, E2E, healthproxy, and generated backend workloads do not share one numeric runtime UID" >&2
+    return 1
+  }
 
   section "Helm lint"
   helm lint deploy/charts/updatec --set publicUrl=https://updates.example
@@ -260,26 +285,54 @@ run_charts() {
 
   helm template updatec-soak lab/chaos/infrastructure/soak -n updated-system \
     >"$soak_manifests"
-  python3 - "$soak_manifests" <<'PY'
-import sys, yaml
+  python3 - "$soak_manifests" crates/updated-tuf/src/repo.rs "$runtime_uid" \
+    crates/updatec-e2e/src/fixture.rs <<'PY'
+import re, sys, yaml
 documents = [doc for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")) if doc]
+source = open(sys.argv[2], encoding="utf-8").read()
+runtime_uid = int(sys.argv[3])
+fixture_source = open(sys.argv[4], encoding="utf-8").read()
+body = re.search(r"pub const KEY_FILE_NAMES: \[&str; \d+\] = \[(.*?)\];", source, re.S)
+assert body, "the canonical signing-key list is missing"
+signing_keys = set(re.findall(r'"([^"]+)"', body.group(1)))
+
+restricted = {
+    "allowPrivilegeEscalation": False,
+    "capabilities": {"drop": ["ALL"]},
+    "readOnlyRootFilesystem": True,
+    "runAsNonRoot": True,
+}
+workloads = []
 for doc in documents:
     pod = None
     if doc["kind"] in ("Deployment", "StatefulSet"):
         pod = doc["spec"]["template"]["spec"]
     elif doc["kind"] == "Job":
         pod = doc["spec"]["template"]["spec"]
-    if pod and "fsGroup" in pod.get("securityContext", {}):
-        assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch", doc["metadata"]["name"]
+    if not pod:
+        continue
+    name = doc["metadata"]["name"]
+    uid = 1000 if name in ("minio", "minio-initialize") else runtime_uid
+    if name == "agent":
+        assert "fsGroup" not in pod["securityContext"], pod["securityContext"]
+    else:
+        assert pod["securityContext"]["fsGroup"] == uid, name
+        assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch", name
+    for container in pod.get("containers", []) + pod.get("initContainers", []):
+        if container["name"] == "prepare-private-state":
+            continue
+        expected = {**restricted, "runAsUser": uid, "runAsGroup": uid}
+        assert container["securityContext"] == expected, (name, container["name"], container["securityContext"])
+    workloads.append(name)
+assert set(workloads) == {"agent", "minio", "minio-initialize", "release-server", "updatec-soak"}, workloads
+campaign = next(doc for doc in documents if doc["kind"] == "Deployment" and doc["metadata"]["name"] == "updatec-soak")
+assert campaign["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] == 420
+
 agents = next(doc for doc in documents if doc["kind"] == "StatefulSet" and doc["metadata"]["name"] == "agent")
 pod = agents["spec"]["template"]["spec"]
-assert "fsGroup" not in pod["securityContext"], pod["securityContext"]
 runtime = next(container for container in pod["containers"] if container["name"] == "agent")
 prepare = next(container for container in pod["initContainers"] if container["name"] == "prepare-private-state")
 runtime_uid = runtime["securityContext"]["runAsUser"]
-assert runtime_uid == 65532, runtime_uid
-assert runtime["securityContext"]["runAsGroup"] == runtime_uid, runtime["securityContext"]
-assert runtime["securityContext"]["readOnlyRootFilesystem"] is True, runtime["securityContext"]
 assert f"uid={runtime_uid}" in prepare["args"][0], prepare["args"]
 assert 'chown -R "$uid:$uid" /var/lib/updated' in prepare["args"][0], prepare["args"]
 assert "chmod 0600 /var/lib/updated/launcher/agent.key" in prepare["args"][0], prepare["args"]
@@ -291,7 +344,100 @@ assert volumes["chaos-mount-workspace"]["emptyDir"]["sizeLimit"] == "16Mi", volu
 mounts = {mount["name"]: mount["mountPath"] for mount in runtime["volumeMounts"]}
 assert mounts["chaos-mount-workspace"] == "/var/lib", mounts
 assert mounts["state"] == "/var/lib/updated", mounts
-print("ok: soak agents prepare private keys and the narrow writable parent IOChaos needs")
+
+minio = next(doc for doc in documents if doc["kind"] == "StatefulSet" and doc["metadata"]["name"] == "minio")
+minio_pod = minio["spec"]["template"]["spec"]
+minio_server = next(container for container in minio_pod["containers"] if container["name"] == "minio")
+assert any(env == {"name": "HOME", "value": "/tmp"} for env in minio_server["env"]), minio_server["env"]
+assert any(mount == {"name": "minio-tmp", "mountPath": "/tmp"} for mount in minio_server["volumeMounts"])
+initializer = next(doc for doc in documents if doc["kind"] == "Job" and doc["metadata"]["name"] == "minio-initialize")
+assert "helm.sh/hook" not in initializer["metadata"].get("annotations", {}), initializer["metadata"]
+
+role = next(doc for doc in documents if doc["kind"] == "Role" and doc["metadata"]["name"] == "updatec-soak")
+owned = {
+    tuple(rule["resources"]): tuple(rule.get("resourceNames", []))
+    for rule in role["rules"]
+    if rule["apiGroups"] == ["updated.dev"] and "resourceNames" in rule
+}
+assert owned == {
+    ("updaterepositories",): ("default",),
+    ("updategroups",): ("soak-a", "soak-b", "soak-c"),
+    ("updategroupsets",): ("soak-fleet",),
+}, owned
+creates = [
+    rule for rule in role["rules"]
+    if rule["apiGroups"] == ["updated.dev"] and rule.get("verbs") == ["create"]
+]
+assert creates == [{
+    "apiGroups": ["updated.dev"],
+    "resources": ["updaterepositories", "updategroups", "updategroupsets"],
+    "verbs": ["create"],
+}], creates
+
+policies = {doc["metadata"]["name"]: str(doc["spec"]) for doc in documents if doc["kind"] == "ValidatingAdmissionPolicy"}
+signing = next(text for name, text in policies.items() if name.endswith("signing-secret"))
+assert set(re.findall(r"'([^']+\.pk8)'", signing)) == signing_keys, (signing_keys, signing)
+for boundary in [
+    "app.kubernetes.io/part-of", "metadata.annotations.size() == 0",
+    "metadata.finalizers.size() == 0", "metadata.ownerReferences.size() == 0",
+]:
+    assert boundary in signing, boundary
+labels = next(text for name, text in policies.items() if name.endswith("agent-labels"))
+for boundary in ["labels.size() == 2", "soak.updated.dev/cohort", "soak.updated.dev/node", "^agent-[0-9]+$"]:
+    assert boundary in labels, boundary
+control = next(text for name, text in policies.items() if name.endswith("control-boundary"))
+for boundary in [
+    "'operations': ['CREATE', 'UPDATE']", "tuf-signing-keys", "s3-credentials",
+    "http://minio:9000", "https://minio-direct.updated-system.svc", "assignmentPrefix",
+    "stateMaxShards", "repositoryRef", "selector", "dependsOn", "inputs",
+    "maxUnavailable", "emergencyCorrection", "maxConcurrent", "maxRegressions",
+    "onRegression", "stuckAfterSeconds", "metadata.annotations.size() == 0",
+    "metadata.finalizers.size() == 0", "metadata.ownerReferences.size() == 0",
+]:
+    assert boundary in control, boundary
+chaos = next(text for name, text in policies.items() if name.endswith("chaos-boundary"))
+for boundary in [
+    "'operations': ['CREATE', 'DELETE']", "request.operation == 'DELETE' ? oldObject : object",
+    "^soak-round-[1-9][0-9]*$", "networkchaos", "iochaos", "podchaos", "partition",
+    "pod-kill", "volumePath", "/var/lib/updated/*", "updated.dev/chaos-target",
+    "metadata.annotations.size() == 0", "metadata.finalizers.size() == 0",
+    "metadata.ownerReferences.size() == 0",
+]:
+    assert boundary in chaos, boundary
+
+def rust_string(name):
+    match = re.search(rf'const {name}: &str = "([^"]+)";', fixture_source)
+    assert match, name
+    return match.group(1)
+
+def rust_number(name):
+    match = re.search(rf'const {name}: (?:u8|u32|u64|usize) = ([0-9_]+);', fixture_source)
+    assert match, name
+    return int(match.group(1).replace("_", ""))
+
+for name in [
+    "REPOSITORY_NAME", "RELEASE_ENDPOINT", "RELEASE_PUBLIC_ENDPOINT", "RELEASE_BUCKET",
+    "RELEASE_REGION", "SIGNING_SECRET", "STORAGE_SECRET", "ASSIGNMENT_PREFIX",
+    "SOAK_FLEET_LABEL", "SOAK_FLEET_VALUE", "SOAK_COHORT_LABEL", "SOAK_GROUP_SET",
+]:
+    assert rust_string(name) in control, name
+for name in ["SOAK_CHAOS_LABEL", "SOAK_CHAOS_VALUE", "SOAK_CHAOS_NAME_PREFIX"]:
+    assert rust_string(name) in chaos, name
+for name, field in {
+    "STATE_MAX_SHARDS": "stateMaxShards",
+    "SOAK_MAX_UNAVAILABLE": "maxUnavailable",
+    "SOAK_MAX_CONCURRENT": "maxConcurrent",
+    "SOAK_MAX_REGRESSIONS": "maxRegressions",
+    "SOAK_STUCK_AFTER_SECONDS": "stuckAfterSeconds",
+}.items():
+    assert f"object.spec.{field} == {rust_number(name)}" in control, name
+groups_body = re.search(r'const SOAK_GROUPS: \[&str; \d+\] = \[(.*?)\];', fixture_source, re.S)
+assert groups_body, "SOAK_GROUPS"
+fixture_groups = set(re.findall(r'"([^"]+)"', groups_body.group(1)))
+policy_groups = re.search(r"object.metadata.name in \[([^]]+)\]", control)
+assert policy_groups, control
+assert set(re.findall(r"'([^']+)'", policy_groups.group(1))) == fixture_groups
+print("ok: every lab workload shares one restricted context and every campaign write is bounded")
 PY
 
   section "Helm safety guardrails"
@@ -489,6 +635,11 @@ PY
     --set controller.alerting.tokenSecret=alert-token \
     --set podSecurityContext.fsGroup=123 \
     --set podSecurityContext.fsGroupChangePolicy=Always \
+    --set podSecurityContext.seccompProfile.type=Unconfined \
+    --set securityContext.runAsUser=123 \
+    --set securityContext.runAsGroup=456 \
+    --set securityContext.allowPrivilegeEscalation=true \
+    --set securityContext.readOnlyRootFilesystem=false \
     --set 'gateway.secretResourceNames={updatedc-store}' >"$pinned_manifests"
   # The RBAC below grants the durable admitted-state ConfigMaps BY EXACT NAME, so the chart has to
   # spell out every shard the controller could ever write. That count is `MAX_ADMITTED_STATE_SHARDS`
@@ -504,9 +655,10 @@ PY
     echo "FAIL: could not read MAX_ADMITTED_STATE_SHARDS from crates/updatec/src/runtime/mod.rs" >&2
     return 1
   }
-  python3 - "$pinned_manifests" "$admitted_shards" <<'PY'
+  python3 - "$pinned_manifests" "$admitted_shards" "$runtime_uid" <<'PY'
 import sys, yaml
 admitted_shards = int(sys.argv[2])
+runtime_uid = int(sys.argv[3])
 gateway_pinned = False
 backend_controller = False
 admitted_configmap_pinned = False
@@ -561,9 +713,21 @@ for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
       pod = doc["spec"]["template"]["spec"]
       containers = pod["containers"]
       assert len(containers) == 1, doc["metadata"]["name"]
-      run_as = containers[0]["securityContext"]["runAsUser"]
-      assert pod["securityContext"]["fsGroup"] == run_as, doc["metadata"]["name"]
-      assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch", doc["metadata"]["name"]
+      context = containers[0]["securityContext"]
+      assert context == {
+          "allowPrivilegeEscalation": False,
+          "capabilities": {"drop": ["ALL"]},
+          "readOnlyRootFilesystem": True,
+          "runAsNonRoot": True,
+          "runAsUser": runtime_uid,
+          "runAsGroup": runtime_uid,
+      }, context
+      run_as = context["runAsUser"]
+      assert pod["securityContext"] == {
+          "fsGroup": run_as,
+          "fsGroupChangePolicy": "OnRootMismatch",
+          "seccompProfile": {"type": "RuntimeDefault"},
+      }, pod["securityContext"]
       for volume in pod.get("volumes", []):
         if "secret" not in volume:
           continue

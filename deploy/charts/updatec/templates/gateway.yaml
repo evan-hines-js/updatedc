@@ -54,7 +54,7 @@ spec:
             httpGet: {path: /healthz, port: health}
           livenessProbe:
             httpGet: {path: /healthz, port: health}
-          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          securityContext: {{- include "updatec.containerSecurityContext" . | nindent 12 }}
           resources: {{- toYaml .Values.gateway.resources | nindent 12 }}
           env:
             {{- include "updatec.commonEnv" . | nindent 12 }}

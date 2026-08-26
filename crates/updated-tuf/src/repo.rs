@@ -84,7 +84,7 @@ impl BoundedKeySource {
             .map_err(|e| err("reading key", e))?;
         // Validate eagerly so a malformed key fails at the named path boundary, before an editor
         // is mutated. `as_sign` parses the same immutable bytes again for tough's owned signer.
-        parse_keypair(&bytes).map_err(|e| err("parsing key", e))?;
+        validate_signing_key_bytes(&bytes)?;
         Ok(Self {
             bytes: Arc::from(bytes),
         })
@@ -99,6 +99,32 @@ impl BoundedKeySource {
     fn boxed(&self) -> Box<dyn KeySource> {
         Box::new(self.clone())
     }
+}
+
+/// Validate one in-memory role key through the same parser and size policy used for key files.
+///
+/// Kubernetes Secret consumers cannot apply the local-file checks in `BoundedKeySource`, but they
+/// must not invent a weaker "non-empty bytes" definition of a signing key. This is the one shared
+/// cryptographic boundary for projected and file-backed authoring keys.
+pub fn validate_signing_key_bytes(bytes: &[u8]) -> Result<()> {
+    signing_key_id(bytes).map(|_| ())
+}
+
+/// Return the canonical TUF key ID for one bounded PKCS#8 role key.
+pub fn signing_key_id(bytes: &[u8]) -> Result<String> {
+    if bytes.len() > SIGNING_KEY_MAX_BYTES {
+        return Err(RepoError(format!(
+            "signing key is {} bytes; maximum is {SIGNING_KEY_MAX_BYTES}",
+            bytes.len()
+        )));
+    }
+    let key = parse_keypair(bytes)
+        .map_err(|error| err("parsing key", error))?
+        .tuf_key();
+    let id = key
+        .key_id()
+        .map_err(|error| err("calculating key ID", error))?;
+    Ok(hex::encode(id.as_ref()))
 }
 
 #[async_trait::async_trait]
@@ -968,16 +994,27 @@ async fn publish_metadata(
 /// Authoring tools use metadata as the single source of truth; targets exist only under
 /// their consistent-snapshot digest-prefixed paths.
 pub async fn target_sha256(repo_dir: &Path, name: &str) -> Result<String> {
+    target_sha256_if_present(repo_dir, name)
+        .await?
+        .ok_or_else(|| RepoError(format!("target {name:?} is absent from metadata")))
+}
+
+/// Read an authenticated target digest when the target exists.
+///
+/// Absence is the only condition represented by `None`: malformed names, unreadable repositories,
+/// and invalid metadata remain errors. Callers that publish idempotently must use this instead of
+/// turning every lookup failure into "not published", which would hide repository corruption and
+/// attempt a write through a broken trust boundary.
+pub async fn target_sha256_if_present(repo_dir: &Path, name: &str) -> Result<Option<String>> {
     validate_target_name(name)?;
     let repo = load_local(repo_dir, "loading repository").await?;
     let name = TargetName::new(name).map_err(|e| err("parsing target name", e))?;
-    let target = repo
+    Ok(repo
         .targets()
         .signed
         .targets
         .get(&name)
-        .ok_or_else(|| RepoError(format!("target {:?} is absent from metadata", name.raw())))?;
-    Ok(hex::encode(&target.hashes.sha256))
+        .map(|target| hex::encode(&target.hashes.sha256)))
 }
 
 /// Resolve a provider set's reconciler artifact against the signed metadata a publisher already
@@ -1524,12 +1561,23 @@ mod tests {
                 artifact.clone(),
             )
         };
+        assert_eq!(
+            target_sha256_if_present(&repo_dir, &target().name)
+                .await
+                .unwrap(),
+            None,
+            "an absent target is distinct from an unreadable repository"
+        );
         add_release(&repo_dir, &keys, vec![target()], 365)
             .await
             .unwrap();
 
         let name = target().name;
         let digest = target_sha256(&repo_dir, &name).await.unwrap();
+        assert_eq!(
+            target_sha256_if_present(&repo_dir, &name).await.unwrap(),
+            Some(digest.clone())
+        );
         let object = repo_dir.join("targets").join(format!("{digest}.{name}"));
         assert_eq!(
             std::fs::read(&object).unwrap(),

@@ -582,7 +582,7 @@ pub(crate) async fn publish_resource_statuses(
             // nothing. The exit is a deployment with a different identity.
             crate::rollout::GroupProgress::Failed => failed_condition(
                 group.metadata.generation,
-                "Rejected",
+                crate::status_contract::REJECTED_REASON,
                 "This group's nodes attempted its admitted deployment and durably rejected it, \
                  rolling back to what they were running; the rollout has ended. Publish corrected \
                  bytes (a new digest) to move this group.",

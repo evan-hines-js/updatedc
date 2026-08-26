@@ -36,6 +36,12 @@ spec:
           labels: {severity: critical}
           annotations:
             summary: updatec soak has failed at least three consecutive campaigns
+        - alert: UpdatecSoakRecoveryStuck
+          expr: (updatec_soak_recovery_pending == 1) or (updatec_soak_forward_recovery_pending == 1)
+          for: 10m
+          labels: {severity: critical}
+          annotations:
+            summary: updatec soak is refusing new faults because known-good recovery has not completed
 ---
 apiVersion: v1
 kind: ConfigMap

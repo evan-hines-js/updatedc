@@ -42,7 +42,7 @@ spec:
         updated.dev/chaos-target: "true"
     spec:
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {{- include "soak.podSecurityContext" (dict "uid" 1000) | nindent 8 }}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.storageUid" .)) | nindent 8 }}
       initContainers:
         - name: assemble-tls-bundle
           image: {{ include "soak.image" . }}
@@ -52,12 +52,7 @@ spec:
           resources:
             requests: {cpu: 5m, memory: 16Mi}
             limits: {cpu: 100m, memory: 32Mi}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 1000
+          securityContext: {{- include "soak.restrictedContainerSecurityContext" (dict "uid" (include "soak.storageUid" .)) | nindent 12 }}
           volumeMounts:
             - {name: tls-source, mountPath: /input, readOnly: true}
             - {name: tls-bundle, mountPath: /output}
@@ -68,6 +63,7 @@ spec:
           args: [server, /data]
           ports: [{name: api, containerPort: 9000}]
           env:
+            - {name: HOME, value: /tmp}
             - name: MINIO_ROOT_USER
               valueFrom: {secretKeyRef: {name: s3-credentials, key: AWS_ACCESS_KEY_ID}}
             - name: MINIO_ROOT_PASSWORD
@@ -77,10 +73,10 @@ spec:
           resources:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: "2", memory: 2Gi}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-          volumeMounts: [{name: data, mountPath: /data}]
+          securityContext: {{- include "soak.restrictedContainerSecurityContext" (dict "uid" (include "soak.storageUid" .)) | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: minio-tmp, mountPath: /tmp}
         - name: tls-proxy
           image: {{ include "soak.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -92,12 +88,7 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 32Mi}
             limits: {cpu: 200m, memory: 128Mi}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 1000
+          securityContext: {{- include "soak.restrictedContainerSecurityContext" (dict "uid" (include "soak.storageUid" .)) | nindent 12 }}
           volumeMounts:
             - {name: proxy-config, mountPath: /etc/haproxy, readOnly: true}
             - {name: tls-bundle, mountPath: /tls, readOnly: true}
@@ -105,6 +96,7 @@ spec:
         - {name: proxy-config, configMap: {name: minio-tls-proxy}}
         - {name: tls-source, secret: {secretName: gateway-tls}}
         - {name: tls-bundle, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
+        - {name: minio-tmp, emptyDir: {sizeLimit: 128Mi}}
   volumeClaimTemplates:
     - metadata: {name: data}
       spec:
@@ -126,10 +118,6 @@ kind: Job
 metadata:
   name: minio-initialize
   labels: {{- include "soak.labels" . | nindent 4 }}
-  annotations:
-    helm.sh/hook: post-install,post-upgrade
-    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
-    helm.sh/hook-weight: "10"
 spec:
   backoffLimit: 20
   ttlSecondsAfterFinished: 300
@@ -141,7 +129,7 @@ spec:
     spec:
       restartPolicy: OnFailure
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {{- include "soak.podSecurityContext" (dict "uid" 1000) | nindent 8 }}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.storageUid" .)) | nindent 8 }}
       containers:
         - name: initialize
           image: {{ .Values.minio.clientImage | quote }}
@@ -164,12 +152,7 @@ spec:
             limits: {cpu: 200m, memory: 128Mi}
           volumeMounts:
             - {name: config, mountPath: /config}
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: [ALL]}
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 1000
+          securityContext: {{- include "soak.restrictedContainerSecurityContext" (dict "uid" (include "soak.storageUid" .)) | nindent 12 }}
       volumes:
         - name: config
           emptyDir: {sizeLimit: 16Mi}

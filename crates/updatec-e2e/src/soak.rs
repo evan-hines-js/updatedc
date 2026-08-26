@@ -3,14 +3,17 @@
 //! One controller owns the complete campaign transaction: choose a release, state the expected
 //! fleet result, apply the typed deployment, inject one bounded Chaos Mesh fault, wait for exact
 //! convergence (or an expected rejection), recover, persist the result, and expose aggregate
-//! metrics. A restart always re-applies the last known-good desired state before starting another
-//! round, so there is no second ad-hoc recovery path.
+//! metrics. Recovery always publishes a strictly newer valid fixture before starting another
+//! round, so process or node loss never asks an agent to violate its downgrade boundary and there
+//! is no second ad-hoc recovery path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -27,22 +30,17 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use updatec::{DeploymentSpec, UpdateAgent, UpdateGroup, UpdateGroupSet, UpdateRepository};
+use updatec::{
+    DeploymentSpec, UpdateAgent, UpdateGroup, UpdateGroupSet, UpdateGroupStatus, UpdateRepository,
+};
 
 use crate::{agent_resource_name, fixture};
 
-const STATE_SCHEMA: u8 = 2;
+const STATE_SCHEMA: u8 = 4;
 const BASELINE_VERSION: &str = "1.0.0";
 const CAMPAIGN_VERSION_MAJOR: u64 = 1_000_000;
 const METRICS_PORT: u16 = 9091;
 const METRICS_MAX_REQUEST: usize = 8 * 1024;
-const SIGNING_KEY_FILES: [&str; 5] = [
-    "root.pk8",
-    "root.next.pk8",
-    "targets.pk8",
-    "snapshot.pk8",
-    "timestamp.pk8",
-];
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -121,6 +119,35 @@ impl Config {
     }
 }
 
+struct CampaignLock {
+    _file: File,
+}
+
+impl CampaignLock {
+    fn try_acquire(config: &Config) -> Result<Option<Self>> {
+        fs::create_dir_all(&config.state_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(config.state_dir.join("campaign.lock"))?;
+        // SAFETY: `file` owns this valid descriptor for the lifetime of the lock guard. `flock`
+        // does not dereference memory, and the guard retains the open file until process exit or
+        // drop, which is precisely the kernel lifetime of this advisory lock.
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked == 0 {
+            return Ok(Some(Self { _file: file }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        Err(error.into())
+    }
+}
+
 fn env_u64(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
     let value = match env::var(name) {
         Ok(raw) => raw
@@ -135,12 +162,49 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
     Ok(value)
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum FaultKind {
+    NetworkPartition,
+    IoError,
+    AgentKill,
+    ControllerKill,
+}
+
+impl FaultKind {
+    const ALL: [Self; 4] = [
+        Self::NetworkPartition,
+        Self::IoError,
+        Self::AgentKill,
+        Self::ControllerKill,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NetworkPartition => "network_partition",
+            Self::IoError => "io_error",
+            Self::AgentKill => "agent_kill",
+            Self::ControllerKill => "controller_kill",
+        }
+    }
+
+    const fn resource(self) -> (&'static str, &'static str) {
+        match self {
+            Self::NetworkPartition => ("NetworkChaos", "networkchaos"),
+            Self::IoError => ("IOChaos", "iochaos"),
+            Self::AgentKill | Self::ControllerKill => ("PodChaos", "podchaos"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CampaignState {
     schema: u8,
     seed: u64,
     round: u64,
+    release_generation: u64,
+    recovery_target: Option<String>,
     desired: BTreeMap<String, String>,
     campaigns: u64,
     successful_campaigns: u64,
@@ -148,9 +212,14 @@ struct CampaignState {
     release_assignments: u64,
     expected_rejections: u64,
     recoveries: u64,
+    forward_recoveries: u64,
+    recovery_pending: bool,
     consecutive_failures: u64,
+    faults: BTreeMap<FaultKind, u64>,
+    fault_failures: BTreeMap<FaultKind, u64>,
     last_success_timestamp: i64,
     last_failure_timestamp: i64,
+    last_convergence_seconds: f64,
 }
 
 impl CampaignState {
@@ -159,6 +228,8 @@ impl CampaignState {
             schema: STATE_SCHEMA,
             seed,
             round: 0,
+            release_generation: 0,
+            recovery_target: None,
             desired: fixture::SOAK_GROUPS
                 .into_iter()
                 .map(|name| (name.into(), BASELINE_VERSION.into()))
@@ -169,9 +240,14 @@ impl CampaignState {
             release_assignments: 0,
             expected_rejections: 0,
             recoveries: 0,
+            forward_recoveries: 0,
+            recovery_pending: false,
             consecutive_failures: 0,
+            faults: FaultKind::ALL.into_iter().map(|kind| (kind, 0)).collect(),
+            fault_failures: FaultKind::ALL.into_iter().map(|kind| (kind, 0)).collect(),
             last_success_timestamp: 0,
             last_failure_timestamp: 0,
+            last_convergence_seconds: 0.0,
         }
     }
 
@@ -202,10 +278,92 @@ impl CampaignState {
         if keys != fixture::SOAK_GROUPS.to_vec() {
             return Err(format!("persisted desired groups are not canonical: {keys:?}").into());
         }
+        let fault_kinds = FaultKind::ALL.into_iter().collect::<BTreeSet<_>>();
+        if self.faults.keys().copied().collect::<BTreeSet<_>>() != fault_kinds
+            || self.fault_failures.keys().copied().collect::<BTreeSet<_>>() != fault_kinds
+        {
+            return Err("persisted fault counters do not cover the canonical fault set".into());
+        }
+        let outcomes = self
+            .successful_campaigns
+            .checked_add(self.failed_campaigns)
+            .ok_or("persisted campaign counters overflow")?;
+        if self.round != self.campaigns || self.campaigns != outcomes {
+            return Err(format!(
+                "persisted campaign counters disagree: round={}, campaigns={}, successes={}, failures={}",
+                self.round, self.campaigns, self.successful_campaigns, self.failed_campaigns
+            )
+            .into());
+        }
+        let accounted_failures = self
+            .recoveries
+            .checked_add(u64::from(self.recovery_pending))
+            .ok_or("persisted recovery counters overflow")?;
+        if self.consecutive_failures > self.failed_campaigns
+            || accounted_failures != self.failed_campaigns
+        {
+            return Err("persisted failure and recovery counters are impossible".into());
+        }
+        let total_faults = self.faults.values().try_fold(0u64, |total, count| {
+            total
+                .checked_add(*count)
+                .ok_or("persisted fault counters overflow")
+        })?;
+        let total_fault_failures =
+            self.fault_failures
+                .values()
+                .try_fold(0u64, |total, count| {
+                    total
+                        .checked_add(*count)
+                        .ok_or("persisted fault failure counters overflow")
+                })?;
+        let maximum_assignment_events = self
+            .campaigns
+            .checked_add(self.forward_recoveries)
+            .ok_or("persisted release assignment event bound overflow")?;
+        let maximum_assignments = maximum_assignment_events
+            .checked_mul(fixture::SOAK_GROUPS.len() as u64)
+            .ok_or("persisted release assignment bound overflow")?;
+        let minimum_recovery_assignments = self
+            .forward_recoveries
+            .checked_mul(fixture::SOAK_GROUPS.len() as u64)
+            .and_then(|count| count.checked_add(self.successful_campaigns))
+            .ok_or("persisted minimum release assignment bound overflow")?;
+        if total_faults < self.successful_campaigns
+            || total_faults > self.campaigns
+            || total_fault_failures > self.failed_campaigns
+            || self.expected_rejections > self.round / 10
+            || self.release_generation < self.campaigns
+            || self.forward_recoveries > self.release_generation
+            || self.forward_recoveries < self.recoveries
+            || self.release_assignments < minimum_recovery_assignments
+            || self.release_assignments > maximum_assignments
+        {
+            return Err("persisted campaign aggregate counters are impossible".into());
+        }
+        if (self.successful_campaigns == 0) != (self.last_success_timestamp == 0)
+            || (self.failed_campaigns == 0) != (self.last_failure_timestamp == 0)
+            || !self.last_convergence_seconds.is_finite()
+            || self.last_convergence_seconds.is_sign_negative()
+        {
+            return Err(
+                "persisted campaign timestamps or convergence duration are impossible".into(),
+            );
+        }
+        for version in self.desired.values() {
+            validate_stable_version(version, self.release_generation)?;
+        }
+        if let Some(target) = &self.recovery_target {
+            let version = validate_stable_version(target, self.release_generation)?;
+            if version.minor != self.release_generation {
+                return Err("persisted recovery target is not the latest allocated release".into());
+            }
+        }
         Ok(())
     }
 
     fn persist(&self, config: &Config) -> Result<()> {
+        self.validate(config)?;
         let path = config.state_path();
         let temporary = config.state_dir.join("campaign.json.tmp");
         let bytes = serde_json::to_vec_pretty(self)?;
@@ -213,52 +371,32 @@ impl CampaignState {
         file.write_all(&bytes)?;
         file.sync_all()?;
         fs::rename(temporary, path)?;
+        // The file fsync makes its contents durable; the directory fsync makes the atomic rename
+        // durable. Without both, a node crash can resurrect the previous round after rename.
+        File::open(&config.state_dir)?.sync_all()?;
         Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum FaultKind {
-    NetworkPartition,
-    IoError,
-    AgentKill,
-    ControllerKill,
-}
-
-impl FaultKind {
-    const ALL: [Self; 4] = [
-        Self::NetworkPartition,
-        Self::IoError,
-        Self::AgentKill,
-        Self::ControllerKill,
-    ];
-
-    const fn index(self) -> usize {
-        match self {
-            Self::NetworkPartition => 0,
-            Self::IoError => 1,
-            Self::AgentKill => 2,
-            Self::ControllerKill => 3,
-        }
+fn validate_stable_version(raw: &str, release_generation: u64) -> Result<Version> {
+    if raw == BASELINE_VERSION {
+        return Ok(Version::parse(raw)?);
     }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::NetworkPartition => "network_partition",
-            Self::IoError => "io_error",
-            Self::AgentKill => "agent_kill",
-            Self::ControllerKill => "controller_kill",
-        }
+    let version = Version::parse(raw)
+        .map_err(|error| format!("persisted desired version {raw:?} is invalid: {error}"))?;
+    if version.major != CAMPAIGN_VERSION_MAJOR
+        || version.minor == 0
+        || version.minor > release_generation
+        || version.patch != 0
+        || !version.pre.is_empty()
+        || !version.build.is_empty()
+    {
+        return Err(format!(
+            "persisted desired version {raw:?} is not a stable release through generation {release_generation}"
+        )
+        .into());
     }
-
-    const fn resource(self) -> (&'static str, &'static str) {
-        match self {
-            Self::NetworkPartition => ("NetworkChaos", "networkchaos"),
-            Self::IoError => ("IOChaos", "iochaos"),
-            Self::AgentKill | Self::ControllerKill => ("PodChaos", "podchaos"),
-        }
-    }
+    Ok(version)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -274,7 +412,7 @@ struct RoundPlan {
 fn plan_round(state: &CampaignState, agent_count: usize) -> RoundPlan {
     let round = state.round + 1;
     let mut rng = state.seed ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let fault = FaultKind::ALL[(splitmix64(&mut rng) as usize) % FaultKind::ALL.len()];
+    let fault = fault_for_round(state.seed, round);
     let target_ordinal = (splitmix64(&mut rng) as usize) % agent_count;
     let expected_rejection = round.is_multiple_of(10);
     let group_count = if expected_rejection {
@@ -297,6 +435,19 @@ fn plan_round(state: &CampaignState, agent_count: usize) -> RoundPlan {
     }
 }
 
+fn fault_for_round(seed: u64, round: u64) -> FaultKind {
+    debug_assert!(round > 0);
+    let cycle = (round - 1) / FaultKind::ALL.len() as u64;
+    let offset = ((round - 1) % FaultKind::ALL.len() as u64) as usize;
+    let mut rng = seed ^ cycle.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    let mut faults = FaultKind::ALL;
+    for index in (1..faults.len()).rev() {
+        let selected = (splitmix64(&mut rng) as usize) % (index + 1);
+        faults.swap(index, selected);
+    }
+    faults[offset]
+}
+
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut value = *state;
@@ -310,23 +461,11 @@ struct Metrics {
     started_timestamp: i64,
     bootstrap_ready: bool,
     campaign_healthy: bool,
-    round: u64,
     round_seed: u64,
-    campaigns: u64,
-    successful_campaigns: u64,
-    failed_campaigns: u64,
-    release_assignments: u64,
-    expected_rejections: u64,
-    recoveries: u64,
-    consecutive_failures: u64,
-    last_success_timestamp: i64,
-    last_failure_timestamp: i64,
-    last_convergence_seconds: f64,
+    state: CampaignState,
     fleet_expected_nodes: usize,
     fleet_converged_nodes: usize,
     active_fault: Option<FaultKind>,
-    faults: [u64; 4],
-    fault_failures: [u64; 4],
 }
 
 impl Metrics {
@@ -335,37 +474,16 @@ impl Metrics {
             started_timestamp: Utc::now().timestamp(),
             bootstrap_ready: false,
             campaign_healthy: false,
-            round: state.round,
             round_seed: 0,
-            campaigns: state.campaigns,
-            successful_campaigns: state.successful_campaigns,
-            failed_campaigns: state.failed_campaigns,
-            release_assignments: state.release_assignments,
-            expected_rejections: state.expected_rejections,
-            recoveries: state.recoveries,
-            consecutive_failures: state.consecutive_failures,
-            last_success_timestamp: state.last_success_timestamp,
-            last_failure_timestamp: state.last_failure_timestamp,
-            last_convergence_seconds: 0.0,
+            state: state.clone(),
             fleet_expected_nodes: expected_nodes,
             fleet_converged_nodes: 0,
             active_fault: None,
-            faults: [0; 4],
-            fault_failures: [0; 4],
         }
     }
 
     fn sync_state(&mut self, state: &CampaignState) {
-        self.round = state.round;
-        self.campaigns = state.campaigns;
-        self.successful_campaigns = state.successful_campaigns;
-        self.failed_campaigns = state.failed_campaigns;
-        self.release_assignments = state.release_assignments;
-        self.expected_rejections = state.expected_rejections;
-        self.recoveries = state.recoveries;
-        self.consecutive_failures = state.consecutive_failures;
-        self.last_success_timestamp = state.last_success_timestamp;
-        self.last_failure_timestamp = state.last_failure_timestamp;
+        self.state = state.clone();
     }
 
     fn render(&self) -> String {
@@ -385,53 +503,77 @@ impl Metrics {
             "updatec_soak_campaign_healthy",
             u8::from(self.campaign_healthy),
         );
-        metric(&mut output, "updatec_soak_round", self.round);
+        metric(&mut output, "updatec_soak_round", self.state.round);
+        metric(
+            &mut output,
+            "updatec_soak_release_generation",
+            self.state.release_generation,
+        );
         metric(&mut output, "updatec_soak_round_seed", self.round_seed);
-        metric(&mut output, "updatec_soak_campaigns_total", self.campaigns);
+        metric(
+            &mut output,
+            "updatec_soak_campaigns_total",
+            self.state.campaigns,
+        );
         metric(
             &mut output,
             "updatec_soak_successful_campaigns_total",
-            self.successful_campaigns,
+            self.state.successful_campaigns,
         );
         metric(
             &mut output,
             "updatec_soak_failed_campaigns_total",
-            self.failed_campaigns,
+            self.state.failed_campaigns,
         );
         metric(
             &mut output,
             "updatec_soak_release_assignments_total",
-            self.release_assignments,
+            self.state.release_assignments,
         );
         metric(
             &mut output,
             "updatec_soak_expected_rejections_total",
-            self.expected_rejections,
+            self.state.expected_rejections,
         );
         metric(
             &mut output,
             "updatec_soak_recoveries_total",
-            self.recoveries,
+            self.state.recoveries,
+        );
+        metric(
+            &mut output,
+            "updatec_soak_forward_recoveries_total",
+            self.state.forward_recoveries,
+        );
+        metric(
+            &mut output,
+            "updatec_soak_recovery_pending",
+            u8::from(self.state.recovery_pending),
+        );
+        metric(
+            &mut output,
+            "updatec_soak_forward_recovery_pending",
+            u8::from(self.state.recovery_target.is_some()),
         );
         metric(
             &mut output,
             "updatec_soak_consecutive_failures",
-            self.consecutive_failures,
+            self.state.consecutive_failures,
         );
         metric(
             &mut output,
             "updatec_soak_last_success_timestamp_seconds",
-            self.last_success_timestamp,
+            self.state.last_success_timestamp,
         );
         metric(
             &mut output,
             "updatec_soak_last_failure_timestamp_seconds",
-            self.last_failure_timestamp,
+            self.state.last_failure_timestamp,
         );
         metric(
             &mut output,
             "updatec_soak_last_convergence_seconds",
-            self.last_convergence_seconds,
+            self.state.last_convergence_seconds,
         );
         metric(
             &mut output,
@@ -453,12 +595,12 @@ impl Metrics {
             output.push_str(&format!(
                 "updatec_soak_faults_total{{kind=\"{}\"}} {}\n",
                 kind.name(),
-                self.faults[kind.index()]
+                self.state.faults[&kind]
             ));
             output.push_str(&format!(
                 "updatec_soak_fault_failures_total{{kind=\"{}\"}} {}\n",
                 kind.name(),
-                self.fault_failures[kind.index()]
+                self.state.fault_failures[&kind]
             ));
         }
         output
@@ -483,8 +625,8 @@ enum CandidateKind {
     Corrupt,
 }
 
-fn campaign_version(round: u64) -> Version {
-    Version::new(CAMPAIGN_VERSION_MAJOR, round, 0)
+fn campaign_version(generation: u64) -> Version {
+    Version::new(CAMPAIGN_VERSION_MAJOR, generation, 0)
 }
 
 impl ReleaseCatalog {
@@ -521,14 +663,15 @@ impl ReleaseCatalog {
     }
 
     async fn target_sha(&self, target: &str) -> Result<String> {
-        server_output(&[
-            "target-sha256".into(),
-            "--repo".into(),
-            self.release_data.join("repository").display().to_string(),
-            "--name".into(),
-            target.into(),
-        ])
-        .await
+        Ok(updated_tuf::repo::target_sha256(&self.release_data.join("repository"), target).await?)
+    }
+
+    async fn target_sha_if_present(&self, target: &str) -> Result<Option<String>> {
+        Ok(updated_tuf::repo::target_sha256_if_present(
+            &self.release_data.join("repository"),
+            target,
+        )
+        .await?)
     }
 
     fn deployment(&self, group: &str, version: &str, sha: &str) -> DeploymentSpec {
@@ -542,10 +685,14 @@ impl ReleaseCatalog {
         )
     }
 
-    async fn ensure_candidate(&self, round: u64, kind: CandidateKind) -> Result<(String, String)> {
-        let version = campaign_version(round).to_string();
+    async fn ensure_candidate(
+        &self,
+        generation: u64,
+        kind: CandidateKind,
+    ) -> Result<(String, String)> {
+        let version = campaign_version(generation).to_string();
         let target = format!("products/app/stable/{version}/{}/app", self.platform);
-        if let Ok(sha) = self.target_sha(&target).await {
+        if let Some(sha) = self.target_sha_if_present(&target).await? {
             return Ok((version, sha));
         }
         let source = self.release_data.join("soak-fixtures").join(&version);
@@ -554,7 +701,7 @@ impl ReleaseCatalog {
         let app = source.join("bin/app");
         match kind {
             CandidateKind::Valid => {
-                let artifact = if round.is_multiple_of(2) {
+                let artifact = if generation.is_multiple_of(2) {
                     "stateful-like"
                 } else {
                     "sampleapp"
@@ -617,25 +764,42 @@ struct Campaign {
     metrics: Arc<RwLock<Metrics>>,
 }
 
+struct FaultExecution {
+    injected: bool,
+    result: Result<()>,
+}
+
 impl Campaign {
     async fn bootstrap(
         client: Client,
         config: Config,
         metrics: Arc<RwLock<Metrics>>,
+        state: &mut CampaignState,
     ) -> Result<Self> {
         let catalog = ReleaseCatalog::load(&config).await?;
         ensure_signing_secret(&client, &config).await?;
-        ensure_control_resources(&client, &config, &catalog).await?;
-        metrics
-            .write()
-            .expect("metrics lock poisoned")
-            .bootstrap_ready = true;
-        Ok(Self {
+        let campaign = Self {
             client,
             config,
             catalog,
             metrics,
-        })
+        };
+        if state.release_generation == 0 && state.recovery_target.is_none() {
+            ensure_control_resources(&campaign.client, &campaign.config, &campaign.catalog, state)
+                .await?;
+            cleanup_faults(&campaign.client, &campaign.config, &campaign.metrics).await?;
+            campaign.wait_for_fleet().await?;
+            campaign.wait_converged(&state.desired).await?;
+        } else {
+            campaign.recover_forward(state).await?;
+        }
+        {
+            let mut metrics = campaign.metrics.write().expect("metrics lock poisoned");
+            metrics.bootstrap_ready = true;
+            metrics.campaign_healthy = true;
+            metrics.sync_state(state);
+        }
+        Ok(campaign)
     }
 
     async fn wait_for_fleet(&self) -> Result<()> {
@@ -688,14 +852,63 @@ impl Campaign {
         }
     }
 
-    async fn restore_known_good(&self, state: &CampaignState) -> Result<()> {
-        for (group, version) in &state.desired {
-            let sha = self.catalog.app_sha(version).await?;
-            self.patch_group(group, self.catalog.deployment(group, version, &sha))
-                .await?;
+    async fn reserve_candidate(
+        &self,
+        state: &mut CampaignState,
+        kind: CandidateKind,
+    ) -> Result<(String, String)> {
+        state.release_generation = state
+            .release_generation
+            .checked_add(1)
+            .ok_or("release generation overflow")?;
+        state.persist(&self.config)?;
+        self.catalog
+            .ensure_candidate(state.release_generation, kind)
+            .await
+    }
+
+    async fn recover_forward(&self, state: &mut CampaignState) -> Result<()> {
+        cleanup_faults(&self.client, &self.config, &self.metrics).await?;
+        let generation = if let Some(target) = &state.recovery_target {
+            validate_stable_version(target, state.release_generation)?.minor
+        } else {
+            state.release_generation = state
+                .release_generation
+                .checked_add(1)
+                .ok_or("release generation overflow")?;
+            let target = campaign_version(state.release_generation).to_string();
+            state.recovery_target = Some(target);
+            state.persist(&self.config)?;
+            self.metrics
+                .write()
+                .expect("metrics lock poisoned")
+                .sync_state(state);
+            state.release_generation
+        };
+        let (version, _sha) = self
+            .catalog
+            .ensure_candidate(generation, CandidateKind::Valid)
+            .await?;
+        let mut forward = state.clone();
+        for group in fixture::SOAK_GROUPS {
+            forward.desired.insert(group.into(), version.clone());
         }
-        self.cleanup_faults().await;
-        self.wait_converged(&state.desired).await?;
+        ensure_control_resources(&self.client, &self.config, &self.catalog, &forward).await?;
+        self.wait_for_fleet().await?;
+        let duration = self.wait_converged(&forward.desired).await?;
+        forward.release_assignments = forward
+            .release_assignments
+            .checked_add(fixture::SOAK_GROUPS.len() as u64)
+            .ok_or("release assignment counter overflow")?;
+        forward.forward_recoveries = forward
+            .forward_recoveries
+            .checked_add(1)
+            .ok_or("forward recovery counter overflow")?;
+        forward.recovery_target = None;
+        forward.last_convergence_seconds = duration.as_secs_f64();
+        forward.persist(&self.config)?;
+        *state = forward;
+        println!("[soak] fleet recovered forward onto generation {generation}");
         Ok(())
     }
 
@@ -721,23 +934,17 @@ impl Campaign {
 
     async fn run_valid_round(&self, state: &mut CampaignState, plan: &RoundPlan) -> Result<()> {
         let mut desired = state.desired.clone();
-        let (version, sha) = self
-            .catalog
-            .ensure_candidate(plan.round, CandidateKind::Valid)
-            .await?;
+        let (version, sha) = self.reserve_candidate(state, CandidateKind::Valid).await?;
         for group in &plan.groups {
             self.patch_group(group, self.catalog.deployment(group, &version, &sha))
                 .await?;
             desired.insert(group.clone(), version.clone());
             state.release_assignments += 1;
         }
-        let convergence = self.wait_converged(&desired);
-        let fault = self.inject_fault(plan);
-        let (duration, ()) = tokio::try_join!(convergence, fault)?;
-        self.metrics
-            .write()
-            .expect("metrics lock poisoned")
-            .last_convergence_seconds = duration.as_secs_f64();
+        let duration = self
+            .run_under_fault(state, plan, self.wait_converged(&desired))
+            .await?;
+        state.last_convergence_seconds = duration.as_secs_f64();
         state.desired = desired;
         Ok(())
     }
@@ -748,8 +955,7 @@ impl Campaign {
             .first()
             .expect("a rejection round has one group");
         let (bad_version, bad_sha) = self
-            .catalog
-            .ensure_candidate(plan.round, CandidateKind::Corrupt)
+            .reserve_candidate(state, CandidateKind::Corrupt)
             .await?;
         self.patch_group(
             group,
@@ -757,9 +963,9 @@ impl Campaign {
         )
         .await?;
         state.release_assignments += 1;
-        let rejected = self.wait_rejected(group, &state.desired);
-        let fault = self.inject_fault(plan);
-        tokio::try_join!(rejected, fault)?;
+        let stable = state.desired.clone();
+        self.run_under_fault(state, plan, self.wait_rejected(group, &stable))
+            .await?;
         state.expected_rejections += 1;
 
         let recovery_version = state
@@ -776,11 +982,44 @@ impl Campaign {
         .await?;
         state.release_assignments += 1;
         let duration = self.wait_converged(&state.desired).await?;
-        self.metrics
-            .write()
-            .expect("metrics lock poisoned")
-            .last_convergence_seconds = duration.as_secs_f64();
+        state.last_convergence_seconds = duration.as_secs_f64();
         Ok(())
+    }
+
+    async fn run_under_fault<T, F>(
+        &self,
+        state: &mut CampaignState,
+        plan: &RoundPlan,
+        assertion: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        // `join!` deliberately waits for both sides. `try_join!` cancels the still-running future
+        // after the first error, which can abandon a successfully injected Chaos Mesh object and
+        // turn a bounded fault into an unbounded one.
+        let (assertion, fault) = tokio::join!(assertion, self.inject_fault(plan));
+        if fault.injected {
+            *state
+                .faults
+                .get_mut(&plan.fault)
+                .expect("every fault kind has a durable counter") += 1;
+        }
+        if fault.result.is_err() {
+            *state
+                .fault_failures
+                .get_mut(&plan.fault)
+                .expect("every fault kind has a durable failure counter") += 1;
+        }
+        match (assertion, fault.result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(assertion), Err(fault)) => Err(format!(
+                "round assertion failed: {assertion}; fault lifecycle also failed: {fault}"
+            )
+            .into()),
+        }
     }
 
     async fn patch_group(&self, name: &str, deployment: DeploymentSpec) -> Result<()> {
@@ -811,12 +1050,7 @@ impl Campaign {
                 match agents.get_opt(&resource).await? {
                     Some(agent) => {
                         let status = agent.status.as_ref();
-                        let exact = status.is_some_and(|status| {
-                            status.selected_group.as_deref() == Some(group)
-                                && status.reported_version.as_deref() == Some(expected)
-                                && status.reported_ready == Some(true)
-                        });
-                        if exact {
+                        if agent_is_converged(&agent, group, expected) {
                             converged += 1;
                         } else {
                             last.push(format!(
@@ -859,13 +1093,11 @@ impl Campaign {
         let started = Instant::now();
         while started.elapsed() < self.config.convergence_timeout {
             let resource = groups.get(group).await?;
-            let rejected = resource.status.as_ref().is_some_and(|status| {
-                status.conditions.iter().any(|condition| {
-                    condition.condition_type == "Ready"
-                        && condition.status == "False"
-                        && condition.reason == "Rejected"
-                })
-            });
+            let rejected = resource
+                .metadata
+                .generation
+                .zip(resource.status.as_ref())
+                .is_some_and(|(generation, status)| status_observed_rejection(status, generation));
             if rejected && self.group_is_stable(group, stable).await? {
                 println!(
                     "[soak] {group} rejected the corrupt release and recovered its predecessor"
@@ -897,32 +1129,33 @@ impl Campaign {
             let Some(agent) = agents.get_opt(&agent_resource_name(ordinal)).await? else {
                 return Ok(false);
             };
-            let Some(status) = agent.status else {
-                return Ok(false);
-            };
-            if status.reported_version.as_deref() != Some(expected)
-                || status.reported_ready != Some(true)
-            {
+            if !agent_is_converged(&agent, group, expected) {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    async fn inject_fault(&self, plan: &RoundPlan) -> Result<()> {
-        let name = format!("soak-round-{}", plan.round);
-        let (api, object) = self.fault_object(plan, &name).await?;
+    async fn inject_fault(&self, plan: &RoundPlan) -> FaultExecution {
+        let name = format!("{}{}", fixture::SOAK_CHAOS_NAME_PREFIX, plan.round);
+        let (api, object) = match self.fault_object(plan, &name).await {
+            Ok(value) => value,
+            Err(error) => {
+                return FaultExecution {
+                    injected: false,
+                    result: Err(error),
+                };
+            }
+        };
         {
             let mut metrics = self.metrics.write().expect("metrics lock poisoned");
             metrics.active_fault = Some(plan.fault);
         }
+        let mut injected = false;
         let result = async {
             api.create(&PostParams::default(), &object).await?;
             wait_chaos_injected(&api, &name).await?;
-            {
-                let mut metrics = self.metrics.write().expect("metrics lock poisoned");
-                metrics.faults[plan.fault.index()] += 1;
-            }
+            injected = true;
             println!("[soak] {} injected by Chaos Mesh", plan.fault.name());
             tokio::time::sleep(self.config.fault_duration).await;
             delete_dynamic(&api, &name).await?;
@@ -935,13 +1168,9 @@ impl Campaign {
             .expect("metrics lock poisoned")
             .active_fault = None;
         if result.is_err() {
-            self.metrics
-                .write()
-                .expect("metrics lock poisoned")
-                .fault_failures[plan.fault.index()] += 1;
             let _ = delete_dynamic(&api, &name).await;
         }
-        result
+        FaultExecution { injected, result }
     }
 
     async fn fault_object(
@@ -992,7 +1221,11 @@ impl Campaign {
         let object = serde_json::from_value(json!({
             "apiVersion": "chaos-mesh.org/v1alpha1",
             "kind": kind,
-            "metadata": {"name": name, "namespace": self.config.namespace},
+            "metadata": {
+                "name": name,
+                "namespace": self.config.namespace,
+                "labels": {fixture::SOAK_CHAOS_LABEL: fixture::SOAK_CHAOS_VALUE},
+            },
             "spec": spec,
         }))?;
         Ok((api, object))
@@ -1013,38 +1246,60 @@ impl Campaign {
             _ => Err(format!("expected one updatec controller pod, found {names:?}").into()),
         }
     }
+}
 
-    async fn cleanup_faults(&self) {
-        // PodChaos backs both kill variants, so visit each Kubernetes resource type once.
-        for kind in [
-            FaultKind::NetworkPartition,
-            FaultKind::IoError,
-            FaultKind::AgentKill,
-        ] {
-            let (resource_kind, plural) = kind.resource();
-            let api = dynamic_api(
-                self.client.clone(),
-                &self.config.namespace,
-                resource_kind,
-                plural,
-            );
-            if let Ok(objects) = api.list(&ListParams::default()).await {
-                for object in objects {
-                    if object.name_any().starts_with("soak-round-") {
-                        let _ = delete_dynamic(&api, &object.name_any()).await;
-                    }
-                }
-            }
+fn status_observed_rejection(status: &UpdateGroupStatus, generation: i64) -> bool {
+    status.observed_generation == Some(generation)
+        && status.conditions.iter().any(|condition| {
+            condition.observed_generation == Some(generation)
+                && ((condition.condition_type == updatec::status_contract::READY_CONDITION
+                    && condition.status == "False"
+                    && condition.reason == updatec::status_contract::REJECTED_REASON)
+                    || (condition.condition_type
+                        == updatec::status_contract::DEPLOYMENT_HALTED_CONDITION
+                        && condition.status == "True"
+                        && condition.reason
+                            == updatec::status_contract::REGRESSION_EVIDENCE_REASON))
+        })
+}
+
+async fn cleanup_faults(
+    client: &Client,
+    config: &Config,
+    metrics: &Arc<RwLock<Metrics>>,
+) -> Result<()> {
+    let selector = format!(
+        "{}={}",
+        fixture::SOAK_CHAOS_LABEL,
+        fixture::SOAK_CHAOS_VALUE
+    );
+    // PodChaos backs both kill variants, so visit each Kubernetes resource type once.
+    for kind in [
+        FaultKind::NetworkPartition,
+        FaultKind::IoError,
+        FaultKind::AgentKill,
+    ] {
+        let (resource_kind, plural) = kind.resource();
+        let api = dynamic_api(client.clone(), &config.namespace, resource_kind, plural);
+        let objects = api.list(&ListParams::default().labels(&selector)).await?;
+        for object in objects {
+            delete_dynamic(&api, &object.name_any()).await?;
         }
-        self.metrics
-            .write()
-            .expect("metrics lock poisoned")
-            .active_fault = None;
     }
+    metrics.write().expect("metrics lock poisoned").active_fault = None;
+    Ok(())
 }
 
 fn agent_hostname(ordinal: usize) -> String {
     format!("agent-{ordinal}")
+}
+
+fn agent_is_converged(agent: &UpdateAgent, group: &str, version: &str) -> bool {
+    agent.status.as_ref().is_some_and(|status| {
+        status.selected_group.as_deref() == Some(group)
+            && status.reported_version.as_deref() == Some(version)
+            && status.reported_ready == Some(true)
+    })
 }
 
 fn dynamic_api(client: Client, namespace: &str, kind: &str, plural: &str) -> Api<DynamicObject> {
@@ -1096,9 +1351,22 @@ async fn ensure_signing_secret(client: &Client, config: &Config) -> Result<()> {
     }
     let seed = config.state_dir.join("control-signing");
     let ready = seed.join("ready");
-    if !ready.is_file() {
+    let keys = seed.join("keys");
+    let data = if ready.is_file() {
+        match read_signing_key_data(&keys) {
+            Ok(data) => Some(data),
+            Err(error) => {
+                println!("[soak] repairing incomplete local signing-key seed: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let data = if let Some(data) = data {
+        data
+    } else {
         let repository = seed.join("repository");
-        let keys = seed.join("keys");
         if seed.exists() {
             fs::remove_dir_all(&seed)?;
         }
@@ -1111,13 +1379,10 @@ async fn ensure_signing_secret(client: &Client, config: &Config) -> Result<()> {
             keys.display().to_string(),
         ])
         .await?;
+        let data = read_signing_key_data(&keys)?;
         fs::write(&ready, b"ready")?;
-    }
-    let keys = seed.join("keys");
-    let mut data = BTreeMap::new();
-    for name in SIGNING_KEY_FILES {
-        data.insert(name.into(), ByteString(fs::read(keys.join(name))?));
-    }
+        data
+    };
     let secret = Secret {
         metadata: kube::core::ObjectMeta {
             name: Some(fixture::SIGNING_SECRET.into()),
@@ -1134,9 +1399,21 @@ async fn ensure_signing_secret(client: &Client, config: &Config) -> Result<()> {
     };
     match secrets.create(&PostParams::default(), &secret).await {
         Ok(_) => Ok(()),
-        Err(kube::Error::Api(error)) if error.code == 409 => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            let existing = secrets.get(fixture::SIGNING_SECRET).await?;
+            validate_signing_secret(&existing)
+        }
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_signing_key_data(keys: &std::path::Path) -> Result<BTreeMap<String, ByteString>> {
+    let data = updated_tuf::repo::KEY_FILE_NAMES
+        .into_iter()
+        .map(|name| Ok((name.into(), ByteString(fs::read(keys.join(name))?))))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    validate_signing_key_data(&data)?;
+    Ok(data)
 }
 
 fn validate_signing_secret(secret: &Secret) -> Result<()> {
@@ -1147,13 +1424,25 @@ fn validate_signing_secret(secret: &Secret) -> Result<()> {
         .data
         .as_ref()
         .ok_or("the TUF signing Secret has no binary data")?;
+    validate_signing_key_data(data)
+}
+
+fn validate_signing_key_data(data: &BTreeMap<String, ByteString>) -> Result<()> {
     let actual = data.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    let expected = SIGNING_KEY_FILES.into_iter().collect::<BTreeSet<_>>();
+    let expected = updated_tuf::repo::KEY_FILE_NAMES
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     if actual != expected {
         return Err(format!("the TUF signing Secret has non-canonical keys: {actual:?}").into());
     }
-    if data.values().any(|value| value.0.is_empty()) {
-        return Err("the TUF signing Secret contains an empty private key".into());
+    let mut key_ids = BTreeSet::new();
+    for (name, value) in data {
+        let id = updated_tuf::repo::signing_key_id(&value.0)
+            .map_err(|error| format!("the TUF signing Secret's {name} is invalid: {error}"))?;
+        key_ids.insert(id);
+    }
+    if key_ids.len() != data.len() {
+        return Err("the TUF signing Secret reuses one private key for multiple roles".into());
     }
     Ok(())
 }
@@ -1162,6 +1451,7 @@ async fn ensure_control_resources(
     client: &Client,
     config: &Config,
     catalog: &ReleaseCatalog,
+    state: &CampaignState,
 ) -> Result<()> {
     let sha = catalog.app_sha(BASELINE_VERSION).await?;
     let repository_deployment = catalog.deployment("default", BASELINE_VERSION, &sha);
@@ -1176,13 +1466,18 @@ async fn ensure_control_resources(
         .await?;
     let groups: Api<UpdateGroup> = Api::namespaced(client.clone(), &config.namespace);
     for name in fixture::SOAK_GROUPS {
+        let version = state
+            .desired
+            .get(name)
+            .ok_or_else(|| format!("no persisted desired version for {name}"))?;
+        let sha = catalog.app_sha(version).await?;
         groups
             .patch(
                 name,
                 &apply,
                 &Patch::Apply(&fixture::group(
                     name,
-                    catalog.deployment(name, BASELINE_VERSION, &sha),
+                    catalog.deployment(name, version, &sha),
                 )),
             )
             .await?;
@@ -1240,72 +1535,185 @@ fn append_record(
     Ok(())
 }
 
+async fn shutdown_signal() -> Result<&'static str> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    tokio::select! {
+        _ = terminate.recv() => Ok("SIGTERM"),
+        _ = interrupt.recv() => Ok("SIGINT"),
+    }
+}
+
 pub(crate) async fn run() -> Result<()> {
     let config = Config::from_env()?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut lock_wait_announced = false;
+    let _campaign_lock = loop {
+        if let Some(lock) = CampaignLock::try_acquire(&config)? {
+            break lock;
+        }
+        if !lock_wait_announced {
+            println!("[soak] another campaign process owns the state lock; waiting without reading or mutating state");
+            lock_wait_announced = true;
+        }
+        tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                let signal = signal?;
+                println!("[soak] received {signal} while waiting for the active campaign process; exiting without competing for cleanup");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    };
     let mut state = CampaignState::load(&config)?;
     state.persist(&config)?;
     let metrics = Arc::new(RwLock::new(Metrics::from_state(&state, config.agent_count)));
     tokio::spawn(serve_metrics(metrics.clone()));
     let client = Client::try_default().await?;
-
-    let campaign = loop {
-        match Campaign::bootstrap(client.clone(), config.clone(), metrics.clone()).await {
-            Ok(campaign) => break campaign,
-            Err(error) => {
-                println!("[soak] bootstrap not ready: {error}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
-    println!("[soak] release and control resources are bootstrapped");
-    campaign.wait_for_fleet().await?;
-    campaign.restore_known_good(&state).await?;
-    metrics
-        .write()
-        .expect("metrics lock poisoned")
-        .campaign_healthy = true;
-
-    loop {
-        let plan = plan_round(&state, config.agent_count);
-        let started = Instant::now();
-        state.campaigns += 1;
-        let result = campaign.run_round(&mut state, &plan).await;
-        state.round = plan.round;
-        match result {
-            Ok(()) => {
-                state.successful_campaigns += 1;
-                state.consecutive_failures = 0;
-                state.last_success_timestamp = Utc::now().timestamp();
-                append_record(&config, &plan, "succeeded", started.elapsed(), None)?;
-                println!("[soak] round {} succeeded", plan.round);
-                metrics
-                    .write()
-                    .expect("metrics lock poisoned")
-                    .campaign_healthy = true;
-            }
-            Err(error) => {
-                let message = error.to_string();
-                state.failed_campaigns += 1;
-                state.consecutive_failures += 1;
-                state.last_failure_timestamp = Utc::now().timestamp();
-                append_record(&config, &plan, "failed", started.elapsed(), Some(&message))?;
-                println!("[soak] round {} failed: {message}", plan.round);
-                metrics
-                    .write()
-                    .expect("metrics lock poisoned")
-                    .campaign_healthy = false;
-                if campaign.restore_known_good(&state).await.is_ok() {
-                    state.recoveries += 1;
-                    println!("[soak] restored the last known-good fleet state after failure");
+    let campaign = {
+        let bootstrap = async {
+            loop {
+                match Campaign::bootstrap(
+                    client.clone(),
+                    config.clone(),
+                    metrics.clone(),
+                    &mut state,
+                )
+                .await
+                {
+                    Ok(campaign) => return Ok::<Campaign, Box<dyn std::error::Error>>(campaign),
+                    Err(error) => {
+                        println!("[soak] bootstrap not ready: {error}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
+        };
+        tokio::pin!(bootstrap);
+        tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                let signal = signal?;
+                println!("[soak] received {signal} during bootstrap; removing managed faults before shutdown");
+                cleanup_faults(&client, &config, &metrics).await?;
+                println!("[soak] graceful shutdown completed with no managed fault active");
+                return Ok(());
+            }
+            campaign = &mut bootstrap => campaign?,
         }
+    };
+    println!("[soak] release, control resources, and fleet are reconciled");
+    if state.recovery_pending {
+        state.recovery_pending = false;
+        state.recoveries += 1;
         state.persist(&config)?;
         metrics
             .write()
             .expect("metrics lock poisoned")
             .sync_state(&state);
-        tokio::time::sleep(config.round_interval).await;
+        println!("[soak] completed the pending recovery from the previous process");
+    }
+
+    loop {
+        let plan = plan_round(&state, config.agent_count);
+        let started = Instant::now();
+        let (result, shutting_down) = {
+            let round = campaign.run_round(&mut state, &plan);
+            tokio::pin!(round);
+            let mut shutting_down = false;
+            let result = tokio::select! {
+                biased;
+                signal = &mut shutdown => {
+                    let signal = signal?;
+                    shutting_down = true;
+                    println!("[soak] received {signal}; finishing the in-flight fault lifecycle before shutdown");
+                    round.as_mut().await
+                }
+                result = &mut round => result,
+            };
+            (result, shutting_down)
+        };
+        state.campaigns += 1;
+        state.round = plan.round;
+        let failure = match result {
+            Ok(()) => {
+                state.successful_campaigns += 1;
+                state.consecutive_failures = 0;
+                state.last_success_timestamp = Utc::now().timestamp();
+                None
+            }
+            Err(error) => {
+                let message = error.to_string();
+                state.failed_campaigns += 1;
+                state.recovery_pending = true;
+                state.consecutive_failures += 1;
+                state.last_failure_timestamp = Utc::now().timestamp();
+                Some(message)
+            }
+        };
+        // The durable aggregate is committed before the append-only detail record or recovery.
+        // A crash during either therefore cannot erase a completed round or count it twice.
+        state.persist(&config)?;
+        {
+            let mut metrics = metrics.write().expect("metrics lock poisoned");
+            metrics.campaign_healthy = failure.is_none();
+            metrics.sync_state(&state);
+        }
+        append_record(
+            &config,
+            &plan,
+            if failure.is_some() {
+                "failed"
+            } else {
+                "succeeded"
+            },
+            started.elapsed(),
+            failure.as_deref(),
+        )?;
+
+        if let Some(message) = failure {
+            println!("[soak] round {} failed: {message}", plan.round);
+            loop {
+                match campaign.recover_forward(&mut state).await {
+                    Ok(()) => {
+                        state.recovery_pending = false;
+                        state.recoveries += 1;
+                        state.persist(&config)?;
+                        {
+                            let mut metrics = metrics.write().expect("metrics lock poisoned");
+                            metrics.campaign_healthy = true;
+                            metrics.sync_state(&state);
+                        }
+                        println!("[soak] completed forward-only fleet recovery after failure");
+                        break;
+                    }
+                    Err(error) => {
+                        println!("[soak] recovery not ready; refusing another round: {error}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        } else {
+            println!("[soak] round {} succeeded", plan.round);
+        }
+        if shutting_down {
+            cleanup_faults(&campaign.client, &campaign.config, &campaign.metrics).await?;
+            println!("[soak] graceful shutdown completed with no managed fault active");
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            signal = &mut shutdown => {
+                let signal = signal?;
+                println!("[soak] received {signal} between rounds; verifying managed faults are absent");
+                cleanup_faults(&campaign.client, &campaign.config, &campaign.metrics).await?;
+                println!("[soak] graceful shutdown completed with no managed fault active");
+                return Ok(());
+            }
+            _ = tokio::time::sleep(config.round_interval) => {}
+        }
     }
 }
 
@@ -1431,6 +1839,17 @@ mod tests {
     }
 
     #[test]
+    fn every_four_rounds_cover_every_fault_exactly_once() {
+        let expected = FaultKind::ALL.into_iter().collect::<BTreeSet<_>>();
+        for cycle in 0..100 {
+            let actual = (1..=FaultKind::ALL.len() as u64)
+                .map(|offset| fault_for_round(42, cycle * FaultKind::ALL.len() as u64 + offset))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected, "fault coverage drifted in cycle {cycle}");
+        }
+    }
+
+    #[test]
     fn campaign_versions_are_strictly_monotonic() {
         let mut previous = Version::parse(BASELINE_VERSION).unwrap();
         for round in 1..=10_000 {
@@ -1454,6 +1873,104 @@ mod tests {
     }
 
     #[test]
+    fn restart_serialization_preserves_every_aggregate_metric() {
+        let config = config();
+        let mut state = CampaignState::fresh(config.seed);
+        state.round = 1;
+        state.release_generation = 1;
+        state.campaigns = 1;
+        state.successful_campaigns = 1;
+        state.release_assignments = 1;
+        state.last_success_timestamp = 1;
+        state.last_convergence_seconds = 12.5;
+        state
+            .desired
+            .insert(fixture::SOAK_GROUPS[0].into(), "1000000.1.0".into());
+        *state.faults.get_mut(&FaultKind::IoError).unwrap() = 1;
+
+        let restored: CampaignState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        restored.validate(&config).unwrap();
+        let rendered = Metrics::from_state(&restored, config.agent_count).render();
+        assert!(rendered.contains("updatec_soak_campaigns_total 1\n"));
+        assert!(rendered.contains("updatec_soak_release_generation 1\n"));
+        assert!(rendered.contains("updatec_soak_faults_total{kind=\"io_error\"} 1\n"));
+        assert!(rendered.contains("updatec_soak_last_convergence_seconds 12.5\n"));
+    }
+
+    #[test]
+    fn persisted_state_round_trips_through_the_durable_atomic_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.state_dir = directory.path().into();
+        let mut state = CampaignState::fresh(config.seed);
+        state.round = 1;
+        state.release_generation = 1;
+        state.campaigns = 1;
+        state.successful_campaigns = 1;
+        state.release_assignments = 1;
+        state.last_success_timestamp = 1;
+        state
+            .desired
+            .insert(fixture::SOAK_GROUPS[0].into(), "1000000.1.0".into());
+        *state.faults.get_mut(&FaultKind::IoError).unwrap() = 1;
+
+        state.persist(&config).unwrap();
+        let restored = CampaignState::load(&config).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(state).unwrap()
+        );
+        assert!(!directory.path().join("campaign.json.tmp").exists());
+    }
+
+    #[test]
+    fn campaign_state_has_exactly_one_process_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.state_dir = directory.path().into();
+
+        let owner = CampaignLock::try_acquire(&config).unwrap().unwrap();
+        assert!(CampaignLock::try_acquire(&config).unwrap().is_none());
+        drop(owner);
+        assert!(CampaignLock::try_acquire(&config).unwrap().is_some());
+    }
+
+    #[test]
+    fn rejection_evidence_accepts_the_only_two_controller_verdicts_for_current_generation() {
+        let condition = |condition_type: &str, status: &str, reason: &str, generation: i64| {
+            updatec::ResourceCondition {
+                condition_type: condition_type.into(),
+                status: status.into(),
+                reason: reason.into(),
+                message: String::new(),
+                observed_generation: Some(generation),
+                last_transition_time: String::new(),
+            }
+        };
+        for verdict in [
+            condition("Ready", "False", "Rejected", 7),
+            condition("DeploymentHalted", "True", "RegressionEvidence", 7),
+        ] {
+            let status = UpdateGroupStatus {
+                observed_generation: Some(7),
+                conditions: vec![verdict],
+                ..Default::default()
+            };
+            assert!(status_observed_rejection(&status, 7));
+            assert!(!status_observed_rejection(&status, 8));
+        }
+
+        let status = UpdateGroupStatus {
+            observed_generation: Some(7),
+            conditions: vec![condition("DeploymentHalted", "False", "NoRegression", 7)],
+            ..Default::default()
+        };
+        assert!(!status_observed_rejection(&status, 7));
+    }
+
+    #[test]
     fn state_rejects_a_seed_or_group_layout_change() {
         let config = config();
         let mut state = CampaignState::fresh(config.seed);
@@ -1466,17 +1983,134 @@ mod tests {
     }
 
     #[test]
-    fn signing_secret_is_exact_and_nonempty() {
+    fn state_rejects_impossible_counters_fault_sets_and_desired_versions() {
+        let config = config();
+        let mut state = CampaignState::fresh(config.seed);
+        state.campaigns = 1;
+        assert!(state.validate(&config).is_err());
+
+        let mut state = CampaignState::fresh(config.seed);
+        state.faults.remove(&FaultKind::IoError);
+        assert!(state.validate(&config).is_err());
+
+        let mut valid = CampaignState::fresh(config.seed);
+        valid.round = 1;
+        valid.release_generation = 1;
+        valid.campaigns = 1;
+        valid.successful_campaigns = 1;
+        valid.release_assignments = 1;
+        valid.last_success_timestamp = 1;
+        *valid.faults.get_mut(&FaultKind::IoError).unwrap() = 1;
+        assert!(valid.validate(&config).is_ok());
+
+        let mut impossible = valid.clone();
+        *impossible.faults.get_mut(&FaultKind::IoError).unwrap() = 2;
+        assert!(impossible.validate(&config).is_err());
+        let mut impossible = valid.clone();
+        *impossible.faults.get_mut(&FaultKind::IoError).unwrap() = 0;
+        assert!(impossible.validate(&config).is_err());
+        let mut impossible = valid.clone();
+        *impossible
+            .fault_failures
+            .get_mut(&FaultKind::IoError)
+            .unwrap() = 1;
+        assert!(impossible.validate(&config).is_err());
+        let mut impossible = valid.clone();
+        impossible.expected_rejections = 1;
+        assert!(impossible.validate(&config).is_err());
+        let mut impossible = valid;
+        impossible.release_assignments = 0;
+        assert!(impossible.validate(&config).is_err());
+
+        assert!(validate_stable_version(BASELINE_VERSION, 0).is_ok());
+        assert!(validate_stable_version("1000000.1.0", 1).is_ok());
+        assert!(validate_stable_version("1000000.10.0", 10).is_ok());
+        assert!(validate_stable_version("1000000.11.0", 10).is_err());
+        assert!(validate_stable_version("999999.1.0", 1).is_err());
+    }
+
+    #[test]
+    fn an_observed_rejection_remains_valid_when_its_recovery_fails() {
+        let config = config();
+        let mut state = CampaignState::fresh(config.seed);
+        state.round = 10;
+        state.release_generation = 10;
+        state.campaigns = 10;
+        state.failed_campaigns = 10;
+        state.recoveries = 9;
+        state.forward_recoveries = 9;
+        state.recovery_pending = true;
+        state.consecutive_failures = 10;
+        state.release_assignments = 29;
+        state.expected_rejections = 1;
+        state.last_failure_timestamp = 1;
+        for version in state.desired.values_mut() {
+            *version = "1000000.9.0".into();
+        }
+        *state.faults.get_mut(&FaultKind::IoError).unwrap() = 1;
+
+        state.validate(&config).unwrap();
+    }
+
+    #[test]
+    fn forward_recovery_is_newer_than_the_failed_round_and_resumable() {
+        let config = config();
+        let mut recovered = CampaignState::fresh(config.seed);
+        recovered.round = 1;
+        recovered.campaigns = 1;
+        recovered.failed_campaigns = 1;
+        recovered.recoveries = 1;
+        recovered.forward_recoveries = 1;
+        recovered.release_generation = 2;
+        recovered.release_assignments = fixture::SOAK_GROUPS.len() as u64;
+        recovered.consecutive_failures = 1;
+        recovered.last_failure_timestamp = 1;
+        for version in recovered.desired.values_mut() {
+            *version = "1000000.2.0".into();
+        }
+        recovered.validate(&config).unwrap();
+
+        let mut pending = recovered;
+        pending.round = 2;
+        pending.campaigns = 2;
+        pending.failed_campaigns = 2;
+        pending.recovery_pending = true;
+        pending.release_generation = 3;
+        pending.recovery_target = Some("1000000.3.0".into());
+        pending.consecutive_failures = 2;
+        pending.validate(&config).unwrap();
+
+        pending.recovery_target = Some("1000000.2.0".into());
+        assert!(pending.validate(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn signing_secret_is_exact_and_cryptographically_valid() {
+        let directory = tempfile::tempdir().unwrap();
+        updated_tuf::repo::generate_keys(directory.path())
+            .await
+            .unwrap();
         let mut secret = Secret {
             type_: Some("Opaque".into()),
             data: Some(
-                SIGNING_KEY_FILES
+                updated_tuf::repo::KEY_FILE_NAMES
                     .into_iter()
-                    .map(|name| (name.into(), ByteString(vec![1])))
+                    .map(|name| {
+                        (
+                            name.into(),
+                            ByteString(std::fs::read(directory.path().join(name)).unwrap()),
+                        )
+                    })
                     .collect(),
             ),
             ..Default::default()
         };
+        assert_eq!(
+            read_signing_key_data(directory.path()).unwrap().len(),
+            updated_tuf::repo::KEY_FILE_NAMES.len()
+        );
+        std::fs::write(directory.path().join("targets.pk8"), []).unwrap();
+        assert!(read_signing_key_data(directory.path()).is_err());
         assert!(validate_signing_secret(&secret).is_ok());
         secret
             .data
@@ -1485,11 +2119,23 @@ mod tests {
             .insert("extra.pk8".into(), ByteString(vec![1]));
         assert!(validate_signing_secret(&secret).is_err());
         secret.data.as_mut().unwrap().remove("extra.pk8");
+        let targets = secret.data.as_ref().unwrap()["targets.pk8"].clone();
+        let root = secret.data.as_ref().unwrap()["root.pk8"].clone();
         secret
             .data
             .as_mut()
             .unwrap()
-            .insert(SIGNING_KEY_FILES[0].into(), ByteString(Vec::new()));
+            .insert("targets.pk8".into(), root);
+        assert!(validate_signing_secret(&secret).is_err());
+        secret
+            .data
+            .as_mut()
+            .unwrap()
+            .insert("targets.pk8".into(), targets);
+        secret.data.as_mut().unwrap().insert(
+            updated_tuf::repo::KEY_FILE_NAMES[0].into(),
+            ByteString(b"not a private key".to_vec()),
+        );
         assert!(validate_signing_secret(&secret).is_err());
     }
 }
