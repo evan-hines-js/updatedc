@@ -42,7 +42,7 @@ spec:
         updated.dev/chaos-target: "true"
     spec:
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {fsGroup: 1000, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" 1000) | nindent 8 }}
       initContainers:
         - name: assemble-tls-bundle
           image: {{ include "soak.image" . }}
@@ -141,10 +141,7 @@ spec:
     spec:
       restartPolicy: OnFailure
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext:
-        fsGroup: 1000
-        fsGroupChangePolicy: OnRootMismatch
-        seccompProfile: {type: RuntimeDefault}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" 1000) | nindent 8 }}
       containers:
         - name: initialize
           image: {{ .Values.minio.clientImage | quote }}

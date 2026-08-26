@@ -67,13 +67,15 @@ gateway everything above; bring-your-own ServiceAccounts must now be named expli
 The one pod-level security context for every updatec workload. Kubernetes Secret projections are
 owned by root; both binaries deliberately run as the same non-root UID. Making that UID the pod's
 supplemental group lets credential volumes use 0440 instead of Kubernetes' world-readable 0644
-default. `fsGroup` is derived here from the container identity and removed from the free-form map,
-so a values override cannot accidentally give the file-reading group and the process different
-identities in only one workload.
+default. A recursive fsGroup rewrite on every mount would also widen durable owner-only signing
+keys from 0600 to 0660. `OnRootMismatch` prepares a new volume once, before any keys exist, and
+never rewrites its contents afterward. Both fields are derived here and removed from the free-form
+map, so a values override cannot weaken only one workload.
 */}}
 {{- define "updatec.podSecurityContext" -}}
 fsGroup: {{ required "securityContext.runAsUser is required so private Secret projections can be group-readable only" .Values.securityContext.runAsUser }}
-{{- omit .Values.podSecurityContext "fsGroup" | toYaml | nindent 0 }}
+fsGroupChangePolicy: OnRootMismatch
+{{- omit .Values.podSecurityContext "fsGroup" "fsGroupChangePolicy" | toYaml | nindent 0 }}
 {{- end -}}
 
 {{/*

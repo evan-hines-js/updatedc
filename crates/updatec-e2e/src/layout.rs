@@ -210,17 +210,10 @@ pub(crate) fn alert_url() -> String {
 /// document and silently drain the whole fleet, so the test below tracks the production constructor.
 pub(crate) const HEALTH_CDN: &str = "http://minio:9000/updates/routing/updated-system/default";
 
-/// The release repository's internal publishing endpoint and TLS public read endpoint. They name
-/// the same bucket/prefix: publishers use cluster-local credentials; agents use anonymous HTTPS
-/// and never present their control-plane identity to MinIO.
-pub(crate) const RELEASE_ENDPOINT: &str = "http://minio:9000";
-pub(crate) const RELEASE_PUBLIC_ENDPOINT: &str = "https://minio-direct.updated-system.svc";
-pub(crate) const RELEASE_BUCKET: &str = "updates";
-pub(crate) const RELEASE_PREFIX: &str = "releases";
-pub(crate) const RELEASE_REGION: &str = "us-east-1";
-
 /// The flags every `updatectl` invocation addresses that repository with.
 pub(crate) fn release_repository_flags() -> String {
+    use crate::fixture::{RELEASE_BUCKET, RELEASE_ENDPOINT, RELEASE_PREFIX, RELEASE_REGION};
+
     format!(
         "--bucket {RELEASE_BUCKET} --prefix {RELEASE_PREFIX} \
          --endpoint {RELEASE_ENDPOINT} --region {RELEASE_REGION}"
@@ -229,6 +222,8 @@ pub(crate) fn release_repository_flags() -> String {
 
 /// The URL a group's signed `releaseRepository` resolves `namespace` (`metadata`/`targets`) from.
 pub(crate) fn release_repository_url(namespace: &str) -> String {
+    use crate::fixture::{RELEASE_BUCKET, RELEASE_PREFIX, RELEASE_PUBLIC_ENDPOINT};
+
     format!("{RELEASE_PUBLIC_ENDPOINT}/{RELEASE_BUCKET}/{RELEASE_PREFIX}/{namespace}/")
 }
 

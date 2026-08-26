@@ -187,6 +187,26 @@ ANSIBLE_CONFIG="$here/ansible/ansible.cfg" ansible-playbook \
   "$here/ansible/site.yml"
 
 export KUBECONFIG="$state_dir/kubeconfig.yaml"
+
+soak_metrics() {
+  kubectl get --raw \
+    /api/v1/namespaces/updated-system/services/http:updatec-soak-metrics:9091/proxy/metrics
+}
+
+soak_metric() {
+  local exposition=$1 name=$2
+  awk -v name="$name" '$1 == name { print $2; found = 1 } END { if (!found) exit 1 }' \
+    <<<"$exposition"
+}
+
+soak_fault_sum() {
+  local exposition=$1 series=$2
+  awk -v series="$series" '
+    index($1, series "{") == 1 { sum += $2; found = 1 }
+    END { if (!found) exit 1; printf "%.0f\n", sum }
+  ' <<<"$exposition"
+}
+
 helm upgrade --install chaos-mesh "$UPDATEDC_CHAOS_MESH_CHART" \
   --namespace chaos-mesh --create-namespace \
   --values "$here/chaos-mesh-values.yaml" \
@@ -259,11 +279,16 @@ kubectl -n updated-system create secret generic s3-credentials \
   --from-literal=AWS_SECRET_ACCESS_KEY="$s3_password" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# The campaign first publishes the release corpus and creates its typed control resources. Agents
-# are enabled only after the real chart is installed, avoiding a second bootstrap ordering path.
-helm upgrade --install updatec-soak "$here/soak" --namespace updated-system \
-  --set image.repository=updatec-chaos-e2e --set image.tag="$e2e_fingerprint" \
-  --set agents.enabled=false --wait --timeout 15m
+# A deploy is qualified only by a new campaign round. Capture the durable counters before changing
+# anything; a historical success cannot certify the binaries and manifests being installed now.
+metrics_before=$(soak_metrics 2>/dev/null || true)
+successful_campaigns_before=$(soak_metric "$metrics_before" updatec_soak_successful_campaigns_total 2>/dev/null || printf '0\n')
+faults_before=$(soak_fault_sum "$metrics_before" updatec_soak_faults_total 2>/dev/null || printf '0\n')
+
+# Install the product first, then the complete campaign exactly once. The gateway and launchers
+# reconcile while the campaign creates the repository and enrollment state; only require their
+# readiness after that bootstrap, so deployment has no alternate agents-off topology or ordering
+# deadlock.
 helm upgrade --install updatec "$lab_root/../../deploy/charts/updatec" \
   --namespace updated-system \
   --values "$here/updatec-values.yaml" \
@@ -271,11 +296,16 @@ helm upgrade --install updatec "$lab_root/../../deploy/charts/updatec" \
   --set healthproxy.image.repository=updatec-chaos-e2e \
   --set healthproxy.image.tag="$e2e_fingerprint"
 kubectl -n updated-system rollout status deployment/updatec-controller --timeout=600s
-kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=600s
-helm upgrade updatec-soak "$here/soak" --namespace updated-system \
+helm upgrade --install updatec-soak "$here/soak" --namespace updated-system \
   --set image.repository=updatec-chaos-e2e --set image.tag="$e2e_fingerprint" \
   --set agents.enabled=true --wait --timeout 15m
+kubectl -n updated-system rollout status deployment/updatec-gateway --timeout=600s
 kubectl -n updated-system rollout status statefulset/agent --timeout=900s
+configured_agents=$(kubectl -n updated-system get statefulset agent -o jsonpath='{.spec.replicas}')
+[[ $configured_agents =~ ^[1-9][0-9]*$ ]] || {
+  echo "The campaign StatefulSet has an invalid replica count: $configured_agents" >&2
+  exit 65
+}
 
 grafana_password_file="$state_dir/grafana-admin-password"
 if [[ ! -s $grafana_password_file ]]; then
@@ -340,5 +370,44 @@ curl --fail --silent --show-error --max-time 10 \
   jq -e '.login == "admin" and .isGrafanaAdmin == true' >/dev/null
 
 UPDATEDC_CHAOS_INTERNAL=1 "$here/qualify.sh"
+
+qualification_deadline=$((SECONDS + 900))
+qualification_attempt=0
+campaign_qualified=false
+while (( SECONDS < qualification_deadline )); do
+  current_metrics=$(soak_metrics 2>/dev/null || true)
+  successful_campaigns=$(soak_metric "$current_metrics" updatec_soak_successful_campaigns_total 2>/dev/null || printf '0\n')
+  faults=$(soak_fault_sum "$current_metrics" updatec_soak_faults_total 2>/dev/null || printf '0\n')
+  active_faults=$(soak_fault_sum "$current_metrics" updatec_soak_fault_active 2>/dev/null || printf '1\n')
+  campaign_healthy=$(soak_metric "$current_metrics" updatec_soak_campaign_healthy 2>/dev/null || printf '0\n')
+  expected_nodes=$(soak_metric "$current_metrics" updatec_soak_fleet_expected_nodes 2>/dev/null || printf '0\n')
+  converged_nodes=$(soak_metric "$current_metrics" updatec_soak_fleet_converged_nodes 2>/dev/null || printf '0\n')
+  for value in "$successful_campaigns" "$faults" "$active_faults" "$campaign_healthy" "$expected_nodes" "$converged_nodes"; do
+    [[ $value =~ ^[0-9]+$ ]] || { echo "Campaign published a non-integer qualification metric: $value" >&2; exit 65; }
+  done
+
+  if (( successful_campaigns > successful_campaigns_before &&
+        faults > faults_before &&
+        active_faults == 0 &&
+        campaign_healthy == 1 &&
+        expected_nodes == configured_agents &&
+        converged_nodes == expected_nodes )); then
+    echo "Permanent campaign qualified: a new faulted round converged all $expected_nodes agents and recovered cleanly."
+    campaign_qualified=true
+    break
+  fi
+
+  if (( qualification_attempt % 6 == 0 )); then
+    echo "Waiting for a new permanent campaign success (successes $successful_campaigns/$((successful_campaigns_before + 1)), faults $faults/$((faults_before + 1)), fleet $converged_nodes/$expected_nodes)..."
+  fi
+  qualification_attempt=$((qualification_attempt + 1))
+  sleep 5
+done
+if ! $campaign_qualified; then
+  echo 'Permanent campaign did not complete a new faulted, fully recovered round within 15 minutes.' >&2
+  kubectl -n updated-system logs deployment/updatec-soak --tail=200 >&2 || true
+  exit 1
+fi
+
 echo "updatec chaos lab is ready; kubeconfig: $KUBECONFIG"
 echo "Grafana: http://10.0.0.250:30300 (admin password: $grafana_password_file)"

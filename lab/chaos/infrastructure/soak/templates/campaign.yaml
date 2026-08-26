@@ -157,7 +157,7 @@ spec:
     spec:
       serviceAccountName: updatec-soak
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.agentUid" .)) | nindent 8 }}
       containers:
         - name: campaign
           image: {{ include "soak.image" . }}

@@ -3467,6 +3467,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

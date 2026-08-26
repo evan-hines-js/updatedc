@@ -21,6 +21,7 @@ use k8s_openapi::ByteString;
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::{Api, Client, ResourceExt};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,8 +31,9 @@ use updatec::{DeploymentSpec, UpdateAgent, UpdateGroup, UpdateGroupSet, UpdateRe
 
 use crate::{agent_resource_name, fixture};
 
-const STATE_SCHEMA: u8 = 1;
+const STATE_SCHEMA: u8 = 2;
 const BASELINE_VERSION: &str = "1.0.0";
+const CAMPAIGN_VERSION_MAJOR: u64 = 1_000_000;
 const METRICS_PORT: u16 = 9091;
 const METRICS_MAX_REQUEST: usize = 8 * 1024;
 const SIGNING_KEY_FILES: [&str; 5] = [
@@ -472,8 +474,17 @@ struct ReleaseCatalog {
     platform: String,
     root_json: String,
     provider_sha: String,
-    valid_versions: Vec<String>,
     release_data: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum CandidateKind {
+    Valid,
+    Corrupt,
+}
+
+fn campaign_version(round: u64) -> Version {
+    Version::new(CAMPAIGN_VERSION_MAJOR, round, 0)
 }
 
 impl ReleaseCatalog {
@@ -487,23 +498,17 @@ impl ReleaseCatalog {
             .to_owned();
         let root_json =
             fs::read_to_string(config.release_data.join("repository/metadata/root.json"))?;
-        let valid_versions = fs::read_to_string(config.release_data.join("valid-versions"))?
-            .lines()
-            .map(str::trim)
-            .filter(|version| !version.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if valid_versions.len() < 3 || !valid_versions.iter().any(|v| v == BASELINE_VERSION) {
-            return Err("release catalog has no usable baseline corpus".into());
-        }
         let mut catalog = Self {
             platform,
             root_json,
             provider_sha: String::new(),
-            valid_versions,
             release_data: config.release_data.clone(),
         };
         catalog.provider_sha = catalog.target_sha("provider-sets/default.json").await?;
+        catalog
+            .app_sha(BASELINE_VERSION)
+            .await
+            .map_err(|error| format!("release catalog has no usable baseline: {error}"))?;
         Ok(catalog)
     }
 
@@ -537,20 +542,8 @@ impl ReleaseCatalog {
         )
     }
 
-    fn next_valid(&self, state: &CampaignState, plan: &RoundPlan, group: &str) -> &str {
-        let mut cursor = (plan.seed as usize ^ group.len()) % self.valid_versions.len();
-        for _ in 0..self.valid_versions.len() {
-            let candidate = &self.valid_versions[cursor];
-            if state.desired.get(group) != Some(candidate) {
-                return candidate;
-            }
-            cursor = (cursor + 1) % self.valid_versions.len();
-        }
-        unreachable!("the validated release corpus has more than one version")
-    }
-
-    async fn ensure_corrupt(&self, round: u64) -> Result<(String, String)> {
-        let version = format!("1000000.{round}.0");
+    async fn ensure_candidate(&self, round: u64, kind: CandidateKind) -> Result<(String, String)> {
+        let version = campaign_version(round).to_string();
         let target = format!("products/app/stable/{version}/{}/app", self.platform);
         if let Ok(sha) = self.target_sha(&target).await {
             return Ok((version, sha));
@@ -559,10 +552,20 @@ impl ReleaseCatalog {
         fs::create_dir_all(source.join("bin"))?;
         fs::create_dir_all(source.join("config"))?;
         let app = source.join("bin/app");
-        fs::write(
-            &app,
-            format!("intentionally corrupt soak release {version}\n"),
-        )?;
+        match kind {
+            CandidateKind::Valid => {
+                let artifact = if round.is_multiple_of(2) {
+                    "stateful-like"
+                } else {
+                    "sampleapp"
+                };
+                fs::copy(format!("/usr/local/bin/{artifact}"), &app)?;
+            }
+            CandidateKind::Corrupt => fs::write(
+                &app,
+                format!("intentionally corrupt soak release {version}\n"),
+            )?,
+        }
         fs::set_permissions(&app, fs::Permissions::from_mode(0o755))?;
         fs::write(
             source.join("config/release.toml"),
@@ -718,12 +721,14 @@ impl Campaign {
 
     async fn run_valid_round(&self, state: &mut CampaignState, plan: &RoundPlan) -> Result<()> {
         let mut desired = state.desired.clone();
+        let (version, sha) = self
+            .catalog
+            .ensure_candidate(plan.round, CandidateKind::Valid)
+            .await?;
         for group in &plan.groups {
-            let version = self.catalog.next_valid(state, plan, group).to_owned();
-            let sha = self.catalog.app_sha(&version).await?;
             self.patch_group(group, self.catalog.deployment(group, &version, &sha))
                 .await?;
-            desired.insert(group.clone(), version);
+            desired.insert(group.clone(), version.clone());
             state.release_assignments += 1;
         }
         let convergence = self.wait_converged(&desired);
@@ -742,7 +747,10 @@ impl Campaign {
             .groups
             .first()
             .expect("a rejection round has one group");
-        let (bad_version, bad_sha) = self.catalog.ensure_corrupt(plan.round).await?;
+        let (bad_version, bad_sha) = self
+            .catalog
+            .ensure_candidate(plan.round, CandidateKind::Corrupt)
+            .await?;
         self.patch_group(
             group,
             self.catalog.deployment(group, &bad_version, &bad_sha),
@@ -754,7 +762,11 @@ impl Campaign {
         tokio::try_join!(rejected, fault)?;
         state.expected_rejections += 1;
 
-        let recovery_version = self.catalog.next_valid(state, plan, group).to_owned();
+        let recovery_version = state
+            .desired
+            .get(group)
+            .ok_or_else(|| format!("no stable version for {group}"))?
+            .clone();
         let recovery_sha = self.catalog.app_sha(&recovery_version).await?;
         self.patch_group(
             group,
@@ -763,14 +775,11 @@ impl Campaign {
         )
         .await?;
         state.release_assignments += 1;
-        let mut desired = state.desired.clone();
-        desired.insert(group.clone(), recovery_version);
-        let duration = self.wait_converged(&desired).await?;
+        let duration = self.wait_converged(&state.desired).await?;
         self.metrics
             .write()
             .expect("metrics lock poisoned")
             .last_convergence_seconds = duration.as_secs_f64();
-        state.desired = desired;
         Ok(())
     }
 
@@ -1419,6 +1428,16 @@ mod tests {
         let tenth = plan_round(&state, 6);
         assert!(tenth.expected_rejection);
         assert_eq!(tenth.groups.len(), 1);
+    }
+
+    #[test]
+    fn campaign_versions_are_strictly_monotonic() {
+        let mut previous = Version::parse(BASELINE_VERSION).unwrap();
+        for round in 1..=10_000 {
+            let current = campaign_version(round);
+            assert!(current > previous, "{current} did not follow {previous}");
+            previous = current;
+        }
     }
 
     #[test]

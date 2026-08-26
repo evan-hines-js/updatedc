@@ -28,7 +28,7 @@ spec:
         updated.dev/chaos-target: "true"
     spec:
       nodeSelector: {updated.dev/chaos-role: storage}
-      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {{- include "soak.podSecurityContext" (dict "uid" (include "soak.agentUid" .)) | nindent 8 }}
       containers:
         - name: release-server
           image: {{ include "soak.image" . }}

@@ -45,8 +45,43 @@ spec:
           whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels: {app.kubernetes.io/name: updated-agent}
-      securityContext: {fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      securityContext: {seccompProfile: {type: RuntimeDefault}}
       terminationGracePeriodSeconds: 30
+      initContainers:
+        # fsGroup recursively grants group access when a PVC is remounted, which turns the
+        # durable node key from 0600 into 0660. Prepare ownership explicitly instead: the agent's
+        # owner-only key check then remains true across every pod replacement.
+        - name: prepare-private-state
+          image: {{ include "soak.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              uid={{ include "soak.agentUid" . }}
+              install -d -o "$uid" -g "$uid" -m 0700 /var/lib/updated /var/lib/updated/launcher /prepared-tls
+              chown -R "$uid:$uid" /var/lib/updated
+              if [ -e /var/lib/updated/launcher/agent.key ]; then
+                chmod 0600 /var/lib/updated/launcher/agent.key
+              fi
+              cp /source-tls/ca.crt /source-tls/tls.crt /source-tls/tls.key /prepared-tls/
+              chown "$uid:$uid" /prepared-tls/*
+              chmod 0400 /prepared-tls/ca.crt /prepared-tls/tls.crt /prepared-tls/tls.key
+          resources:
+            requests: {cpu: 5m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 32Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL], add: [CHOWN, DAC_OVERRIDE, FOWNER]}
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+          volumeMounts:
+            # Chaos Mesh's toda moves the target mount to a sibling named
+            # /var/lib/__chaosfs__updated__. Give that one parent a writable mount namespace while
+            # keeping the rest of the container root read-only.
+            - {name: chaos-mount-workspace, mountPath: /var/lib}
+            - {name: state, mountPath: /var/lib/updated}
+            - {name: agent-tls-source, mountPath: /source-tls, readOnly: true}
+            - {name: agent-tls, mountPath: /prepared-tls}
       containers:
         - name: agent
           image: {{ include "soak.image" . }}
@@ -61,14 +96,20 @@ spec:
             capabilities: {drop: [ALL]}
             readOnlyRootFilesystem: true
             runAsNonRoot: true
-            runAsUser: 65532
+            runAsUser: {{ include "soak.agentUid" . }}
+            runAsGroup: {{ include "soak.agentUid" . }}
           volumeMounts:
+            # toda moves /var/lib/updated to a sibling while installing its FUSE mount. The
+            # writable parent is deliberately narrower than making the container root writable.
+            - {name: chaos-mount-workspace, mountPath: /var/lib}
             - {name: state, mountPath: /var/lib/updated}
             - {name: tmp, mountPath: /tmp}
             - {name: agent-tls, mountPath: /etc/agent-tls, readOnly: true}
       volumes:
+        - {name: chaos-mount-workspace, emptyDir: {sizeLimit: 16Mi}}
         - {name: tmp, emptyDir: {medium: Memory, sizeLimit: 128Mi}}
-        - {name: agent-tls, secret: {secretName: agent-tls}}
+        - {name: agent-tls-source, secret: {secretName: agent-tls}}
+        - {name: agent-tls, emptyDir: {medium: Memory, sizeLimit: 1Mi}}
   volumeClaimTemplates:
     - metadata: {name: state}
       spec:

@@ -252,9 +252,47 @@ run_charts() {
   local pinned_manifests="$WORK/pinned.yaml"
   local digest_manifests="$WORK/digest.yaml"
   local default_manifests="$WORK/default.yaml"
+  local soak_manifests="$WORK/soak.yaml"
 
   section "Helm lint"
   helm lint deploy/charts/updatec --set publicUrl=https://updates.example
+  helm lint lab/chaos/infrastructure/soak
+
+  helm template updatec-soak lab/chaos/infrastructure/soak -n updated-system \
+    >"$soak_manifests"
+  python3 - "$soak_manifests" <<'PY'
+import sys, yaml
+documents = [doc for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")) if doc]
+for doc in documents:
+    pod = None
+    if doc["kind"] in ("Deployment", "StatefulSet"):
+        pod = doc["spec"]["template"]["spec"]
+    elif doc["kind"] == "Job":
+        pod = doc["spec"]["template"]["spec"]
+    if pod and "fsGroup" in pod.get("securityContext", {}):
+        assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch", doc["metadata"]["name"]
+agents = next(doc for doc in documents if doc["kind"] == "StatefulSet" and doc["metadata"]["name"] == "agent")
+pod = agents["spec"]["template"]["spec"]
+assert "fsGroup" not in pod["securityContext"], pod["securityContext"]
+runtime = next(container for container in pod["containers"] if container["name"] == "agent")
+prepare = next(container for container in pod["initContainers"] if container["name"] == "prepare-private-state")
+runtime_uid = runtime["securityContext"]["runAsUser"]
+assert runtime_uid == 65532, runtime_uid
+assert runtime["securityContext"]["runAsGroup"] == runtime_uid, runtime["securityContext"]
+assert runtime["securityContext"]["readOnlyRootFilesystem"] is True, runtime["securityContext"]
+assert f"uid={runtime_uid}" in prepare["args"][0], prepare["args"]
+assert 'chown -R "$uid:$uid" /var/lib/updated' in prepare["args"][0], prepare["args"]
+assert "chmod 0600 /var/lib/updated/launcher/agent.key" in prepare["args"][0], prepare["args"]
+assert "chmod 0400 /prepared-tls/ca.crt /prepared-tls/tls.crt /prepared-tls/tls.key" in prepare["args"][0], prepare["args"]
+volumes = {volume["name"]: volume for volume in pod["volumes"]}
+assert volumes["agent-tls-source"]["secret"]["secretName"] == "agent-tls", volumes
+assert volumes["agent-tls"]["emptyDir"]["medium"] == "Memory", volumes
+assert volumes["chaos-mount-workspace"]["emptyDir"]["sizeLimit"] == "16Mi", volumes
+mounts = {mount["name"]: mount["mountPath"] for mount in runtime["volumeMounts"]}
+assert mounts["chaos-mount-workspace"] == "/var/lib", mounts
+assert mounts["state"] == "/var/lib/updated", mounts
+print("ok: soak agents prepare private keys and the narrow writable parent IOChaos needs")
+PY
 
   section "Helm safety guardrails"
   must_refuse_chart "a control plane with no publicUrl" \
@@ -449,6 +487,8 @@ PY
     --set publicUrl=https://updates.example \
     --set controller.alerting.url=https://alerts.example \
     --set controller.alerting.tokenSecret=alert-token \
+    --set podSecurityContext.fsGroup=123 \
+    --set podSecurityContext.fsGroupChangePolicy=Always \
     --set 'gateway.secretResourceNames={updatedc-store}' >"$pinned_manifests"
   # The RBAC below grants the durable admitted-state ConfigMaps BY EXACT NAME, so the chart has to
   # spell out every shard the controller could ever write. That count is `MAX_ADMITTED_STATE_SHARDS`
@@ -523,6 +563,7 @@ for doc in yaml.safe_load_all(open(sys.argv[1], encoding="utf-8")):
       assert len(containers) == 1, doc["metadata"]["name"]
       run_as = containers[0]["securityContext"]["runAsUser"]
       assert pod["securityContext"]["fsGroup"] == run_as, doc["metadata"]["name"]
+      assert pod["securityContext"]["fsGroupChangePolicy"] == "OnRootMismatch", doc["metadata"]["name"]
       for volume in pod.get("volumes", []):
         if "secret" not in volume:
           continue
@@ -576,7 +617,7 @@ assert controller_slice_denied, "the controller can exercise its delegation-only
 assert gateway_agent_boundary, "gateway UpdateAgent writes have no fail-closed field boundary"
 assert gateway_agent_binding, "gateway UpdateAgent boundary is not pinned to its repository parameter"
 assert credential_projections == 3, credential_projections
-print("ok: separate identities, owner-group-only credentials, and Secret, UpdateAgent, ConfigMap, and EndpointSlice authority explicitly bounded")
+print("ok: separate identities, one-time volume ownership, owner-group-only credentials, and Secret, UpdateAgent, ConfigMap, and EndpointSlice authority explicitly bounded")
 PY
   helm template updatec deploy/charts/updatec -n updated-system \
     --set publicUrl=https://updates.example \

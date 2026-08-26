@@ -18,6 +18,8 @@ pub(crate) const REPOSITORY_NAME: &str = "default";
 pub(crate) const RELEASE_ENDPOINT: &str = "http://minio:9000";
 pub(crate) const RELEASE_PUBLIC_ENDPOINT: &str = "https://minio-direct.updated-system.svc";
 pub(crate) const RELEASE_BUCKET: &str = "updates";
+pub(crate) const RELEASE_PREFIX: &str = "releases";
+pub(crate) const RELEASE_REGION: &str = "us-east-1";
 pub(crate) const SIGNING_SECRET: &str = "tuf-signing-keys";
 pub(crate) const STORAGE_SECRET: &str = "s3-credentials";
 pub(crate) const SOAK_FLEET_LABEL: &str = "soak.updated.dev/fleet";
@@ -126,7 +128,7 @@ pub(crate) fn repository(default_deployment: DeploymentSpec) -> UpdateRepository
             },
             s3: RepositoryStorage {
                 bucket: RELEASE_BUCKET.into(),
-                region: "us-east-1".into(),
+                region: RELEASE_REGION.into(),
                 credentials_secret_ref: Some(LocalSecretReference {
                     name: STORAGE_SECRET.into(),
                 }),
