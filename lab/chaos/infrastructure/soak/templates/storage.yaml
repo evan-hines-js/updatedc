@@ -7,6 +7,8 @@ data:
   haproxy.cfg: |
     global
       log stdout format raw local0
+      maxconn 256
+      nbthread 1
     defaults
       mode http
       log global
@@ -83,7 +85,7 @@ spec:
           image: {{ include "soak.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: [/usr/sbin/haproxy]
-          args: [-W, -db, -f, /etc/haproxy/haproxy.cfg]
+          args: [-db, -f, /etc/haproxy/haproxy.cfg]
           ports: [{name: tls, containerPort: 8443}]
           readinessProbe: {tcpSocket: {port: tls}, periodSeconds: 5}
           livenessProbe: {tcpSocket: {port: tls}, periodSeconds: 15}
