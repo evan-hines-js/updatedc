@@ -97,7 +97,7 @@ impl Identity {
     /// roots for private HTTPS object stores. Only an absent CA is optional; a present CA that is
     /// unreadable or malformed fails closed instead of silently changing the trust policy.
     pub fn reqwest_direct_object_client(&self) -> io::Result<reqwest::Client> {
-        match self.ca.try_exists()? {
+        match foundation::file::path_entry_exists(&self.ca)? {
             true => self.reqwest_capability_client(),
             false => anonymous_object_client(),
         }
@@ -374,6 +374,16 @@ mod tests {
         identity
             .reqwest_direct_object_client()
             .expect("an absent optional CA uses public roots");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(directory.path().join("missing-ca"), &ca).unwrap();
+            assert!(
+                identity.reqwest_direct_object_client().is_err(),
+                "a dangling configured CA is present-but-unreadable, never absent"
+            );
+            std::fs::remove_file(&ca).unwrap();
+        }
 
         std::fs::write(&ca, b"not a PEM certificate").unwrap();
         assert!(

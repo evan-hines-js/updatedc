@@ -22,9 +22,46 @@ pub mod alerts;
 /// admission, monitoring, or campaign assertions that depend on a semantic verdict.
 pub mod status_contract {
     pub const READY_CONDITION: &str = "Ready";
+    pub const ROLLOUT_STUCK_CONDITION: &str = "RolloutStuck";
+    pub const REPORTS_STALE_CONDITION: &str = "ReportsStale";
     pub const DEPLOYMENT_HALTED_CONDITION: &str = "DeploymentHalted";
+    pub const RECONCILE_FAILING_CONDITION: &str = "ReconcileFailing";
+    pub const ROOT_RENEWAL_CONDITION: &str = "RootRenewal";
+    pub const RELEASE_ADMISSION_CONDITION: &str = "ReleaseAdmission";
+    pub const ENROLLMENT_CAPACITY_CONDITION: &str = "EnrollmentCapacity";
+    pub const CONDITION_TRUE: &str = "True";
+    pub const CONDITION_FALSE: &str = "False";
     pub const REJECTED_REASON: &str = "Rejected";
     pub const REGRESSION_EVIDENCE_REASON: &str = "RegressionEvidence";
+
+    /// Assemble the one Kubernetes condition wire shape from an observed verdict.
+    ///
+    /// Alert projections, ordinary status writers, and subscription delivery all provide their
+    /// own clock because they observe transitions at different boundaries. They do not get to
+    /// restate how a boolean verdict maps onto the Kubernetes condition fields: keeping that here
+    /// makes `True`/`False`, generation binding, and transition stamping one invariant.
+    pub(crate) fn condition(
+        condition_type: &str,
+        active: bool,
+        observed_generation: Option<i64>,
+        reason: &str,
+        message: impl Into<String>,
+        last_transition_time: impl Into<String>,
+    ) -> super::ResourceCondition {
+        super::ResourceCondition {
+            condition_type: condition_type.into(),
+            status: if active {
+                CONDITION_TRUE
+            } else {
+                CONDITION_FALSE
+            }
+            .into(),
+            reason: reason.into(),
+            message: message.into(),
+            observed_generation,
+            last_transition_time: last_transition_time.into(),
+        }
+    }
 }
 pub mod crd;
 pub(crate) mod dataflow;
@@ -1455,7 +1492,8 @@ pub(crate) fn resolve_node_groups(
     let mut node_groups = BTreeMap::new();
     for node in nodes {
         let name = node.name;
-        if !updated_contracts::telemetry::is_valid_node(&name) || node_groups.contains_key(&name) {
+        if !updated_contracts::identity::is_dns_subdomain(&name) || node_groups.contains_key(&name)
+        {
             return if node_groups.contains_key(&name) {
                 Err(PlanError::DuplicateNode(name))
             } else {

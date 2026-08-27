@@ -51,9 +51,10 @@ data channel—and only the exact current report schema is accepted.
 The plane remembers each claim it has seen (node, assignment identity) so that one unreadable report
 object cannot un-halt a proven-bad release for a pass; the memory is monotone, is bounded by the
 live fleet and the live deployment identities, and needs no durability because the claim stands in
-the node's own report and is re-read on the next pass. A node WITHDRAWING its claim — the operator
-break-glassed its rejection record — is honoured, because the alternative is a halt whose evidence
-the operator has already destroyed.
+the node's own report and is re-read on the next pass. The memory is monotone for each live
+`(node, deployment identity)` pair: a later negative report cannot erase proven-bad evidence.
+Publishing corrected bytes creates a new identity and retires the old claim; a node that leaves the
+fleet is pruned separately.
 
 ## Verdict
 

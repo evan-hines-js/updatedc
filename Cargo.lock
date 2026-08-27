@@ -2814,7 +2814,6 @@ version = "0.1.0"
 dependencies = [
  "foundation",
  "rcgen",
- "same-file",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2823,7 +2822,6 @@ dependencies = [
  "updated",
  "updated-contracts",
  "updated-tuf",
- "url",
 ]
 
 [[package]]
@@ -3464,9 +3462,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "demo-lifecycle",
+ "foundation",
  "k8s-openapi",
  "kube",
- "libc",
  "reqwest",
  "semver",
  "serde",

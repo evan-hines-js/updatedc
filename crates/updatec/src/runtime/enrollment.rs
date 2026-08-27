@@ -294,7 +294,7 @@ pub(crate) fn enrollment_capacity_condition(
 ) -> ResourceCondition {
     let full = agents >= updated_contracts::backend::MAX_BACKEND_INVENTORY_MEMBERS;
     condition(
-        "EnrollmentCapacity",
+        crate::status_contract::ENROLLMENT_CAPACITY_CONDITION,
         !full,
         generation,
         if full { "AtCapacity" } else { "Available" },

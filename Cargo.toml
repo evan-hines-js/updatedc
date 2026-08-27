@@ -54,7 +54,6 @@ tokio = { version = "1", features = [
     "sync",
 ] }
 url = "2"
-same-file = "1"
 # Every test and tool that needs scratch space gets its directory from here.
 tempfile = "3"
 # Pinned to match tough's own versions so the trees unify (no duplicates).

@@ -22,7 +22,7 @@ use crate::*;
 pub(crate) fn ensure_keys_dir_is_empty(dir: &Path) -> Result<(), Error> {
     let mut present = Vec::new();
     for key in role_key_names(dir)? {
-        if dir.join(&key).try_exists()? {
+        if foundation::file::path_entry_exists(&dir.join(&key))? {
             present.push(key);
         }
     }
@@ -114,14 +114,23 @@ impl PendingKeyMaterial {
     /// copy of a live root's keys. Called first thing in a `commit`, before any delivery step that
     /// can fail; the caller wraps the error with what the operator must do about it.
     pub(crate) fn publish(&mut self) -> Result<(), Error> {
-        self.committed = true;
         let suffix = self
             .staged
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "staged key-material path has no UTF-8 file name: {}",
+                    self.staged.display()
+                )
+            })?;
         let pending = pending_prefix(&self.stem);
-        let suffix = suffix.strip_prefix(&pending).unwrap_or(&suffix).to_string();
+        let suffix = suffix.strip_prefix(&pending).ok_or_else(|| {
+            format!(
+                "staged key-material path {} escaped its pending namespace",
+                self.staged.display()
+            )
+        })?;
         let published = self
             .dir
             .join(format!("{}{suffix}", published_prefix(&self.stem)));
@@ -133,6 +142,7 @@ impl PendingKeyMaterial {
             )
         })?;
         self.staged = published;
+        self.committed = true;
         Ok(())
     }
 }
@@ -163,11 +173,7 @@ pub(crate) fn published_prefix(stem: &str) -> String {
 
 /// Remove one staged entry, whichever shape the ceremony minted.
 pub(crate) fn remove_staged(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
+    foundation::durable::remove_path(path)
 }
 
 /// Step 1 of [`PendingKeyMaterial`]: remove the staged material of runs that died before they
@@ -183,7 +189,11 @@ pub(crate) fn sweep_stale_staging(dir: &Path, stem: &str, command: &str) -> Resu
     };
     for entry in entries {
         let entry = entry.map_err(|error| format!("reading {}: {error}", dir.display()))?;
-        if !entry.file_name().to_string_lossy().starts_with(&pending) {
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&pending))
+        {
             continue;
         }
         let path = entry.path();
@@ -333,14 +343,10 @@ pub(crate) struct PendingRootKey {
     pub(crate) destination: PathBuf,
 }
 
-/// The staging stem a `rotate-root` successor key is named under: the `--new-key-out` file name,
-/// so two rotations writing different successor paths in one directory do not sweep each other.
-pub(crate) fn successor_stem(destination: &Path) -> String {
-    destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "root-successor".to_string())
-}
+/// The one staging namespace for root successors. Concurrent ceremonies in one key directory are
+/// unsupported, so destination-derived variants only created stale-material paths that could evade
+/// the next ceremony's sweep.
+const ROOT_SUCCESSOR_STEM: &str = "root-successor";
 
 impl PendingRootKey {
     /// Mint a fresh ed25519 key into a staging file. `repo::generate_root_key` creates it
@@ -348,7 +354,7 @@ impl PendingRootKey {
     /// rather than an adoption.
     pub(crate) async fn mint(destination: &Path) -> Result<Self, Error> {
         let dir = destination.parent().unwrap_or_else(|| Path::new("."));
-        let material = PendingKeyMaterial::stage(dir, &successor_stem(destination), "rotate-root")?;
+        let material = PendingKeyMaterial::stage(dir, ROOT_SUCCESSOR_STEM, "rotate-root")?;
         repo::generate_root_key(material.path()).await?;
         Ok(Self {
             material,

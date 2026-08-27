@@ -216,7 +216,7 @@ fn taken_path(marker: &Path) -> std::path::PathBuf {
 /// the path in the meantime it is newer evidence of the same event and wins; what must never
 /// happen is ending with no marker at all when one is owed.
 fn restore_taken(taken: &Path, marker: &Path) -> std::io::Result<()> {
-    if marker.try_exists()? {
+    if foundation::file::path_entry_exists(marker)? {
         foundation::durable::remove_file(taken)
     } else {
         std::fs::rename(taken, marker)
@@ -229,7 +229,7 @@ fn restore_taken(taken: &Path, marker: &Path) -> std::io::Result<()> {
 /// marker is ever read.
 fn recover_interrupted_clear(marker: &Path) -> std::io::Result<()> {
     let taken = taken_path(marker);
-    if taken.try_exists()? {
+    if foundation::file::path_entry_exists(&taken)? {
         restore_taken(&taken, marker)?;
     }
     Ok(())

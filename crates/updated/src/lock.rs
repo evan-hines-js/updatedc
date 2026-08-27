@@ -3,7 +3,7 @@
 //! `File::try_lock` maps to the platform lock primitive. The OS releases the lock
 //! when the handle is dropped or the owning process exits.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io;
 use std::path::Path;
 
@@ -15,15 +15,11 @@ pub struct InstanceLock {
 impl InstanceLock {
     /// Acquire an exclusive, non-blocking lock, creating its file if needed.
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        std::fs::create_dir_all(foundation::durable::parent_dir(path))?;
+        let file = foundation::file::open_lock_file(
+            path,
+            foundation::file::LockFileDisposition::OpenOrCreate,
+        )?;
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
             Err(TryLockError::WouldBlock) => Err(io::Error::new(
@@ -56,5 +52,21 @@ mod tests {
         let lock = InstanceLock::acquire(&path).unwrap();
         assert!(path.is_file());
         drop(lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_path_can_never_redirect_locking_to_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("unrelated");
+        let path = dir.path().join("x.lock");
+        std::fs::write(&target, b"unrelated state").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert_eq!(
+            InstanceLock::acquire(&path).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(target).unwrap(), b"unrelated state");
     }
 }

@@ -80,15 +80,18 @@ type Error = Box<dyn std::error::Error>;
 /// directory this is the full set, and over `--keys-dir` it is exactly the role keys standing there.
 fn role_key_names(dir: &Path) -> Result<Vec<String>, Error> {
     let keys = repo::Keys::in_dir(dir)?;
-    Ok(keys
-        .roots
+    keys.roots
         .iter()
         .chain([&keys.targets, &keys.snapshot, &keys.timestamp])
-        .filter_map(|path| {
+        .map(|path| {
             path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!("role-key path has no UTF-8 file name: {}", path.display()).into()
+                })
         })
-        .collect())
+        .collect()
 }
 
 #[tokio::main]

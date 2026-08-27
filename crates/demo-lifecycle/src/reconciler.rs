@@ -4,7 +4,7 @@
 //! that process as one typed, idempotent state machine rather than a pile of shell
 //! entrypoints. The agent downloads this executable as a provider artifact.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -534,10 +534,7 @@ impl Deployment {
     }
 
     fn audit(&self, event: &str) -> Result<(), Error> {
-        let mut log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.state.join("audit/lifecycle.tsv"))?;
+        let mut log = foundation::file::open_append_file(&self.state.join("audit/lifecycle.tsv"))?;
         writeln!(log, "{}\t{}\t{event}", self.phase.as_str(), self.attempt)?;
         log.sync_all()?;
         Ok(())
@@ -640,10 +637,7 @@ impl Deployment {
             return Ok(());
         }
         self.stop_workload()?;
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.workload_record("workload.log"))?;
+        let log = foundation::file::open_append_file(&self.workload_record("workload.log"))?;
         let pidfile = self.workload_record("workload.pid");
         let address = workload_address();
         let mut command = std::process::Command::new(self.candidate_dir.join("bin/app"));

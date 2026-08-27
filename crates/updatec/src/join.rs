@@ -31,11 +31,37 @@ const LEAF_CERT_TTL_DAYS: i64 = 90;
 /// certificate on another repository's gateway and only the `repository` segment distinguishes them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeSpiffeId {
-    pub repository: String,
-    pub node: String,
+    repository: String,
+    node: String,
 }
 
 impl NodeSpiffeId {
+    /// Construct the one canonical repository-scoped node identity.
+    ///
+    /// Both components are Kubernetes resource identities before they cross certificate,
+    /// object-key, status, and filesystem boundaries. Keeping the fields private and admitting
+    /// them only through the shared DNS-subdomain grammar makes it impossible for minting,
+    /// enrollment, telemetry, and parsing to disagree about which names are identities.
+    pub fn new(repository: &str, node: &str) -> Option<Self> {
+        if !updated_contracts::identity::is_dns_subdomain(repository)
+            || !updated_contracts::identity::is_dns_subdomain(node)
+        {
+            return None;
+        }
+        Some(Self {
+            repository: repository.to_owned(),
+            node: node.to_owned(),
+        })
+    }
+
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
     /// The SAN URI this identity is encoded as. Minting and parsing share this one shape so the
     /// certificate a gateway issues and the identity another gateway reads back can never drift.
     pub fn uri(&self) -> String {
@@ -52,17 +78,7 @@ impl NodeSpiffeId {
     pub fn parse(uri: &str) -> Option<Self> {
         let rest = uri.strip_prefix(&format!("spiffe://{TRUST_DOMAIN}/scope/"))?;
         let (repository, node) = rest.split_once("/node/")?;
-        if repository.is_empty()
-            || node.is_empty()
-            || repository.contains('/')
-            || node.contains('/')
-        {
-            return None;
-        }
-        Some(Self {
-            repository: repository.to_string(),
-            node: node.to_string(),
-        })
+        Self::new(repository, node)
     }
 }
 
@@ -111,6 +127,33 @@ impl IssuingCa {
         let params = CertificateParams::from_ca_cert_pem(cert_pem).map_err(|error| {
             io::Error::other(format!("loading issuing CA certificate: {error}"))
         })?;
+        if !matches!(params.is_ca, IsCa::Ca(_))
+            || !params.key_usages.contains(&KeyUsagePurpose::KeyCertSign)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuing certificate must be a CA permitted to sign certificates",
+            ));
+        }
+        let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parsing issuing CA PEM: {error}"),
+            )
+        })?;
+        let (remainder, parsed) =
+            x509_parser::parse_x509_certificate(&pem.contents).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("parsing issuing CA DER: {error}"),
+                )
+            })?;
+        if !remainder.is_empty() || parsed.public_key().raw != key.public_key_der() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuing CA certificate and private key do not match",
+            ));
+        }
         let cert = params
             .self_signed(&key)
             .map_err(|error| io::Error::other(format!("reconstructing issuing CA: {error}")))?;
@@ -130,11 +173,13 @@ impl IssuingCa {
         csr.params.is_ca = IsCa::NoCa;
         csr.params.distinguished_name = rcgen::DistinguishedName::new();
         csr.params.distinguished_name.push(DnType::CommonName, name);
-        let uri = NodeSpiffeId {
-            repository: scope.to_string(),
-            node: name.to_string(),
-        }
-        .uri();
+        let identity = NodeSpiffeId::new(scope, name).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repository and node must use the canonical identity grammar",
+            )
+        })?;
+        let uri = identity.uri();
         csr.params.subject_alt_names =
             vec![SanType::URI(uri.clone().try_into().map_err(|error| {
                 io::Error::other(format!("encoding node URI SAN {uri}: {error}"))
@@ -170,6 +215,46 @@ mod tests {
     use rcgen::PublicKeyData;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, UnixTime};
+
+    #[test]
+    fn node_spiffe_ids_are_valid_by_construction() {
+        let identity = NodeSpiffeId::new("production", "web-01").unwrap();
+        assert_eq!(identity.repository(), "production");
+        assert_eq!(identity.node(), "web-01");
+        assert_eq!(NodeSpiffeId::parse(&identity.uri()), Some(identity));
+
+        for (repository, node) in [
+            ("Production", "web-01"),
+            ("production", "web-01?admin=true"),
+            ("production", "node_7"),
+            ("production", "node-"),
+            (&"r".repeat(64), "web-01"),
+        ] {
+            assert!(
+                NodeSpiffeId::new(repository, node).is_none(),
+                "admitted {repository:?}/{node:?}"
+            );
+        }
+        assert!(
+            NodeSpiffeId::new("con", "web-01").is_some(),
+            "certificate identity must not add a filesystem-only reserved-name rule"
+        );
+        let maximum = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(
+            maximum.len(),
+            updated_contracts::identity::MAX_DNS_SUBDOMAIN_BYTES
+        );
+        assert!(
+            NodeSpiffeId::new(&maximum, &maximum).is_some(),
+            "every Kubernetes-valid repository and node identity must be representable"
+        );
+    }
 
     /// A CSR whose self-signature does not verify is refused, so no key is ever pinned without
     /// proof the requester holds it.
@@ -300,10 +385,75 @@ mod tests {
         (cert.pem(), key.serialize_pem())
     }
 
+    #[test]
+    fn issuing_ca_loads_only_a_matching_certificate_signing_pair() {
+        let (cert, key) = test_ca();
+        assert!(IssuingCa::load(&cert, &key).is_ok());
+
+        let (_, other_key) = test_ca();
+        let error = IssuingCa::load(&cert, &other_key).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&leaf_key)
+            .unwrap();
+        let error = IssuingCa::load(&leaf.pem(), &leaf_key.serialize_pem())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     fn parse_leaf(leaf_pem: &str) -> Vec<u8> {
         CertificateDer::from_pem_slice(leaf_pem.as_bytes())
             .unwrap()
             .to_vec()
+    }
+
+    #[test]
+    fn certificate_signing_refuses_an_invalid_spiffe_identity() {
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let ca = IssuingCa::load(&ca_cert_pem, &ca_key_pem).unwrap();
+        let csr =
+            updated::csr::csr_for(&updated::csr::generate_key().unwrap(), "identity").unwrap();
+
+        for (repository, node) in [
+            ("Production", "agent-7"),
+            ("production", "agent-7?admin=true"),
+        ] {
+            let error = ca.sign_client_csr(repository, node, &csr).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn certificate_signing_accepts_maximum_kubernetes_identities() {
+        let maximum = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        let (ca_cert_pem, ca_key_pem) = test_ca();
+        let ca = IssuingCa::load(&ca_cert_pem, &ca_key_pem).unwrap();
+        let csr =
+            updated::csr::csr_for(&updated::csr::generate_key().unwrap(), "identity").unwrap();
+
+        let leaf = ca.sign_client_csr(&maximum, &maximum, &csr).unwrap();
+        let leaf_der = parse_leaf(&leaf);
+        let (_, certificate) = X509Certificate::from_der(&leaf_der).unwrap();
+        let san = certificate
+            .subject_alternative_name()
+            .unwrap()
+            .expect("leaf must carry a SAN");
+        let expected_uri = NodeSpiffeId::new(&maximum, &maximum).unwrap().uri();
+        assert!(san
+            .value
+            .general_names
+            .iter()
+            .any(|name| { matches!(name, GeneralName::URI(uri) if *uri == expected_uri) }));
     }
 
     #[test]

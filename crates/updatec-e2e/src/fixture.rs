@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::layout::NAMESPACE;
 use updatec::{
     DeploymentSpec, EnrollmentSpec, LabelSelector, LocalObjectReference, LocalSecretReference,
     RegressionResponse, ReleaseRepositorySpec, RepositoryStorage, RuntimeSpec, TargetSpec,
@@ -13,7 +14,6 @@ use updatec::{
     UpdateRepositorySpec,
 };
 
-pub(crate) const NAMESPACE: &str = "updated-system";
 pub(crate) const REPOSITORY_NAME: &str = "default";
 pub(crate) const RELEASE_ENDPOINT: &str = "http://minio:9000";
 pub(crate) const RELEASE_PUBLIC_ENDPOINT: &str = "https://minio-direct.updated-system.svc";

@@ -12,13 +12,6 @@ use std::path::{Path, PathBuf};
 
 use crate::{status_contract, ResourceCondition};
 
-const ROLLOUT_STUCK: &str = "RolloutStuck";
-const REPORTS_STALE: &str = "ReportsStale";
-/// Named beyond this module because the repository writer looks its previous entry up by name to
-/// carry the transition (the default cohort's halt has no set or group status to ride on).
-pub const DEPLOYMENT_HALTED: &str = status_contract::DEPLOYMENT_HALTED_CONDITION;
-pub const RECONCILE_FAILING: &str = "ReconcileFailing";
-
 /// A webhook credential is a token, not an artifact. Bounding the opened handle makes a mistaken
 /// device/FIFO path or a file replaced while it is read unable to consume the controller's memory.
 const BEARER_TOKEN_BYTES_LIMIT: usize = 8 * 1024;
@@ -93,24 +86,6 @@ impl ProgressTracker {
     }
 }
 
-fn condition(
-    condition_type: &str,
-    active: bool,
-    generation: Option<i64>,
-    reason: &str,
-    message: String,
-    now: &chrono::DateTime<chrono::Utc>,
-) -> ResourceCondition {
-    ResourceCondition {
-        condition_type: condition_type.into(),
-        status: if active { "True" } else { "False" }.into(),
-        reason: reason.into(),
-        message,
-        observed_generation: generation,
-        last_transition_time: now.to_rfc3339(),
-    }
-}
-
 /// `RolloutStuck` on an `UpdateGroup`: it has been staging with no node newly settled for longer
 /// than its governing set's `stuckAfterSeconds`.
 pub fn rollout_stuck(
@@ -135,7 +110,14 @@ pub fn rollout_stuck(
     } else {
         ("NotStaging", "No rollout is staging.".into())
     };
-    condition(ROLLOUT_STUCK, stuck, generation, reason, message, &now)
+    status_contract::condition(
+        status_contract::ROLLOUT_STUCK_CONDITION,
+        stuck,
+        generation,
+        reason,
+        message,
+        now.to_rfc3339(),
+    )
 }
 
 /// `ReportsStale` on an `UpdateGroup`: fewer than the group's admission quorum of nodes have fresh
@@ -179,7 +161,14 @@ pub fn reports_stale(
             format!("{fresh} of {observable} observable nodes have fresh reports."),
         )
     };
-    condition(REPORTS_STALE, active, generation, reason, message, &now)
+    status_contract::condition(
+        status_contract::REPORTS_STALE_CONDITION,
+        active,
+        generation,
+        reason,
+        message,
+        now.to_rfc3339(),
+    )
 }
 
 /// `DeploymentHalted` on an `UpdateGroupSet`: the regression verdict, with its evidence count.
@@ -219,7 +208,14 @@ pub fn deployment_halted(
             "No staged deployment has reached the set's regression threshold.".into(),
         )
     };
-    condition(DEPLOYMENT_HALTED, active, generation, reason, message, &now)
+    status_contract::condition(
+        status_contract::DEPLOYMENT_HALTED_CONDITION,
+        active,
+        generation,
+        reason,
+        message,
+        now.to_rfc3339(),
+    )
 }
 
 /// `ReconcileFailing` on an `UpdateGroupSet`: the loop itself erred on consecutive passes. One
@@ -242,7 +238,14 @@ pub fn reconcile_failing(
     } else {
         ("Reconciling", "The reconcile loop is passing.".into())
     };
-    condition(RECONCILE_FAILING, active, generation, reason, message, &now)
+    status_contract::condition(
+        status_contract::RECONCILE_FAILING_CONDITION,
+        active,
+        generation,
+        reason,
+        message,
+        now.to_rfc3339(),
+    )
 }
 
 /// Merge a freshly computed condition over the one the resource already carries: standard k8s
@@ -262,7 +265,7 @@ pub fn carry_transition(
         }
         Some(_) => (next, true),
         None => {
-            let fires = next.status == "True";
+            let fires = next.status == status_contract::CONDITION_TRUE;
             (next, fires)
         }
     }
@@ -291,20 +294,30 @@ pub fn merge_conditions(
     observed: &[ResourceCondition],
     next: Vec<ResourceCondition>,
 ) -> Vec<ResourceCondition> {
-    let mut merged: Vec<ResourceCondition> = next
-        .into_iter()
-        .map(|next| carry_transition(existing(observed, &next.condition_type), next).0)
-        .collect();
-    let foreign: Vec<ResourceCondition> = observed
-        .iter()
-        .filter(|condition| {
-            !merged
-                .iter()
-                .any(|entry| entry.condition_type == condition.condition_type)
-        })
-        .cloned()
-        .collect();
-    merged.extend(foreign);
+    // Kubernetes conditions are a logical map keyed by `type`, even though their wire shape is an
+    // array. Enforce that invariant here as part of assembly: a caller that accidentally computes
+    // the same type twice cannot publish duplicates, and a malformed/legacy observed array is
+    // canonicalized on its next write. The last freshly computed verdict wins while preserving the
+    // position of that writer's first entry; for foreign entries the first observed value wins.
+    let mut positions = HashMap::<String, usize>::new();
+    let mut merged = Vec::new();
+    for next in next {
+        let condition_type = next.condition_type.clone();
+        let published = carry_transition(existing(observed, &condition_type), next).0;
+        if let Some(index) = positions.get(&condition_type).copied() {
+            merged[index] = published;
+        } else {
+            positions.insert(condition_type, merged.len());
+            merged.push(published);
+        }
+    }
+    for condition in observed {
+        if positions.contains_key(&condition.condition_type) {
+            continue;
+        }
+        positions.insert(condition.condition_type.clone(), merged.len());
+        merged.push(condition.clone());
+    }
     merged
 }
 
@@ -780,6 +793,23 @@ mod tests {
         );
         assert_eq!(merged[0].status, "False");
         assert_eq!(merged[0].last_transition_time, "2026-08-08T12:00:00Z");
+
+        // The wire array is a logical map keyed by condition type. A buggy writer or malformed
+        // observed status cannot make the shared assembler publish duplicate keys: the writer's
+        // last verdict wins, while foreign state keeps the first value the API presented.
+        let duplicate_foreign = stamped("PolicyApproved", "False", "2026-02-02T00:00:00Z");
+        let merged = merge_conditions(
+            &[observed[0].clone(), observed[1].clone(), duplicate_foreign],
+            vec![
+                stamped("Ready", "True", "2026-08-08T12:00:00Z"),
+                stamped("Ready", "False", "2026-09-09T12:00:00Z"),
+            ],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].condition_type, "Ready");
+        assert_eq!(merged[0].status, "False");
+        assert_eq!(merged[0].last_transition_time, "2026-09-09T12:00:00Z");
+        assert_eq!(merged[1], observed[1]);
     }
 
     /// The webhook client against a local listener: transitions are POSTed as one JSON document
@@ -843,7 +873,7 @@ mod tests {
 
         let event = AlertEvent {
             resource: "UpdateGroup/edge".into(),
-            condition: ROLLOUT_STUCK.into(),
+            condition: status_contract::ROLLOUT_STUCK_CONDITION.into(),
             state: "True".into(),
             reason: "NoNewSettledNode".into(),
             evidence: "stuck".into(),
@@ -956,7 +986,7 @@ mod tests {
 
         let event = |state: &str, reason: &str| AlertEvent {
             resource: "UpdateGroup/edge".into(),
-            condition: ROLLOUT_STUCK.into(),
+            condition: status_contract::ROLLOUT_STUCK_CONDITION.into(),
             state: state.into(),
             reason: reason.into(),
             evidence: String::new(),

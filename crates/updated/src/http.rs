@@ -12,13 +12,7 @@ use std::io;
 
 use futures::StreamExt;
 
-/// The transport policy for an operator-configured network endpoint. Public node-facing origins
-/// require HTTPS; explicitly internal webhook and health endpoints may also use HTTP.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndpointTransport {
-    HttpsOnly,
-    HttpOrHttps,
-}
+pub use updated_contracts::endpoint::EndpointTransport;
 
 /// Where an outbound request's total deadline is enforced. Most controller integrations put it on
 /// their shared client; the health proxy owns a separate per-fetch `tokio::time::timeout` that also
@@ -41,22 +35,8 @@ pub fn network_endpoint(
     transport: EndpointTransport,
     what: &str,
 ) -> io::Result<reqwest::Url> {
-    let parsed = reqwest::Url::parse(value).map_err(|_| invalid_endpoint(what, transport))?;
-    let scheme_allowed = match transport {
-        EndpointTransport::HttpsOnly => parsed.scheme() == "https",
-        EndpointTransport::HttpOrHttps => matches!(parsed.scheme(), "http" | "https"),
-    };
-    if !scheme_allowed || parsed.host_str().is_none() {
-        return Err(invalid_endpoint(what, transport));
-    }
-    if !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(invalid_endpoint(what, transport));
-    }
-    Ok(parsed)
+    updated_contracts::endpoint::network_endpoint(value, transport)
+        .map_err(|_| invalid_endpoint(what, transport))
 }
 
 fn invalid_endpoint(what: &str, transport: EndpointTransport) -> io::Error {

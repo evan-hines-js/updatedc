@@ -1,31 +1,35 @@
-//! What a client certificate proves. A leaf carries a name, and — once enrolled — a SPIFFE
-//! identity and a certified public key; authorization compares the key, not merely the name, so a
-//! re-enrolled name cannot be answered for by its previous holder.
+//! What a client certificate proves. A leaf is classified exactly once, at the TLS boundary, as
+//! anonymous, the fleet enrollment identity, or one repository-scoped node identity. Handlers
+//! cannot assemble partially parsed identities or reinterpret malformed certificate fields.
 
-/// The verified per-connection client identity, read from the mTLS leaf rustls already validated
-/// against the fleet CA before any handler runs. The node cannot forge either field — both come
-/// from the CA-signed certificate, not from anything the node puts in the request — so this is the
-/// trusted answer to "who is this?" that every authorization check gates on.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientIdentity {
-    /// The leaf's Common Name. `None` on a connection with no client certificate (the health
-    /// listener), a leaf carrying no CN, or an ambiguous leaf carrying more than one.
-    pub(crate) common_name: Option<String>,
-    /// The per-node SPIFFE identity the leaf's URI SAN names — repository scope *and* node —
-    /// present only on a certificate minted at `/enroll`, absent on the shared fleet bootstrap
-    /// certificate. Enrollment requires it to be absent; every steady-state route requires it to
-    /// name this gateway's own repository.
-    pub(crate) node: Option<crate::join::NodeSpiffeId>,
-    /// Hex of the leaf's certified public key (its `SubjectPublicKeyInfo` bit string), in exactly
-    /// the encoding `/enroll` pins onto the `UpdateAgent` — the leaf certifies the CSR's own key,
-    /// so the two are byte-identical for the holder the pin was minted for. `None` on a connection
-    /// with no client certificate. This is what makes a node's identity a KEY and not merely a
-    /// name: the handshake proved possession of it, so comparing it to the pin distinguishes the
-    /// machine that holds the name now from a previous holder of a re-enrolled name.
-    pub(crate) public_key: Option<String>,
+    kind: ClientIdentityKind,
+}
+
+#[derive(Clone, Debug)]
+enum ClientIdentityKind {
+    Anonymous,
+    /// A certificate with exactly one CN and no SAN. The `/enroll` gate still compares the CN to
+    /// the repository's configured enrollment name before granting authority.
+    Enrollment {
+        common_name: String,
+    },
+    /// A certificate with exactly one CN and exactly one URI SAN, where the SPIFFE node equals the
+    /// CN. The certified key is what the TLS handshake proved the caller possesses.
+    Node {
+        identity: crate::join::NodeSpiffeId,
+        public_key: String,
+    },
 }
 
 impl ClientIdentity {
+    pub(crate) fn anonymous() -> Self {
+        Self {
+            kind: ClientIdentityKind::Anonymous,
+        }
+    }
+
     /// The node this connection is authorized to act as **within `repository`**.
     ///
     /// Naming the repository is not optional, and that is the point: the fleet CA is shared across
@@ -34,62 +38,210 @@ impl ClientIdentity {
     /// let a staging node read the production node of the same name's secrets and forge its
     /// telemetry. There is no way to obtain a node name here without saying which repository the
     /// answer is for.
-    ///
-    /// The shared fleet bootstrap certificate carries no node SAN, so it resolves to no node in any
-    /// repository — it authenticates the one `/enroll` handshake and nothing else.
     pub(crate) fn node_in(&self, repository: &str) -> Option<&str> {
-        let identity = self.node.as_ref()?;
-        (identity.repository == repository).then_some(identity.node.as_str())
+        let ClientIdentityKind::Node { identity, .. } = &self.kind else {
+            return None;
+        };
+        (identity.repository() == repository).then_some(identity.node())
+    }
+
+    /// The CN of a certificate having the one exact enrollment shape. A node certificate cannot
+    /// reach this accessor: malformed or ambiguous SANs classify as anonymous instead of silently
+    /// degrading into enrollment authority.
+    pub(crate) fn enrollment_name(&self) -> Option<&str> {
+        match &self.kind {
+            ClientIdentityKind::Enrollment { common_name } => Some(common_name),
+            ClientIdentityKind::Anonymous | ClientIdentityKind::Node { .. } => None,
+        }
+    }
+
+    /// The certified key of an unambiguous node identity. No other certificate shape can enter an
+    /// authorization memo or satisfy a live `UpdateAgent` key pin.
+    pub(crate) fn node_public_key(&self) -> Option<&str> {
+        match &self.kind {
+            ClientIdentityKind::Node { public_key, .. } => Some(public_key),
+            ClientIdentityKind::Anonymous | ClientIdentityKind::Enrollment { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_enrollment(common_name: &str) -> Self {
+        Self {
+            kind: ClientIdentityKind::Enrollment {
+                common_name: common_name.to_owned(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_node(repository: &str, node: &str, public_key: &str) -> Self {
+        Self {
+            kind: ClientIdentityKind::Node {
+                identity: crate::join::NodeSpiffeId::new(repository, node)
+                    .expect("test node identity is canonical"),
+                public_key: public_key.to_owned(),
+            },
+        }
     }
 }
 
-/// Extract the leaf certificate's identity — Common Name, SPIFFE node SAN and certified public
-/// key — from a completed server-side TLS connection.
-pub(crate) fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> ClientIdentity {
+/// Classify one already-verified leaf. This is deliberately an exact grammar, not a best-effort
+/// extraction:
+///
+/// - one CN and no SAN is an enrollment-shaped certificate;
+/// - one CN plus one matching node SPIFFE URI SAN is a node certificate;
+/// - every absent, malformed, mismatched, extra, or ambiguous field is anonymous.
+///
+/// In particular, dropping only a malformed SAN while retaining the CN would turn a malformed
+/// node leaf whose CN equals the configured enrollment name into enrollment authority. Returning
+/// the all-or-nothing classification makes that downgrade unrepresentable to every handler.
+fn certificate_identity(leaf: &[u8]) -> ClientIdentity {
     use x509_parser::extensions::GeneralName;
 
-    let anonymous = ClientIdentity {
-        common_name: None,
-        node: None,
-        public_key: None,
+    let Ok((remaining, cert)) = x509_parser::parse_x509_certificate(leaf) else {
+        return ClientIdentity::anonymous();
     };
-    let Some(leaf) = conn.peer_certificates().and_then(|certs| certs.first()) else {
-        return anonymous;
-    };
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf.as_ref()) else {
-        return anonymous;
-    };
+    if !remaining.is_empty() {
+        return ClientIdentity::anonymous();
+    }
+
     let mut common_names = cert.subject().iter_common_name();
-    let cn = common_names
+    let Some(common_name) = common_names
         .next()
         .and_then(|name| name.as_str().ok())
-        .map(str::to_owned);
-    // An ambiguous subject is not an identity. Issued node and bootstrap certificates each carry
-    // exactly one CN; fail closed if an external issuer supplies more.
+        .filter(|name| !name.is_empty())
+    else {
+        return ClientIdentity::anonymous();
+    };
     if common_names.next().is_some() {
-        return anonymous;
+        return ClientIdentity::anonymous();
     }
-    // Every node leaf minted by this control plane carries a SPIFFE URI SAN naming its repository
-    // scope and node. It is a cryptographic marker that the certificate is an ordinary node
-    // identity — so it can never regain bootstrap authority merely by choosing the bootstrap
-    // certificate's CN — and it is the ONLY thing that says which repository the leaf belongs to.
-    let node = cert
-        .subject_alternative_name()
-        .ok()
-        .flatten()
-        .and_then(|san| {
-            san.value.general_names.iter().find_map(|name| match name {
-                GeneralName::URI(uri) => crate::join::NodeSpiffeId::parse(uri),
-                _ => None,
-            })
-        })
-        // The subject and the SAN are minted together from one name, so a leaf whose two identity
-        // fields disagree was not minted by this control plane and is not an identity at all.
-        .filter(|identity| Some(identity.node.as_str()) == cn.as_deref());
+    let common_name = common_name.to_owned();
+
+    let san = match cert.subject_alternative_name() {
+        Ok(san) => san,
+        Err(_) => return ClientIdentity::anonymous(),
+    };
+    let Some(san) = san else {
+        return ClientIdentity {
+            kind: ClientIdentityKind::Enrollment { common_name },
+        };
+    };
+    let [only_name] = san.value.general_names.as_slice() else {
+        return ClientIdentity::anonymous();
+    };
+    let GeneralName::URI(uri) = only_name else {
+        return ClientIdentity::anonymous();
+    };
+    let Some(identity) = crate::join::NodeSpiffeId::parse(uri) else {
+        return ClientIdentity::anonymous();
+    };
+    if identity.node() != common_name {
+        return ClientIdentity::anonymous();
+    }
+
     ClientIdentity {
-        common_name: cn,
-        node,
-        // The key the handshake proved possession of, encoded exactly as `/enroll` pinned it.
-        public_key: Some(hex::encode(&*cert.public_key().subject_public_key.data)),
+        kind: ClientIdentityKind::Node {
+            identity,
+            public_key: hex::encode(&*cert.public_key().subject_public_key.data),
+        },
+    }
+}
+
+/// Extract and classify the leaf certificate from a completed server-side TLS connection. Rustls
+/// has already validated the chain against the fleet CA before this runs; this chokepoint decides
+/// what, if any, application identity that authenticated certificate proves.
+pub(crate) fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> ClientIdentity {
+    conn.peer_certificates()
+        .and_then(|certificates| certificates.first())
+        .map_or_else(ClientIdentity::anonymous, |leaf| {
+            certificate_identity(leaf.as_ref())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+
+    fn certificate(common_names: &[&str], sans: Vec<SanType>) -> Vec<u8> {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        for (index, common_name) in common_names.iter().enumerate() {
+            params.distinguished_name.push(
+                if index == 0 {
+                    DnType::CommonName
+                } else {
+                    // `rcgen` stores one value per `DnType`. A custom type with the same OID
+                    // emits a second CN so the parser's ambiguity gate is exercised directly.
+                    DnType::CustomDnType(vec![2, 5, 4, 3])
+                },
+                *common_name,
+            );
+        }
+        params.subject_alt_names = sans;
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    fn uri(value: &str) -> SanType {
+        SanType::URI(value.try_into().unwrap())
+    }
+
+    #[test]
+    fn certificate_shapes_have_one_fail_closed_classification() {
+        let enrollment = certificate(&["updated-enrollment"], vec![]);
+        let enrollment = certificate_identity(&enrollment);
+        assert_eq!(enrollment.enrollment_name(), Some("updated-enrollment"));
+        assert_eq!(enrollment.node_in("prod"), None);
+        assert_eq!(enrollment.node_public_key(), None);
+
+        let node = certificate(
+            &["web-01"],
+            vec![uri("spiffe://updated.fleet/scope/prod/node/web-01")],
+        );
+        let node = certificate_identity(&node);
+        assert_eq!(node.enrollment_name(), None);
+        assert_eq!(node.node_in("prod"), Some("web-01"));
+        assert!(node.node_public_key().is_some());
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_node_fields_never_degrade_to_enrollment() {
+        let mut trailing_der = certificate(&["updated-enrollment"], vec![]);
+        trailing_der.extend_from_slice(b"trailing");
+        let cases = [
+            certificate(
+                &["updated-enrollment"],
+                vec![uri("spiffe://updated.fleet/scope/prod/node/other")],
+            ),
+            certificate(
+                &["updated-enrollment"],
+                vec![uri("spiffe://updated.fleet/scope/prod/node/")],
+            ),
+            certificate(
+                &["updated-enrollment"],
+                vec![
+                    uri("spiffe://updated.fleet/scope/prod/node/updated-enrollment"),
+                    uri("spiffe://updated.fleet/scope/staging/node/updated-enrollment"),
+                ],
+            ),
+            certificate(
+                &["updated-enrollment"],
+                vec![SanType::DnsName("updated.example".try_into().unwrap())],
+            ),
+            certificate(&["updated-enrollment", "updated-enrollment"], vec![]),
+            certificate(&[""], vec![]),
+            certificate(&[], vec![]),
+            trailing_der,
+            b"not a DER certificate".to_vec(),
+        ];
+
+        for (case, leaf) in cases.into_iter().enumerate() {
+            let identity = certificate_identity(&leaf);
+            assert_eq!(identity.enrollment_name(), None, "case {case}");
+            assert_eq!(identity.node_in("prod"), None, "case {case}");
+            assert_eq!(identity.node_public_key(), None, "case {case}");
+        }
     }
 }

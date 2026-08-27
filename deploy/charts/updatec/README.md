@@ -151,8 +151,9 @@ over a single pod blocks node drains forever. The gateway is stateless and scale
 The chart refuses to render configurations that would wedge a fleet, because each of them fails
 later in a way that names none of its cause:
 
-- no `publicUrl`, or one that is not an `https://` URL — nodes would be told to return to nowhere
-  or to something they cannot resolve, permanently, since the value is signed into their bundles
+- no `publicUrl` — nodes would be told to return to nowhere, permanently, since the value is signed
+  into their bundles. The updatec process applies the workspace's single strict URL parser before
+  either workload starts; Helm does not carry a weaker copy of that security grammar.
 - an ingress that terminates TLS — strips the client certificate that *is* the node's identity
 - one ServiceAccount name for both workloads, or `serviceAccount.create=false` with a name left
   empty — either binds the controller's namespace-wide Role to the internet-facing gateway

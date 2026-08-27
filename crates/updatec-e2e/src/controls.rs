@@ -141,7 +141,10 @@ pub(crate) async fn assert_node_controls(
         "the group settles around the benched node",
         || {
             let advanced = reports_version(&sibling_resource, version);
-            let ready = condition_field(&group, "Ready", "status").as_deref() == Some("True");
+            let ready =
+                condition_field(&group, updatec::status_contract::READY_CONDITION, "status")
+                    .as_deref()
+                    == Some(updatec::status_contract::CONDITION_TRUE);
             Ok(advanced && ready)
         },
     )
@@ -787,8 +790,10 @@ pub(crate) async fn assert_quarantine_fails_closed(
         60,
         "the group to be quarantined for its invalid deployment",
         || {
-            Ok(condition_field(&group, "Ready", "reason")
-                .is_some_and(|reason| reason == "InvalidDeployment"))
+            Ok(
+                condition_field(&group, updatec::status_contract::READY_CONDITION, "reason")
+                    .is_some_and(|reason| reason == "InvalidDeployment"),
+            )
         },
     )
     .await?;
@@ -814,8 +819,10 @@ pub(crate) async fn assert_quarantine_fails_closed(
         )
         .await?;
     await_for(120, "the repaired group to plan again", || {
-        Ok(condition_field(&group, "Ready", "reason")
-            .is_some_and(|reason| reason != "InvalidDeployment"))
+        Ok(
+            condition_field(&group, updatec::status_contract::READY_CONDITION, "reason")
+                .is_some_and(|reason| reason != "InvalidDeployment"),
+        )
     })
     .await?;
     println!("[e2e] quarantine verified: the broken spec froze the group and moved nobody");

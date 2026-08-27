@@ -206,7 +206,7 @@ impl BundleStore {
         let tree = self.location(release);
         for file in &manifest.files {
             let destination = workspace.join(&file.path);
-            if std::fs::symlink_metadata(&destination).is_ok() {
+            if foundation::file::path_entry_exists(&destination)? {
                 continue;
             }
             if let Some(parent) = Path::new(&file.path).parent() {
@@ -310,8 +310,8 @@ fn staging_name(destination: &Path) -> io::Result<PathBuf> {
     let name = destination
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bundle path has no file name"))?
-        .to_string_lossy()
-        .into_owned();
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bundle path is not UTF-8"))?;
     let parent = destination.parent().unwrap_or(Path::new("."));
     Ok(parent.join(format!(
         ".materializing-{}-{}-{name}",
@@ -338,6 +338,17 @@ mod tests {
             root.join("staging"),
             root.join("work"),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_names_never_rewrite_invalid_path_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let destination = Path::new(OsStr::from_bytes(b"invalid-\xff"));
+        let error = staging_name(destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     /// A release archive shaped like the ones the tower actually ships — an entrypoint plus a

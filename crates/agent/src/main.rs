@@ -1633,49 +1633,6 @@ mod tests {
         assert!(store.write_journal(&other).is_ok());
     }
 
-    /// A rejection is never-retry evidence; only the machine's own proof that the exact bytes
-    /// later succeeded — they are the committed head — may erase one.
-    #[test]
-    fn a_rejection_is_erased_only_for_the_committed_head() {
-        let situation = interrupted_revert(None);
-        let Installed::Present(installed) = situation.installed else {
-            panic!("the fixture commits a head");
-        };
-        let lineage = installed.repository_lineage.clone();
-        let mut store = Store::memory(MemoryBackend {
-            installed: Some(*installed.clone()),
-            active: Some(installed.release.clone()),
-            ..MemoryBackend::default()
-        });
-        let other_archive = digest("not-the-committed-archive");
-        store.reject_artifact(&lineage, &other_archive).unwrap();
-        store
-            .reject_artifact(&lineage, &installed.archive_sha256)
-            .unwrap();
-
-        // Bytes that never became the head keep their rejection.
-        assert!(store
-            .clear_application_rejection(&lineage, &other_archive)
-            .is_err());
-        assert!(store.is_rejected(&lineage, &other_archive));
-
-        // A rollback may leave the candidate's committed record durable for crash recovery after
-        // the pointer has already returned to its predecessor. That stale record is not proof the
-        // rejected candidate now works and cannot erase the never-retry verdict.
-        store.memory_backend_mut().active = Some(release("0.9.0", "predecessor"));
-        assert!(store
-            .clear_application_rejection(&lineage, &installed.archive_sha256)
-            .is_err());
-        assert!(store.is_rejected(&lineage, &installed.archive_sha256));
-
-        // The committed head's own stale rejection is the one erasure with proof behind it.
-        store.memory_backend_mut().active = Some(installed.release.clone());
-        store
-            .clear_application_rejection(&lineage, &installed.archive_sha256)
-            .unwrap();
-        assert!(!store.is_rejected(&lineage, &installed.archive_sha256));
-    }
-
     /// A node whose update committed (installed = candidate, pending = predecessor) and whose
     /// revert a previous boot began — the active pointer is already back on the predecessor — with
     /// `journal` still on disk in the given phase.

@@ -475,12 +475,10 @@ fn corrupt_archive(archive: &Path, kind: &str, version: &str) -> R {
 /// directory: staging outside the lock lets two publishers sign each other's bytes. Keep the
 /// development server's single-writer policy here rather than in the reusable TUF authoring library.
 fn lock_publisher(repo_dir: &Path) -> std::io::Result<File> {
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(repo_dir.join(".publish.lock"))?;
+    let lock = foundation::file::open_lock_file(
+        &repo_dir.join(".publish.lock"),
+        foundation::file::LockFileDisposition::OpenOrCreate,
+    )?;
     lock.lock()?;
     Ok(lock)
 }
@@ -539,21 +537,10 @@ async fn serve(args: &[String], kind: ServeKind) -> R {
             let ca = PathBuf::from(flag(args, "--ca").ok_or("--ca <ca.crt> is required")?);
             let public_url =
                 flag(args, "--public-url").ok_or("--public-url <https-url> is required")?;
-            let parsed = url::Url::parse(&public_url)?;
-            if parsed.scheme() != "https"
-                || parsed.cannot_be_a_base()
-                || parsed.host_str().is_none()
-                || !parsed.username().is_empty()
-                || parsed.password().is_some()
-                || parsed.query().is_some()
-                || parsed.fragment().is_some()
-                || parsed.path() != "/"
-            {
-                return Err(
-                    "--public-url must be an HTTPS origin with no path, query, or fragment".into(),
-                );
-            }
-            let public_url: Arc<str> = public_url.trim_end_matches('/').into();
+            let parsed = updated_contracts::endpoint::https_origin(&public_url).map_err(|_| {
+                "--public-url must be an HTTPS origin with no path, query, or fragment"
+            })?;
+            let public_url: Arc<str> = parsed.as_str().trim_end_matches('/').into();
             (
                 updated::tls::capability_fixture_server_config(&cert, &key, &ca)?,
                 Some(CapabilityStore {
@@ -840,19 +827,7 @@ fn open_repository_file(root: &Path, path: &str) -> Option<std::fs::File> {
     for part in object.relative.split('/') {
         out.push(part);
     }
-    // Open before validating and compare stable file identities afterward. If an attacker
-    // swaps any ancestor or symlink during resolution, the opened handle and validated
-    // canonical path refer to different files and the request fails closed.
-    let file = std::fs::File::open(&out).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let opened = same_file::Handle::from_file(file.try_clone().ok()?).ok()?;
-    let canonical = std::fs::canonicalize(&out).ok()?;
-    if !canonical.starts_with(root) || same_file::Handle::from_path(&canonical).ok()? != opened {
-        return None;
-    }
-    Some(file)
+    foundation::file::open_regular_beneath(root, &out, foundation::file::FinalSymlink::Follow).ok()
 }
 
 async fn respond_file<S>(
@@ -1321,11 +1296,11 @@ mod tests {
         let dir = scratch.path().to_path_buf();
 
         let first = lock_publisher(&dir).unwrap();
-        let second = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(dir.join(".publish.lock"))
-            .unwrap();
+        let second = foundation::file::open_lock_file(
+            &dir.join(".publish.lock"),
+            foundation::file::LockFileDisposition::OpenExisting,
+        )
+        .unwrap();
         assert!(matches!(
             second.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
@@ -1335,6 +1310,19 @@ mod tests {
         second.try_lock().unwrap();
         drop(second);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publisher_lock_never_follows_a_redirected_name() {
+        let scratch = tempfile::tempdir().unwrap();
+        let victim = scratch.path().join("victim");
+        let lock = scratch.path().join(".publish.lock");
+        std::fs::write(&victim, b"not a repository lock").unwrap();
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+
+        assert!(lock_publisher(scratch.path()).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"not a repository lock");
     }
 
     /// The signed runtime policy an assignment carries. Valid, because `publish-assignment`

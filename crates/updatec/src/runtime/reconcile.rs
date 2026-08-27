@@ -558,7 +558,7 @@ pub async fn reconcile_once(
         }
         // Apply the shared identity grammar before a node enters assignment, raw-report, or backend
         // projections. Every one of those structures keys by this exact name.
-        if !updated_contracts::telemetry::is_valid_node(&node) {
+        if !updated_contracts::identity::is_dns_subdomain(&node) {
             quarantine_agent(
                 &nodes_api,
                 agent,
@@ -832,7 +832,7 @@ pub async fn reconcile_once(
     // freshness), and it is ONE mechanism: the same check renews the root, which `replace_release`
     // never touches.
     let mut renewals = expiring_metadata(&repo_dir, reconcile_now).await;
-    let initialized = repo_dir.join("metadata/root.json").try_exists()?;
+    let initialized = foundation::file::path_entry_exists(&repo_dir.join("metadata/root.json"))?;
     // The root renewal is attempted BEFORE this pass commits to signing a generation, because a
     // renewal that cannot be performed drops back out of `renewals` (see `renew_expiring_root`) and
     // must then not be the reason a generation was signed at all.
@@ -1127,7 +1127,7 @@ pub(crate) async fn deliver_subscriptions(
     public_url: &str,
 ) {
     let repo_dir = state_dir.join("repository");
-    match repo_dir.join("metadata/timestamp.json").try_exists() {
+    match foundation::file::path_entry_exists(&repo_dir.join("metadata/timestamp.json")) {
         Ok(true) => {}
         Ok(false) => return, // nothing has been published yet — no generation to announce.
         Err(error) => {

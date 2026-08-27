@@ -1430,7 +1430,7 @@ mod tests {
             let parsed = backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1))
                 .expect("a valid node name is configurable");
             assert_eq!(parsed.node(), node);
-            assert!(updated_contracts::telemetry::is_valid_node(node));
+            assert!(updated_contracts::identity::is_dns_subdomain(node));
         }
         for node in [
             "agent#1",
@@ -1451,7 +1451,7 @@ mod tests {
             // stray `\n` must be legible in the log line that refuses it.
             assert!(error.contains(&format!("{node:?}")), "{error}");
             assert!(error.contains("invalid node identity"), "{error}");
-            assert!(!updated_contracts::telemetry::is_valid_node(node));
+            assert!(!updated_contracts::identity::is_dns_subdomain(node));
         }
         assert!(backend::BackendInventoryMember::active("", "10.0.0.1", &pin(1)).is_err());
         // The shared grammar carries Kubernetes' object-name ceiling because every production
@@ -1463,10 +1463,13 @@ mod tests {
             "c".repeat(63),
             "d".repeat(61)
         );
-        assert_eq!(maximum.len(), updated_contracts::telemetry::MAX_NODE_BYTES);
+        assert_eq!(
+            maximum.len(),
+            updated_contracts::identity::MAX_DNS_SUBDOMAIN_BYTES
+        );
         assert!(backend::BackendInventoryMember::active(&maximum, "10.0.0.1", &pin(1)).is_ok());
         assert!(backend::BackendInventoryMember::active(
-            "a".repeat(updated_contracts::telemetry::MAX_NODE_BYTES + 1),
+            "a".repeat(updated_contracts::identity::MAX_DNS_SUBDOMAIN_BYTES + 1),
             "10.0.0.1",
             &pin(1)
         )
@@ -1493,7 +1496,7 @@ mod tests {
         // Everything the shared identity grammar accepts is safe for the balancer too, including
         // dotted cluster-scoped names.
         for node in ["agent-0", "vm-db-17", "agent-7.prod"] {
-            assert!(updated_contracts::telemetry::is_valid_node(node));
+            assert!(updated_contracts::identity::is_dns_subdomain(node));
             assert!(updated_contracts::backend::is_balancer_safe(node));
             assert!(backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1)).is_ok());
         }

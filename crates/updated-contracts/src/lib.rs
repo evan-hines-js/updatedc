@@ -15,6 +15,7 @@ pub mod backend;
 pub mod bounded;
 pub mod dataflow;
 pub mod digest;
+pub mod endpoint;
 pub mod enrollment;
 pub mod identity;
 pub mod key;

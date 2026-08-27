@@ -228,7 +228,7 @@ pub(crate) async fn checkout_metadata(
     tokio::fs::create_dir_all(repo_dir.path().join("targets")).await?;
     let generation = RoleVersions::live(store, destination).await?;
     download_metadata(store, destination, &metadata_dir).await?;
-    if !metadata_dir.join("root.json").try_exists()? {
+    if !foundation::file::path_entry_exists(&metadata_dir.join("root.json"))? {
         return Err(format!(
             "release repository at s3://{}/{} is not initialized (no metadata/root.json); run \
              `updatectl trust-root` first",
@@ -289,18 +289,62 @@ pub(crate) fn report_deploy(
 }
 
 /// Append `key=value` lines to the file named by `$GITHUB_OUTPUT`, the idiomatic way a
-/// GitHub Actions step exposes outputs. A no-op elsewhere. Values here are single-line.
+/// GitHub Actions step exposes outputs. A no-op elsewhere.
+///
+/// The whole document is validated before the file is opened, so a value cannot inject a second
+/// output through a newline and a bad later pair cannot leave a convincing partial result.
 pub(crate) fn emit_github_outputs(pairs: &[(&str, &str)]) -> Result<(), Error> {
     let Some(path) = std::env::var_os("GITHUB_OUTPUT") else {
         return Ok(());
     };
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut document = String::new();
     for (key, value) in pairs {
-        writeln!(file, "{key}={value}")?;
+        document.push_str(&github_output_line(key, value)?);
     }
+    let mut file = foundation::file::open_append_file(std::path::Path::new(&path))?;
+    file.write_all(document.as_bytes())?;
     Ok(())
+}
+
+/// Serialize the deliberately single-line subset of GitHub's environment-file protocol.
+fn github_output_line(key: &str, value: &str) -> std::io::Result<String> {
+    if key.is_empty()
+        || key
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'=' | b'\r' | b'\n'))
+        || value
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "GitHub output keys must be non-empty and key/value pairs must be single-line",
+        ));
+    }
+    Ok(format!("{key}={value}\n"))
+}
+
+#[cfg(test)]
+mod github_output_tests {
+    use super::github_output_line;
+
+    #[test]
+    fn github_outputs_accept_only_the_single_line_protocol() {
+        assert_eq!(
+            github_output_line("sha256", "abc123").unwrap(),
+            "sha256=abc123\n"
+        );
+        for (key, value) in [
+            ("", "value"),
+            ("bad=name", "value"),
+            ("bad\nname", "value"),
+            ("name", "first\nsecond=forged"),
+            ("name", "first\rsecond"),
+        ] {
+            assert!(github_output_line(key, value).is_err());
+        }
+    }
 }

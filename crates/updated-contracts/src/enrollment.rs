@@ -28,10 +28,10 @@ impl EnrollmentRequest {
     /// Whether the name a node self-asserts at enrollment is one the fleet can actually own.
     ///
     /// This is exactly the shared Kubernetes DNS-subdomain identity grammar
-    /// ([`crate::telemetry::is_valid_node`]), so self-enrollment, report maps, backend projections,
+    /// ([`crate::identity::is_dns_subdomain`]), so self-enrollment, report maps, backend projections,
     /// and `UpdateAgent` objects cannot disagree about node identity.
     pub fn name_is_wellformed(&self) -> bool {
-        crate::telemetry::is_valid_node(&self.name)
+        crate::identity::is_dns_subdomain(&self.name)
     }
 }
 
@@ -70,7 +70,7 @@ pub struct EnrollmentBundle {
 
 impl EnrollmentBundle {
     pub fn validate_shape(&self) -> io::Result<()> {
-        if self.schema != 1 || !crate::telemetry::is_valid_node(&self.agent_id) {
+        if self.schema != 1 || !crate::identity::is_dns_subdomain(&self.agent_id) {
             return Err(invalid(
                 "unsupported enrollment bundle or invalid agent identity",
             ));
@@ -287,7 +287,10 @@ mod tests {
         // projection objects or need a second, storage-specific reserved-word grammar.
         assert!(request("fleet").name_is_wellformed());
         assert!(request("rack-1.agent-7").name_is_wellformed());
-        assert!(!request(&"a".repeat(crate::telemetry::MAX_NODE_BYTES + 1)).name_is_wellformed());
+        assert!(
+            !request(&"a".repeat(crate::identity::MAX_DNS_SUBDOMAIN_BYTES + 1))
+                .name_is_wellformed()
+        );
         for bad in [
             "", "-agent", "agent-", "Agent", "a_b", "a/b", ".agent", "agent.", "a..b",
         ] {

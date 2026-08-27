@@ -413,15 +413,6 @@ pub(crate) async fn check_application(
     .await;
     match outcome {
         Ok(Outcome::Committed { host_action }) => {
-            if !provider_only {
-                if let Err(e) = store.clear_application_rejection(lineage, &prepared.archive_sha256)
-                {
-                    warn(&format!(
-                        "upgraded to {}, but clearing its stale rejection failed: {e}",
-                        prepared.version
-                    ));
-                }
-            }
             log(&format!("upgraded to {}", prepared.version));
             AppOutcome::Upgraded {
                 version: prepared.version,

@@ -320,7 +320,13 @@ impl Chaos {
                     pending.push(format!("{set}.status.halted lacks {deployment}"));
                     continue;
                 }
-                if condition_field(&group, "DeploymentHalted", "status").as_deref() != Some("True")
+                if condition_field(
+                    &group,
+                    updatec::status_contract::DEPLOYMENT_HALTED_CONDITION,
+                    "status",
+                )
+                .as_deref()
+                    != Some(updatec::status_contract::CONDITION_TRUE)
                 {
                     pending.push(format!("{group}/DeploymentHalted is not True"));
                 }
@@ -335,8 +341,8 @@ impl Chaos {
                 let by_set = format!("UpdateGroupSet/{set}");
                 let by_group = format!("UpdateGroup/{group}");
                 let found = delivered.iter().find(|alert| {
-                    alert["condition"] == "DeploymentHalted"
-                        && alert["state"] == "True"
+                    alert["condition"] == updatec::status_contract::DEPLOYMENT_HALTED_CONDITION
+                        && alert["state"] == updatec::status_contract::CONDITION_TRUE
                         && alert["resource"]
                             .as_str()
                             .is_some_and(|name| name == by_set || name == by_group)

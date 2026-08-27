@@ -277,7 +277,7 @@ impl WrappedSource {
 
 impl Drop for WrappedSource {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let _ = foundation::durable::remove_path(&self.path);
     }
 }
 
@@ -545,7 +545,7 @@ pub(crate) fn stage_bundle_file(
     // `symlink_metadata`, not `exists`: `exists` follows symlinks, so a dangling link at this
     // name would report "nothing here", skip the repair below, and leave the rename to fail
     // against an entry that does exist. What matters is whether the name is occupied at all.
-    if fs::symlink_metadata(&destination).is_ok() {
+    if foundation::file::path_entry_exists(&destination)? {
         // A content-addressed directory is only reusable while its complete tree still
         // matches the authenticated manifest. Do not let local drift become trusted just
         // because the same release is downloaded again.
@@ -676,9 +676,9 @@ impl Stage {
 impl Drop for Stage {
     fn drop(&mut self) {
         // A successful stage renamed the directory away; `NotFound` is then the normal case.
-        let _ = fs::remove_dir_all(&self.dir);
+        let _ = foundation::durable::remove_path(&self.dir);
         drop(self.owner.take());
-        let _ = fs::remove_file(&self.owner_path);
+        let _ = foundation::durable::remove_file(&self.owner_path);
     }
 }
 
@@ -715,10 +715,10 @@ fn sweep_abandoned(staging_root: &Path) {
             // Nothing is ever created under a claim name but the claim file itself, so a
             // dot-prefixed directory belongs to someone else and is left alone.
             if !claim
-                && !staging_root
-                    .join(format!("{name}{OWNER_SUFFIX}"))
-                    .try_exists()
-                    .unwrap_or(true)
+                && !foundation::file::path_entry_exists(
+                    &staging_root.join(format!("{name}{OWNER_SUFFIX}")),
+                )
+                .unwrap_or(true)
             {
                 discard(&path);
             }
@@ -738,23 +738,13 @@ fn sweep_abandoned(staging_root: &Path) {
         if !claim {
             discard(&staging_root.join(attempt));
         }
-        let _ = fs::remove_file(&path);
+        let _ = foundation::durable::remove_file(&path);
     }
 }
 
 /// Remove a path of any type without ever following a symlink out of the staging root.
 fn discard(path: &Path) {
-    match fs::symlink_metadata(path) {
-        // `symlink_metadata` reports a symlink-to-directory as a symlink, never a directory,
-        // so this arm can only be a real directory.
-        Ok(metadata) if metadata.is_dir() => {
-            let _ = fs::remove_dir_all(path);
-        }
-        Ok(_) => {
-            let _ = fs::remove_file(path);
-        }
-        Err(_) => {}
-    }
+    let _ = foundation::durable::remove_path(path);
 }
 
 fn ensure_real_directory(path: &Path) -> io::Result<()> {
@@ -825,11 +815,11 @@ fn extract(
                 "bundle contains a non-regular archive entry",
             ));
         }
-        let path = entry
-            .path()
-            .map_err(|e| fault.classify(e))?
-            .to_string_lossy()
-            .into_owned();
+        let path = entry.path().map_err(|e| fault.classify(e))?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| archive_verdict("bundle path is not UTF-8"))?
+            .to_owned();
         validate_relative(&path, limits.path_bytes).map_err(InstallError::Archive)?;
         // Count entries seen, not entries recorded in `extracted` (which excludes the manifest), so
         // the limit bounds the archive's real entry count rather than that count plus one.
@@ -1719,7 +1709,7 @@ mod tests {
     /// The name is written into the header's raw 100-byte field because the `tar` crate refuses to
     /// build a `..` path at all. The safe API cannot express what the extractor defends against,
     /// which is why no test had ever produced one.
-    fn archive_with_hostile_entry(source: &Path, dest: &Path, hostile: &str) {
+    fn archive_with_hostile_entry(source: &Path, dest: &Path, hostile: &[u8]) {
         let mut original = Vec::new();
         zstd::stream::copy_decode(File::open(source).unwrap(), &mut original).unwrap();
 
@@ -1738,7 +1728,7 @@ mod tests {
         let mut header = deterministic_header(payload.len() as u64, false).unwrap();
         let raw = header.as_old_mut();
         raw.name = [0u8; 100];
-        raw.name[..hostile.len()].copy_from_slice(hostile.as_bytes());
+        raw.name[..hostile.len()].copy_from_slice(hostile);
         header.set_cksum();
         out.append(&header, &payload[..]).unwrap();
         out.into_inner()
@@ -1806,7 +1796,7 @@ mod tests {
         ] {
             let archive = root.join("hostile.tar.zst");
             let _ = fs::remove_file(&archive);
-            archive_with_hostile_entry(&good, &archive, hostile);
+            archive_with_hostile_entry(&good, &archive, hostile.as_bytes());
 
             let error = stage_bundle(
                 &archive,
@@ -1826,6 +1816,23 @@ mod tests {
                 "{hostile}: extraction wrote outside the tree"
             );
         }
+
+        // The publisher has one UTF-8 path grammar. Extraction must reject an archive that cannot
+        // inhabit it, not lossily rewrite the bytes to U+FFFD and accept a different member name.
+        let archive = root.join("non-utf8.tar.zst");
+        archive_with_hostile_entry(&good, &archive, b"bin/invalid-\xff");
+        let error = stage_bundle(
+            &archive,
+            &staging,
+            &versions,
+            &expected,
+            &BundleLimits::default(),
+        )
+        .expect_err("a non-UTF-8 entry name must be refused");
+        assert!(
+            matches!(error, InstallError::Archive(_)),
+            "a non-UTF-8 entry name is a verdict on the archive bytes: {error}"
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl BackendInventoryMember {
     /// Revalidate a deserialized entry at the one shared protocol gate.
     pub fn validate(self) -> Result<Self, String> {
         let node = self.node();
-        if !crate::telemetry::is_valid_node(node) || !is_balancer_safe(node) {
+        if !crate::identity::is_dns_subdomain(node) || !is_balancer_safe(node) {
             return Err(format!(
                 "inventory member has invalid node identity {node:?}"
             ));
@@ -300,11 +300,13 @@ pub fn routable_host(address: &str) -> Option<String> {
 /// name, and the `backend` section that qualifies it — because they share one command line and one
 /// consequence.
 ///
-/// [`crate::telemetry::is_valid_node`] is a URL/path grammar — it rejects `/ \ :`, `. % ? #`, and
-/// control characters — and none of that covers the syntax of the balancer the name is programmed
-/// into: the HAProxy Runtime API separates commands on a line with `;` and a command's own words
-/// with whitespace. A name carrying either does not name a server, it appends a second command to a
-/// `level admin` socket (`agent-0; shutdown frontend public` really does take the frontend down).
+/// [`crate::identity::is_dns_subdomain`] is the resource-identity grammar. It admits only lowercase
+/// DNS labels and separators, so a node identity satisfying it is also command-safe, but backend
+/// section names are operator configuration with a deliberately wider vocabulary. This separate
+/// predicate is the one HAProxy interpolation invariant shared by both inputs: the Runtime API
+/// separates commands on a line with `;` and a command's own words with whitespace. A name carrying
+/// either does not name a server, it appends a second command to a `level admin` socket (`agent-0;
+/// shutdown frontend public` really does take the frontend down).
 /// Whitespace alone is enough to matter without any malice: `HAPROXY_BACKEND` with a copy-pasted
 /// trailing space emits `set server fleet /agent-0 state ready`, which HAProxy answers with an
 /// error for every member, so every reconcile fails and nothing is ever programmed.

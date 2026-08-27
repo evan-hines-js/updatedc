@@ -229,6 +229,6 @@ impl AuthorizationMemo {
     }
 
     pub(crate) fn key(node: &str, identity: &ClientIdentity) -> Option<String> {
-        Some(format!("{node}/{}", identity.public_key.as_deref()?))
+        Some(format!("{node}/{}", identity.node_public_key()?))
     }
 }

@@ -18,13 +18,11 @@ updated-tuf = { path = "../updated-tuf" }
 updatec = { path = "../updatec" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
-same-file = { workspace = true }
 # Mint the fixture TLS material (fleet CA, server cert, agent client cert) like TUF keys. The
 # capability listener validates identities when they are presented; the object listener presents
 # only its server certificate and never asks for a node identity.
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
-url = { workspace = true }
 
 [dev-dependencies]
 # The connection deadline is minutes long; `test-util`'s paused clock exercises it in milliseconds.

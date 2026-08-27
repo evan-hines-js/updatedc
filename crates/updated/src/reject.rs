@@ -10,29 +10,27 @@ const MAX_REJECTION_RECORD_BYTES: usize = 1 << 20;
 pub struct Rejections {
     path: PathBuf,
     hashes: BTreeSet<String>,
-    overrides: BTreeSet<String>,
+    dirty: bool,
 }
 
 impl Rejections {
     /// Load the record from `path`. Only a missing file is an empty set; unreadable or
     /// malformed state fails closed so rejected bytes cannot silently become eligible.
     pub fn load(path: &Path) -> std::io::Result<Self> {
-        let hashes = load_keys(path, "rejection")?;
-        let overrides = load_keys(&override_path(path), "rejection override")?;
+        let hashes = load_record(path)?;
         Ok(Rejections {
             path: path.to_owned(),
             hashes,
-            overrides,
+            dirty: false,
         })
     }
 
     /// Whether these exact bytes were rejected. Rejections do not expire: retrying an
     /// unchanged, proven-bad artifact only creates an availability loop. Publishing
-    /// corrected bytes produces a new digest and is immediately eligible. An exact key
-    /// in the startup-loaded break-glass file overrides the rejection.
+    /// corrected bytes produces a new digest and is immediately eligible. There is no
+    /// deletion or override path for the same bytes: a durable safety verdict is monotone.
     pub fn is_rejected(&self, hash: &str) -> bool {
-        digest_key(hash)
-            .is_ok_and(|hash| self.hashes.contains(&hash) && !self.overrides.contains(&hash))
+        digest_key(hash).is_ok_and(|hash| self.hashes.contains(&hash))
     }
 
     /// Record `hash` as rejected (persisted immediately). Validated on the way in with the
@@ -43,7 +41,7 @@ impl Rejections {
         let hash = digest_key(hash)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         if self.hashes.contains(&hash) {
-            return Ok(());
+            return if self.dirty { self.persist() } else { Ok(()) };
         }
         if self.hashes.len() >= MAX_REJECTION_KEYS {
             return Err(std::io::Error::new(
@@ -51,26 +49,28 @@ impl Rejections {
                 "rejection record has reached its key limit",
             ));
         }
-        self.hashes.insert(hash.clone());
-        if let Err(error) = self.save() {
-            self.hashes.remove(&hash);
-            return Err(error);
-        }
-        Ok(())
+        // The evidence already exists even if this machine cannot persist it. Keep the live
+        // process fail-closed on every write failure. This is also required for the durable
+        // primitive's post-rename error: the new record is already visible even though its
+        // directory fsync failed, so rolling memory back would make this process disagree with
+        // every fresh reader of the same path.
+        self.hashes.insert(hash);
+        self.persist()
     }
 
-    /// Drop any rejection for `hash` (e.g. once it later commits cleanly).
-    pub fn clear(&mut self, hash: &str) -> std::io::Result<()> {
-        let hash = digest_key(hash)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        if !self.hashes.remove(&hash) {
-            return Ok(());
+    fn persist(&mut self) -> std::io::Result<()> {
+        match self.save() {
+            Ok(()) => {
+                self.dirty = false;
+                Ok(())
+            }
+            Err(error) => {
+                // A later call for this key must retry the whole-set atomic write rather than
+                // mistaking in-memory suppression for a durable commit.
+                self.dirty = true;
+                Err(error)
+            }
         }
-        if let Err(error) = self.save() {
-            self.hashes.insert(hash);
-            return Err(error);
-        }
-        Ok(())
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -89,7 +89,7 @@ impl Rejections {
     }
 }
 
-fn load_keys(path: &Path, record: &str) -> std::io::Result<BTreeSet<String>> {
+fn load_record(path: &Path) -> std::io::Result<BTreeSet<String>> {
     let mut hashes = BTreeSet::new();
     let text = match foundation::file::read_bounded_regular_string(
         path,
@@ -101,40 +101,44 @@ fn load_keys(path: &Path, record: &str) -> std::io::Result<BTreeSet<String>> {
         Err(e) => return Err(e),
     };
     if let Some(text) = text {
-        for (line_no, line) in text.lines().enumerate() {
-            // Blank and whitespace-padded lines are skipped, not fatal: the break-glass file
-            // (see `override_path`) is hand-edited by an operator during an incident, and a
-            // stray blank line there must not turn emergency recovery into a boot failure.
-            // A non-empty line that is not a key still fails closed.
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
+        let body = text.strip_suffix('\n').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed rejection record: missing final newline",
+            )
+        })?;
+        if body.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed rejection record: empty files are not records",
+            ));
+        }
+        for (line_no, line) in body.split('\n').enumerate() {
             let hash = digest_key(line).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("malformed {record}: {e} at line {}", line_no + 1),
+                    format!("malformed rejection record: {e} at line {}", line_no + 1),
                 )
             })?;
+            if hashes.last().is_some_and(|previous| previous >= &hash) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "malformed rejection record: keys are duplicated or unsorted at line {}",
+                        line_no + 1
+                    ),
+                ));
+            }
             hashes.insert(hash);
             if hashes.len() > MAX_REJECTION_KEYS {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("{record} exceeds its key limit"),
+                    "rejection record exceeds its key limit",
                 ));
             }
         }
     }
     Ok(hashes)
-}
-
-/// Path of the deliberately local break-glass allowlist. Adding an exact rejection key here and
-/// restarting the runtime permits those same bytes to be tried again. Normal remediation
-/// publishes corrected bytes, whose new digest needs no override.
-fn override_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".allow");
-    PathBuf::from(name)
 }
 
 /// Whether `hash` is a well-formed rejection key: a plain SHA-256 digest (agent
@@ -163,7 +167,6 @@ fn digest_key(hash: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -211,6 +214,28 @@ mod tests {
     }
 
     #[test]
+    fn noncanonical_record_aliases_fail_closed() {
+        let (_dir, path) = tmp();
+        let a = hash('a');
+        let b = hash('b');
+        for body in [
+            String::new(),
+            a.clone(),
+            format!(" {a}\n"),
+            format!("{a} \n"),
+            format!("{a}\n\n"),
+            format!("{b}\n{a}\n"),
+            format!("{a}\n{a}\n"),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert_eq!(
+                Rejections::load(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
     fn application_rejections_are_scoped_to_repository_lineage() {
         let (_dir, path) = tmp();
         let digest = hash('2');
@@ -236,65 +261,25 @@ mod tests {
     }
 
     #[test]
-    fn exact_break_glass_entry_allows_rejected_bytes_after_restart() {
-        let (_dir, path) = tmp();
-        let rejected = format!("{}:{}", hash('a'), hash('2'));
-        let other = format!("{}:{}", hash('a'), hash('3'));
-        let mut first = Rejections::load(&path).unwrap();
-        first.reject(&rejected).unwrap();
-        first.reject(&other).unwrap();
-        assert!(first.is_rejected(&rejected));
-
-        std::fs::write(override_path(&path), format!("{rejected}\n")).unwrap();
-        let restarted = Rejections::load(&path).unwrap();
-        assert!(
-            !restarted.is_rejected(&rejected),
-            "exact override permits a retry"
-        );
-        assert!(
-            restarted.is_rejected(&other),
-            "override cannot broaden to other bytes"
-        );
-    }
-
-    #[test]
-    fn hand_edited_break_glass_whitespace_still_loads() {
-        // The break-glass file is typed by an operator mid-incident. A blank line or a
-        // padded entry must still start the runtime: the record is read before anything
-        // else the agent does, so a fatal parse here is a permanent boot failure on the
-        // one path that exists to end an outage.
-        let (_dir, path) = tmp();
-        let rejected = format!("{}:{}", hash('a'), hash('2'));
-        let mut first = Rejections::load(&path).unwrap();
-        first.reject(&rejected).unwrap();
-
-        std::fs::write(override_path(&path), format!("\n  {rejected}  \n\n")).unwrap();
-        let restarted = Rejections::load(&path).unwrap();
-        assert!(
-            !restarted.is_rejected(&rejected),
-            "a padded entry beside blank lines still overrides"
-        );
-    }
-
-    #[test]
-    fn malformed_break_glass_file_fails_closed() {
-        let (_dir, path) = tmp();
-        std::fs::write(override_path(&path), "all\n").unwrap();
-        assert_eq!(
-            Rejections::load(&path).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
-    }
-
-    #[test]
-    fn clear_removes_the_entry() {
-        let (_dir, path) = tmp();
+    fn persistence_failure_cannot_erase_live_rejection_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("missing-parent");
+        let path = parent.join("rejected");
         let digest = hash('2');
-        let mut r = Rejections::load(&path).unwrap();
-        r.reject(&digest).unwrap();
-        r.clear(&digest).unwrap();
-        assert!(!r.is_rejected(&digest));
-        assert!(!Rejections::load(&path).unwrap().is_rejected(&digest));
+        let mut rejections = Rejections::load(&path).unwrap();
+
+        assert!(rejections.reject(&digest).is_err());
+        assert!(
+            rejections.is_rejected(&digest),
+            "the process that observed bad bytes must remain fail-closed even when persistence fails"
+        );
+        assert!(!path.exists());
+
+        std::fs::create_dir(&parent).unwrap();
+        rejections
+            .reject(&digest)
+            .expect("an idempotent retry must finish the failed durable write");
+        assert!(Rejections::load(&path).unwrap().is_rejected(&digest));
     }
 
     #[test]
@@ -336,7 +321,5 @@ mod tests {
         r.reject(&hash('a')).unwrap();
         assert!(r.is_rejected(&hash('a')));
         assert!(!r.is_rejected(&hash('A')));
-        r.clear(&hash('a')).unwrap();
-        assert!(!r.is_rejected(&hash('a')));
     }
 }

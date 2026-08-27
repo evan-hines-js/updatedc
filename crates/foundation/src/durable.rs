@@ -483,21 +483,20 @@ pub struct TempDirectoryLease {
 
 /// Mark a newly-created staged directory as actively owned.
 pub fn lease_temp_directory(path: &Path) -> io::Result<TempDirectoryLease> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path.join(TEMP_DIRECTORY_LEASE_FILE))?;
+    let file = crate::file::open_lock_file(
+        &path.join(TEMP_DIRECTORY_LEASE_FILE),
+        crate::file::LockFileDisposition::CreateNew,
+    )?;
     file.lock()?;
     Ok(TempDirectoryLease { _file: file })
 }
 
 fn abandoned_temp_directory_lease(path: &Path) -> Option<File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path.join(TEMP_DIRECTORY_LEASE_FILE))
-        .ok()?;
+    let file = crate::file::open_lock_file(
+        &path.join(TEMP_DIRECTORY_LEASE_FILE),
+        crate::file::LockFileDisposition::OpenExisting,
+    )
+    .ok()?;
     match file.try_lock() {
         Ok(()) => Some(file),
         Err(fs::TryLockError::WouldBlock | fs::TryLockError::Error(_)) => None,

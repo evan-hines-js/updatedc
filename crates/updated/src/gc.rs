@@ -16,8 +16,11 @@ struct Entry {
 }
 
 /// Marker written into a workspace the moment its release directory is first observed missing.
-/// Dot-prefixed and namespaced so it cannot collide with anything an application keeps in its own
-/// working directory, and inside the workspace so it is removed with it.
+///
+/// The workspace belongs to the application, so this reserved entry is hostile input whenever the
+/// privileged agent examines it. Every marker operation must inspect or replace the entry itself,
+/// never follow it. Keeping that policy in [`orphaned_for`], [`mark_orphaned`], and
+/// [`clear_orphan_marker`] makes the whole marker lifecycle use one no-follow path.
 const ORPHAN_MARKER: &str = ".updated-orphaned-since";
 
 /// How long a release directory must stay missing before its workspace is scratch nobody owns.
@@ -54,8 +57,8 @@ const ORPHAN_GRACE: Duration = Duration::from_secs(600);
 ///
 /// Best-effort by design: leftover scratch costs disk, never correctness, and neither a launch nor
 /// a collection pass may fail because one stale directory resisted removal. Only direct children of
-/// `work` that are real directories are touched, and the release check is `is_dir` on the
-/// corresponding `versions` entry, so a dangling symlink or an unknown file never protects a
+/// `work` that are real directories are touched, and the release check examines the entry itself
+/// rather than following it, so a symlink or an unknown file never protects a
 /// workspace or leads deletion elsewhere.
 pub fn reap_orphaned_workspaces(work: &Path, versions: &Path) {
     reap_orphaned_workspaces_after(work, versions, ORPHAN_GRACE);
@@ -64,6 +67,14 @@ pub fn reap_orphaned_workspaces(work: &Path, versions: &Path) {
 /// [`reap_orphaned_workspaces`] with an explicit grace, so tests can drive the two-observation rule
 /// without sleeping.
 pub(crate) fn reap_orphaned_workspaces_after(work: &Path, versions: &Path, grace: Duration) {
+    // The roots themselves are configuration/state boundaries, not traversal hints. Following a
+    // replaced `work` root would turn arbitrary sibling directories into deletion candidates; a
+    // missing/unreadable `versions` root is likewise not evidence that every release disappeared.
+    if !matches!(real_directory_exists(work), Ok(true))
+        || !matches!(real_directory_exists(versions), Ok(true))
+    {
+        return;
+    }
     let Ok(entries) = fs::read_dir(work) else {
         return;
     };
@@ -76,35 +87,72 @@ pub(crate) fn reap_orphaned_workspaces_after(work: &Path, versions: &Path, grace
             continue;
         }
         let marker = workspace.join(ORPHAN_MARKER);
-        if versions.join(entry.file_name()).is_dir() {
+        let release = versions.join(entry.file_name());
+        let release_present = match real_directory_exists(&release) {
+            Ok(present) => present,
+            // An I/O or permission failure is not proof that a release disappeared. Skip this
+            // workspace so an unreadable versions volume can never authorize deletion.
+            Err(_) => continue,
+        };
+        if release_present {
             // The release is here, so any earlier suspicion was the staging window (or a repair
             // that has since completed). Forget it, or a future absence would be judged by a
             // long-expired stamp.
-            let _ = fs::remove_file(&marker);
+            clear_orphan_marker(&marker);
             continue;
         }
         match orphaned_for(&marker) {
             Some(elapsed) if elapsed >= grace => {
-                let _ = fs::remove_dir_all(&workspace);
+                let _ = foundation::durable::remove_path(&workspace);
             }
             Some(_) => {}
-            None => {
-                let _ = fs::write(&marker, b"");
-            }
+            None => mark_orphaned(&marker),
         }
+    }
+}
+
+/// Whether `path` names a real directory entry, distinguishing proven absence/garbage from an
+/// observation failure. A symlink is not a release, while an I/O error is not evidence of absence.
+fn real_directory_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
 /// How long this workspace has been marked orphaned, or `None` if it carries no usable mark yet.
 /// A clock that moved backwards since the mark was written reads as "not long enough", which only
-/// ever delays a deletion.
+/// ever delays a deletion. `symlink_metadata` is load-bearing: the workspace is application
+/// writable, so following a marker symlink would let the application choose the file whose mtime
+/// authorizes deletion.
 fn orphaned_for(marker: &Path) -> Option<Duration> {
-    let modified = fs::metadata(marker).ok()?.modified().ok()?;
+    let metadata = fs::symlink_metadata(marker).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?;
     Some(
         SystemTime::now()
             .duration_since(modified)
             .unwrap_or_default(),
     )
+}
+
+/// Install a fresh orphan clock without ever opening an application-chosen path.
+///
+/// A workload may have planted a symlink, directory, or other non-file at the reserved name. The
+/// shared removal primitive unlinks a symlink rather than following it, then the shared atomic
+/// writer commits a newly created sibling over the now-empty name. Failure is intentionally
+/// best-effort: it can only delay garbage collection.
+fn mark_orphaned(marker: &Path) {
+    let _ = foundation::durable::remove_path(marker)
+        .and_then(|()| foundation::durable::atomic_write_managed(marker, ".orphan-marker-", b""));
+}
+
+/// Forget a disproved orphan observation through the same shape-agnostic, no-follow removal path.
+fn clear_orphan_marker(marker: &Path) {
+    let _ = foundation::durable::remove_path(marker);
 }
 
 /// Remove oldest unprotected release directories until both inactive limits hold.
@@ -142,6 +190,17 @@ pub fn prune_directories(
     max_inactive: usize,
     max_inactive_bytes: u64,
 ) -> io::Result<usize> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "garbage-collection root is not a real directory",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    }
     let mut entries = Vec::new();
     match fs::read_dir(root) {
         Ok(children) => {
@@ -171,13 +230,10 @@ pub fn prune_directories(
         if count <= max_inactive && bytes <= max_inactive_bytes {
             break;
         }
-        fs::remove_dir_all(&entry.path)?;
+        foundation::durable::remove_path(&entry.path)?;
         count -= 1;
         bytes = bytes.saturating_sub(entry.bytes);
         removed += 1;
-    }
-    if removed != 0 {
-        foundation::durable::sync_dir(root)?;
     }
     Ok(removed)
 }
@@ -285,6 +341,30 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn pruning_never_follows_a_redirected_root() {
+        let (_dir, root) = temp();
+        let target = root.join("target");
+        let redirect = root.join("redirect");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(target.join("release")).unwrap();
+        fs::write(target.join("release/keep"), b"outside the configured root").unwrap();
+        std::os::unix::fs::symlink(&target, &redirect).unwrap();
+
+        assert_eq!(
+            prune_directories(&redirect, &HashSet::new(), 0, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            fs::read(target.join("release/keep")).unwrap(),
+            b"outside the configured root"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// A workspace and its release directory, with application scratch already in the workspace.
     fn workspace_pair(root: &Path, id: &ReleaseId) -> (PathBuf, PathBuf) {
         let work = root.join("work").join(id.directory_name());
@@ -362,6 +442,104 @@ mod tests {
         fs::remove_dir_all(&release_dir).unwrap();
         reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
         assert!(work_dir.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hostile_orphan_marker_never_redirects_the_privileged_writer() {
+        let (_dir, root) = temp();
+        let id = release("1.0.0", 1);
+        let (work_dir, release_dir) = workspace_pair(&root, &id);
+        let work = root.join("work");
+        let versions = root.join("versions");
+        let victim = root.join("agent-owned-file");
+        let marker = work_dir.join(ORPHAN_MARKER);
+
+        fs::remove_dir_all(release_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, &marker).unwrap();
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+
+        assert!(!victim.exists());
+        assert!(fs::symlink_metadata(marker).unwrap().file_type().is_file());
+        assert!(work_dir.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_hostile_directory_at_the_marker_is_repaired() {
+        let (_dir, root) = temp();
+        let id = release("1.0.0", 1);
+        let (work_dir, release_dir) = workspace_pair(&root, &id);
+        let work = root.join("work");
+        let versions = root.join("versions");
+        let marker = work_dir.join(ORPHAN_MARKER);
+
+        fs::remove_dir_all(release_dir).unwrap();
+        fs::create_dir(&marker).unwrap();
+        fs::write(marker.join("blocker"), b"application-controlled").unwrap();
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+
+        assert!(fs::symlink_metadata(marker).unwrap().file_type().is_file());
+        assert!(work_dir.is_dir());
+        reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        assert!(!work_dir.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_symlink_cannot_protect_or_redirect_workspace_collection() {
+        let (_dir, root) = temp();
+        let id = release("1.0.0", 1);
+        let (work_dir, release_dir) = workspace_pair(&root, &id);
+        let work = root.join("work");
+        let versions = root.join("versions");
+        let elsewhere = root.join("elsewhere");
+
+        fs::remove_dir_all(&release_dir).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep"), b"outside the versions tree").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, release_dir).unwrap();
+        for _ in 0..2 {
+            reap_orphaned_workspaces_after(&work, &versions, Duration::ZERO);
+        }
+
+        assert!(!work_dir.exists());
+        assert_eq!(
+            fs::read(elsewhere.join("keep")).unwrap(),
+            b"outside the versions tree"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_collection_never_follows_a_redirected_root() {
+        let (_dir, root) = temp();
+        let work = root.join("work");
+        let versions = root.join("versions");
+        let elsewhere = root.join("elsewhere");
+        let redirected = root.join("redirected-work");
+        let id = release("1.0.0", 1);
+        fs::create_dir_all(elsewhere.join(id.directory_name())).unwrap();
+        fs::write(
+            elsewhere.join(id.directory_name()).join("keep"),
+            b"outside the configured work root",
+        )
+        .unwrap();
+        fs::create_dir_all(&versions).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &redirected).unwrap();
+
+        for _ in 0..2 {
+            reap_orphaned_workspaces_after(&redirected, &versions, Duration::ZERO);
+        }
+
+        assert_eq!(
+            fs::read(elsewhere.join(id.directory_name()).join("keep")).unwrap(),
+            b"outside the configured work root"
+        );
+        assert!(!work.exists());
         let _ = fs::remove_dir_all(root);
     }
 

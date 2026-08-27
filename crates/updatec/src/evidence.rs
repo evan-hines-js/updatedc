@@ -128,16 +128,17 @@ impl VerifiedReports {
             .and_then(|report| report.fresh(now_ms))
     }
 
-    /// This node's one nonperishable claim, without exposing any stale machine state.
-    pub(crate) fn durable_rejection(
+    /// This node's one nonperishable positive claim, without exposing stale machine state or a
+    /// negative/retraction representation.
+    pub(crate) fn rejected_assignment(
         &self,
         node: &str,
         envelope: &Envelope,
         key: &P256PublicKey,
-    ) -> Option<(String, bool)> {
+    ) -> Option<String> {
         self.authentic(node, envelope, key)
-            .map(AuthenticReport::durable_rejection)
-            .map(|(identity, rejected)| (identity.to_string(), rejected))
+            .and_then(AuthenticReport::rejected_assignment)
+            .map(str::to_string)
     }
 
     /// Verify the whole fleet up front, across every available core.
@@ -272,21 +273,15 @@ impl ObservationLog {
         self.reported.contains(node)
     }
 
-    /// Record what `node`'s own authentic report says about the release its assignment names: that
-    /// it durably rejected it, or that it does not claim so.
+    /// Record `node`'s authenticated proof that it durably rejected `identity`.
     ///
-    /// Remembering is what a missing report must not undo; a report that ARRIVES and says otherwise
-    /// is the node itself withdrawing the claim, and it is honoured. The node has one way to do
-    /// that — an operator's break-glass override of its rejection record — and refusing to hear it
-    /// would leave the deployment halted fleet-wide with no exit but a new digest, after the
-    /// operator had deliberately cleared the very record the halt rests on.
-    pub(crate) fn note_rejection(&mut self, node: &str, identity: &str, rejected: bool) {
-        let claim = (node.to_string(), identity.to_string());
-        if rejected {
-            self.rejections.insert(claim);
-        } else {
-            self.rejections.remove(&claim);
-        }
+    /// This is monotone for the live `(node, identity)` pair, exactly like the node's append-only
+    /// rejection ledger. Missing reports and later negative statements cannot erase safety
+    /// evidence. Normal remediation publishes corrected bytes with a new identity; node and
+    /// identity departure are the two explicit pruning paths below.
+    pub(crate) fn note_rejection(&mut self, node: &str, identity: &str) {
+        self.rejections
+            .insert((node.to_string(), identity.to_string()));
     }
 
     /// Every node that has claimed a durable rejection of `identity` — now or in an earlier pass.
@@ -526,7 +521,7 @@ mod tests {
         };
         let mut log = ObservationLog::new();
         assert!(provers(&log, &identity).is_empty());
-        log.note_rejection("n", &identity, true);
+        log.note_rejection("n", &identity);
         assert_eq!(provers(&log, &identity), vec!["n".to_string()]);
         assert!(
             provers(&log, &other).is_empty(),
@@ -540,14 +535,7 @@ mod tests {
         log.prune_identities(&HashSet::from([other]));
         assert!(provers(&log, &identity).is_empty());
 
-        // The node itself withdrawing the claim — the operator break-glassed its rejection record
-        // — is heard, because the alternative is a halt with no exit but a new digest after the
-        // operator has already cleared what the halt rests on.
-        log.note_rejection("n", &identity, true);
-        log.note_rejection("n", &identity, false);
-        assert!(provers(&log, &identity).is_empty());
-
-        log.note_rejection("n", &identity, true);
+        log.note_rejection("n", &identity);
         log.prune_nodes(|_| false);
         assert!(
             provers(&log, &identity).is_empty(),
@@ -564,9 +552,9 @@ mod tests {
         let identity = "a".repeat(64);
         let other = "b".repeat(64);
         let mut log = ObservationLog::new();
-        log.note_rejection("grouped", &identity, true);
-        log.note_rejection("unmatched", &identity, true);
-        log.note_rejection("elsewhere", &other, true);
+        log.note_rejection("grouped", &identity);
+        log.note_rejection("unmatched", &identity);
+        log.note_rejection("elsewhere", &other);
         assert_eq!(
             log.provers(&identity),
             BTreeSet::from(["grouped".to_string(), "unmatched".to_string()])

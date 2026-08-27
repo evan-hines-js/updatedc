@@ -447,8 +447,6 @@ PY
     helm template updatec deploy/charts/updatec --set publicUrl=https://u.example \
       --set gateway.ingress.enabled=true --set gateway.ingress.host=u.example \
       --set gateway.ingress.passthrough=false
-  must_refuse_chart "a publicUrl that is not an https URL" \
-    helm template updatec deploy/charts/updatec --set publicUrl=updates.example.com
   # Both halves of the one-identity collapse: an unnamed bring-your-own pair (which used to fall
   # back to the namespace `default` account for BOTH workloads), and two names spelled the same.
   must_refuse_chart "bring-your-own ServiceAccounts with no names" \

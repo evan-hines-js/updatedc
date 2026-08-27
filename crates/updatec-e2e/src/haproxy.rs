@@ -228,7 +228,7 @@ fn publish_haproxy_app(
         "kind": "UpdateGroup",
         "metadata": {"name": seed, "namespace": NAMESPACE},
         "spec": {
-            "repositoryRef": {"name": "default"},
+            "repositoryRef": {"name": fixture::REPOSITORY_NAME},
             "selector": {"matchLabels": {COHORT_LABEL: "__haproxy-seed-unmatched__"}},
             // A full clone of edge's deployment (CRD-valid); `updatectl deploy` overwrites application.
             "deployment": seed_deployment
@@ -379,7 +379,7 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
             }
         },
         "spec": {
-            "repositoryRef": {"name": "default"},
+            "repositoryRef": {"name": fixture::REPOSITORY_NAME},
             "selector": {"matchLabels": {COHORT_LABEL: HAPROXY_COHORT}},
             "deployment": base,
             "maxUnavailable": 1
@@ -402,7 +402,7 @@ pub(crate) async fn prepare_haproxy_tier(platform: &str) -> Result<(), Box<dyn s
             "kind": "UpdateAgent",
             "metadata": {"name": resource_name(&node), "namespace": NAMESPACE},
             "spec": {
-                "repositoryRef": {"name": "default"},
+                "repositoryRef": {"name": fixture::REPOSITORY_NAME},
                 "identity": {"kind": "reserved"},
                 "labels": {
                     NODE_LABEL: node,
@@ -454,7 +454,7 @@ pub(crate) async fn deploy_haproxy_healthproxy() -> Result<(), Box<dyn std::erro
         "kind": "UpdateBackend",
         "metadata": {"name": "haproxy", "namespace": NAMESPACE},
         "spec": {
-            "repositoryRef": {"name": "default"},
+            "repositoryRef": {"name": fixture::REPOSITORY_NAME},
             "selector": {"matchLabels": {COHORT_LABEL: EXTERNAL_COHORT}},
             "healthBase": HEALTH_CDN,
             "target": {

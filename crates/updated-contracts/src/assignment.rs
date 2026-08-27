@@ -180,11 +180,7 @@ pub fn canonical_repository_base(value: &str) -> Result<url::Url, String> {
             format!("must be an HTTPS/file base URL or absolute directory: {error}")
         })?
     };
-    if url.query().is_some()
-        || url.fragment().is_some()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
+    if !crate::endpoint::has_unambiguous_shape(&url, crate::endpoint::QueryPolicy::Forbidden) {
         return Err("must not contain credentials, a query, or a fragment".into());
     }
     if url.cannot_be_a_base() || !url.path().ends_with('/') {

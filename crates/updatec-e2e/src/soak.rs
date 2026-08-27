@@ -9,11 +9,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, TryLockError};
 use std::future::Future;
-use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -34,13 +33,14 @@ use updatec::{
     DeploymentSpec, UpdateAgent, UpdateGroup, UpdateGroupSet, UpdateGroupStatus, UpdateRepository,
 };
 
-use crate::{agent_resource_name, fixture};
+use crate::{agent_resource_name, fixture, NAMESPACE};
 
 const STATE_SCHEMA: u8 = 4;
 const BASELINE_VERSION: &str = "1.0.0";
 const CAMPAIGN_VERSION_MAJOR: u64 = 1_000_000;
 const METRICS_PORT: u16 = 9091;
 const METRICS_MAX_REQUEST: usize = 8 * 1024;
+const CAMPAIGN_STATE_MAX_BYTES: usize = 64 * 1024;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -59,8 +59,7 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         let config = Self {
-            namespace: env::var("UPDATEC_SOAK_NAMESPACE")
-                .unwrap_or_else(|_| fixture::NAMESPACE.into()),
+            namespace: env::var("UPDATEC_SOAK_NAMESPACE").unwrap_or_else(|_| NAMESPACE.into()),
             seed: env_u64("UPDATEC_SOAK_SEED", 2_026_082_500, 1, i64::MAX as u64)?,
             agent_count: env_u64("UPDATEC_SOAK_AGENT_COUNT", 6, 3, 60)? as usize,
             round_interval: Duration::from_secs(env_u64(
@@ -99,11 +98,10 @@ impl Config {
         if self.fault_duration >= self.convergence_timeout {
             return Err("fault duration must be shorter than the convergence budget".into());
         }
-        if self.namespace != fixture::NAMESPACE {
+        if self.namespace != NAMESPACE {
             return Err(format!(
                 "soak namespace {:?} disagrees with the shared fixture namespace {:?}",
-                self.namespace,
-                fixture::NAMESPACE
+                self.namespace, NAMESPACE
             )
             .into());
         }
@@ -126,25 +124,15 @@ struct CampaignLock {
 impl CampaignLock {
     fn try_acquire(config: &Config) -> Result<Option<Self>> {
         fs::create_dir_all(&config.state_dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(config.state_dir.join("campaign.lock"))?;
-        // SAFETY: `file` owns this valid descriptor for the lifetime of the lock guard. `flock`
-        // does not dereference memory, and the guard retains the open file until process exit or
-        // drop, which is precisely the kernel lifetime of this advisory lock.
-        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if locked == 0 {
-            return Ok(Some(Self { _file: file }));
+        let file = foundation::file::open_lock_file(
+            &config.state_dir.join("campaign.lock"),
+            foundation::file::LockFileDisposition::OpenOrCreate,
+        )?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error.into()),
         }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(None);
-        }
-        Err(error.into())
     }
 }
 
@@ -171,6 +159,12 @@ enum FaultKind {
     ControllerKill,
 }
 
+struct FaultDescriptor {
+    metric_name: &'static str,
+    resource_kind: &'static str,
+    resource_plural: &'static str,
+}
+
 impl FaultKind {
     const ALL: [Self; 4] = [
         Self::NetworkPartition,
@@ -179,20 +173,28 @@ impl FaultKind {
         Self::ControllerKill,
     ];
 
-    const fn name(self) -> &'static str {
+    const fn descriptor(self) -> FaultDescriptor {
         match self {
-            Self::NetworkPartition => "network_partition",
-            Self::IoError => "io_error",
-            Self::AgentKill => "agent_kill",
-            Self::ControllerKill => "controller_kill",
-        }
-    }
-
-    const fn resource(self) -> (&'static str, &'static str) {
-        match self {
-            Self::NetworkPartition => ("NetworkChaos", "networkchaos"),
-            Self::IoError => ("IOChaos", "iochaos"),
-            Self::AgentKill | Self::ControllerKill => ("PodChaos", "podchaos"),
+            Self::NetworkPartition => FaultDescriptor {
+                metric_name: "network_partition",
+                resource_kind: "NetworkChaos",
+                resource_plural: "networkchaos",
+            },
+            Self::IoError => FaultDescriptor {
+                metric_name: "io_error",
+                resource_kind: "IOChaos",
+                resource_plural: "iochaos",
+            },
+            Self::AgentKill => FaultDescriptor {
+                metric_name: "agent_kill",
+                resource_kind: "PodChaos",
+                resource_plural: "podchaos",
+            },
+            Self::ControllerKill => FaultDescriptor {
+                metric_name: "controller_kill",
+                resource_kind: "PodChaos",
+                resource_plural: "podchaos",
+            },
         }
     }
 }
@@ -254,10 +256,19 @@ impl CampaignState {
     fn load(config: &Config) -> Result<Self> {
         fs::create_dir_all(&config.state_dir)?;
         let path = config.state_path();
-        let state = if path.exists() {
-            serde_json::from_slice(&fs::read(&path)?)?
-        } else {
-            Self::fresh(config.seed)
+        let state = match foundation::file::read_bounded_regular(
+            &path,
+            CAMPAIGN_STATE_MAX_BYTES,
+            foundation::file::FinalSymlink::Refuse,
+        ) {
+            Ok(bytes) => updated_contracts::bounded::decode(
+                &bytes,
+                "soak campaign state",
+                CAMPAIGN_STATE_MAX_BYTES,
+            )
+            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::fresh(config.seed),
+            Err(error) => return Err(error.into()),
         };
         state.validate(config)?;
         Ok(state)
@@ -365,15 +376,13 @@ impl CampaignState {
     fn persist(&self, config: &Config) -> Result<()> {
         self.validate(config)?;
         let path = config.state_path();
-        let temporary = config.state_dir.join("campaign.json.tmp");
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let mut file = File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        fs::rename(temporary, path)?;
-        // The file fsync makes its contents durable; the directory fsync makes the atomic rename
-        // durable. Without both, a node crash can resurrect the previous round after rename.
-        File::open(&config.state_dir)?.sync_all()?;
+        let bytes = updated_contracts::bounded::encode(
+            self,
+            "soak campaign state",
+            CAMPAIGN_STATE_MAX_BYTES,
+        )
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+        foundation::durable::atomic_write_managed(&path, ".campaign-state-", &bytes)?;
         Ok(())
     }
 }
@@ -589,17 +598,17 @@ impl Metrics {
             let active = self.active_fault == Some(kind);
             output.push_str(&format!(
                 "updatec_soak_fault_active{{kind=\"{}\"}} {}\n",
-                kind.name(),
+                kind.descriptor().metric_name,
                 u8::from(active)
             ));
             output.push_str(&format!(
                 "updatec_soak_faults_total{{kind=\"{}\"}} {}\n",
-                kind.name(),
+                kind.descriptor().metric_name,
                 self.state.faults[&kind]
             ));
             output.push_str(&format!(
                 "updatec_soak_fault_failures_total{{kind=\"{}\"}} {}\n",
-                kind.name(),
+                kind.descriptor().metric_name,
                 self.state.fault_failures[&kind]
             ));
         }
@@ -635,11 +644,10 @@ impl ReleaseCatalog {
         if !ready.is_file() {
             return Err(format!("release repository is not ready at {}", ready.display()).into());
         }
-        let platform = fs::read_to_string(config.release_data.join("platform"))?
-            .trim()
-            .to_owned();
-        let root_json =
-            fs::read_to_string(config.release_data.join("repository/metadata/root.json"))?;
+        let platform = foundation::platform::platform_key();
+        let root_json = String::from_utf8(
+            updated_tuf::repo::root_bytes(&config.release_data.join("repository")).await?,
+        )?;
         let mut catalog = Self {
             platform,
             root_json,
@@ -922,7 +930,7 @@ impl Campaign {
             plan.round,
             plan.seed,
             plan.groups,
-            plan.fault.name(),
+            plan.fault.descriptor().metric_name,
             plan.expected_rejection
         );
         if plan.expected_rejection {
@@ -1156,10 +1164,13 @@ impl Campaign {
             api.create(&PostParams::default(), &object).await?;
             wait_chaos_injected(&api, &name).await?;
             injected = true;
-            println!("[soak] {} injected by Chaos Mesh", plan.fault.name());
+            println!(
+                "[soak] {} injected by Chaos Mesh",
+                plan.fault.descriptor().metric_name
+            );
             tokio::time::sleep(self.config.fault_duration).await;
             delete_dynamic(&api, &name).await?;
-            println!("[soak] {} recovered", plan.fault.name());
+            println!("[soak] {} recovered", plan.fault.descriptor().metric_name);
             Ok::<(), Box<dyn std::error::Error>>(())
         }
         .await;
@@ -1178,8 +1189,13 @@ impl Campaign {
         plan: &RoundPlan,
         name: &str,
     ) -> Result<(Api<DynamicObject>, DynamicObject)> {
-        let (kind, plural) = plan.fault.resource();
-        let api = dynamic_api(self.client.clone(), &self.config.namespace, kind, plural);
+        let descriptor = plan.fault.descriptor();
+        let api = dynamic_api(
+            self.client.clone(),
+            &self.config.namespace,
+            descriptor.resource_kind,
+            descriptor.resource_plural,
+        );
         let target = match plan.fault {
             FaultKind::ControllerKill => self.controller_pod().await?,
             _ => agent_hostname(plan.target_ordinal),
@@ -1220,7 +1236,7 @@ impl Campaign {
         };
         let object = serde_json::from_value(json!({
             "apiVersion": "chaos-mesh.org/v1alpha1",
-            "kind": kind,
+            "kind": descriptor.resource_kind,
             "metadata": {
                 "name": name,
                 "namespace": self.config.namespace,
@@ -1253,11 +1269,11 @@ fn status_observed_rejection(status: &UpdateGroupStatus, generation: i64) -> boo
         && status.conditions.iter().any(|condition| {
             condition.observed_generation == Some(generation)
                 && ((condition.condition_type == updatec::status_contract::READY_CONDITION
-                    && condition.status == "False"
+                    && condition.status == updatec::status_contract::CONDITION_FALSE
                     && condition.reason == updatec::status_contract::REJECTED_REASON)
                     || (condition.condition_type
                         == updatec::status_contract::DEPLOYMENT_HALTED_CONDITION
-                        && condition.status == "True"
+                        && condition.status == updatec::status_contract::CONDITION_TRUE
                         && condition.reason
                             == updatec::status_contract::REGRESSION_EVIDENCE_REASON))
         })
@@ -1273,14 +1289,22 @@ async fn cleanup_faults(
         fixture::SOAK_CHAOS_LABEL,
         fixture::SOAK_CHAOS_VALUE
     );
-    // PodChaos backs both kill variants, so visit each Kubernetes resource type once.
-    for kind in [
-        FaultKind::NetworkPartition,
-        FaultKind::IoError,
-        FaultKind::AgentKill,
-    ] {
-        let (resource_kind, plural) = kind.resource();
-        let api = dynamic_api(client.clone(), &config.namespace, resource_kind, plural);
+    // Derive cleanup from the exhaustive descriptor table and deduplicate shared resources.
+    // PodChaos backs both kill variants; new fault kinds cannot silently escape cleanup.
+    let resources = FaultKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let descriptor = kind.descriptor();
+            (descriptor.resource_kind, descriptor.resource_plural)
+        })
+        .collect::<BTreeSet<_>>();
+    for (resource_kind, resource_plural) in resources {
+        let api = dynamic_api(
+            client.clone(),
+            &config.namespace,
+            resource_kind,
+            resource_plural,
+        );
         let objects = api.list(&ListParams::default().labels(&selector)).await?;
         for object in objects {
             delete_dynamic(&api, &object.name_any()).await?;
@@ -1410,7 +1434,12 @@ async fn ensure_signing_secret(client: &Client, config: &Config) -> Result<()> {
 fn read_signing_key_data(keys: &std::path::Path) -> Result<BTreeMap<String, ByteString>> {
     let data = updated_tuf::repo::KEY_FILE_NAMES
         .into_iter()
-        .map(|name| Ok((name.into(), ByteString(fs::read(keys.join(name))?))))
+        .map(|name| {
+            Ok((
+                name.into(),
+                ByteString(updated_tuf::repo::read_signing_key_bytes(&keys.join(name))?),
+            ))
+        })
         .collect::<Result<BTreeMap<_, _>>>()?;
     validate_signing_key_data(&data)?;
     Ok(data)
@@ -1454,7 +1483,7 @@ async fn ensure_control_resources(
     state: &CampaignState,
 ) -> Result<()> {
     let sha = catalog.app_sha(BASELINE_VERSION).await?;
-    let repository_deployment = catalog.deployment("default", BASELINE_VERSION, &sha);
+    let repository_deployment = catalog.deployment(updatec::DEFAULT_GROUP, BASELINE_VERSION, &sha);
     let repositories: Api<UpdateRepository> = Api::namespaced(client.clone(), &config.namespace);
     let apply = PatchParams::apply("updatec-soak").force();
     repositories
@@ -1526,10 +1555,7 @@ fn append_record(
     };
     let mut line = serde_json::to_vec(&record)?;
     line.push(b'\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(config.journal_path())?;
+    let mut file = foundation::file::open_append_file(&config.journal_path())?;
     file.write_all(&line)?;
     file.sync_data()?;
     Ok(())
@@ -1803,7 +1829,7 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            namespace: fixture::NAMESPACE.into(),
+            namespace: NAMESPACE.into(),
             seed: 42,
             agent_count: 6,
             round_interval: Duration::from_secs(90),
@@ -1866,10 +1892,42 @@ mod tests {
         metrics.active_fault = Some(FaultKind::IoError);
         let text = metrics.render();
         for kind in FaultKind::ALL {
-            assert!(text.contains(&format!("kind=\"{}\"", kind.name())));
+            assert!(text.contains(&format!("kind=\"{}\"", kind.descriptor().metric_name)));
         }
         assert!(!text.contains("round=\""));
         assert!(text.contains("updatec_soak_fault_active{kind=\"io_error\"} 1"));
+    }
+
+    #[test]
+    fn fault_descriptors_are_complete_and_cleanup_resources_are_derived() {
+        let descriptors = FaultKind::ALL.map(|kind| {
+            let descriptor = kind.descriptor();
+            (
+                descriptor.metric_name,
+                descriptor.resource_kind,
+                descriptor.resource_plural,
+            )
+        });
+        assert_eq!(
+            descriptors,
+            [
+                ("network_partition", "NetworkChaos", "networkchaos"),
+                ("io_error", "IOChaos", "iochaos"),
+                ("agent_kill", "PodChaos", "podchaos"),
+                ("controller_kill", "PodChaos", "podchaos"),
+            ]
+        );
+        assert_eq!(
+            descriptors
+                .into_iter()
+                .map(|(_, kind, plural)| (kind, plural))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ("IOChaos", "iochaos"),
+                ("NetworkChaos", "networkchaos"),
+                ("PodChaos", "podchaos"),
+            ])
+        );
     }
 
     #[test]
@@ -1922,7 +1980,41 @@ mod tests {
             serde_json::to_value(restored).unwrap(),
             serde_json::to_value(state).unwrap()
         );
-        assert!(!directory.path().join("campaign.json.tmp").exists());
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".campaign-state-")
+        }));
+    }
+
+    #[test]
+    fn campaign_state_is_bounded_and_cannot_redirect_its_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.state_dir = directory.path().into();
+        std::fs::write(
+            config.state_path(),
+            vec![b' '; CAMPAIGN_STATE_MAX_BYTES + 1],
+        )
+        .unwrap();
+        assert!(CampaignState::load(&config).is_err());
+
+        std::fs::remove_file(config.state_path()).unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::write(
+            &outside,
+            updated_contracts::bounded::encode(
+                &CampaignState::fresh(config.seed),
+                "soak campaign state",
+                CAMPAIGN_STATE_MAX_BYTES,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, config.state_path()).unwrap();
+        assert!(CampaignState::load(&config).is_err());
     }
 
     #[test]
@@ -1935,6 +2027,36 @@ mod tests {
         assert!(CampaignLock::try_acquire(&config).unwrap().is_none());
         drop(owner);
         assert!(CampaignLock::try_acquire(&config).unwrap().is_some());
+
+        let lock = config.state_dir.join("campaign.lock");
+        std::fs::remove_file(&lock).unwrap();
+        let redirected = config.state_dir.join("redirected");
+        std::fs::write(&redirected, b"must remain ordinary state").unwrap();
+        std::os::unix::fs::symlink(&redirected, &lock).unwrap();
+        assert!(CampaignLock::try_acquire(&config).is_err());
+        assert_eq!(
+            std::fs::read(&redirected).unwrap(),
+            b"must remain ordinary state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_journal_cannot_redirect_its_append_through_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.state_dir = directory.path().into();
+        let outside = directory.path().join("outside");
+        std::fs::write(&outside, b"must remain ordinary state").unwrap();
+        std::os::unix::fs::symlink(&outside, config.journal_path()).unwrap();
+        let state = CampaignState::fresh(config.seed);
+        let plan = plan_round(&state, config.agent_count);
+
+        assert!(append_record(&config, &plan, "success", Duration::ZERO, None).is_err());
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"must remain ordinary state"
+        );
     }
 
     #[test]
@@ -1950,8 +2072,18 @@ mod tests {
             }
         };
         for verdict in [
-            condition("Ready", "False", "Rejected", 7),
-            condition("DeploymentHalted", "True", "RegressionEvidence", 7),
+            condition(
+                updatec::status_contract::READY_CONDITION,
+                updatec::status_contract::CONDITION_FALSE,
+                updatec::status_contract::REJECTED_REASON,
+                7,
+            ),
+            condition(
+                updatec::status_contract::DEPLOYMENT_HALTED_CONDITION,
+                updatec::status_contract::CONDITION_TRUE,
+                updatec::status_contract::REGRESSION_EVIDENCE_REASON,
+                7,
+            ),
         ] {
             let status = UpdateGroupStatus {
                 observed_generation: Some(7),
@@ -1964,7 +2096,12 @@ mod tests {
 
         let status = UpdateGroupStatus {
             observed_generation: Some(7),
-            conditions: vec![condition("DeploymentHalted", "False", "NoRegression", 7)],
+            conditions: vec![condition(
+                updatec::status_contract::DEPLOYMENT_HALTED_CONDITION,
+                updatec::status_contract::CONDITION_FALSE,
+                "NoRegression",
+                7,
+            )],
             ..Default::default()
         };
         assert!(!status_observed_rejection(&status, 7));

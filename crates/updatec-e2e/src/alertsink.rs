@@ -114,20 +114,28 @@ async fn serve(mut stream: TcpStream, record: &Path) -> Result<(), Box<dyn std::
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
-    let body = &buffer[header_end..header_end + length];
-    let mut line = body.to_vec();
-    line.push(b'\n');
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(record)
-        .await?;
-    file.write_all(&line).await?;
-    file.flush().await?;
+    append_record(record, &buffer[header_end..header_end + length]).await?;
     stream
         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
         .await?;
     stream.flush().await?;
+    Ok(())
+}
+
+/// Append one complete delivery through the workspace's sole managed-record opener.
+///
+/// The configured record path is writable state inside the sink container. Refusing a final
+/// symlink keeps that authority on the named record instead of letting a planted path redirect
+/// the controller's alert bodies into an unrelated file. Converting the already-validated
+/// standard handle preserves that no-follow proof while allowing the socket task to await I/O.
+async fn append_record(record: &Path, body: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut line = body.to_vec();
+    line.push(b'\n');
+    let file = foundation::file::open_append_file(record)?;
+    let mut file = tokio::fs::File::from_std(file);
+    file.write_all(&line).await?;
+    file.flush().await?;
+    file.sync_data().await?;
     Ok(())
 }
 
@@ -188,6 +196,26 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&record).unwrap(),
             format!("{document}\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn alert_records_cannot_redirect_their_append_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let record = dir.path().join("alerts.jsonl");
+        std::fs::write(&outside, b"must remain ordinary state").unwrap();
+        std::os::unix::fs::symlink(&outside, &record).unwrap();
+
+        assert!(
+            append_record(&record, br#"{"condition":"DeploymentHalted"}"#)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"must remain ordinary state"
         );
     }
 

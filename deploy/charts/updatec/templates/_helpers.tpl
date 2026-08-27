@@ -158,18 +158,14 @@ point at. A name this chart cannot spell verbatim is therefore refused while ren
 {{- end -}}
 
 {{/*
-The environment both workloads share. `UPDATED_PUBLIC_URL` is minted into immutable signed
-enrollment bundles, so it is validated here — once, for every consumer — rather than left to fail
-as a node that cannot come back. Presence is not the whole check: nothing downstream parses the
-value (the gateway appends a trailing slash and mints it verbatim), so the shape is checked here
-too, to the same `^https://` rule install.sh and the Ansible role already enforce on the node side.
+The environment both workloads share. `publicUrl` has no meaningful default, so the chart requires
+the operator to choose one. Its URL grammar is deliberately not reimplemented in Helm: updatec's
+shared process-boundary parser is the single authority for HTTPS, host, credential, query, fragment,
+and canonicalization rules in every launch environment, including this chart.
 */}}
 {{- define "updatec.commonEnv" -}}
 {{- if not .Values.publicUrl }}
 {{- fail "publicUrl is required: it is the URL nodes are told to return to and it is baked into immutable signed enrollment bundles. Set it to the address agents resolve from outside the cluster." }}
-{{- end }}
-{{- if not (regexMatch "^https://[^\\s\"]+$" .Values.publicUrl) }}
-{{- fail (printf "publicUrl must be an https URL, got %q. Enrollment is mutual TLS, and this exact string is minted into immutable signed bundles as the base every node returns to — a scheme-less or malformed value is not repaired by editing the release later, because a node refuses a bundle whose base URL changed." .Values.publicUrl) }}
 {{- end }}
 - name: UPDATED_NAMESPACE
   value: {{ .Release.Namespace | quote }}

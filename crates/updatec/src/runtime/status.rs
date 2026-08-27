@@ -136,16 +136,12 @@ pub(crate) async fn publish_group_set_statuses(
     Ok(())
 }
 
-/// The condition type [`ready_condition`] and [`failed_condition`] both report on. Named because a
-/// writer that replaces the conditions array has to be able to say which entry is its own.
-pub(crate) const READY_CONDITION: &str = "Ready";
-
 /// A `Ready` [`ResourceCondition`] for `generation`, reporting success (`status: "True"`) or
 /// failure (`status: "False"`). The single place a Ready condition's fields are assembled;
 /// [`ready_condition`] and [`failed_condition`] are the two named entry points.
-/// `alerts::condition` is a deliberate sibling, not a duplicate to merge: the alert constructors
-/// take the caller's clock, while these read it here — and folding one into the other would couple
-/// the alert module's semantics to this file for six lines of struct literal.
+/// Alert constructors and subscriptions use the same [`crate::status_contract::condition`]
+/// assembler with their explicit observation clocks; this wrapper supplies the status writer's
+/// current clock and is not a second condition shape.
 ///
 /// The stamped time is this OBSERVATION's, which is not what the field means, so a condition built
 /// here is never written as it stands: every writer merges its array through
@@ -159,32 +155,56 @@ pub(crate) fn condition(
     reason: &str,
     message: &str,
 ) -> ResourceCondition {
-    ResourceCondition {
-        condition_type: condition_type.into(),
-        status: if ok { "True" } else { "False" }.into(),
-        reason: reason.into(),
-        message: message.into(),
-        observed_generation: generation,
-        last_transition_time: chrono::Utc::now().to_rfc3339(),
-    }
+    crate::status_contract::condition(
+        condition_type,
+        ok,
+        generation,
+        reason,
+        message,
+        chrono::Utc::now().to_rfc3339(),
+    )
 }
 
-/// Whether a computed status is identical to the one the resource already carries, in which case
-/// the merge patch would change nothing and is skipped.
+/// Whether applying a computed status as an RFC 7386 JSON merge patch would leave the resource's
+/// observed status unchanged, in which case the API write is skipped.
 ///
 /// The loop recomputes every status once per second for every resource, so an unconditional patch is
 /// an apiserver round trip per resource per second on a fleet where nothing is happening — the same
 /// discipline `record_reconcile_failing` applies to its own condition, and the reason every writer's
 /// conditions array is stabilized by [`crate::alerts::merge_conditions`] first. Compared as the JSON
-/// that would be sent, because that is exactly what the apiserver merges.
+/// merge EFFECT, not as whole serialized structs: omitted fields survive a merge patch, so a partial
+/// failure status can be a no-op even though it deliberately does not repeat the last successful
+/// publication's fields.
 pub(crate) fn status_unchanged<T: serde::Serialize>(next: &T, observed: Option<&T>) -> bool {
     let Some(observed) = observed else {
         return false;
     };
     match (serde_json::to_value(next), serde_json::to_value(observed)) {
-        (Ok(next), Ok(observed)) => next == observed,
+        (Ok(next), Ok(observed)) => merge_patch_unchanged(&next, &observed),
         _ => false,
     }
+}
+
+/// Compare one RFC 7386 merge patch with its target without materializing a second document.
+/// Objects merge recursively, `null` deletes a member, and every other value (arrays included)
+/// replaces its target wholesale. A typed Kubernetes status cannot distinguish an absent optional
+/// field from an explicit `null` after deserialization, so those two wire shapes are treated as
+/// semantically equal; a stale non-null value still makes the delete a required change.
+fn merge_patch_unchanged(patch: &serde_json::Value, target: &serde_json::Value) -> bool {
+    let serde_json::Value::Object(patch) = patch else {
+        return patch == target;
+    };
+    let serde_json::Value::Object(target) = target else {
+        return false;
+    };
+    patch.iter().all(|(key, value)| {
+        if value.is_null() {
+            return target.get(key).is_none_or(serde_json::Value::is_null);
+        }
+        target
+            .get(key)
+            .is_some_and(|observed| merge_patch_unchanged(value, observed))
+    })
 }
 
 /// Whether this repository's trust anchor is being kept fresh, reported unconditionally alongside
@@ -197,7 +217,7 @@ pub(crate) fn root_renewal_condition(
     failure: Option<&str>,
 ) -> ResourceCondition {
     condition(
-        "RootRenewal",
+        crate::status_contract::ROOT_RENEWAL_CONDITION,
         failure.is_none(),
         generation,
         if failure.is_some() {
@@ -214,7 +234,13 @@ pub(crate) fn ready_condition(
     reason: &str,
     message: &str,
 ) -> ResourceCondition {
-    condition(READY_CONDITION, true, generation, reason, message)
+    condition(
+        crate::status_contract::READY_CONDITION,
+        true,
+        generation,
+        reason,
+        message,
+    )
 }
 
 pub(crate) fn failed_condition(
@@ -222,7 +248,13 @@ pub(crate) fn failed_condition(
     reason: &str,
     message: &str,
 ) -> ResourceCondition {
-    condition(READY_CONDITION, false, generation, reason, message)
+    condition(
+        crate::status_contract::READY_CONDITION,
+        false,
+        generation,
+        reason,
+        message,
+    )
 }
 
 /// The `ReleaseAdmission` condition, which this writer speaks for on EVERY pass — including the
@@ -238,10 +270,8 @@ pub(crate) fn admission_condition(
     deployment: &crate::DesiredDeployment,
 ) -> ResourceCondition {
     // One spelling of the condition type, for both outcomes: this constructor is where
-    // `ReleaseAdmission` is named, the way `RootRenewal` and `EnrollmentCapacity` are named in
-    // theirs. Every reader finds it by the type the condition itself carries (`merge_conditions`
-    // looks each entry up by its own `condition_type`), so there is no second literal to keep in
-    // step with this one.
+    // `ReleaseAdmission` is named by the same status vocabulary every condition producer and
+    // exact consumer imports; no writer gets a private spelling of a shared wire type.
     let (allowed, reason, message) = match evaluation.status(deployment) {
         Some(status) => (status.allowed, status.reason, status.message),
         None => (
@@ -250,7 +280,13 @@ pub(crate) fn admission_condition(
             "No UpdateAdmissionPolicy is referenced; releases are not gated.".to_string(),
         ),
     };
-    condition("ReleaseAdmission", allowed, generation, reason, &message)
+    condition(
+        crate::status_contract::RELEASE_ADMISSION_CONDITION,
+        allowed,
+        generation,
+        reason,
+        &message,
+    )
 }
 
 /// An [`UpdateGroupStatus`] carrying the generation-scoped fields (matched count, digest,
@@ -498,7 +534,10 @@ pub(crate) async fn publish_resource_statuses(
         .map(std::slice::from_ref)
         .unwrap_or(&[]);
     let (halted_condition, halt_fired) = crate::alerts::carry_transition(
-        crate::alerts::existing(previous, crate::alerts::DEPLOYMENT_HALTED),
+        crate::alerts::existing(
+            previous,
+            crate::status_contract::DEPLOYMENT_HALTED_CONDITION,
+        ),
         crate::alerts::deployment_halted(repository_generation, default_halt, now),
     );
     repository_conditions.push(halted_condition.clone());
@@ -836,6 +875,9 @@ pub async fn record_repository_failure(
         .map(|status| status.conditions.as_slice())
         .unwrap_or_default();
     let status = failure_status(repository.metadata.generation, message, observed);
+    if status_unchanged(&status, repository.status.as_ref()) {
+        return Ok(());
+    }
     repositories
         .patch_status(
             repository_name,
@@ -872,15 +914,20 @@ pub async fn record_reconcile_failing(
             chrono::Utc::now(),
         );
         let (published, fired) = crate::alerts::carry_transition(
-            crate::alerts::existing(observed, crate::alerts::RECONCILE_FAILING),
+            crate::alerts::existing(
+                observed,
+                crate::status_contract::RECONCILE_FAILING_CONDITION,
+            ),
             next,
         );
         // The condition's message is streak-independent, so once it has stabilized every further
         // failed pass would patch an identical document: skip the write — a failing loop must not
         // also be an apiserver write per set per second.
         if !fired
-            && crate::alerts::existing(observed, crate::alerts::RECONCILE_FAILING)
-                == Some(&published)
+            && crate::alerts::existing(
+                observed,
+                crate::status_contract::RECONCILE_FAILING_CONDITION,
+            ) == Some(&published)
         {
             continue;
         }
@@ -918,8 +965,9 @@ pub async fn record_reconcile_failing(
 ///
 /// `observed` is the conditions array the repository currently carries. A merge patch REPLACES an
 /// array wholesale, so the same omission rule applies to the entries of this one: a failure speaks
-/// only for [`READY_CONDITION`] and carries every other condition forward untouched, which is what
-/// [`crate::alerts::merge_conditions`] does for every writer. Rewriting the array with just its own
+/// only for [`crate::status_contract::READY_CONDITION`] and carries every other condition forward
+/// untouched, which is what [`crate::alerts::merge_conditions`] does for every writer. Rewriting
+/// the array with just its own
 /// entry deleted `EnrollmentCapacity` — the only operator-visible sign that `/enroll` is at its
 /// ceiling — for the entire duration of any reconcile failure. The merge also keeps the failure's
 /// own transition time, so a loop that stays down patches a document identical to the stored one
@@ -969,6 +1017,12 @@ pub(crate) async fn materialize_signing_keys(
     directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data = secret.data.as_ref().ok_or("signing Secret has no data")?;
+    updated_tuf::repo::validate_complete_signing_key_set(
+        data.iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.0.as_slice())),
+    )
+    .map_err(|error| format!("signing Secret contains an invalid key set: {error}"))?;
+
     let mut material = Vec::with_capacity(updated_tuf::repo::KEY_FILE_NAMES.len());
     for name in updated_tuf::repo::KEY_FILE_NAMES {
         let bytes = data
@@ -977,12 +1031,15 @@ pub(crate) async fn materialize_signing_keys(
         material.push((name, bytes));
     }
 
-    // Validate the complete rotatable set before touching disk. A malformed Secret therefore
-    // cannot leave a convincing partial key directory for a later path to mistake as initialized.
+    // Validate the complete rotatable set, including every key's cryptographic shape and role
+    // separation, before touching disk. A malformed Secret therefore cannot leave a convincing
+    // partial key directory for a later path to mistake as initialized. The gate above is the same
+    // one file-backed TUF authoring uses; projected and local signing keys cannot drift into
+    // separate definitions.
     tokio::fs::create_dir_all(directory).await?;
     for (name, bytes) in material {
         let path = directory.join(name);
-        if path.try_exists()? {
+        if foundation::file::path_entry_exists(&path)? {
             if read_local_bounded(&path, bytes.0.len()).await? != bytes.0 {
                 return Err(format!("signing key {name} changed in place").into());
             }
@@ -1021,4 +1078,45 @@ pub(crate) fn secret_string(
             String::from_utf8(bytes.0.clone()).map_err(|e| e.into())
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod merge_patch_tests {
+    use super::merge_patch_unchanged;
+
+    #[test]
+    fn no_op_detection_follows_merge_patch_semantics_recursively() {
+        let target = serde_json::json!({
+            "kept": "value",
+            "nil": null,
+            "nested": { "one": 1, "two": 2 },
+            "array": [1, 2],
+        });
+
+        assert!(merge_patch_unchanged(
+            &serde_json::json!({ "nested": { "one": 1 } }),
+            &target,
+        ));
+        assert!(merge_patch_unchanged(&serde_json::json!({}), &target));
+        assert!(!merge_patch_unchanged(
+            &serde_json::json!({ "nested": { "one": 3 } }),
+            &target,
+        ));
+        assert!(!merge_patch_unchanged(
+            &serde_json::json!({ "array": [1] }),
+            &target,
+        ));
+        assert!(!merge_patch_unchanged(
+            &serde_json::json!({ "kept": null }),
+            &target,
+        ));
+        assert!(merge_patch_unchanged(
+            &serde_json::json!({ "absent": null }),
+            &target,
+        ));
+        assert!(merge_patch_unchanged(
+            &serde_json::json!({ "nil": null }),
+            &target,
+        ));
+    }
 }

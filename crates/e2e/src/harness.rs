@@ -164,13 +164,11 @@ impl Ctx {
         // built-artifact path below at the same dir so builds and copies agree.
         let target = root.join(format!("target/{name}-cargo"));
         std::env::set_var("CARGO_TARGET_DIR", &target);
-        let run_lock = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(str_err)?;
+        let run_lock = foundation::file::open_lock_file(
+            &lock_path,
+            foundation::file::LockFileDisposition::OpenOrCreate,
+        )
+        .map_err(str_err)?;
         let lock_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match run_lock.try_lock() {

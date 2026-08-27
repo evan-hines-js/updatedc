@@ -48,6 +48,39 @@ pub fn is_segment(value: &str) -> bool {
         && !is_windows_device_stem(value.split('.').next().unwrap_or_default())
 }
 
+/// The largest Kubernetes DNS-subdomain identity.
+///
+/// Nodes, update groups, and repository resources all cross Kubernetes object metadata and wire
+/// contracts. They therefore share this one ceiling and grammar instead of maintaining a
+/// telemetry-specific approximation of the API server's name rules.
+pub const MAX_DNS_SUBDOMAIN_BYTES: usize = 253;
+
+/// Whether `value` is the one Kubernetes DNS-subdomain identity grammar.
+///
+/// This is deliberately separate from [`is_segment`]: opaque portable path segments may contain
+/// `_`, while Kubernetes resource identities may contain dots only as separators between DNS
+/// labels. Certificate issuance, enrollment, reports, backend inventory, assignments, and durable
+/// rollout state all call this predicate, so none can mint or persist an identity another refuses.
+pub fn is_dns_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_DNS_SUBDOMAIN_BYTES
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
 fn is_windows_device_stem(stem: &str) -> bool {
     matches!(stem, "con" | "prn" | "aux" | "nul")
         || stem
@@ -93,6 +126,24 @@ mod tests {
         assert!(!is_segment("prod/web"));
         assert!(!is_segment("prod\nweb"));
         assert!(!is_segment(&"a".repeat(MAX_SEGMENT_BYTES + 1)));
+    }
+
+    #[test]
+    fn kubernetes_resource_identities_have_one_dns_subdomain_grammar() {
+        assert!(is_dns_subdomain("agent-7"));
+        assert!(is_dns_subdomain("rack-1.agent-7"));
+        assert!(is_dns_subdomain(&format!(
+            "{}.{}",
+            "a".repeat(63),
+            "b".repeat(63)
+        )));
+        for invalid in [
+            "", ".", "..", "a/b", "a\\b", "a:b", "a%b", "a?b", "a#b", "A", "a_b", "-a", "a-",
+            "a..b", "a\nb",
+        ] {
+            assert!(!is_dns_subdomain(invalid), "{invalid:?} must be refused");
+        }
+        assert!(!is_dns_subdomain(&"a".repeat(MAX_DNS_SUBDOMAIN_BYTES + 1)));
     }
 
     /// The exported pattern and the predicate accept exactly the same strings.

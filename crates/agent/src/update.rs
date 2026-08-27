@@ -2437,7 +2437,11 @@ mod tests {
         .expect("a failed durable write mid-switchover restarts rather than holding the node down");
 
         assert!(matches!(outcome, Outcome::RollbackPending));
-        assert!(store.memory_backend().rejected.is_empty());
+        assert_eq!(
+            store.memory_backend().rejected.len(),
+            1,
+            "persistence failure cannot erase the live process's rejection evidence"
+        );
         assert!(
             store
                 .memory_backend()

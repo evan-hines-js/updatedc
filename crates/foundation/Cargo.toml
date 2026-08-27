@@ -8,7 +8,8 @@ license.workspace = true
 # serialization, async runtime, crypto policy, configuration, or application crates.
 # Platform binding crates are the sole permitted dependencies (they are ABI-correct
 # type/constant/function declarations, not behaviour) — the `process` module's
-# process-group/job-object containment needs them. Routine tower changes must remain
+# process-group/job-object containment and the confined-open handle proof need them.
+# Routine tower changes must remain
 # deployable against an older statically linked launcher. A rare launcher/OS release may
 # coordinate a new tower baseline.
 

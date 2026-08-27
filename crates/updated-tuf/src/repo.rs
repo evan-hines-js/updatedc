@@ -110,6 +110,17 @@ pub fn validate_signing_key_bytes(bytes: &[u8]) -> Result<()> {
     signing_key_id(bytes).map(|_| ())
 }
 
+/// Read and validate one file-backed signing key through the authoring boundary.
+///
+/// Callers that need the bytes themselves (for example, to project them into a Kubernetes Secret)
+/// must not read the path first and rely on [`validate_signing_key_bytes`] to reject it afterwards:
+/// by then an oversized or redirected file has already bypassed the bound and no-follow policy.
+/// This is the sole file-to-bytes path for signing keys.
+pub fn read_signing_key_bytes(path: &Path) -> Result<Vec<u8>> {
+    let source = BoundedKeySource::load(path)?;
+    Ok(source.bytes.as_ref().to_vec())
+}
+
 /// Return the canonical TUF key ID for one bounded PKCS#8 role key.
 pub fn signing_key_id(bytes: &[u8]) -> Result<String> {
     if bytes.len() > SIGNING_KEY_MAX_BYTES {
@@ -125,6 +136,82 @@ pub fn signing_key_id(bytes: &[u8]) -> Result<String> {
         .key_id()
         .map_err(|error| err("calculating key ID", error))?;
     Ok(hex::encode(id.as_ref()))
+}
+
+/// The one role-separation gate for a set of signing-key snapshots.
+///
+/// Parsing each file is insufficient: copying one valid private key into several role slots
+/// collapses TUF's compromise boundaries, while supplying one threshold key more than once must
+/// never count as several signers. Callers name each slot so a duplicate reports the two pieces of
+/// configuration that collapsed. File-backed authoring and projected Kubernetes Secrets both use
+/// this accumulator on the exact bytes they will subsequently sign with or persist.
+#[derive(Default)]
+struct DistinctSigningKeys {
+    slots_by_id: HashMap<String, String>,
+}
+
+impl DistinctSigningKeys {
+    fn insert(&mut self, slot: &str, bytes: &[u8]) -> Result<()> {
+        let id =
+            signing_key_id(bytes).map_err(|error| RepoError(format!("invalid {slot}: {error}")))?;
+        self.insert_id(slot, id)
+    }
+
+    fn insert_id(&mut self, slot: &str, id: String) -> Result<()> {
+        if let Some(existing) = self.slots_by_id.get(&id) {
+            return Err(RepoError(format!(
+                "signing-key slots {existing} and {slot} contain the same public key"
+            )));
+        }
+        self.slots_by_id.insert(id, slot.to_string());
+        Ok(())
+    }
+}
+
+/// Validate that every supplied signing-key snapshot is cryptographically valid and distinct.
+pub fn validate_distinct_signing_keys<'a>(
+    keys: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<()> {
+    let mut distinct = DistinctSigningKeys::default();
+    for (slot, bytes) in keys {
+        distinct.insert(slot, bytes)?;
+    }
+    Ok(())
+}
+
+/// Validate the one complete rotatable repository-key document.
+///
+/// This is the Kubernetes Secret boundary: missing slots, obsolete/unknown slots, malformed keys,
+/// and role-collapsed keys are all one invalid document. File-backed authoring may deliberately
+/// omit the standby root for a single-key repository, so it consumes the distinct-key primitive
+/// above directly instead of weakening this closed shape.
+pub fn validate_complete_signing_key_set<'a>(
+    keys: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<()> {
+    let mut supplied = HashMap::new();
+    for (slot, bytes) in keys {
+        if supplied.insert(slot, bytes).is_some() {
+            return Err(RepoError(format!(
+                "complete signing-key set contains duplicate slot {slot}"
+            )));
+        }
+    }
+    let mut material = Vec::with_capacity(KEY_FILE_NAMES.len());
+    for slot in KEY_FILE_NAMES {
+        let bytes = supplied
+            .remove(slot)
+            .ok_or_else(|| RepoError(format!("complete signing-key set is missing {slot}")))?;
+        material.push((slot, bytes));
+    }
+    if !supplied.is_empty() {
+        let mut unexpected = supplied.keys().copied().collect::<Vec<_>>();
+        unexpected.sort_unstable();
+        return Err(RepoError(format!(
+            "complete signing-key set contains unexpected slot(s): {}",
+            unexpected.join(", ")
+        )));
+    }
+    validate_distinct_signing_keys(material)
 }
 
 #[async_trait::async_trait]
@@ -172,10 +259,13 @@ impl Keys {
     pub fn in_dir(dir: &Path) -> Result<Self> {
         let mut roots = vec![dir.join("root.pk8")];
         let successor = dir.join("root.next.pk8");
-        if successor
-            .try_exists()
+        if foundation::file::path_entry_exists(&successor)
             .map_err(|error| err("checking for the standby root key", error))?
         {
+            // Optional means genuinely absent, not occupied-but-unusable. Validate through the
+            // sole signing-key file boundary now, so discovery cannot silently downgrade a
+            // two-root directory and cannot defer a symlink/mode/format failure to a later role.
+            read_signing_key_bytes(&successor)?;
             roots.push(successor);
         }
         Ok(Keys {
@@ -475,8 +565,10 @@ pub async fn init_from_version(
     let mut roles: HashMap<RoleType, RoleKeys> = HashMap::new();
     let mut root_keyids = Vec::new();
     let mut root_sources = Vec::new();
+    let mut distinct = DistinctSigningKeys::default();
     for path in &keys.roots {
         let source = BoundedKeySource::load(path)?;
+        distinct.insert(&path.display().to_string(), &source.bytes)?;
         let key = source.tuf_key()?;
         let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
         root_keys.insert(keyid.clone(), key);
@@ -494,6 +586,7 @@ pub async fn init_from_version(
     let mut online_sources = Vec::new();
     for (role, path) in keys.online() {
         let source = BoundedKeySource::load(path)?;
+        distinct.insert(&path.display().to_string(), &source.bytes)?;
         let key = source.tuf_key()?;
         let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
         root_keys.insert(keyid.clone(), key);
@@ -594,7 +687,7 @@ async fn republish_root(
         .ok_or_else(|| RepoError("current root omits the root role".into()))?;
     let (keys, roles, sources) = plan(old, old_root_role)?;
 
-    let next_version = nz(old.version.get() + 1);
+    let next_version = next_version(old.version, "root")?;
     let next = Root {
         spec_version: old.spec_version.clone(),
         consistent_snapshot: old.consistent_snapshot,
@@ -645,18 +738,23 @@ pub async fn rotate_root(
         // Carry the online roles forward from the current root, unchanged.
         let mut keys: HashMap<Decoded<Hex>, Key> = HashMap::new();
         let mut roles: HashMap<RoleType, RoleKeys> = HashMap::new();
+        let mut distinct = DistinctSigningKeys::default();
         for role in [RoleType::Targets, RoleType::Snapshot, RoleType::Timestamp] {
             let role_keys = old
                 .roles
                 .get(&role)
                 .ok_or_else(|| RepoError(format!("current root omits the {role:?} role")))?
                 .clone();
-            for keyid in &role_keys.keyids {
+            for (index, keyid) in role_keys.keyids.iter().enumerate() {
                 let key = old
                     .keys
                     .get(keyid)
                     .ok_or_else(|| RepoError(format!("current root omits a {role:?} key")))?
                     .clone();
+                distinct.insert_id(
+                    &format!("current {role:?}[{index}]"),
+                    hex::encode(keyid.as_ref()),
+                )?;
                 keys.insert(keyid.clone(), key);
             }
             roles.insert(role, role_keys);
@@ -667,6 +765,7 @@ pub async fn rotate_root(
         let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
         for path in retained {
             let source = BoundedKeySource::load(path)?;
+            distinct.insert(&path.display().to_string(), &source.bytes)?;
             let key = source.tuf_key()?;
             let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
             if !old_root_role.keyids.contains(&keyid) {
@@ -680,6 +779,7 @@ pub async fn rotate_root(
             sources.push(source.boxed());
         }
         let new_source = BoundedKeySource::load(new_root_key)?;
+        distinct.insert(&new_root_key.display().to_string(), &new_source.bytes)?;
         let new_key = new_source.tuf_key()?;
         let new_keyid = new_key.key_id().map_err(|e| err("computing key id", e))?;
         if old_root_role.keyids.contains(&new_keyid) {
@@ -727,11 +827,25 @@ pub async fn renew_root(repo_dir: &Path, root_keys: &[PathBuf], expiry_days: i64
         // directory over — and refusing the renewal outright for one stray key made every reconcile
         // a hard failure at exactly the moment the root is closest to expiring.
         let mut sources: Vec<Box<dyn KeySource>> = Vec::new();
+        let mut distinct = DistinctSigningKeys::default();
+        for role in [RoleType::Targets, RoleType::Snapshot, RoleType::Timestamp] {
+            let role_keys = old
+                .roles
+                .get(&role)
+                .ok_or_else(|| RepoError(format!("current root omits the {role:?} role")))?;
+            for (index, keyid) in role_keys.keyids.iter().enumerate() {
+                distinct.insert_id(
+                    &format!("current {role:?}[{index}]"),
+                    hex::encode(keyid.as_ref()),
+                )?;
+            }
+        }
         for path in root_keys {
             let source = BoundedKeySource::load(path)?;
             let key = source.tuf_key()?;
             let keyid = key.key_id().map_err(|e| err("computing key id", e))?;
             if old_root_role.keyids.contains(&keyid) {
+                distinct.insert_id(&path.display().to_string(), hex::encode(keyid.as_ref()))?;
                 sources.push(source.boxed());
             }
         }
@@ -819,11 +933,12 @@ async fn publish_release(
         staged.0.push(path);
     }
 
-    // Load the current repository to learn its metadata versions (bump = +1).
+    // Load the current repository and advance every role through the one checked version gate.
+    // A repository at u64::MAX is exhausted, not permission to panic or wrap rollback protection.
     let repo = load_local(repo_dir, "loading repository to edit").await?;
-    let next_targets = nz(repo.targets().signed.version.get() + 1);
-    let next_snapshot = nz(repo.snapshot().signed.version.get() + 1);
-    let next_timestamp = nz(repo.timestamp().signed.version.get() + 1);
+    let next_targets = next_version(repo.targets().signed.version, "targets")?;
+    let next_snapshot = next_version(repo.snapshot().signed.version, "snapshot")?;
+    let next_timestamp = next_version(repo.timestamp().signed.version, "timestamp")?;
 
     let expires = expiry(expiry_days)?;
     let mut editor = RepositoryEditor::from_repo(&root_path, repo)
@@ -862,11 +977,17 @@ async fn publish_release(
             .map_err(|e| err("adding target", e))?;
     }
 
-    let online_sources = [
-        BoundedKeySource::load(&keys.targets)?.boxed(),
-        BoundedKeySource::load(&keys.snapshot)?.boxed(),
-        BoundedKeySource::load(&keys.timestamp)?.boxed(),
+    let online = [
+        ("targets.pk8", BoundedKeySource::load(&keys.targets)?),
+        ("snapshot.pk8", BoundedKeySource::load(&keys.snapshot)?),
+        ("timestamp.pk8", BoundedKeySource::load(&keys.timestamp)?),
     ];
+    validate_distinct_signing_keys(
+        online
+            .iter()
+            .map(|(slot, source)| (*slot, source.bytes.as_ref())),
+    )?;
+    let online_sources = online.map(|(_, source)| source.boxed());
     let signed = editor
         .sign(&online_sources)
         .await
@@ -1245,6 +1366,19 @@ fn nz(n: u64) -> NonZeroU64 {
     NonZeroU64::new(n).expect("version/threshold is non-zero")
 }
 
+/// Advance a TUF metadata version without weakening rollback protection at the integer boundary.
+///
+/// Root renewal and release publication share this transition so no role can grow a private
+/// overflow behavior. Reaching the wire format's maximum version permanently exhausts that role;
+/// the operator must create a new repository lineage rather than wrap it to an older version.
+fn next_version(current: NonZeroU64, role: &str) -> Result<NonZeroU64> {
+    current
+        .get()
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| RepoError(format!("{role} metadata version is exhausted")))
+}
+
 fn validate_target_name(name: &str) -> Result<()> {
     let parts: Vec<_> = name.split('/').collect();
     let known_layout = (parts.len() == 6 && parts[0] == "products")
@@ -1317,9 +1451,20 @@ mod tests {
 
     #[test]
     fn nz_preserves_the_value() {
-        // The metadata version bump relies on this returning n, not a fixed 1.
+        // Repository initialization relies on this returning n, not a fixed 1.
         assert_eq!(nz(5).get(), 5);
         assert_eq!(nz(1).get(), 1);
+    }
+
+    #[test]
+    fn metadata_versions_advance_once_and_never_wrap() {
+        assert_eq!(next_version(nz(41), "targets").unwrap(), nz(42));
+        assert_eq!(
+            next_version(NonZeroU64::MAX, "root")
+                .unwrap_err()
+                .to_string(),
+            "root metadata version is exhausted"
+        );
     }
 
     #[test]
@@ -1604,6 +1749,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signing_key_roles_cannot_collapse_onto_one_public_key() {
+        let first = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let second = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        validate_distinct_signing_keys([
+            ("root.pk8", first.as_ref()),
+            ("root.next.pk8", second.as_ref()),
+        ])
+        .unwrap();
+
+        let error = validate_distinct_signing_keys([
+            ("root.pk8", first.as_ref()),
+            ("targets.pk8", first.as_ref()),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("root.pk8"), "{error}");
+        assert!(error.contains("targets.pk8"), "{error}");
+        assert!(error.contains("same public key"), "{error}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn signing_keys_must_be_owner_only_regular_files() {
@@ -1614,12 +1780,14 @@ mod tests {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         std::fs::write(&key, pkcs8.as_ref()).unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(BoundedKeySource::load(&key).is_err());
+        assert!(read_signing_key_bytes(&key).is_err());
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(BoundedKeySource::load(&key).is_ok());
+        assert_eq!(read_signing_key_bytes(&key).unwrap(), pkcs8.as_ref());
         let link = dir.join("link.pk8");
         std::os::unix::fs::symlink(&key, &link).unwrap();
-        assert!(BoundedKeySource::load(&link).is_err());
+        assert!(read_signing_key_bytes(&link).is_err());
+        std::fs::write(&key, vec![0; SIGNING_KEY_MAX_BYTES + 1]).unwrap();
+        assert!(read_signing_key_bytes(&key).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

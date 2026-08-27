@@ -129,7 +129,7 @@ pub async fn reconcile_backends(
                     matched_agents: Some(0),
                     workload: draining.then(|| resource_name.clone()),
                     conditions: vec![condition(
-                        READY_CONDITION,
+                        crate::status_contract::READY_CONDITION,
                         !draining,
                         generation,
                         if draining { "Draining" } else { "Idle" },
@@ -152,7 +152,7 @@ pub async fn reconcile_backends(
                         matched_agents: Some(inventory.len().min(u32::MAX as usize) as u32),
                         workload: Some(resource_name.clone()),
                         conditions: vec![condition(
-                            READY_CONDITION,
+                            crate::status_contract::READY_CONDITION,
                             false,
                             generation,
                             "Draining",
@@ -202,7 +202,7 @@ pub async fn reconcile_backends(
                         matched_agents: Some(inventory.len().min(u32::MAX as usize) as u32),
                         workload: Some(resource_name.clone()),
                         conditions: vec![condition(
-                            READY_CONDITION,
+                            crate::status_contract::READY_CONDITION,
                             ready,
                             generation,
                             reason,

@@ -198,15 +198,7 @@ async fn defer(
         "subscription delivery budget spent before this subscriber was attempted; it is first in \
          line next reconcile"
     );
-    record(
-        subscriptions,
-        &name,
-        repository,
-        mark,
-        now,
-        Outcome::Deferred,
-    )
-    .await;
+    record(subscriptions, sub, repository, mark, now, Outcome::Deferred).await;
 }
 
 /// This subscription's high-water mark for `repository` — the last generation it acknowledged.
@@ -246,7 +238,7 @@ fn delivery_order(sub: &UpdateSubscription) -> (&str, String) {
 fn deferral_says_nothing_new(sub: &UpdateSubscription) -> bool {
     sub.status.as_ref().is_some_and(|status| {
         status.conditions.iter().any(|condition| {
-            condition.condition_type == "Ready"
+            condition.condition_type == crate::status_contract::READY_CONDITION
                 && (condition.reason == DEFERRED_REASON || condition.reason == FAILED_REASON)
         })
     })
@@ -265,8 +257,6 @@ async fn deliver_one(
     context: DeliveryContext<'_>,
     deadline: std::time::Instant,
 ) {
-    let name = sub.name_any();
-
     let webhook_url = match updated::http::network_endpoint(
         &sub.spec.webhook.url,
         updated::http::EndpointTransport::HttpOrHttps,
@@ -276,7 +266,7 @@ async fn deliver_one(
         Err(error) => {
             record(
                 subscriptions,
-                &name,
+                sub,
                 context.repository,
                 mark,
                 context.now,
@@ -294,7 +284,7 @@ async fn deliver_one(
             Err(error) => {
                 record(
                     subscriptions,
-                    &name,
+                    sub,
                     context.repository,
                     mark,
                     context.now,
@@ -333,7 +323,7 @@ async fn deliver_one(
             Err(error) => {
                 record(
                     subscriptions,
-                    &name,
+                    sub,
                     context.repository,
                     delivered,
                     context.now,
@@ -356,7 +346,7 @@ async fn deliver_one(
             Ok(response) => {
                 record(
                     subscriptions,
-                    &name,
+                    sub,
                     context.repository,
                     delivered,
                     context.now,
@@ -372,7 +362,7 @@ async fn deliver_one(
                 );
                 record(
                     subscriptions,
-                    &name,
+                    sub,
                     context.repository,
                     delivered,
                     context.now,
@@ -391,7 +381,7 @@ async fn deliver_one(
     }
     record(
         subscriptions,
-        &name,
+        sub,
         context.repository,
         delivered,
         context.now,
@@ -420,25 +410,31 @@ const DEFERRED_REASON: &str = "DeliveryDeferred";
 /// written: a deferral must not overwrite it (see [`deferral_says_nothing_new`]).
 const FAILED_REASON: &str = "DeliveryFailed";
 
-/// Persist a subscription's delivery progress: advance the per-repository mark to `delivered`, set
-/// the `Ready` condition for `outcome`, and stamp the times. Best-effort — a failed status patch is
-/// logged, never propagated, since delivery must not block the publish.
+/// Persist a subscription's delivery progress: advance the per-repository mark to `delivered`,
+/// merge the `Ready` condition for `outcome` through the shared condition invariant, and stamp the
+/// times. Best-effort — a failed status patch is logged, never propagated, since delivery must not
+/// block the publish.
 ///
 /// `lastAttemptTime` is stamped for an attempt and NOT for a deferral: it is the cursor the next
 /// pass orders by, so stamping it here would send the subscription this pass could not reach to the
 /// back of the queue again — which is the starvation it exists to end.
 async fn record(
     subscriptions: &Api<UpdateSubscription>,
-    name: &str,
+    subscription: &UpdateSubscription,
     repository: &str,
     delivered: u64,
     now: &str,
     outcome: Outcome<'_>,
 ) {
-    let status = status_document(repository, delivered, now, outcome);
+    let observed = subscription
+        .status
+        .as_ref()
+        .map_or(&[][..], |status| status.conditions.as_slice());
+    let status = status_document(observed, repository, delivered, now, outcome);
+    let name = subscription.name_any();
     if let Err(error) = subscriptions
         .patch_status(
-            name,
+            &name,
             &PatchParams::default(),
             &Patch::Merge(serde_json::json!({ "status": status })),
         )
@@ -451,24 +447,25 @@ async fn record(
 /// The status patch [`record`] writes, built without touching the apiserver so the cursor rule is
 /// directly testable.
 fn status_document(
+    observed: &[ResourceCondition],
     repository: &str,
     delivered: u64,
     now: &str,
     outcome: Outcome<'_>,
 ) -> serde_json::Value {
-    let (status_value, reason, message) = match outcome {
+    let (ready, reason, message) = match outcome {
         Outcome::Delivered => (
-            "True",
+            true,
             "Delivered",
             format!("delivered through generation {delivered}"),
         ),
         Outcome::Failed(detail) => (
-            "False",
+            false,
             FAILED_REASON,
             format!("stalled at generation {delivered}: {detail}"),
         ),
         Outcome::Deferred => (
-            "False",
+            false,
             DEFERRED_REASON,
             format!(
                 "waiting at generation {delivered}: the {}s delivery budget was spent on earlier \
@@ -477,20 +474,21 @@ fn status_document(
             ),
         ),
     };
-    let condition = ResourceCondition {
-        condition_type: "Ready".to_string(),
-        status: status_value.to_string(),
-        reason: reason.to_string(),
+    let condition = crate::status_contract::condition(
+        crate::status_contract::READY_CONDITION,
+        ready,
+        None,
+        reason,
         message,
-        observed_generation: None,
         // Always stamped, including on the failure paths. An empty transition time is not a
         // "never" a reader can interpret — `kubectl` renders it as an epoch and any consumer
         // sorting conditions by age puts a fresh failure at the bottom.
-        last_transition_time: now.to_string(),
-    };
+        now,
+    );
+    let conditions = crate::alerts::merge_conditions(observed, vec![condition]);
     let mut status = serde_json::json!({
         "deliveredVersions": { repository: delivered },
-        "conditions": [condition],
+        "conditions": conditions,
     });
     if matches!(outcome, Outcome::Delivered) {
         status["lastDeliveryTime"] = serde_json::Value::String(now.to_string());
@@ -598,7 +596,7 @@ mod tests {
 
     #[test]
     fn a_deferral_is_visible_on_the_cr_and_does_not_advance_the_cursor() {
-        let deferred = status_document("fleet", 7, "2026-08-03T14:00:00Z", Outcome::Deferred);
+        let deferred = status_document(&[], "fleet", 7, "2026-08-03T14:00:00Z", Outcome::Deferred);
         assert_eq!(deferred["deliveredVersions"]["fleet"], 7);
         assert_eq!(deferred["conditions"][0]["reason"], DEFERRED_REASON);
         assert_eq!(deferred["conditions"][0]["status"], "False");
@@ -609,11 +607,11 @@ mod tests {
         );
         // ... while a real attempt does advance it, in both directions.
         for outcome in [Outcome::Delivered, Outcome::Failed("connection refused")] {
-            let attempted = status_document("fleet", 7, "2026-08-03T14:00:00Z", outcome);
+            let attempted = status_document(&[], "fleet", 7, "2026-08-03T14:00:00Z", outcome);
             assert_eq!(attempted["lastAttemptTime"], "2026-08-03T14:00:00Z");
         }
         assert_eq!(
-            status_document("fleet", 7, "2026-08-03T14:00:00Z", Outcome::Delivered)
+            status_document(&[], "fleet", 7, "2026-08-03T14:00:00Z", Outcome::Delivered,)
                 ["lastDeliveryTime"],
             "2026-08-03T14:00:00Z"
         );
@@ -637,6 +635,57 @@ mod tests {
             Some("2026-08-03T09:00:00Z"),
             "Delivered"
         )));
+    }
+
+    #[test]
+    fn subscription_status_uses_the_shared_condition_merge_invariant() {
+        let observed = vec![
+            ResourceCondition {
+                condition_type: "Ready".into(),
+                status: "False".into(),
+                reason: "EarlierFailure".into(),
+                message: "earlier detail".into(),
+                observed_generation: None,
+                last_transition_time: "2026-08-03T10:00:00Z".into(),
+            },
+            ResourceCondition {
+                condition_type: "Foreign".into(),
+                status: "True".into(),
+                reason: "OwnedElsewhere".into(),
+                message: "must survive a Ready write".into(),
+                observed_generation: None,
+                last_transition_time: "2026-08-03T09:00:00Z".into(),
+            },
+        ];
+
+        let failure = status_document(
+            &observed,
+            "fleet",
+            7,
+            "2026-08-03T14:00:00Z",
+            Outcome::Failed("new detail"),
+        );
+        assert_eq!(
+            failure["conditions"][0]["lastTransitionTime"], "2026-08-03T10:00:00Z",
+            "a changed observation in the same state is not a transition"
+        );
+        assert_eq!(failure["conditions"][1]["type"], "Foreign");
+        assert_eq!(
+            failure["conditions"][1]["lastTransitionTime"],
+            "2026-08-03T09:00:00Z"
+        );
+
+        let recovery = status_document(
+            &observed,
+            "fleet",
+            7,
+            "2026-08-03T14:00:00Z",
+            Outcome::Delivered,
+        );
+        assert_eq!(
+            recovery["conditions"][0]["lastTransitionTime"], "2026-08-03T14:00:00Z",
+            "a False-to-True state change is a transition"
+        );
     }
 
     #[tokio::test]

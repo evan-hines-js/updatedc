@@ -126,10 +126,16 @@ pub(crate) mod lease_tests {
     async fn signing_key_materialization_requires_one_complete_rotatable_set() {
         let guard = tempfile::tempdir().unwrap();
         let directory = guard.path().join("keys");
+        let source = guard.path().join("source");
+        updated_tuf::repo::generate_keys(&source).await.unwrap();
         let mut data = BTreeMap::new();
         for name in updated_tuf::repo::KEY_FILE_NAMES {
-            data.insert(name.to_string(), ByteString(name.as_bytes().to_vec()));
+            data.insert(
+                name.to_string(),
+                ByteString(updated_tuf::repo::read_signing_key_bytes(&source.join(name)).unwrap()),
+            );
         }
+        let original_targets = data["targets.pk8"].0.clone();
         let complete = Secret {
             data: Some(data.clone()),
             ..Default::default()
@@ -146,6 +152,60 @@ pub(crate) mod lease_tests {
             "an incomplete Secret writes no partial key set"
         );
 
+        let mut oversized_shape = complete.clone();
+        oversized_shape
+            .data
+            .as_mut()
+            .unwrap()
+            .insert("retired-root.pk8".into(), ByteString(vec![1]));
+        let error = materialize_signing_keys(&oversized_shape, &directory)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retired-root.pk8"), "{error}");
+        assert!(
+            !directory.try_exists().unwrap(),
+            "an open-ended Secret writes no partial key set"
+        );
+
+        let mut malformed = complete.clone();
+        malformed
+            .data
+            .as_mut()
+            .unwrap()
+            .insert("snapshot.pk8".into(), ByteString(b"not a key".to_vec()));
+        let error = materialize_signing_keys(&malformed, &directory)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("invalid snapshot.pk8"),
+            "{error}"
+        );
+        assert!(
+            !directory.try_exists().unwrap(),
+            "a malformed Secret writes no partial key set"
+        );
+
+        let mut collapsed = complete.clone();
+        let root = collapsed.data.as_ref().unwrap()["root.pk8"].clone();
+        collapsed
+            .data
+            .as_mut()
+            .unwrap()
+            .insert("root.next.pk8".into(), root);
+        let error = materialize_signing_keys(&collapsed, &directory)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("root.pk8")
+                && error.to_string().contains("root.next.pk8")
+                && error.to_string().contains("same public key"),
+            "{error}"
+        );
+        assert!(
+            !directory.try_exists().unwrap(),
+            "a role-collapsed Secret writes no partial key set"
+        );
+
         materialize_signing_keys(&complete, &directory)
             .await
             .unwrap();
@@ -158,7 +218,17 @@ pub(crate) mod lease_tests {
             "the signer retains both active and standby root keys"
         );
 
-        data.insert("targets.pk8".into(), ByteString(b"changed.pk8".to_vec()));
+        let replacement = guard.path().join("replacement");
+        updated_tuf::repo::generate_keys(&replacement)
+            .await
+            .unwrap();
+        data.insert(
+            "targets.pk8".into(),
+            ByteString(
+                updated_tuf::repo::read_signing_key_bytes(&replacement.join("targets.pk8"))
+                    .unwrap(),
+            ),
+        );
         let drifted = Secret {
             data: Some(data),
             ..Default::default()
@@ -170,7 +240,7 @@ pub(crate) mod lease_tests {
             .contains("targets.pk8 changed in place"));
         assert_eq!(
             std::fs::read(directory.join("targets.pk8")).unwrap(),
-            b"targets.pk8",
+            original_targets,
             "detected key drift never overwrites the pinned material"
         );
     }
@@ -636,6 +706,20 @@ pub(crate) mod lease_tests {
             .collect();
         assert_eq!(types, vec!["Ready", "EnrollmentCapacity"], "{patch}");
         assert_eq!(patch["conditions"][1]["reason"], "AtCapacity");
+
+        // Once that failure is stored, the next failed tick computes a partial status which omits
+        // the successful publication fields. Omission preserves those fields under merge-patch
+        // semantics, so the shared no-op gate must still recognize the patch as identical.
+        let failed = failure_status(Some(4), "reconciliation failed", &observed);
+        let stored = UpdateRepositoryStatus {
+            published_digest: Some("last-live-digest".into()),
+            agent_count: Some(42),
+            routing_root_sha256: Some("a".repeat(64)),
+            conditions: failed.conditions.clone(),
+            observed_generation: failed.observed_generation,
+            ..Default::default()
+        };
+        assert!(status_unchanged(&failed, Some(&stored)));
     }
 
     /// Clearing `spec.admissionPolicyRef` mid-incident must clear the verdict it produced. The

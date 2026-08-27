@@ -276,6 +276,25 @@ async fn reusing_an_existing_root_key_as_the_successor_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_root_rotation_cannot_reuse_an_online_role_key() {
+    let fixture = Fixture::new("reuse-online").await;
+    let error = repo::rotate_root(
+        &fixture.repo_dir,
+        &fixture.keys.roots[1..],
+        &fixture.keys.targets,
+        365,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("Targets"), "unexpected error: {error}");
+    assert!(
+        error.contains("same public key"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn a_retired_key_can_no_longer_authorize_the_next_rotation() {
     let fixture = Fixture::new("retired").await;
     // Rotation retires roots[0].
@@ -371,6 +390,17 @@ async fn renewal_ignores_keys_the_current_root_does_not_list() {
             == 2
     );
 
+    // Untrusted material is outside the signing set altogether. Its duplication cannot make an
+    // otherwise valid renewal unavailable; uniqueness is a property of threshold participants,
+    // not of ignored directory debris.
+    let duplicate_foreign = fixture.mint_key("duplicate-foreign.pk8").await;
+    let mut keys = vec![duplicate_foreign.clone(), duplicate_foreign];
+    keys.extend(fixture.keys.roots.iter().cloned());
+    repo::renew_root(&fixture.repo_dir, &keys, 365)
+        .await
+        .unwrap();
+    assert_eq!(root_version(&fixture.metadata(), "root.json").await, 3);
+
     // Below the threshold there is nothing to sign with, and that IS a failure.
     let foreign = fixture.mint_key("only-foreign.pk8").await;
     for supplied in [vec![foreign], Vec::new()] {
@@ -383,4 +413,14 @@ async fn renewal_ignores_keys_the_current_root_does_not_list() {
             "unexpected error: {error}"
         );
     }
+
+    let duplicate = vec![fixture.keys.roots[0].clone(), fixture.keys.roots[0].clone()];
+    let error = repo::renew_root(&fixture.repo_dir, &duplicate, 365)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("same public key"),
+        "a duplicate path cannot count as two threshold signers: {error}"
+    );
 }

@@ -37,7 +37,7 @@ pub(crate) fn build_store(
 pub(crate) fn open_keys(dir: &Path) -> Result<repo::Keys, Error> {
     let keys = repo::Keys::in_dir(dir)?;
     for path in [&keys.targets, &keys.snapshot, &keys.timestamp] {
-        if !path.try_exists()? {
+        if !foundation::file::path_entry_exists(path)? {
             return Err(format!(
                 "--keys-dir {} is missing {}",
                 dir.display(),

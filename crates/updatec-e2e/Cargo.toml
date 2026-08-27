@@ -10,6 +10,7 @@ chrono.workspace = true
 # so the value signed into the provider set here and the reconciler's own apply budget are one
 # constant.
 demo-lifecycle = { path = "../demo-lifecycle" }
+foundation = { path = "../foundation" }
 k8s-openapi.workspace = true
 kube.workspace = true
 reqwest.workspace = true
@@ -21,9 +22,6 @@ updated = { path = "../updated" }
 updated-contracts = { path = "../updated-contracts" }
 updated-tuf = { path = "../updated-tuf" }
 updatec = { path = "../updatec" }
-
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

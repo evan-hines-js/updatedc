@@ -151,11 +151,6 @@ pub fn parse_fleet_report_max_shards(value: Option<&str>) -> Result<FleetShardLi
     FleetShardLimit::new(shards)
 }
 
-/// Kubernetes object names, and therefore enrolled node identities, cannot exceed 253 bytes. The
-/// shared identity grammar states that same bound so report-map accounting has one authoritative
-/// maximum and non-Kubernetes consumers cannot create identities the control plane could not own.
-pub const MAX_NODE_BYTES: usize = 253;
-
 /// Exact byte ceiling for one fetched or stored fleet-report shard. Together with
 /// `UPDATED_FLEET_REPORT_MAX_SHARDS`, this gives an operator an explicit upper bound on active
 /// pending and stored serialized report bytes: `max_shards × 16 MiB`, plus the small index.
@@ -228,30 +223,7 @@ pub fn split_assignment_path(assignment: &str) -> Option<(&str, &str)> {
     let (prefix, node) = assignment
         .strip_suffix(".json")?
         .rsplit_once(ASSIGNMENT_AGENTS_SEGMENT)?;
-    (!prefix.is_empty() && is_valid_node(node)).then_some((prefix, node))
-}
-
-/// The one node-identity grammar: a Kubernetes DNS subdomain, at most 253 bytes, made of labels no
-/// longer than 63 bytes. Raw report objects use hashed keys, so identity syntax is not coupled to
-/// URL or object-path layout.
-pub fn is_valid_node(node: &str) -> bool {
-    !node.is_empty()
-        && node.len() <= MAX_NODE_BYTES
-        && node.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-                && label
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && label
-                    .as_bytes()
-                    .last()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-        })
+    (!prefix.is_empty() && crate::identity::is_dns_subdomain(node)).then_some((prefix, node))
 }
 
 /// An opaque measurement of node state produced by the signed reconciler's `fingerprint` phase.
@@ -472,7 +444,7 @@ impl NodeReport {
         if self.schema != Self::SCHEMA {
             return Some("unknown schema");
         }
-        if !is_valid_node(&self.node) {
+        if !crate::identity::is_dns_subdomain(&self.node) {
             return Some("invalid node identity");
         }
         if !crate::identity::is_segment(&self.deployment) {
@@ -717,32 +689,37 @@ pub fn accept_stored_report(
 ) -> Option<AcceptedReport> {
     let envelope: Envelope =
         crate::bounded::decode(body, "node report envelope", MAX_REPORT_ENVELOPE_BYTES).ok()?;
-    report_envelope_is_acceptable(&envelope, node).then_some(AcceptedReport {
+    let payload = decode_report_payload(&envelope)?;
+    parse_attributed_payload(&payload, node).map(|_| AcceptedReport {
         node: node.to_string(),
         envelope,
         stored_at_ms: stored_at.0,
     })
 }
 
-/// The single structural predicate for an envelope entering an indexed fleet generation, whether it arrived
-/// at the live write gate or is being recovered from stored bytes. Signature authenticity remains
-/// a reader concern; this gate guarantees only that a reader can safely attempt it and that the
-/// decoded report is usable and attributed to its map key.
-fn report_envelope_is_acceptable(envelope: &Envelope, node: &str) -> bool {
+/// The one envelope decoder shared by storage admission, shard recovery, and cryptographic
+/// authentication. Every trusted path therefore agrees on payload type, signature cardinality,
+/// and base64 spelling.
+fn decode_report_payload(envelope: &Envelope) -> Option<Vec<u8>> {
     if envelope.payload_type != REPORT_PAYLOAD_TYPE
         || envelope.signatures.is_empty()
         || envelope.signatures.len() > Envelope::MAX_SIGNATURES
     {
-        return false;
+        return None;
     }
     use base64::Engine as _;
-    let Ok(payload) = base64::engine::general_purpose::STANDARD.decode(&envelope.payload) else {
-        return false;
-    };
-    let Ok(report) = serde_json::from_slice::<NodeReport>(&payload) else {
-        return false;
-    };
-    is_valid_node(node) && report.node == node && report.is_wellformed()
+    base64::engine::general_purpose::STANDARD
+        .decode(&envelope.payload)
+        .ok()
+}
+
+/// The one report parser and attribution gate. Authentication calls it only after signature
+/// verification, so forged payloads cannot spend JSON parsing work; storage admission and shard
+/// recovery use the identical interpretation without pretending to establish authenticity.
+fn parse_attributed_payload(payload: &[u8], node: &str) -> Option<NodeReport> {
+    let report = serde_json::from_slice::<NodeReport>(payload).ok()?;
+    (crate::identity::is_dns_subdomain(node) && report.node == node && report.is_wellformed())
+        .then_some(report)
 }
 
 /// Proof that a report passed [`accept_stored_report`].
@@ -794,7 +771,7 @@ impl AcceptedReport {
 /// The inner [`NodeReport`] is intentionally private. Authentication alone is not authority to
 /// read current health, deployment, or output state: those claims expire. A holder can obtain the
 /// full report only through [`AuthenticReport::fresh`], or read the one nonperishable claim through
-/// [`AuthenticReport::durable_rejection`]. This makes the trust distinction a type boundary rather
+/// [`AuthenticReport::rejected_assignment`]. This makes the trust distinction a type boundary rather
 /// than a warning every cache and consumer has to remember.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthenticReport(NodeReport);
@@ -805,10 +782,11 @@ impl AuthenticReport {
         self.0.is_fresh(now_ms).then(|| self.0.clone())
     }
 
-    /// The report's one durable claim: whether this node permanently rejected the exact signed
-    /// assignment identity returned beside it.
-    pub fn durable_rejection(&self) -> (&str, bool) {
-        (&self.0.assignment_sha256, self.0.rejected)
+    /// The report's one durable claim: the exact signed assignment this node permanently
+    /// rejected. A negative statement is current report state, not durable evidence, and therefore
+    /// has no value in this stale-safe API.
+    pub fn rejected_assignment(&self) -> Option<&str> {
+        self.0.rejected.then_some(&self.0.assignment_sha256)
     }
 }
 
@@ -834,13 +812,8 @@ pub fn authenticate_report(
 ) -> Option<AuthenticReport> {
     use base64::Engine as _;
 
-    if envelope.payload_type != REPORT_PAYLOAD_TYPE
-        || envelope.signatures.len() > Envelope::MAX_SIGNATURES
-    {
-        return None;
-    }
+    let payload = decode_report_payload(envelope)?;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let payload = b64.decode(&envelope.payload).ok()?;
     let pae = pae(&payload, REPORT_PAYLOAD_TYPE);
 
     // The pin cannot be malformed here: [`P256PublicKey`] is the only shape this takes and its
@@ -855,10 +828,10 @@ pub fn authenticate_report(
         return None;
     }
 
-    let report: NodeReport = serde_json::from_slice(&payload).ok()?;
-    let usable = report.is_wellformed() && report.node == expected_node;
-
-    usable.then_some(AuthenticReport(report))
+    Some(AuthenticReport(parse_attributed_payload(
+        &payload,
+        expected_node,
+    )?))
 }
 
 /// Whether the report an envelope CLAIMS to carry is stale, decoded without verifying a signature.
@@ -1080,7 +1053,9 @@ impl FleetReports {
                 let stored: StoredReport = serde_json::from_value(value).ok()?;
                 (serde_json::to_vec(&stored.envelope)
                     .is_ok_and(|body| body.len() <= MAX_REPORT_ENVELOPE_BYTES)
-                    && report_envelope_is_acceptable(&stored.envelope, &node)
+                    && decode_report_payload(&stored.envelope)
+                        .and_then(|payload| parse_attributed_payload(&payload, &node))
+                        .is_some()
                     && Self::shard_for(&node, usize::from(location.max_shards))
                         == usize::from(location.shard))
                 .then_some((node, stored))
@@ -1738,9 +1713,17 @@ mod tests {
             "the cached authenticity capability must enforce the identical freshness gate"
         );
         assert_eq!(
-            authentic.durable_rejection(),
-            (assignment_sha256.as_str(), false),
-            "authentication without freshness may expose only the standing rejection claim"
+            authentic.rejected_assignment(),
+            None,
+            "a stale negative statement is not durable evidence"
+        );
+        let (rejected, rejected_point) = signed(|report| report.rejected = true);
+        let authentic_rejection =
+            authenticate_report(&rejected, "agent-9", &rejected_point).unwrap();
+        assert_eq!(
+            authentic_rejection.rejected_assignment(),
+            Some(assignment_sha256.as_str()),
+            "the positive rejection is the only claim authentication may expose without freshness"
         );
 
         // A genuinely signed record whose field meanings this build does not know.
@@ -2473,21 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn node_identity_is_a_kubernetes_dns_subdomain() {
-        assert!(is_valid_node("agent-7"));
-        assert!(is_valid_node("rack-1.agent-7"));
-        assert!(is_valid_node(&format!(
-            "{}.{}",
-            "a".repeat(63),
-            "b".repeat(63)
-        )));
-        for invalid in [
-            "", ".", "..", "a/b", "a\\b", "a:b", "a%b", "a?b", "a#b", "A", "a_b", "-a", "a-",
-            "a..b", "a\nb",
-        ] {
-            assert!(!is_valid_node(invalid), "{invalid:?} must be refused");
-        }
-        assert!(!is_valid_node(&"a".repeat(MAX_NODE_BYTES + 1)));
+    fn reports_consume_the_shared_kubernetes_identity_grammar() {
         assert!(report().is_wellformed());
         let mut malformed = report();
         malformed.node = "Agent-7".into();

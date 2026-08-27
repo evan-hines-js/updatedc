@@ -63,9 +63,7 @@ pub(crate) fn is_enrollment_identity(
     identity: &ClientIdentity,
     enrollment_client_cn: &str,
 ) -> bool {
-    !enrollment_client_cn.is_empty()
-        && identity.common_name.as_deref() == Some(enrollment_client_cn)
-        && identity.node.is_none()
+    !enrollment_client_cn.is_empty() && identity.enrollment_name() == Some(enrollment_client_cn)
 }
 
 pub(crate) fn is_distinct_from_bootstrap_identity(name: &str, enrollment_client_cn: &str) -> bool {
@@ -153,8 +151,7 @@ pub(crate) fn is_pinned_leaf(
     repository: &str,
 ) -> bool {
     identity
-        .public_key
-        .as_deref()
+        .node_public_key()
         .is_some_and(|public_key| is_pinned_identity(agent, repository, public_key))
 }
 

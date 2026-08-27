@@ -457,8 +457,6 @@ fn tree_digest(root: &Path) -> io::Result<String> {
         at: &Path,
         digest: &mut updated_contracts::digest::Sha256Hasher,
     ) -> io::Result<()> {
-        use io::Read as _;
-
         let mut entries: Vec<PathBuf> = std::fs::read_dir(at)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<io::Result<_>>()?;
@@ -474,15 +472,7 @@ fn tree_digest(root: &Path) -> io::Result<String> {
                 walk(root, &entry, digest)?;
             } else if kind.is_file() {
                 digest.update(b"file\0");
-                let mut file = std::fs::File::open(&entry)?;
-                let mut buffer = [0_u8; 64 * 1024];
-                loop {
-                    let read = file.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    digest.update(&buffer[..read]);
-                }
+                digest_regular_file(root, &entry, digest)?;
             } else {
                 digest.update(b"other\0");
             }
@@ -493,6 +483,31 @@ fn tree_digest(root: &Path) -> io::Result<String> {
     let mut digest = updated_contracts::digest::Sha256Hasher::new();
     walk(root, root, &mut digest)?;
     Ok(digest.finish_hex())
+}
+
+/// Hash one file from the same regular, no-follow handle that proved its final path component.
+///
+/// `walk` inspects directory-entry kinds to decide whether to recurse, but that observation cannot
+/// authorize a later plain open: a hook can replace a regular file with a symlink between those
+/// operations. The shared opener closes that final-component race on every supported platform.
+fn digest_regular_file(
+    root: &Path,
+    path: &Path,
+    digest: &mut updated_contracts::digest::Sha256Hasher,
+) -> io::Result<()> {
+    use io::Read as _;
+
+    let mut file =
+        foundation::file::open_regular_beneath(root, path, foundation::file::FinalSymlink::Refuse)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(())
 }
 
 /// The running verdict: one line per check, and the count that decides the exit status.
@@ -1085,5 +1100,25 @@ printf 'state=ready\n'
         assert_eq!(original, tree_digest(root).unwrap());
         std::fs::rename(root.join("sub/a"), root.join("sub/b")).unwrap();
         assert_ne!(original, tree_digest(root).unwrap(), "names count");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tree_file_reader_never_follows_a_replaced_entry() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("state");
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("value"), b"state outside the observation tree").unwrap();
+        let redirected_parent = root.join("redirected-parent");
+        symlink(&outside, &redirected_parent).unwrap();
+
+        let mut digest = updated_contracts::digest::Sha256Hasher::new();
+        assert!(
+            digest_regular_file(&root, &redirected_parent.join("value"), &mut digest,).is_err()
+        );
     }
 }

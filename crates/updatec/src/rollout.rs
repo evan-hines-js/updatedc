@@ -730,11 +730,11 @@ impl<'a> Observations<'a> {
     /// a sequence also meant catching a transient as it went past: a plane that was restarting, had
     /// just changed leader, or was merely slow that second never saw it again, because the node
     /// never retries rejected bytes.
-    fn claims_rejection(&self, node: &str) -> Option<(String, bool)> {
+    fn claims_rejection(&self, node: &str) -> Option<String> {
         self.reports
             .get(node)
             .zip(self.public_keys.get(node))
-            .and_then(|(envelope, key)| self.verified.durable_rejection(node, envelope, key))
+            .and_then(|(envelope, key)| self.verified.rejected_assignment(node, envelope, key))
     }
 
     /// Whether ANY node in the fleet is still placed on `deployment`, whatever group it is in now.
@@ -864,8 +864,8 @@ pub(crate) fn plan_rollouts(
     // earlier generations, so pre-admission state is the honest baseline.
     // Each node's own standing claim, folded into the pass's memory before any verdict reads it.
     for node in node_groups.keys() {
-        if let Some((identity, rejected)) = observations.claims_rejection(node) {
-            observed.note_rejection(node, &identity, rejected);
+        if let Some(identity) = observations.claims_rejection(node) {
+            observed.note_rejection(node, &identity);
         }
     }
     // Bounded to the deployments some generation still names: corrected bytes have a new identity,
@@ -8399,15 +8399,11 @@ mod tests {
         );
     }
 
-    /// A rejection is the NODE's claim, and the plane holds it exactly as long as the node makes
-    /// it. Two directions, one test: a node that committed a release and later merely fetches it
-    /// again claims nothing, so nothing halts (the plane must not be carrying state from an earlier
-    /// movement of the same machine toward the same bytes); and a node whose claim is later
-    /// withdrawn — the one way that happens is an operator break-glassing its rejection record —
-    /// clears the halt it raised, rather than leaving the fleet frozen on evidence the operator has
-    /// already destroyed.
+    /// A rejection is monotone for a live node and deployment identity. A node that committed a
+    /// release and later merely fetches it again claims nothing, so nothing halts; once the same
+    /// node does prove those bytes bad, neither silence nor a later negative report can erase it.
     #[test]
-    fn a_rejection_claim_follows_the_node_that_makes_it_in_both_directions() {
+    fn a_rejection_claim_is_monotone_for_a_live_node_and_deployment() {
         let hex = |c: char| c.to_string().repeat(64);
         let v0 = deployment_with_app("v0", &hex('1'));
         let v1 = deployment_with_app("v1", &hex('2'));
@@ -8544,11 +8540,8 @@ mod tests {
              fleet-wide"
         );
 
-        // And the withdrawal direction: the node DOES reject v1, halting it fleet-wide, and the
-        // operator then break-glasses that record. The node's next report says so, and the halt
-        // clears — the claim is the node's, so its retraction is the node's too. Anything else
-        // leaves the fleet halted on bytes whose only evidence the operator has already cleared,
-        // with no exit but a new digest.
+        // The node now DOES reject v1, halting it fleet-wide. A later negative statement cannot
+        // erase append-only evidence for the same live node and deployment identity.
         let (node, envelope) = report_rejected("n0", &v1, &arch0);
         reports.insert(node, envelope);
         let plan = pass(
@@ -8571,8 +8564,8 @@ mod tests {
             &mut attempts,
         );
         assert!(
-            plan.halted_groups.is_empty(),
-            "a withdrawn claim clears the halt it raised: {:?}",
+            plan.halted_groups.contains_key("g"),
+            "a negative report cannot retract a durable rejection: {:?}",
             plan.halted_groups
         );
     }
@@ -10004,7 +9997,7 @@ mod tests {
         assert!(
             !vetoed.contains_key(&id(&v0)),
             "no rebase happened, so nothing consumed v0's evidence into a veto: the halt is \
-             recomputed from the standing claim and clears if the node withdraws it"
+             recomputed from the standing claim until the node or deployment identity leaves"
         );
         assert_eq!(
             plan.halted_groups.get("g"),
@@ -10181,7 +10174,7 @@ mod tests {
             },
         )]);
         let mut attempts = ObservationLog::new();
-        attempts.note_rejection("n0", &id(&v1), true);
+        attempts.note_rejection("n0", &id(&v1));
         let published = BTreeMap::from([
             ("n0".to_string(), id(&v0)),
             ("n1".to_string(), id(&v1)),

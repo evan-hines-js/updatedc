@@ -1,7 +1,7 @@
 //! Small filesystem primitives whose security properties must not drift between binaries.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read as _},
     path::Path,
 };
@@ -18,6 +18,32 @@ pub enum FinalSymlink {
     Refuse,
 }
 
+/// How the single lock-file opener treats an occupied or absent name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockFileDisposition {
+    /// The lease must already exist; absence is an error.
+    OpenExisting,
+    /// The caller is publishing a fresh lease; any occupied name is an error.
+    CreateNew,
+    /// A long-lived instance lock survives process restarts, so create it once or reopen it.
+    OpenOrCreate,
+}
+
+/// Whether a directory entry occupies `path`, without following its final symlink/reparse point.
+///
+/// [`Path::try_exists`] answers whether the *target* exists. That is the wrong question for trust
+/// anchors, one-way markers, durable identities, and exclusive destinations: a dangling symlink
+/// still occupies the name and must fail closed rather than silently turning configured state into
+/// absence. Every security-sensitive presence decision goes through this primitive so that policy
+/// cannot drift between platforms or callers.
+pub fn path_entry_exists(path: &Path) -> io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Open one regular file under an explicit final-symlink policy.
 ///
 /// Callers that need streaming rather than collection use this handle directly; bounded in-memory
@@ -26,6 +52,137 @@ pub fn open_regular(path: &Path, final_symlink: FinalSymlink) -> io::Result<File
     let mut options = OpenOptions::new();
     options.read(true);
 
+    open_regular_with_options(path, final_symlink, options)
+}
+
+/// Open one regular file and prove the opened handle remains confined beneath `root`.
+///
+/// Refusing only a final symlink does not stop an attacker from replacing an ancestor directory.
+/// Conversely, canonicalizing before opening leaves a replacement race. This operation opens
+/// first, canonicalizes afterward, and requires the canonical path to remain below the canonical
+/// root *and* name the same file as the already-open handle. Callers choose whether a stable final
+/// symlink inside the root is part of their contract.
+pub fn open_regular_beneath(
+    root: &Path,
+    path: &Path,
+    final_symlink: FinalSymlink,
+) -> io::Result<File> {
+    let file = open_regular(path, final_symlink)?;
+    let canonical_root = fs::canonicalize(root)?;
+    if !canonical_root.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confinement root is not a directory",
+        ));
+    }
+    let canonical_path = fs::canonicalize(path)?;
+    if !canonical_path.starts_with(&canonical_root) || !same_named_file(&file, &canonical_path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened file is outside its confinement root",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn same_named_file(file: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let opened = file.metadata()?;
+    let named = path.metadata()?;
+    Ok(opened.dev() == named.dev() && opened.ino() == named.ino())
+}
+
+#[cfg(windows)]
+fn same_named_file(file: &File, path: &Path) -> io::Result<bool> {
+    let named = open_regular(path, FinalSymlink::Follow)?;
+    Ok(windows_file_identity(file)? == windows_file_identity(&named)?)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a live handle for the duration of the call, and the output points to
+    // writable storage for the exact structure Windows fills on success.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful call initialized the complete structure.
+    let information = unsafe { information.assume_init() };
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_named_file(_file: &File, _path: &Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "confined file identity is unsupported on this platform",
+    ))
+}
+
+/// Open a regular lock file for reading and writing without following its final path component.
+///
+/// Locking a symlink target is still an externally visible privileged side effect even when no
+/// bytes are written. Instance locks and temporary-directory leases therefore share this one
+/// opener, including its handle-based regular-file check and Windows reparse-point refusal.
+pub fn open_lock_file(path: &Path, disposition: LockFileDisposition) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).truncate(false);
+    match disposition {
+        LockFileDisposition::OpenExisting => {}
+        LockFileDisposition::CreateNew => {
+            options.create_new(true);
+        }
+        LockFileDisposition::OpenOrCreate => {
+            options.create(true);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    open_regular_with_options(path, FinalSymlink::Refuse, options)
+}
+
+/// Open one regular append-only record without following its final path component.
+///
+/// Append-only journals and process output files must not turn a planted symlink into writes
+/// through an unrelated path. Append semantics and the regular/no-follow proof are established on
+/// the same handle, avoiding the replacement race created by checking path metadata before a
+/// separate open.
+pub fn open_append_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    open_regular_with_options(path, FinalSymlink::Refuse, options)
+}
+
+/// Apply the final-component policy and regular-file proof to one configured open operation.
+/// Reads and advisory-lock handles deliberately converge here so neither platform grows a second
+/// interpretation of "refuse a symlink."
+fn open_regular_with_options(
+    path: &Path,
+    final_symlink: FinalSymlink,
+    mut options: OpenOptions,
+) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -174,6 +331,7 @@ pub fn read_bounded_regular_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn reads_the_opened_regular_file_only_within_the_limit() {
@@ -243,6 +401,123 @@ mod tests {
                     .kind(),
                 io::ErrorKind::InvalidData
             );
+        }
+    }
+
+    #[test]
+    fn confined_opens_prove_the_opened_handle_is_beneath_the_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("file");
+        std::fs::write(&file, b"inside").unwrap();
+        assert!(open_regular_beneath(&root, &file, FinalSymlink::Refuse).is_ok());
+
+        #[cfg(unix)]
+        {
+            let outside = directory.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("file"), b"outside").unwrap();
+            let redirected_parent = root.join("redirected-parent");
+            std::os::unix::fs::symlink(&outside, &redirected_parent).unwrap();
+            assert_eq!(
+                open_regular_beneath(&root, &redirected_parent.join("file"), FinalSymlink::Refuse,)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+
+            let inside_link = root.join("inside-link");
+            std::os::unix::fs::symlink(&file, &inside_link).unwrap();
+            assert!(open_regular_beneath(&root, &inside_link, FinalSymlink::Follow).is_ok());
+            assert!(open_regular_beneath(&root, &inside_link, FinalSymlink::Refuse).is_err());
+        }
+    }
+
+    #[test]
+    fn entry_presence_never_follows_the_final_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        let absent = directory.path().join("absent");
+        std::fs::write(&file, b"present").unwrap();
+
+        assert!(path_entry_exists(&file).unwrap());
+        assert!(!path_entry_exists(&absent).unwrap());
+
+        #[cfg(unix)]
+        {
+            let dangling = directory.path().join("dangling");
+            std::os::unix::fs::symlink(&absent, &dangling).unwrap();
+            assert!(path_entry_exists(&dangling).unwrap());
+            assert!(!dangling.try_exists().unwrap());
+        }
+    }
+
+    #[test]
+    fn every_lock_disposition_uses_the_same_regular_no_follow_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join("state.lock");
+
+        assert_eq!(
+            open_lock_file(&lock, LockFileDisposition::OpenExisting)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        drop(open_lock_file(&lock, LockFileDisposition::CreateNew).unwrap());
+        assert!(open_lock_file(&lock, LockFileDisposition::OpenOrCreate).is_ok());
+        assert_eq!(
+            open_lock_file(&lock, LockFileDisposition::CreateNew)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("target");
+            let redirect = directory.path().join("redirect.lock");
+            std::fs::write(&target, b"must not become the lock").unwrap();
+            std::os::unix::fs::symlink(&target, &redirect).unwrap();
+            assert_eq!(
+                open_lock_file(&redirect, LockFileDisposition::OpenOrCreate)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(std::fs::read(target).unwrap(), b"must not become the lock");
+        }
+    }
+
+    #[test]
+    fn append_files_use_the_same_regular_no_follow_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = directory.path().join("journal.jsonl");
+        let mut first = open_append_file(&journal).unwrap();
+        first.write_all(b"first\n").unwrap();
+        drop(first);
+        let mut second = open_append_file(&journal).unwrap();
+        second.write_all(b"second\n").unwrap();
+        drop(second);
+        assert_eq!(std::fs::read(&journal).unwrap(), b"first\nsecond\n");
+
+        assert!(
+            open_append_file(directory.path()).is_err(),
+            "a directory can never become an append record"
+        );
+
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("target");
+            let redirect = directory.path().join("redirect.jsonl");
+            std::fs::write(&target, b"ordinary state").unwrap();
+            std::os::unix::fs::symlink(&target, &redirect).unwrap();
+            assert_eq!(
+                open_append_file(&redirect).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(std::fs::read(target).unwrap(), b"ordinary state");
         }
     }
 }

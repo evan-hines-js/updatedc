@@ -216,7 +216,7 @@ pub fn load_or_enroll(
             Ok(bundle)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if consumed.try_exists()? {
+            if foundation::file::path_entry_exists(&consumed)? {
                 return Err(invalid(
                     "enrollment bundle is missing after bootstrap eligibility was consumed",
                 ));
@@ -283,8 +283,9 @@ pub async fn load_or_enroll_http(
             let routing_is_local = crate::config::base_url_is_local(&bundle.routing_base_url)
                 .map_err(|error| invalid(&format!("invalid routing base URL: {error}")))?;
             if !routing_is_local {
-                let identity_complete = joined_cert_path(state_dir).try_exists()?
-                    && joined_key_path(state_dir).try_exists()?;
+                let identity_complete =
+                    foundation::file::path_entry_exists(&joined_cert_path(state_dir))?
+                        && foundation::file::path_entry_exists(&joined_key_path(state_dir))?;
                 if !identity_complete {
                     // The current object must agree on every immutable routing boundary the operator
                     // preplaced. Its root may be newer: the standard live TUF refresh walks that
@@ -537,7 +538,9 @@ fn chrono_now_unix() -> i64 {
 /// when a fresh network enrollment is due. Called only by [`load_or_enroll_http`], the sole
 /// bootstrap entry point, so the one-way, consumed-once contract lives on that one path.
 fn load_existing_or_fresh(bundle_path: &Path) -> io::Result<Option<EnrollmentBundle>> {
-    if bundle_path.try_exists()? || consumed_path(bundle_path).try_exists()? {
+    if foundation::file::path_entry_exists(bundle_path)?
+        || foundation::file::path_entry_exists(&consumed_path(bundle_path))?
+    {
         load_or_enroll(bundle_path, || {
             Err(invalid("enrollment must not run for existing local state"))
         })
@@ -647,17 +650,12 @@ fn decode(bytes: &[u8]) -> io::Result<EnrollmentBundle> {
 }
 
 fn consume_if_needed(path: &Path) -> io::Result<()> {
-    if path.try_exists()? {
+    if foundation::file::path_entry_exists(path)? {
         return Ok(());
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("enrollment marker has no parent"))?;
+    let parent = foundation::durable::parent_dir(path);
     std::fs::create_dir_all(parent)?;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let file = foundation::durable::create_private_new(path)?;
     file.sync_all()?;
     foundation::durable::sync_dir(parent)
 }
@@ -740,6 +738,25 @@ mod tests {
             Ok(bundle())
         })
         .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!called.get());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_consumed_marker_still_blocks_enrollment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.enrollment.json");
+        let consumed = consumed_path(&path);
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), consumed).unwrap();
+        let called = Cell::new(false);
+
+        let error = load_or_enroll(&path, || {
+            called.set(true);
+            Ok(bundle())
+        })
+        .unwrap_err();
+
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!called.get());
     }

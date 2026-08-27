@@ -352,7 +352,8 @@ mod tests {
         // silently draining the entire external LB path.
         let endpoint = crate::fixture::RELEASE_ENDPOINT;
         let bucket = crate::fixture::RELEASE_BUCKET;
-        let prefix = updatec::runtime::managed_repository_prefix("updated-system", "default");
+        let prefix =
+            updatec::runtime::managed_repository_prefix(NAMESPACE, crate::fixture::REPOSITORY_NAME);
         assert_eq!(HEALTH_CDN, format!("{endpoint}/{bucket}/{prefix}"));
 
         assert_eq!(

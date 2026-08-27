@@ -21,11 +21,11 @@ pub(crate) struct Store {
 
 enum Backend {
     File {
-        paths: Paths,
+        paths: Box<Paths>,
         rejected: Rejections,
     },
     #[cfg(test)]
-    Memory(MemoryBackend),
+    Memory(Box<MemoryBackend>),
 }
 
 #[derive(Clone, Copy)]
@@ -50,7 +50,10 @@ impl Store {
         std::fs::create_dir_all(&paths.state_dir)?;
         let rejected = Rejections::load(&paths.rejected)?;
         Ok(Self {
-            backend: Backend::File { paths, rejected },
+            backend: Backend::File {
+                paths: Box::new(paths),
+                rejected,
+            },
         })
     }
 
@@ -466,26 +469,13 @@ impl Store {
             Backend::File { rejected, .. } => rejected.reject(&key),
             #[cfg(test)]
             Backend::Memory(memory) => {
+                // Match `Rejections::reject`: once bad-byte evidence is observed, a persistence
+                // failure cannot make it eligible again in the live process. The returned error
+                // still tells the state machine to retain and replay its durable obligation.
+                memory.rejected.insert(key);
                 if memory.fail_reject {
                     return Err(io::Error::other("injected rejection write failure"));
                 }
-                memory.rejected.insert(key);
-                Ok(())
-            }
-        }
-    }
-
-    /// Delete a rejection record, unconditionally. The implementation detail behind
-    /// [`Store::clear_application_rejection`] — call that instead: a rejection is never-retry
-    /// evidence, and only proof that the same application bytes later succeeded may erase it.
-    #[allow(clippy::disallowed_methods)]
-    fn remove_rejection(&mut self, lineage: &RepositoryLineage, digest: &str) -> io::Result<()> {
-        let key = lineage.rejection_key(digest);
-        match &mut self.backend {
-            Backend::File { rejected, .. } => rejected.clear(&key),
-            #[cfg(test)]
-            Backend::Memory(memory) => {
-                memory.rejected.remove(&key);
                 Ok(())
             }
         }
@@ -879,37 +869,10 @@ impl Store {
         }
         self.remove_install_journal()
     }
-    /// Erase a direct application-artifact rejection — but only with proof of settlement: those
-    /// exact bytes are the currently committed head, so the machine itself has demonstrated they
-    /// work. Provider and deployment verdicts have no corresponding proof here and cannot pass
-    /// this gate accidentally.
-    #[allow(clippy::disallowed_methods)]
-    pub(crate) fn clear_application_rejection(
-        &mut self,
-        lineage: &RepositoryLineage,
-        digest: &str,
-    ) -> io::Result<()> {
-        Self::rejection_key(lineage, digest)?;
-        let active = self.active_release()?;
-        let settled = matches!(
-            self.installed(),
-            Installed::Present(ref state)
-                if active.as_ref() == Some(&state.release)
-                    && state.repository_lineage == *lineage
-                    && state.archive_sha256 == digest
-        );
-        if !settled {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "refusing to erase a rejection for bytes that are not the active committed head",
-            ));
-        }
-        self.remove_rejection(lineage, digest)
-    }
     #[cfg(test)]
     pub(crate) fn memory(backend: MemoryBackend) -> Self {
         Self {
-            backend: Backend::Memory(backend),
+            backend: Backend::Memory(Box::new(backend)),
         }
     }
 

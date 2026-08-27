@@ -22,6 +22,10 @@ const SUMMARY_EVERY: Duration = Duration::from_millis(500);
 /// service lost from the caller's point of view and counts as a failure.
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(800);
 
+/// A health/version response is a few bytes. Use the shared streamed-body gate so a broken backend
+/// cannot turn the permanent probe into an unbounded allocator before the request deadline fires.
+const RESPONSE_BODY_LIMIT: usize = 8 * 1024;
+
 /// One cumulative observation window, serialized as a single JSON line per emission — and parsed
 /// back from the pod log by the harness ([`Summary::from_logs`]). ONE definition for the one wire
 /// document, written and read: two mirrored structs let a field renamed on the writer alone still
@@ -55,9 +59,13 @@ impl Summary {
 /// [`SUMMARY_EVERY`]. Requests are sequential — the measurement is "a client's request stream
 /// across the upgrade", not a throughput benchmark — and the interval paces steady load.
 pub(crate) async fn run(url: &str, interval_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()?;
+    let endpoint = updated::http::network_endpoint(
+        url,
+        updated::http::EndpointTransport::HttpOrHttps,
+        "load probe URL",
+    )?;
+    let client =
+        updated::http::outbound_client(updated::http::OutboundDeadline::Total(REQUEST_TIMEOUT))?;
     let interval = Duration::from_millis(interval_ms.max(1));
     let mut total = 0u64;
     let mut failed = 0u64;
@@ -66,14 +74,21 @@ pub(crate) async fn run(url: &str, interval_ms: u64) -> Result<(), Box<dyn std::
     let mut max_gap = Duration::ZERO;
     let mut last_summary = Instant::now();
     loop {
-        let outcome = match client.get(url).send().await {
-            Ok(response) if response.status().is_success() => match response.text().await {
-                Ok(body) if !body.trim().is_empty() => Ok(()),
-                Ok(_) => Err("empty response body".to_string()),
-                Err(error) => Err(format!("reading response body: {error}")),
-            },
-            Ok(response) => Err(format!("status {}", response.status())),
-            Err(error) => Err(error.to_string()),
+        let outcome = match client.get(endpoint.clone()).send().await {
+            Ok(response) => {
+                match updated::http::read_bounded(response, "load probe", RESPONSE_BODY_LIMIT).await
+                {
+                    Ok(body) => match std::str::from_utf8(&body) {
+                        Ok(body) if !body.trim().is_empty() => Ok(()),
+                        Ok(_) => Err("empty response body".to_string()),
+                        Err(_) => Err("response body is not UTF-8".to_string()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            Err(error) => {
+                Err(updated::http::redacted_reqwest_error("load probe", &error).to_string())
+            }
         };
         total += 1;
         match outcome {

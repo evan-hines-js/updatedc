@@ -369,7 +369,7 @@ impl OutputPublication {
     pub fn validate(&self, node: &str) -> Result<(), String> {
         if self.schema != Self::SCHEMA
             || self.node != node
-            || !crate::telemetry::is_valid_node(node)
+            || !crate::identity::is_dns_subdomain(node)
             || !crate::identity::is_segment(&self.deployment)
             || !crate::is_canonical_sha256(&self.assignment_sha256)
             || !crate::is_canonical_sha256(&self.archive_sha256)
@@ -459,42 +459,22 @@ impl UploadCapability {
 /// in the signed form fields: accepting query material here would create a second bearer mechanism
 /// and make the exact authority harder to audit.
 pub fn upload_action_url(value: &str) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(value)
-        .map_err(|_| "object-store upload action URL is invalid".to_string())?;
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(
+    crate::endpoint::https_url(value, crate::endpoint::QueryPolicy::Forbidden).map_err(|_| {
+        String::from(
             "object-store upload action must be an absolute HTTPS URL without credentials, query material, or a fragment"
-                .into(),
-        );
-    }
-    Ok(parsed)
+        )
+    })
 }
 
 /// Parse the only bearer-URL shape an agent may spend. Userinfo would put another credential in
 /// authority syntax, and fragments are client-local ambiguity; neither belongs in an exact S3
 /// capability.
 pub fn capability_url(value: &str) -> Result<url::Url, String> {
-    let parsed =
-        url::Url::parse(value).map_err(|_| "object-store capability URL is invalid".to_string())?;
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_none_or(str::is_empty)
-        || parsed.fragment().is_some()
-    {
-        return Err(
-            "object-store capability must be an absolute HTTPS URL with bearer query material"
-                .into(),
-        );
-    }
-    Ok(parsed)
+    crate::endpoint::https_url(value, crate::endpoint::QueryPolicy::Required).map_err(|_| {
+        String::from(
+            "object-store capability must be an absolute HTTPS URL with bearer query material",
+        )
+    })
 }
 
 fn bounded_json(value: &impl Serialize, what: &str) -> Result<Vec<u8>, String> {

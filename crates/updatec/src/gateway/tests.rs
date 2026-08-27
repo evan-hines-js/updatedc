@@ -116,14 +116,7 @@ fn node_identity(node: &str) -> ClientIdentity {
 /// A minted node leaf certifying `public_key` — the previous holder of a re-enrolled name holds
 /// a leaf identical to the replacement's but for this.
 fn node_leaf_keyed(repository: &str, node: &str, public_key: &str) -> ClientIdentity {
-    ClientIdentity {
-        common_name: Some(node.into()),
-        node: Some(crate::join::NodeSpiffeId {
-            repository: repository.into(),
-            node: node.into(),
-        }),
-        public_key: Some(public_key.into()),
-    }
+    ClientIdentity::test_node(repository, node, public_key)
 }
 
 #[test]
@@ -167,11 +160,7 @@ fn capability_authorization_memo_is_keyed_by_leaf_and_strictly_bounded() {
 
 #[test]
 fn the_bootstrap_certificate_is_a_node_in_no_repository() {
-    let bootstrap = ClientIdentity {
-        common_name: Some("updated-enrollment".into()),
-        node: None,
-        public_key: Some(TEST_LEAF_KEY.into()),
-    };
+    let bootstrap = ClientIdentity::test_enrollment("updated-enrollment");
     assert_eq!(bootstrap.node_in("prod"), None);
     assert!(is_enrollment_identity(&bootstrap, "updated-enrollment"));
     // A minted node leaf never regains enrollment authority by taking the bootstrap CN.
@@ -183,10 +172,7 @@ fn the_bootstrap_certificate_is_a_node_in_no_repository() {
 
 #[test]
 fn a_spiffe_uri_round_trips_and_rejects_a_prefix_only_uri() {
-    let identity = crate::join::NodeSpiffeId {
-        repository: "prod".into(),
-        node: "web-01".into(),
-    };
+    let identity = crate::join::NodeSpiffeId::new("prod", "web-01").unwrap();
     assert_eq!(
         crate::join::NodeSpiffeId::parse(&identity.uri()),
         Some(identity)
@@ -199,6 +185,9 @@ fn a_spiffe_uri_round_trips_and_rejects_a_prefix_only_uri() {
         "spiffe://updated.fleet/scope//node/web-01",
         "spiffe://updated.fleet/scope/prod/node/",
         "spiffe://elsewhere/scope/prod/node/web-01",
+        "spiffe://updated.fleet/scope/Prod/node/web-01",
+        "spiffe://updated.fleet/scope/prod/node/web-01?admin=true",
+        "spiffe://updated.fleet/scope/prod/node/web_01",
     ] {
         assert_eq!(
             crate::join::NodeSpiffeId::parse(uri),
@@ -333,11 +322,7 @@ fn a_certificate_authenticated_route_requires_the_leaf_s_own_pinned_identity() {
     ));
     // A connection with no client certificate carries no key and authorizes nothing.
     assert!(!is_pinned_leaf(
-        &ClientIdentity {
-            common_name: None,
-            node: None,
-            public_key: None,
-        },
+        &ClientIdentity::anonymous(),
         &enrolled,
         "repo"
     ));
@@ -774,11 +759,7 @@ async fn bootstrap_and_cross_repository_leaves_cannot_mint_repository_capabiliti
                 repository: Arc::from(TEST_REPOSITORY),
             },
         });
-    let bootstrap = ClientIdentity {
-        common_name: Some("updated-enrollment".into()),
-        node: None,
-        public_key: Some(TEST_LEAF_KEY.into()),
-    };
+    let bootstrap = ClientIdentity::test_enrollment("updated-enrollment");
     for identity in [bootstrap, node_leaf("another-repository", "node-a")] {
         let response = app
             .clone()
@@ -1106,11 +1087,7 @@ fn enrollment_resolves_consistent_snapshot_target_objects() {
 
 #[test]
 fn only_the_configured_bootstrap_identity_can_enroll() {
-    let bootstrap = |cn: &str| ClientIdentity {
-        common_name: Some(cn.to_owned()),
-        node: None,
-        public_key: Some(TEST_LEAF_KEY.into()),
-    };
+    let bootstrap = ClientIdentity::test_enrollment;
     assert!(is_enrollment_identity(
         &bootstrap("updated-agent"),
         "updated-agent"
@@ -1120,11 +1097,7 @@ fn only_the_configured_bootstrap_identity_can_enroll() {
         "updated-agent"
     ));
     assert!(!is_enrollment_identity(
-        &ClientIdentity {
-            common_name: None,
-            node: None,
-            public_key: None,
-        },
+        &ClientIdentity::anonymous(),
         "updated-agent"
     ));
     assert!(!is_enrollment_identity(&bootstrap(""), ""));
@@ -1151,12 +1124,7 @@ fn only_a_minted_node_leaf_carries_steady_state_authority() {
         Some("agent-7")
     );
     assert_eq!(
-        ClientIdentity {
-            common_name: Some("updated-agent".into()),
-            node: None,
-            public_key: Some(TEST_LEAF_KEY.into()),
-        }
-        .node_in(TEST_REPOSITORY),
+        ClientIdentity::test_enrollment("updated-agent").node_in(TEST_REPOSITORY),
         None
     );
 }

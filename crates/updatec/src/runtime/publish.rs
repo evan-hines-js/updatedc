@@ -23,7 +23,7 @@ pub async fn publish_repository(
             .path
             .strip_prefix(repository_dir)
             .map_err(|e| StorageError(format!("invalid retained repository path: {e}")))?;
-        let key = crate::object_key(&destination.prefix, &relative.to_string_lossy());
+        let key = repository_object_key(&destination.prefix, relative)?;
         let digest = content_addressed_target_digest(relative)?.ok_or_else(|| {
             StorageError(format!(
                 "retained repository object {} is not below targets/",
@@ -52,8 +52,7 @@ pub async fn publish_repository(
             timestamp_relative.display()
         )));
     }
-    let timestamp_key =
-        crate::object_key(&destination.prefix, &timestamp_relative.to_string_lossy());
+    let timestamp_key = repository_object_key(&destination.prefix, timestamp_relative)?;
 
     let mut root_file = None;
     let mut validated_targets = HashMap::new();
@@ -106,7 +105,7 @@ pub async fn publish_repository(
         if relative == Path::new("metadata/root.json") {
             continue;
         }
-        let key = crate::object_key(&destination.prefix, &relative.to_string_lossy());
+        let key = repository_object_key(&destination.prefix, relative)?;
         if let Some(length) = validated_targets.get(relative) {
             let expected = content_addressed_target_digest(relative)?.ok_or_else(|| {
                 StorageError(format!(
@@ -128,6 +127,36 @@ pub async fn publish_repository(
     commit_conditional_publication_file(store, &timestamp_key, "timestamp", timestamp_write)
         .await?;
     Ok(())
+}
+
+/// Convert a local repository path into its one exact object-store identity. Repository metadata
+/// names UTF-8 targets, so replacing undecodable local bytes would publish a different name than
+/// the file being validated and can collide with a genuine U+FFFD path. Refuse it at the shared
+/// boundary instead.
+fn repository_object_key(
+    prefix: &str,
+    relative: &Path,
+) -> Result<object_store::path::Path, StorageError> {
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(StorageError(format!(
+                "repository object path is not relative and normalized: {}",
+                relative.display()
+            )));
+        };
+        let part = part.to_str().ok_or_else(|| {
+            StorageError(format!(
+                "repository object path is not UTF-8: {}",
+                relative.display()
+            ))
+        })?;
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return Err(StorageError("repository object path is empty".into()));
+    }
+    Ok(crate::object_key(prefix, &parts.join("/")))
 }
 
 pub(crate) struct ConditionalPublicationFile {
@@ -569,7 +598,7 @@ pub(crate) async fn refuse_generation_rollback(
     let Some(published) = store_published_version(store, destination).await? else {
         return Ok(()); // nothing is served, so nothing can be rolled back.
     };
-    if !repo_dir.join("metadata/root.json").try_exists()? {
+    if !foundation::file::path_entry_exists(&repo_dir.join("metadata/root.json"))? {
         return Err(Box::new(StorageError(
             "local publisher state is empty but the object store already holds a published \
              generation; refusing to re-initialize a v1 TUF repo (restore the state volume)"
@@ -859,4 +888,32 @@ pub(crate) async fn metadata_expiry(path: &Path) -> Option<chrono::DateTime<chro
     chrono::DateTime::parse_from_rfc3339(expires)
         .ok()
         .map(|instant| instant.with_timezone(&chrono::Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_object_keys_have_one_platform_independent_spelling() {
+        assert_eq!(
+            repository_object_key("releases", Path::new("metadata/timestamp.json"))
+                .unwrap()
+                .as_ref(),
+            "releases/metadata/timestamp.json"
+        );
+        assert!(repository_object_key("releases", Path::new("../root.json")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_object_keys_never_rewrite_invalid_path_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = Path::new(OsStr::from_bytes(b"targets/invalid-\xff"));
+        let error = repository_object_key("releases", path).unwrap_err();
+
+        assert!(error.0.contains("not UTF-8"));
+    }
 }

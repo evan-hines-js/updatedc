@@ -551,7 +551,7 @@ impl DurableRolloutState {
     /// Validate the one durable rollout-state contract on both sides of persistence.
     pub(crate) fn validate(&self) -> Result<(), String> {
         for (group, admitted) in &self.admitted {
-            if !updated_contracts::telemetry::is_valid_node(group) {
+            if !updated_contracts::identity::is_dns_subdomain(group) {
                 return Err(format!("durable admitted-state group {group:?} is invalid"));
             }
             admitted
@@ -573,8 +573,8 @@ impl DurableRolloutState {
             }
         }
         for (node, group) in &self.routing {
-            if !updated_contracts::telemetry::is_valid_node(node)
-                || !updated_contracts::telemetry::is_valid_node(group)
+            if !updated_contracts::identity::is_dns_subdomain(node)
+                || !updated_contracts::identity::is_dns_subdomain(group)
             {
                 return Err(format!(
                     "durable route {node:?} -> {group:?} has an invalid identity"
@@ -582,7 +582,7 @@ impl DurableRolloutState {
             }
         }
         for (node, identity) in &self.assignments {
-            if !updated_contracts::telemetry::is_valid_node(node)
+            if !updated_contracts::identity::is_dns_subdomain(node)
                 || !updated_contracts::is_canonical_sha256(identity)
             {
                 return Err(format!(
@@ -622,7 +622,7 @@ pub(crate) fn decode_assignments(
             ));
         }
         for node in nodes {
-            if !updated_contracts::telemetry::is_valid_node(&node) {
+            if !updated_contracts::identity::is_dns_subdomain(&node) {
                 return Err(format!("stored assignment node {node:?} is invalid"));
             }
             if assignments.insert(node.clone(), identity.clone()).is_some() {

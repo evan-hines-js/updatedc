@@ -331,19 +331,14 @@ rollbacks onto a release the node has run before.
 The launcher has a separate state root containing `desired-agent`, lifecycle markers, and
 content-addressed agent candidates.
 
-## Rejected releases and break glass
+## Rejected releases
 
 A release that fails activation or health is rejected by repository lineage and artifact digest.
 That rejection does not expire: repeatedly launching unchanged, proven-bad bytes would turn a safe
 rollback into an availability loop. The normal fix is to publish a new release containing corrected
 bytes; its new digest is eligible without clearing anything.
-
-To deliberately retry the exact rejected bytes, copy its complete key from
-`<install-root>/state/rejected` into `<install-root>/state/rejected.allow`, one key per line, and
-restart the runtime. This local file is an intentionally inconvenient break-glass mechanism:
-malformed or partial keys fail startup closed, overrides are read only at startup, and the file
-should be removed after the controlled retry. Application keys are
-`repository-lineage-sha256:artifact-sha256`; agent keys are a single artifact SHA-256.
+Rejection records are append-only: there is no local deletion or override path that can make the
+same proven-bad bytes eligible again.
 
 ## Try it
 

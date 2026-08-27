@@ -863,7 +863,7 @@ async fn deploy_external_reconciler() -> Result<(), Box<dyn std::error::Error>> 
         "kind": "UpdateBackend",
         "metadata": {"name": "external", "namespace": NAMESPACE},
         "spec": {
-            "repositoryRef": {"name": "default"},
+            "repositoryRef": {"name": fixture::REPOSITORY_NAME},
             "selector": {"matchLabels": {COHORT_LABEL: EXTERNAL_COHORT}},
             "healthBase": HEALTH_CDN,
             "target": {
@@ -943,7 +943,7 @@ fn bootstrap_minio_release_repo(
         "kind": "UpdateGroup",
         "metadata": {"name": "release-seed", "namespace": NAMESPACE},
         "spec": {
-            "repositoryRef": {"name": "default"},
+            "repositoryRef": {"name": fixture::REPOSITORY_NAME},
             "selector": {"matchLabels": {COHORT_LABEL: "__release-seed-unmatched__"}},
             "deployment": seed_deployment
         }
@@ -1095,7 +1095,7 @@ fn apply_resources(
                 "labels":labels
             },
             "spec":{
-                "repositoryRef":{"name":"default"},
+                "repositoryRef":{"name":fixture::REPOSITORY_NAME},
                 "selector":{"matchLabels":{COHORT_LABEL:cohort}},
                 "deployment":deployment
             }
@@ -1148,7 +1148,7 @@ fn apply_resources(
                 "kind":"UpdateGroup",
                 "metadata":{"name": name, "namespace":NAMESPACE},
                 "spec":{
-                    "repositoryRef":{"name":"default"},
+                    "repositoryRef":{"name":fixture::REPOSITORY_NAME},
                     "selector": {"matchLabels":{KIND_LABEL:"jenkins", ROLE_LABEL: role}},
                     "deployment": deployment
                 }

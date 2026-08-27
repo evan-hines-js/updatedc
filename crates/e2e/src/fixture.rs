@@ -380,11 +380,7 @@ pub fn run() -> R {
 fn record(root: &Path, operation: Operation, id: &str, reason: &str, version: &str) -> R {
     let append = |path: PathBuf, line: &str| -> R {
         std::fs::create_dir_all(root).map_err(str_err)?;
-        let mut log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(str_err)?;
+        let mut log = foundation::file::open_append_file(&path).map_err(str_err)?;
         writeln!(log, "{line}").map_err(str_err)
     };
     append(
@@ -456,11 +452,7 @@ fn converge(root: &Path, release: &Path, address: &str, mode: &Mode) -> R {
     if let Some(fault) = mode.fault.as_deref() {
         command.args(["--fault", fault]);
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root.join("workload.log"))
-        .map_err(str_err)?;
+    let log = foundation::file::open_append_file(&root.join("workload.log")).map_err(str_err)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().map_err(str_err)?))
