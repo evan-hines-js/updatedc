@@ -31,8 +31,8 @@ const LEAF_CERT_TTL_DAYS: i64 = 90;
 /// certificate on another repository's gateway and only the `repository` segment distinguishes them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeSpiffeId {
-    repository: String,
-    node: String,
+    repository: updated_contracts::identity::ResourceName,
+    node: updated_contracts::identity::ResourceName,
 }
 
 impl NodeSpiffeId {
@@ -43,23 +43,17 @@ impl NodeSpiffeId {
     /// them only through the shared DNS-subdomain grammar makes it impossible for minting,
     /// enrollment, telemetry, and parsing to disagree about which names are identities.
     pub fn new(repository: &str, node: &str) -> Option<Self> {
-        if !updated_contracts::identity::is_dns_subdomain(repository)
-            || !updated_contracts::identity::is_dns_subdomain(node)
-        {
-            return None;
-        }
-        Some(Self {
-            repository: repository.to_owned(),
-            node: node.to_owned(),
-        })
+        let repository = updated_contracts::identity::ResourceName::new(repository).ok()?;
+        let node = updated_contracts::identity::ResourceName::new(node).ok()?;
+        Some(Self { repository, node })
     }
 
     pub fn repository(&self) -> &str {
-        &self.repository
+        self.repository.as_str()
     }
 
     pub fn node(&self) -> &str {
-        &self.node
+        self.node.as_str()
     }
 
     /// The SAN URI this identity is encoded as. Minting and parsing share this one shape so the
@@ -204,6 +198,7 @@ impl IssuingCa {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 // These tests assert the end-to-end claim that a key pinned at enrollment is the key that later
 // verifies that node's telemetry, which cannot be shown through the controller's report cache.
 mod tests {
@@ -323,7 +318,8 @@ mod tests {
         let pkcs8_der = updated::csr::key_pem_to_pkcs8_der(&key_pem).unwrap();
         let mut report = updated_contracts::telemetry::NodeReport::new(
             "agent-9", "deploy-2", DIGEST, "2.0.0", DIGEST, DIGEST, true,
-        );
+        )
+        .unwrap();
         let envelope = crate::test_support::sign_report(&mut report, &pkcs8_der);
         let now_ms = updated_contracts::telemetry::now_ms();
 

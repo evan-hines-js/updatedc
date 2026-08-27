@@ -213,6 +213,7 @@ pub(crate) enum Level {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::test_support::{deployment_rejection, digest, lineage, provider, release};

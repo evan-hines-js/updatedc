@@ -56,12 +56,12 @@ pub const MAX_BACKEND_INVENTORY_MEMBERS: usize = 10_000;
 #[serde(tag = "state", rename_all = "camelCase", deny_unknown_fields)]
 pub enum BackendInventoryMember {
     Active {
-        node: String,
+        node: crate::identity::ResourceName,
         address: String,
         public_key: crate::key::P256PublicKey,
     },
     Cordoned {
-        node: String,
+        node: crate::identity::ResourceName,
     },
 }
 
@@ -72,6 +72,8 @@ impl BackendInventoryMember {
         public_key: &str,
     ) -> Result<Self, String> {
         let node = node.into();
+        let node = crate::identity::ResourceName::new(node.clone())
+            .map_err(|_| format!("inventory member has invalid node identity {node:?}"))?;
         let address = address.into();
         let address = routable_host(&address).ok_or_else(|| {
             format!("inventory member {node:?} has unroutable address {address:?}")
@@ -103,12 +105,15 @@ impl BackendInventoryMember {
     }
 
     pub fn cordoned(node: impl Into<String>) -> Result<Self, String> {
-        Self::Cordoned { node: node.into() }.validate()
+        let node = node.into();
+        let node = crate::identity::ResourceName::new(node.clone())
+            .map_err(|_| format!("inventory member has invalid node identity {node:?}"))?;
+        Self::Cordoned { node }.validate()
     }
 
     pub fn node(&self) -> &str {
         match self {
-            Self::Active { node, .. } | Self::Cordoned { node } => node,
+            Self::Active { node, .. } | Self::Cordoned { node } => node.as_str(),
         }
     }
 
@@ -119,7 +124,7 @@ impl BackendInventoryMember {
     /// Revalidate a deserialized entry at the one shared protocol gate.
     pub fn validate(self) -> Result<Self, String> {
         let node = self.node();
-        if !crate::identity::is_dns_subdomain(node) || !is_balancer_safe(node) {
+        if !is_balancer_safe(node) {
             return Err(format!(
                 "inventory member has invalid node identity {node:?}"
             ));
@@ -300,7 +305,7 @@ pub fn routable_host(address: &str) -> Option<String> {
 /// name, and the `backend` section that qualifies it — because they share one command line and one
 /// consequence.
 ///
-/// [`crate::identity::is_dns_subdomain`] is the resource-identity grammar. It admits only lowercase
+/// [`crate::identity::ResourceName`] is the resource-identity grammar. It admits only lowercase
 /// DNS labels and separators, so a node identity satisfying it is also command-safe, but backend
 /// section names are operator configuration with a deliberately wider vocabulary. This separate
 /// predicate is the one HAProxy interpolation invariant shared by both inputs: the Runtime API
@@ -339,6 +344,7 @@ pub fn is_tcp_endpoint(endpoint: &str) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -438,7 +444,7 @@ mod tests {
             BackendInventoryMember::Active { ref address, .. } if address == "rooted.internal"
         ));
         assert!(BackendInventoryMember::Active {
-            node: "agent-0".into(),
+            node: crate::identity::ResourceName::new("agent-0").unwrap(),
             address: "rooted.internal.".into(),
             public_key: crate::key::P256PublicKey::parse_hex(pin()).unwrap(),
         }

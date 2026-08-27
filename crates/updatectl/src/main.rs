@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! `updatectl` — the CI-facing publisher for `updated`.
 //!
 //! No `kubectl` and no secret-management code of its own:
@@ -133,6 +135,7 @@ pub(crate) fn node_public_key(path: &Path) -> Result<String, Error> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;

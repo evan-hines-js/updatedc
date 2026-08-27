@@ -455,6 +455,7 @@ pub(crate) fn confirm_update(store: &mut Store) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod confirmation_tests {
     use super::*;
     use crate::test_support::{deployment_rejection, digest, lineage, provider, release};

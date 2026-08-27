@@ -42,6 +42,7 @@ fn check(length: usize, what: &str, limit: usize) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

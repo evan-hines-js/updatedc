@@ -204,6 +204,7 @@ fn authenticate_input_capability(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

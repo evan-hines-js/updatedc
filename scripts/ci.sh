@@ -7,7 +7,7 @@ BACKGROUND_PID=""
 
 usage() {
   cat <<'EOF'
-usage: scripts/ci.sh [all|rust|charts|semgrep|trivy|haproxy|kind|fleet]
+usage: scripts/ci.sh [all|rust|coverage|charts|semgrep|trivy|haproxy|kind|fleet]
 
 With no argument, run every CI check supported by this host. The named suites
 exist so GitHub Actions can call this same implementation while retaining
@@ -16,7 +16,7 @@ EOF
 }
 
 case "$SUITE" in
-  all|rust|charts|semgrep|trivy|haproxy|kind|fleet) ;;
+  all|rust|coverage|charts|semgrep|trivy|haproxy|kind|fleet) ;;
   --help|-h)
     usage
     exit 0
@@ -54,6 +54,18 @@ preflight() {
     rust)
       require_commands cargo cmake diff go mktemp uname
       ;;
+    coverage)
+      require_commands cargo cmake go
+      local coverage_toolchain=${RUST_COVERAGE_TOOLCHAIN:-nightly}
+      cargo +"$coverage_toolchain" --version >/dev/null 2>&1 || {
+        echo "FAIL: the coverage suite requires Rust toolchain $coverage_toolchain" >&2
+        exit 2
+      }
+      cargo +"$coverage_toolchain" llvm-cov --version >/dev/null 2>&1 || {
+        echo "FAIL: the coverage suite requires cargo-llvm-cov" >&2
+        exit 2
+      }
+      ;;
     charts)
       require_commands grep helm kubeconform mktemp python3
       python3 -c 'import yaml' >/dev/null 2>&1 || {
@@ -77,6 +89,7 @@ preflight() {
       ;;
     all)
       preflight rust
+      preflight coverage
       preflight charts
       preflight semgrep
       preflight trivy
@@ -84,6 +97,39 @@ preflight() {
       preflight kind
       ;;
   esac
+}
+
+run_coverage() {
+  local coverage_toolchain=${RUST_COVERAGE_TOOLCHAIN:-nightly}
+  local -a excluded=(
+    e2e
+    updatec-e2e
+    killfuzz
+    demo-lifecycle
+    sampleapp
+    server
+    windows-service
+  )
+  local -a report_scope=()
+  local package
+  for package in "${excluded[@]}"; do
+    report_scope+=(--exclude-from-report "$package")
+  done
+  section "Shipped Rust code coverage (test and harness code excluded)"
+  # This function is the one report scope: it still RUNS every workspace test, while excluding test
+  # harnesses, demos, fixture servers, and platform wrappers from the report. Inline
+  # `cfg(test)` modules carry nightly's `coverage(off)`, so test bodies cannot inflate either the
+  # numerator or denominator. This initial floor is deliberately below the measured baseline; it
+  # makes coverage regression a build failure without encouraging low-value tests for a round
+  # number. Raise it when production-path tests improve the baseline.
+  #
+  # A source edit can leave an older instrumented object beside its replacement. llvm-cov unions
+  # both source maps if they survive into a later report, duplicating that file's denominator. The
+  # explicit clean is therefore part of correctness, not build hygiene.
+  cargo +"$coverage_toolchain" llvm-cov clean --workspace
+  cargo +"$coverage_toolchain" llvm-cov --workspace \
+    "${report_scope[@]}" \
+    --all-features --all-targets --fail-under-lines 70
 }
 
 section() {
@@ -855,6 +901,7 @@ trap 'exit 143' TERM
 
 case "$SUITE" in
   rust) run_rust ;;
+  coverage) run_coverage ;;
   charts) run_charts ;;
   semgrep) run_semgrep ;;
   trivy) run_trivy ;;
@@ -865,6 +912,7 @@ case "$SUITE" in
     run_semgrep
     run_trivy
     run_rust
+    run_coverage
     run_charts
     run_haproxy
     run_kind

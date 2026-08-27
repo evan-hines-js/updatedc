@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! The node agent: a package runner. It pulls signed TUF bundles, activates them through a
 //! durable transaction, and invokes the release's own reconciler hooks — `apply`, `healthcheck`,
 //! `rollback`, `inspect`. It never launches, signals, or holds a PID of any workload. The agent
@@ -36,6 +38,7 @@ mod self_update;
 mod store;
 mod telemetry;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod test_support;
 mod transient;
 mod update;
@@ -1355,6 +1358,7 @@ pub(crate) fn error(msg: &str) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::store::MemoryBackend;

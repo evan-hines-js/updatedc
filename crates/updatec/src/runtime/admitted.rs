@@ -14,14 +14,31 @@ pub(crate) fn admitted_configmap_name(repository_name: &str) -> String {
     bounded_child_name("updatec-admitted-", repository_name, MAX_BASE_BYTES)
 }
 
-pub(crate) fn admitted_state_shard_limit(configured: u8) -> Result<usize, StorageError> {
-    let configured = usize::from(configured);
-    if !(1..=MAX_ADMITTED_STATE_SHARDS).contains(&configured) {
-        return Err(StorageError(format!(
-            "stateMaxShards must be between 1 and {MAX_ADMITTED_STATE_SHARDS}"
-        )));
+/// A repository's validated durable-state width.
+///
+/// The CRD carries a `u8`, storage indexes carry a `u8`, and collection APIs need a `usize`.
+/// Keeping both conversions behind this type means code that writes an index cannot accidentally
+/// consume an unvalidated integer or re-state the absolute bound with a fallible conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdmittedShardLimit(u8);
+
+impl AdmittedShardLimit {
+    pub(crate) fn new(configured: u8) -> Result<Self, StorageError> {
+        if !(1..=MAX_ADMITTED_STATE_SHARDS).contains(&usize::from(configured)) {
+            return Err(StorageError(format!(
+                "stateMaxShards must be between 1 and {MAX_ADMITTED_STATE_SHARDS}"
+            )));
+        }
+        Ok(Self(configured))
     }
-    Ok(configured)
+
+    pub(crate) fn stored(self) -> u8 {
+        self.0
+    }
+
+    pub(crate) fn count(self) -> usize {
+        usize::from(self.0)
+    }
 }
 
 pub(crate) fn admitted_state_shard_name(
@@ -170,28 +187,28 @@ pub(crate) struct StoredDurableRolloutState {
 pub(crate) struct PreparedAdmittedState {
     pub(crate) encoded: Vec<u8>,
     pub(crate) revision_sha256: String,
-    pub(crate) max_shards: usize,
+    pub(crate) max_shards: AdmittedShardLimit,
 }
 
 /// Encode the durable rollout state and check it fits the shards the operator allowed.
 ///
-/// `max_shards` is always [`admitted_state_shard_limit`]'s answer — `reconcile_once` computes it
+/// `max_shards` is always [`AdmittedShardLimit::new`]'s answer — `reconcile_once` computes it
 /// once per pass and threads it here and through [`AdmittedRecord`] — so the knob is bounded in
 /// exactly one place and this function only spends it. Repeating the range check here restated the
 /// bound at a layer that cannot disagree with the first.
 pub(crate) fn prepare_admitted_state(
     state: &DurableRolloutState,
-    max_shards: usize,
+    max_shards: AdmittedShardLimit,
 ) -> Result<PreparedAdmittedState, Box<dyn std::error::Error>> {
     state.validate().map_err(StorageError)?;
     let encoded = serde_json::to_vec(&StoredDurableRolloutState::from(state))?;
-    let capacity = max_shards * ADMITTED_STATE_SHARD_MAX_BYTES;
+    let capacity = max_shards.count() * ADMITTED_STATE_SHARD_MAX_BYTES;
     if encoded.len() > capacity {
         return Err(Box::new(StorageError(format!(
             "StateCapacityExceeded: durable rollout state is {} bytes but stateMaxShards={} \
              permits exactly {} bytes; raise spec.stateMaxShards before publishing this fleet",
             encoded.len(),
-            max_shards,
+            max_shards.count(),
             capacity
         ))));
     }
@@ -400,7 +417,7 @@ pub(crate) struct AdmittedRecord<'a> {
     pub(crate) name: &'a str,
     pub(crate) namespace: &'a str,
     pub(crate) owner: Option<OwnerReference>,
-    pub(crate) max_shards: usize,
+    pub(crate) max_shards: AdmittedShardLimit,
 }
 
 /// Record the state a generation published but never got to store in-cluster.
@@ -551,7 +568,7 @@ impl DurableRolloutState {
     /// Validate the one durable rollout-state contract on both sides of persistence.
     pub(crate) fn validate(&self) -> Result<(), String> {
         for (group, admitted) in &self.admitted {
-            if !updated_contracts::identity::is_dns_subdomain(group) {
+            if updated_contracts::identity::ResourceName::new(group).is_err() {
                 return Err(format!("durable admitted-state group {group:?} is invalid"));
             }
             admitted
@@ -573,8 +590,8 @@ impl DurableRolloutState {
             }
         }
         for (node, group) in &self.routing {
-            if !updated_contracts::identity::is_dns_subdomain(node)
-                || !updated_contracts::identity::is_dns_subdomain(group)
+            if updated_contracts::identity::ResourceName::new(node).is_err()
+                || updated_contracts::identity::ResourceName::new(group).is_err()
             {
                 return Err(format!(
                     "durable route {node:?} -> {group:?} has an invalid identity"
@@ -582,7 +599,7 @@ impl DurableRolloutState {
             }
         }
         for (node, identity) in &self.assignments {
-            if !updated_contracts::identity::is_dns_subdomain(node)
+            if updated_contracts::identity::ResourceName::new(node).is_err()
                 || !updated_contracts::is_canonical_sha256(identity)
             {
                 return Err(format!(
@@ -622,7 +639,7 @@ pub(crate) fn decode_assignments(
             ));
         }
         for node in nodes {
-            if !updated_contracts::identity::is_dns_subdomain(&node) {
+            if updated_contracts::identity::ResourceName::new(&node).is_err() {
                 return Err(format!("stored assignment node {node:?} is invalid"));
             }
             if assignments.insert(node.clone(), identity.clone()).is_some() {
@@ -659,18 +676,17 @@ pub(crate) async fn store_admitted_state(
         .active
         .map(AdmittedStateSlot::other)
         .unwrap_or(AdmittedStateSlot::A);
+    let shard_count = max_shards.count();
     let target_previous = usize::from(old_index.shards(target));
-    if target_previous > max_shards {
-        delete_admitted_state_shards(configmaps, name, target, max_shards, target_previous).await?;
+    if target_previous > shard_count {
+        delete_admitted_state_shards(configmaps, name, target, shard_count, target_previous)
+            .await?;
     }
 
     // Record the allocation before writing it. If the process dies mid-slot, the next load knows
     // the exact inactive range to reclaim; unindexed partial shards can therefore never leak.
     let mut allocating = old_index.clone();
-    allocating.set_shards(
-        target,
-        u8::try_from(max_shards).expect("the absolute shard bound fits u8"),
-    );
+    allocating.set_shards(target, max_shards.stored());
     let mut version = write_admitted_state_index(
         configmaps,
         name,
@@ -687,14 +703,14 @@ pub(crate) async fn store_admitted_state(
         namespace,
         owner: owner.clone(),
     };
-    for shard_index in 0..max_shards {
-        let start = encoded.len() * shard_index / max_shards;
-        let end = encoded.len() * (shard_index + 1) / max_shards;
+    for shard_index in 0..shard_count {
+        let start = encoded.len() * shard_index / shard_count;
+        let end = encoded.len() * (shard_index + 1) / shard_count;
         projection
             .write_shard(
                 target,
                 shard_index,
-                max_shards,
+                shard_count,
                 &revision,
                 &encoded[start..end],
             )
@@ -704,7 +720,7 @@ pub(crate) async fn store_admitted_state(
     let old_active = version.index.active;
     version.index.active = Some(target);
     version.index.revision_sha256 = Some(revision);
-    version.index.max_shards = u8::try_from(max_shards).expect("the absolute shard bound fits u8");
+    version.index.max_shards = max_shards.stored();
     version = write_admitted_state_index(
         configmaps,
         name,

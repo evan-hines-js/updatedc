@@ -28,6 +28,31 @@ impl std::fmt::Display for EndpointError {
 
 impl std::error::Error for EndpointError {}
 
+/// An operator-configured HTTP(S) endpoint admitted by the shared authority gate.
+///
+/// The inner URL stays private so configuration and network clients cannot accidentally regain an
+/// unchecked string after validation. Consumers may borrow it for requests or deliberately consume
+/// the wrapper when adapting into a client library's URL type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkEndpoint(url::Url);
+
+impl NetworkEndpoint {
+    /// Consume the validated capability at the network-client adapter boundary.
+    pub fn into_url(self) -> url::Url {
+        self.0
+    }
+}
+
+/// An HTTPS root authority from which absolute capability URLs may be minted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpsOrigin(url::Url);
+
+impl HttpsOrigin {
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum QueryPolicy {
     Forbidden,
@@ -40,7 +65,8 @@ pub(crate) enum QueryPolicy {
 pub fn network_endpoint(
     value: &str,
     transport: EndpointTransport,
-) -> Result<url::Url, EndpointError> {
+) -> Result<NetworkEndpoint, EndpointError> {
+    #[allow(clippy::disallowed_methods)] // This function is the configured-endpoint authority.
     let parsed = url::Url::parse(value).map_err(|_| EndpointError)?;
     let scheme_allowed = match transport {
         EndpointTransport::HttpsOnly => parsed.scheme() == "https",
@@ -52,19 +78,23 @@ pub fn network_endpoint(
     {
         return Err(EndpointError);
     }
-    Ok(parsed)
+    Ok(NetworkEndpoint(parsed))
 }
 
 /// Parse an HTTPS origin: the root authority from which absolute capability URLs are minted.
-pub fn https_origin(value: &str) -> Result<url::Url, EndpointError> {
-    let parsed = network_endpoint(value, EndpointTransport::HttpsOnly)?;
+pub fn https_origin(value: &str) -> Result<HttpsOrigin, EndpointError> {
+    let parsed = network_endpoint(value, EndpointTransport::HttpsOnly)?.into_url();
     if parsed.cannot_be_a_base() || parsed.path() != "/" {
         return Err(EndpointError);
     }
-    Ok(parsed)
+    Ok(HttpsOrigin(parsed))
 }
 
-pub(crate) fn https_url(value: &str, query: QueryPolicy) -> Result<url::Url, EndpointError> {
+pub(crate) fn validate_https_url(
+    value: &str,
+    query: QueryPolicy,
+) -> Result<NetworkEndpoint, EndpointError> {
+    #[allow(clippy::disallowed_methods)] // This function is the capability-URL authority.
     let parsed = url::Url::parse(value).map_err(|_| EndpointError)?;
     if parsed.scheme() != "https"
         || parsed.host_str().is_none()
@@ -72,7 +102,7 @@ pub(crate) fn https_url(value: &str, query: QueryPolicy) -> Result<url::Url, End
     {
         return Err(EndpointError);
     }
-    Ok(parsed)
+    Ok(NetworkEndpoint(parsed))
 }
 
 pub(crate) fn has_unambiguous_shape(url: &url::Url, query: QueryPolicy) -> bool {
@@ -87,6 +117,7 @@ pub(crate) fn has_unambiguous_shape(url: &url::Url, query: QueryPolicy) -> bool 
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

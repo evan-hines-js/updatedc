@@ -36,6 +36,7 @@ pub fn network_endpoint(
     what: &str,
 ) -> io::Result<reqwest::Url> {
     updated_contracts::endpoint::network_endpoint(value, transport)
+        .map(updated_contracts::endpoint::NetworkEndpoint::into_url)
         .map_err(|_| invalid_endpoint(what, transport))
 }
 
@@ -86,7 +87,9 @@ pub fn redirect_capability(response: &reqwest::Response, what: &str) -> io::Resu
         .get(reqwest::header::LOCATION)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| io::Error::other(format!("{what} omitted its capability location")))?;
-    updated_contracts::dataflow::capability_url(location).map_err(io::Error::other)
+    updated_contracts::dataflow::capability_url(location)
+        .map(updated_contracts::endpoint::NetworkEndpoint::into_url)
+        .map_err(io::Error::other)
 }
 
 /// Classify a reqwest failure without formatting its URL. Capability URLs are bearer secrets and
@@ -180,6 +183,7 @@ fn too_large(what: &str) -> io::Error {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Shared e2e harness library. `harness` holds the low-level process / TUF / HTTP primitives
 //! (Ctx, Proc, Service, publish, serve, waits); `fixtures` holds the `Node` launcher+agent config
 //! builder and version-path helpers; `fixture` is the signed node reconciler every scenario runs —

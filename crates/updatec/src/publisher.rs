@@ -58,6 +58,7 @@ pub async fn publication_plan(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::path::PathBuf;

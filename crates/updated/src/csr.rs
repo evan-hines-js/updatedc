@@ -53,6 +53,7 @@ pub fn key_pem_to_pkcs8_der(key_pem: &str) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

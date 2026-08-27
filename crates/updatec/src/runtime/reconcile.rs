@@ -290,6 +290,245 @@ pub struct ReconcileRequest<'a> {
     pub agents: Vec<Arc<UpdateAgent>>,
 }
 
+/// The one cutoff policy for private objects superseded by a published generation.
+///
+/// Both input snapshots and enrollment objects are bearer-capability targets. They must therefore
+/// use the same shared grace from the wire contract; accepting a duration at either call site would
+/// reopen the possibility that one object kind is retired while a capability remains spendable.
+fn private_object_retirement_cutoff(
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, StorageError> {
+    let grace =
+        chrono::Duration::from_std(updated_contracts::dataflow::PRIVATE_OBJECT_RETIREMENT_GRACE)
+            .map_err(|_| {
+                StorageError("private-object retirement grace is not representable".into())
+            })?;
+    now.checked_sub_signed(grace)
+        .ok_or_else(|| StorageError("private-object retirement cutoff is not representable".into()))
+}
+
+/// The irreversible half of a planned generation.
+///
+/// Construction requires every preflighted input, and `commit` consumes the value. This is the one
+/// path from a pure plan to a projection-ready generation: private inputs exist before signed
+/// metadata can name them, the publisher lease is rechecked immediately before the external write,
+/// and durable rollout state is recorded only after that write is known to have landed.
+struct PublicationTransaction<'a> {
+    client: &'a Client,
+    namespace: &'a str,
+    identity: &'a str,
+    state_dir: &'a Path,
+    repository: &'a UpdateRepository,
+    destination: &'a S3Destination,
+    store: &'a Arc<dyn ObjectStore>,
+    secrets: &'a Api<Secret>,
+    configmaps: &'a Api<ConfigMap>,
+    admitted_name: &'a str,
+    admitted_version: Option<AdmittedStateVersion>,
+    dataflow: &'a crate::dataflow::RepositoryDataflow,
+    dataflow_key: &'a [u8; 32],
+    plan: &'a crate::PublicationPlan,
+    input_snapshots: &'a BTreeMap<String, updated_contracts::dataflow::FileSnapshot>,
+    planned: &'a DurableRolloutState,
+    prepared_state: Option<PreparedAdmittedState>,
+    desired_digest: &'a str,
+    reconcile_now: chrono::DateTime<chrono::Utc>,
+}
+
+/// Proof that publication and its durable rollout-state record completed, carrying the only values
+/// the projection phase may learn from that transaction.
+struct PublishedGeneration {
+    repo_dir: std::path::PathBuf,
+    root_renewal_failure: Option<String>,
+}
+
+impl PublicationTransaction<'_> {
+    async fn commit(self) -> Result<PublishedGeneration, Box<dyn std::error::Error>> {
+        let Self {
+            client,
+            namespace,
+            identity,
+            state_dir,
+            repository,
+            destination,
+            store,
+            secrets,
+            configmaps,
+            admitted_name,
+            admitted_version,
+            dataflow,
+            dataflow_key,
+            plan,
+            input_snapshots,
+            planned,
+            prepared_state,
+            desired_digest,
+            reconcile_now,
+        } = self;
+
+        // Every assignment's complete keyed-blinded input publication must exist in private S3
+        // before the TUF generation can commit to its exact bytes. Construction happens only after
+        // deterministic publication and durable-state preflights, so a generation that cannot
+        // possibly commit never uploads sensitive input objects no generation can reference.
+        crate::input_data::publish(
+            dataflow,
+            plan,
+            &repository.spec.assignment_prefix,
+            input_snapshots,
+            dataflow_key,
+        )
+        .await?;
+
+        let published_marker = state_dir.join(PUBLISHED_GENERATION_FILE);
+        let local_marker = publication_marker(state_dir, desired_digest).await?;
+        let recorded_marker = match read_publication_marker(&published_marker).await {
+            Ok(marker) => marker,
+            Err(error) => {
+                // This file is only a republication optimization, never generation authority. A bad
+                // copy safely means "publish again" after the rollback guard verifies the store.
+                tracing::warn!(%error, "the local publication marker is unusable; forcing republication");
+                None
+            }
+        };
+        let content_unchanged = local_marker.is_some() && local_marker == recorded_marker;
+        let repo_dir = state_dir.join("repository");
+        // Re-signing well before expiry is the standard TUF discipline (timestamp exists to prove
+        // freshness), and it is ONE mechanism: the same check renews the root, which
+        // `replace_release` never touches.
+        let mut renewals = expiring_metadata(&repo_dir, reconcile_now).await;
+        let initialized =
+            foundation::file::path_entry_exists(&repo_dir.join("metadata/root.json"))?;
+        // Root renewal happens before the pass commits to signing a generation. A renewal that
+        // cannot be performed drops out of `renewals` and must not itself cause a generation sign.
+        let mut root_renewal_failure = None;
+        if publication_required(content_unchanged, &renewals) {
+            refuse_generation_rollback(store.as_ref(), destination, &repo_dir).await?;
+            let signing = secrets
+                .get(&repository.spec.signing_secret_ref.name)
+                .await?;
+            let keys_dir = state_dir.join("keys");
+            materialize_signing_keys(&signing, &keys_dir).await?;
+            if !initialized {
+                let keys = updated_tuf::repo::Keys::in_dir(&keys_dir)?;
+                updated_tuf::repo::init(&repo_dir, &keys, METADATA_EXPIRY_DAYS).await?;
+            } else {
+                root_renewal_failure = renew_expiring_root(
+                    &repo_dir,
+                    &keys_dir,
+                    &repository.name_any(),
+                    &mut renewals,
+                )
+                .await;
+            }
+            if publication_required(content_unchanged, &renewals) {
+                crate::publisher::sign_plan(&repo_dir, &keys_dir, plan, METADATA_EXPIRY_DAYS)
+                    .await?;
+
+                // Signing can starve lease renewal. Recheck immediately before the irreversible
+                // external write; object-version CAS fences the remaining network gap.
+                if !holds_lease(client, namespace, "updatec-publisher", identity).await? {
+                    return Err(Box::new(StorageError(
+                        "publisher lease lost during reconcile; skipping publish to avoid a split-brain write"
+                            .into(),
+                    )));
+                }
+
+                let marker = publication_marker(state_dir, desired_digest)
+                    .await?
+                    .ok_or_else(|| {
+                        StorageError(
+                            "signed repository has no root/timestamp generation after signing"
+                                .into(),
+                        )
+                    })?;
+                // Journal before upload. If the process dies after the upload but before the state
+                // CAS, recovery adopts exactly the state the store-served generation implies.
+                let pending_bytes = serde_json::to_vec(&PendingPublication {
+                    marker: marker.clone(),
+                    version: updated_tuf::repo::current_version(&repo_dir).await?,
+                    state: StoredDurableRolloutState::from(planned),
+                })?;
+                if pending_bytes.len() > PENDING_STATE_MAX_BYTES {
+                    return Err(Box::new(StorageError(format!(
+                        "pending publication state is {} bytes, over the {} byte durable-state limit",
+                        pending_bytes.len(),
+                        PENDING_STATE_MAX_BYTES
+                    ))));
+                }
+                foundation::durable::atomic_write(
+                    &state_dir.join(PENDING_STATE_FILE),
+                    ".pending-",
+                    &pending_bytes,
+                )?;
+
+                publish_repository(store.as_ref(), destination, &repo_dir).await?;
+                foundation::durable::atomic_write(
+                    &published_marker,
+                    ".published-",
+                    &marker.to_bounded_json()?,
+                )?;
+            }
+        }
+
+        // Immutable input objects may contain credentials. The generation is now live (or was
+        // already live), so retire only objects it no longer names and only after the shared
+        // capability grace. Cleanup remains best-effort; it cannot roll back a committed publish.
+        if let Err(error) = dataflow
+            .sweep_inputs_before(
+                plan.node_assignments.values().cloned(),
+                private_object_retirement_cutoff(chrono::Utc::now())?,
+            )
+            .await
+        {
+            tracing::warn!(%error, "retiring obsolete private input snapshots failed");
+        }
+
+        // Durable state is a claim about what was published, so this CAS is necessarily after the
+        // object-store commit. The journal above covers cancellation in this final gap.
+        if let Some(prepared_state) = prepared_state {
+            let _ = store_admitted_state(
+                configmaps,
+                admitted_name,
+                namespace,
+                prepared_state,
+                admitted_version,
+                repository.controller_owner_ref(&()),
+            )
+            .await?;
+        }
+        remove_pending_publication_journal(&state_dir.join(PENDING_STATE_FILE)).await?;
+
+        Ok(PublishedGeneration {
+            repo_dir,
+            root_renewal_failure,
+        })
+    }
+}
+
+/// Quarantine one invalid group and preserve every safety fact the rest of this pass needs.
+///
+/// A quarantined group always has two coupled effects: its status records the refusal, and its
+/// agents remain associated with it (and with its last admitted deployment, when one exists).
+/// Keeping those effects in one operation prevents a new validation branch from accidentally
+/// routing the group's agents through the ungated default deployment.
+async fn quarantine_invalid_group(
+    groups_api: &Api<UpdateGroup>,
+    group: &UpdateGroup,
+    reason: &str,
+    message: &str,
+    durable: &DurableRolloutState,
+    quarantined: &mut BTreeMap<String, BTreeMap<String, String>>,
+    held: &mut BTreeMap<String, crate::rollout::AdmittedDeployment>,
+) -> Result<(), kube::Error> {
+    quarantine_group(groups_api, group, reason, message).await?;
+    let name = group.name_any();
+    if let Some(state) = durable.admitted.get(&name) {
+        held.insert(name.clone(), state.clone());
+    }
+    quarantined.insert(name, group.spec.selector.match_labels.clone());
+    Ok(())
+}
+
 pub async fn reconcile_once(
     request: ReconcileRequest<'_>,
     hooks: &mut ReconcileHooks,
@@ -388,7 +627,7 @@ pub async fn reconcile_once(
     // compare-and-swap as a second guard. It is loaded here, before groups are validated, because
     // quarantining a group needs the deployment that group is still pinned to.
     let admitted_name = admitted_configmap_name(repository_name);
-    let state_max_shards = admitted_state_shard_limit(repository.spec.state_max_shards)?;
+    let state_max_shards = AdmittedShardLimit::new(repository.spec.state_max_shards)?;
     let (durable, admitted_version) = load_admitted_state(&configmaps, &admitted_name).await?;
     // A generation this replica published but never recorded is adopted before anything is planned
     // from the loaded state — planning on a baseline that predates the live generation is what
@@ -436,52 +675,65 @@ pub async fn reconcile_once(
     // Only a group that has been admitted at least once has a pin, so this is a SUBSET of
     // `quarantined_groups`; membership — which agents are a quarantined group's agents — is
     // answered from `quarantined_groups` above, which covers the never-admitted ones too.
-    let hold_group =
-        |name: &str, held: &mut BTreeMap<String, crate::rollout::AdmittedDeployment>| {
-            if let Some(state) = durable.admitted.get(name) {
-                held.insert(name.to_string(), state.clone());
-            }
-        };
     for group in group_resources.iter() {
         let name = group.name_any();
         if name == crate::DEFAULT_GROUP {
-            quarantine_group(
+            quarantine_invalid_group(
                 &groups_api,
                 group,
                 "ReservedName",
                 "`default` is reserved for agents that match no group; rename this UpdateGroup.",
+                &durable,
+                &mut quarantined_groups,
+                &mut held_groups,
             )
             .await?;
-            hold_group(&name, &mut held_groups);
-            quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
             continue;
         }
         if group.spec.selector.match_labels.is_empty() {
-            quarantine_group(
+            quarantine_invalid_group(
                 &groups_api,
                 group,
                 "EmptySelector",
                 "This group's selector has no matchLabels; an empty selector would match every agent and is refused.",
+                &durable,
+                &mut quarantined_groups,
+                &mut held_groups,
             )
             .await?;
-            hold_group(&name, &mut held_groups);
-            quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
             continue;
         }
         let deployment = match group.spec.deployment.clone().try_into() {
             Ok(deployment) => deployment,
             Err(error) => {
-                quarantine_group(
+                quarantine_invalid_group(
                     &groups_api,
                     group,
                     "InvalidDeployment",
                     &format!("This group's deployment is invalid: {error}"),
+                    &durable,
+                    &mut quarantined_groups,
+                    &mut held_groups,
                 )
                 .await?;
-                hold_group(&name, &mut held_groups);
-                quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
                 continue;
             }
+        };
+        let max_unavailable = match group.spec.max_unavailable {
+            Some(0) => {
+                quarantine_invalid_group(
+                    &groups_api,
+                    group,
+                    "InvalidMaxUnavailable",
+                    "maxUnavailable must be at least one",
+                    &durable,
+                    &mut quarantined_groups,
+                    &mut held_groups,
+                )
+                .await?;
+                continue;
+            }
+            value => value.unwrap_or(1),
         };
         groups.insert(
             name.clone(),
@@ -492,21 +744,7 @@ pub async fn reconcile_once(
                 inputs: group.spec.inputs.clone(),
                 input_snapshot: None,
                 deployment,
-                max_unavailable: match group.spec.max_unavailable {
-                    Some(0) => {
-                        quarantine_group(
-                            &groups_api,
-                            group,
-                            "InvalidMaxUnavailable",
-                            "maxUnavailable must be at least one",
-                        )
-                        .await?;
-                        hold_group(&name, &mut held_groups);
-                        quarantined_groups.insert(name, group.spec.selector.match_labels.clone());
-                        continue;
-                    }
-                    value => value.unwrap_or(1),
-                },
+                max_unavailable,
                 emergency_correction: group.spec.emergency_correction,
             },
         );
@@ -524,9 +762,16 @@ pub async fn reconcile_once(
         else {
             continue;
         };
-        quarantine_group(&groups_api, group, "InvalidDependencies", &message).await?;
-        hold_group(&name, &mut held_groups);
-        quarantined_groups.insert(name.clone(), group.spec.selector.match_labels.clone());
+        quarantine_invalid_group(
+            &groups_api,
+            group,
+            "InvalidDependencies",
+            &message,
+            &durable,
+            &mut quarantined_groups,
+            &mut held_groups,
+        )
+        .await?;
         groups.remove(&name);
         group_labels.remove(&name);
     }
@@ -544,29 +789,25 @@ pub async fn reconcile_once(
     for agent in &agent_resources {
         let node = agent.name_any();
         let identity = &agent.spec.identity;
-        if !identity.is_well_formed_for(&node) {
-            quarantine_agent(
-                &nodes_api,
-                agent,
+        let invalid = if !identity.is_well_formed_for(&node) {
+            Some((
                 "InvalidIdentity",
                 "This agent's identity is malformed (its registration digest or pinned key does \
                  not match its kind).",
-            )
-            .await?;
-            quarantined_agents.insert(node);
-            continue;
-        }
-        // Apply the shared identity grammar before a node enters assignment, raw-report, or backend
-        // projections. Every one of those structures keys by this exact name.
-        if !updated_contracts::identity::is_dns_subdomain(&node) {
-            quarantine_agent(
-                &nodes_api,
-                agent,
+            ))
+        } else if updated_contracts::identity::ResourceName::new(&node).is_err() {
+            // Apply the shared identity grammar before a node enters assignment, raw-report, or
+            // backend projections. Every one of those structures keys by this exact name.
+            Some((
                 "InvalidName",
                 "This agent's name is not a lowercase Kubernetes DNS subdomain, so it cannot be \
                  used consistently as a node identity. Recreate it with a valid name.",
-            )
-            .await?;
+            ))
+        } else {
+            None
+        };
+        if let Some((reason, message)) = invalid {
+            quarantine_agent(&nodes_api, agent, reason, message).await?;
             quarantined_agents.insert(node);
         }
     }
@@ -643,7 +884,9 @@ pub async fn reconcile_once(
     if should_sweep {
         let retention =
             chrono::Duration::from_std(updated_contracts::telemetry::FLEET_GENERATION_RETENTION)
-                .expect("the fleet generation retention is representable");
+                .map_err(|_| {
+                    StorageError("fleet-generation retention is not representable".into())
+                })?;
         let cutoff = chrono::Utc::now() - retention;
         if let Err(error) = crate::dataflow::sweep_report_projections_before(
             store.as_ref(),
@@ -788,25 +1031,15 @@ pub async fn reconcile_once(
         node_counts,
         halted_groups,
     } = outcome;
-    // Every assignment's complete keyed-blinded input publication must exist in private S3 before
-    // the TUF generation can commit to its exact bytes.
-    crate::input_data::publish(
-        &dataflow,
-        &plan,
-        &repository.spec.assignment_prefix,
-        &input_snapshots,
-        &dataflow_key,
-    )
-    .await?;
     let planned = DurableRolloutState {
         admitted: planned_admitted,
         vetoed: planned_vetoed,
         routing: planned_routing,
         assignments: planned_assignments,
     };
-    let state_needs_rebalance = admitted_version.as_ref().is_none_or(|version| {
-        version.index.max_shards != u8::try_from(state_max_shards).expect("bounded shard count")
-    });
+    let state_needs_rebalance = admitted_version
+        .as_ref()
+        .is_none_or(|version| version.index.max_shards != state_max_shards.stored());
     // Preflight the exact bytes before signing or uploading anything. Discovering an undersized
     // stateMaxShards after the object store advanced would leave the live generation ahead of its
     // rollout baseline until the knob was repaired.
@@ -815,148 +1048,32 @@ pub async fn reconcile_once(
         .transpose()?;
 
     let desired_digest = desired_publication_digest(&repository.spec, &plan.digest)?;
-    let published_marker = state_dir.join(PUBLISHED_GENERATION_FILE);
-    let local_marker = publication_marker(state_dir, &desired_digest).await?;
-    let recorded_marker = match read_publication_marker(&published_marker).await {
-        Ok(marker) => marker,
-        Err(error) => {
-            // This file is only a republication optimization, never generation authority. A bad
-            // copy safely means "publish again" after the rollback guard verifies the store.
-            tracing::warn!(%error, "the local publication marker is unusable; forcing republication");
-            None
-        }
-    };
-    let content_unchanged = local_marker.is_some() && local_marker == recorded_marker;
-    let repo_dir = state_dir.join("repository");
-    // Re-signing well before expiry is the standard TUF discipline (timestamp exists to prove
-    // freshness), and it is ONE mechanism: the same check renews the root, which `replace_release`
-    // never touches.
-    let mut renewals = expiring_metadata(&repo_dir, reconcile_now).await;
-    let initialized = foundation::file::path_entry_exists(&repo_dir.join("metadata/root.json"))?;
-    // The root renewal is attempted BEFORE this pass commits to signing a generation, because a
-    // renewal that cannot be performed drops back out of `renewals` (see `renew_expiring_root`) and
-    // must then not be the reason a generation was signed at all.
-    let mut root_renewal_failure = None;
-    if publication_required(content_unchanged, &renewals) {
-        refuse_generation_rollback(store.as_ref(), &destination, &repo_dir).await?;
-        let signing = secrets
-            .get(&repository.spec.signing_secret_ref.name)
-            .await?;
-        let keys_dir = state_dir.join("keys");
-        materialize_signing_keys(&signing, &keys_dir).await?;
-        if !initialized {
-            let keys = updated_tuf::repo::Keys::in_dir(&keys_dir)?;
-            updated_tuf::repo::init(&repo_dir, &keys, METADATA_EXPIRY_DAYS).await?;
-        } else {
-            root_renewal_failure =
-                renew_expiring_root(&repo_dir, &keys_dir, &repository.name_any(), &mut renewals)
-                    .await;
-        }
-        if publication_required(content_unchanged, &renewals) {
-            crate::publisher::sign_plan(&repo_dir, &keys_dir, &plan, METADATA_EXPIRY_DAYS).await?;
-
-            // Re-verify leadership right before the irreversible S3 publish. The CPU-bound signing
-            // above can starve the main loop's 5s lease renewal past the 15s deadline. The final
-            // timestamp is additionally fenced by an object-version compare-and-swap, so this check
-            // avoids wasted uploads while the storage fence closes the unavoidable network gap.
-            if !holds_lease(&client, namespace, "updatec-publisher", identity).await? {
-                return Err(Box::new(StorageError(
-                    "publisher lease lost during reconcile; skipping publish to avoid a split-brain \
-                     write"
-                        .into(),
-                )));
-            }
-
-            // The marker this upload commits to, computed from the metadata as it stands NOW —
-            // after the root renewal and the online re-sign above — so it always describes the
-            // generation the store will serve, and is written only once that upload lands.
-            let marker = publication_marker(state_dir, &desired_digest)
-                .await?
-                .ok_or_else(|| {
-                    StorageError(
-                        "signed repository has no root/timestamp generation after signing".into(),
-                    )
-                })?;
-            // Journalled BEFORE the upload and keyed to that marker, so the state this generation
-            // implies survives losing the in-cluster write below (see `recover_pending_publication`)
-            // without a failed upload ever being mistaken for a published one.
-            let pending_bytes = serde_json::to_vec(&PendingPublication {
-                marker: marker.clone(),
-                // What the store will serve if this upload lands — the second, independent way
-                // the next pass can tell that it did.
-                version: updated_tuf::repo::current_version(&repo_dir).await?,
-                state: StoredDurableRolloutState::from(&planned),
-            })?;
-            if pending_bytes.len() > PENDING_STATE_MAX_BYTES {
-                return Err(Box::new(StorageError(format!(
-                    "pending publication state is {} bytes, over the {} byte durable-state limit",
-                    pending_bytes.len(),
-                    PENDING_STATE_MAX_BYTES
-                ))));
-            }
-            foundation::durable::atomic_write(
-                &state_dir.join(PENDING_STATE_FILE),
-                ".pending-",
-                &pending_bytes,
-            )?;
-
-            publish_repository(store.as_ref(), &destination, &repo_dir).await?;
-            foundation::durable::atomic_write(
-                &published_marker,
-                ".published-",
-                &marker.to_bounded_json()?,
-            )?;
-        }
+    let PublishedGeneration {
+        repo_dir,
+        root_renewal_failure,
+    } = PublicationTransaction {
+        client: &client,
+        namespace,
+        identity,
+        state_dir,
+        repository: &repository,
+        destination: &destination,
+        store: &store,
+        secrets: &secrets,
+        configmaps: &configmaps,
+        admitted_name: &admitted_name,
+        admitted_version,
+        dataflow: &dataflow,
+        dataflow_key: &dataflow_key,
+        plan: &plan,
+        input_snapshots: &input_snapshots,
+        planned: &planned,
+        prepared_state,
+        desired_digest: &desired_digest,
+        reconcile_now,
     }
-
-    // Input objects contain the actual application configuration, including credentials. They are
-    // immutable so a signed assignment can never change underneath a node, but immutability must
-    // not mean indefinite secret retention. At this point either the desired generation was
-    // already live or its publish and local commit marker both succeeded, so only assignments in
-    // `plan` remain current. Keep abandoned objects through two full capability lifetimes to cover
-    // a GET minted immediately before the generation changed, then retire them best-effort; a
-    // cleanup outage must not turn a successfully published generation into a failed transaction.
-    let input_retirement_grace = chrono::Duration::seconds(
-        i64::try_from(updated_contracts::dataflow::OBJECT_CAPABILITY_TTL.as_secs())
-            .expect("the fixed capability lifetime fits i64")
-            * 2,
-    );
-    if let Err(error) = dataflow
-        .sweep_inputs_before(
-            plan.node_assignments.values().cloned(),
-            chrono::Utc::now() - input_retirement_grace,
-        )
-        .await
-    {
-        tracing::warn!(%error, "retiring obsolete private input snapshots failed");
-    }
-
-    // The durable state records what WAS published, so it is written only once the generation
-    // above is signed and uploaded. Every field of it is a claim about the live generation —
-    // notably `assignments`, the node → deployment identity map that is the ONLY staging signal a
-    // blind node has — and writing it first turned any failed publish (an object-store error, or
-    // the fail-closed lease and rollback guards above) into a durable record that nodes had been
-    // handed a deployment nobody ever served. A failed publish now leaves the record untouched and
-    // the next pass replans from the same baseline. The reverse gap — losing this write after a
-    // successful publish — is covered by the journal `recover_pending_publication` reads, because
-    // it is NOT self-healing on its own: the next pass would replan from a baseline that predates
-    // the live generation and could republish an advanced node on its predecessor.
-    //
-    // Reconcile runs every second; only write when the state actually changed, so a steady
-    // generation makes no apiserver writes.
-    if let Some(prepared_state) = prepared_state {
-        let _ = store_admitted_state(
-            &configmaps,
-            &admitted_name,
-            namespace,
-            prepared_state,
-            admitted_version,
-            repository.controller_owner_ref(&()),
-        )
-        .await?;
-    }
-    // The journal has served its purpose the moment the state it carries is recorded in-cluster.
-    remove_pending_publication_journal(&state_dir.join(PENDING_STATE_FILE)).await?;
+    .commit()
+    .await?;
 
     // ONE projection path for both outcomes — a reconcile that reused an unchanged generation and
     // one that just signed a new one reach this same sequence, so both expose identical enrollment,
@@ -1028,16 +1145,11 @@ pub async fn reconcile_once(
     // The status pointer is durable before retirement begins. Keep superseded bytes through two
     // capability lifetimes as well: an operator may have read the old pointer immediately before
     // this status update and be in the middle of copying it out of band.
-    let enrollment_retirement_grace = chrono::Duration::seconds(
-        i64::try_from(updated_contracts::dataflow::OBJECT_CAPABILITY_TTL.as_secs())
-            .expect("the fixed capability lifetime fits i64")
-            * 2,
-    );
     if let Err(error) = sweep_enrollment_objects(
         store.as_ref(),
         &destination.prefix,
         &enrollment_objects,
-        chrono::Utc::now() - enrollment_retirement_grace,
+        private_object_retirement_cutoff(chrono::Utc::now())?,
     )
     .await
     {
@@ -1171,6 +1283,8 @@ pub(crate) async fn local_routing_root_sha256(state_dir: &Path) -> Option<String
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::disallowed_methods)] // In-memory signer fixtures need synthetic URL values.
 pub(crate) mod wiring_tests {
     use super::*;
     use axum::body::Bytes;
@@ -1179,6 +1293,19 @@ pub(crate) mod wiring_tests {
     use std::sync::Mutex as StdMutex;
 
     const TEST_MANAGED_PREFIX: &str = "routing/default/default";
+
+    #[test]
+    fn private_object_retirement_uses_the_contracts_shared_grace() {
+        let now = chrono::Utc::now();
+        let cutoff = private_object_retirement_cutoff(now).unwrap();
+        assert_eq!(
+            now - cutoff,
+            chrono::Duration::from_std(
+                updated_contracts::dataflow::PRIVATE_OBJECT_RETIREMENT_GRACE
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn group_set_ownership_is_filtered_before_label_selection() {
@@ -1838,7 +1965,8 @@ pub(crate) mod wiring_tests {
             "1".repeat(64),
             "1".repeat(64),
             true,
-        );
+        )
+        .unwrap();
         mutate(&mut report);
         let envelope = crate::test_support::sign_report(&mut report, &NODE_KEY.0);
         let body = serde_json::to_vec(&envelope).expect("encoded report");

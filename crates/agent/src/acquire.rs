@@ -221,6 +221,7 @@ pub(crate) async fn acquire_verified_bundle(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

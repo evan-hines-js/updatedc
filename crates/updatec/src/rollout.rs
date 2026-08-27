@@ -2275,6 +2275,7 @@ fn assign_nodes(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -2419,7 +2420,8 @@ mod tests {
             DIGEST,
             desired.provider_set.sha256,
             healthy,
-        );
+        )
+        .unwrap();
         report.reported_at_ms = now.timestamp_millis() as u64;
         let envelope = sign_test_report(&mut report, &TEST_KEY.0);
         (node.into(), envelope)
@@ -2473,7 +2475,8 @@ mod tests {
             archive,
             &deployment.provider_set.sha256,
             true,
-        );
+        )
+        .unwrap();
         report.rejected = true;
         report.reported_at_ms = test_now().timestamp_millis() as u64;
         let envelope = sign_test_report(&mut report, &TEST_KEY.0);
@@ -2506,7 +2509,8 @@ mod tests {
             archive,
             &deployment.provider_set.sha256,
             healthy,
-        );
+        )
+        .unwrap();
         report.updating = updating;
         report.reported_at_ms = test_now().timestamp_millis() as u64;
         let envelope = sign_test_report(&mut report, &TEST_KEY.0);
@@ -2526,7 +2530,8 @@ mod tests {
             DIGEST,
             desired.provider_set.sha256,
             true,
-        );
+        )
+        .unwrap();
         let stale_ms = updated_contracts::telemetry::REPORT_FRESHNESS.as_millis() as u64 + 60_000;
         report.reported_at_ms = (test_now().timestamp_millis() as u64).saturating_sub(stale_ms);
         let envelope = sign_test_report(&mut report, &TEST_KEY.0);
@@ -3826,7 +3831,8 @@ mod tests {
             DIGEST,
             desired.provider_set.sha256,
             true,
-        );
+        )
+        .unwrap();
         report_a.reported_at_ms = test_now().timestamp_millis() as u64;
         // Genuinely signed, but by a key the control plane never pinned for this node — the forgery a
         // bucket writer could mount without the node's own key.
@@ -7949,7 +7955,8 @@ mod tests {
             deployment.application.sha256.clone(),
             "9".repeat(64),
             true,
-        );
+        )
+        .unwrap();
         report.reported_at_ms = test_now().timestamp_millis() as u64;
         let envelope = sign_test_report(&mut report, &TEST_KEY.0);
         let node_groups = BTreeMap::from([("n0".to_string(), "g".to_string())]);
@@ -9614,7 +9621,8 @@ mod tests {
             archive,
             &deployment.provider_set.sha256,
             false,
-        );
+        )
+        .unwrap();
         report.rejected = true;
         report.reported_at_ms = test_now().timestamp_millis() as u64;
         let envelope = sign_test_report(&mut report, &TEST_KEY.0);

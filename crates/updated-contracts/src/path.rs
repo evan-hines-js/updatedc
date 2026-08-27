@@ -82,6 +82,7 @@ pub fn is_confined_relative(path: &str) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

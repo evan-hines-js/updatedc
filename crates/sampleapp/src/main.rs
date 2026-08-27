@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Update-unaware HTTP fixture used by the updater end-to-end tests.
 
 use std::io::{Read, Write};

@@ -122,6 +122,7 @@ pub(crate) async fn run(url: &str, interval_ms: u64) -> Result<(), Box<dyn std::
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

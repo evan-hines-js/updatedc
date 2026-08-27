@@ -99,6 +99,7 @@ pub(crate) async fn wait_for_shutdown_signal() {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -17,6 +17,7 @@
 pub const CHAOS_POINT: &str = "UPDATED_CHAOS_POINT";
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! End-to-end test / demo. One cross-platform Rust binary — instead of parallel
 //! bash and PowerShell scripts that inevitably drift — that builds the release
 //! binaries, stands up a real TUF repository via the `server`, and drives real
@@ -275,6 +277,7 @@ fn ok(msg: &str) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::default_job_count;
 

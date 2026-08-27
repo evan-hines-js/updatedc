@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Development TUF publisher and explicit private-capability/public-object fixtures.
 //!
 //! - `init`    mint the five ed25519 role keys and an empty signed repository.
@@ -122,7 +124,7 @@ fn export_enrollment(args: &[String]) -> R {
     )?;
     let bundle = updated_contracts::enrollment::EnrollmentBundle {
         schema: 1,
-        agent_id,
+        agent_id: updated_contracts::identity::ResourceName::new(agent_id)?,
         routing_base_url: ensure_base_location(routing_base_url),
         assignment,
         install_root: managed.runtime.install_root,
@@ -975,6 +977,7 @@ fn flags_all(args: &[String], name: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

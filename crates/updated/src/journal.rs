@@ -77,6 +77,7 @@ pub fn clear(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;

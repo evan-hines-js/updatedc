@@ -67,6 +67,7 @@ fn entry_name(line: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

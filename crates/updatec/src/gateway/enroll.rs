@@ -22,10 +22,7 @@ pub(crate) async fn enroll(
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if !request.name_is_wellformed() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    if !is_distinct_from_bootstrap_identity(&request.name, &state.enrollment_client_cn) {
+    if !is_distinct_from_bootstrap_identity(request.name.as_str(), &state.enrollment_client_cn) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let name = request.name.as_str();

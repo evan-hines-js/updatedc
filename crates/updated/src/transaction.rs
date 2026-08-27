@@ -444,6 +444,7 @@ impl crate::journal::Journaled for Transaction {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::testing::update_transaction as tx;

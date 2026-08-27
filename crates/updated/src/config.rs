@@ -62,6 +62,7 @@ pub fn base_url_is_local(base_url: &str) -> Result<bool, String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod repository_location_tests {
     use super::base_url_is_local;
 

@@ -162,6 +162,7 @@ pub async fn serve(address: std::net::SocketAddr, metrics: Shared) -> Result<(),
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

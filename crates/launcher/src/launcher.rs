@@ -98,6 +98,7 @@ impl Backoff {
     /// A backoff with an explicit base, for tests that need to advance it without a real
     /// wall-clock sleep (a zero base yields a zero delay).
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn with_base(base: Duration) -> Self {
         Backoff {
             base,
@@ -636,6 +637,7 @@ fn sleep_interruptible(dur: Duration) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

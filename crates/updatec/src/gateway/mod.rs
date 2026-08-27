@@ -105,6 +105,7 @@ mod repository;
 mod serve;
 mod state;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests;
 
 pub(crate) use data::*;

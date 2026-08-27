@@ -65,6 +65,7 @@ impl ClientIdentity {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn test_enrollment(common_name: &str) -> Self {
         Self {
             kind: ClientIdentityKind::Enrollment {
@@ -74,6 +75,7 @@ impl ClientIdentity {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn test_node(repository: &str, node: &str, public_key: &str) -> Self {
         Self {
             kind: ClientIdentityKind::Node {
@@ -160,6 +162,7 @@ pub(crate) fn peer_identity(conn: &tokio_rustls::rustls::ServerConnection) -> Cl
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};

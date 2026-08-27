@@ -230,6 +230,10 @@ impl OutputPublisher {
         if !state.healthy {
             return None;
         }
+        let Ok(node_identity) = updated_contracts::identity::ResourceName::new(node) else {
+            crate::warn("invalid node identity; skipping output publication");
+            return None;
+        };
         let snapshot = load_outputs(state.paths, state.manifest_sha256)?;
         let same = self.current.as_ref().is_some_and(|current| {
             current.publication.node == node
@@ -242,7 +246,7 @@ impl OutputPublisher {
             self.current = Some(CachedOutput {
                 publication: OutputPublication {
                     schema: OutputPublication::SCHEMA,
-                    node: node.to_string(),
+                    node: node_identity,
                     deployment: state.deployment.to_string(),
                     assignment_sha256: state.assignment_sha256.to_string(),
                     archive_sha256: state.archive_sha256.to_string(),
@@ -357,7 +361,7 @@ pub async fn report_running_state(
             return;
         }
     };
-    let mut report = NodeReport::new(
+    let Ok(mut report) = NodeReport::new(
         node,
         state.deployment,
         state.assignment_sha256,
@@ -365,7 +369,10 @@ pub async fn report_running_state(
         state.archive_sha256,
         state.provider_set_sha256,
         state.healthy,
-    );
+    ) else {
+        crate::warn("invalid node identity; skipping rollout telemetry");
+        return;
+    };
     report.updating = state.updating;
     report.rejected = state.rejected;
     report.fingerprint = if state.healthy {
@@ -428,6 +435,7 @@ pub async fn report_running_state(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

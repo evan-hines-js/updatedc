@@ -663,6 +663,7 @@ fn resolve_one(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use updated_contracts::artifact::TargetReference;
@@ -696,7 +697,8 @@ mod tests {
             snapshot: outputs(name, value),
         };
         let body = publication.to_bounded_body().unwrap();
-        let output = crate::dataflow::ExactOutputPublication::decode(&body, &report.node).unwrap();
+        let output =
+            crate::dataflow::ExactOutputPublication::decode(&body, report.node.as_str()).unwrap();
         report.output_sha256 = Some(output.sha256().to_string());
         output
     }
@@ -745,7 +747,8 @@ mod tests {
                 DIGEST,
                 DIGEST,
                 true,
-            );
+            )
+            .unwrap();
             report.reported_at_ms = now_ms;
             let output = publication(&mut report, "endpoint", value);
             (
@@ -894,7 +897,8 @@ mod tests {
                 .unwrap();
         let now_ms = updated_contracts::telemetry::now_ms();
         let identity = crate::deployment_identity(&deployment("init-v1")).unwrap();
-        let mut report = NodeReport::new("p0", "init-v1", identity, "1.0.0", DIGEST, DIGEST, true);
+        let mut report =
+            NodeReport::new("p0", "init-v1", identity, "1.0.0", DIGEST, DIGEST, true).unwrap();
         report.reported_at_ms = now_ms;
         let output = publication(&mut report, "endpoint", "https://vault-0:8200");
         let reports = HashMap::from([(
@@ -983,7 +987,8 @@ mod tests {
         let identity = crate::deployment_identity(&deployment("init-v1")).unwrap();
         let mut report = NodeReport::new(
             "producer", "init-v1", identity, "1.0.0", DIGEST, DIGEST, true,
-        );
+        )
+        .unwrap();
         report.reported_at_ms = now_ms;
         let output = publication(&mut report, "endpoint", "https://vault-0:8200");
         let reports = HashMap::from([(
@@ -1934,7 +1939,8 @@ mod tests {
             "b".repeat(64),
             default.provider_set.sha256.clone(),
             false,
-        );
+        )
+        .unwrap();
         report.rejected = true;
         report.reported_at_ms = updated_contracts::telemetry::now_ms();
         let reports = HashMap::from([(
@@ -2052,7 +2058,8 @@ mod tests {
             "b".repeat(64),
             default.provider_set.sha256.clone(),
             false,
-        );
+        )
+        .unwrap();
         report.rejected = true;
         report.reported_at_ms = updated_contracts::telemetry::now_ms();
         let reports = HashMap::from([(

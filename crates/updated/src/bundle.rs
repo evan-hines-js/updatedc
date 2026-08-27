@@ -1114,6 +1114,7 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

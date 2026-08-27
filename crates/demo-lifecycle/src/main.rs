@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Entry point of the signed lifecycle-provider fixture for the operator demo.
 //!
 //! The fixture itself lives in [`reconciler`]. It owns the release's workload process — it

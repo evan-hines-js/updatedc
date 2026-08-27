@@ -571,6 +571,8 @@ async fn read_bearer_token(path: &Path) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::disallowed_methods)] // Loopback fixture URLs deliberately bypass production TLS.
 mod tests {
     use super::*;
 

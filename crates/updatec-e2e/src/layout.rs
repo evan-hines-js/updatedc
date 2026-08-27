@@ -288,6 +288,7 @@ pub(crate) fn agent_volumes(workload: Vec<serde_json::Value>) -> Vec<serde_json:
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

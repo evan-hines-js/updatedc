@@ -91,6 +91,8 @@ impl SignedEnrollment {
         let managed = updated_contracts::assignment::RepositoryAssignment::from_bounded_json(
             self.managed_configuration.as_bytes(),
         )?;
+        let agent_id = updated_contracts::identity::ResourceName::new(agent_id)
+            .map_err(|_| "enrollment bundle has invalid agent identity".to_string())?;
         Ok(crate::EnrollmentBundle {
             schema: 1,
             agent_id,

@@ -607,6 +607,7 @@ impl TrustedRepository {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -859,6 +860,7 @@ mod tests {
 /// These author a real release repo (app 1.0.0 with provider set A, 2.0.0 with provider set B)
 /// and drive [`TrustedRepository::assigned_application`] end to end.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod provider_binding {
     use super::*;
     use crate::fixture::runtime;

@@ -72,6 +72,7 @@ controller_env! {
 pub const HOSTNAME: &str = "HOSTNAME";
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

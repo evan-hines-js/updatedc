@@ -162,6 +162,7 @@ impl ReleaseTarget<'_> {
 
 impl InvocationFailure {
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn kind(&self) -> io::ErrorKind {
         match self {
             Self::ReleaseFault(error) | Self::Inconclusive(error) => error.kind(),
@@ -1440,6 +1441,7 @@ exec "$@"
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::test_support::{deployment_rejection, digest, release};

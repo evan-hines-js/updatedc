@@ -176,6 +176,7 @@ pub fn canonical_repository_base(value: &str) -> Result<url::Url, String> {
         url::Url::from_directory_path(value)
             .map_err(|()| "absolute offline directory cannot be represented as a file URL")?
     } else {
+        #[allow(clippy::disallowed_methods)] // This function is the repository-base authority.
         url::Url::parse(value).map_err(|error| {
             format!("must be an HTTPS/file base URL or absolute directory: {error}")
         })?
@@ -399,6 +400,7 @@ pub mod testing {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::artifact::TargetReference;

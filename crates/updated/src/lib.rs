@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Reusable node-side installation primitives shared by the agent:
 //! crash-safe filesystem replacement, a single-instance lock,
 //! health-rejection tracking, the committed
@@ -31,6 +33,7 @@ pub mod reconciler;
 pub mod reject;
 pub mod state;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod testing;
 pub mod tls;
 pub mod transaction;

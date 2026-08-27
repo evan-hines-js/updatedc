@@ -119,6 +119,7 @@ pub(crate) async fn holds_lease(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod lease_tests {
     use super::*;
 
@@ -573,7 +574,7 @@ pub(crate) mod lease_tests {
     fn enrollment_objects_bind_generation_bytes_agent_and_assignment() {
         let bundle = crate::EnrollmentBundle {
             schema: 1,
-            agent_id: "web-01".into(),
+            agent_id: updated_contracts::identity::ResourceName::new("web-01").unwrap(),
             routing_base_url: "https://control/".into(),
             assignment: "a/agents/web-01.json".into(),
             install_root: "/var/lib/app".into(),
@@ -1250,7 +1251,7 @@ pub(crate) mod lease_tests {
                     name: "state",
                     namespace: "prod",
                     owner: None,
-                    max_shards: 1,
+                    max_shards: AdmittedShardLimit::new(1).unwrap(),
                 },
                 state_dir,
                 &store,
@@ -1412,7 +1413,7 @@ pub(crate) mod lease_tests {
                 name: "state",
                 namespace: "prod",
                 owner: None,
-                max_shards: 1,
+                max_shards: AdmittedShardLimit::new(1).unwrap(),
             },
             state_dir,
             &store,
@@ -1481,7 +1482,7 @@ pub(crate) mod lease_tests {
                 name: "state",
                 namespace: "prod",
                 owner: None,
-                max_shards: 1,
+                max_shards: AdmittedShardLimit::new(1).unwrap(),
             },
             tmp.path(),
             &InMemory::new(),
@@ -1626,6 +1627,18 @@ pub(crate) mod lease_tests {
     }
 
     #[test]
+    fn admitted_shard_width_is_validated_once_and_converts_without_panicking() {
+        assert!(AdmittedShardLimit::new(0).is_err());
+        assert!(AdmittedShardLimit::new((MAX_ADMITTED_STATE_SHARDS + 1) as u8).is_err());
+
+        for configured in [1, MAX_ADMITTED_STATE_SHARDS as u8] {
+            let limit = AdmittedShardLimit::new(configured).unwrap();
+            assert_eq!(limit.stored(), configured);
+            assert_eq!(limit.count(), usize::from(configured));
+        }
+    }
+
+    #[test]
     fn durable_state_capacity_fails_before_any_kubernetes_mutation() {
         let state = DurableRolloutState {
             routing: (0..5_000)
@@ -1645,7 +1658,9 @@ pub(crate) mod lease_tests {
         };
         // Reconcile calls this pure preflight before signing, object-store upload, or the first API
         // call; store_admitted_state accepts only its successful result.
-        let error = prepare_admitted_state(&state, 1).err().unwrap();
+        let error = prepare_admitted_state(&state, AdmittedShardLimit::new(1).unwrap())
+            .err()
+            .unwrap();
         assert!(
             error.to_string().contains("StateCapacityExceeded"),
             "{error}"
@@ -1687,7 +1702,7 @@ pub(crate) mod lease_tests {
             assignments: BTreeMap::from([("node".into(), "a".repeat(64))]),
             ..Default::default()
         };
-        let prepared = prepare_admitted_state(&state, 3).unwrap();
+        let prepared = prepare_admitted_state(&state, AdmittedShardLimit::new(3).unwrap()).unwrap();
         let version = store_admitted_state(&configmaps, "state", "prod", prepared, None, None)
             .await
             .unwrap()

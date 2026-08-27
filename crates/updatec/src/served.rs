@@ -119,6 +119,7 @@ pub fn parse_range_value(value: &str) -> Option<ByteRange> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

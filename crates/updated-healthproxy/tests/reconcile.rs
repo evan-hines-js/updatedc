@@ -80,7 +80,7 @@ async fn spawn_cdn(reports: Vec<(String, bool)>) -> TestCdn {
     let mut fleet = FleetReports::default();
     for (node, healthy) in reports {
         let mut report =
-            NodeReport::new(&node, "deploy-3", DIGEST, "3.0.0", DIGEST, DIGEST, healthy);
+            NodeReport::new(&node, "deploy-3", DIGEST, "3.0.0", DIGEST, DIGEST, healthy).unwrap();
         bind_reconciliation(&mut report);
         let body =
             updated_contracts::telemetry::encode_signed_report(&report, &TEST_KEY.0).unwrap();
@@ -204,7 +204,7 @@ fn inventory(pairs: &[(&str, &str)]) -> Vec<BackendInventoryMember> {
     pairs
         .iter()
         .map(|(node, address)| BackendInventoryMember::Active {
-            node: node.to_string(),
+            node: updated_contracts::identity::ResourceName::new(*node).unwrap(),
             address: address.to_string(),
             public_key: TEST_KEY.1.clone(),
         })
@@ -282,7 +282,7 @@ async fn a_cordon_is_drained_without_consulting_or_trusting_its_s3_report() {
     let cdn = spawn_cdn(vec![("agent-0".into(), true)]).await;
     let base = format!("http://{}", cdn.address);
     let inventory = vec![BackendInventoryMember::Cordoned {
-        node: "agent-0".into(),
+        node: updated_contracts::identity::ResourceName::new("agent-0").unwrap(),
     }];
     let mut cache = updated_healthproxy::LastKnownGood::new();
     let (members, observed) = resolve_members(

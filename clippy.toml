@@ -9,6 +9,7 @@
 # Every legitimate caller carries `#[allow(clippy::disallowed_methods)]` with the reason it is the
 # one door. That allow is the exception list, and it lives at the exception.
 disallowed-methods = [
+  { path = "url::Url::parse", reason = "raw URL parsing bypasses the shared endpoint/repository authority gates; use updated_contracts::endpoint or assignment::canonical_repository_base." },
   { path = "updated_agent::store::Store::verify_release", reason = "raw half of activation; use Store::activate so verifying bytes and moving the active pointer remain one fail-closed operation." },
   { path = "updated_agent::store::Store::point_active", reason = "raw half of activation; use Store::activate so no caller can point at bytes it did not just verify." },
   { path = "updated_agent::store::Store::record_journal", reason = "unconditional storage primitive; use Store::write_journal so transaction identity and phase monotonicity cannot be bypassed." },

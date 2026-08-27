@@ -45,6 +45,7 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

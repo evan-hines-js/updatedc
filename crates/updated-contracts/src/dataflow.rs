@@ -28,6 +28,13 @@ pub const GATEWAY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// The issuer and private-object retirement both consume this value: cleanup must not delete an
 /// object while a capability the system minted for it can still be spent.
 pub const OBJECT_CAPABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Minimum age of a private object before the controller may retire it.
+///
+/// A capability minted immediately before a generation changes remains valid for one full TTL.
+/// The second TTL is the system's deliberate clock/observation margin. Inputs and enrollment
+/// objects consume this same policy so cleanup behavior cannot drift by object kind.
+pub const PRIVATE_OBJECT_RETIREMENT_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(OBJECT_CAPABILITY_TTL.as_secs() * 2);
 /// Time from a repository's deletion timestamp after which no capability minted for that
 /// incarnation can still create or read an object.
 ///
@@ -356,7 +363,7 @@ impl InputPublication {
 #[serde(deny_unknown_fields)]
 pub struct OutputPublication {
     pub schema: u32,
-    pub node: String,
+    pub node: crate::identity::ResourceName,
     pub deployment: String,
     pub assignment_sha256: String,
     pub archive_sha256: String,
@@ -368,8 +375,7 @@ impl OutputPublication {
 
     pub fn validate(&self, node: &str) -> Result<(), String> {
         if self.schema != Self::SCHEMA
-            || self.node != node
-            || !crate::identity::is_dns_subdomain(node)
+            || self.node.as_str() != node
             || !crate::identity::is_segment(&self.deployment)
             || !crate::is_canonical_sha256(&self.assignment_sha256)
             || !crate::is_canonical_sha256(&self.archive_sha256)
@@ -381,7 +387,7 @@ impl OutputPublication {
     }
 
     pub fn to_bounded_body(&self) -> Result<Vec<u8>, String> {
-        self.validate(&self.node)?;
+        self.validate(self.node.as_str())?;
         bounded_json(self, "dataflow output publication")
     }
 }
@@ -458,8 +464,8 @@ impl UploadCapability {
 /// Parse the only direct-upload action shape an agent may use. Authorization belongs exclusively
 /// in the signed form fields: accepting query material here would create a second bearer mechanism
 /// and make the exact authority harder to audit.
-pub fn upload_action_url(value: &str) -> Result<url::Url, String> {
-    crate::endpoint::https_url(value, crate::endpoint::QueryPolicy::Forbidden).map_err(|_| {
+pub fn upload_action_url(value: &str) -> Result<crate::endpoint::NetworkEndpoint, String> {
+    crate::endpoint::validate_https_url(value, crate::endpoint::QueryPolicy::Forbidden).map_err(|_| {
         String::from(
             "object-store upload action must be an absolute HTTPS URL without credentials, query material, or a fragment"
         )
@@ -469,12 +475,14 @@ pub fn upload_action_url(value: &str) -> Result<url::Url, String> {
 /// Parse the only bearer-URL shape an agent may spend. Userinfo would put another credential in
 /// authority syntax, and fragments are client-local ambiguity; neither belongs in an exact S3
 /// capability.
-pub fn capability_url(value: &str) -> Result<url::Url, String> {
-    crate::endpoint::https_url(value, crate::endpoint::QueryPolicy::Required).map_err(|_| {
-        String::from(
-            "object-store capability must be an absolute HTTPS URL with bearer query material",
-        )
-    })
+pub fn capability_url(value: &str) -> Result<crate::endpoint::NetworkEndpoint, String> {
+    crate::endpoint::validate_https_url(value, crate::endpoint::QueryPolicy::Required).map_err(
+        |_| {
+            String::from(
+                "object-store capability must be an absolute HTTPS URL with bearer query material",
+            )
+        },
+    )
 }
 
 fn bounded_json(value: &impl Serialize, what: &str) -> Result<Vec<u8>, String> {
@@ -507,6 +515,7 @@ pub mod testing {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -639,6 +648,15 @@ mod tests {
             OBJECT_CAPABILITY_DRAIN,
             GATEWAY_AUTHORIZATION_MEMO_TTL + GATEWAY_REQUEST_TIMEOUT + OBJECT_CAPABILITY_TTL
         );
+    }
+
+    #[test]
+    fn private_object_retirement_has_one_shared_capability_grace() {
+        assert_eq!(
+            PRIVATE_OBJECT_RETIREMENT_GRACE,
+            OBJECT_CAPABILITY_TTL + OBJECT_CAPABILITY_TTL
+        );
+        assert!(PRIVATE_OBJECT_RETIREMENT_GRACE > OBJECT_CAPABILITY_TTL);
     }
 
     #[test]

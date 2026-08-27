@@ -328,6 +328,7 @@ fn github_output_line(key: &str, value: &str) -> std::io::Result<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod github_output_tests {
     use super::github_output_line;
 

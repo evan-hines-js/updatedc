@@ -1,3 +1,8 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// Cargo builds the ordinary binary as well as its test harness under llvm-cov. Only the latter
+// contains the `cfg(test)` modules that use this feature.
+#![cfg_attr(all(coverage_nightly, not(test)), allow(unused_features))]
+
 //! updated-launcher — the installer-owned launcher: the one process that decides which
 //! agent binary runs.
 //!
@@ -141,6 +146,7 @@ const ACCEPTED_FLAGS: &[&str] = &[
 ];
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod launch_sites {
     //! A launcher command line is duplicated as untyped text across shipped assets — a shell
     //! wrapper, Kubernetes manifests, an init unit, the README. Nothing else type-checks them, so a
@@ -295,6 +301,7 @@ mod launch_sites {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod dependency_isolation {
     //! The launcher's isolation is load-bearing: it must depend only on the frozen
     //! `control` protocol crate and platform binding crates — never on the churning

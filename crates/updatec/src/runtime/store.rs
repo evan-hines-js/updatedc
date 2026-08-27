@@ -435,6 +435,7 @@ pub(crate) async fn build_store(
 /// patch — was a WIRING bug invisible to the pure planner tests; this module is where that class
 /// gets locked instead of re-reviewed.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod store_tests {
     use super::*;
     use object_store::memory::InMemory;

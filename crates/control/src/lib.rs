@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Versioned launcher⇄agent control protocol. The std-only crate is shared by
 //! both processes so framing and protocol rules cannot drift.
 //!
@@ -573,6 +575,7 @@ fn os_from_units(bytes: &[u8]) -> Result<OsString> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod agent_staging_tests {
     use super::*;
 
@@ -641,6 +644,7 @@ mod agent_staging_tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

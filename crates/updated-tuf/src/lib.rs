@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Async TUF client and repository builder, wrapping [`tough`].
 //!
 //! The client ([`TrustedRepository`]) loads an installer-pinned root, performs the
@@ -126,6 +128,7 @@ fn is_integrity_failure(source: &tough::TransportError) -> bool {
 /// thirty lines of noise a reader has to diff against its neighbours to find the one field the test
 /// is actually about. Tests state their subject with `..assignment(name)` and leave the rest here.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod fixture {
     use updated_contracts::assignment::RepositoryAssignment;
 
@@ -156,6 +159,7 @@ mod fixture {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod error_tests {
     use super::{transport_timeout, Error};
     use crate::fixture::{assignment, runtime};
@@ -1423,6 +1427,7 @@ fn write_if_changed(path: &Path, prefix: &str, bytes: &[u8]) -> std::io::Result<
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod write_if_changed_tests {
     use super::write_if_changed;
 
@@ -1468,6 +1473,7 @@ fn to_verified(path: &str, target: &Target) -> VerifiedTarget {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod integrity_tests {
     use super::{classify, repository_base, Error};
     use crate::repo;

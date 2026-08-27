@@ -891,6 +891,7 @@ pub(crate) async fn metadata_expiry(path: &Path) -> Option<chrono::DateTime<chro
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

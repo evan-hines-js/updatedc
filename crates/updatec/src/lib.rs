@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Environment-neutral desired-state compiler for `updated`, hosted on Kubernetes.
 //!
 //! Custom `UpdateAgent` resources represent agents anywhere. Group selectors determine
@@ -78,6 +80,7 @@ pub mod runtime;
 pub mod served;
 pub mod subscription;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod test_support;
 pub(crate) mod webhook;
 pub mod window;
@@ -1492,7 +1495,8 @@ pub(crate) fn resolve_node_groups(
     let mut node_groups = BTreeMap::new();
     for node in nodes {
         let name = node.name;
-        if !updated_contracts::identity::is_dns_subdomain(&name) || node_groups.contains_key(&name)
+        if updated_contracts::identity::ResourceName::new(&name).is_err()
+            || node_groups.contains_key(&name)
         {
             return if node_groups.contains_key(&name) {
                 Err(PlanError::DuplicateNode(name))
@@ -1736,6 +1740,7 @@ pub async fn read_object_bounded(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

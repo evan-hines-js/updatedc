@@ -1163,6 +1163,7 @@ pub fn make_owner_writable(path: &Path) -> R {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::agent_features;
 

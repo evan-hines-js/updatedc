@@ -437,6 +437,7 @@ pub(crate) async fn check_application(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

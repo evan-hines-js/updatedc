@@ -363,6 +363,7 @@ fn load_key(path: &Path, label: &'static str) -> io::Result<PrivateKeyDer<'stati
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

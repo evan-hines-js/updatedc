@@ -1,5 +1,13 @@
 //! Canonical human-readable identities carried across signed and durable boundaries.
 
+use std::borrow::Borrow;
+use std::fmt;
+use std::str::FromStr;
+
+use schemars::schema::{InstanceType, Schema, SchemaObject, StringValidation};
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
+
 /// The largest product, channel, platform, provider-set, or deployment identity.
 ///
 /// These values become path segments, status fields, log attributes, and telemetry fields in
@@ -55,13 +63,22 @@ pub fn is_segment(value: &str) -> bool {
 /// telemetry-specific approximation of the API server's name rules.
 pub const MAX_DNS_SUBDOMAIN_BYTES: usize = 253;
 
+/// [`ResourceName`]'s grammar for generated JSON schemas.
+///
+/// The runtime predicate remains the admission authority. This adjacent expression makes generated
+/// schemas reject the same invalid shapes before they reach Rust; the unit test below pins every
+/// clause to representative runtime decisions. The overall byte ceiling is expressed separately as
+/// `maxLength` because the grammar is ASCII, so bytes and JSON-schema characters are identical.
+pub const DNS_SUBDOMAIN_PATTERN: &str =
+    "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$";
+
 /// Whether `value` is the one Kubernetes DNS-subdomain identity grammar.
 ///
 /// This is deliberately separate from [`is_segment`]: opaque portable path segments may contain
 /// `_`, while Kubernetes resource identities may contain dots only as separators between DNS
 /// labels. Certificate issuance, enrollment, reports, backend inventory, assignments, and durable
 /// rollout state all call this predicate, so none can mint or persist an identity another refuses.
-pub fn is_dns_subdomain(value: &str) -> bool {
+fn is_dns_subdomain(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_DNS_SUBDOMAIN_BYTES
         && value.split('.').all(|label| {
@@ -79,6 +96,133 @@ pub fn is_dns_subdomain(value: &str) -> bool {
                     .last()
                     .is_some_and(u8::is_ascii_alphanumeric)
         })
+}
+
+/// A Kubernetes resource identity that has passed the fleet's one canonical name grammar.
+///
+/// Nodes, repositories, and rollout groups are the same kind of identity: each is serialized as a
+/// Kubernetes DNS subdomain and crosses certificate, object-key, report, and durable-state
+/// boundaries. A field-specific wrapper for every use would only move drift into conversion code,
+/// so the system has exactly this one type. Its inner string is private, construction is fallible,
+/// and deserialization calls the same constructor. Once a value is a `ResourceName`, consumers do
+/// not revalidate it.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ResourceName(String);
+
+/// A value is not a canonical [`ResourceName`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceNameError;
+
+impl ResourceName {
+    /// Admit one owned string through the canonical identity grammar.
+    pub fn new(value: impl Into<String>) -> Result<Self, ResourceNameError> {
+        let value = value.into();
+        if is_dns_subdomain(&value) {
+            Ok(Self(value))
+        } else {
+            Err(ResourceNameError)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for ResourceName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for ResourceNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid Kubernetes resource identity")
+    }
+}
+
+impl std::error::Error for ResourceNameError {}
+
+impl JsonSchema for ResourceName {
+    fn schema_name() -> String {
+        "ResourceName".to_owned()
+    }
+
+    fn json_schema(_: &mut schemars::gen::SchemaGenerator) -> Schema {
+        SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                max_length: Some(MAX_DNS_SUBDOMAIN_BYTES as u32),
+                min_length: Some(1),
+                pattern: Some(DNS_SUBDOMAIN_PATTERN.to_owned()),
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
+impl AsRef<str> for ResourceName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for ResourceName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<str> for ResourceName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for ResourceName {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl FromStr for ResourceName {
+    type Err = ResourceNameError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for ResourceName {
+    type Error = ResourceNameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for ResourceName {
+    type Error = ResourceNameError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
 }
 
 fn is_windows_device_stem(stem: &str) -> bool {
@@ -110,6 +254,7 @@ pub fn is_release_version(value: &str) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -130,20 +275,50 @@ mod tests {
 
     #[test]
     fn kubernetes_resource_identities_have_one_dns_subdomain_grammar() {
-        assert!(is_dns_subdomain("agent-7"));
-        assert!(is_dns_subdomain("rack-1.agent-7"));
-        assert!(is_dns_subdomain(&format!(
-            "{}.{}",
-            "a".repeat(63),
-            "b".repeat(63)
-        )));
+        assert!(ResourceName::new("agent-7").is_ok());
+        assert!(ResourceName::new("rack-1.agent-7").is_ok());
+        assert!(ResourceName::new(format!("{}.{}", "a".repeat(63), "b".repeat(63))).is_ok());
         for invalid in [
             "", ".", "..", "a/b", "a\\b", "a:b", "a%b", "a?b", "a#b", "A", "a_b", "-a", "a-",
             "a..b", "a\nb",
         ] {
-            assert!(!is_dns_subdomain(invalid), "{invalid:?} must be refused");
+            assert!(
+                ResourceName::new(invalid).is_err(),
+                "{invalid:?} must be refused"
+            );
         }
-        assert!(!is_dns_subdomain(&"a".repeat(MAX_DNS_SUBDOMAIN_BYTES + 1)));
+        assert!(ResourceName::new("a".repeat(MAX_DNS_SUBDOMAIN_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn resource_names_cannot_bypass_validation_during_deserialization() {
+        let name = ResourceName::new("rack-1.agent-7").unwrap();
+        assert_eq!(serde_json::to_string(&name).unwrap(), "\"rack-1.agent-7\"");
+        assert_eq!(
+            serde_json::from_str::<ResourceName>("\"rack-1.agent-7\"").unwrap(),
+            name
+        );
+        assert!(serde_json::from_str::<ResourceName>("\"Agent-7\"").is_err());
+    }
+
+    #[test]
+    fn resource_name_schema_carries_the_runtime_grammar_and_bound() {
+        let schema = schemars::schema_for!(ResourceName);
+        let validation = schema.schema.string.expect("ResourceName must be a string");
+        assert_eq!(validation.min_length, Some(1));
+        assert_eq!(validation.max_length, Some(MAX_DNS_SUBDOMAIN_BYTES as u32));
+        assert_eq!(validation.pattern.as_deref(), Some(DNS_SUBDOMAIN_PATTERN));
+
+        assert_eq!(
+            DNS_SUBDOMAIN_PATTERN,
+            "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+        );
+        for valid in ["a", "agent-7", "rack-1.agent-7"] {
+            assert!(ResourceName::new(valid).is_ok());
+        }
+        for invalid in ["", "-agent", "agent-", "Agent", "agent_7", "rack..agent"] {
+            assert!(ResourceName::new(invalid).is_err());
+        }
     }
 
     /// The exported pattern and the predicate accept exactly the same strings.

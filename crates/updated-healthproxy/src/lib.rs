@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Health-driven load-balancer membership for the fleet.
 //!
 //! A node's `updated` agent publishes a signed [`updated_contracts::telemetry::NodeReport`],
@@ -269,17 +271,19 @@ pub async fn resolve_members(
                 address,
                 public_key,
             } => Member {
-                node: node.clone(),
+                node: node.to_string(),
                 address: address.clone(),
                 ready: resolve_readiness(
-                    node,
+                    node.as_str(),
                     public_key,
-                    fetched.as_mut().and_then(|reports| reports.remove(node)),
+                    fetched
+                        .as_mut()
+                        .and_then(|reports| reports.remove(node.as_str())),
                     cache,
                 ),
             },
             BackendInventoryMember::Cordoned { node } => Member {
-                node: node.clone(),
+                node: node.to_string(),
                 address: String::new(),
                 ready: false,
             },
@@ -876,6 +880,7 @@ fn parse_inventory(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
@@ -945,7 +950,7 @@ mod tests {
     /// A report produced through the same single validation/signing/encoding boundary as a node.
     fn report_with(node: &str, healthy: bool, mutate: impl FnOnce(&mut NodeReport)) -> Envelope {
         let mut report =
-            NodeReport::new(node, "deploy-3", DIGEST, "3.0.0", DIGEST, DIGEST, healthy);
+            NodeReport::new(node, "deploy-3", DIGEST, "3.0.0", DIGEST, DIGEST, healthy).unwrap();
         bind_reconciliation(&mut report);
         mutate(&mut report);
         let body =
@@ -1210,12 +1215,12 @@ mod tests {
             ok.inventory,
             vec![
                 BackendInventoryMember::Active {
-                    node: "agent-0".into(),
+                    node: updated_contracts::identity::ResourceName::new("agent-0").unwrap(),
                     address: "10.0.0.1".into(),
                     public_key: P256PublicKey::parse_hex(&pin(1)).unwrap(),
                 },
                 BackendInventoryMember::Active {
-                    node: "agent-1".into(),
+                    node: updated_contracts::identity::ResourceName::new("agent-1").unwrap(),
                     address: "10.0.0.2".into(),
                     public_key: P256PublicKey::parse_hex(&pin(2)).unwrap(),
                 },
@@ -1430,7 +1435,7 @@ mod tests {
             let parsed = backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1))
                 .expect("a valid node name is configurable");
             assert_eq!(parsed.node(), node);
-            assert!(updated_contracts::identity::is_dns_subdomain(node));
+            assert!(updated_contracts::identity::ResourceName::new(node).is_ok());
         }
         for node in [
             "agent#1",
@@ -1451,7 +1456,7 @@ mod tests {
             // stray `\n` must be legible in the log line that refuses it.
             assert!(error.contains(&format!("{node:?}")), "{error}");
             assert!(error.contains("invalid node identity"), "{error}");
-            assert!(!updated_contracts::identity::is_dns_subdomain(node));
+            assert!(updated_contracts::identity::ResourceName::new(node).is_err());
         }
         assert!(backend::BackendInventoryMember::active("", "10.0.0.1", &pin(1)).is_err());
         // The shared grammar carries Kubernetes' object-name ceiling because every production
@@ -1496,7 +1501,7 @@ mod tests {
         // Everything the shared identity grammar accepts is safe for the balancer too, including
         // dotted cluster-scoped names.
         for node in ["agent-0", "vm-db-17", "agent-7.prod"] {
-            assert!(updated_contracts::identity::is_dns_subdomain(node));
+            assert!(updated_contracts::identity::ResourceName::new(node).is_ok());
             assert!(updated_contracts::backend::is_balancer_safe(node));
             assert!(backend::BackendInventoryMember::active(node, "10.0.0.1", &pin(1)).is_ok());
         }
@@ -1619,7 +1624,9 @@ mod tests {
         let hosts: Vec<(String, String)> = parsed
             .into_iter()
             .map(|member| match member {
-                BackendInventoryMember::Active { node, address, .. } => (node, address),
+                BackendInventoryMember::Active { node, address, .. } => {
+                    (node.into_string(), address)
+                }
                 BackendInventoryMember::Cordoned { node } => panic!("unexpected cordon {node}"),
             })
             .collect();

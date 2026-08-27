@@ -1824,6 +1824,7 @@ async fn serve_metrics_connection(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

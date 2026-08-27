@@ -616,6 +616,7 @@ pub fn sync_tree(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

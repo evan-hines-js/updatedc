@@ -329,6 +329,7 @@ pub fn read_bounded_regular_string(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::io::Write as _;

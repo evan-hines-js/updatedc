@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Strict, versioned contracts shared across the node and control-plane boundary.
 //!
 //! This crate owns serialized protocol types and the validation/security rules required to
@@ -50,6 +52,7 @@ pub use digest::is_canonical_sha256;
 /// operations, and a rule about the normative contract that is written twice is a rule one half of
 /// the schemas silently stops getting.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod published_schema {
     use serde::Serialize;
     use serde_json::Value;
@@ -121,6 +124,7 @@ pub(crate) mod published_schema {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod dependency_isolation {
     const CONTRACT_MANIFEST: &str = include_str!("../Cargo.toml");
     const UPDATED_CONFIG: &str = include_str!("../../updated/src/config.rs");
@@ -257,6 +261,7 @@ mod dependency_isolation {
 /// It held on every type when this was written. That is exactly when to nail it down: the invariant
 /// was one forgotten attribute away from lapsing on the next type anyone adds, with nothing failing.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod closed_documents {
     const MODULES: &[(&str, &str)] = &[
         ("artifact", include_str!("artifact.rs")),

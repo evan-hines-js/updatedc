@@ -1081,6 +1081,7 @@ pub(crate) fn secret_string(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod merge_patch_tests {
     use super::merge_patch_unchanged;
 

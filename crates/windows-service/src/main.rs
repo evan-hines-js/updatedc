@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Native Windows SCM host for the installer-owned launcher.
 //!
 //! The service owns only the launcher, and owns it as a contained tree: it is spawned into a
@@ -301,6 +303,7 @@ mod windows {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     mod tests {
         use super::*;
 

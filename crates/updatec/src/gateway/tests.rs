@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // Signer fixtures must construct both valid and invalid URLs.
+
 use super::*;
 
 use axum::http::Request;

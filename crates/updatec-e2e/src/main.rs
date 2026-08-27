@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! The fleet end-to-end test for the `updatec` operator.
 //!
 //! It builds the kind environment (`scripts/kind-updatec-e2e.sh`), scales it to a real fleet with
@@ -120,6 +122,7 @@ async fn run_e2e() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{agent_resource_name, resource_name};
 

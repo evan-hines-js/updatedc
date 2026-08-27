@@ -86,6 +86,7 @@ fn make_structural(value: &mut serde_json::Value) {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

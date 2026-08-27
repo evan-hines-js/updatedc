@@ -72,6 +72,7 @@ pub fn mark_rejected_agent(state_dir: &Path, candidate: &Path) -> std::io::Resul
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

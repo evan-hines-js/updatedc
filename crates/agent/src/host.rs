@@ -59,6 +59,7 @@ fn reboot_command() -> io::Result<Command> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

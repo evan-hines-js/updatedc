@@ -139,7 +139,7 @@ async fn preplaced_enrollment_resolves_offline_through_the_live_repository() {
         .to_string();
     let bundle = updated_contracts::enrollment::EnrollmentBundle {
         schema: 1,
-        agent_id: "offline".into(),
+        agent_id: updated_contracts::identity::ResourceName::new("offline").unwrap(),
         routing_base_url,
         assignment: agent_path.into(),
         install_root: assignment.runtime.install_root.clone(),

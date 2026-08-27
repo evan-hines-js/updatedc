@@ -755,6 +755,7 @@ mod channel_tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod marker_tests {
     use super::*;
 

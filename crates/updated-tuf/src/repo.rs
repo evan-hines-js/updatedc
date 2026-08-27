@@ -1440,6 +1440,7 @@ fn dir_url(dir: &Path) -> Result<Url> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

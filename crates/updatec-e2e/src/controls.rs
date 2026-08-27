@@ -936,6 +936,7 @@ pub(crate) async fn assert_metrics_exposed() -> Result<(), Box<dyn std::error::E
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::samples;
 

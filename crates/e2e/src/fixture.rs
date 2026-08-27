@@ -755,6 +755,7 @@ fn migration_gate(root: &Path, version: &str) -> R {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

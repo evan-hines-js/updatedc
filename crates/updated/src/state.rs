@@ -427,6 +427,7 @@ pub fn write_installed(path: &Path, state: &InstalledState) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;

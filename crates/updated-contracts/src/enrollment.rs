@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::dataflow::DownloadCapability;
+use crate::identity::ResourceName;
 
 /// The one enrollment endpoint.
 pub const ENROLL_PATH: &str = "/enroll";
@@ -20,19 +21,8 @@ pub const MAX_CONTROL_DOCUMENT_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollmentRequest {
-    pub name: String,
+    pub name: ResourceName,
     pub csr: String,
-}
-
-impl EnrollmentRequest {
-    /// Whether the name a node self-asserts at enrollment is one the fleet can actually own.
-    ///
-    /// This is exactly the shared Kubernetes DNS-subdomain identity grammar
-    /// ([`crate::identity::is_dns_subdomain`]), so self-enrollment, report maps, backend projections,
-    /// and `UpdateAgent` objects cannot disagree about node identity.
-    pub fn name_is_wellformed(&self) -> bool {
-        crate::identity::is_dns_subdomain(&self.name)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -58,7 +48,7 @@ pub struct RenewalResponse {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollmentBundle {
     pub schema: u32,
-    pub agent_id: String,
+    pub agent_id: ResourceName,
     pub routing_base_url: String,
     pub assignment: String,
     /// Immutable node-local boundary authenticated at enrollment. Live signed assignments may
@@ -70,10 +60,8 @@ pub struct EnrollmentBundle {
 
 impl EnrollmentBundle {
     pub fn validate_shape(&self) -> io::Result<()> {
-        if self.schema != 1 || !crate::identity::is_dns_subdomain(&self.agent_id) {
-            return Err(invalid(
-                "unsupported enrollment bundle or invalid agent identity",
-            ));
+        if self.schema != 1 {
+            return Err(invalid("unsupported enrollment bundle"));
         }
         if crate::assignment::canonical_repository_base(&self.routing_base_url).is_err()
             || self.assignment.starts_with('/')
@@ -85,7 +73,7 @@ impl EnrollmentBundle {
             return Err(invalid("invalid enrollment assignment path"));
         }
         if crate::telemetry::split_assignment_path(&self.assignment)
-            .is_none_or(|(_, agent)| agent != self.agent_id)
+            .is_none_or(|(_, agent)| agent != self.agent_id.as_str())
         {
             return Err(invalid(
                 "enrollment assignment does not name the bundle's agent identity",
@@ -159,20 +147,14 @@ fn invalid(message: &str) -> io::Error {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-
-    fn request(name: &str) -> EnrollmentRequest {
-        EnrollmentRequest {
-            name: name.into(),
-            csr: String::new(),
-        }
-    }
 
     fn bundle(base: &str) -> EnrollmentBundle {
         EnrollmentBundle {
             schema: 1,
-            agent_id: "agent-7".into(),
+            agent_id: ResourceName::new("agent-7").unwrap(),
             routing_base_url: base.into(),
             assignment: "assignments/agents/agent-7.json".into(),
             install_root: "/var/lib/app".into(),
@@ -243,10 +225,10 @@ mod tests {
         assert!(mismatched.validate_shape().is_err());
         assert!(mismatched.to_bounded_json().is_err());
 
-        let mut invalid_identity = bundle("https://updates.example/routing/");
-        invalid_identity.agent_id = "Agent-7".into();
-        invalid_identity.assignment = "assignments/agents/Agent-7.json".into();
-        assert!(invalid_identity.validate_shape().is_err());
+        let encoded = serde_json::to_string(&bundle("https://updates.example/routing/"))
+            .unwrap()
+            .replace("agent-7", "Agent-7");
+        assert!(serde_json::from_str::<EnrollmentBundle>(&encoded).is_err());
     }
 
     #[test]
@@ -281,23 +263,19 @@ mod tests {
     /// basename above all — must be rejected here too, without enrollment restating the rule.
     #[test]
     fn an_enrollment_name_is_refused_wherever_the_shared_identity_grammar_refuses_it() {
-        assert!(request("agent-7").name_is_wellformed());
-        assert!(request("jenkins-author-0").name_is_wellformed());
+        assert!(ResourceName::new("agent-7").is_ok());
+        assert!(ResourceName::new("jenkins-author-0").is_ok());
         // Raw report keys are hashed, so ordinary DNS names no longer collide with controller
         // projection objects or need a second, storage-specific reserved-word grammar.
-        assert!(request("fleet").name_is_wellformed());
-        assert!(request("rack-1.agent-7").name_is_wellformed());
+        assert!(ResourceName::new("fleet").is_ok());
+        assert!(ResourceName::new("rack-1.agent-7").is_ok());
         assert!(
-            !request(&"a".repeat(crate::identity::MAX_DNS_SUBDOMAIN_BYTES + 1))
-                .name_is_wellformed()
+            ResourceName::new("a".repeat(crate::identity::MAX_DNS_SUBDOMAIN_BYTES + 1)).is_err()
         );
         for bad in [
             "", "-agent", "agent-", "Agent", "a_b", "a/b", ".agent", "agent.", "a..b",
         ] {
-            assert!(
-                !request(bad).name_is_wellformed(),
-                "{bad:?} must be refused"
-            );
+            assert!(ResourceName::new(bad).is_err(), "{bad:?} must be refused");
         }
     }
 }

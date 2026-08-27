@@ -870,6 +870,7 @@ impl Store {
         self.remove_install_journal()
     }
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn memory(backend: MemoryBackend) -> Self {
         Self {
             backend: Backend::Memory(Box::new(backend)),
@@ -877,6 +878,7 @@ impl Store {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn memory_backend(&self) -> &MemoryBackend {
         let Backend::Memory(memory) = &self.backend else {
             panic!("the store does not use the test-memory backend");
@@ -885,6 +887,7 @@ impl Store {
     }
 
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub(crate) fn memory_backend_mut(&mut self) -> &mut MemoryBackend {
         let Backend::Memory(memory) = &mut self.backend else {
             panic!("the store does not use the test-memory backend");
@@ -911,6 +914,7 @@ pub(crate) struct MemoryBackend {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl Default for Store {
     fn default() -> Self {
         Self::memory(MemoryBackend::default())
@@ -918,6 +922,7 @@ impl Default for Store {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use updated::install::InstallPhase;

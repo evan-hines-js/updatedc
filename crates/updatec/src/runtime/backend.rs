@@ -1088,6 +1088,7 @@ pub(crate) async fn finalize_backend(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod backend_tests {
     use super::*;
 
@@ -1174,7 +1175,7 @@ pub(crate) mod backend_tests {
             inventory,
             vec![
                 updated_contracts::backend::BackendInventoryMember::Cordoned {
-                    node: "node-a".into()
+                    node: updated_contracts::identity::ResourceName::new("node-a").unwrap()
                 }
             ]
         );

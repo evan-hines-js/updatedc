@@ -132,6 +132,7 @@ fn parse_semver(v: &str) -> Result<semver::Version, PolicyError> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

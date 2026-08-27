@@ -280,6 +280,7 @@ pub(crate) fn print_kind_resources(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -167,6 +167,7 @@ fn digest_key(hash: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

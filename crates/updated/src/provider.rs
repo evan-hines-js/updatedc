@@ -321,6 +321,7 @@ fn staging_name(destination: &Path) -> io::Result<PathBuf> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::fs;

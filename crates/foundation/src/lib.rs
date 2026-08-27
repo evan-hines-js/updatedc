@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Dependency-isolated mechanisms shared across the permanent-launcher boundary.
 //!
 //! This crate may use `std` and operating-system bindings only. It contains no
@@ -23,6 +25,7 @@ pub mod process;
 pub mod time;
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod dependency_isolation {
     const MANIFEST: &str = include_str!("../Cargo.toml");
     const ALLOWED: &[&str] = &["libc", "windows-sys"];

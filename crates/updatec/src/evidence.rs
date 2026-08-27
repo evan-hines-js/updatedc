@@ -322,6 +322,7 @@ impl ObservationLog {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -340,7 +341,7 @@ mod tests {
     fn signed(pkcs8: &[u8], node: &str, healthy: bool) -> Envelope {
         const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let mut report =
-            NodeReport::new(node, "deploy-1", DIGEST, "1.0.0", DIGEST, DIGEST, healthy);
+            NodeReport::new(node, "deploy-1", DIGEST, "1.0.0", DIGEST, DIGEST, healthy).unwrap();
         crate::test_support::sign_report(&mut report, pkcs8)
     }
 

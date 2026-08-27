@@ -160,6 +160,7 @@ fn content_length(headers: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

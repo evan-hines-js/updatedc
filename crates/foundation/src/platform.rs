@@ -24,6 +24,7 @@ pub fn agent_binary_name() -> &'static str {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -56,7 +56,7 @@ pub struct NodeConfig {
 pub struct EnrollmentBootstrap {
     pub url: String,
     pub ca: PathBuf,
-    pub name: String,
+    pub name: updated_contracts::identity::ResourceName,
     pub bootstrap: Option<EnrollmentClientIdentity>,
 }
 
@@ -78,17 +78,6 @@ impl EnrollmentBootstrap {
     /// here, so a config that loads is a config the gateway will admit. The single validation site
     /// for it.
     pub fn validate(&self) -> io::Result<()> {
-        let proposed = EnrollmentRequest {
-            name: self.name.clone(),
-            csr: String::new(),
-        };
-        if !proposed.name_is_wellformed() {
-            return Err(invalid(&format!(
-                "enrollment name {:?} is not a DNS subdomain: lowercase letters, digits, '-' and \
-                 '.'; labels are at most 63 bytes and the whole name at most 253 bytes",
-                self.name
-            )));
-        }
         let mut paths = vec![("ca", &self.ca)];
         if let Some(bootstrap) = &self.bootstrap {
             paths.extend([
@@ -361,7 +350,7 @@ async fn mint_leaf(config: &NodeConfig, state_dir: &Path) -> io::Result<Enrollme
     validate_leaf(
         &enrolled.leaf,
         &request.csr,
-        &request.name,
+        request.name.as_str(),
         &config.enrollment.ca,
     )?;
     let bundle = download_bundle(config, &enrolled.bundle_download).await?;
@@ -461,7 +450,7 @@ async fn renew_leaf_if_due(config: &NodeConfig, state_dir: &Path) -> io::Result<
     validate_leaf(
         &renewed.leaf,
         &request.csr,
-        &config.enrollment.name,
+        config.enrollment.name.as_str(),
         &config.enrollment.ca,
     )?;
     persist_leaf(state_dir, &renewed.leaf)?;
@@ -521,7 +510,7 @@ fn validate_stored_leaf(config: &NodeConfig, state_dir: &Path) -> io::Result<()>
     validate_leaf(
         &leaf,
         &csr_pem,
-        &config.enrollment.name,
+        config.enrollment.name.as_str(),
         &config.enrollment.ca,
     )
 }
@@ -669,6 +658,7 @@ fn invalid(message: &str) -> io::Error {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use futures::executor::block_on;
@@ -682,7 +672,7 @@ mod tests {
     fn bundle() -> Vec<u8> {
         serde_json::to_vec(&EnrollmentBundle {
             schema: 1,
-            agent_id: "agent-a".into(),
+            agent_id: updated_contracts::identity::ResourceName::new("agent-a").unwrap(),
             routing_base_url: "https://updates.example/".into(),
             assignment: "assignments/agents/agent-a.json".into(),
             install_root: "/var/lib/app".into(),
@@ -798,7 +788,7 @@ mod tests {
     fn bundle_for(agent_id: &str, marker: &str) -> EnrollmentBundle {
         EnrollmentBundle {
             schema: 1,
-            agent_id: agent_id.into(),
+            agent_id: updated_contracts::identity::ResourceName::new(agent_id).unwrap(),
             routing_base_url: "https://updates.example/".into(),
             assignment: format!("assignments/agents/{agent_id}.json"),
             install_root: "/var/lib/app".into(),
@@ -1069,12 +1059,15 @@ mod tests {
     fn every_control_plane_request_carries_a_total_deadline() {
         // The production half only — this test quotes the very spellings it counts.
         let source = include_str!("enrollment.rs")
-            .split("\n#[cfg(test)]\nmod tests {")
+            .split("\n#[cfg(test)]\n")
             .next()
             .expect("the module source splits at its test module");
         // Exactly one send in the module, and it is built by the helper that attaches the deadline.
         assert_eq!(
-            source.matches(".send()").count(),
+            source
+                .lines()
+                .filter(|line| line.trim() == ".send()")
+                .count(),
             1,
             "this module must send one request shape, the one that carries the deadline"
         );

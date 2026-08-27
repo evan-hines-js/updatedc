@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Arbitrary-`SIGKILL` fuzzer for the cold-install / broken-rollout / roll-forward / interleave
 //! crash-safety paths.
 //!
@@ -509,6 +511,7 @@ fn run() -> R {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

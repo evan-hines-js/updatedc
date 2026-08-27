@@ -59,6 +59,7 @@ use updated_contracts::telemetry::Envelope;
 
 /// Test-only: pins the chart's controller write-boundary policy to the naming rules below.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod chart_boundary;
 
 const LEASE_SECONDS: i32 = 15;

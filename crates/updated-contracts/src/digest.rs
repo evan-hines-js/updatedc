@@ -79,6 +79,7 @@ pub fn deployment_rejection_sha256(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

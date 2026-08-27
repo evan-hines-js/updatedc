@@ -248,6 +248,7 @@ pub fn prune_output_snapshots(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

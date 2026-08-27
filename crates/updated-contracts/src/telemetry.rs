@@ -223,7 +223,8 @@ pub fn split_assignment_path(assignment: &str) -> Option<(&str, &str)> {
     let (prefix, node) = assignment
         .strip_suffix(".json")?
         .rsplit_once(ASSIGNMENT_AGENTS_SEGMENT)?;
-    (!prefix.is_empty() && crate::identity::is_dns_subdomain(node)).then_some((prefix, node))
+    (!prefix.is_empty() && crate::identity::ResourceName::new(node).is_ok())
+        .then_some((prefix, node))
 }
 
 /// An opaque measurement of node state produced by the signed reconciler's `fingerprint` phase.
@@ -277,7 +278,7 @@ impl Fingerprint {
 pub struct NodeReport {
     pub schema: u32,
     /// The node identity this report is for (matches the selected `UpdateAgent`).
-    pub node: String,
+    pub node: crate::identity::ResourceName,
     /// The deployment identity the node currently has assigned
     /// selected by the control plane.
     pub deployment: String,
@@ -396,10 +397,10 @@ impl NodeReport {
         archive_sha256: impl Into<String>,
         provider_set_sha256: impl Into<String>,
         healthy: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::identity::ResourceNameError> {
+        Ok(Self {
             schema: Self::SCHEMA,
-            node: node.into(),
+            node: crate::identity::ResourceName::new(node)?,
             deployment: deployment.into(),
             assignment_sha256: assignment_sha256.into(),
             version: version.into(),
@@ -412,7 +413,7 @@ impl NodeReport {
             fingerprint: None,
             output_sha256: None,
             reconciliation: None,
-        }
+        })
     }
 
     /// Whether this report is a shape a reader may act on.
@@ -443,9 +444,6 @@ impl NodeReport {
     fn shape_error(&self) -> Option<&'static str> {
         if self.schema != Self::SCHEMA {
             return Some("unknown schema");
-        }
-        if !crate::identity::is_dns_subdomain(&self.node) {
-            return Some("invalid node identity");
         }
         if !crate::identity::is_segment(&self.deployment) {
             return Some("invalid deployment identity");
@@ -718,8 +716,7 @@ fn decode_report_payload(envelope: &Envelope) -> Option<Vec<u8>> {
 /// recovery use the identical interpretation without pretending to establish authenticity.
 fn parse_attributed_payload(payload: &[u8], node: &str) -> Option<NodeReport> {
     let report = serde_json::from_slice::<NodeReport>(payload).ok()?;
-    (crate::identity::is_dns_subdomain(node) && report.node == node && report.is_wellformed())
-        .then_some(report)
+    (report.node.as_str() == node && report.is_wellformed()).then_some(report)
 }
 
 /// Proof that a report passed [`accept_stored_report`].
@@ -1347,6 +1344,7 @@ impl FleetReportBuffer {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use aws_lc_rs::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
@@ -1404,7 +1402,8 @@ mod tests {
             DIGEST,
             DIGEST,
             true,
-        );
+        )
+        .unwrap();
         report.reconciliation = Some(reconciliation());
         report
     }
@@ -2042,7 +2041,7 @@ mod tests {
         let (pkcs8, _) = keypair();
         let sign_at = |node: &str, at: u64| {
             let mut report = report();
-            report.node = node.to_string();
+            report.node = crate::identity::ResourceName::new(node).unwrap();
             report.reported_at_ms = at;
             encoded_envelope(&report, &pkcs8)
         };
@@ -2144,7 +2143,7 @@ mod tests {
         let (pkcs8, _) = keypair();
         let sign_at = |node: &str, at: u64| {
             let mut report = report();
-            report.node = node.into();
+            report.node = crate::identity::ResourceName::new(node).unwrap();
             report.reported_at_ms = at;
             encoded_envelope(&report, &pkcs8)
         };
@@ -2458,11 +2457,11 @@ mod tests {
     #[test]
     fn reports_consume_the_shared_kubernetes_identity_grammar() {
         assert!(report().is_wellformed());
-        let mut malformed = report();
-        malformed.node = "Agent-7".into();
+        let mut malformed = serde_json::to_value(report()).unwrap();
+        malformed["node"] = serde_json::Value::String("Agent-7".into());
         assert!(
-            !malformed.is_wellformed(),
-            "the report gate must consume the shared node grammar"
+            serde_json::from_value::<NodeReport>(malformed).is_err(),
+            "report deserialization must consume the shared node grammar"
         );
     }
 

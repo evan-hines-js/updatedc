@@ -387,7 +387,7 @@ impl OutputCache {
         Ok(self
             .entries
             .values()
-            .map(|(_, output)| (output.publication().node.clone(), output.clone()))
+            .map(|(_, output)| (output.publication().node.to_string(), output.clone()))
             .collect())
     }
 }
@@ -618,6 +618,7 @@ pub(crate) async fn sweep_report_projections_before(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -643,7 +644,7 @@ mod tests {
     fn publication(node: &str, value: &[u8]) -> OutputPublication {
         OutputPublication {
             schema: OutputPublication::SCHEMA,
-            node: node.into(),
+            node: updated_contracts::identity::ResourceName::new(node).unwrap(),
             deployment: "database".into(),
             assignment_sha256: "a".repeat(64),
             archive_sha256: "b".repeat(64),
@@ -679,7 +680,8 @@ mod tests {
             "b".repeat(64),
             "b".repeat(64),
             true,
-        );
+        )
+        .unwrap();
         report.output_sha256 = Some("c".repeat(64));
         // Prove the test key really came from the production randomness source rather than a
         // fixed fixture that could accidentally make signature handling deterministic.

@@ -155,6 +155,7 @@ impl crate::journal::Journaled for InstallTransaction {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::testing::install_transaction as tx;
